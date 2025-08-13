@@ -1,4 +1,5 @@
 # To Do
+- UWB Plots: velocity threshold input not taking, always defaulting to 0.1 (default) even if user inputs values. 
 - behavioral classification module
 - For animation output, add ability to check boxes related to whether aligned IR cameras should be shown, different types of plots, etc, broken up into panels. 
 - In the long term, it may also be really cool to have a command center at voleterra that shows plots that are update every 10 minutes or so with what is going on out in the field. 

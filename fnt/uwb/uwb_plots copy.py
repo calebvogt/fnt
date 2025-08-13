@@ -593,116 +593,6 @@ def create_cumulative_distance_plots(data, tag_color_map, tag_label_map):
     
     print("  All cumulative distance plots complete.")
 
-def create_velocity_plots(data, tag_color_map, tag_label_map, velocity_threshold=0.1):
-    """
-    Create velocity over time plots for each tag, similar to the behavioral analysis pipeline.
-    X-axis: Time, Y-axis: Velocity (m/s)
-    Shows movement speed patterns with threshold lines.
-    """
-    print("Creating velocity plots...")
-    
-    # Set column names for plotting
-    x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
-    y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
-    
-    # Ensure we have Day column
-    if 'Day' not in data.columns:
-        unique_dates = sorted(data['Date'].unique())
-        date_to_day = {date: i+1 for i, date in enumerate(unique_dates)}
-        data['Day'] = data['Date'].map(date_to_day)
-    
-    # Create velocity plots for each tag
-    for tag in data['shortid'].unique():
-        tag_data = data[data['shortid'] == tag].copy()
-        
-        if tag_data.empty:
-            continue
-            
-        label = tag_label_map[tag]
-        color = tag_color_map[tag]
-        print(f"  Creating velocity plot for {label}")
-        
-        # Sort by timestamp and calculate velocity
-        tag_data = tag_data.sort_values(by='Timestamp')
-        
-        # Calculate velocity using proper groupby to avoid mixing data between sessions
-        tag_data['velocity'] = np.sqrt(
-            tag_data[x_col].diff()**2 + tag_data[y_col].diff()**2
-        ) / tag_data['Timestamp'].diff().dt.total_seconds()
-        
-        # Replace infinite and NaN values with 0
-        tag_data['velocity'] = tag_data['velocity'].replace([np.inf, -np.inf], np.nan).fillna(0)
-        
-        # Create time column for plotting (hours from start of each day)
-        tag_data['time_of_day'] = (
-            tag_data['Timestamp'] - tag_data['Timestamp'].dt.normalize()
-        ).dt.total_seconds() / 3600  # Convert to hours
-        
-        # Get unique days for this animal
-        unique_days = sorted(tag_data['Day'].unique())
-        
-        # Calculate number of subplot rows and columns
-        num_days = len(unique_days)
-        num_cols = min(4, num_days)  # Max 4 columns
-        num_rows = (num_days + num_cols - 1) // num_cols
-        
-        # Create the faceted plot
-        fig, axes = plt.subplots(num_rows, num_cols, figsize=(5 * num_cols, 4 * num_rows))
-        fig.suptitle(f'Velocity Over Time - {label}\n(Threshold: {velocity_threshold} m/s)', 
-                     fontsize=16, fontweight='bold')
-        
-        # Handle the case of single subplot
-        if num_days == 1:
-            axes = [axes]
-        elif num_rows == 1:
-            axes = axes if hasattr(axes, '__len__') else [axes]
-        else:
-            axes = axes.flatten()
-        
-        # Calculate consistent y-axis limits across all days for this animal
-        max_velocity = tag_data['velocity'].quantile(0.99)  # Use 99th percentile to avoid outliers
-        max_velocity = max(max_velocity, velocity_threshold * 1.2)  # Ensure threshold line is visible
-        
-        for i, day in enumerate(unique_days):
-            ax = axes[i]
-            day_data = tag_data[tag_data['Day'] == day]
-            
-            if not day_data.empty:
-                # Plot velocity line
-                ax.plot(day_data['time_of_day'], day_data['velocity'], 
-                       color=color, linewidth=1.5, alpha=0.8, label=f'{label} velocity')
-                
-                # Add threshold line
-                ax.axhline(y=velocity_threshold, color='red', linestyle='--', 
-                          linewidth=2, alpha=0.7, label=f'Activity threshold ({velocity_threshold} m/s)')
-                
-                # Add some styling
-                ax.set_xlabel('Time of Day (hours)')
-                ax.set_ylabel('Velocity (m/s)')
-                ax.set_title(f'Day {day}', fontsize=12, fontweight='bold')
-                ax.grid(True, alpha=0.3)
-                ax.set_xlim(0, 24)  # Show full 24-hour period
-                
-                # Format x-axis to show hours nicely
-                ax.set_xticks([0, 6, 12, 18, 24])
-                ax.set_xticklabels(['0:00', '6:00', '12:00', '18:00', '24:00'])
-                
-                # Set consistent y-axis limits
-                ax.set_ylim(0, max_velocity * 1.05)  # Add 5% padding at top
-                
-                # Add legend to first subplot only
-                if i == 0:
-                    ax.legend(loc='upper right', fontsize=9)
-        
-        # Hide any unused subplots
-        for i in range(num_days, len(axes)):
-            fig.delaxes(axes[i])
-        
-        plt.tight_layout()
-        plt.show(block=False)
-    
-    print("  Velocity plots complete.")
-
 def uwb_create_plots():
     """
     Standalone function to create multiple UWB tag plots with optional downsampling and smoothing.
@@ -747,7 +637,6 @@ def uwb_create_plots():
     plot_descriptions = [
         ("basic_trajectories", "Full Trajectory Plots", "Combined and individual path plots showing complete movement traces"),
         ("daily_faceted", "Daily Faceted Trajectories", "Day-by-day trajectory plots in grid format (uses seaborn FacetGrid)"),
-        ("velocity_plots", "Velocity Over Time", "Time-series plots showing movement speed over time with activity threshold lines"),
         ("cumulative_distance", "Cumulative Distance Traveled", "Time-series plots showing cumulative distance traveled by each animal, faceted by day"),
         ("occupancy_2d", "2D Occupancy Heatmaps", "Heat maps showing spatial usage patterns across days"),
         ("occupancy_3d", "3D Occupancy Heatmaps", "3D surface plots of spatial occupancy"),
@@ -914,30 +803,25 @@ def uwb_create_plots():
     selected_timezone = timezone_choice.get()
     print(f"Selected timezone: {selected_timezone}")
 
-    # DEBUG: Check what plot types were actually selected
-    print("DEBUG: Checking selected plot types before velocity parameter collection:")
-    for key, value in selected_plot_types.items():
-        print(f"  {key}: {value}")
-    print(f"DEBUG: velocity_plots selected: {selected_plot_types.get('velocity_plots', False)}")
-    print(f"DEBUG: actograms selected: {selected_plot_types.get('actograms', False)}")
-
-    # 6. Velocity threshold parameters (for velocity plots and actograms)
-    velocity_params = {}
-    if selected_plot_types.get('velocity_plots', False) or selected_plot_types.get('actograms', False):
-        print("Asking user for velocity threshold parameters...")
-        velocity_window = tk.Tk()
-        velocity_window.title("Velocity Threshold Parameters")
-        velocity_window.geometry("400x200")
+    # 6. Circadian actogram parameters (only if actograms are selected)
+    actogram_params = {}
+    if selected_plot_types.get('actograms', False):
+        print("Asking user for circadian actogram parameters...")
+        actogram_window = tk.Tk()
+        actogram_window.title("Circadian Actogram Parameters")
+        actogram_window.geometry("400x300")
         
         # Variables to store parameters
         velocity_threshold = tk.DoubleVar(value=0.1)
+        lights_on_time = tk.StringVar(value="1200")  # Default to your experiment: noon
+        lights_off_time = tk.StringVar(value="0000")  # Default to your experiment: midnight
         
         # Create main frame
-        main_frame = tk.Frame(velocity_window)
+        main_frame = tk.Frame(actogram_window)
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         
         # Title
-        tk.Label(main_frame, text="Velocity Threshold Parameters", 
+        tk.Label(main_frame, text="Circadian Actogram Parameters", 
                  font=("Arial", 14, "bold")).pack(pady=(0, 20))
         
         # Velocity threshold section
@@ -954,90 +838,9 @@ def uwb_create_plots():
         velocity_entry = tk.Entry(velocity_frame, textvariable=velocity_threshold, width=10)
         velocity_entry.pack(anchor="w", pady=(5, 0))
         
-        def on_velocity_submit():
-            print("Collecting velocity threshold parameters...")
-            
-            # Debug: Check what's in the Entry widget and DoubleVar
-            entered_text = velocity_entry.get()
-            doublevar_value = velocity_threshold.get()
-            print(f"DEBUG: Entry widget text: '{entered_text}'")
-            print(f"DEBUG: DoubleVar value: {doublevar_value}")
-            
-            # Get velocity threshold from Entry widget directly first
-            try:
-                # Try to get value from Entry widget first
-                if entered_text.strip():
-                    vel_thresh = float(entered_text.strip())
-                else:
-                    # Fallback to DoubleVar
-                    vel_thresh = float(velocity_threshold.get())
-                
-                if vel_thresh < 0:
-                    raise ValueError("Velocity threshold must be positive")
-                    
-                print(f"DEBUG: Parsed velocity threshold: {vel_thresh}")
-                
-            except ValueError as e:
-                messagebox.showerror("Invalid Input", f"Invalid velocity threshold: {e}")
-                return
-            
-            velocity_params['velocity_threshold'] = vel_thresh
-            
-            print(f"  Velocity threshold: {vel_thresh} m/s")
-            
-            velocity_window.quit()
-            velocity_window.destroy()
-        
-        # Submit button
-        tk.Button(main_frame, text="Continue", command=on_velocity_submit, 
-                  font=("Arial", 10, "bold")).pack(pady=20)
-        
-        velocity_window.mainloop()
-        
-        # Debug: Check what was collected
-        print(f"Velocity params collected: {velocity_params}")
-        
-        if not velocity_params:
-            print("WARNING: No velocity parameters collected. Using defaults.")
-            velocity_params = {
-                'velocity_threshold': 0.1
-            }
-            print(f"Using default velocity params: {velocity_params}")
-        else:
-            print(f"Successfully collected user velocity params: {velocity_params}")
-    
-    else:
-        print("DEBUG: Velocity plots and actograms not selected, skipping velocity parameter collection.")
-        print(f"DEBUG: velocity_plots value: {selected_plot_types.get('velocity_plots', 'NOT_FOUND')}")
-        print(f"DEBUG: actograms value: {selected_plot_types.get('actograms', 'NOT_FOUND')}")
-        # Set default parameters for potential use (though won't be needed)
-        velocity_params = {
-            'velocity_threshold': 0.1
-        }
-
-    # 7. Circadian actogram light schedule parameters (only if actograms are selected)
-    actogram_params = {}
-    if selected_plot_types.get('actograms', False):
-        print("Asking user for circadian actogram light schedule parameters...")
-        actogram_window = tk.Tk()
-        actogram_window.title("Actogram Light Schedule Parameters")
-        actogram_window.geometry("400x250")
-        
-        # Variables to store parameters
-        lights_on_time = tk.StringVar(value="1200")  # Default to your experiment: noon
-        lights_off_time = tk.StringVar(value="0000")  # Default to your experiment: midnight
-        
-        # Create main frame
-        main_frame = tk.Frame(actogram_window)
-        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
-        
-        # Title
-        tk.Label(main_frame, text="Actogram Light Schedule Parameters", 
-                 font=("Arial", 14, "bold")).pack(pady=(0, 20))
-        
         # Light schedule section
         lights_frame = tk.Frame(main_frame)
-        lights_frame.pack(fill="x", pady=10)
+        lights_frame.pack(fill="x", pady=20)
         
         tk.Label(lights_frame, text="Light Schedule (Military Time):", 
                  font=("Arial", 10, "bold")).pack(anchor="w")
@@ -1067,7 +870,16 @@ def uwb_create_plots():
             return 0 <= hours <= 23 and 0 <= minutes <= 59
         
         def on_actogram_submit():
-            print("Collecting circadian actogram light schedule parameters...")
+            print("Collecting circadian actogram parameters...")
+            
+            # Get velocity threshold
+            try:
+                vel_thresh = float(velocity_threshold.get())
+                if vel_thresh < 0:
+                    raise ValueError("Velocity threshold must be positive")
+            except ValueError as e:
+                messagebox.showerror("Invalid Input", f"Invalid velocity threshold: {e}")
+                return
             
             # Get and validate light times
             lights_on = lights_on_time.get().strip()
@@ -1087,11 +899,13 @@ def uwb_create_plots():
             lights_on_hour = int(lights_on[:2]) + int(lights_on[2:]) / 60.0
             lights_off_hour = int(lights_off[:2]) + int(lights_off[2:]) / 60.0
             
+            actogram_params['velocity_threshold'] = vel_thresh
             actogram_params['lights_on_hour'] = lights_on_hour
             actogram_params['lights_off_hour'] = lights_off_hour
             actogram_params['lights_on_str'] = lights_on
             actogram_params['lights_off_str'] = lights_off
             
+            print(f"  Velocity threshold: {vel_thresh} m/s")
             print(f"  Lights ON: {lights_on} ({lights_on_hour:.2f} hours)")
             print(f"  Lights OFF: {lights_off} ({lights_off_hour:.2f} hours)")
             
@@ -1108,21 +922,23 @@ def uwb_create_plots():
         print(f"Actogram params collected: {actogram_params}")
         
         if not actogram_params:
-            print("WARNING: No actogram light schedule parameters collected. Using defaults.")
+            print("WARNING: No actogram parameters collected. Using defaults.")
             actogram_params = {
+                'velocity_threshold': 0.1,
                 'lights_on_hour': 12.0,  # noon
                 'lights_off_hour': 0.0,  # midnight
                 'lights_on_str': '1200',
                 'lights_off_str': '0000'
             }
-            print(f"Using default actogram params: {actogram_params}")
+            print(f"Using default params: {actogram_params}")
         else:
-            print(f"Successfully collected user actogram params: {actogram_params}")
+            print(f"Successfully collected user params: {actogram_params}")
     
     else:
-        print("Actograms not selected, skipping light schedule parameter collection.")
+        print("Actograms not selected, skipping parameter collection.")
         # Set default parameters for potential use (though won't be needed)
         actogram_params = {
+            'velocity_threshold': 0.1,
             'lights_on_hour': 12.0,
             'lights_off_hour': 0.0,
             'lights_on_str': '1200',
@@ -1147,7 +963,7 @@ def uwb_create_plots():
         
     print(f"Found {len(available_tags)} unique tags in database: {list(available_tags['shortid'])}")
 
-    # 8. Tag selection and metadata window
+    # 7. Tag selection and metadata window
     print("Opening tag selection and metadata window...")
     unique_tag_ids = list(available_tags['shortid'])
     
@@ -1448,12 +1264,6 @@ def uwb_create_plots():
         print("Creating daily faceted plots for each tag...")
         create_daily_faceted_plots(data, tag_color_map, tag_label_map, arena_coordinates=None)
     
-    # Create velocity plots for each tag
-    if selected_plot_types.get('velocity_plots', False):
-        print("Creating velocity plots for each tag...")
-        create_velocity_plots(data, tag_color_map, tag_label_map, 
-                             velocity_threshold=velocity_params['velocity_threshold'])
-    
     # Create cumulative distance plots for each tag
     if selected_plot_types.get('cumulative_distance', False):
         print("Creating cumulative distance plots for each tag...")
@@ -1473,7 +1283,7 @@ def uwb_create_plots():
     if selected_plot_types.get('actograms', False):
         print("Creating actograms for each tag...")
         create_actograms(data, tag_color_map, tag_label_map, 
-                        velocity_threshold=velocity_params['velocity_threshold'],
+                        velocity_threshold=actogram_params['velocity_threshold'],
                         lights_on_hour=actogram_params['lights_on_hour'],
                         lights_off_hour=actogram_params['lights_off_hour'],
                         selected_timezone=selected_timezone)
@@ -1484,8 +1294,6 @@ def uwb_create_plots():
         selected_plot_names.append("Full Trajectory Plots")
     if selected_plot_types.get('daily_faceted', False):
         selected_plot_names.append("Daily Faceted Trajectories")
-    if selected_plot_types.get('velocity_plots', False):
-        selected_plot_names.append("Velocity Over Time")
     if selected_plot_types.get('cumulative_distance', False):
         selected_plot_names.append("Cumulative Distance Traveled")
     if selected_plot_types.get('occupancy_2d', False):
