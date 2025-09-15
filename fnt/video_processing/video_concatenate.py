@@ -25,7 +25,7 @@ def video_concatenate():
     os.chdir(input_directory)  # Move into the selected directory
 
     # List of supported video file extensions
-    VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
+    VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".MP4")
 
     # Normalize filenames (removing spaces)
     for f in os.listdir("."):
