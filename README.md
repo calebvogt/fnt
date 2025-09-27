@@ -17,7 +17,7 @@ Overview
 
 ## Windows Installation
 
-1. Clone the fieldneuro github repo. 
+1. Clone the fnt github repo. 
 
 2. Add anaconda to system path so you can run fnt conda environment in standard cmd window
 - open anaconda prompt:
@@ -40,9 +40,9 @@ C:\Users\YourUsername\anaconda3\Library\bin
 - install the package in editable mode. Any changes made to the code within the github repo will be availbale within the conda environment. 
 
 ```bash
-conda create --name fieldneuro
-conda activate fieldneuro 
-cd C:\GitHub\fieldneuro 
+conda create --name fnt
+conda activate fnt 
+cd C:\GitHub\fnt 
 pip install -e . 
 ```
 
@@ -51,9 +51,9 @@ pip install -e .
 ## Mac Installation
 
 ```bash
-conda create --name fieldneuro
-conda activate fieldneuro 
-cd ~/Documents/GitHub/fieldneuro # relative to home directory
+conda create --name fnt
+conda activate fnt 
+cd ~/Documents/GitHub/fnt # relative to home directory
 pip install -e . 
 ```
 
