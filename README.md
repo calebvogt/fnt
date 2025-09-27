@@ -1,5 +1,5 @@
 
-# FieldNeuroToolbox (fieldneuro)
+# FieldNeuroToolbox (fnt)
 
 Preprocessing and analysis toolbox for neurobehavioral data. 
 
