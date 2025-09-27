@@ -17,33 +17,37 @@ Overview
 
 ## Windows Installation
 
-1. Clone the fnt github repo. 
+Clone the fnt github repo. 
 
-2. Add anaconda to system path so you can run fnt conda environment in standard cmd window
-- open anaconda prompt:
-
-```bash
-conda info --base
-```
-
-- Open Windows Settings → Search for "Environment Variables" → Click Edit the system environment variables.
-- In the System Properties window, click Environment Variables.
-- Under System variables, find Path, select it, and click Edit.
-- Click New and add the following paths:
-C:\Users\YourUsername\anaconda3\Scripts
-C:\Users\YourUsername\anaconda3
-C:\Users\YourUsername\anaconda3\Library\bin
-
-
-3. Create a new conda environment using a new cmd window (or the integrated terminal in VS code). 
-- Note that conda environments can be stored in a user profile and across users (C:\anaconda3\envs). This can matter. I like to store things in the C: drive typically. 
-- install the package in editable mode. Any changes made to the code within the github repo will be availbale within the conda environment. 
+Install the package in editable mode. Any changes made to the code within the github repo will be availbale within the conda environment. 
 
 ```bash
-conda create --name fnt
+conda create --name fnt python
 conda activate fnt 
 cd C:\GitHub\fnt 
 pip install -e . 
+```
+
+## Launch the GUI
+
+After installation, you can launch the FieldNeuroToolbox GUI in several ways:
+
+**Option 1: Direct Python execution (recommended)**
+```bash
+conda activate fnt
+python -m fnt.gui_pyqt
+```
+
+**Option 2: Use the batch launcher**
+```bash
+# Double-click launch_fnt_gui.bat or run from command line
+launch_fnt_gui.bat
+```
+
+**Option 3: Console script (if properly registered)**
+```bash
+conda activate fnt
+fnt-gui
 ```
 
 

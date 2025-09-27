@@ -11,3 +11,4 @@ shapely
 openpyxl
 soundfile
 moviepy
+PyQt5

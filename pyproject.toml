@@ -18,9 +18,13 @@ dependencies = [
     "shapely",
     "openpyxl",
     "soundfile",
-    "moviepy"
+    "moviepy",
+    "PyQt5"
 ]
 requires-python = ">=3.8"
+
+[project.scripts]
+fnt-gui = "fnt.gui_pyqt:main"
 
 [tool.setuptools.packages.find]
 include = ["fnt"]

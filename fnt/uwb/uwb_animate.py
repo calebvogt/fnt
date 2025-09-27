@@ -62,7 +62,7 @@ def parse_wiser_xml_zones(xml_file_path):
                             'zone': zone_name,
                             'x': x_meters,
                             'y': y_meters
-                        })c
+                        })
                     except ValueError:
                         print(f"Warning: Could not convert coordinates for zone {zone_name}: x={x_str}, y={y_str}")
                         continue

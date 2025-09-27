@@ -31,13 +31,15 @@ from datetime import datetime
 import sys
 
 # Import our behavioral classifier module
+# TODO: Implement behavioral_classifier module
 try:
-    from behavioral_classifier import BehavioralClassifier, BehaviorConfig
-    print("✅ Behavioral classifier module imported successfully")
+    # from behavioral_classifier import BehavioralClassifier, BehaviorConfig
+    print("⚠️ Behavioral classifier module not yet implemented - skipping import")
+    BEHAVIORAL_CLASSIFIER_AVAILABLE = False
 except ImportError as e:
     print(f"❌ Failed to import behavioral_classifier: {e}")
     print("Make sure behavioral_classifier.py is in the same directory")
-    sys.exit(1)
+    BEHAVIORAL_CLASSIFIER_AVAILABLE = False
 
 def uwb_behavioral_analysis():
     """

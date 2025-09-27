@@ -15,3 +15,4 @@ Requires-Dist: shapely
 Requires-Dist: openpyxl
 Requires-Dist: soundfile
 Requires-Dist: moviepy
+Requires-Dist: PyQt5
