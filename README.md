@@ -32,18 +32,6 @@ pip install -e .
 
 After installation, you can launch the FieldNeuroToolbox GUI in several ways:
 
-**Option 1: Direct Python execution (recommended)**
-```bash
-conda activate fnt
-python -m fnt.gui_pyqt
-```
-
-**Option 2: Use the batch launcher**
-```bash
-# Double-click launch_fnt_gui.bat or run from command line
-launch_fnt_gui.bat
-```
-
 **Option 3: Console script (if properly registered)**
 ```bash
 conda activate fnt
@@ -53,9 +41,10 @@ fnt-gui
 
 
 ## Mac Installation
+Open terminal
 
 ```bash
-conda create --name fnt
+conda create --name fnt python
 conda activate fnt 
 cd ~/Documents/GitHub/fnt # relative to home directory
 pip install -e . 
