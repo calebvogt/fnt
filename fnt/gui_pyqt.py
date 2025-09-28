@@ -23,7 +23,7 @@ try:
         QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
         QHBoxLayout, QGridLayout, QPushButton, QLabel, QStatusBar, 
         QMessageBox, QGroupBox, QTextEdit, QSplitter, QFrame,
-        QScrollArea, QSizePolicy
+        QScrollArea, QSizePolicy, QFileDialog, QInputDialog
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
@@ -132,6 +132,7 @@ class FNTMainWindow(QMainWindow):
         self.create_sleap_tab()
         self.create_usv_tab()
         self.create_uwb_tab()
+        self.create_github_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -302,6 +303,33 @@ class FNTMainWindow(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "UWB Tracking")
     
+    def create_github_tab(self):
+        """Create the GitHub preprocessing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Tools for preparing data files for GitHub repositories")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #666666; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # GitHub preprocessing group
+        group = QGroupBox("GitHub Data Preparation")
+        group_layout = QGridLayout()
+        
+        buttons = [
+            ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
+        ]
+        
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "GitHub Preprocessing")
+
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -487,6 +515,279 @@ class FNTMainWindow(QMainWindow):
             from fnt.uwb.plot_uwb_path import plot_uwb_path
             plot_uwb_path()
         self.run_function_safely(func, "UWB Path Plotting")
+    
+    # GitHub Processing Methods - Pure PyQt implementations
+    def run_file_splitter(self):
+        """Launch file splitter for GitHub preparation"""
+        # Run file selection in main thread to avoid Qt threading issues
+        try:
+            self.split_large_files()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
+    
+
+    def split_large_files(self):
+        """Split large files into smaller chunks for GitHub"""
+        self.status_bar.showMessage("Opening file selection dialog...")
+        
+        # Select files to split - improved dialog with more options
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select files to split for GitHub (Use Ctrl+Click for multiple files)",
+            "",
+            "All Files (*.*);;"
+            "CSV Files (*.csv);;"
+            "Excel Files (*.xlsx *.xls);;"
+            "Data Files (*.dat *.txt);;"
+            "Archive Files (*.zip *.rar *.7z);;"
+            "Video Files (*.mp4 *.avi *.mov);;"
+            "Image Files (*.jpg *.png *.tiff)"
+        )
+        
+        if not files:
+            QMessageBox.information(self, "No Files Selected", "No files were selected for splitting.")
+            self.status_bar.showMessage("Ready")
+            return
+        
+        # Get max file size from user
+        max_size_mb, ok = QInputDialog.getInt(
+            self,
+            "Maximum File Size",
+            "Enter maximum file size in MB:\n\n" +
+            "• GitHub limit: 50MB\n" +
+            "• Recommended: 45MB (for safety)\n" +
+            "• Minimum: 1MB",
+            value=45,
+            min=1,
+            max=100
+        )
+        
+        if not ok:
+            self.status_bar.showMessage("Ready")
+            return
+        
+        # Process files in worker thread to avoid blocking GUI
+        def process_files():
+            self.process_file_splitting(files, max_size_mb)
+        
+        self.run_function_safely(process_files, "File Splitting")
+    
+    def process_file_splitting(self, files, max_size_mb):
+        """Process the actual file splitting (runs in worker thread)"""
+        
+    def process_file_splitting(self, files, max_size_mb):
+        """Process the actual file splitting (runs in worker thread)"""
+        max_size_bytes = max_size_mb * 1024 * 1024
+        
+        # Process each file
+        total_files = len(files)
+        files_split = 0
+        files_skipped = 0
+        
+        for i, file_path in enumerate(files, 1):
+            print(f"Processing file {i}/{total_files}: {os.path.basename(file_path)}")
+            
+            try:
+                file_size = os.path.getsize(file_path)
+                
+                if file_size <= max_size_bytes:
+                    print(f"Skipping {file_path}: already under size limit ({file_size/1024/1024:.1f}MB)")
+                    files_skipped += 1
+                    continue
+                
+                # Split the file
+                self.split_file(file_path, max_size_bytes)
+                files_split += 1
+                
+            except Exception as e:
+                print(f"Error processing {os.path.basename(file_path)}: {str(e)}")
+        
+        # Print summary to console (will be shown in status)
+        print(f"\nFile splitting completed!")
+        print(f"Files split: {files_split}")
+        print(f"Files skipped (already small enough): {files_skipped}")
+        print(f"Total files processed: {total_files}")
+        
+        return f"Split {files_split} files, skipped {files_skipped}"
+    
+    def split_file(self, file_path, max_size_bytes):
+        """Split a single file into chunks - smart splitting for CSV files"""
+        file_dir = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+        base_name, ext = os.path.splitext(file_name)
+        
+        # Check if it's a CSV file for smart splitting
+        if ext.lower() in ['.csv', '.tsv']:
+            return self.split_csv_file(file_path, max_size_bytes)
+        else:
+            return self.split_binary_file(file_path, max_size_bytes)
+    
+    def split_csv_file(self, file_path, max_size_bytes):
+        """Split CSV file by rows to preserve data structure"""
+        import csv
+        file_dir = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+        base_name, ext = os.path.splitext(file_name)
+        
+        chunk_number = 1
+        current_size = 0
+        current_rows = []
+        header_row = None
+        
+        print(f"Smart CSV splitting: {file_name}")
+        
+        # Detect CSV dialect and read file
+        with open(file_path, 'r', newline='', encoding='utf-8') as input_file:
+            # Read first few lines to detect dialect
+            sample = input_file.read(8192)
+            input_file.seek(0)
+            
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except csv.Error:
+                # Fallback to excel dialect
+                dialect = csv.excel
+            
+            reader = csv.reader(input_file, dialect)
+            
+            # Read header
+            try:
+                header_row = next(reader)
+                header_size = len(','.join(header_row).encode('utf-8'))
+                print(f"  Header: {len(header_row)} columns")
+            except StopIteration:
+                print("  Warning: Empty file")
+                return 0
+            
+            # Process data rows
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                row_text = ','.join(row)
+                row_size = len(row_text.encode('utf-8'))
+                
+                # Check if adding this row would exceed size limit
+                if (current_size + row_size + header_size) > max_size_bytes and current_rows:
+                    # Write current chunk
+                    self.write_csv_chunk(file_dir, base_name, ext, chunk_number, header_row, current_rows)
+                    chunk_number += 1
+                    current_rows = []
+                    current_size = header_size  # Reset with header size
+                
+                current_rows.append(row)
+                current_size += row_size
+                
+                if row_count % 10000 == 0:
+                    print(f"  Processed {row_count:,} rows...")
+        
+        # Write final chunk if there are remaining rows
+        if current_rows:
+            self.write_csv_chunk(file_dir, base_name, ext, chunk_number, header_row, current_rows)
+        
+        # Create info file
+        self.create_csv_info_file(file_path, chunk_number, row_count)
+        
+        print(f"✅ CSV split complete: {chunk_number} parts, {row_count:,} total rows")
+        return chunk_number
+    
+    def write_csv_chunk(self, file_dir, base_name, ext, chunk_number, header_row, data_rows):
+        """Write a single CSV chunk with header"""
+        import csv
+        
+        chunk_filename = f"{base_name}.part{chunk_number:03d}{ext}"
+        chunk_path = os.path.join(file_dir, chunk_filename)
+        
+        with open(chunk_path, 'w', newline='', encoding='utf-8') as chunk_file:
+            writer = csv.writer(chunk_file)
+            
+            # Write header
+            writer.writerow(header_row)
+            
+            # Write data rows
+            writer.writerows(data_rows)
+        
+        chunk_size = os.path.getsize(chunk_path)
+        print(f"  Created: {chunk_filename} ({chunk_size/1024/1024:.1f}MB, {len(data_rows):,} rows)")
+    
+    def create_csv_info_file(self, file_path, total_chunks, total_rows):
+        """Create info file for CSV splits"""
+        file_dir = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+        base_name, ext = os.path.splitext(file_name)
+        
+        info_filename = f"{base_name}.split_info.txt"
+        info_path = os.path.join(file_dir, info_filename)
+        
+        original_size = os.path.getsize(file_path)
+        
+        with open(info_path, 'w') as info_file:
+            info_file.write(f"File Type: CSV (Smart Split)\n")
+            info_file.write(f"Original file: {file_name}\n")
+            info_file.write(f"Original size: {original_size} bytes ({original_size/1024/1024:.1f}MB)\n")
+            info_file.write(f"Total chunks: {total_chunks}\n")
+            info_file.write(f"Total rows: {total_rows:,}\n")
+            info_file.write(f"Split method: Row-based (preserves data structure)\n")
+            info_file.write(f"Headers: Included in each chunk\n")
+            info_file.write(f"Split date: {os.path.getctime(file_path)}\n")
+            info_file.write(f"\nNote: Each chunk contains headers and can be processed independently. Use pandas.concat() in Python or rbind() in R to recombine if needed.\n")
+            info_file.write(f"\nChunk files:\n")
+            for i in range(1, total_chunks + 1):
+                chunk_name = f"{base_name}.part{i:03d}{ext}"
+                info_file.write(f"  {chunk_name}\n")
+            info_file.write(f"\nTo rejoin CSV files:\n")
+            info_file.write(f"1. Use FNT GUI: GitHub Preprocessing -> File Joiner\n")
+            info_file.write(f"2. Python: pd.concat([pd.read_csv(f) for f in chunk_files])\n")
+            info_file.write(f"3. R: rbind(read.csv('part001'), read.csv('part002'), ...)\n")
+    
+    def split_binary_file(self, file_path, max_size_bytes):
+        """Split non-CSV files using byte-level splitting (original method)"""
+    def split_binary_file(self, file_path, max_size_bytes):
+        """Split non-CSV files using byte-level splitting (original method)"""
+        file_dir = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+        base_name, ext = os.path.splitext(file_name)
+        
+        chunk_number = 1
+        
+        print(f"Binary splitting: {file_name}")
+        
+        with open(file_path, 'rb') as input_file:
+            while True:
+                chunk_data = input_file.read(max_size_bytes)
+                if not chunk_data:
+                    break
+                
+                # Create chunk filename
+                chunk_filename = f"{base_name}.part{chunk_number:03d}{ext}"
+                chunk_path = os.path.join(file_dir, chunk_filename)
+                
+                # Write chunk
+                with open(chunk_path, 'wb') as chunk_file:
+                    chunk_file.write(chunk_data)
+                
+                print(f"  Created: {chunk_filename} ({len(chunk_data)/1024/1024:.1f}MB)")
+                chunk_number += 1
+        
+        # Create info file for binary splits
+        info_filename = f"{base_name}.split_info.txt"
+        info_path = os.path.join(file_dir, info_filename)
+        
+        total_chunks = chunk_number - 1
+        original_size = os.path.getsize(file_path)
+        
+        with open(info_path, 'w') as info_file:
+            info_file.write(f"File Type: Binary\n")
+            info_file.write(f"Original file: {file_name}\n")
+            info_file.write(f"Original size: {original_size} bytes ({original_size/1024/1024:.1f}MB)\n")
+            info_file.write(f"Total chunks: {total_chunks}\n")
+            info_file.write(f"Chunk size: {max_size_bytes} bytes\n")
+            info_file.write(f"Split date: {os.path.getctime(file_path)}\n")
+            info_file.write(f"\nNote: These chunks can be processed individually or recombined using standard tools like pandas (for CSV) or file concatenation commands.\n")
+        
+        print(f"✅ Binary split complete: {total_chunks} chunks")
+        return total_chunks
+    
+
     
     # Utility Methods
     def show_about(self):
