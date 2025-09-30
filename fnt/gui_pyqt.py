@@ -201,6 +201,7 @@ class FNTMainWindow(QMainWindow):
         
         # Create buttons with descriptions
         buttons = [
+            ("Video Processing", "Combined downsampling & re-encoding with custom options", self.run_video_processing),
             ("Video Trimming", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
             ("Video Downsampling", "Reduce video resolution and frame rate", self.run_video_downsample),
@@ -418,57 +419,69 @@ class FNTMainWindow(QMainWindow):
     def run_video_trim(self):
         """Launch video trimming tool"""
         def func():
-            from fnt.video_processing.video_trim import video_trim
+            from fnt.videoProcessing.video_trim import video_trim
             video_trim()
         self.run_function_safely(func, "Video Trimming")
     
     def run_video_concatenate(self):
         """Launch video concatenation tool"""
         def func():
-            from fnt.video_processing.video_concatenate import video_concatenate
+            from fnt.videoProcessing.video_concatenate import video_concatenate
             video_concatenate()
         self.run_function_safely(func, "Video Concatenation")
     
     def run_video_downsample(self):
         """Launch video downsampling tool"""
         def func():
-            from fnt.video_processing.video_downsample import video_downsample
+            from fnt.videoProcessing.videoDownsample import video_downsample
             video_downsample()
         self.run_function_safely(func, "Video Downsampling")
     
     def run_video_reencode(self):
         """Launch video re-encoding tool"""
         def func():
-            from fnt.video_processing.video_reencode import video_reencode
+            from fnt.videoProcessing.video_reencode import video_reencode
             video_reencode()
         self.run_function_safely(func, "Video Re-encoding")
+    
+    def run_video_processing(self):
+        """Launch combined video processing tool with PyQt interface"""
+        try:
+            from fnt.videoProcessing.videoProcessing import VideoProcessingGUI
+            
+            # Create and show the video processing window
+            self.video_processing_window = VideoProcessingGUI()
+            self.video_processing_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch video processing tool: {str(e)}")
     
     # SLEAP Processing Methods - Call existing tkinter functions
     def run_sleap_inference_track(self):
         """Launch SLEAP inference and tracking"""
         def func():
-            from fnt.sleap_processing.batch_video_inference_and_track import main
+            from fnt.sleapProcessing.batch_video_inference_and_track import main
             main()
         self.run_function_safely(func, "SLEAP Inference + Tracking")
     
     def run_sleap_inference_only(self):
         """Launch SLEAP inference only"""
         def func():
-            from fnt.sleap_processing.batch_video_inference_only import main
+            from fnt.sleapProcessing.batch_video_inference_only import main
             main()
         self.run_function_safely(func, "SLEAP Inference Only")
     
     def run_sleap_convert(self):
         """Launch SLEAP file conversion"""
         def func():
-            from fnt.sleap_processing.batch_convert_slp_to_csv_h5 import main
+            from fnt.sleapProcessing.batch_convert_slp_to_csv_h5 import main
             main()
         self.run_function_safely(func, "SLEAP File Conversion")
     
     def run_sleap_retrack(self):
         """Launch SLEAP re-tracking"""
         def func():
-            from fnt.sleap_processing.batch_slp_retrack import main
+            from fnt.sleapProcessing.batch_slp_retrack import main
             main()
         self.run_function_safely(func, "SLEAP Re-tracking")
     
