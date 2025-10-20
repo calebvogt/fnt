@@ -1,5 +1,5 @@
 opencv-python
-numpy
+numpy>=2.3
 ffmpeg-python
 tk
 pandas

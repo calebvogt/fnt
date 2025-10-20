@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Combined Video Processing Tool for FieldNeuroToolbox
+Video PreProcessing Tool for FieldNeuroToolbox
 
-Combines functionality f            # Get filename without extension
-            video_filename = os.path.basename(video_file)
-            video_filename_no_ext = re.sub(r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '', video_filename, flags=re.IGNORECASE) videoDownsample.py and video_reencode.py with a modern PyQt interface.
-Allows users to process videos with customizable frame rate and grayscale options.
+Comprehensive video preprocessing combining downsampling, re-encoding, and format conversion.
+Allows users to batch process videos with customizable quality, resolution, and encoding options.
 """
 
 import os
@@ -38,13 +36,19 @@ class VideoProcessorWorker(QThread):
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
-    def __init__(self, input_dirs, frame_rate, grayscale, gpu_acceleration, apply_clahe):
+    def __init__(self, input_dirs, frame_rate, grayscale, apply_clahe, 
+                 remove_audio, output_format, crf_quality, resolution, codec, preset):
         super().__init__()
         self.input_dirs = input_dirs
         self.frame_rate = frame_rate
         self.grayscale = grayscale
-        self.gpu_acceleration = gpu_acceleration
         self.apply_clahe = apply_clahe
+        self.remove_audio = remove_audio
+        self.output_format = output_format
+        self.crf_quality = crf_quality
+        self.resolution = resolution
+        self.codec = codec
+        self.preset = preset
         self.should_stop = False
     
     def stop(self):
@@ -113,10 +117,10 @@ class VideoProcessorWorker(QThread):
         try:
             # Get filename without extension
             video_filename = os.path.basename(video_file)
-            video_filename_no_ext = re.sub(r'\\.(avi|mp4|mov)$', '', video_filename, flags=re.IGNORECASE)
+            video_filename_no_ext = re.sub(r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '', video_filename, flags=re.IGNORECASE)
             
-            # Output file path
-            output_file = os.path.join(out_dir, video_filename_no_ext + '_processed.mp4')
+            # Output file path with selected format
+            output_file = os.path.join(out_dir, f"{video_filename_no_ext}_processed.{self.output_format}")
             
             self.progress_update.emit(f"Processing: {video_filename}")
             
@@ -160,47 +164,40 @@ class VideoProcessorWorker(QThread):
     def build_ffmpeg_command(self, input_file, output_file):
         """Build the FFmpeg command based on user settings"""
         
-        if self.gpu_acceleration:
-            # GPU-accelerated command (similar to videoDownsample.py GPU mode)
-            cmd = [
-                "ffmpeg", "-y",  # -y to overwrite output files
-                "-hwaccel", "cuda", 
-                "-i", input_file,
-                "-vcodec", "hevc_nvenc",  # GPU acceleration
-                "-preset", "hq",
-                "-rc:v", "vbr",           # variable bitrate mode
-                "-cq:v", "30",            # quality (15-32): lower is better
-                "-b:v", "0.8M",           # target average bitrate
-                "-maxrate", "0.8M",       # maximum bitrate
-                "-bufsize", "1.6M",       # buffer size
-                "-pix_fmt", "yuv420p",
-                "-r", str(self.frame_rate),
-                "-vsync", "cfr",
-                "-an",                    # Remove audio
-                "-movflags", "+faststart",
-                "-max_muxing_queue_size", "10000000"
-            ]
-        else:
-            # CPU command (similar to video_reencode.py)
-            cmd = [
-                "ffmpeg", "-y",  # -y to overwrite output files
-                "-i", input_file,
-                "-vcodec", "libx265",
-                "-preset", "fast",
-                "-crf", "25",             # Good quality compromise
-                "-pix_fmt", "yuv420p",
-                "-r", str(self.frame_rate),
-                "-an",                    # Remove audio
-                "-movflags", "+faststart",
-                "-max_muxing_queue_size", "10000000"
-            ]
+        # Get resolution dimensions
+        if self.resolution == "1080p":
+            width, height = 1920, 1080
+        else:  # 720p
+            width, height = 1280, 720
         
-        # Add video filter for scaling, grayscale, and contrast enhancement
+        # Build FFmpeg command with user-selected codec and preset
+        cmd = [
+            "ffmpeg", "-y",                      # Overwrite output files
+            "-i", input_file,
+            "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
+            "-preset", self.preset,              # User-selected speed preset
+            "-crf", str(self.crf_quality),       # Quality (0-51): lower is better
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.frame_rate),
+            "-vsync", "cfr",                     # Constant frame rate
+        ]
+        
+        # Add audio option
+        if self.remove_audio:
+            cmd.append("-an")  # Remove audio
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])  # Keep audio with AAC codec
+        
+        # Add faststart for better streaming
+        cmd.extend(["-movflags", "+faststart"])
+        cmd.extend(["-max_muxing_queue_size", "10000000"])
+        
+        # Build video filter for scaling, grayscale, and contrast enhancement
         video_filters = []
         
-        # Base scaling and padding
-        video_filters.append("scale=1920:1080:force_original_aspect_ratio=decrease:eval=frame")
-        video_filters.append("pad=1920:1080:-1:-1:color=black")
+        # Scaling and padding
+        video_filters.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame")
+        video_filters.append(f"pad={width}:{height}:-1:-1:color=black")
         
         # Add contrast enhancement if requested (works with both color and grayscale)
         if self.apply_clahe:
@@ -231,9 +228,9 @@ class VideoProcessingGUI(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("Video Processing Tool - FieldNeuroToolbox")
-        self.setGeometry(200, 200, 800, 600)
-        self.setMinimumSize(600, 500)
+        self.setWindowTitle("Video PreProcessing Tool - FieldNeuroToolbox")
+        self.setGeometry(200, 200, 900, 700)
+        self.setMinimumSize(700, 600)
         
         # Set application style
         self.setStyleSheet("""
@@ -322,13 +319,13 @@ class VideoProcessingGUI(QMainWindow):
         header_layout = QVBoxLayout()
         header_frame.setLayout(header_layout)
         
-        title = QLabel("Video Processing Tool")
+        title = QLabel("Video PreProcessing Tool")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 18, QFont.Bold))
         title.setStyleSheet("color: #007acc;")
         header_layout.addWidget(title)
         
-        subtitle = QLabel("Combined video downsampling and re-encoding with customizable options")
+        subtitle = QLabel("Comprehensive video preprocessing with downsampling, re-encoding, and format conversion")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
         subtitle.setStyleSheet("color: #666666; font-style: italic;")
@@ -375,40 +372,126 @@ class VideoProcessingGUI(QMainWindow):
         group = QGroupBox("Processing Options")
         group_layout = QGridLayout()
         
+        row = 0
+        
         # Frame rate option
-        group_layout.addWidget(QLabel("Frame Rate (fps):"), 0, 0)
+        group_layout.addWidget(QLabel("Frame Rate (fps):"), row, 0)
         self.frame_rate_spin = QSpinBox()
         self.frame_rate_spin.setRange(1, 120)
         self.frame_rate_spin.setValue(30)
         self.frame_rate_spin.setToolTip("Target frame rate for output videos")
-        group_layout.addWidget(self.frame_rate_spin, 0, 1)
+        group_layout.addWidget(self.frame_rate_spin, row, 1)
+        row += 1
+        
+        # Output format option
+        group_layout.addWidget(QLabel("Output Format:"), row, 0)
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["mp4", "avi"])
+        self.format_combo.setCurrentText("mp4")
+        self.format_combo.setToolTip("Output video file format")
+        group_layout.addWidget(self.format_combo, row, 1)
+        row += 1
         
         # Grayscale option
         self.grayscale_check = QCheckBox("Convert to Grayscale")
         self.grayscale_check.setChecked(True)
         self.grayscale_check.setToolTip("Convert videos to grayscale to reduce file size")
-        group_layout.addWidget(self.grayscale_check, 1, 0, 1, 2)
+        group_layout.addWidget(self.grayscale_check, row, 0, 1, 2)
+        row += 1
         
-        # GPU acceleration option
-        self.gpu_check = QCheckBox("Use GPU Acceleration (NVIDIA CUDA)")
-        self.gpu_check.setChecked(False)
-        self.gpu_check.setToolTip("Use NVIDIA GPU for faster encoding (requires CUDA-capable GPU)")
-        group_layout.addWidget(self.gpu_check, 2, 0, 1, 2)
+        # Remove audio option
+        self.remove_audio_check = QCheckBox("Remove Audio")
+        self.remove_audio_check.setChecked(True)
+        self.remove_audio_check.setToolTip("Remove audio track from videos to reduce file size")
+        group_layout.addWidget(self.remove_audio_check, row, 0, 1, 2)
+        row += 1
         
         # CLAHE contrast enhancement option
         self.clahe_check = QCheckBox("Apply Contrast Enhancement")
         self.clahe_check.setChecked(False)
         self.clahe_check.setToolTip("Apply contrast and brightness enhancement for better visibility (works with both color and grayscale)")
-        group_layout.addWidget(self.clahe_check, 3, 0, 1, 2)
+        group_layout.addWidget(self.clahe_check, row, 0, 1, 2)
+        row += 1
         
-        # Output format info
-        info_label = QLabel("Output: 1920x1080 MP4, audio removed, saved to 'proc' subfolder")
+        # Show/Hide Advanced Options Button
+        self.advanced_btn = QPushButton("Show Advanced Options ▼")
+        self.advanced_btn.clicked.connect(self.toggle_advanced_options)
+        self.advanced_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d;
+                text-align: left;
+                padding-left: 10px;
+            }
+            QPushButton:hover {
+                background-color: #5a6268;
+            }
+        """)
+        group_layout.addWidget(self.advanced_btn, row, 0, 1, 2)
+        row += 1
+        
+        # Advanced options frame (initially hidden)
+        self.advanced_frame = QFrame()
+        self.advanced_frame.setVisible(False)
+        self.advanced_frame.setStyleSheet("QFrame { border: 1px solid #cccccc; background-color: #f9f9f9; padding: 10px; }")
+        advanced_layout = QGridLayout()
+        self.advanced_frame.setLayout(advanced_layout)
+        
+        # Video Codec option
+        advanced_layout.addWidget(QLabel("Video Codec:"), 0, 0)
+        self.codec_combo = QComboBox()
+        self.codec_combo.addItems(["libx265 (H.265/HEVC)", "libx264 (H.264/AVC)"])
+        self.codec_combo.setCurrentText("libx265 (H.265/HEVC)")
+        self.codec_combo.setToolTip("Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible")
+        advanced_layout.addWidget(self.codec_combo, 0, 1)
+        
+        # Speed Preset option
+        advanced_layout.addWidget(QLabel("Speed Preset:"), 1, 0)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "ultrafast", "superfast", "veryfast", "faster", 
+            "fast", "medium", "slow", "slower", "veryslow"
+        ])
+        self.preset_combo.setCurrentText("ultrafast")
+        self.preset_combo.setToolTip("Encoding speed: ultrafast = fastest encoding but larger files; slower = better compression but takes longer")
+        advanced_layout.addWidget(self.preset_combo, 1, 1)
+        
+        # CRF Quality option
+        advanced_layout.addWidget(QLabel("CRF Quality:"), 2, 0)
+        self.crf_combo = QComboBox()
+        self.crf_combo.addItems(["10 (Best)", "15 (High)", "20 (Good)", "25 (Medium)", "30 (Low)"])
+        self.crf_combo.setCurrentText("15 (High)")
+        self.crf_combo.setToolTip("Lower values = better quality but larger file size. CRF 15 is near-lossless.")
+        advanced_layout.addWidget(self.crf_combo, 2, 1)
+        
+        # Resolution option
+        advanced_layout.addWidget(QLabel("Resolution:"), 3, 0)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems(["1080p (1920x1080)", "720p (1280x720)"])
+        self.resolution_combo.setCurrentText("1080p (1920x1080)")
+        self.resolution_combo.setToolTip("Target output resolution")
+        advanced_layout.addWidget(self.resolution_combo, 3, 1)
+        
+        group_layout.addWidget(self.advanced_frame, row, 0, 1, 2)
+        row += 1
+        
+        # Output info
+        info_label = QLabel("Videos saved to 'proc' subfolder in each input directory")
         info_label.setStyleSheet("color: #666666; font-style: italic; margin-top: 10px;")
         info_label.setWordWrap(True)
-        group_layout.addWidget(info_label, 4, 0, 1, 2)
+        group_layout.addWidget(info_label, row, 0, 1, 2)
         
         group.setLayout(group_layout)
         layout.addWidget(group)
+    
+    def toggle_advanced_options(self):
+        """Toggle visibility of advanced options"""
+        is_visible = self.advanced_frame.isVisible()
+        self.advanced_frame.setVisible(not is_visible)
+        
+        if is_visible:
+            self.advanced_btn.setText("Show Advanced Options ▼")
+        else:
+            self.advanced_btn.setText("Hide Advanced Options ▲")
     
     def create_control_buttons(self, layout):
         """Create control buttons section"""
@@ -507,8 +590,24 @@ class VideoProcessingGUI(QMainWindow):
         # Get user settings
         frame_rate = self.frame_rate_spin.value()
         grayscale = self.grayscale_check.isChecked()
-        gpu_acceleration = self.gpu_check.isChecked()
         apply_clahe = self.clahe_check.isChecked()
+        remove_audio = self.remove_audio_check.isChecked()
+        output_format = self.format_combo.currentText()
+        
+        # Get codec (extract first word from selection)
+        codec_text = self.codec_combo.currentText()
+        codec = codec_text.split()[0]  # Extract "libx265" or "libx264"
+        
+        # Get speed preset
+        preset = self.preset_combo.currentText()
+        
+        # Get CRF quality value (extract number from selection)
+        crf_text = self.crf_combo.currentText()
+        crf_quality = int(crf_text.split()[0])  # Extract number from "15 (High)"
+        
+        # Get resolution (extract value from selection)
+        resolution_text = self.resolution_combo.currentText()
+        resolution = resolution_text.split()[0]  # Extract "1080p" or "720p"
         
         # Disable controls
         self.start_btn.setEnabled(False)
@@ -523,16 +622,22 @@ class VideoProcessingGUI(QMainWindow):
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
-        self.log_message("Starting video processing...")
-        self.log_message(f"Settings: {frame_rate} fps, Grayscale: {grayscale}, GPU: {gpu_acceleration}, Contrast Enhancement: {apply_clahe}")
+        self.log_message("Starting video preprocessing...")
+        self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
+        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}")
         
         # Start worker thread
         self.worker = VideoProcessorWorker(
             self.selected_dirs, 
             frame_rate, 
-            grayscale, 
-            gpu_acceleration,
-            apply_clahe
+            grayscale,
+            apply_clahe,
+            remove_audio,
+            output_format,
+            crf_quality,
+            resolution,
+            codec,
+            preset
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)

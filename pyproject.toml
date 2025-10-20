@@ -7,7 +7,7 @@ name = "fnt"
 version = "0.1"
 dependencies = [
     "opencv-python",
-    "numpy",
+    "numpy>=2.3",
     "ffmpeg-python",
     "tk",
     "pandas",

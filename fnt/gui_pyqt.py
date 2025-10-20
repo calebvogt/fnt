@@ -129,9 +129,9 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs
         self.create_video_tab()
-        self.create_sleap_tab()
         self.create_usv_tab()
         self.create_uwb_tab()
+        self.create_sleap_tab()
         self.create_github_tab()
         self.create_utilities_tab()
         
@@ -201,11 +201,9 @@ class FNTMainWindow(QMainWindow):
         
         # Create buttons with descriptions
         buttons = [
-            ("Video Processing", "Combined downsampling & re-encoding with custom options", self.run_video_processing),
+            ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
             ("Video Trimming", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
-            ("Video Downsampling", "Reduce video resolution and frame rate", self.run_video_downsample),
-            ("Video Re-encoding", "Convert video formats and codecs", self.run_video_reencode),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -258,12 +256,13 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(desc)
         
         # USV processing group
-        group = QGroupBox("USV Analysis Tools")
+        group = QGroupBox("USV Processing Tools")
         group_layout = QGridLayout()
         
         buttons = [
-            ("USV Heterodyne Processing", "Process ultrasonic recordings", self.run_usv_heterodyne),
             ("Compress Audio Files", "Compress WAV files for storage", self.run_compress_wavs),
+            ("USV Heterodyne Processing", "Process ultrasonic recordings", self.run_usv_heterodyne),
+            ("Trim Audio File", "Trim audio with spectrogram visualization and frequency filtering", self.run_audio_trim),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -272,7 +271,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "USV Analysis")
+        self.tabs.addTab(tab, "USV Processing")
     
     def create_uwb_tab(self):
         """Create the UWB processing tab"""
@@ -284,6 +283,18 @@ class FNTMainWindow(QMainWindow):
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #666666; margin: 10px;")
         layout.addWidget(desc)
+        
+        # UWB Quick Review group
+        quick_group = QGroupBox("UWB Quick Review")
+        quick_layout = QGridLayout()
+        
+        quick_buttons = [
+            ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
+        ]
+        
+        self.create_button_grid(quick_layout, quick_buttons)
+        quick_group.setLayout(quick_layout)
+        layout.addWidget(quick_group)
         
         # UWB processing group
         group = QGroupBox("UWB Tracking & Analysis")
@@ -302,7 +313,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "UWB Tracking")
+        self.tabs.addTab(tab, "UWB Processing")
     
     def create_github_tab(self):
         """Create the GitHub preprocessing tab"""
@@ -415,34 +426,27 @@ class FNTMainWindow(QMainWindow):
         
         self.current_worker = None
     
-    # Video Processing Methods - Call existing tkinter functions
+    # Video Processing Methods
     def run_video_trim(self):
         """Launch video trimming tool"""
-        def func():
-            from fnt.videoProcessing.video_trim import video_trim
+        # PyQt dialogs must run in main thread, not worker thread
+        try:
+            from fnt.videoProcessing.video_trim_pyqt import video_trim
             video_trim()
-        self.run_function_safely(func, "Video Trimming")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Video trimming failed: {str(e)}")
     
     def run_video_concatenate(self):
-        """Launch video concatenation tool"""
-        def func():
-            from fnt.videoProcessing.video_concatenate import video_concatenate
-            video_concatenate()
-        self.run_function_safely(func, "Video Concatenation")
-    
-    def run_video_downsample(self):
-        """Launch video downsampling tool"""
-        def func():
-            from fnt.videoProcessing.videoDownsample import video_downsample
-            video_downsample()
-        self.run_function_safely(func, "Video Downsampling")
-    
-    def run_video_reencode(self):
-        """Launch video re-encoding tool"""
-        def func():
-            from fnt.videoProcessing.video_reencode import video_reencode
-            video_reencode()
-        self.run_function_safely(func, "Video Re-encoding")
+        """Launch video concatenation tool with PyQt interface"""
+        try:
+            from fnt.videoProcessing.video_concatenate_pyqt import VideoConcatenationGUI
+            
+            # Create and show the video concatenation window
+            self.video_concatenation_window = VideoConcatenationGUI()
+            self.video_concatenation_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch video concatenation tool: {str(e)}")
     
     def run_video_processing(self):
         """Launch combined video processing tool with PyQt interface"""
@@ -493,14 +497,40 @@ class FNTMainWindow(QMainWindow):
             usv_batch_heterodyne()
         self.run_function_safely(func, "USV Heterodyne Processing")
     
+    def run_audio_trim(self):
+        """Launch audio trimming with spectrogram visualization"""
+        try:
+            from fnt.usv.audio_trim_pyqt import AudioTrimWindow
+            
+            # Create and show the audio trim window
+            self.audio_trim_window = AudioTrimWindow()
+            self.audio_trim_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Audio trimming failed: {str(e)}")
+    
     def run_compress_wavs(self):
         """Launch WAV compression"""
-        def func():
-            from fnt.usv.compress_wavs import compress_wavs_main
-            compress_wavs_main()
-        self.run_function_safely(func, "WAV Compression")
+        try:
+            from fnt.usv.compress_wavs_pyqt import CompressWavsWindow
+            
+            # Create and show the compress wavs window
+            self.compress_wavs_window = CompressWavsWindow()
+            self.compress_wavs_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"WAV compression failed: {str(e)}")
     
-    # UWB Processing Methods - Call existing tkinter functions
+    # UWB Processing Methods
+    def run_uwb_quick_plots(self):
+        """Launch UWB Quick Plots tool"""
+        try:
+            from fnt.uwb.uwb_quick_plots_pyqt import UWBQuickPlotsWindow
+            
+            # Create and show the UWB quick plots window
+            self.uwb_quick_plots_window = UWBQuickPlotsWindow()
+            self.uwb_quick_plots_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"UWB Quick Plots failed: {str(e)}")
+    
     def run_uwb_preprocess(self):
         """Launch UWB data preprocessing"""
         def func():
