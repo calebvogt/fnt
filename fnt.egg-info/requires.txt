@@ -12,3 +12,6 @@ openpyxl
 soundfile
 moviepy
 PyQt5
+torch>=2.0.0
+torchvision
+segment-anything@ git+https://github.com/facebookresearch/segment-anything.git

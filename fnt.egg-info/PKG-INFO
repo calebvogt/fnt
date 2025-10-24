@@ -16,3 +16,6 @@ Requires-Dist: openpyxl
 Requires-Dist: soundfile
 Requires-Dist: moviepy
 Requires-Dist: PyQt5
+Requires-Dist: torch>=2.0.0
+Requires-Dist: torchvision
+Requires-Dist: segment-anything@ git+https://github.com/facebookresearch/segment-anything.git

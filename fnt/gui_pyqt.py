@@ -67,26 +67,39 @@ class FNTMainWindow(QMainWindow):
         self.setGeometry(100, 100, 1000, 700)
         self.setMinimumSize(800, 600)
         
-        # Set application style
+        # Set dark theme style
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #f5f5f5;
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
             }
             QTabWidget::pane {
-                border: 1px solid #c0c0c0;
-                background-color: white;
+                border: 1px solid #3f3f3f;
+                background-color: #2b2b2b;
             }
             QTabBar::tab {
-                background-color: #e1e1e1;
-                padding: 8px 16px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+                padding: 8px 24px;
                 margin-right: 2px;
+                min-width: 140px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
             }
             QTabBar::tab:selected {
-                background-color: white;
-                border-bottom: 2px solid #007acc;
+                background-color: #2b2b2b;
+                border-bottom: 2px solid #0078d4;
+                font-weight: bold;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #3f3f3f;
             }
             QPushButton {
-                background-color: #007acc;
+                background-color: #0078d4;
                 color: white;
                 border: none;
                 padding: 8px 16px;
@@ -94,21 +107,40 @@ class FNTMainWindow(QMainWindow):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #005a9e;
+                background-color: #106ebe;
             }
             QPushButton:pressed {
-                background-color: #004578;
+                background-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #cccccc;
             }
             QGroupBox {
                 font-weight: bold;
-                border: 2px solid #c0c0c0;
-                border-radius: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
                 margin-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px 0 5px;
+            }
+            QLabel {
+                color: #cccccc;
+                background-color: transparent;
+            }
+            QStatusBar {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                border-top: 1px solid #3f3f3f;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+                border-color: #3f3f3f;
             }
         """)
         
@@ -133,6 +165,7 @@ class FNTMainWindow(QMainWindow):
         self.create_uwb_tab()
         self.create_sleap_tab()
         self.create_github_tab()
+        self.create_video_tracking_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -156,7 +189,7 @@ class FNTMainWindow(QMainWindow):
         """Create the header section with title and description"""
         header_frame = QFrame()
         header_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        header_frame.setStyleSheet("background-color: white; padding: 10px;")
+        header_frame.setStyleSheet("background-color: #1e1e1e; padding: 10px; border: 1px solid #3f3f3f;")
         
         header_layout = QVBoxLayout()
         header_frame.setLayout(header_layout)
@@ -165,21 +198,21 @@ class FNTMainWindow(QMainWindow):
         title = QLabel("FieldNeuroToolbox")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 20, QFont.Bold))
-        title.setStyleSheet("color: #007acc;")
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
         header_layout.addWidget(title)
         
         # Subtitle
         subtitle = QLabel("Preprocessing and analysis toolbox for neurobehavioral data")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 11))
-        subtitle.setStyleSheet("color: #666666; font-style: italic;")
+        subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         header_layout.addWidget(subtitle)
         
         # Version
         version = QLabel("Version 0.1 | Professional PyQt Interface")
         version.setAlignment(Qt.AlignCenter)
         version.setFont(QFont("Arial", 9))
-        version.setStyleSheet("color: #999999;")
+        version.setStyleSheet("color: #888888; background-color: transparent;")
         header_layout.addWidget(version)
         
         layout.addWidget(header_frame)
@@ -192,7 +225,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("Tools for video file processing and manipulation")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # Video processing group
@@ -222,7 +255,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("SLEAP pose estimation pipeline tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # SLEAP processing group
@@ -252,7 +285,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("Ultrasonic vocalization analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # USV processing group
@@ -281,7 +314,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("Ultra-wideband tracking and behavioral analysis")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # UWB Quick Review group
@@ -323,7 +356,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("Tools for preparing data files for GitHub repositories")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # GitHub preprocessing group
@@ -342,6 +375,47 @@ class FNTMainWindow(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "GitHub Preprocessing")
 
+    def create_video_tracking_tab(self):
+        """Create the video tracking tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Interactive tracking using SAM (Segment Anything Model) for behavioral tests")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # Simple tracking group
+        group = QGroupBox("Simple Tracking Tools")
+        group_layout = QGridLayout()
+        
+        buttons = [
+            ("Open Field Test", "Track single or multiple animals in open arena with center zone metrics", self.run_oft_tracker),
+            ("Light Dark Box", "Track animal with occlusion handling for dark compartment", self.run_ldb_tracker),
+        ]
+        
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        # Info box
+        info_label = QLabel(
+            "<b>Note:</b> Video tracking requires SAM model checkpoint.<br>"
+            "Download from: <a href='https://github.com/facebookresearch/segment-anything#model-checkpoints'>"
+            "github.com/facebookresearch/segment-anything</a><br><br>"
+            "<b>Workflow:</b> Select video → Click on animal → Draw ROI → Track automatically"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setOpenExternalLinks(True)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 10px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Video Tracking")
+
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -350,7 +424,7 @@ class FNTMainWindow(QMainWindow):
         # Description
         desc = QLabel("General utilities and information")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #666666; margin: 10px;")
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
         # Utilities group
@@ -392,7 +466,7 @@ class FNTMainWindow(QMainWindow):
             # Description label
             desc_label = QLabel(description)
             desc_label.setFont(QFont("Arial", 9))
-            desc_label.setStyleSheet("color: #666666; margin: 5px;")
+            desc_label.setStyleSheet("color: #cccccc; margin: 5px;")
             desc_label.setWordWrap(True)
             desc_label.setAlignment(Qt.AlignCenter)
             button_layout.addWidget(desc_label)
@@ -558,6 +632,29 @@ class FNTMainWindow(QMainWindow):
             from fnt.uwb.plot_uwb_path import plot_uwb_path
             plot_uwb_path()
         self.run_function_safely(func, "UWB Path Plotting")
+    
+    # Video Tracking Methods
+    def run_oft_tracker(self):
+        """Launch Open Field Test tracker with SAM"""
+        try:
+            from fnt.videoTracking.oft_tracker_gui import OFTTrackerGUI
+            
+            # Create and show the OFT tracker window
+            self.oft_tracker_window = OFTTrackerGUI()
+            self.oft_tracker_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch OFT tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
+    
+    def run_ldb_tracker(self):
+        """Launch Light Dark Box tracker with SAM"""
+        try:
+            from fnt.videoTracking.ldb_tracker_gui import LDBTrackerGUI
+            
+            # Create and show the LDB tracker window
+            self.ldb_tracker_window = LDBTrackerGUI()
+            self.ldb_tracker_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch LDB tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
     
     # GitHub Processing Methods - Pure PyQt implementations
     def run_file_splitter(self):

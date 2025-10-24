@@ -19,7 +19,11 @@ dependencies = [
     "openpyxl",
     "soundfile",
     "moviepy",
-    "PyQt5"
+    "PyQt5",
+    # Video tracking dependencies (SAM)
+    "torch>=2.0.0",
+    "torchvision",
+    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git"
 ]
 requires-python = ">=3.8"
 

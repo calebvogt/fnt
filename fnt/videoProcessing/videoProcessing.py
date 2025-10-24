@@ -199,16 +199,22 @@ class VideoProcessorWorker(QThread):
         video_filters.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame")
         video_filters.append(f"pad={width}:{height}:-1:-1:color=black")
         
+        # CONTRAST ENHANCEMENT - COMMENTED OUT FOR NOW
+        # Can be re-enabled later if needed
         # Add contrast enhancement if requested (works with both color and grayscale)
-        if self.apply_clahe:
-            if self.grayscale:
-                video_filters.append("format=gray")
-                # Contrast enhancement for grayscale
-                video_filters.append("eq=contrast=1.3:brightness=0.05")
-            else:
-                # Contrast enhancement for color videos
-                video_filters.append("eq=contrast=1.2:brightness=0.03:saturation=1.1")
-        elif self.grayscale:
+        # if self.apply_clahe:
+        #     if self.grayscale:
+        #         video_filters.append("format=gray")
+        #         # Contrast enhancement for grayscale
+        #         video_filters.append("eq=contrast=1.3:brightness=0.05")
+        #     else:
+        #         # Contrast enhancement for color videos
+        #         video_filters.append("eq=contrast=1.2:brightness=0.03:saturation=1.1")
+        # elif self.grayscale:
+        #     video_filters.append("format=gray")
+        
+        # Grayscale conversion (without contrast enhancement)
+        if self.grayscale:
             video_filters.append("format=gray")
         
         video_filter = ",".join(video_filters)
@@ -406,12 +412,13 @@ class VideoProcessingGUI(QMainWindow):
         group_layout.addWidget(self.remove_audio_check, row, 0, 1, 2)
         row += 1
         
-        # CLAHE contrast enhancement option
-        self.clahe_check = QCheckBox("Apply Contrast Enhancement")
-        self.clahe_check.setChecked(False)
-        self.clahe_check.setToolTip("Apply contrast and brightness enhancement for better visibility (works with both color and grayscale)")
-        group_layout.addWidget(self.clahe_check, row, 0, 1, 2)
-        row += 1
+        # CLAHE contrast enhancement option - COMMENTED OUT FOR NOW
+        # Can be re-enabled later if needed
+        # self.clahe_check = QCheckBox("Apply Contrast Enhancement")
+        # self.clahe_check.setChecked(False)
+        # self.clahe_check.setToolTip("Apply contrast and brightness enhancement for better visibility (works with both color and grayscale)")
+        # group_layout.addWidget(self.clahe_check, row, 0, 1, 2)
+        # row += 1
         
         # Show/Hide Advanced Options Button
         self.advanced_btn = QPushButton("Show Advanced Options ▼")
@@ -459,7 +466,7 @@ class VideoProcessingGUI(QMainWindow):
         advanced_layout.addWidget(QLabel("CRF Quality:"), 2, 0)
         self.crf_combo = QComboBox()
         self.crf_combo.addItems(["10 (Best)", "15 (High)", "20 (Good)", "25 (Medium)", "30 (Low)"])
-        self.crf_combo.setCurrentText("15 (High)")
+        self.crf_combo.setCurrentText("20 (Good)")
         self.crf_combo.setToolTip("Lower values = better quality but larger file size. CRF 15 is near-lossless.")
         advanced_layout.addWidget(self.crf_combo, 2, 1)
         
@@ -590,7 +597,8 @@ class VideoProcessingGUI(QMainWindow):
         # Get user settings
         frame_rate = self.frame_rate_spin.value()
         grayscale = self.grayscale_check.isChecked()
-        apply_clahe = self.clahe_check.isChecked()
+        # apply_clahe = self.clahe_check.isChecked()  # COMMENTED OUT - contrast enhancement disabled
+        apply_clahe = False  # Set to False since feature is disabled
         remove_audio = self.remove_audio_check.isChecked()
         output_format = self.format_combo.currentText()
         
