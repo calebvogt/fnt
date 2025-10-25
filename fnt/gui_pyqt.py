@@ -254,8 +254,8 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
-            ("Video Inference + Tracking", "Run full SLEAP pipeline on videos", self.run_sleap_inference_track),
             ("Video Inference Only", "Run SLEAP inference without tracking", self.run_sleap_inference_only),
+            ("Video Inference + Tracking", "Run full SLEAP pipeline on videos", self.run_sleap_inference_track),
             ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
             ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
         ]
