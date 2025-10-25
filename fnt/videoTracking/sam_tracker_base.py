@@ -60,7 +60,9 @@ class SAMTrackerBase:
         model_type: str = "vit_h",
         device: str = "cuda",
         sam_update_interval: int = 30,
-        confidence_threshold: float = 0.5
+        confidence_threshold: float = 0.5,
+        flow_window_size: int = 101,
+        tracking_method: str = "optical_flow"
     ):
         """
         Initialize SAM tracker.
@@ -73,6 +75,8 @@ class SAMTrackerBase:
             device: "cuda" for GPU or "cpu" for CPU
             sam_update_interval: Update SAM segmentation every N frames
             confidence_threshold: Minimum confidence for tracking (0-1)
+            flow_window_size: Optical flow window size (must be odd, default 101)
+            tracking_method: "optical_flow" (precise but slow) or "centroid" (fast but less precise)
         """
         self.video_path = Path(video_path)
         self.sam_checkpoint = sam_checkpoint
@@ -84,6 +88,8 @@ class SAMTrackerBase:
             self.device = "cpu"
         self.sam_update_interval = sam_update_interval
         self.confidence_threshold = confidence_threshold
+        self.flow_window_size = flow_window_size
+        self.tracking_method = tracking_method
         
         # Video properties
         self.cap = None
@@ -107,7 +113,7 @@ class SAMTrackerBase:
         
         # Optical flow parameters
         self.lk_params = dict(
-            winSize=(21, 21),
+            winSize=(self.flow_window_size, self.flow_window_size),
             maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
@@ -266,6 +272,63 @@ class SAMTrackerBase:
                 
         return None
         
+    def track_centroid(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        """
+        Track using simple centroid-based blob detection (faster than optical flow).
+        Searches for dark blob near previous position.
+        
+        Args:
+            frame: Current grayscale frame
+            
+        Returns:
+            (x, y, confidence) or None if tracking failed
+        """
+        if self.current_centroid is None:
+            return None
+            
+        # Define search region around previous position (e.g., 100px radius)
+        search_radius = 100
+        cx, cy = int(self.current_centroid[0]), int(self.current_centroid[1])
+        x1 = max(0, cx - search_radius)
+        y1 = max(0, cy - search_radius)
+        x2 = min(frame.shape[1], cx + search_radius)
+        y2 = min(frame.shape[0], cy + search_radius)
+        
+        # Extract search region
+        search_region = frame[y1:y2, x1:x2]
+        
+        # Threshold to find dark blob (assumes animal is darker than background)
+        # Use Otsu's method for adaptive thresholding
+        _, binary = cv2.threshold(search_region, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if len(contours) == 0:
+            return None
+            
+        # Find largest contour (assumed to be the animal)
+        largest_contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest_contour)
+        
+        # Calculate centroid of largest contour
+        M = cv2.moments(largest_contour)
+        if M["m00"] == 0:
+            return None
+            
+        local_cx = M["m10"] / M["m00"]
+        local_cy = M["m01"] / M["m00"]
+        
+        # Convert back to full frame coordinates
+        global_x = x1 + local_cx
+        global_y = y1 + local_cy
+        
+        # Confidence based on blob size consistency
+        expected_area = self.current_mask.sum() if self.current_mask is not None else 1000
+        confidence = min(1.0, area / max(expected_area, 1))
+        
+        return (global_x, global_y, confidence)
+    
     def predict_with_kalman(self) -> Tuple[float, float]:
         """Predict next position using Kalman filter."""
         if not self.kalman_initialized:
@@ -375,16 +438,24 @@ class SAMTrackerBase:
                     # Update Kalman filter
                     self.update_kalman(centroid[0], centroid[1])
                     
-                    # Update optical flow points
-                    points = cv2.goodFeaturesToTrack(gray, mask=mask, maxCorners=100, qualityLevel=0.01, minDistance=10)
-                    if points is not None:
-                        self.prev_points = points
+                    # Update optical flow points (only if using optical flow)
+                    if self.tracking_method == "optical_flow":
+                        points = cv2.goodFeaturesToTrack(gray, mask=mask, maxCorners=100, qualityLevel=0.01, minDistance=10)
+                        if points is not None:
+                            self.prev_points = points
                         
                     self.prev_gray = gray
                     return (centroid[0], centroid[1], 1.0)
         else:
-            # Track with optical flow
-            result = self.track_optical_flow(gray)
+            # Track with selected method
+            if self.tracking_method == "optical_flow":
+                result = self.track_optical_flow(gray)
+            elif self.tracking_method == "centroid":
+                result = self.track_centroid(gray)
+            else:
+                print(f"Unknown tracking method: {self.tracking_method}, falling back to optical flow")
+                result = self.track_optical_flow(gray)
+                
             if result is not None:
                 x, y, confidence = result
                 self.prev_gray = gray

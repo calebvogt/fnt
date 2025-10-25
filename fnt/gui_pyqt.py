@@ -84,16 +84,14 @@ class FNTMainWindow(QMainWindow):
             QTabBar::tab {
                 background-color: #1e1e1e;
                 color: #cccccc;
-                padding: 8px 24px;
+                padding: 8px 16px;
                 margin-right: 2px;
-                min-width: 140px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
             }
             QTabBar::tab:selected {
                 background-color: #2b2b2b;
                 border-bottom: 2px solid #0078d4;
-                font-weight: bold;
             }
             QTabBar::tab:hover:!selected {
                 background-color: #3f3f3f;
@@ -161,11 +159,11 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs
         self.create_video_tab()
+        self.create_sleap_tab()
+        self.create_video_tracking_tab()
         self.create_usv_tab()
         self.create_uwb_tab()
-        self.create_sleap_tab()
         self.create_github_tab()
-        self.create_video_tracking_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -207,13 +205,6 @@ class FNTMainWindow(QMainWindow):
         subtitle.setFont(QFont("Arial", 11))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         header_layout.addWidget(subtitle)
-        
-        # Version
-        version = QLabel("Version 0.1 | Professional PyQt Interface")
-        version.setAlignment(Qt.AlignCenter)
-        version.setFont(QFont("Arial", 9))
-        version.setStyleSheet("color: #888888; background-color: transparent;")
-        header_layout.addWidget(version)
         
         layout.addWidget(header_frame)
     
