@@ -534,11 +534,16 @@ class FNTMainWindow(QMainWindow):
         self.run_function_safely(func, "SLEAP Inference + Tracking")
     
     def run_sleap_inference_only(self):
-        """Launch SLEAP inference only"""
-        def func():
-            from fnt.sleapProcessing.batch_video_inference_only import main
-            main()
-        self.run_function_safely(func, "SLEAP Inference Only")
+        """Launch SLEAP inference only with PyQt interface"""
+        try:
+            from fnt.sleapProcessing.batch_video_inference_only_pyqt import VideoInferenceWindow
+            
+            # Create and show the video inference window
+            self.video_inference_window = VideoInferenceWindow()
+            self.video_inference_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch video inference tool: {str(e)}")
     
     def run_sleap_convert(self):
         """Launch SLEAP file conversion"""
