@@ -18,11 +18,10 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
         QGridLayout, QPushButton, QLabel, QSpinBox, QCheckBox, QComboBox,
         QFileDialog, QMessageBox, QProgressBar, QTextEdit, QGroupBox,
-        QFrame, QSizePolicy, QScrollArea, QDialog, QTreeView, QDialogButtonBox,
-        QFileSystemModel
+        QFrame, QSizePolicy, QScrollArea
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDir
-    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QStandardItemModel, QStandardItem
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -129,82 +128,29 @@ class VideoProcessorWorker(QThread):
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(video_file, output_file)
             
-            # Run FFmpeg in a separate visible command window
-            # On Windows, use CREATE_NEW_CONSOLE to show FFmpeg progress in its own window
-            import platform
-            if platform.system() == "Windows":
-                # Create a batch file to run FFmpeg and keep window open
-                batch_content = f'''@echo off
-title Video Processing #{self.instance_id} - {video_filename}
-color 0A
-echo ============================================================
-echo   FieldNeuroToolbox - Video Processing Instance #{self.instance_id}
-echo ============================================================
-echo.
-echo Processing: {video_filename}
-echo Output directory: {out_dir}
-echo.
-echo Starting FFmpeg processing...
-echo ============================================================
-echo.
-"{'" "'.join(cmd)}"
-echo.
-echo ============================================================
-if %ERRORLEVEL% EQU 0 (
-    echo ✅ SUCCESS: Video processed successfully!
-    color 0A
-) else (
-    echo ❌ ERROR: Processing failed with code %ERRORLEVEL%
-    color 0C
-)
-echo ============================================================
-echo.
-echo Processing completed. Press any key to close this window.
-pause >nul
-'''
-                batch_file = os.path.join(out_dir, f"ffmpeg_process_{file_index}.bat")
-                with open(batch_file, 'w') as f:
-                    f.write(batch_content)
-                
-                # Run the batch file in a new console window
-                process = subprocess.Popen(
-                    ["cmd", "/c", "start", "/wait", "cmd", "/k", batch_file],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
-            else:
-                # For non-Windows systems, run normally
-                process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
-                    text=True,
-                    universal_newlines=True,
-                    bufsize=1
-                )
+            # Run FFmpeg and capture output for GUI display
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True,
+                universal_newlines=True,
+                bufsize=1
+            )
             
-            # Wait for process completion
-            if platform.system() == "Windows":
-                process.wait()
-                # Clean up batch file
-                try:
-                    os.remove(batch_file)
-                except:
-                    pass
-                success = process.returncode == 0
-            else:
-                # Monitor process output for non-Windows systems
-                for line in process.stdout:
-                    if self.should_stop:
-                        process.terminate()
-                        return False
-                    
-                    # Send FFmpeg output to GUI
-                    line = line.strip()
-                    if line:  # Only send non-empty lines
-                        self.ffmpeg_output.emit(line)
+            # Monitor process output and stream to GUI
+            for line in process.stdout:
+                if self.should_stop:
+                    process.terminate()
+                    return False
                 
-                process.wait()
-                success = process.returncode == 0
+                # Send FFmpeg output to GUI
+                line = line.strip()
+                if line:  # Only send non-empty lines
+                    self.ffmpeg_output.emit(line)
+            
+            process.wait()
+            success = process.returncode == 0
             
             if success:
                 self.progress_update.emit(f"✅ Completed: {video_filename}")
@@ -493,9 +439,8 @@ class VideoProcessingGUI(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
         
-        self.add_dir_btn = QPushButton("Add Directories")
+        self.add_dir_btn = QPushButton("Add Folder")
         self.add_dir_btn.clicked.connect(self.add_directory)
-        self.add_dir_btn.setToolTip("Select multiple directories at once using Ctrl/Cmd + click")
         button_layout.addWidget(self.add_dir_btn)
         
         self.clear_dirs_btn = QPushButton("Clear All")
@@ -697,103 +642,18 @@ class VideoProcessingGUI(QMainWindow):
         layout.addWidget(group)
     
     def add_directory(self):
-        """Add directories to the processing list with multi-selection support"""
-        # Create a custom dialog for multi-directory selection
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Multiple Directories with Video Files")
-        dialog.setModal(True)
-        dialog.resize(600, 500)
+        """Add a directory to the processing list"""
+        directory = QFileDialog.getExistingDirectory(
+            self, 
+            "Select Directory with Video Files",
+            "", 
+            QFileDialog.ShowDirsOnly
+        )
         
-        # Apply consistent dark theme styling
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #cccccc;
-            }
-            QTreeView {
-                background-color: #3c3c3c;
-                color: #cccccc;
-                border: 1px solid #555555;
-                selection-background-color: #0078d4;
-            }
-            QTreeView::item:hover {
-                background-color: #404040;
-            }
-            QTreeView::item:selected {
-                background-color: #0078d4;
-                color: white;
-            }
-            QLabel {
-                color: #cccccc;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-        """)
-        
-        layout = QVBoxLayout()
-        
-        # Instructions
-        instructions = QLabel("Hold Ctrl/Cmd to select multiple directories:")
-        instructions.setStyleSheet("font-weight: bold; color: #0078d4; margin-bottom: 10px;")
-        layout.addWidget(instructions)
-        
-        # File system tree view
-        tree_view = QTreeView()
-        tree_view.setSelectionMode(QTreeView.MultiSelection)
-        
-        # Use QFileSystemModel for directory browsing
-        model = QFileSystemModel()
-        model.setRootPath(QDir.rootPath())
-        model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
-        
-        tree_view.setModel(model)
-        tree_view.setRootIndex(model.index(QDir.homePath()))
-        tree_view.hideColumn(1)  # Hide size column
-        tree_view.hideColumn(2)  # Hide type column  
-        tree_view.hideColumn(3)  # Hide date column
-        tree_view.expandToDepth(1)  # Expand one level
-        
-        layout.addWidget(tree_view)
-        
-        # Button box
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
-        
-        dialog.setLayout(layout)
-        
-        # Show dialog and get results
-        if dialog.exec_() == QDialog.Accepted:
-            selected_indexes = tree_view.selectionModel().selectedIndexes()
-            new_directories = []
-            
-            for index in selected_indexes:
-                if index.column() == 0:  # Only process first column to avoid duplicates
-                    directory_path = model.filePath(index)
-                    if directory_path and directory_path not in self.selected_dirs:
-                        new_directories.append(directory_path)
-            
-            if new_directories:
-                self.selected_dirs.extend(new_directories)
-                self.update_directory_display()
-                self.start_btn.setEnabled(len(self.selected_dirs) > 0)
-                
-                # Show confirmation
-                QMessageBox.information(
-                    self, 
-                    "Directories Added", 
-                    f"Added {len(new_directories)} director{'y' if len(new_directories) == 1 else 'ies'} to processing list."
-                )
+        if directory and directory not in self.selected_dirs:
+            self.selected_dirs.append(directory)
+            self.update_directory_display()
+            self.start_btn.setEnabled(len(self.selected_dirs) > 0)
     
     def clear_directories(self):
         """Clear all selected directories"""
