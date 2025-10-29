@@ -26,7 +26,7 @@ try:
         QScrollArea, QSizePolicy, QFileDialog, QInputDialog
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -66,6 +66,17 @@ class FNTMainWindow(QMainWindow):
         self.setWindowTitle("FieldNeuroToolbox (FNT) v0.1")
         self.setGeometry(100, 100, 1000, 700)
         self.setMinimumSize(800, 600)
+        
+        # Set window icon (check multiple possible locations)
+        icon_paths = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
+            os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
+        ]
+        
+        for icon_path in icon_paths:
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                break
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -189,22 +200,46 @@ class FNTMainWindow(QMainWindow):
         header_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
         header_frame.setStyleSheet("background-color: #1e1e1e; padding: 10px; border: 1px solid #3f3f3f;")
         
-        header_layout = QVBoxLayout()
+        header_layout = QHBoxLayout()
         header_frame.setLayout(header_layout)
         
-        # Title
+        # Logo/Icon on the left
+        logo_label = QLabel()
+        icon_paths = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
+            os.path.join(os.path.dirname(__file__), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
+        ]
+        
+        for icon_path in icon_paths:
+            if os.path.exists(icon_path):
+                pixmap = QPixmap(icon_path)
+                # Scale to reasonable size while maintaining aspect ratio
+                scaled_pixmap = pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                logo_label.setPixmap(scaled_pixmap)
+                break
+        
+        logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_layout.addWidget(logo_label)
+        
+        # Title and subtitle in the center
+        text_layout = QVBoxLayout()
+        
         title = QLabel("FieldNeuroToolbox")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 20, QFont.Bold))
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
-        header_layout.addWidget(title)
+        text_layout.addWidget(title)
         
         # Subtitle
         subtitle = QLabel("Preprocessing and analysis toolbox for neurobehavioral data")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 11))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
-        header_layout.addWidget(subtitle)
+        text_layout.addWidget(subtitle)
+        
+        # Add text layout to header
+        header_layout.addLayout(text_layout)
+        header_layout.addStretch()
         
         layout.addWidget(header_frame)
     
@@ -254,8 +289,7 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
-            ("Video Inference Only", "Run SLEAP inference without tracking", self.run_sleap_inference_only),
-            ("Video Inference + Tracking", "Run full SLEAP pipeline on videos", self.run_sleap_inference_track),
+            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
             ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
             ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
         ]
@@ -518,21 +552,19 @@ class FNTMainWindow(QMainWindow):
         try:
             from fnt.videoProcessing.videoProcessing import VideoProcessingGUI
             
-            # Create and show the video processing window
-            self.video_processing_window = VideoProcessingGUI()
-            self.video_processing_window.show()
+            # Create a new instance each time to allow multiple windows
+            video_processing_window = VideoProcessingGUI()
+            video_processing_window.show()
+            
+            # Store reference to prevent garbage collection (use list to allow multiple instances)
+            if not hasattr(self, 'video_processing_windows'):
+                self.video_processing_windows = []
+            self.video_processing_windows.append(video_processing_window)
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video processing tool: {str(e)}")
     
-    # SLEAP Processing Methods - Call existing tkinter functions
-    def run_sleap_inference_track(self):
-        """Launch SLEAP inference and tracking"""
-        def func():
-            from fnt.sleapProcessing.batch_video_inference_and_track import main
-            main()
-        self.run_function_safely(func, "SLEAP Inference + Tracking")
-    
+    # SLEAP Processing Methods
     def run_sleap_inference_only(self):
         """Launch SLEAP inference only with PyQt interface"""
         try:
@@ -1058,12 +1090,31 @@ def main():
         print("Error: PyQt5 is not available. Please install it with: pip install PyQt5")
         return
     
+    # Windows taskbar icon fix - must be set before creating QApplication
+    try:
+        import ctypes
+        myappid = 'fnt.fieldneurotoolbox.gui.01'  # arbitrary string
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except:
+        pass
+    
     app = QApplication(sys.argv)
     
     # Set application properties
     app.setApplicationName("FieldNeuroToolbox")
     app.setApplicationVersion("0.1")
     app.setOrganizationName("FNT")
+    
+    # Set application icon (check multiple possible locations)
+    icon_paths = [
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
+        os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
+    ]
+    
+    for icon_path in icon_paths:
+        if os.path.exists(icon_path):
+            app.setWindowIcon(QIcon(icon_path))
+            break
     
     # Create and show main window
     window = FNTMainWindow()

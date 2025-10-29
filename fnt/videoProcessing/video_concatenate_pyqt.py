@@ -16,7 +16,8 @@ try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
         QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox, 
-        QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit
+        QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit,
+        QComboBox
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal
     from PyQt5.QtGui import QFont
@@ -34,15 +35,47 @@ class ConcatenationWorker(QThread):
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
-    def __init__(self, input_dirs, output_filename):
+    def __init__(self, input_dirs, output_filename, sort_order="default"):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
+        self.sort_order = sort_order
         self.should_stop = False
     
     def stop(self):
         """Stop the processing"""
         self.should_stop = True
+    
+    def sort_viewtron_files(self, video_files):
+        """
+        Sort ViewTron DVR files in chronological order.
+        ViewTron naming: Base_YYYYMMDDHHMMSS.ext, then Base_YYYYMMDDHHMMSS(001).ext, etc.
+        """
+        import re
+        
+        def viewtron_sort_key(filepath):
+            filename = os.path.basename(filepath)
+            
+            # Pattern: extract timestamp and sequence number
+            # Matches: YYYYMMDDHHMMSS_suffix.ext or YYYYMMDDHHMMSS(NNN)_suffix.ext
+            match = re.search(r'_(\d{14})(?:\((\d+)\))?', filename)
+            
+            if match:
+                timestamp = match.group(1)  # YYYYMMDDHHMMSS
+                sequence = match.group(2)    # Optional (NNN)
+                
+                # Files without (NNN) come before files with (NNN)
+                if sequence is None:
+                    sequence = -1  # Base file comes first
+                else:
+                    sequence = int(sequence)
+                
+                return (timestamp, sequence)
+            else:
+                # Fallback for files that don't match pattern
+                return (filename, 0)
+        
+        return sorted(video_files, key=viewtron_sort_key)
     
     def run(self):
         """Main processing function"""
@@ -84,13 +117,20 @@ class ConcatenationWorker(QThread):
             # Video extensions to look for
             VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".MP4", ".mkv", ".flv", ".wmv", ".m4v")
             
-            # Find all video files
-            video_files = []
+            # Find all video files (use set to avoid duplicates from case-insensitive filesystems)
+            video_files_set = set()
             for ext in VIDEO_EXTENSIONS:
-                video_files.extend(glob.glob(os.path.join(folder_path, f"*{ext}")))
+                found_files = glob.glob(os.path.join(folder_path, f"*{ext}"))
+                video_files_set.update(found_files)
             
-            # Sort files
-            video_files = sorted(video_files)
+            # Convert back to list
+            video_files = list(video_files_set)
+            
+            # Sort files based on selected order
+            if self.sort_order == "viewtron":
+                video_files = self.sort_viewtron_files(video_files)
+            else:
+                video_files = sorted(video_files)
             
             if not video_files:
                 self.progress_update.emit(f"⚠️ No video files found in {os.path.basename(folder_path)}")
@@ -118,14 +158,22 @@ class ConcatenationWorker(QThread):
                     counter += 1
                 self.progress_update.emit(f"Output file exists, using: {os.path.basename(output_file)}")
             
-            # FFmpeg command
+            # SLEAP-compatible FFmpeg command for precise frame handling
             command = [
                 "ffmpeg", "-y",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
-                "-c", "copy",
-                "-movflags", "+faststart",  # Better streaming support
+                # SLEAP-compatible encoding instead of copy
+                "-c:v", "libx264",                   # Re-encode for consistency
+                "-preset", "medium",                 # Balance speed/quality
+                "-crf", "18",                        # High quality
+                "-pix_fmt", "yuv420p",              # Standard pixel format
+                "-movflags", "+faststart",           # Move moov atom to beginning
+                "-avoid_negative_ts", "make_zero",   # Fix timestamp issues
+                "-fflags", "+genpts",                # Generate presentation timestamps
+                "-vsync", "vfr",                     # Variable frame rate (preserves timing)
+                "-an",                               # Remove audio to avoid sync issues
                 output_file
             ]
             
@@ -185,13 +233,18 @@ class VideoConcatenationGUI(QMainWindow):
         self.setGeometry(200, 200, 900, 700)
         self.setMinimumSize(700, 600)
         
-        # Set application style
+        # Set application style - Dark Mode
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #f5f5f5;
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
             }
             QPushButton {
-                background-color: #007acc;
+                background-color: #0078d4;
                 color: white;
                 border: none;
                 padding: 8px 16px;
@@ -200,21 +253,22 @@ class VideoConcatenationGUI(QMainWindow):
                 min-height: 20px;
             }
             QPushButton:hover {
-                background-color: #005a9e;
+                background-color: #106ebe;
             }
             QPushButton:pressed {
-                background-color: #004578;
+                background-color: #005a9e;
             }
             QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
+                background-color: #3f3f3f;
+                color: #888888;
             }
             QGroupBox {
                 font-weight: bold;
-                border: 2px solid #c0c0c0;
-                border-radius: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
                 margin-top: 10px;
-                padding-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -222,12 +276,38 @@ class VideoConcatenationGUI(QMainWindow):
                 padding: 0 5px 0 5px;
             }
             QLabel {
-                color: #333333;
+                color: #cccccc;
+                background-color: transparent;
             }
             QLineEdit {
                 padding: 5px;
-                border: 1px solid #cccccc;
+                border: 1px solid #3f3f3f;
                 border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QTextEdit {
+                background-color: #1e1e1e;
+                border: 1px solid #3f3f3f;
+                color: #cccccc;
+            }
+            QProgressBar {
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+            }
+            QScrollArea {
+                border: none;
+                background-color: #2b2b2b;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+                border-color: #3f3f3f;
             }
         """)
         
@@ -267,7 +347,7 @@ class VideoConcatenationGUI(QMainWindow):
         """Create header section"""
         header_frame = QFrame()
         header_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        header_frame.setStyleSheet("background-color: white; padding: 15px;")
+        header_frame.setStyleSheet("background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f;")
         
         header_layout = QVBoxLayout()
         header_frame.setLayout(header_layout)
@@ -275,13 +355,13 @@ class VideoConcatenationGUI(QMainWindow):
         title = QLabel("Video Concatenation Tool")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 18, QFont.Bold))
-        title.setStyleSheet("color: #007acc;")
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
         header_layout.addWidget(title)
         
         subtitle = QLabel("Join multiple video files together using FFmpeg concat")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
-        subtitle.setStyleSheet("color: #666666; font-style: italic;")
+        subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         header_layout.addWidget(subtitle)
         
         layout.addWidget(header_frame)
@@ -294,12 +374,12 @@ class VideoConcatenationGUI(QMainWindow):
         # Instructions
         instructions = QLabel("Select directories containing video files to concatenate (.mp4, .avi, .mov, .mkv, etc.)\nVideos in each directory will be concatenated into a single output file.")
         instructions.setWordWrap(True)
-        instructions.setStyleSheet("color: #666666; margin-bottom: 10px;")
+        instructions.setStyleSheet("color: #999999; margin-bottom: 10px;")
         group_layout.addWidget(instructions)
         
         # Directory list display
         self.dir_list_label = QLabel("No directories selected")
-        self.dir_list_label.setStyleSheet("border: 1px solid #cccccc; padding: 10px; background-color: white; min-height: 60px;")
+        self.dir_list_label.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 60px; color: #cccccc;")
         self.dir_list_label.setWordWrap(True)
         group_layout.addWidget(self.dir_list_label)
         
@@ -323,21 +403,35 @@ class VideoConcatenationGUI(QMainWindow):
     def create_output_options(self, layout):
         """Create output filename options section"""
         group = QGroupBox("Output Options")
-        group_layout = QHBoxLayout()
+        group_layout = QGridLayout()
         
-        group_layout.addWidget(QLabel("Output Filename:"))
+        # Row 0: Output filename
+        group_layout.addWidget(QLabel("Output Filename:"), 0, 0)
         
         self.output_filename_edit = QLineEdit()
         self.output_filename_edit.setText("concatenated_output.mp4")
         self.output_filename_edit.setPlaceholderText("Enter output filename...")
         self.output_filename_edit.setToolTip("Filename for the concatenated video (saved in each directory)")
-        group_layout.addWidget(self.output_filename_edit)
+        group_layout.addWidget(self.output_filename_edit, 0, 1)
         
         info_label = QLabel("💡 Files saved in each selected directory")
-        info_label.setStyleSheet("color: #666666; font-style: italic;")
-        group_layout.addWidget(info_label)
+        info_label.setStyleSheet("color: #999999; font-style: italic;")
+        group_layout.addWidget(info_label, 0, 2)
         
-        group_layout.addStretch()
+        # Row 1: Sort order
+        group_layout.addWidget(QLabel("Sort Order:"), 1, 0)
+        
+        self.sort_order_combo = QComboBox()
+        self.sort_order_combo.addItems(["Default (Alphabetical)", "ViewTron DVR (Chronological)"])
+        self.sort_order_combo.setCurrentIndex(0)
+        self.sort_order_combo.setToolTip("How to order videos for concatenation:\n• Default: Standard alphabetical sorting\n• ViewTron DVR: Handles ViewTron naming (YYYYMMDDHHMMSS, then YYYYMMDDHHMMSS(001), etc.)")
+        group_layout.addWidget(self.sort_order_combo, 1, 1)
+        
+        sort_info_label = QLabel("ℹ️ Choose ViewTron for DVR recordings")
+        sort_info_label.setStyleSheet("color: #999999; font-style: italic;")
+        group_layout.addWidget(sort_info_label, 1, 2)
+        
+        group_layout.setColumnStretch(1, 1)
         
         group.setLayout(group_layout)
         layout.addWidget(group)
@@ -379,24 +473,24 @@ class VideoConcatenationGUI(QMainWindow):
         
         # Status log
         status_label = QLabel("Status Log:")
-        status_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(status_label)
         
         self.status_log = QTextEdit()
         self.status_log.setMaximumHeight(100)
         self.status_log.setReadOnly(True)
-        self.status_log.setStyleSheet("background-color: #f8f8f8; border: 1px solid #cccccc;")
+        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
         group_layout.addWidget(self.status_log)
         
         # FFmpeg output log
         ffmpeg_label = QLabel("FFmpeg Output:")
-        ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(ffmpeg_label)
         
         self.ffmpeg_log = QTextEdit()
         self.ffmpeg_log.setMaximumHeight(150)
         self.ffmpeg_log.setReadOnly(True)
-        self.ffmpeg_log.setStyleSheet("background-color: #f0f0f0; border: 1px solid #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
+        self.ffmpeg_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
         group_layout.addWidget(self.ffmpeg_log)
         
         group.setLayout(group_layout)
@@ -456,14 +550,18 @@ class VideoConcatenationGUI(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
+        # Get sort order
+        sort_order = "viewtron" if self.sort_order_combo.currentIndex() == 1 else "default"
+        
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
         self.log_message("Starting video concatenation...")
         self.log_message(f"Output filename: {output_filename}")
+        self.log_message(f"Sort order: {self.sort_order_combo.currentText()}")
         
         # Start worker thread
-        self.worker = ConcatenationWorker(self.selected_dirs, output_filename)
+        self.worker = ConcatenationWorker(self.selected_dirs, output_filename, sort_order)
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)

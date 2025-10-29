@@ -18,10 +18,11 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
         QGridLayout, QPushButton, QLabel, QSpinBox, QCheckBox, QComboBox,
         QFileDialog, QMessageBox, QProgressBar, QTextEdit, QGroupBox,
-        QFrame, QSizePolicy, QScrollArea
+        QFrame, QSizePolicy, QScrollArea, QDialog, QTreeView, QDialogButtonBox,
+        QFileSystemModel
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDir
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QStandardItemModel, QStandardItem
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -37,7 +38,7 @@ class VideoProcessorWorker(QThread):
     finished = pyqtSignal(bool, str)  # success, final message
     
     def __init__(self, input_dirs, frame_rate, grayscale, apply_clahe, 
-                 remove_audio, output_format, crf_quality, resolution, codec, preset):
+                 remove_audio, output_format, crf_quality, resolution, codec, preset, instance_id=1):
         super().__init__()
         self.input_dirs = input_dirs
         self.frame_rate = frame_rate
@@ -49,6 +50,7 @@ class VideoProcessorWorker(QThread):
         self.resolution = resolution
         self.codec = codec
         self.preset = preset
+        self.instance_id = instance_id
         self.should_stop = False
     
     def stop(self):
@@ -99,7 +101,7 @@ class VideoProcessorWorker(QThread):
                         self.file_progress.emit(processed_files, total_files)
                         
                         # Process individual file
-                        success = self.process_single_file(video_file, out_dir)
+                        success = self.process_single_file(video_file, out_dir, processed_files)
                         if not success and not self.should_stop:
                             self.finished.emit(False, f"Failed to process: {os.path.basename(video_file)}")
                             return
@@ -112,7 +114,7 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"Error during processing: {str(e)}")
     
-    def process_single_file(self, video_file, out_dir):
+    def process_single_file(self, video_file, out_dir, file_index):
         """Process a single video file"""
         try:
             # Get filename without extension
@@ -127,30 +129,84 @@ class VideoProcessorWorker(QThread):
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(video_file, output_file)
             
-            # Run FFmpeg
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True,
-                universal_newlines=True,
-                bufsize=1
-            )
-            
-            # Monitor process output and stream to GUI
-            for line in process.stdout:
-                if self.should_stop:
-                    process.terminate()
-                    return False
+            # Run FFmpeg in a separate visible command window
+            # On Windows, use CREATE_NEW_CONSOLE to show FFmpeg progress in its own window
+            import platform
+            if platform.system() == "Windows":
+                # Create a batch file to run FFmpeg and keep window open
+                batch_content = f'''@echo off
+title Video Processing #{self.instance_id} - {video_filename}
+color 0A
+echo ============================================================
+echo   FieldNeuroToolbox - Video Processing Instance #{self.instance_id}
+echo ============================================================
+echo.
+echo Processing: {video_filename}
+echo Output directory: {out_dir}
+echo.
+echo Starting FFmpeg processing...
+echo ============================================================
+echo.
+"{'" "'.join(cmd)}"
+echo.
+echo ============================================================
+if %ERRORLEVEL% EQU 0 (
+    echo ✅ SUCCESS: Video processed successfully!
+    color 0A
+) else (
+    echo ❌ ERROR: Processing failed with code %ERRORLEVEL%
+    color 0C
+)
+echo ============================================================
+echo.
+echo Processing completed. Press any key to close this window.
+pause >nul
+'''
+                batch_file = os.path.join(out_dir, f"ffmpeg_process_{file_index}.bat")
+                with open(batch_file, 'w') as f:
+                    f.write(batch_content)
                 
-                # Send FFmpeg output to GUI
-                line = line.strip()
-                if line:  # Only send non-empty lines
-                    self.ffmpeg_output.emit(line)
+                # Run the batch file in a new console window
+                process = subprocess.Popen(
+                    ["cmd", "/c", "start", "/wait", "cmd", "/k", batch_file],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+            else:
+                # For non-Windows systems, run normally
+                process = subprocess.Popen(
+                    cmd, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.STDOUT, 
+                    text=True,
+                    universal_newlines=True,
+                    bufsize=1
+                )
             
-            process.wait()
+            # Wait for process completion
+            if platform.system() == "Windows":
+                process.wait()
+                # Clean up batch file
+                try:
+                    os.remove(batch_file)
+                except:
+                    pass
+                success = process.returncode == 0
+            else:
+                # Monitor process output for non-Windows systems
+                for line in process.stdout:
+                    if self.should_stop:
+                        process.terminate()
+                        return False
+                    
+                    # Send FFmpeg output to GUI
+                    line = line.strip()
+                    if line:  # Only send non-empty lines
+                        self.ffmpeg_output.emit(line)
+                
+                process.wait()
+                success = process.returncode == 0
             
-            if process.returncode == 0:
+            if success:
                 self.progress_update.emit(f"✅ Completed: {video_filename}")
                 return True
             else:
@@ -162,7 +218,7 @@ class VideoProcessorWorker(QThread):
             return False
     
     def build_ffmpeg_command(self, input_file, output_file):
-        """Build the FFmpeg command based on user settings"""
+        """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""
         
         # Get resolution dimensions
         if self.resolution == "1080p":
@@ -170,7 +226,7 @@ class VideoProcessorWorker(QThread):
         else:  # 720p
             width, height = 1280, 720
         
-        # Build FFmpeg command with user-selected codec and preset
+        # Build FFmpeg command with SLEAP-compatible settings
         cmd = [
             "ffmpeg", "-y",                      # Overwrite output files
             "-i", input_file,
@@ -178,9 +234,15 @@ class VideoProcessorWorker(QThread):
             "-preset", self.preset,              # User-selected speed preset
             "-crf", str(self.crf_quality),       # Quality (0-51): lower is better
             "-pix_fmt", "yuv420p",
-            "-r", str(self.frame_rate),
-            "-vsync", "cfr",                     # Constant frame rate
         ]
+        
+        # SLEAP-compatible frame rate handling
+        if self.frame_rate < 30:  # Only downsample if requested rate is lower
+            # Use fps filter for precise frame selection instead of -r
+            video_filters = [f"fps={self.frame_rate}"]
+        else:
+            # Keep original frame rate for high frame rates
+            video_filters = []
         
         # Add audio option
         if self.remove_audio:
@@ -188,16 +250,20 @@ class VideoProcessorWorker(QThread):
         else:
             cmd.extend(["-c:a", "aac", "-b:a", "128k"])  # Keep audio with AAC codec
         
-        # Add faststart for better streaming
-        cmd.extend(["-movflags", "+faststart"])
-        cmd.extend(["-max_muxing_queue_size", "10000000"])
-        
-        # Build video filter for scaling, grayscale, and contrast enhancement
-        video_filters = []
+        # SLEAP-compatible settings for better frame handling
+        cmd.extend([
+            "-movflags", "+faststart",           # Move moov atom to beginning
+            "-avoid_negative_ts", "make_zero",   # Fix timestamp issues
+            "-max_muxing_queue_size", "10000000",
+            "-fflags", "+genpts",                # Generate presentation timestamps
+            "-vsync", "vfr"                      # Variable frame rate (preserves timing)
+        ])
         
         # Scaling and padding
-        video_filters.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame")
-        video_filters.append(f"pad={width}:{height}:-1:-1:color=black")
+        video_filters.extend([
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame",
+            f"pad={width}:{height}:-1:-1:color=black"
+        ])
         
         # CONTRAST ENHANCEMENT - COMMENTED OUT FOR NOW
         # Can be re-enabled later if needed
@@ -226,25 +292,38 @@ class VideoProcessorWorker(QThread):
 class VideoProcessingGUI(QMainWindow):
     """Main GUI window for combined video processing"""
     
+    # Class variable to track instance count
+    instance_count = 0
+    
     def __init__(self):
         super().__init__()
+        
+        # Increment instance counter and set unique ID
+        VideoProcessingGUI.instance_count += 1
+        self.instance_id = VideoProcessingGUI.instance_count
+        
         self.selected_dirs = []
         self.worker = None
         self.init_ui()
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("Video PreProcessing Tool - FieldNeuroToolbox")
-        self.setGeometry(200, 200, 900, 700)
+        self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroToolbox")
+        self.setGeometry(200 + (self.instance_id - 1) * 50, 200 + (self.instance_id - 1) * 50, 900, 700)
         self.setMinimumSize(700, 600)
         
-        # Set application style
+        # Set application style - Dark Mode
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #f5f5f5;
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
             }
             QPushButton {
-                background-color: #007acc;
+                background-color: #0078d4;
                 color: white;
                 border: none;
                 padding: 8px 16px;
@@ -253,21 +332,22 @@ class VideoProcessingGUI(QMainWindow):
                 min-height: 20px;
             }
             QPushButton:hover {
-                background-color: #005a9e;
+                background-color: #106ebe;
             }
             QPushButton:pressed {
-                background-color: #004578;
+                background-color: #005a9e;
             }
             QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
+                background-color: #3f3f3f;
+                color: #888888;
             }
             QGroupBox {
                 font-weight: bold;
-                border: 2px solid #c0c0c0;
-                border-radius: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
                 margin-top: 10px;
-                padding-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -275,12 +355,66 @@ class VideoProcessingGUI(QMainWindow):
                 padding: 0 5px 0 5px;
             }
             QLabel {
-                color: #333333;
+                color: #cccccc;
+                background-color: transparent;
             }
             QSpinBox, QComboBox {
                 padding: 5px;
-                border: 1px solid #cccccc;
+                border: 1px solid #3f3f3f;
                 border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #3f3f3f;
+                border: 1px solid #3f3f3f;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #0078d4;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3f3f3f;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #cccccc;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                selection-background-color: #0078d4;
+                border: 1px solid #3f3f3f;
+            }
+            QCheckBox {
+                color: #cccccc;
+                spacing: 8px;
+            }
+            QTextEdit {
+                background-color: #1e1e1e;
+                border: 1px solid #3f3f3f;
+                color: #cccccc;
+            }
+            QProgressBar {
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+            }
+            QScrollArea {
+                border: none;
+                background-color: #2b2b2b;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+                border-color: #3f3f3f;
             }
         """)
         
@@ -320,21 +454,21 @@ class VideoProcessingGUI(QMainWindow):
         """Create header section"""
         header_frame = QFrame()
         header_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        header_frame.setStyleSheet("background-color: white; padding: 15px;")
+        header_frame.setStyleSheet("background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f;")
         
         header_layout = QVBoxLayout()
         header_frame.setLayout(header_layout)
         
-        title = QLabel("Video PreProcessing Tool")
+        title = QLabel(f"Video PreProcessing Tool #{self.instance_id}")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 18, QFont.Bold))
-        title.setStyleSheet("color: #007acc;")
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
         header_layout.addWidget(title)
         
         subtitle = QLabel("Comprehensive video preprocessing with downsampling, re-encoding, and format conversion")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
-        subtitle.setStyleSheet("color: #666666; font-style: italic;")
+        subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         header_layout.addWidget(subtitle)
         
         layout.addWidget(header_frame)
@@ -347,20 +481,21 @@ class VideoProcessingGUI(QMainWindow):
         # Instructions
         instructions = QLabel("Select directories containing video files (.avi, .mp4, .mov, .mkv, .webm, .flv, .wmv, .m4v)")
         instructions.setWordWrap(True)
-        instructions.setStyleSheet("color: #666666; margin-bottom: 10px;")
+        instructions.setStyleSheet("color: #999999; margin-bottom: 10px;")
         group_layout.addWidget(instructions)
         
         # Directory list display
         self.dir_list_label = QLabel("No directories selected")
-        self.dir_list_label.setStyleSheet("border: 1px solid #cccccc; padding: 10px; background-color: white; min-height: 60px;")
+        self.dir_list_label.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 60px; color: #cccccc;")
         self.dir_list_label.setWordWrap(True)
         group_layout.addWidget(self.dir_list_label)
         
         # Buttons
         button_layout = QHBoxLayout()
         
-        self.add_dir_btn = QPushButton("Add Directory")
+        self.add_dir_btn = QPushButton("Add Directories")
         self.add_dir_btn.clicked.connect(self.add_directory)
+        self.add_dir_btn.setToolTip("Select multiple directories at once using Ctrl/Cmd + click")
         button_layout.addWidget(self.add_dir_btn)
         
         self.clear_dirs_btn = QPushButton("Clear All")
@@ -425,12 +560,13 @@ class VideoProcessingGUI(QMainWindow):
         self.advanced_btn.clicked.connect(self.toggle_advanced_options)
         self.advanced_btn.setStyleSheet("""
             QPushButton {
-                background-color: #6c757d;
+                background-color: #3f3f3f;
+                color: #cccccc;
                 text-align: left;
                 padding-left: 10px;
             }
             QPushButton:hover {
-                background-color: #5a6268;
+                background-color: #4f4f4f;
             }
         """)
         group_layout.addWidget(self.advanced_btn, row, 0, 1, 2)
@@ -439,7 +575,7 @@ class VideoProcessingGUI(QMainWindow):
         # Advanced options frame (initially hidden)
         self.advanced_frame = QFrame()
         self.advanced_frame.setVisible(False)
-        self.advanced_frame.setStyleSheet("QFrame { border: 1px solid #cccccc; background-color: #f9f9f9; padding: 10px; }")
+        self.advanced_frame.setStyleSheet("QFrame { border: 1px solid #3f3f3f; background-color: #1e1e1e; padding: 10px; }")
         advanced_layout = QGridLayout()
         self.advanced_frame.setLayout(advanced_layout)
         
@@ -466,7 +602,7 @@ class VideoProcessingGUI(QMainWindow):
         advanced_layout.addWidget(QLabel("CRF Quality:"), 2, 0)
         self.crf_combo = QComboBox()
         self.crf_combo.addItems(["10 (Best)", "15 (High)", "20 (Good)", "25 (Medium)", "30 (Low)"])
-        self.crf_combo.setCurrentText("20 (Good)")
+        self.crf_combo.setCurrentText("25 (Medium)")
         self.crf_combo.setToolTip("Lower values = better quality but larger file size. CRF 15 is near-lossless.")
         advanced_layout.addWidget(self.crf_combo, 2, 1)
         
@@ -483,7 +619,7 @@ class VideoProcessingGUI(QMainWindow):
         
         # Output info
         info_label = QLabel("Videos saved to 'proc' subfolder in each input directory")
-        info_label.setStyleSheet("color: #666666; font-style: italic; margin-top: 10px;")
+        info_label.setStyleSheet("color: #999999; font-style: italic; margin-top: 10px;")
         info_label.setWordWrap(True)
         group_layout.addWidget(info_label, row, 0, 1, 2)
         
@@ -537,42 +673,127 @@ class VideoProcessingGUI(QMainWindow):
         
         # Status log
         status_label = QLabel("Status Log:")
-        status_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(status_label)
         
         self.status_log = QTextEdit()
         self.status_log.setMaximumHeight(100)
         self.status_log.setReadOnly(True)
-        self.status_log.setStyleSheet("background-color: #f8f8f8; border: 1px solid #cccccc;")
+        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
         group_layout.addWidget(self.status_log)
         
         # FFmpeg output log
         ffmpeg_label = QLabel("FFmpeg Output:")
-        ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(ffmpeg_label)
         
         self.ffmpeg_log = QTextEdit()
         self.ffmpeg_log.setMaximumHeight(150)
         self.ffmpeg_log.setReadOnly(True)
-        self.ffmpeg_log.setStyleSheet("background-color: #f0f0f0; border: 1px solid #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
+        self.ffmpeg_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
         group_layout.addWidget(self.ffmpeg_log)
         
         group.setLayout(group_layout)
         layout.addWidget(group)
     
     def add_directory(self):
-        """Add a directory to the processing list"""
-        directory = QFileDialog.getExistingDirectory(
-            self, 
-            "Select Directory with Video Files",
-            "", 
-            QFileDialog.ShowDirsOnly
-        )
+        """Add directories to the processing list with multi-selection support"""
+        # Create a custom dialog for multi-directory selection
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Multiple Directories with Video Files")
+        dialog.setModal(True)
+        dialog.resize(600, 500)
         
-        if directory and directory not in self.selected_dirs:
-            self.selected_dirs.append(directory)
-            self.update_directory_display()
-            self.start_btn.setEnabled(len(self.selected_dirs) > 0)
+        # Apply consistent dark theme styling
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QTreeView {
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 1px solid #555555;
+                selection-background-color: #0078d4;
+            }
+            QTreeView::item:hover {
+                background-color: #404040;
+            }
+            QTreeView::item:selected {
+                background-color: #0078d4;
+                color: white;
+            }
+            QLabel {
+                color: #cccccc;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel("Hold Ctrl/Cmd to select multiple directories:")
+        instructions.setStyleSheet("font-weight: bold; color: #0078d4; margin-bottom: 10px;")
+        layout.addWidget(instructions)
+        
+        # File system tree view
+        tree_view = QTreeView()
+        tree_view.setSelectionMode(QTreeView.MultiSelection)
+        
+        # Use QFileSystemModel for directory browsing
+        model = QFileSystemModel()
+        model.setRootPath(QDir.rootPath())
+        model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
+        
+        tree_view.setModel(model)
+        tree_view.setRootIndex(model.index(QDir.homePath()))
+        tree_view.hideColumn(1)  # Hide size column
+        tree_view.hideColumn(2)  # Hide type column  
+        tree_view.hideColumn(3)  # Hide date column
+        tree_view.expandToDepth(1)  # Expand one level
+        
+        layout.addWidget(tree_view)
+        
+        # Button box
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        # Show dialog and get results
+        if dialog.exec_() == QDialog.Accepted:
+            selected_indexes = tree_view.selectionModel().selectedIndexes()
+            new_directories = []
+            
+            for index in selected_indexes:
+                if index.column() == 0:  # Only process first column to avoid duplicates
+                    directory_path = model.filePath(index)
+                    if directory_path and directory_path not in self.selected_dirs:
+                        new_directories.append(directory_path)
+            
+            if new_directories:
+                self.selected_dirs.extend(new_directories)
+                self.update_directory_display()
+                self.start_btn.setEnabled(len(self.selected_dirs) > 0)
+                
+                # Show confirmation
+                QMessageBox.information(
+                    self, 
+                    "Directories Added", 
+                    f"Added {len(new_directories)} director{'y' if len(new_directories) == 1 else 'ies'} to processing list."
+                )
     
     def clear_directories(self):
         """Clear all selected directories"""
@@ -645,7 +866,8 @@ class VideoProcessingGUI(QMainWindow):
             crf_quality,
             resolution,
             codec,
-            preset
+            preset,
+            self.instance_id
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)

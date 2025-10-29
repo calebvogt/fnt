@@ -16,30 +16,63 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, 
     QPushButton, QFileDialog, QMessageBox, QGroupBox,
     QComboBox, QSpinBox, QGridLayout, QFrame, QApplication,
-    QLineEdit
+    QLineEdit, QTextEdit
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
+
+
+class TrimWorker(QThread):
+    """Worker thread for running FFmpeg trim operations"""
+    progress = pyqtSignal(str)  # For log output
+    finished = pyqtSignal(bool, str)  # Success, message
+    
+    def __init__(self, command, output_file):
+        super().__init__()
+        self.command = command
+        self.output_file = output_file
+    
+    def run(self):
+        """Run FFmpeg command in background thread"""
+        try:
+            process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                universal_newlines=True
+            )
+            
+            # Stream output line by line
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    self.progress.emit(line.strip())
+            
+            process.wait()
+            
+            if process.returncode == 0:
+                self.finished.emit(True, f"✅ Video trimmed successfully!\n\nSaved as:\n{self.output_file}")
+            else:
+                self.finished.emit(False, f"❌ FFmpeg failed with error code {process.returncode}")
+                
+        except Exception as e:
+            self.finished.emit(False, f"❌ An error occurred:\n{str(e)}")
 
 
 class VideoTrimDialog(QDialog):
     """PyQt5 dialog for interactive video trimming with duration selection"""
     
-    def __init__(self, video_path, parent=None):
+    def __init__(self, video_path=None, parent=None):
         super().__init__(parent)
         self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
+        self.cap = None
         
-        if not self.cap.isOpened():
-            QMessageBox.critical(self, "Error", "Could not open video file.")
-            return
-        
-        # Video properties
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.duration = self.total_frames / self.fps
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Video properties (will be set when video is loaded)
+        self.total_frames = 0
+        self.fps = 0
+        self.duration = 0
+        self.width = 0
+        self.height = 0
         
         # Current frame position (in seconds)
         self.current_position = 0.0
@@ -55,13 +88,109 @@ class VideoTrimDialog(QDialog):
             "Custom": -1
         }
         
+        # Worker thread for background processing
+        self.worker = None
+        
         self.init_ui()
-        self.update_preview()
+        
+        # Load video if provided
+        if video_path:
+            self.load_video(video_path)
     
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("Video Trimming Tool")
         self.setMinimumSize(900, 700)
+        
+        # Apply dark mode styling
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QLabel {
+                color: #cccccc;
+                background-color: transparent;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #3f3f3f;
+                height: 8px;
+                background-color: #1e1e1e;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background-color: #0078d4;
+                border: 1px solid #0078d4;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background-color: #106ebe;
+            }
+            QComboBox, QSpinBox, QLineEdit {
+                padding: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3f3f3f;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #cccccc;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                selection-background-color: #0078d4;
+                border: 1px solid #3f3f3f;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #3f3f3f;
+                border: 1px solid #3f3f3f;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #0078d4;
+            }
+        """)
         
         layout = QVBoxLayout()
         
@@ -69,18 +198,40 @@ class VideoTrimDialog(QDialog):
         title = QLabel("Video Trimming Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
         layout.addWidget(title)
         
-        # Video info
-        info_text = f"Video: {os.path.basename(self.video_path)}\n"
-        info_text += f"Duration: {self.format_time(self.duration)} | "
-        info_text += f"Resolution: {self.width}x{self.height} | "
-        info_text += f"FPS: {self.fps:.2f}"
+        # Select Video button
+        select_button_layout = QHBoxLayout()
+        select_button_layout.addStretch()
         
-        info_label = QLabel(info_text)
-        info_label.setAlignment(Qt.AlignCenter)
-        info_label.setStyleSheet("color: #666666; padding: 10px;")
-        layout.addWidget(info_label)
+        self.select_video_btn = QPushButton("Select Video")
+        self.select_video_btn.setFixedSize(200, 40)
+        self.select_video_btn.clicked.connect(self.select_video_file)
+        self.select_video_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+        """)
+        select_button_layout.addWidget(self.select_video_btn)
+        select_button_layout.addStretch()
+        layout.addLayout(select_button_layout)
+        
+        # Video info
+        self.info_label = QLabel("No video selected")
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setStyleSheet("color: #999999; padding: 10px; background-color: transparent;")
+        layout.addWidget(self.info_label)
         
         # Preview section
         preview_group = QGroupBox("Start Frame Preview")
@@ -88,7 +239,7 @@ class VideoTrimDialog(QDialog):
         
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("background-color: black; border: 2px solid #007acc;")
+        self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
         self.preview_label.setMinimumSize(640, 360)
         preview_layout.addWidget(self.preview_label)
         
@@ -108,8 +259,9 @@ class VideoTrimDialog(QDialog):
         # Slider
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setMinimum(0)
-        self.position_slider.setMaximum(int(self.duration * 10))  # 0.1 second resolution
+        self.position_slider.setMaximum(100)  # Will be updated when video loads
         self.position_slider.setValue(0)
+        self.position_slider.setEnabled(False)  # Disabled until video is loaded
         self.position_slider.valueChanged.connect(self.on_slider_changed)
         position_layout.addWidget(self.position_slider)
         
@@ -149,6 +301,7 @@ class VideoTrimDialog(QDialog):
         self.duration_combo = QComboBox()
         self.duration_combo.addItems(list(self.duration_presets.keys()))
         self.duration_combo.setCurrentText("10 minutes")  # Default
+        self.duration_combo.setEnabled(False)  # Disabled until video is loaded
         self.duration_combo.currentTextChanged.connect(self.on_duration_changed)
         self.duration_combo.setMinimumWidth(150)
         duration_layout.addWidget(self.duration_combo)
@@ -170,9 +323,8 @@ class VideoTrimDialog(QDialog):
         
         # End time display
         duration_layout.addStretch()
-        self.end_time_label = QLabel()
+        self.end_time_label = QLabel("End Time: -- (Duration: --)")
         self.end_time_label.setFont(QFont("Arial", 10, QFont.Bold))
-        self.update_end_time_display()
         duration_layout.addWidget(self.end_time_label)
         
         duration_group.setLayout(duration_layout)
@@ -184,12 +336,10 @@ class VideoTrimDialog(QDialog):
         
         output_layout.addWidget(QLabel("Output filename:"))
         
-        # Generate default output filename
-        base_name, ext = os.path.splitext(os.path.basename(self.video_path))
-        default_output = f"{base_name}_trimmed.mp4"
-        
+        # Output filename field (will be populated when video is loaded)
         self.output_filename = QLineEdit()
-        self.output_filename.setText(default_output)
+        self.output_filename.setText("")
+        self.output_filename.setEnabled(False)  # Disabled until video is loaded
         self.output_filename.setMinimumWidth(300)
         self.output_filename.setPlaceholderText("Enter output filename...")
         output_layout.addWidget(self.output_filename)
@@ -197,43 +347,96 @@ class VideoTrimDialog(QDialog):
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
         
+        # Progress and log section
+        progress_group = QGroupBox("Processing Log")
+        progress_group.setStyleSheet("QGroupBox { font-weight: bold; color: #0078d4; }")
+        progress_layout = QVBoxLayout()
+        
+        self.log_text = QTextEdit()
+        self.log_text.setMaximumHeight(200)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #dcdcdc;
+                border: 1px solid #404040;
+                padding: 5px;
+            }
+        """)
+        self.log_text.setPlaceholderText("Processing output will appear here...")
+        progress_layout.addWidget(self.log_text)
+        
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+
         # Action buttons
         action_layout = QHBoxLayout()
         action_layout.addStretch()
         
-        trim_button = QPushButton("Trim Video")
-        trim_button.clicked.connect(self.trim_video)
-        trim_button.setFixedSize(150, 40)
-        trim_button.setStyleSheet("""
+        self.trim_button = QPushButton("Trim Video")
+        self.trim_button.clicked.connect(self.trim_video)
+        self.trim_button.setFixedSize(150, 40)
+        self.trim_button.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
                 color: white;
                 font-size: 14px;
                 font-weight: bold;
-                border-radius: 5px;
+                border-radius: 4px;
             }
             QPushButton:hover {
                 background-color: #218838;
             }
+            QPushButton:pressed {
+                background-color: #1e7e34;
+            }
         """)
-        action_layout.addWidget(trim_button)
+        action_layout.addWidget(self.trim_button)
         
-        cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.reject)
-        cancel_button.setFixedSize(150, 40)
-        cancel_button.setStyleSheet("""
+        self.cancel_button = QPushButton("Cancel Trim")
+        self.cancel_button.clicked.connect(self.cancel_trim)
+        self.cancel_button.setFixedSize(150, 40)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setStyleSheet("""
             QPushButton {
-                background-color: #6c757d;
+                background-color: #dc3545;
                 color: white;
                 font-size: 14px;
                 font-weight: bold;
-                border-radius: 5px;
+                border-radius: 4px;
             }
             QPushButton:hover {
-                background-color: #5a6268;
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #bd2130;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #888888;
             }
         """)
-        action_layout.addWidget(cancel_button)
+        action_layout.addWidget(self.cancel_button)
+        
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        close_button.setFixedSize(150, 40)
+        close_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3f3f3f;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #4f4f4f;
+            }
+            QPushButton:pressed {
+                background-color: #2f2f2f;
+            }
+        """)
+        action_layout.addWidget(close_button)
         
         action_layout.addStretch()
         layout.addLayout(action_layout)
@@ -247,8 +450,74 @@ class VideoTrimDialog(QDialog):
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     
+    def select_video_file(self):
+        """Open file dialog to select a video file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.wmv);;All Files (*)"
+        )
+        
+        if file_path:
+            self.load_video(file_path)
+    
+    def load_video(self, video_path):
+        """Load a video file and update the UI"""
+        # Release previous video if any
+        if self.cap:
+            self.cap.release()
+        
+        self.video_path = video_path
+        self.cap = cv2.VideoCapture(video_path)
+        
+        if not self.cap.isOpened():
+            QMessageBox.critical(self, "Error", "Could not open video file.")
+            return
+        
+        # Get video properties
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.duration = self.total_frames / self.fps
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Reset position
+        self.current_position = 0.0
+        
+        # Update UI
+        info_text = f"Video: {os.path.basename(self.video_path)}\n"
+        info_text += f"Duration: {self.format_time(self.duration)} | "
+        info_text += f"Resolution: {self.width}x{self.height} | "
+        info_text += f"FPS: {self.fps:.2f}"
+        self.info_label.setText(info_text)
+        
+        # Update slider range
+        self.position_slider.setMaximum(int(self.duration * 10))
+        self.position_slider.setValue(0)
+        
+        # Update custom duration spinbox max
+        self.custom_duration_spinbox.setMaximum(int(self.duration))
+        
+        # Update output filename
+        base_name, ext = os.path.splitext(os.path.basename(self.video_path))
+        default_output = f"{base_name}_trimmed.mp4"
+        self.output_filename.setText(default_output)
+        
+        # Enable controls
+        self.position_slider.setEnabled(True)
+        self.duration_combo.setEnabled(True)
+        self.output_filename.setEnabled(True)
+        
+        # Update preview
+        self.update_preview()
+        self.update_end_time_display()
+    
     def on_slider_changed(self, value):
         """Handle slider value change"""
+        if not self.cap or not self.cap.isOpened():
+            return
+        
         self.current_position = value / 10.0  # Convert back to seconds
         self.update_preview()
         self.time_label.setText(f"Start Time: {self.format_time(self.current_position)}")
@@ -256,6 +525,9 @@ class VideoTrimDialog(QDialog):
     
     def adjust_position(self, seconds):
         """Adjust the current position by the given seconds"""
+        if not self.cap or not self.cap.isOpened() or self.duration == 0:
+            return
+        
         new_position = max(0, min(self.duration, self.current_position + seconds))
         slider_value = int(new_position * 10)
         self.position_slider.setValue(slider_value)
@@ -277,6 +549,10 @@ class VideoTrimDialog(QDialog):
     
     def update_end_time_display(self):
         """Update the end time display label"""
+        if not self.cap or not self.cap.isOpened() or self.duration == 0:
+            self.end_time_label.setText("End Time: -- (Duration: --)")
+            return
+        
         duration = self.get_selected_duration()
         end_time = min(self.current_position + duration, self.duration)
         self.end_time_label.setText(
@@ -286,6 +562,12 @@ class VideoTrimDialog(QDialog):
     
     def update_preview(self):
         """Update the video preview frame"""
+        if not self.cap or not self.cap.isOpened():
+            # Show placeholder text when no video is loaded
+            self.preview_label.setText("No video loaded\n\nClick 'Select Video' to begin")
+            self.preview_label.setStyleSheet("background-color: #1e1e1e; border: 2px solid #3f3f3f; color: #999999; font-size: 14px;")
+            return
+        
         frame_number = int(self.current_position * self.fps)
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ret, frame = self.cap.read()
@@ -305,9 +587,22 @@ class VideoTrimDialog(QDialog):
             q_image = QImage(frame_resized.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(q_image)
             self.preview_label.setPixmap(pixmap)
+            self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
     
     def trim_video(self):
-        """Execute FFmpeg to trim the video"""
+        """Execute FFmpeg to trim the video using worker thread"""
+        # Check if video is loaded
+        if not self.video_path or not self.cap or not self.cap.isOpened():
+            QMessageBox.warning(self, "No Video", 
+                              "Please select a video file first.")
+            return
+        
+        # Check if already processing
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "Processing", 
+                              "Video trimming is already in progress.")
+            return
+        
         start_time = self.current_position
         duration = self.get_selected_duration()
         end_time = min(start_time + duration, self.duration)
@@ -343,42 +638,79 @@ class VideoTrimDialog(QDialog):
             if reply == QMessageBox.No:
                 return
         
-        # FFmpeg command
+        # SLEAP-compatible FFmpeg command for precise frame handling
         command = [
             "ffmpeg",
             "-y",  # Overwrite without asking
             "-i", self.video_path,
             "-ss", str(start_time),
             "-to", str(end_time),
-            "-c", "copy",
+            # SLEAP-compatible encoding instead of copy
+            "-c:v", "libx264",                   # Re-encode video for frame accuracy
+            "-preset", "medium",                 # Balance speed/quality
+            "-crf", "18",                        # High quality
+            "-pix_fmt", "yuv420p",              # Standard pixel format
+            "-movflags", "+faststart",           # Move moov atom to beginning
+            "-avoid_negative_ts", "make_zero",   # Fix timestamp issues
+            "-fflags", "+genpts",                # Generate presentation timestamps
+            "-vsync", "vfr",                     # Variable frame rate (preserves timing)
+            "-an",                               # Remove audio to avoid sync issues
             output_file
         ]
         
-        try:
-            # Run FFmpeg in background (non-blocking)
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
+        # Clear log and prepare UI for processing
+        self.log_text.clear()
+        self.log_text.append(f"🎬 Starting video trim...\n")
+        self.log_text.append(f"📁 Input: {os.path.basename(self.video_path)}")
+        self.log_text.append(f"📁 Output: {output_filename}")
+        self.log_text.append(f"⏱️  Start: {self.format_time(start_time)}")
+        self.log_text.append(f"⏱️  End: {self.format_time(end_time)}")
+        self.log_text.append(f"⏱️  Duration: {self.format_time(end_time - start_time)}\n")
+        self.log_text.append("Running FFmpeg command...")
+        
+        # Update button states
+        self.trim_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        
+        # Create and start worker thread
+        self.worker = TrimWorker(command, output_file)
+        self.worker.progress.connect(self.on_worker_progress)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+    
+    def cancel_trim(self):
+        """Cancel the current trim operation"""
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+            self.log_text.append("\n❌ Trim operation cancelled by user.")
             
-            # Wait for completion
-            output, _ = process.communicate()
-            
-            if process.returncode == 0:
-                QMessageBox.information(
-                    self, "Success",
-                    f"Video trimmed successfully!\n\nSaved as:\n{output_file}"
-                )
-                self.accept()
-            else:
-                QMessageBox.critical(
-                    self, "Error",
-                    f"FFmpeg failed with error code {process.returncode}\n\n{output[:500]}"
-                )
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred:\n{str(e)}")
+            # Reset button states
+            self.trim_button.setEnabled(True)
+            self.cancel_button.setEnabled(False)
+    
+    def on_worker_progress(self, message):
+        """Handle progress messages from worker thread"""
+        self.log_text.append(message)
+        # Auto-scroll to bottom
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def on_worker_finished(self, success, message):
+        """Handle worker thread completion"""
+        # Reset button states
+        self.trim_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        
+        # Show completion message in log
+        self.log_text.append(f"\n{message}")
+        
+        if success:
+            # Show success dialog but don't close the window
+            QMessageBox.information(self, "Success", message)
+        else:
+            # Show error dialog
+            QMessageBox.critical(self, "Error", message)
     
     def closeEvent(self, event):
         """Clean up when dialog is closed"""
@@ -388,7 +720,7 @@ class VideoTrimDialog(QDialog):
 
 
 def video_trim():
-    """Opens a file dialog to select a video file and launches the PyQt5 trimming GUI"""
+    """Launches the PyQt5 trimming GUI"""
     from PyQt5.QtWidgets import QApplication
     import sys
     
@@ -397,17 +729,9 @@ def video_trim():
     if app is None:
         app = QApplication(sys.argv)
     
-    # File dialog
-    file_path, _ = QFileDialog.getOpenFileName(
-        None,
-        "Select Video File",
-        "",
-        "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.wmv);;All Files (*)"
-    )
-    
-    if file_path:
-        dialog = VideoTrimDialog(file_path)
-        dialog.exec_()
+    # Open the dialog (user will select video from within the GUI)
+    dialog = VideoTrimDialog()
+    dialog.exec_()
 
 
 # For backward compatibility and standalone testing
