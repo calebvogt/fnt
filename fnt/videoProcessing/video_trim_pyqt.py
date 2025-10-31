@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, 
     QPushButton, QFileDialog, QMessageBox, QGroupBox,
     QComboBox, QSpinBox, QGridLayout, QFrame, QApplication,
-    QLineEdit, QTextEdit
+    QLineEdit, QTextEdit, QScrollArea, QWidget
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -101,6 +101,9 @@ class VideoTrimDialog(QDialog):
         """Initialize the user interface"""
         self.setWindowTitle("Video Trimming Tool")
         self.setMinimumSize(900, 700)
+        
+        # Enable window resize with maximize button, remove help button
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         
         # Apply dark mode styling
         self.setStyleSheet("""
@@ -192,27 +195,28 @@ class VideoTrimDialog(QDialog):
             }
         """)
         
-        layout = QVBoxLayout()
+        # Main layout
+        main_layout = QVBoxLayout()
         
         # Title
         title = QLabel("Video Trimming Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
-        layout.addWidget(title)
+        main_layout.addWidget(title)
         
-        # Select Video button
+        # Select Video button (smaller)
         select_button_layout = QHBoxLayout()
         select_button_layout.addStretch()
         
         self.select_video_btn = QPushButton("Select Video")
-        self.select_video_btn.setFixedSize(200, 40)
+        self.select_video_btn.setFixedSize(150, 35)
         self.select_video_btn.clicked.connect(self.select_video_file)
         self.select_video_btn.setStyleSheet("""
             QPushButton {
                 background-color: #0078d4;
                 color: white;
-                font-size: 14px;
+                font-size: 12px;
                 font-weight: bold;
                 border-radius: 4px;
             }
@@ -225,22 +229,35 @@ class VideoTrimDialog(QDialog):
         """)
         select_button_layout.addWidget(self.select_video_btn)
         select_button_layout.addStretch()
-        layout.addLayout(select_button_layout)
+        main_layout.addLayout(select_button_layout)
         
         # Video info
         self.info_label = QLabel("No video selected")
         self.info_label.setAlignment(Qt.AlignCenter)
-        self.info_label.setStyleSheet("color: #999999; padding: 10px; background-color: transparent;")
-        layout.addWidget(self.info_label)
+        self.info_label.setStyleSheet("color: #999999; padding: 5px; background-color: transparent;")
+        main_layout.addWidget(self.info_label)
         
-        # Preview section
+        # Create scrollable area for content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: #2b2b2b;
+            }
+        """)
+        scroll_widget = QWidget()
+        layout = QVBoxLayout()
+        scroll_widget.setLayout(layout)
+        
+        # Preview section (larger)
         preview_group = QGroupBox("Start Frame Preview")
         preview_layout = QVBoxLayout()
         
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
-        self.preview_label.setMinimumSize(640, 360)
+        self.preview_label.setMinimumSize(800, 450)
         preview_layout.addWidget(self.preview_label)
         
         preview_group.setLayout(preview_layout)
@@ -441,7 +458,12 @@ class VideoTrimDialog(QDialog):
         action_layout.addStretch()
         layout.addLayout(action_layout)
         
-        self.setLayout(layout)
+        # Set scroll widget and add to main layout
+        scroll.setWidget(scroll_widget)
+        main_layout.addWidget(scroll)
+        
+        # Set main layout on dialog
+        self.setLayout(main_layout)
     
     def format_time(self, seconds):
         """Format seconds as HH:MM:SS"""

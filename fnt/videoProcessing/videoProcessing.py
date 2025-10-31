@@ -547,7 +547,7 @@ class VideoProcessingGUI(QMainWindow):
         advanced_layout.addWidget(QLabel("CRF Quality:"), 2, 0)
         self.crf_combo = QComboBox()
         self.crf_combo.addItems(["10 (Best)", "15 (High)", "20 (Good)", "25 (Medium)", "30 (Low)"])
-        self.crf_combo.setCurrentText("25 (Medium)")
+        self.crf_combo.setCurrentText("20 (Good)")
         self.crf_combo.setToolTip("Lower values = better quality but larger file size. CRF 15 is near-lossless.")
         advanced_layout.addWidget(self.crf_combo, 2, 1)
         

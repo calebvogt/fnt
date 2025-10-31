@@ -1,15 +1,17 @@
 import os
 import sys
 import subprocess
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QTextEdit, QFileDialog, 
-                             QMessageBox, QGroupBox, QLineEdit)
-from PyQt5.QtCore import QThread, pyqtSignal
+                             QMessageBox, QGroupBox, QLineEdit, QProgressBar, QFrame,
+                             QScrollArea)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont
 
 class CompressWorker(QThread):
     """Worker thread for compressing WAV files"""
     progress = pyqtSignal(str)
+    file_progress = pyqtSignal(int, int)  # current file, total files
     finished = pyqtSignal(bool, str)
     
     def __init__(self, folder_path, output_folder):
@@ -37,6 +39,8 @@ class CompressWorker(QThread):
                 input_path = os.path.join(self.folder_path, wav_file)
                 output_path = os.path.join(self.output_folder, os.path.splitext(wav_file)[0] + ".wav")
                 
+                # Update progress
+                self.file_progress.emit(idx, len(wav_files))
                 self.progress.emit(f"\n[{idx}/{len(wav_files)}] Processing: {wav_file}")
                 
                 # ffmpeg command: downsample to 250kHz, mono, ADPCM compression
@@ -82,7 +86,7 @@ class CompressWorker(QThread):
             self.finished.emit(False, f"Error during compression: {str(e)}")
 
 
-class CompressWavsWindow(QWidget):
+class CompressWavsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.folder_path = None
@@ -90,25 +94,127 @@ class CompressWavsWindow(QWidget):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle("Compress WAV Files")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle("Compress WAV Files - FieldNeuroToolbox")
+        self.setGeometry(200, 200, 900, 700)
+        self.setMinimumSize(700, 600)
         
+        # Apply dark mode styling matching video preprocessing
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #888888;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QLabel {
+                color: #cccccc;
+                background-color: transparent;
+            }
+            QLineEdit {
+                padding: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QTextEdit {
+                background-color: #1e1e1e;
+                border: 1px solid #3f3f3f;
+                color: #cccccc;
+            }
+            QProgressBar {
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+                border-color: #3f3f3f;
+            }
+        """)
+        
+        # Create central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
         layout = QVBoxLayout()
+        central_widget.setLayout(layout)
         
-        # Title
+        # Header
+        header_frame = QFrame()
+        header_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
+        header_frame.setStyleSheet("background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f;")
+        
+        header_layout = QVBoxLayout()
+        header_frame.setLayout(header_layout)
+        
         title = QLabel("Compress WAV Files")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
-        layout.addWidget(title)
+        title.setAlignment(Qt.AlignCenter)
+        title.setFont(QFont("Arial", 18, QFont.Bold))
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
+        header_layout.addWidget(title)
         
-        # Description
-        desc = QLabel("Compress WAV files using ADPCM encoding (250kHz, mono)\nOutputs to 'proc' subfolder")
-        desc.setFont(QFont("Arial", 10))
-        desc.setStyleSheet("color: #666666; margin-bottom: 10px;")
-        layout.addWidget(desc)
+        subtitle = QLabel("Compress WAV files using ADPCM encoding (250kHz, mono)")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setFont(QFont("Arial", 10))
+        subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
+        header_layout.addWidget(subtitle)
+        
+        layout.addWidget(header_frame)
         
         # Folder selection group
         folder_group = QGroupBox("Input Folder")
         folder_layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel("Select a folder containing WAV files to compress")
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("color: #999999; margin-bottom: 10px;")
+        folder_layout.addWidget(instructions)
+        
+        # Selected folder display
+        self.lbl_folder = QLabel("No folder selected")
+        self.lbl_folder.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 40px; color: #cccccc;")
+        self.lbl_folder.setWordWrap(True)
+        folder_layout.addWidget(self.lbl_folder)
         
         # Folder selection button
         btn_layout = QHBoxLayout()
@@ -117,11 +223,6 @@ class CompressWavsWindow(QWidget):
         btn_layout.addWidget(self.btn_select)
         btn_layout.addStretch()
         folder_layout.addLayout(btn_layout)
-        
-        # Selected folder display
-        self.lbl_folder = QLabel("No folder selected")
-        self.lbl_folder.setStyleSheet("color: #666666; font-style: italic;")
-        folder_layout.addWidget(self.lbl_folder)
         
         # Output folder name input
         output_layout = QHBoxLayout()
@@ -132,26 +233,53 @@ class CompressWavsWindow(QWidget):
         output_layout.addStretch()
         folder_layout.addLayout(output_layout)
         
+        info_label = QLabel("Compressed files saved to output subfolder in input directory")
+        info_label.setStyleSheet("color: #999999; font-style: italic; margin-top: 10px;")
+        info_label.setWordWrap(True)
+        folder_layout.addWidget(info_label)
+        
         folder_group.setLayout(folder_layout)
         layout.addWidget(folder_group)
         
-        # Process button
+        # Control buttons
         btn_layout = QHBoxLayout()
-        self.btn_process = QPushButton("Compress Files")
+        self.btn_process = QPushButton("Start Compression")
         self.btn_process.clicked.connect(self.start_compression)
         self.btn_process.setEnabled(False)
-        self.btn_process.setStyleSheet("padding: 8px; font-size: 12px;")
         btn_layout.addWidget(self.btn_process)
         btn_layout.addStretch()
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+        
         layout.addLayout(btn_layout)
         
-        # Output text area
+        # Progress section
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout()
+        
+        # File progress
+        self.file_progress_label = QLabel("Ready to start...")
+        progress_layout.addWidget(self.file_progress_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        progress_layout.addWidget(self.progress_bar)
+        
+        # Status log
+        status_label = QLabel("Status Log:")
+        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
+        progress_layout.addWidget(status_label)
+        
         self.txt_output_display = QTextEdit()
         self.txt_output_display.setReadOnly(True)
-        self.txt_output_display.setFont(QFont("Courier", 9))
-        layout.addWidget(self.txt_output_display)
+        self.txt_output_display.setFont(QFont("Courier New", 9))
+        self.txt_output_display.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
+        progress_layout.addWidget(self.txt_output_display)
         
-        self.setLayout(layout)
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
         
     def select_folder(self):
         """Select folder containing WAV files"""
@@ -164,8 +292,8 @@ class CompressWavsWindow(QWidget):
         
         if folder:
             self.folder_path = folder
-            self.lbl_folder.setText(folder)
-            self.lbl_folder.setStyleSheet("color: black;")
+            self.lbl_folder.setText(f"• {folder}")
+            self.lbl_folder.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 40px; color: #cccccc;")
             self.btn_process.setEnabled(True)
             self.txt_output_display.clear()
             self.txt_output_display.append(f"Selected folder: {folder}\n")
@@ -187,14 +315,27 @@ class CompressWavsWindow(QWidget):
         # Disable buttons during processing
         self.btn_select.setEnabled(False)
         self.btn_process.setEnabled(False)
+        
+        # Show progress bar
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        # Clear log
         self.txt_output_display.clear()
         self.txt_output_display.append("Starting compression...\n")
         
         # Create and start worker thread
         self.worker = CompressWorker(self.folder_path, output_folder)
         self.worker.progress.connect(self.update_progress)
+        self.worker.file_progress.connect(self.update_file_progress)
         self.worker.finished.connect(self.compression_finished)
         self.worker.start()
+    
+    def update_file_progress(self, current, total):
+        """Update file progress bar"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.file_progress_label.setText(f"Processing file {current} of {total}")
         
     def update_progress(self, message):
         """Update the progress text area"""
@@ -209,6 +350,10 @@ class CompressWavsWindow(QWidget):
         # Re-enable buttons
         self.btn_select.setEnabled(True)
         self.btn_process.setEnabled(True)
+        
+        # Hide progress bar
+        self.progress_bar.setVisible(False)
+        self.file_progress_label.setText("Ready")
         
         if success:
             QMessageBox.information(self, "Success", message)
