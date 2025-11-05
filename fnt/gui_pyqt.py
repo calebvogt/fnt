@@ -292,6 +292,7 @@ class FNTMainWindow(QMainWindow):
             ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
             ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
             ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -411,13 +412,13 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Simple tracking group
-        group = QGroupBox("Simple Tracking Tools")
+        # SAM-based tracking group
+        group = QGroupBox("SAM-Based Tracking Tools")
         group_layout = QGridLayout()
         
         buttons = [
-            ("Open Field Test", "Track single or multiple animals in open arena with center zone metrics", self.run_oft_tracker),
-            ("Light Dark Box", "Track animal with occlusion handling for dark compartment", self.run_ldb_tracker),
+            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("Mask Pose Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -591,6 +592,18 @@ class FNTMainWindow(QMainWindow):
             main()
         self.run_function_safely(func, "SLEAP Re-tracking")
     
+    def run_sleap_render_videos(self):
+        """Launch SLEAP video rendering from existing .slp files"""
+        try:
+            from fnt.sleapProcessing.batch_render_videos_pyqt import RenderVideosWindow
+            
+            # Create and show the render videos window
+            self.render_videos_window = RenderVideosWindow()
+            self.render_videos_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
+    
     # USV Processing Methods - Call existing tkinter functions
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""
@@ -662,27 +675,27 @@ class FNTMainWindow(QMainWindow):
         self.run_function_safely(func, "UWB Path Plotting")
     
     # Video Tracking Methods
-    def run_oft_tracker(self):
-        """Launch Open Field Test tracker with SAM"""
+    def run_mask_pose_tracker(self):
+        """Launch Mask Pose Tracker with SAM"""
         try:
-            from fnt.videoTracking.oft_tracker_gui import OFTTrackerGUI
+            from fnt.videoTracking.mask_pose_tracker_gui import MaskPoseTrackerGUI
             
-            # Create and show the OFT tracker window
-            self.oft_tracker_window = OFTTrackerGUI()
-            self.oft_tracker_window.show()
+            # Create and show the Mask Pose Tracker window
+            self.mask_pose_tracker_window = MaskPoseTrackerGUI()
+            self.mask_pose_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch OFT tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
+            QMessageBox.critical(self, "Error", f"Failed to launch Mask Pose Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
     
-    def run_ldb_tracker(self):
-        """Launch Light Dark Box tracker with SAM"""
+    def run_simple_tracker(self):
+        """Launch Simple Tracker (CPU-only, no SAM)"""
         try:
-            from fnt.videoTracking.ldb_tracker_gui import LDBTrackerGUI
+            from fnt.videoTracking.simple_tracker_gui_v2 import SimpleTrackerGUI
             
-            # Create and show the LDB tracker window
-            self.ldb_tracker_window = LDBTrackerGUI()
-            self.ldb_tracker_window.show()
+            # Create and show the Simple Tracker window
+            self.simple_tracker_window = SimpleTrackerGUI()
+            self.simple_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch LDB tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
+            QMessageBox.critical(self, "Error", f"Failed to launch Simple Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python pandas numpy scipy")
     
     # GitHub Processing Methods - Pure PyQt implementations
     def run_file_splitter(self):

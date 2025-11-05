@@ -8,6 +8,7 @@ Automatically converts output to CSV format.
 
 import os
 import subprocess
+import glob
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
@@ -23,7 +24,7 @@ class InferenceWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, video_folders, model_paths, overwrite_existing, create_csv=True, add_tracking=False, 
+    def __init__(self, video_folders, model_paths, overwrite_existing, create_csv=True, create_video=False, add_tracking=False, 
                  tracker_method="simple", similarity_method="instance", match_method="greedy", 
                  max_tracks=0, track_window=5, robust_quantile=1.0, conda_env=None):
         super().__init__()
@@ -31,6 +32,7 @@ class InferenceWorker(QThread):
         self.model_paths = model_paths
         self.overwrite_existing = overwrite_existing
         self.create_csv = create_csv
+        self.create_video = create_video
         self.add_tracking = add_tracking
         self.tracker_method = tracker_method
         self.similarity_method = similarity_method
@@ -39,6 +41,12 @@ class InferenceWorker(QThread):
         self.track_window = track_window
         self.robust_quantile = robust_quantile
         self.conda_env = conda_env
+        self._stop_requested = False
+    
+    def request_stop(self):
+        """Request the worker to stop processing"""
+        self._stop_requested = True
+        self.progress.emit("\n⚠️ Stop requested by user...")
         
     def run(self):
         try:
@@ -46,6 +54,9 @@ class InferenceWorker(QThread):
             total_skipped = 0
             
             for folder in self.video_folders:
+                if self._stop_requested:
+                    break
+                    
                 video_files = [f for f in os.listdir(folder)
                               if f.lower().endswith((".mp4", ".avi", ".mov"))]
                 
@@ -57,16 +68,31 @@ class InferenceWorker(QThread):
                 self.progress.emit(f"Found {len(video_files)} video file(s)\n")
                 
                 for video_file in video_files:
+                    if self._stop_requested:
+                        break
+                        
                     full_path = os.path.join(folder, video_file)
-                    slp_path = self.get_output_path(full_path)
-                    csv_path = slp_path.replace(".predictions.slp", ".predictions.analysis.csv")
                     
-                    if not self.overwrite_existing and (os.path.exists(slp_path) or os.path.exists(csv_path)):
+                    # Check for existing prediction files with any timestamp
+                    existing_files = self.find_existing_predictions(full_path)
+                    
+                    if existing_files and not self.overwrite_existing:
                         self.progress.emit(f"⏭️ Skipping {video_file} (existing predictions detected)")
                         total_skipped += 1
                         continue
                     
+                    # Delete existing files if overwrite is enabled
+                    if existing_files and self.overwrite_existing:
+                        self.progress.emit(f"🗑️ Deleting {len(existing_files)} existing prediction file(s) for {video_file}")
+                        for existing_file in existing_files:
+                            try:
+                                os.remove(existing_file)
+                                self.progress.emit(f"   Deleted: {os.path.basename(existing_file)}")
+                            except Exception as e:
+                                self.progress.emit(f"   ⚠️ Failed to delete {os.path.basename(existing_file)}: {str(e)}")
+                    
                     # Run inference
+                    slp_path = self.get_output_path(full_path)
                     success = self.run_inference_on_video(full_path)
                     if success:
                         total_processed += 1
@@ -76,16 +102,41 @@ class InferenceWorker(QThread):
                         self.progress.emit(f"❌ Failed to process {video_file}")
             
             summary = f"\n{'='*60}\n"
-            summary += f"✅ Inference complete!\n"
+            if self._stop_requested:
+                summary += f"⚠️ Inference stopped by user!\n"
+            else:
+                summary += f"✅ Inference complete!\n"
             summary += f"Videos processed: {total_processed}\n"
             summary += f"Videos skipped: {total_skipped}\n"
             summary += f"Total videos: {total_processed + total_skipped}\n"
             
             self.progress.emit(summary)
-            self.finished.emit(True, "Inference completed successfully!")
+            
+            if self._stop_requested:
+                self.finished.emit(False, "Inference stopped by user")
+            else:
+                self.finished.emit(True, "Inference completed successfully!")
             
         except Exception as e:
             self.finished.emit(False, f"Error during inference: {str(e)}")
+    
+    def find_existing_predictions(self, video_path):
+        """Find all existing prediction files for a video (with any timestamp)"""
+        base = os.path.basename(video_path)
+        parent = os.path.dirname(video_path)
+        
+        # Search patterns for .slp, .csv, and .mp4 prediction files
+        patterns = [
+            os.path.join(parent, f"{base}.*.predictions.slp"),
+            os.path.join(parent, f"{base}.*.predictions.analysis.csv"),
+            os.path.join(parent, f"{base}.*.predictions.mp4")
+        ]
+        
+        existing_files = []
+        for pattern in patterns:
+            existing_files.extend(glob.glob(pattern))
+        
+        return existing_files
     
     def get_output_path(self, video_path):
         """Generate output file path with timestamp"""
@@ -175,6 +226,10 @@ class InferenceWorker(QThread):
                 # Convert to CSV if requested
                 if self.create_csv:
                     self.convert_to_csv(output_file)
+                
+                # Render tracked video if requested
+                if self.create_video:
+                    self.render_video(output_file, video_file)
                     
                 return True
             else:
@@ -218,6 +273,50 @@ class InferenceWorker(QThread):
                 
         except Exception as e:
             self.progress.emit(f"⚠️ CSV conversion error: {str(e)}")
+    
+    def render_video(self, slp_file, video_file):
+        """Render tracked video with predictions overlay using sleap-render"""
+        # Generate output video path
+        video_output = slp_file.replace(".predictions.slp", ".predictions.mp4")
+        
+        if os.path.exists(video_output) and not self.overwrite_existing:
+            self.progress.emit(f"⏭️ Skipping video rendering: {os.path.basename(video_output)} already exists")
+            return
+        
+        self.progress.emit(f"🎬 Rendering tracked video: {os.path.basename(slp_file)}")
+        
+        try:
+            # Build sleap-render command
+            cmd = ["sleap-render", slp_file, "-o", video_output]
+            
+            if self.conda_env:
+                full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
+            else:
+                full_cmd = cmd
+            
+            # Log the command being executed
+            cmd_str = " ".join(full_cmd)
+            self.progress.emit(f"   Command: {cmd_str}")
+            self.progress.emit(f"   Output: {video_output}")
+                
+            result = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                shell=True
+            )
+            
+            if result.returncode == 0:
+                self.progress.emit(f"✅ Video rendered: {os.path.basename(video_output)}")
+            else:
+                self.progress.emit(f"⚠️ Video rendering failed (return code {result.returncode})")
+                if result.stderr:
+                    self.progress.emit(f"   stderr: {result.stderr[:500]}")
+                if result.stdout:
+                    self.progress.emit(f"   stdout: {result.stdout[:500]}")
+                
+        except Exception as e:
+            self.progress.emit(f"⚠️ Video rendering error: {str(e)}")
 
 
 class VideoInferenceWindow(QWidget):
@@ -424,6 +523,11 @@ class VideoInferenceWindow(QWidget):
         self.chk_create_csv.setChecked(True)
         options_layout.addWidget(self.chk_create_csv)
         
+        # Rendered Video Option
+        self.chk_create_video = QCheckBox("Create tracked video with predictions overlay")
+        self.chk_create_video.setChecked(False)
+        options_layout.addWidget(self.chk_create_video)
+        
         self.chk_overwrite = QCheckBox("Overwrite existing prediction files")
         self.chk_overwrite.setChecked(True)
         options_layout.addWidget(self.chk_overwrite)
@@ -574,13 +678,44 @@ class VideoInferenceWindow(QWidget):
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
         
-        # Run Button
+        # Run and Stop Buttons
         btn_layout = QHBoxLayout()
-        self.btn_run = QPushButton("Run Inference")
+        self.btn_run = QPushButton("▶️ Run Inference")
         self.btn_run.clicked.connect(self.run_inference)
         self.btn_run.setEnabled(False)
-        self.btn_run.setStyleSheet("padding: 10px; font-size: 13px;")
+        self.btn_run.setStyleSheet("""
+            QPushButton {
+                background-color: #16825d;
+                padding: 10px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #1a9667;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+            }
+        """)
         btn_layout.addWidget(self.btn_run)
+        
+        self.btn_stop = QPushButton("⏹️ Stop Processing")
+        self.btn_stop.clicked.connect(self.stop_inference)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #c42b1c;
+                padding: 10px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #d83b2c;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+            }
+        """)
+        btn_layout.addWidget(self.btn_stop)
+        
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
@@ -890,8 +1025,9 @@ class VideoInferenceWindow(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # Disable controls during processing
+        # Disable run button, enable stop button during processing
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.log("\n" + "="*60)
         self.log("🚀 Starting SLEAP inference...")
         self.log(f"Model type: {model_type}")
@@ -905,6 +1041,7 @@ class VideoInferenceWindow(QWidget):
             self.model_paths,
             self.chk_overwrite.isChecked(),
             self.chk_create_csv.isChecked(),
+            self.chk_create_video.isChecked(),
             self.chk_tracking.isChecked(),
             self.combo_tracker.currentText(),
             self.combo_similarity.currentText(),
@@ -918,9 +1055,25 @@ class VideoInferenceWindow(QWidget):
         self.worker.finished.connect(self.on_inference_finished)
         self.worker.start()
     
+    def stop_inference(self):
+        """Stop the running inference process"""
+        if self.worker and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Stop Processing",
+                "Are you sure you want to stop the inference process?\n\nThe current video will finish processing.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.worker.request_stop()
+                self.btn_stop.setEnabled(False)
+    
     def on_inference_finished(self, success, message):
         """Handle inference completion"""
         self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         
         if success:
             QMessageBox.information(

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Open Field Test (OFT) Tracker GUI
+Mask Pose Tracker GUI
 
-Interactive SAM-based tracking for open field behavioral tests.
+SAM-based pose tracking using mask shape analysis for behavioral tests.
+Segments the animal on every frame and extracts rich pose features from mask geometry.
+
 User workflow:
 1. Select video file(s)
 2. Click on animal in first frame -> SAM segments automatically
 3. Draw rectangular ROI for arena boundary
-4. Track and export trajectory with center zone metrics
+4. Track and export trajectory with pose features for behavioral clustering
 
 Features:
-- Batch processing support
+- Frame-by-frame SAM segmentation with ROI cropping for speed
+- Rich mask-based pose feature extraction (shape, orientation, skeleton)
 - Real-time tracking preview
 - Distance traveled calculation
-- Time in center zone analysis (inner 60% of arena)
-- CSV export with behavioral metrics
+- CSV export with behavioral metrics and pose features
+- Designed for UMAP clustering and behavioral motif discovery
 
 Author: FieldNeuroToolbox Contributors
 """
@@ -866,12 +869,12 @@ class TrackingWorker(QThread):
         self.is_cancelled = True
 
 
-class OFTTrackerGUI(QMainWindow):
-    """Main GUI for Open Field Test tracking."""
+class MaskPoseTrackerGUI(QMainWindow):
+    """Main GUI for Mask Pose Tracker - SAM-based behavioral tracking."""
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Open Field Test Tracker - FieldNeuroToolbox")
+        self.setWindowTitle("Mask Pose Tracker - FieldNeuroToolbox")
         self.setGeometry(100, 100, 1200, 800)
         
         # State
@@ -1461,7 +1464,7 @@ def main():
         )
         return
         
-    window = OFTTrackerGUI()
+    window = MaskPoseTrackerGUI()
     window.show()
     sys.exit(app.exec_())
 
