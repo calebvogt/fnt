@@ -3,6 +3,8 @@
 
 Preprocessing and analysis toolbox for neurobehavioral data. 
 
+Authored by Caleb C. Vogt, PhD in collaboration with Claude.
+
 Overview
 ========
 

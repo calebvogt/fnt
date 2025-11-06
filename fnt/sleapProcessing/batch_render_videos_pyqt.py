@@ -6,6 +6,7 @@ Renders tracked videos from existing .slp prediction files without re-running in
 
 import os
 import sys
+import re
 import subprocess
 from pathlib import Path
 
@@ -81,8 +82,23 @@ class RenderWorker(QThread):
         self.progress.emit(f"🎬 Rendering: {os.path.basename(slp_file)}")
         
         try:
+            # Find the original video file by removing the timestamp and .predictions.slp
+            # Example: F9039_PreLDB.mp4.251104_202452.predictions.slp -> F9039_PreLDB.mp4
+            video_file = self.find_original_video(slp_file)
+            
+            if not video_file:
+                self.progress.emit(f"⚠️ Could not find original video for {os.path.basename(slp_file)}")
+                self.progress.emit(f"   Rendering without frame range specification...")
+            
             # Build sleap-render command
             cmd = ["sleap-render", slp_file, "-o", video_output]
+            
+            # Get frame count and add frame range to render all frames
+            if video_file:
+                frame_count = self.get_video_frame_count(video_file)
+                if frame_count > 0:
+                    cmd.extend(["--frames", f"1-{frame_count}"])
+                    self.progress.emit(f"   Rendering all {frame_count} frames (1-{frame_count})")
             
             if self.conda_env:
                 full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
@@ -115,6 +131,42 @@ class RenderWorker(QThread):
         except Exception as e:
             self.progress.emit(f"⚠️ Rendering error: {str(e)}")
             return False
+    
+    def find_original_video(self, slp_file):
+        """Find the original video file from the .slp filename"""
+        # Remove .predictions.slp and timestamp to get original video name
+        # Example: F9039_PreLDB.mp4.251104_202452.predictions.slp -> F9039_PreLDB.mp4
+        import re
+        basename = os.path.basename(slp_file)
+        # Pattern: {videoname}.{timestamp}.predictions.slp
+        match = re.match(r'(.+)\.\d{6}_\d{6}\.predictions\.slp$', basename)
+        if match:
+            video_name = match.group(1)
+            video_dir = os.path.dirname(slp_file)
+            video_path = os.path.join(video_dir, video_name)
+            if os.path.exists(video_path):
+                return video_path
+        return None
+    
+    def get_video_frame_count(self, video_file):
+        """Get the total number of frames in a video using ffprobe"""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
+                "-of", "csv=p=0",
+                video_file
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip())
+        except:
+            pass
+        
+        return 0
 
 
 class RenderVideosWindow(QWidget):

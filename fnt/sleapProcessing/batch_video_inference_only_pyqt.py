@@ -286,8 +286,16 @@ class InferenceWorker(QThread):
         self.progress.emit(f"🎬 Rendering tracked video: {os.path.basename(slp_file)}")
         
         try:
+            # Get frame count from original video to render all frames
+            frame_count = self.get_video_frame_count(video_file)
+            
             # Build sleap-render command
             cmd = ["sleap-render", slp_file, "-o", video_output]
+            
+            # Add frame range to render all frames (even those without predictions)
+            if frame_count > 0:
+                cmd.extend(["--frames", f"1-{frame_count}"])
+                self.progress.emit(f"   Rendering all {frame_count} frames (1-{frame_count})")
             
             if self.conda_env:
                 full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
@@ -317,6 +325,26 @@ class InferenceWorker(QThread):
                 
         except Exception as e:
             self.progress.emit(f"⚠️ Video rendering error: {str(e)}")
+    
+    def get_video_frame_count(self, video_file):
+        """Get the total number of frames in a video using ffprobe"""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
+                "-of", "csv=p=0",
+                video_file
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip())
+        except:
+            pass
+        
+        return 0
 
 
 class VideoInferenceWindow(QWidget):

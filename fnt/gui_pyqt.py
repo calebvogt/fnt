@@ -299,6 +299,18 @@ class FNTMainWindow(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
         
+        # SLEAP post-processing group
+        post_group = QGroupBox("SLEAP Post-Processing")
+        post_layout = QGridLayout()
+        
+        post_buttons = [
+            ("ROI Tool", "Define ROIs and analyze spatial occupancy", self.run_sleap_roi_tool),
+        ]
+        
+        self.create_button_grid(post_layout, post_buttons)
+        post_group.setLayout(post_layout)
+        layout.addWidget(post_group)
+        
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "SLEAP Analysis")
@@ -603,6 +615,18 @@ class FNTMainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
+    
+    def run_sleap_roi_tool(self):
+        """Launch SLEAP ROI Analysis Tool"""
+        try:
+            from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
+            
+            # Create and show the ROI tool window
+            self.roi_tool_window = ROIToolGUI()
+            self.roi_tool_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
     
     # USV Processing Methods - Call existing tkinter functions
     def run_usv_heterodyne(self):
