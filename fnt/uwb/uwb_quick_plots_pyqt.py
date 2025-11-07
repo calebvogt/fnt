@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import numpy as np
 import pandas as pd
+import pytz
 from scipy.signal import savgol_filter
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
@@ -22,7 +23,7 @@ class PlotGeneratorWorker(QThread):
     plot_ready = pyqtSignal(object, str)  # (figure, plot_name)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, db_path, table_name, selected_tags, plot_types, downsample, smoothing_method):
+    def __init__(self, db_path, table_name, selected_tags, plot_types, downsample, smoothing_method, timezone='US/Mountain'):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -30,6 +31,7 @@ class PlotGeneratorWorker(QThread):
         self.plot_types = plot_types
         self.downsample = downsample
         self.smoothing_method = smoothing_method
+        self.timezone = timezone
         
     def run(self):
         try:
@@ -44,7 +46,15 @@ class PlotGeneratorWorker(QThread):
             self.progress.emit(f"Loaded {len(data)} records")
             
             # Process data
+            # Convert timestamp to datetime in UTC first
             data['Timestamp'] = pd.to_datetime(data['timestamp'], unit='ms', origin='unix', utc=True)
+            
+            # Convert to user-selected timezone
+            tz = pytz.timezone(self.timezone)
+            data['Timestamp'] = data['Timestamp'].dt.tz_convert(tz)
+            self.progress.emit(f"Converted timestamps to {self.timezone}")
+            
+            # Convert location to meters
             data['location_x'] *= 0.0254  # Convert to meters
             data['location_y'] *= 0.0254
             data = data.sort_values(by=['shortid', 'Timestamp'])
@@ -213,6 +223,26 @@ class PlotGeneratorWorker(QThread):
         unique_dates = sorted(data['Date'].unique())
         unique_tags = sorted(data['shortid'].unique())
         
+        # Calculate min/max coordinates per animal across ALL days
+        tag_bounds = {}
+        for tag in unique_tags:
+            tag_data = data[data['shortid'] == tag]
+            x_min, x_max = tag_data[x_col].min(), tag_data[x_col].max()
+            y_min, y_max = tag_data[y_col].min(), tag_data[y_col].max()
+            
+            # Add 5% padding to the bounds
+            x_range = x_max - x_min
+            y_range = y_max - y_min
+            x_pad = x_range * 0.05 if x_range > 0 else 1
+            y_pad = y_range * 0.05 if y_range > 0 else 1
+            
+            tag_bounds[tag] = {
+                'x_min': x_min - x_pad,
+                'x_max': x_max + x_pad,
+                'y_min': y_min - y_pad,
+                'y_max': y_max + y_pad
+            }
+        
         # Create subplots: one row per tag, columns for days
         num_tags = len(unique_tags)
         num_days = len(unique_dates)
@@ -221,6 +251,7 @@ class PlotGeneratorWorker(QThread):
         
         for tag_idx, tag in enumerate(unique_tags):
             tag_data = data[data['shortid'] == tag]
+            bounds = tag_bounds[tag]
             
             for day_idx, date in enumerate(unique_dates):
                 day_data = tag_data[tag_data['Date'] == date]
@@ -234,6 +265,10 @@ class PlotGeneratorWorker(QThread):
                               c='green', s=50, marker='o', label='Start', zorder=5)
                     ax.scatter(day_data[x_col].iloc[-1], day_data[y_col].iloc[-1], 
                               c='red', s=50, marker='s', label='End', zorder=5)
+                
+                # Apply consistent axis limits for this tag across all days
+                ax.set_xlim(bounds['x_min'], bounds['x_max'])
+                ax.set_ylim(bounds['y_min'], bounds['y_max'])
                 
                 ax.set_xlabel('X (m)', fontsize=8)
                 ax.set_ylabel('Y (m)', fontsize=8)
@@ -312,7 +347,7 @@ class PlotGeneratorWorker(QThread):
         # Count data points per hour for each tag
         for tag in data['shortid'].unique():
             tag_data = data[data['shortid'] == tag]
-            hourly_counts = tag_data.set_index('Timestamp').resample('1H').size()
+            hourly_counts = tag_data.set_index('Timestamp').resample('1h').size()
             ax.plot(hourly_counts.index, hourly_counts.values, 
                    label=f'Tag {tag}', marker='o', markersize=3, linewidth=1)
         
@@ -467,6 +502,112 @@ class UWBQuickPlotsWindow(QWidget):
         self.setWindowTitle("UWB Quick Plots")
         self.setGeometry(50, 50, 1400, 900)
         
+        # Set dark theme style to match video processing GUI
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
+                font-family: Arial;
+            }
+            QLabel {
+                color: #cccccc;
+                background-color: transparent;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #666666;
+            }
+            QGroupBox {
+                background-color: #1e1e1e;
+                border: 1px solid #3f3f3f;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 12px;
+                font-weight: bold;
+                color: #cccccc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 4px 8px;
+                background-color: #2b2b2b;
+                color: #0078d4;
+            }
+            QCheckBox {
+                color: #cccccc;
+                spacing: 8px;
+            }
+            QComboBox {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
+                padding: 4px 8px;
+                min-width: 100px;
+            }
+            QComboBox:hover {
+                border-color: #0078d4;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #cccccc;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                selection-background-color: #0078d4;
+                border: 1px solid #3f3f3f;
+            }
+            QSpinBox {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QSpinBox:hover {
+                border-color: #0078d4;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #2b2b2b;
+                border: none;
+                width: 16px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #3f3f3f;
+            }
+            QScrollArea {
+                background-color: #2b2b2b;
+                border: none;
+            }
+            QFrame {
+                background-color: #2b2b2b;
+                border-color: #3f3f3f;
+            }
+        """)
+        
         # Main layout
         main_layout = QHBoxLayout()
         
@@ -560,6 +701,21 @@ class UWBQuickPlotsWindow(QWidget):
         # Processing options
         options_group = QGroupBox("Options")
         options_layout = QVBoxLayout()
+        
+        # Timezone selection
+        tz_layout = QHBoxLayout()
+        tz_layout.addWidget(QLabel("Timezone:"))
+        self.combo_timezone = QComboBox()
+        # Add common timezones
+        common_timezones = [
+            "US/Mountain", "US/Pacific", "US/Central", "US/Eastern",
+            "UTC", "Europe/London", "Europe/Paris", "Asia/Tokyo"
+        ]
+        self.combo_timezone.addItems(common_timezones)
+        self.combo_timezone.setCurrentText("US/Mountain")  # Default
+        self.combo_timezone.setToolTip("Select timezone for timestamp conversion (UWB timestamps are in UTC)")
+        tz_layout.addWidget(self.combo_timezone)
+        options_layout.addLayout(tz_layout)
         
         # Downsample option
         self.chk_downsample = QCheckBox("Downsample to 1Hz")
@@ -893,9 +1049,11 @@ class UWBQuickPlotsWindow(QWidget):
         # Get processing options
         downsample = self.chk_downsample.isChecked()
         smoothing = self.combo_smoothing.currentText()
+        timezone = self.combo_timezone.currentText()
         
         # Create and start worker thread
-        self.worker = PlotGeneratorWorker(self.db_path, self.table_name, selected_tags, selected_plots, downsample, smoothing)
+        self.worker = PlotGeneratorWorker(self.db_path, self.table_name, selected_tags, 
+                                         selected_plots, downsample, smoothing, timezone)
         self.worker.progress.connect(self.update_status)
         self.worker.plot_ready.connect(self.add_plot)
         self.worker.finished.connect(self.generation_finished)

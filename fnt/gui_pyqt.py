@@ -168,7 +168,7 @@ class FNTMainWindow(QMainWindow):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         
-        # Create tabs
+        # Create tabs - Original order
         self.create_video_tab()
         self.create_sleap_tab()
         self.create_video_tracking_tab()
@@ -361,6 +361,7 @@ class FNTMainWindow(QMainWindow):
         
         quick_buttons = [
             ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
+            ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -669,6 +670,17 @@ class FNTMainWindow(QMainWindow):
             self.uwb_quick_plots_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"UWB Quick Plots failed: {str(e)}")
+    
+    def run_uwb_quick_visualization(self):
+        """Launch UWB Quick Visualization tool"""
+        try:
+            from fnt.uwb.uwb_quick_visualization_pyqt import UWBQuickVisualizationWindow
+            
+            # Create and show the UWB quick visualization window
+            self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
+            self.uwb_quick_viz_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"UWB Quick Visualization failed: {str(e)}")
     
     def run_uwb_preprocess(self):
         """Launch UWB data preprocessing"""

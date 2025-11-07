@@ -27,6 +27,9 @@ import os
 import cv2
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for saving plots
+import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 import re
@@ -124,7 +127,8 @@ class ROIProcessor(QThread):
     def __init__(self, video_configs: List[VideoROIConfig], create_video: bool, 
                  show_tracking_area: bool = True, show_rois: bool = True, 
                  show_all_keypoints: bool = True, show_edges: bool = False,
-                 show_keypoint_labels: bool = False, interpolate_keypoints: bool = False):
+                 show_keypoint_labels: bool = False, interpolate_keypoints: bool = False,
+                 save_tracking_plots: bool = True):
         super().__init__()
         self.video_configs = video_configs
         self.create_video = create_video
@@ -134,9 +138,7 @@ class ROIProcessor(QThread):
         self.show_edges = show_edges
         self.show_keypoint_labels = show_keypoint_labels
         self.interpolate_keypoints = interpolate_keypoints
-        self.cancelled = False
-        self.show_all_keypoints = show_all_keypoints
-        self.show_edges = show_edges
+        self.save_tracking_plots = save_tracking_plots
         self.cancelled = False
     
     def get_output_path(self, video_path: str, csv_path: str, suffix: str) -> str:
@@ -223,6 +225,13 @@ class ROIProcessor(QThread):
                 # Save summary
                 summary_path = self.get_output_path(config.video_path, config.csv_path, '_roiSummary.csv')
                 summary_df.to_csv(summary_path, index=False)
+                
+                # Create tracking plots if requested
+                if self.save_tracking_plots:
+                    self.status.emit(f"Generating tracking plots for {len(config.selected_keypoints)} keypoints...")
+                    self.create_tracking_plots(config, df)
+                else:
+                    self.status.emit(f"Skipping tracking plots (not enabled)")
                 
                 # Create tracked video if requested
                 if self.create_video:
@@ -544,6 +553,109 @@ class ROIProcessor(QThread):
                         })
         
         return pd.DataFrame(summary_data)
+    
+    def create_tracking_plots(self, config: VideoROIConfig, df: pd.DataFrame):
+        """
+        Create and save tracking plots for each selected keypoint showing trajectories with ROI boundaries.
+        
+        Args:
+            config: Video configuration with ROIs and selected keypoints
+            df: Tracking data (filtered and potentially interpolated)
+        """
+        self.status.emit(f"Creating tracking plots for selected keypoints...")
+        
+        for keypoint in config.selected_keypoints:
+            try:
+                # Create figure
+                fig, ax = plt.subplots(figsize=(12, 10))
+                
+                # Get keypoint coordinates - check for column name variations
+                x_col = None
+                y_col = None
+                
+                # Try different column name formats
+                possible_x_cols = [f'{keypoint}_x', f'{keypoint}.x', keypoint + '_x']
+                possible_y_cols = [f'{keypoint}_y', f'{keypoint}.y', keypoint + '_y']
+                
+                for col in possible_x_cols:
+                    if col in df.columns:
+                        x_col = col
+                        break
+                
+                for col in possible_y_cols:
+                    if col in df.columns:
+                        y_col = col
+                        break
+                
+                if x_col is None or y_col is None:
+                    self.status.emit(f"Warning: Keypoint columns for {keypoint} not found. Available columns: {list(df.columns[:10])}")
+                    continue
+                
+                # Get valid (non-NaN) coordinates
+                valid_data = df[[x_col, y_col]].dropna()
+                
+                if len(valid_data) == 0:
+                    self.status.emit(f"Warning: No valid coordinates for keypoint {keypoint}")
+                    continue
+                
+                x_coords = valid_data[x_col].values
+                y_coords = valid_data[y_col].values
+                
+                # Plot trajectory as a solid blue line
+                ax.plot(x_coords, y_coords, color='blue', linewidth=2, alpha=0.8, label='Trajectory')
+                
+                # Mark start and end points
+                ax.plot(x_coords[0], y_coords[0], 'ko', markersize=10, 
+                       label='Start', zorder=5, markerfacecolor='black', markeredgecolor='black')
+                ax.plot(x_coords[-1], y_coords[-1], 'ks', markersize=10, 
+                       label='End', zorder=5, markerfacecolor='black', markeredgecolor='black')
+                
+                # Draw ROI boundaries (no labels, all black solid lines)
+                for idx, (roi_name, roi_polygon) in enumerate(config.rois):
+                    if len(roi_polygon) < 3:
+                        continue
+                    
+                    roi_poly = np.array(roi_polygon, dtype=np.int32)
+                    roi_poly = np.append(roi_poly, [roi_poly[0]], axis=0)
+                    
+                    # Draw ROI boundary in solid black
+                    ax.plot(roi_poly[:, 0], roi_poly[:, 1], 
+                           color='black', linewidth=2, linestyle='-', 
+                           label=f'ROI: {roi_name}' if idx == 0 else '')  # Only label first ROI for legend
+                
+                # Set labels and title
+                ax.set_xlabel('X Position (pixels)', fontsize=12)
+                ax.set_ylabel('Y Position (pixels)', fontsize=12)
+                ax.set_title(f'Tracking Plot: {keypoint}\n{os.path.basename(config.video_path)}', 
+                           fontsize=14, fontweight='bold')
+                
+                # Equal aspect ratio and grid
+                ax.set_aspect('equal')
+                ax.grid(True, alpha=0.3)
+                
+                # Place legend in upper right corner
+                ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+                
+                # Invert y-axis to match image coordinates
+                ax.invert_yaxis()
+                
+                # Tight layout
+                plt.tight_layout()
+                
+                # Save plot
+                output_path = self.get_output_path(config.video_path, config.csv_path, 
+                                                   f'_roiTrackingPlot_{keypoint}.png')
+                self.status.emit(f"Saving plot to: {output_path}")
+                fig.savefig(output_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                
+                self.status.emit(f"✓ Saved tracking plot: {os.path.basename(output_path)}")
+                
+            except Exception as e:
+                import traceback
+                error_msg = f"Error creating plot for {keypoint}: {str(e)}\n{traceback.format_exc()}"
+                self.status.emit(error_msg)
+                print(error_msg)  # Also print to console for debugging
     
     def detect_skeleton_edges(self, df: pd.DataFrame, keypoints: List[str], 
                               max_distance_pixels: float = 150.0, 
@@ -1137,6 +1249,12 @@ class ROIToolGUI(QMainWindow):
         self.chk_interpolate = QCheckBox("Interpolate missing keypoints")
         self.chk_interpolate.setChecked(True)
         layout.addWidget(self.chk_interpolate)
+        
+        # Save tracking plots checkbox
+        self.chk_save_tracking_plots = QCheckBox("Save tracking plots")
+        self.chk_save_tracking_plots.setChecked(True)
+        self.chk_save_tracking_plots.setToolTip("Save PNG plots of tracked coordinates for each selected keypoint with ROI boundaries")
+        layout.addWidget(self.chk_save_tracking_plots)
         
         # Video creation checkbox
         self.chk_create_video = QCheckBox("Create tracked video")
@@ -1978,6 +2096,7 @@ class ROIToolGUI(QMainWindow):
         show_edges = self.chk_show_edges.isChecked()
         show_keypoint_labels = self.chk_show_keypoint_labels.isChecked()
         interpolate_keypoints = self.chk_interpolate.isChecked()
+        save_tracking_plots = self.chk_save_tracking_plots.isChecked()
         
         self.processor = ROIProcessor(
             self.video_configs, 
@@ -1987,7 +2106,8 @@ class ROIToolGUI(QMainWindow):
             show_all_keypoints,
             show_edges,
             show_keypoint_labels,
-            interpolate_keypoints
+            interpolate_keypoints,
+            save_tracking_plots
         )
         self.processor.progress.connect(self.update_progress)
         self.processor.status.connect(self.update_status)
