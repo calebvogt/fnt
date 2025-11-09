@@ -58,7 +58,8 @@ class InferenceWorker(QThread):
                     break
                     
                 video_files = [f for f in os.listdir(folder)
-                              if f.lower().endswith((".mp4", ".avi", ".mov"))]
+                              if f.lower().endswith((".mp4", ".avi", ".mov"))
+                              and not f.endswith("_roiTracked.mp4")]  # Ignore ROI tracked videos
                 
                 if not video_files:
                     self.progress.emit(f"⚠️ No video files found in: {folder}\n")
@@ -1023,7 +1024,8 @@ class VideoInferenceWindow(QWidget):
         video_count = 0
         for folder in self.video_folders:
             video_files = [f for f in os.listdir(folder)
-                          if f.lower().endswith((".mp4", ".avi", ".mov"))]
+                          if f.lower().endswith((".mp4", ".avi", ".mov"))
+                          and not f.endswith("_roiTracked.mp4")]  # Ignore ROI tracked videos
             video_count += len(video_files)
         
         model_type = "Top-Down (Centroid + Centered)" if self.is_top_down else "Bottom-Up"
