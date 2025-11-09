@@ -1,9 +1,21 @@
 # ToDo
-- USV analysis; implement unsupervised clustering, and quick plots feature
+
+# video tracking
 - improve the video tracking/optical flow SAM module tab; still underperforming
+
+# video processing
  - explore CLAHE algo implementation for video processing; may not be necessary
- 
+
+ # sleap ROI tracking
+ - allow scroll wheel zoom and click to pan feature in the video preview. 
+
+
  # UWB
+- add ability to "play" the preview window
+- add animate video functionality to quick viz tool. export options
+- add battery level figure to export options
+
+- create smoothed plots
 - UWB Plots: velocity threshold input not taking, always defaulting to 0.1 (default) even if user inputs values. 
 - behavioral classification module
 - For animation output, add ability to check boxes related to whether aligned IR cameras should be shown, different types of plots, etc, broken up into panels. 
@@ -20,4 +32,8 @@
 - Show the UWB tracking alongside the actual footage; 
 - 
 
-
+# USV
+- USV analysis; implement unsupervised clustering, and quick plots feature
+- add ability to overlay the usv calls with the video, temporally aligned based on shared timestamp (show DAS detection overlay)
+- create UMAP of prairie vole vocalization types
+- 
