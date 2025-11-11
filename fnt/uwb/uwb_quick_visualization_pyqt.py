@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
                              QSpinBox, QSplitter, QFrame, QSlider)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 
@@ -320,6 +320,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.show_trail = False
         self.trail_length = 30  # Changed to seconds
         self.preview_loaded = False
+        
+        # Playback control variables
+        self.is_playing = False
+        self.playback_speed = 1  # 1x, 2x, 4x, etc.
+        self.playback_timer = QTimer()
+        self.playback_timer.timeout.connect(self.advance_playback)
+        
         self.initUI()
         
     def initUI(self):
@@ -650,6 +657,48 @@ class UWBQuickVisualizationWindow(QWidget):
         
         layout.addWidget(self.canvas)
         
+        # Playback controls
+        playback_layout = QHBoxLayout()
+        
+        # Rewind button
+        self.btn_rewind = QPushButton("⏮ Rewind")
+        self.btn_rewind.clicked.connect(self.rewind_playback)
+        self.btn_rewind.setEnabled(False)
+        self.btn_rewind.setMaximumWidth(100)
+        playback_layout.addWidget(self.btn_rewind)
+        
+        # Play/Pause button
+        self.btn_play_pause = QPushButton("▶ Play")
+        self.btn_play_pause.clicked.connect(self.toggle_play_pause)
+        self.btn_play_pause.setEnabled(False)
+        self.btn_play_pause.setMaximumWidth(100)
+        playback_layout.addWidget(self.btn_play_pause)
+        
+        # Fast forward button
+        self.btn_fast_forward = QPushButton("Fast Forward ⏭")
+        self.btn_fast_forward.clicked.connect(self.fast_forward_playback)
+        self.btn_fast_forward.setEnabled(False)
+        self.btn_fast_forward.setMaximumWidth(120)
+        playback_layout.addWidget(self.btn_fast_forward)
+        
+        # Spacer
+        playback_layout.addSpacing(20)
+        
+        # Playback speed label
+        playback_layout.addWidget(QLabel("Speed:"))
+        
+        # Speed selector
+        self.combo_playback_speed = QComboBox()
+        self.combo_playback_speed.addItems(["1x", "2x", "4x", "8x"])
+        self.combo_playback_speed.setCurrentText("1x")
+        self.combo_playback_speed.currentTextChanged.connect(self.on_speed_changed)
+        self.combo_playback_speed.setMaximumWidth(80)
+        playback_layout.addWidget(self.combo_playback_speed)
+        
+        playback_layout.addStretch()
+        
+        layout.addLayout(playback_layout)
+        
         # Time slider
         slider_layout = QVBoxLayout()
         
@@ -840,6 +889,11 @@ class UWBQuickVisualizationWindow(QWidget):
             # Initial visualization
             self.update_visualization(0)
             
+            # Enable playback controls
+            self.btn_rewind.setEnabled(True)
+            self.btn_play_pause.setEnabled(True)
+            self.btn_fast_forward.setEnabled(True)
+            
             # Mark preview as loaded and disable button
             self.preview_loaded = True
             self.btn_load_preview.setEnabled(False)
@@ -945,6 +999,56 @@ class UWBQuickVisualizationWindow(QWidget):
         self.ax.invert_yaxis()
         
         self.canvas.draw()
+    
+    def rewind_playback(self):
+        """Rewind to the beginning"""
+        self.time_slider.setValue(0)
+        if self.is_playing:
+            self.toggle_play_pause()  # Pause if playing
+    
+    def toggle_play_pause(self):
+        """Toggle between play and pause"""
+        if self.is_playing:
+            # Pause
+            self.is_playing = False
+            self.playback_timer.stop()
+            self.btn_play_pause.setText("▶ Play")
+        else:
+            # Play
+            self.is_playing = True
+            # Calculate interval based on playback speed
+            # Base interval is 1000ms (1 second) for 1x speed
+            base_interval = 1000
+            interval = int(base_interval / self.playback_speed)
+            self.playback_timer.start(interval)
+            self.btn_play_pause.setText("⏸ Pause")
+    
+    def fast_forward_playback(self):
+        """Fast forward to the end"""
+        self.time_slider.setValue(self.time_slider.maximum())
+        if self.is_playing:
+            self.toggle_play_pause()  # Pause if playing
+    
+    def on_speed_changed(self, speed_text):
+        """Handle playback speed change"""
+        self.playback_speed = int(speed_text.replace('x', ''))
+        
+        # If currently playing, restart timer with new interval
+        if self.is_playing:
+            base_interval = 1000
+            interval = int(base_interval / self.playback_speed)
+            self.playback_timer.start(interval)
+    
+    def advance_playback(self):
+        """Advance playback by one frame"""
+        current_value = self.time_slider.value()
+        max_value = self.time_slider.maximum()
+        
+        if current_value < max_value:
+            self.time_slider.setValue(current_value + 1)
+        else:
+            # Reached the end, pause playback
+            self.toggle_play_pause()
     
     def export_data(self):
         """Export data and/or plots based on selected options"""

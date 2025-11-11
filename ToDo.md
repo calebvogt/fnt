@@ -6,9 +6,12 @@
 # video processing
  - explore CLAHE algo implementation for video processing; may not be necessary
 
- # sleap ROI tracking
- - allow scroll wheel zoom and click to pan feature in the video preview. 
+ # sleap ROI Tool
+- allow scroll wheel zoom and click to pan feature in the video preview. 
 
+# Sleap EthoScope / Behavioral Catagorizer
+- create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
+- 
 
  # UWB
 - add ability to "play" the preview window

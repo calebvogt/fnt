@@ -172,8 +172,8 @@ class FNTMainWindow(QMainWindow):
         self.create_video_tab()
         self.create_sleap_tab()
         self.create_video_tracking_tab()
-        self.create_usv_tab()
         self.create_uwb_tab()
+        self.create_usv_tab()
         self.create_github_tab()
         self.create_utilities_tab()
         
@@ -360,8 +360,8 @@ class FNTMainWindow(QMainWindow):
         quick_layout = QGridLayout()
         
         quick_buttons = [
-            ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
             ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
+            ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
