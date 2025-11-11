@@ -125,15 +125,16 @@ class BatchTrimWorker(QThread):
             if len(config.crop_polygon) >= 3:
                 temp_mask_file = self.create_mask(config)
                 
-                # Add mask input - use -loop 1 but FORCE stop with -frames:v
-                command.extend([
-                    "-loop", "1",
-                    "-i", temp_mask_file
-                ])
+                # Use movie filter to load mask and apply to every video frame
+                # Convert Windows path to forward slashes and escape properly for FFmpeg
+                mask_path = temp_mask_file.replace('\\', '/')
+                # On Windows, escape the colon in drive letters for movie filter
+                if len(mask_path) > 1 and mask_path[1] == ':':
+                    mask_path = mask_path[0] + '\\:' + mask_path[2:]
                 
-                # Apply alphamerge filter - mask will loop infinitely but we'll limit output
                 filter_complex = (
-                    f"[0:v][1:v]alphamerge[vid_with_alpha];"
+                    f"movie='{mask_path}',scale={config.width}:{config.height}[mask];"
+                    f"[0:v][mask]alphamerge[vid_with_alpha];"
                     f"color=black:s={config.width}x{config.height}[black];"
                     f"[black][vid_with_alpha]overlay=format=auto"
                 )
