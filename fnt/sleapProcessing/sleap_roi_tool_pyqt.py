@@ -274,7 +274,7 @@ class ROIProcessor(QThread):
                 
                 # STEP 2: Interpolate ALL keypoints (if requested for this video)
                 if config.interpolate_keypoints:
-                    df = self.interpolate_all_keypoints(df)
+                    df = self.interpolate_all_keypoints(df, config)
                 
                 # STEP 3: Save tracked coordinates (all keypoints, filtered and interpolated)
                 if config.save_position_coords:
@@ -479,16 +479,18 @@ class ROIProcessor(QThread):
         
         return df_complete
     
-    def interpolate_all_keypoints(self, df: pd.DataFrame) -> pd.DataFrame:
+    def interpolate_all_keypoints(self, df: pd.DataFrame, config: VideoROIConfig) -> pd.DataFrame:
         """
         Interpolate missing coordinates for ALL keypoints (forward-only after first detection).
+        After interpolation, re-filter to remove any interpolated points outside tracking area.
         This is the SECOND step - applied after tracking area filtering.
         
         Args:
             df: DataFrame with tracking data (already filtered by tracking area)
+            config: Video configuration with tracking area
             
         Returns:
-            DataFrame with interpolated values for all keypoints
+            DataFrame with interpolated values for all keypoints (respecting tracking area)
         """
         df = df.copy()
         
@@ -501,6 +503,7 @@ class ROIProcessor(QThread):
         
         # Track interpolation stats for debugging
         total_interpolated = 0
+        total_removed_after_interpolation = 0
         
         # For each keypoint, interpolate x and y coordinates
         for kp in all_keypoints:
@@ -523,11 +526,27 @@ class ROIProcessor(QThread):
                 x_filled = x_nans_before - x_nans_after
                 y_filled = y_nans_before - y_nans_after
                 total_interpolated += x_filled + y_filled
+                
+                # NOW: Re-filter interpolated points to remove any that fall outside tracking area
+                if config.tracking_area_set and config.tracking_area:
+                    for frame_idx, row in df.iterrows():
+                        x = row[x_col]
+                        y = row[y_col]
+                        
+                        # If point is valid but outside tracking area, remove it
+                        if not pd.isna(x) and not pd.isna(y):
+                            if not self.point_in_polygon((x, y), config.tracking_area):
+                                df.at[frame_idx, x_col] = np.nan
+                                df.at[frame_idx, y_col] = np.nan
+                                total_removed_after_interpolation += 1
         
         if total_interpolated > 0:
             self.status.emit(f"Interpolated {total_interpolated} coordinate values across all keypoints")
         else:
             self.status.emit("No missing values to interpolate")
+        
+        if total_removed_after_interpolation > 0:
+            self.status.emit(f"Removed {total_removed_after_interpolation} interpolated points outside tracking area")
         
         return df
     

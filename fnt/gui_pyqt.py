@@ -261,7 +261,7 @@ class FNTMainWindow(QMainWindow):
         # Create buttons with descriptions
         buttons = [
             ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
-            ("Video Trimming", "Interactively trim video files with preview", self.run_video_trim),
+            ("Video Trim and Crop", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
         ]
         

@@ -77,6 +77,12 @@ class VideoTrimDialog(QDialog):
         # Current frame position (in seconds)
         self.current_position = 0.0
         
+        # Crop ROI state
+        self.crop_polygon = []  # List of (x, y) points for crop region
+        self.drawing_crop = False  # Whether user is currently drawing crop region
+        self.current_frame = None  # Store current frame for drawing
+        self.temp_mask_file = None  # Temporary mask file for FFmpeg
+        
         # Duration presets (in seconds)
         self.duration_presets = {
             "1 minute": 60,
@@ -99,8 +105,8 @@ class VideoTrimDialog(QDialog):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("Video Trimming Tool")
-        self.setMinimumSize(900, 700)
+        self.setWindowTitle("Video Trim and Crop")
+        self.setMinimumSize(900, 800)  # Increased height for crop section
         
         # Enable window resize with maximize button, remove help button
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
@@ -199,7 +205,7 @@ class VideoTrimDialog(QDialog):
         main_layout = QVBoxLayout()
         
         # Title
-        title = QLabel("Video Trimming Tool")
+        title = QLabel("Video Trim and Crop")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
@@ -309,6 +315,52 @@ class VideoTrimDialog(QDialog):
         position_group.setLayout(position_layout)
         layout.addWidget(position_group)
         
+        # Crop ROI section (NEW)
+        crop_group = QGroupBox("Select Crop ROI (Optional)")
+        crop_layout = QVBoxLayout()
+        
+        # Instructions
+        crop_instructions = QLabel("Click on the preview image to define a crop region. Area outside the polygon will be black.")
+        crop_instructions.setWordWrap(True)
+        crop_instructions.setStyleSheet("color: #999999; padding: 5px; background-color: transparent;")
+        crop_layout.addWidget(crop_instructions)
+        
+        # Drawing instructions (initially hidden)
+        self.crop_drawing_instructions = QLabel("Click to add points. Press ENTER when done.")
+        self.crop_drawing_instructions.setWordWrap(True)
+        self.crop_drawing_instructions.setAlignment(Qt.AlignCenter)
+        self.crop_drawing_instructions.setStyleSheet("color: #28a745; font-weight: bold; padding: 5px; background-color: transparent;")
+        self.crop_drawing_instructions.setVisible(False)
+        crop_layout.addWidget(self.crop_drawing_instructions)
+        
+        # Crop buttons
+        crop_button_layout = QHBoxLayout()
+        crop_button_layout.addStretch()
+        
+        self.btn_draw_crop = QPushButton("Select Crop ROI")
+        self.btn_draw_crop.setEnabled(False)  # Disabled until video is loaded
+        self.btn_draw_crop.clicked.connect(self.start_drawing_crop)
+        self.btn_draw_crop.setFixedWidth(150)
+        crop_button_layout.addWidget(self.btn_draw_crop)
+        
+        self.btn_clear_crop = QPushButton("Clear Crop")
+        self.btn_clear_crop.setEnabled(False)
+        self.btn_clear_crop.clicked.connect(self.clear_crop)
+        self.btn_clear_crop.setFixedWidth(150)
+        crop_button_layout.addWidget(self.btn_clear_crop)
+        
+        crop_button_layout.addStretch()
+        crop_layout.addLayout(crop_button_layout)
+        
+        # Crop status
+        self.crop_status_label = QLabel("No crop region defined")
+        self.crop_status_label.setAlignment(Qt.AlignCenter)
+        self.crop_status_label.setStyleSheet("color: #999999; padding: 5px; background-color: transparent;")
+        crop_layout.addWidget(self.crop_status_label)
+        
+        crop_group.setLayout(crop_layout)
+        layout.addWidget(crop_group)
+        
         # Duration selection section
         duration_group = QGroupBox("Select Duration")
         duration_layout = QHBoxLayout()
@@ -317,26 +369,35 @@ class VideoTrimDialog(QDialog):
         
         self.duration_combo = QComboBox()
         self.duration_combo.addItems(list(self.duration_presets.keys()))
-        self.duration_combo.setCurrentText("10 minutes")  # Default
+        self.duration_combo.setCurrentText("5 minutes")  # Default
         self.duration_combo.setEnabled(False)  # Disabled until video is loaded
         self.duration_combo.currentTextChanged.connect(self.on_duration_changed)
         self.duration_combo.setMinimumWidth(150)
         duration_layout.addWidget(self.duration_combo)
         
-        # Custom duration spinbox (initially hidden)
-        self.custom_duration_label = QLabel("Custom Duration (seconds):")
-        self.custom_duration_spinbox = QSpinBox()
-        self.custom_duration_spinbox.setMinimum(1)
-        self.custom_duration_spinbox.setMaximum(int(self.duration))
-        self.custom_duration_spinbox.setValue(600)  # Default 10 minutes
-        self.custom_duration_spinbox.setSuffix(" seconds")
-        self.custom_duration_spinbox.setMinimumWidth(150)
+        # Custom duration input (initially hidden)
+        self.custom_duration_label = QLabel("Custom Duration:")
+        self.custom_duration_input = QLineEdit()
+        self.custom_duration_input.setPlaceholderText("Enter value")
+        self.custom_duration_input.setMaximumWidth(100)
+        self.custom_duration_input.setText("5")  # Default value
+        
+        self.custom_duration_unit = QComboBox()
+        self.custom_duration_unit.addItems(["seconds", "minutes", "hours"])
+        self.custom_duration_unit.setCurrentText("minutes")  # Default to minutes
+        self.custom_duration_unit.setMaximumWidth(100)
+        
+        # Connect signals to update end time
+        self.custom_duration_input.textChanged.connect(self.update_end_time_display)
+        self.custom_duration_unit.currentTextChanged.connect(self.update_end_time_display)
         
         self.custom_duration_label.setVisible(False)
-        self.custom_duration_spinbox.setVisible(False)
+        self.custom_duration_input.setVisible(False)
+        self.custom_duration_unit.setVisible(False)
         
         duration_layout.addWidget(self.custom_duration_label)
-        duration_layout.addWidget(self.custom_duration_spinbox)
+        duration_layout.addWidget(self.custom_duration_input)
+        duration_layout.addWidget(self.custom_duration_unit)
         
         # End time display
         duration_layout.addStretch()
@@ -518,9 +579,6 @@ class VideoTrimDialog(QDialog):
         self.position_slider.setMaximum(int(self.duration * 10))
         self.position_slider.setValue(0)
         
-        # Update custom duration spinbox max
-        self.custom_duration_spinbox.setMaximum(int(self.duration))
-        
         # Update output filename
         base_name, ext = os.path.splitext(os.path.basename(self.video_path))
         default_output = f"{base_name}_trimmed.mp4"
@@ -529,7 +587,9 @@ class VideoTrimDialog(QDialog):
         # Enable controls
         self.position_slider.setEnabled(True)
         self.duration_combo.setEnabled(True)
+        self.duration_combo.setCurrentText("5 minutes")  # Reset to default
         self.output_filename.setEnabled(True)
+        self.btn_draw_crop.setEnabled(True)  # Enable crop button
         
         # Update preview
         self.update_preview()
@@ -558,14 +618,30 @@ class VideoTrimDialog(QDialog):
         """Handle duration selection change"""
         is_custom = text == "Custom"
         self.custom_duration_label.setVisible(is_custom)
-        self.custom_duration_spinbox.setVisible(is_custom)
+        self.custom_duration_input.setVisible(is_custom)
+        self.custom_duration_unit.setVisible(is_custom)
         self.update_end_time_display()
     
     def get_selected_duration(self):
         """Get the currently selected duration in seconds"""
         selected = self.duration_combo.currentText()
         if selected == "Custom":
-            return self.custom_duration_spinbox.value()
+            # Parse custom duration
+            try:
+                value = float(self.custom_duration_input.text())
+                unit = self.custom_duration_unit.currentText()
+                
+                # Convert to seconds
+                if unit == "seconds":
+                    return value
+                elif unit == "minutes":
+                    return value * 60
+                elif unit == "hours":
+                    return value * 3600
+                else:
+                    return 300  # Default 5 minutes
+            except ValueError:
+                return 300  # Default 5 minutes if invalid input
         else:
             return self.duration_presets[selected]
     
@@ -577,10 +653,21 @@ class VideoTrimDialog(QDialog):
         
         duration = self.get_selected_duration()
         end_time = min(self.current_position + duration, self.duration)
-        self.end_time_label.setText(
-            f"End Time: {self.format_time(end_time)} "
-            f"(Duration: {self.format_time(duration)})"
-        )
+        actual_duration = end_time - self.current_position
+        
+        # Show warning if duration exceeds video length
+        if end_time >= self.duration and duration > actual_duration:
+            self.end_time_label.setText(
+                f"End Time: {self.format_time(end_time)} "
+                f"(Duration: {self.format_time(actual_duration)}) ⚠️ Video ends here"
+            )
+            self.end_time_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+        else:
+            self.end_time_label.setText(
+                f"End Time: {self.format_time(end_time)} "
+                f"(Duration: {self.format_time(duration)})"
+            )
+            self.end_time_label.setStyleSheet("")
     
     def update_preview(self):
         """Update the video preview frame"""
@@ -595,20 +682,36 @@ class VideoTrimDialog(QDialog):
         ret, frame = self.cap.read()
         
         if ret:
-            # Convert frame to RGB for Qt
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Store the original frame for crop processing
+            self.current_frame = frame.copy()
             
-            # Resize to fit preview (maintain aspect ratio)
-            preview_height = 360
-            preview_width = int(preview_height * self.width / self.height)
-            frame_resized = cv2.resize(frame_rgb, (preview_width, preview_height))
+            # Draw crop polygon on the frame (if any)
+            frame_display = frame.copy()
             
-            # Convert to QImage and display
-            h, w, ch = frame_resized.shape
+            # Draw current polygon being drawn or completed polygon
+            if len(self.crop_polygon) > 0:
+                # Draw lines between points
+                for i in range(len(self.crop_polygon)):
+                    pt1 = self.crop_polygon[i]
+                    pt2 = self.crop_polygon[(i + 1) % len(self.crop_polygon)]
+                    cv2.line(frame_display, pt1, pt2, (0, 255, 0), 2)
+                
+                # Draw points
+                for pt in self.crop_polygon:
+                    cv2.circle(frame_display, pt, 5, (0, 255, 0), -1)
+            
+            # Convert to RGB for Qt
+            frame_rgb = cv2.cvtColor(frame_display, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
             bytes_per_line = ch * w
-            q_image = QImage(frame_resized.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_image)
-            self.preview_label.setPixmap(pixmap)
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Create pixmap and scale to fit preview label
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            self.preview_label.setPixmap(scaled_pixmap)
+            self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
             self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
     
     def trim_video(self):
@@ -633,6 +736,15 @@ class VideoTrimDialog(QDialog):
             QMessageBox.warning(self, "Invalid Range", 
                               "End time must be greater than start time.")
             return
+        
+        # Warn if duration was capped
+        actual_duration = end_time - start_time
+        if actual_duration < duration:
+            QMessageBox.warning(
+                self, "Duration Adjusted",
+                f"Selected duration ({self.format_time(duration)}) exceeds video length.\n"
+                f"Output will be {self.format_time(actual_duration)} (from {self.format_time(start_time)} to end of video)."
+            )
         
         # Get output filename from the text field
         output_filename = self.output_filename.text().strip()
@@ -660,14 +772,58 @@ class VideoTrimDialog(QDialog):
             if reply == QMessageBox.No:
                 return
         
-        # SLEAP-compatible FFmpeg command for precise frame handling
+        # Build FFmpeg command
         command = [
             "ffmpeg",
             "-y",  # Overwrite without asking
             "-i", self.video_path,
             "-ss", str(start_time),
-            "-to", str(end_time),
-            # SLEAP-compatible encoding instead of copy
+            "-to", str(end_time)
+        ]
+        
+        # Add crop filter if defined (mask outside crop region to black)
+        if len(self.crop_polygon) >= 3:
+            # FFmpeg's movie filter has issues with Windows paths
+            # Use a simpler approach: apply the mask using the overlay filter with a pre-generated mask video
+            
+            import tempfile
+            import subprocess
+            
+            # Create a mask image using OpenCV
+            # WHITE inside polygon (keep), BLACK outside (remove)
+            mask = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            pts = np.array(self.crop_polygon, dtype=np.int32)
+            cv2.fillPoly(mask, [pts], (255, 255, 255))
+            
+            # Save mask to temporary file
+            temp_mask = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+            temp_mask_path = temp_mask.name
+            temp_mask.close()
+            cv2.imwrite(temp_mask_path, mask)
+            
+            # Store temp file path for cleanup
+            self.temp_mask_file = temp_mask_path
+            
+            # Add mask input as a separate input file (not via movie filter)
+            # Insert after the main video input
+            command.insert(6, "-loop")  # Loop the mask image
+            command.insert(7, "1")
+            command.insert(8, "-i")
+            command.insert(9, temp_mask_path)
+            
+            # Use filter_complex to apply the mask
+            # Strategy: Create black background, multiply video with mask (whites pixels through, black blocks)
+            # Then overlay the masked video on black background
+            filter_complex = (
+                f"[0:v][1:v]alphamerge[vid_with_alpha];"
+                f"color=black:s={self.width}x{self.height}[black];"
+                f"[black][vid_with_alpha]overlay=format=auto"
+            )
+            
+            command.extend(["-filter_complex", filter_complex])
+        
+        # Add encoding parameters
+        command.extend([
             "-c:v", "libx264",                   # Re-encode video for frame accuracy
             "-preset", "medium",                 # Balance speed/quality
             "-crf", "18",                        # High quality
@@ -678,17 +834,19 @@ class VideoTrimDialog(QDialog):
             "-vsync", "vfr",                     # Variable frame rate (preserves timing)
             "-an",                               # Remove audio to avoid sync issues
             output_file
-        ]
+        ])
         
         # Clear log and prepare UI for processing
         self.log_text.clear()
-        self.log_text.append(f"🎬 Starting video trim...\n")
+        self.log_text.append(f"🎬 Starting video trim{' & crop' if len(self.crop_polygon) >= 3 else ''}...\n")
         self.log_text.append(f"📁 Input: {os.path.basename(self.video_path)}")
         self.log_text.append(f"📁 Output: {output_filename}")
         self.log_text.append(f"⏱️  Start: {self.format_time(start_time)}")
         self.log_text.append(f"⏱️  End: {self.format_time(end_time)}")
-        self.log_text.append(f"⏱️  Duration: {self.format_time(end_time - start_time)}\n")
-        self.log_text.append("Running FFmpeg command...")
+        self.log_text.append(f"⏱️  Output Duration: {self.format_time(end_time - start_time)}")
+        if len(self.crop_polygon) >= 3:
+            self.log_text.append(f"✂️  Crop: {len(self.crop_polygon)} points defined")
+        self.log_text.append("\nRunning FFmpeg command...")
         
         # Update button states
         self.trim_button.setEnabled(False)
@@ -724,6 +882,14 @@ class VideoTrimDialog(QDialog):
         self.trim_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         
+        # Clean up temporary mask file
+        if self.temp_mask_file and os.path.exists(self.temp_mask_file):
+            try:
+                os.remove(self.temp_mask_file)
+                self.temp_mask_file = None
+            except:
+                pass
+        
         # Show completion message in log
         self.log_text.append(f"\n{message}")
         
@@ -734,10 +900,131 @@ class VideoTrimDialog(QDialog):
             # Show error dialog
             QMessageBox.critical(self, "Error", message)
     
+    def start_drawing_crop(self):
+        """Enable crop region drawing mode"""
+        self.drawing_crop = True
+        self.crop_polygon = []
+        
+        # Disable the button and gray it out (don't change text or color)
+        self.btn_draw_crop.setEnabled(False)
+        
+        # Show drawing instructions
+        self.crop_drawing_instructions.setVisible(True)
+        self.crop_status_label.setText("Drawing crop region...")
+        self.crop_status_label.setStyleSheet("color: #28a745; font-weight: bold;")
+        
+        # Enable mouse tracking on preview label
+        self.preview_label.setMouseTracking(True)
+        self.preview_label.mousePressEvent = self.on_preview_click
+        
+        # Enable keyboard event handling for Enter key
+        self.preview_label.setFocusPolicy(Qt.StrongFocus)
+        self.preview_label.setFocus()
+        self.preview_label.keyPressEvent = self.on_preview_key_press
+    
+    def on_preview_key_press(self, event):
+        """Handle key press events on preview label"""
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            if self.drawing_crop and len(self.crop_polygon) >= 3:
+                # Finish drawing
+                self.finish_drawing_crop()
+    
+    def finish_drawing_crop(self):
+        """Finish drawing the crop region"""
+        if len(self.crop_polygon) < 3:
+            QMessageBox.warning(self, "Invalid Crop", "Crop region must have at least 3 points.")
+            return
+        
+        self.drawing_crop = False
+        
+        # Re-enable the draw button
+        self.btn_draw_crop.setEnabled(True)
+        
+        # Enable clear button
+        self.btn_clear_crop.setEnabled(True)
+        
+        # Hide drawing instructions
+        self.crop_drawing_instructions.setVisible(False)
+        
+        # Update status
+        self.crop_status_label.setText(f"✓ Crop region set with {len(self.crop_polygon)} points")
+        self.crop_status_label.setStyleSheet("color: #4caf50; font-weight: bold;")
+        
+        # Disable mouse and keyboard tracking
+        self.preview_label.setMouseTracking(False)
+        self.preview_label.setFocusPolicy(Qt.NoFocus)
+        
+        # Update preview to show final polygon
+        self.update_preview()
+    
+    def on_preview_click(self, event):
+        """Handle mouse click on preview label for crop ROI drawing"""
+        if not self.drawing_crop:
+            return
+        
+        if self.current_frame is None:
+            return
+        
+        # Get label dimensions
+        label_width = self.preview_label.width()
+        label_height = self.preview_label.height()
+        
+        # Calculate scaling (how the frame fits in the label)
+        frame_height, frame_width = self.current_frame.shape[:2]
+        scale = min(label_width / frame_width, label_height / frame_height)
+        
+        # Get click coordinates in original frame space
+        x = int((event.x() - (label_width - frame_width * scale) / 2) / scale)
+        y = int((event.y() - (label_height - frame_height * scale) / 2) / scale)
+        
+        # Clamp to frame bounds
+        x = max(0, min(x, frame_width - 1))
+        y = max(0, min(y, frame_height - 1))
+        
+        # Add point to polygon
+        self.crop_polygon.append((x, y))
+        
+        # Update preview to show the polygon
+        self.update_preview()
+        
+        # Update status
+        self.crop_status_label.setText(f"{len(self.crop_polygon)} points defined. Press ENTER when done.")
+    
+    def clear_crop(self):
+        """Clear the crop region"""
+        # Clear the polygon data
+        self.crop_polygon = []
+        self.drawing_crop = False
+        
+        # Reset button states
+        self.btn_draw_crop.setEnabled(True)
+        self.btn_clear_crop.setEnabled(False)
+        
+        # Hide instructions if showing
+        self.crop_drawing_instructions.hide()
+        
+        # Update status
+        self.crop_status_label.setText("No crop region defined")
+        self.crop_status_label.setStyleSheet("color: #999999; padding: 5px; background-color: transparent;")
+        
+        # Disable mouse tracking
+        self.preview_label.setMouseTracking(False)
+        
+        # Refresh preview
+        self.update_preview()
+    
     def closeEvent(self, event):
         """Clean up when dialog is closed"""
         if self.cap:
             self.cap.release()
+        
+        # Clean up temporary mask file
+        if self.temp_mask_file and os.path.exists(self.temp_mask_file):
+            try:
+                os.remove(self.temp_mask_file)
+            except:
+                pass
+        
         event.accept()
 
 
