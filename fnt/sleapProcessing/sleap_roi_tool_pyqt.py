@@ -8,13 +8,13 @@ Analyzes animal position within defined regions and generates occupancy statisti
 Workflow:
 1. Select videos + corresponding CSV files (predictions.analysis.csv)
 2. Set tracking area (optional) - exclude areas outside arena
-3. Draw ROIs (Open Field Test, Light-Dark Box, Custom)
+3. Draw ROIs (Open Field Test, Light-Dark Box light area only, Custom)
 4. Select keypoints for analysis
 5. Process batch - generate occupancy data, summary stats, and tracked videos
 
 Features:
 - Flexible ROI definition (polygon-based)
-- Multiple ROI types (OFT outer/center, LDB light/dark, custom)
+- Multiple ROI types (OFT outer/center, LDB light area, custom)
 - Per-keypoint analysis
 - Occupancy timeseries and summary statistics
 - Video rendering with ROI overlays
@@ -98,6 +98,7 @@ class VideoROIConfig:
         self.show_all_keypoints = False  # Default
         self.show_edges = True  # Default
         self.show_keypoint_labels = False  # Default
+        self.save_data_view = False  # Default - video + live statistics panel
         self.overwrite_files = True  # Default
     
     def add_roi(self, name: str, polygon: List[Tuple[int, int]]):
@@ -159,6 +160,7 @@ class VideoROIConfig:
             'show_all_keypoints': self.show_all_keypoints,
             'show_edges': self.show_edges,
             'show_keypoint_labels': self.show_keypoint_labels,
+            'save_data_view': self.save_data_view,
             'overwrite_files': self.overwrite_files
         }
     
@@ -186,6 +188,7 @@ class VideoROIConfig:
         self.show_all_keypoints = config_dict.get('show_all_keypoints', False)
         self.show_edges = config_dict.get('show_edges', True)
         self.show_keypoint_labels = config_dict.get('show_keypoint_labels', False)
+        self.save_data_view = config_dict.get('save_data_view', False)
         self.overwrite_files = config_dict.get('overwrite_files', True)
 
 
@@ -250,6 +253,51 @@ class ROIProcessor(QThread):
         output_name = video_base.replace('.mp4', suffix)
         return os.path.join(analysis_folder_path, output_name)
     
+    def clear_existing_outputs(self, config: VideoROIConfig):
+        """
+        Clear all existing output files for this video EXCEPT the JSON config file.
+        The JSON config will be overwritten/updated with new run information.
+        
+        Deletes: CSV files, PNG plots, tracked videos
+        Preserves: JSON config file (will be updated)
+        """
+        try:
+            video_base = os.path.basename(config.video_path)
+            video_dir = os.path.dirname(config.video_path)
+            
+            # Get roiAnalysis folder path
+            analysis_folder = f"{video_base}_roiAnalysis"
+            analysis_folder_path = os.path.join(video_dir, analysis_folder)
+            
+            if not os.path.exists(analysis_folder_path):
+                return  # Nothing to clear
+            
+            # Get list of all files in the analysis folder
+            files_deleted = 0
+            for filename in os.listdir(analysis_folder_path):
+                file_path = os.path.join(analysis_folder_path, filename)
+                
+                # Skip if it's a directory
+                if os.path.isdir(file_path):
+                    continue
+                
+                # Skip JSON config files - they will be overwritten/updated
+                if filename.endswith('_roiConfig.json'):
+                    continue
+                
+                # Delete all other files (CSV, PNG, MP4, etc.)
+                try:
+                    os.remove(file_path)
+                    files_deleted += 1
+                except Exception as e:
+                    self.status.emit(f"Warning: Could not delete {filename}: {str(e)}")
+            
+            if files_deleted > 0:
+                self.status.emit(f"✓ Cleared {files_deleted} existing output file(s) (JSON config preserved)")
+        
+        except Exception as e:
+            self.status.emit(f"Warning: Error clearing existing outputs: {str(e)}")
+    
     def run(self):
         """Process all videos."""
         total_videos = len(self.video_configs)
@@ -263,6 +311,10 @@ class ROIProcessor(QThread):
             self.status.emit(f"Processing video {video_idx + 1}/{total_videos}: {os.path.basename(config.video_path)}")
             
             try:
+                # Handle overwrite: delete all existing output files EXCEPT JSON config
+                if config.overwrite_files:
+                    self.clear_existing_outputs(config)
+                
                 # Load tracking data
                 df = pd.read_csv(config.csv_path)
                 
@@ -314,8 +366,12 @@ class ROIProcessor(QThread):
                     self.status.emit(f"Skipping tracking plots (not enabled)")
                 
                 # Create tracked video if requested
+                # If data view is enabled, it replaces the tracked video (includes stats panel)
                 if config.create_tracked_video:
-                    self.create_tracked_video(config, occupancy_df, df, video_idx)
+                    if config.save_data_view:
+                        self.create_data_view_video(config, occupancy_df, df, video_idx)
+                    else:
+                        self.create_tracked_video(config, occupancy_df, df, video_idx)
                 
                 self.video_finished.emit(video_idx, True, f"Completed: {os.path.basename(config.video_path)}")
                 successful += 1
@@ -1101,6 +1157,255 @@ class ROIProcessor(QThread):
         cap.release()
         out.release()
     
+    def create_data_view_video(self, config: VideoROIConfig, occupancy_df: pd.DataFrame, df: pd.DataFrame, video_idx: int):
+        """Create video with video on left (with all overlays) and live statistics panel on right.
+        
+        Args:
+            config: Video configuration
+            occupancy_df: ROI occupancy results with per-frame statistics
+            df: Tracking data (potentially interpolated)
+            video_idx: Index of current video being processed
+        """
+        self.status.emit(f"Rendering data view video...")
+        
+        # Open video
+        cap = cv2.VideoCapture(config.video_path)
+        if not cap.isOpened():
+            return
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Panel dimensions
+        panel_width = 500  # Right panel for statistics
+        output_width = video_width + panel_width
+        output_height = video_height
+        
+        # Output path - use tracked video name since it replaces it
+        output_path = self.get_output_path(config.video_path, config.csv_path, '_roiTracked.mp4')
+        
+        # Video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+        
+        # Get all available keypoints from CSV for skeleton edges
+        all_keypoints = []
+        for col in df.columns:
+            if col.endswith('.x') and not col.startswith('track'):
+                keypoint_name = col[:-2]  # Remove '.x'
+                all_keypoints.append(keypoint_name)
+        
+        # Detect skeleton edges
+        skeleton_edges = self.detect_skeleton_edges(df, all_keypoints)
+        
+        # Get selected keypoints and ROI names
+        keypoints_to_track = config.selected_keypoints if config.selected_keypoints else []
+        roi_names = config.get_roi_names()
+        
+        # Pre-calculate cumulative statistics for each keypoint-ROI pair
+        cumulative_stats = {}
+        for kp in keypoints_to_track:
+            cumulative_stats[kp] = {}
+            for roi in roi_names:
+                cumulative_stats[kp][roi] = {
+                    'frames_in_roi': 0,
+                    'entries': 0,
+                    'was_in_roi': False
+                }
+        
+        # Check if CSV has frame_idx column
+        if 'frame_idx' in df.columns:
+            frame_to_row = {int(row['frame_idx']): idx for idx, row in enumerate(df.to_dict('records'))}
+        elif 'frame' in df.columns:
+            frame_to_row = {int(row['frame']): idx for idx, row in enumerate(df.to_dict('records'))}
+        else:
+            frame_to_row = {idx: idx for idx in range(len(df))}
+        
+        video_frame_number = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Emit progress update
+            if video_frame_number % 10 == 0:
+                self.progress.emit(video_idx, video_frame_number, total_video_frames)
+            
+            # ===== DRAW ALL VIDEO OVERLAYS (same as create_tracked_video) =====
+            
+            # Draw ROIs (if enabled)
+            if config.show_rois:
+                for roi_name, roi_polygon in config.rois:
+                    if 'center' in roi_name.lower() or 'inner' in roi_name.lower():
+                        color = (0, 165, 255)  # Orange
+                    elif 'light' in roi_name.lower():
+                        color = (0, 255, 0)  # Green
+                    elif 'dark' in roi_name.lower():
+                        color = (0, 255, 255)  # Yellow
+                    else:
+                        color = (0, 255, 0)  # Green default
+                    
+                    pts = np.array(roi_polygon, dtype=np.int32)
+                    cv2.polylines(frame, [pts], True, color, 2)
+                    
+                    # Add label
+                    if len(roi_polygon) > 0:
+                        cv2.putText(frame, roi_name, tuple(roi_polygon[0]), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Draw tracking area (if enabled)
+            if config.show_tracking_area and config.tracking_area_set and config.tracking_area:
+                pts = np.array(config.tracking_area, dtype=np.int32)
+                cv2.polylines(frame, [pts], True, (255, 0, 255), 2)  # Magenta
+            
+            # Draw keypoints - look up the correct row based on frame number
+            if video_frame_number in frame_to_row:
+                row_idx = frame_to_row[video_frame_number]
+                row = df.iloc[row_idx]
+                
+                # Determine which keypoints to display
+                if config.show_all_keypoints:
+                    keypoints_to_show = all_keypoints
+                else:
+                    keypoints_to_show = config.selected_keypoints
+                
+                # Store keypoint positions for edge drawing
+                keypoint_positions = {}
+                
+                # First pass: collect keypoint positions
+                for keypoint in keypoints_to_show:
+                    x_col = f"{keypoint}.x"
+                    y_col = f"{keypoint}.y"
+                    
+                    if x_col in df.columns and y_col in df.columns:
+                        x = row[x_col]
+                        y = row[y_col]
+                        
+                        # If valid (not NaN), include it
+                        if not pd.isna(x) and not pd.isna(y):
+                            keypoint_positions[keypoint] = (int(x), int(y))
+                
+                # Draw skeleton edges FIRST (so they appear below keypoints)
+                if config.show_edges:
+                    for kp1, kp2 in skeleton_edges:
+                        if kp1 in keypoint_positions and kp2 in keypoint_positions:
+                            pt1 = keypoint_positions[kp1]
+                            pt2 = keypoint_positions[kp2]
+                            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)  # Yellow lines
+                
+                # Draw keypoints SECOND (so they appear above edges)
+                for keypoint in keypoints_to_show:
+                    if keypoint in keypoint_positions:
+                        x, y = keypoint_positions[keypoint]
+                        
+                        # Color: blue for selected keypoints, red for others
+                        if keypoint in config.selected_keypoints:
+                            color = (255, 0, 0)  # Blue for selected
+                        else:
+                            color = (0, 0, 255)  # Red for unselected
+                        
+                        cv2.circle(frame, (x, y), 5, color, -1)
+                        
+                        # Draw label if enabled
+                        if config.show_keypoint_labels:
+                            cv2.putText(frame, keypoint, (x + 10, y), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # ===== UPDATE CUMULATIVE STATISTICS =====
+            if video_frame_number < len(occupancy_df):
+                occ_row = occupancy_df.iloc[video_frame_number]
+                for kp in keypoints_to_track:
+                    region_col = f"{kp}_region"
+                    if region_col in occupancy_df.columns:
+                        current_roi = occ_row[region_col]
+                        
+                        # Update stats for each ROI
+                        for roi in roi_names:
+                            if kp in cumulative_stats and roi in cumulative_stats[kp]:
+                                is_in_roi = (current_roi == roi)
+                                
+                                if is_in_roi:
+                                    cumulative_stats[kp][roi]['frames_in_roi'] += 1
+                                
+                                # Detect entry (transition from out to in)
+                                if is_in_roi and not cumulative_stats[kp][roi]['was_in_roi']:
+                                    cumulative_stats[kp][roi]['entries'] += 1
+                                
+                                cumulative_stats[kp][roi]['was_in_roi'] = is_in_roi
+            
+            # ===== CREATE COMPOSITE WITH STATS PANEL =====
+            composite = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+            composite[:, :video_width] = frame
+            
+            # Draw statistics panel (dark background)
+            panel_color = (40, 40, 40)
+            composite[:, video_width:] = panel_color
+            
+            # Draw statistics text
+            y_offset = 40
+            line_height = 30
+            
+            # Title
+            cv2.putText(composite, "Live Statistics", (video_width + 20, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            y_offset += line_height + 10
+            
+            # Frame number
+            cv2.putText(composite, f"Frame: {video_frame_number}", (video_width + 20, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            y_offset += line_height
+            
+            # Time (if fps available)
+            if fps > 0:
+                time_sec = video_frame_number / fps
+                cv2.putText(composite, f"Time: {time_sec:.2f}s", (video_width + 20, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                y_offset += line_height + 20
+            else:
+                y_offset += 20
+            
+            # Statistics for each keypoint-ROI pair
+            for kp in keypoints_to_track:
+                # Keypoint header
+                cv2.putText(composite, f"{kp}:", (video_width + 10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 200, 255), 2)
+                y_offset += line_height
+                
+                for roi in roi_names:
+                    if kp in cumulative_stats and roi in cumulative_stats[kp]:
+                        stats = cumulative_stats[kp][roi]
+                        frames_in = stats['frames_in_roi']
+                        entries = stats['entries']
+                        
+                        # Calculate time in ROI
+                        if fps > 0:
+                            time_in_roi = frames_in / fps
+                            time_str = f"{time_in_roi:.2f}s"
+                        else:
+                            time_str = f"{frames_in} fr"
+                        
+                        # ROI statistics (indented)
+                        text = f"  {roi}: {time_str}"
+                        cv2.putText(composite, text, (video_width + 20, y_offset),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                        y_offset += line_height - 5
+                        
+                        # Entries (indented more)
+                        text = f"    Entries: {entries}"
+                        cv2.putText(composite, text, (video_width + 20, y_offset),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                        y_offset += line_height - 5
+                
+                y_offset += 10  # Extra space between keypoints
+            
+            out.write(composite)
+            video_frame_number += 1
+        
+        cap.release()
+        out.release()
+    
     def cancel(self):
         """Cancel processing."""
         self.cancelled = True
@@ -1124,6 +1429,7 @@ class ROIToolGUI(QMainWindow):
         self.drawing_mode = None  # 'tracking_area', 'oft', 'ldb_light', 'ldb_dark', 'custom', 'scale_bar'
         self.current_polygon = []
         self.oft_outer_polygon = []
+        self.last_roi_layout = None  # Track which layout was just completed ('oft' or 'ldb')
         
         # Scale bar state
         self.scale_bar_points = []  # Two points for scale bar
@@ -1947,6 +2253,7 @@ class ROIToolGUI(QMainWindow):
         """Start OFT layout drawing."""
         self.drawing_mode = 'oft'
         self.current_polygon = []
+        self.last_roi_layout = 'oft'  # Track for scale bar default
         self.lbl_instructions.setText("OFT STEP 1 of 2: Click 4 corners of the Open Field Test floor. Press ENTER when done.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
         
@@ -1959,7 +2266,8 @@ class ROIToolGUI(QMainWindow):
         """Start Light-Dark Box drawing."""
         self.drawing_mode = 'ldb_light'
         self.current_polygon = []
-        self.lbl_instructions.setText("LDB STEP 1 of 3: Draw the LIGHT box area (polygon). Press ENTER when done.")
+        self.last_roi_layout = 'ldb'  # Track for scale bar default
+        self.lbl_instructions.setText("LDB STEP 1 of 2: Draw the LIGHT box area (polygon). Press ENTER when done.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
         
         # Disable other ROI buttons while drawing
@@ -1999,12 +2307,19 @@ class ROIToolGUI(QMainWindow):
         p1, p2 = self.scale_bar_points
         pixel_distance = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
         
+        # Determine default scale bar distance based on ROI layout type
+        # LDB boxes are 28.4cm in the lab, OFT arenas are 50cm
+        if self.last_roi_layout == 'ldb':
+            default_distance = 28.4
+        else:  # OFT or custom
+            default_distance = 50.0
+        
         # Ask user for real-world distance
         distance_cm, ok = QInputDialog.getDouble(
             self,
             "Set Scale Bar",
             f"Distance between points: {pixel_distance:.1f} pixels\n\nEnter the real-world distance in cm:",
-            value=50.0,
+            value=default_distance,
             min=0.1,
             max=1000.0,
             decimals=2
@@ -2142,23 +2457,11 @@ class ROIToolGUI(QMainWindow):
             config.add_roi('ldb_light', self.current_polygon.copy())
             self.update_roi_table()
             
-            # Now prompt for dark box
-            self.drawing_mode = 'ldb_dark'
-            self.current_polygon = []
-            self.lbl_instructions.setText("LDB STEP 2 of 3: Draw the DARK box area (polygon). Press ENTER when done.")
-            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
-            self.redraw_preview()
-            return
-            
-        elif self.drawing_mode == 'ldb_dark':
-            config.add_roi('ldb_dark', self.current_polygon.copy())
-            self.update_roi_table()
-            
             # LDB requires scale bar - transition to scale bar setting
             self.drawing_mode = 'scale_bar'
             self.current_polygon = []
             self.scale_bar_points = []
-            self.lbl_instructions.setText("LDB STEP 3 of 3: Click two points to set scale bar, then enter the known distance in cm.")
+            self.lbl_instructions.setText("LDB STEP 2 of 2: Click two points to set scale bar, then enter the known distance in cm.")
             self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             self.redraw_preview()
             return
@@ -2479,6 +2782,7 @@ class ROIToolGUI(QMainWindow):
         config.show_all_keypoints = self.chk_show_all_keypoints.isChecked()
         config.show_edges = self.chk_show_edges.isChecked()
         config.show_keypoint_labels = self.chk_show_keypoint_labels.isChecked()
+        config.save_data_view = self.chk_data_view.isChecked()
         config.overwrite_files = self.chk_overwrite.isChecked()
     
     def load_ui_settings_from_config(self, config):
@@ -2498,6 +2802,7 @@ class ROIToolGUI(QMainWindow):
         self.chk_show_all_keypoints.setChecked(config.show_all_keypoints)
         self.chk_show_edges.setChecked(config.show_edges)
         self.chk_show_keypoint_labels.setChecked(config.show_keypoint_labels)
+        self.chk_data_view.setChecked(config.save_data_view)
         self.chk_overwrite.setChecked(config.overwrite_files)
     
     def add_current_video_to_queue(self):
