@@ -1,7 +1,7 @@
 """
-SLEAP Video Inference Only - PyQt5 Implementation
+SLEAP Inference Tool - PyQt5 Implementation
 
-Run SLEAP inference without tracking on video files.
+Run SLEAP inference with optional tracking on video files.
 Supports both top-down (centroid + centered instance) and bottom-up models.
 Automatically converts output to CSV format.
 """
@@ -24,16 +24,15 @@ class InferenceWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, video_folders, individual_videos, model_paths, overwrite_existing, create_csv=True, create_video=False, add_tracking=False, 
+    def __init__(self, video_folders, individual_videos, model_paths, overwrite_existing, create_csv=True, add_tracking=False, 
                  tracker_method="simple", similarity_method="instance", match_method="greedy", 
-                 max_tracks=0, track_window=5, robust_quantile=1.0, conda_env=None):
+                 max_tracks=0, track_window=10, robust_quantile=0.95, post_connect_breaks=False, conda_env=None):
         super().__init__()
         self.video_folders = video_folders
         self.individual_videos = individual_videos
         self.model_paths = model_paths
         self.overwrite_existing = overwrite_existing
         self.create_csv = create_csv
-        self.create_video = create_video
         self.add_tracking = add_tracking
         self.tracker_method = tracker_method
         self.similarity_method = similarity_method
@@ -41,6 +40,7 @@ class InferenceWorker(QThread):
         self.max_tracks = max_tracks
         self.track_window = track_window
         self.robust_quantile = robust_quantile
+        self.post_connect_breaks = post_connect_breaks
         self.conda_env = conda_env
         self._stop_requested = False
     
@@ -188,40 +188,53 @@ class InferenceWorker(QThread):
         return os.path.join(parent, filename)
     
     def run_inference_on_video(self, video_file):
-        """Run SLEAP inference on a single video"""
+        """Run SLEAP inference on a single video using SLEAP v1.5.2 syntax"""
         cmd = ["sleap-track", video_file]
         
-        # In SLEAP v1.5.1, -m expects the model directory, not the training_config.json file
+        # Add model paths
         for model_path in self.model_paths:
-            cmd += ["-m", model_path]  # Pass the directory directly
+            cmd += ["-m", model_path]
         
         output_file = self.get_output_path(video_file)
         
-        # Basic inference parameters for SLEAP v1.5.1
+        # Basic inference parameters
         cmd += [
             "-o", output_file,
             "--batch_size", "4",
             "--gpu", "auto",
-            "--peak_threshold", "0.2"  # This IS available in v1.5.1!
+            "--peak_threshold", "0.2"
         ]
         
-        # Add tracking parameters if enabled (using correct v1.5.1 syntax)
+        # Add tracking parameters if enabled (SLEAP v1.5.2 syntax)
         if self.add_tracking:
-            cmd += [
-                "--tracking.tracker", self.tracker_method,
-                "--tracking.similarity", self.similarity_method,
-                "--tracking.match", self.match_method
-            ]
+            # Add max_instances first (required for post_connect_single_breaks)
+            if self.max_tracks > 0:
+                cmd += ["--max_instances", str(self.max_tracks)]
             
-            # Add advanced tracking parameters if provided
-            if hasattr(self, 'max_tracks') and self.max_tracks > 0:
+            cmd += ["--tracking.tracker", self.tracker_method]
+            
+            # Add similarity method
+            cmd += ["--tracking.similarity", self.similarity_method]
+            
+            # Add match method
+            cmd += ["--tracking.match", self.match_method]
+            
+            # Add max_tracks parameter
+            if self.max_tracks > 0:
                 cmd += ["--tracking.max_tracks", str(self.max_tracks)]
             
-            if hasattr(self, 'track_window') and self.track_window != 5:  # 5 is default
+            # Add track window (default is 5, but we use 10)
+            if self.track_window != 5:
                 cmd += ["--tracking.track_window", str(self.track_window)]
                 
-            if hasattr(self, 'robust_quantile') and self.robust_quantile != 1.0:  # 1.0 is default
+            # Add robust quantile setting
+            # In SLEAP 1.5.2: if robust_quantile < 1.0, use robust mode; if 1.0, use max (non-robust)
+            if self.robust_quantile < 1.0:
                 cmd += ["--tracking.robust", str(self.robust_quantile)]
+            
+            # Add post-processing option if enabled (requires max_instances to be set)
+            if self.post_connect_breaks:
+                cmd += ["--tracking.post_connect_single_breaks", "1"]
         
         self.progress.emit(f"\n🔁 Running inference on: {os.path.basename(video_file)}")
         
@@ -237,7 +250,6 @@ class InferenceWorker(QThread):
         
         try:
             # Execute command using conda run
-            # Note: SLEAP doesn't stream progress, so we'll show a generic progress indicator
             self.progress.emit("🔄 Running SLEAP inference... (this may take several minutes)")
             self.progress.emit("⏳ SLEAP is processing frames - progress will appear when complete")
             
@@ -267,10 +279,6 @@ class InferenceWorker(QThread):
                 # Convert to CSV if requested
                 if self.create_csv:
                     self.convert_to_csv(output_file)
-                
-                # Render tracked video if requested
-                if self.create_video:
-                    self.render_video(output_file, video_file)
                     
                 return True
             else:
@@ -315,72 +323,6 @@ class InferenceWorker(QThread):
         except Exception as e:
             self.progress.emit(f"⚠️ CSV conversion error: {str(e)}")
     
-    def render_video(self, slp_file, video_file):
-        """Render tracked video with predictions overlay using sleap-render"""
-        # Generate output video path
-        video_output = slp_file.replace(".predictions.slp", ".predictions.mp4")
-        
-        if os.path.exists(video_output) and not self.overwrite_existing:
-            self.progress.emit(f"⏭️ Skipping video rendering: {os.path.basename(video_output)} already exists")
-            return
-        
-        self.progress.emit(f"🎬 Rendering tracked video: {os.path.basename(slp_file)}")
-        
-        try:
-            # Build sleap-render command (without frame limits - render all frames)
-            cmd = ["sleap-render", slp_file, "-o", video_output]
-            
-            # Let SLEAP render all frames automatically without specifying frame range
-            self.progress.emit(f"   Rendering all frames from: {os.path.basename(slp_file)}")
-            
-            if self.conda_env:
-                full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
-            else:
-                full_cmd = cmd
-            
-            # Log the command being executed
-            cmd_str = " ".join(full_cmd)
-            self.progress.emit(f"   Command: {cmd_str}")
-            self.progress.emit(f"   Output: {video_output}")
-                
-            result = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                shell=True
-            )
-            
-            if result.returncode == 0:
-                self.progress.emit(f"✅ Video rendered: {os.path.basename(video_output)}")
-            else:
-                self.progress.emit(f"⚠️ Video rendering failed (return code {result.returncode})")
-                if result.stderr:
-                    self.progress.emit(f"   stderr: {result.stderr[:500]}")
-                if result.stdout:
-                    self.progress.emit(f"   stdout: {result.stdout[:500]}")
-                
-        except Exception as e:
-            self.progress.emit(f"⚠️ Video rendering error: {str(e)}")
-    
-    def get_video_frame_count(self, video_file):
-        """Get the total number of frames in a video using ffprobe"""
-        try:
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-count_packets",
-                "-show_entries", "stream=nb_read_packets",
-                "-of", "csv=p=0",
-                video_file
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip())
-        except:
-            pass
-        
-        return 0
 
 
 class VideoInferenceWindow(QWidget):
@@ -592,11 +534,6 @@ class VideoInferenceWindow(QWidget):
         self.chk_create_csv.setChecked(True)
         options_layout.addWidget(self.chk_create_csv)
         
-        # Rendered Video Option
-        self.chk_create_video = QCheckBox("Create tracked video with predictions overlay")
-        self.chk_create_video.setChecked(False)
-        options_layout.addWidget(self.chk_create_video)
-        
         self.chk_overwrite = QCheckBox("Overwrite existing prediction files")
         self.chk_overwrite.setChecked(True)
         options_layout.addWidget(self.chk_overwrite)
@@ -708,7 +645,7 @@ class VideoInferenceWindow(QWidget):
         self.spin_track_window = QSpinBox()
         self.spin_track_window.setMinimum(1)
         self.spin_track_window.setMaximum(20)
-        self.spin_track_window.setValue(5)
+        self.spin_track_window.setValue(10)  # Default is 10 in SLEAP 1.5.2
         self.spin_track_window.setToolTip("How many frames back to look for matches")
         self.spin_track_window.setStyleSheet("""
             QSpinBox {
@@ -726,8 +663,8 @@ class VideoInferenceWindow(QWidget):
         self.spin_robust.setMinimum(0.0)
         self.spin_robust.setMaximum(1.0)
         self.spin_robust.setSingleStep(0.05)
-        self.spin_robust.setValue(1.0)
-        self.spin_robust.setToolTip("Robust quantile of similarity score (1.0 = non-robust)")
+        self.spin_robust.setValue(0.95)  # Default is 0.95 (robust) in SLEAP 1.5.2
+        self.spin_robust.setToolTip("Robust quantile of similarity score (1.0 = use max, non-robust)")
         self.spin_robust.setStyleSheet("""
             QDoubleSpinBox {
                 background-color: #1e1e1e;
@@ -740,6 +677,13 @@ class VideoInferenceWindow(QWidget):
         grid_layout.addWidget(self.spin_robust, 2, 3)
         
         tracking_layout.addLayout(grid_layout)
+        
+        # Post-processing checkbox
+        self.chk_post_connect = QCheckBox("Connect single track breaks (post-processing)")
+        self.chk_post_connect.setChecked(False)
+        self.chk_post_connect.setToolTip("Fill in single-frame gaps in tracks after tracking")
+        tracking_layout.addWidget(self.chk_post_connect)
+        
         self.tracking_widget.setLayout(tracking_layout)
         self.tracking_widget.setVisible(False)  # Hidden by default
         options_layout.addWidget(self.tracking_widget)
@@ -1015,6 +959,46 @@ class VideoInferenceWindow(QWidget):
             self.log(f"❌ Error testing SLEAP: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error testing SLEAP: {str(e)}")
     
+    def find_centered_instance_model(self, centroid_folder):
+        """Automatically find the matching centered instance model based on centroid folder.
+        
+        Looks for a sibling folder with the same date and n=X pattern but with 'centered_instance' in the name.
+        Example: 
+            Centroid: .../251110_231303.centroid.n=250
+            Centered: .../251110_231345.centered_instance.n=250
+        """
+        import re
+        
+        parent_dir = os.path.dirname(centroid_folder)
+        centroid_basename = os.path.basename(centroid_folder)
+        
+        # Extract date pattern (YYMMDD_HHMMSS) and n=X from centroid folder
+        date_match = re.search(r'(\d{6}_\d{6})', centroid_basename)
+        n_match = re.search(r'n=(\d+)', centroid_basename)
+        
+        if not date_match or not n_match:
+            return None
+        
+        date_prefix = date_match.group(1)[:6]  # Just the YYMMDD part
+        n_value = n_match.group(1)
+        
+        # Look for matching centered_instance folder
+        if not os.path.exists(parent_dir):
+            return None
+        
+        for folder_name in os.listdir(parent_dir):
+            folder_path = os.path.join(parent_dir, folder_name)
+            if not os.path.isdir(folder_path):
+                continue
+            
+            # Check if it matches the pattern: same date prefix, contains 'centered_instance', and same n=X
+            if (folder_name.startswith(date_prefix) and 
+                'centered_instance' in folder_name.lower() and 
+                f'n={n_value}' in folder_name):
+                return folder_path
+        
+        return None
+    
     def select_topdown_models(self):
         """Select top-down models (centroid + centered instance)"""
         self.is_top_down = True
@@ -1029,13 +1013,20 @@ class VideoInferenceWindow(QWidget):
         if not centroid_folder:
             return
         
-        # Select centered instance model
-        centered_folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select CENTERED INSTANCE model folder"
-        )
-        if not centered_folder:
-            return
+        # Try to automatically find centered instance model
+        centered_folder = self.find_centered_instance_model(centroid_folder)
+        
+        if centered_folder:
+            self.log(f"🔍 Auto-detected centered instance model: {os.path.basename(centered_folder)}")
+        else:
+            # Fallback to manual selection if auto-detection fails
+            self.log("⚠️ Could not auto-detect centered instance model. Please select manually.")
+            centered_folder = QFileDialog.getExistingDirectory(
+                self,
+                "Select CENTERED INSTANCE model folder"
+            )
+            if not centered_folder:
+                return
         
         self.model_paths = [centroid_folder, centered_folder]
         self.model_list.addItem(f"Centroid: {centroid_folder}")
@@ -1113,6 +1104,7 @@ class VideoInferenceWindow(QWidget):
             msg += f"  - Similarity: {self.combo_similarity.currentText()}\n"
             msg += f"  - Match: {self.combo_match.currentText()}\n"
             msg += f"  - Max Tracks: {self.spin_max_tracks.value() if self.spin_max_tracks.value() > 0 else 'No limit'}\n"
+            msg += f"  - Post-connect breaks: {'Yes' if self.chk_post_connect.isChecked() else 'No'}\n"
         msg += "\nContinue?"
         
         reply = QMessageBox.question(
@@ -1145,14 +1137,14 @@ class VideoInferenceWindow(QWidget):
             self.model_paths,
             self.chk_overwrite.isChecked(),
             self.chk_create_csv.isChecked(),
-            self.chk_create_video.isChecked(),
             self.chk_tracking.isChecked(),
             self.combo_tracker.currentText(),
             self.combo_similarity.currentText(),
             self.combo_match.currentText(),
             self.spin_max_tracks.value() if hasattr(self, 'spin_max_tracks') else 0,
-            self.spin_track_window.value() if hasattr(self, 'spin_track_window') else 5,
-            self.spin_robust.value() if hasattr(self, 'spin_robust') else 1.0,
+            self.spin_track_window.value() if hasattr(self, 'spin_track_window') else 10,
+            self.spin_robust.value() if hasattr(self, 'spin_robust') else 0.95,
+            self.chk_post_connect.isChecked() if hasattr(self, 'chk_post_connect') else False,
             self.combo_environment.currentData()
         )
         self.worker.progress.connect(self.log)
