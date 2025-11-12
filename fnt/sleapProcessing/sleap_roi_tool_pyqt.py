@@ -344,12 +344,17 @@ class ROIProcessor(QThread):
                         occupancy_path = self.get_output_path(config.video_path, config.csv_path, f'_roiOccupancy_{keypoint}.csv')
                         keypoint_occupancy.to_csv(occupancy_path, index=False)
                 
-                # Calculate and save summary statistics - one file per keypoint (if requested)
+                # Calculate and save summary statistics - combined file for all keypoints (if requested)
                 if config.save_roi_summary:
+                    all_summaries = []
                     for keypoint in config.selected_keypoints:
                         summary_df = self.calculate_summary_long_format(config, occupancy_df, df, keypoint)
-                        summary_path = self.get_output_path(config.video_path, config.csv_path, f'_roiSummary_{keypoint}.csv')
-                        summary_df.to_csv(summary_path, index=False)
+                        all_summaries.append(summary_df)
+                    
+                    # Combine all keypoint summaries into a single DataFrame
+                    combined_summary = pd.concat(all_summaries, ignore_index=True)
+                    summary_path = self.get_output_path(config.video_path, config.csv_path, '_roiSummary.csv')
+                    combined_summary.to_csv(summary_path, index=False)
                 
                 # Save configuration file for reproducibility (if requested)
                 if config.save_config:
@@ -511,9 +516,10 @@ class ROIProcessor(QThread):
             return df
         
         # Get the range of frames
-        min_frame = int(df['frame_idx'].min())
+        # ALWAYS start from frame 0, not from first detection
+        min_frame = 0
         max_frame = int(df['frame_idx'].max())
-        expected_frames = max_frame - min_frame + 1
+        expected_frames = max_frame + 1  # 0 to max_frame inclusive
         actual_frames = len(df)
         
         missing_count = expected_frames - actual_frames
@@ -522,10 +528,10 @@ class ROIProcessor(QThread):
             # No missing frames
             return df
         
-        self.status.emit(f"Found {missing_count} missing frames - adding them for interpolation")
+        self.status.emit(f"Found {missing_count} missing frames - adding them (from frame 0 to {max_frame})")
         
-        # Create a complete frame sequence
-        all_frames = pd.DataFrame({'frame_idx': range(min_frame, max_frame + 1)})
+        # Create a complete frame sequence starting from 0
+        all_frames = pd.DataFrame({'frame_idx': range(0, max_frame + 1)})
         
         # Merge with existing data (missing frames will have NaN for all keypoint columns)
         df_complete = all_frames.merge(df, on='frame_idx', how='left')
@@ -1207,7 +1213,10 @@ class ROIProcessor(QThread):
         # Pre-calculate cumulative statistics for each keypoint-ROI pair
         cumulative_stats = {}
         for kp in keypoints_to_track:
-            cumulative_stats[kp] = {}
+            cumulative_stats[kp] = {
+                'total_distance_cm': 0.0,  # Total distance traveled (cumulative)
+                'last_position': None,  # Last known position for distance calculation
+            }
             for roi in roi_names:
                 cumulative_stats[kp][roi] = {
                     'frames_in_roi': 0,
@@ -1316,24 +1325,54 @@ class ROIProcessor(QThread):
             # ===== UPDATE CUMULATIVE STATISTICS =====
             if video_frame_number < len(occupancy_df):
                 occ_row = occupancy_df.iloc[video_frame_number]
-                for kp in keypoints_to_track:
-                    region_col = f"{kp}_region"
-                    if region_col in occupancy_df.columns:
-                        current_roi = occ_row[region_col]
+                
+                # Get current frame's tracking data for distance calculation
+                if video_frame_number in frame_to_row:
+                    row_idx = frame_to_row[video_frame_number]
+                    row = df.iloc[row_idx]
+                    
+                    for kp in keypoints_to_track:
+                        # Update distance traveled
+                        x_col = f"{kp}.x"
+                        y_col = f"{kp}.y"
                         
-                        # Update stats for each ROI
-                        for roi in roi_names:
-                            if kp in cumulative_stats and roi in cumulative_stats[kp]:
-                                is_in_roi = (current_roi == roi)
+                        if x_col in df.columns and y_col in df.columns:
+                            x = row[x_col]
+                            y = row[y_col]
+                            
+                            if not pd.isna(x) and not pd.isna(y):
+                                current_pos = (x, y)
                                 
-                                if is_in_roi:
-                                    cumulative_stats[kp][roi]['frames_in_roi'] += 1
+                                # Calculate distance from last position
+                                if cumulative_stats[kp]['last_position'] is not None:
+                                    last_x, last_y = cumulative_stats[kp]['last_position']
+                                    distance_pixels = np.sqrt((x - last_x)**2 + (y - last_y)**2)
+                                    
+                                    # Convert to cm if scale bar is set
+                                    if config.scale_bar_set and config.pixels_per_cm:
+                                        distance_cm = distance_pixels / config.pixels_per_cm
+                                        cumulative_stats[kp]['total_distance_cm'] += distance_cm
                                 
-                                # Detect entry (transition from out to in)
-                                if is_in_roi and not cumulative_stats[kp][roi]['was_in_roi']:
-                                    cumulative_stats[kp][roi]['entries'] += 1
-                                
-                                cumulative_stats[kp][roi]['was_in_roi'] = is_in_roi
+                                cumulative_stats[kp]['last_position'] = current_pos
+                        
+                        # Update ROI statistics
+                        region_col = f"{kp}_region"
+                        if region_col in occupancy_df.columns:
+                            current_roi = occ_row[region_col]
+                            
+                            # Update stats for each ROI
+                            for roi in roi_names:
+                                if roi in cumulative_stats[kp]:
+                                    is_in_roi = (current_roi == roi)
+                                    
+                                    if is_in_roi:
+                                        cumulative_stats[kp][roi]['frames_in_roi'] += 1
+                                    
+                                    # Detect entry (transition from out to in)
+                                    if is_in_roi and not cumulative_stats[kp][roi]['was_in_roi']:
+                                        cumulative_stats[kp][roi]['entries'] += 1
+                                    
+                                    cumulative_stats[kp][roi]['was_in_roi'] = is_in_roi
             
             # ===== CREATE COMPOSITE WITH STATS PANEL =====
             composite = np.zeros((output_height, output_width, 3), dtype=np.uint8)
@@ -1373,8 +1412,16 @@ class ROIProcessor(QThread):
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 200, 255), 2)
                 y_offset += line_height
                 
+                # Distance traveled (if scale bar is set)
+                if config.scale_bar_set and config.pixels_per_cm:
+                    distance_cm = cumulative_stats[kp]['total_distance_cm']
+                    text = f"  Distance: {distance_cm:.1f} cm"
+                    cv2.putText(composite, text, (video_width + 20, y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                    y_offset += line_height - 5
+                
                 for roi in roi_names:
-                    if kp in cumulative_stats and roi in cumulative_stats[kp]:
+                    if roi in cumulative_stats[kp]:
                         stats = cumulative_stats[kp][roi]
                         frames_in = stats['frames_in_roi']
                         entries = stats['entries']
@@ -2069,11 +2116,11 @@ class ROIToolGUI(QMainWindow):
             
             cap.release()
         
-        # Display the frame with overlays
-        self.redraw_preview()
-        
         # Try to load existing config file from roiAnalysis folder
         self.try_load_config(config)
+        
+        # Display the frame with overlays (after loading config so ROIs appear)
+        self.redraw_preview()
         
         # Load available keypoints from CSV if not already loaded
         if not config.available_keypoints:

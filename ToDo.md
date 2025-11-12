@@ -17,7 +17,6 @@
 - add ability to "play" the preview window
 - add animate video functionality to quick viz tool. export options
 - add battery level figure to export options
-
 - create smoothed plots
 - UWB Plots: velocity threshold input not taking, always defaulting to 0.1 (default) even if user inputs values. 
 - behavioral classification module
