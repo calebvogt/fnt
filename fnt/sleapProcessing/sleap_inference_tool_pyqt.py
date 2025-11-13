@@ -540,7 +540,7 @@ class VideoInferenceWindow(QWidget):
         
         # Tracking Options
         self.chk_tracking = QCheckBox("Add Tracking (assign identities across frames)")
-        self.chk_tracking.setChecked(False)
+        self.chk_tracking.setChecked(True)  # Changed to True by default
         self.chk_tracking.stateChanged.connect(self.toggle_tracking_options)
         options_layout.addWidget(self.chk_tracking)
         
@@ -685,7 +685,7 @@ class VideoInferenceWindow(QWidget):
         tracking_layout.addWidget(self.chk_post_connect)
         
         self.tracking_widget.setLayout(tracking_layout)
-        self.tracking_widget.setVisible(False)  # Hidden by default
+        self.tracking_widget.setVisible(True)  # Visible by default since tracking is checked
         options_layout.addWidget(self.tracking_widget)
         
         options_group.setLayout(options_layout)

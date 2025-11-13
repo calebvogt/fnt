@@ -456,8 +456,8 @@ class VideoTrimTool(QMainWindow):
         duration_layout = QHBoxLayout()
         
         self.duration_combo = QComboBox()
-        self.duration_combo.addItems(["1 minute", "5 minutes", "10 minutes", "20 minutes", "30 minutes", "1 hour", "Custom"])
-        self.duration_combo.setCurrentText("5 minutes")
+        self.duration_combo.addItems(["Original Video Duration", "1 minute", "5 minutes", "10 minutes", "20 minutes", "30 minutes", "1 hour", "Custom"])
+        self.duration_combo.setCurrentText("Original Video Duration")
         self.duration_combo.setEnabled(False)
         self.duration_combo.currentTextChanged.connect(self.on_duration_changed)
         duration_layout.addWidget(self.duration_combo)
@@ -759,6 +759,10 @@ class VideoTrimTool(QMainWindow):
         total_frames = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_COUNT))
         config.total_duration = total_frames / config.fps
         
+        # Set default duration to full video if not configured
+        if not config.configured:
+            config.duration = config.total_duration
+        
         # Read first frame
         ret, frame = self.preview_cap.read()
         if ret:
@@ -844,6 +848,13 @@ class VideoTrimTool(QMainWindow):
     def get_duration_from_ui(self) -> float:
         """Get duration in seconds from UI"""
         selected = self.duration_combo.currentText()
+        
+        # Handle original video duration
+        if selected == "Original Video Duration":
+            if self.current_config_idx < len(self.video_configs):
+                config = self.video_configs[self.current_config_idx]
+                return config.total_duration
+            return 300  # Fallback default
         
         duration_map = {
             "1 minute": 60,

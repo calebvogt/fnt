@@ -36,10 +36,11 @@ class VideoProcessorWorker(QThread):
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
-    def __init__(self, input_dirs, frame_rate, grayscale, apply_clahe, 
+    def __init__(self, input_dirs, input_videos, frame_rate, grayscale, apply_clahe, 
                  remove_audio, output_format, crf_quality, resolution, codec, preset, instance_id=1):
         super().__init__()
         self.input_dirs = input_dirs
+        self.input_videos = input_videos
         self.frame_rate = frame_rate
         self.grayscale = grayscale
         self.apply_clahe = apply_clahe
@@ -64,12 +65,17 @@ class VideoProcessorWorker(QThread):
             
             # Count total files first
             video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
+            
+            # Count files from directories
             for input_dir in self.input_dirs:
                 for ext in video_extensions:
                     total_files += len(glob.glob(os.path.join(input_dir, ext)))
             
+            # Add count of individual videos
+            total_files += len(self.input_videos)
+            
             if total_files == 0:
-                self.finished.emit(False, "No video files found in selected directories.")
+                self.finished.emit(False, "No video files found in selected directories or video list.")
                 return
             
             self.progress_update.emit(f"Found {total_files} video files to process...")
@@ -104,6 +110,27 @@ class VideoProcessorWorker(QThread):
                         if not success and not self.should_stop:
                             self.finished.emit(False, f"Failed to process: {os.path.basename(video_file)}")
                             return
+            
+            # Process individual video files
+            for video_file in self.input_videos:
+                if self.should_stop:
+                    break
+                
+                processed_files += 1
+                self.file_progress.emit(processed_files, total_files)
+                
+                # Create output directory next to the video file
+                video_dir = os.path.dirname(video_file)
+                out_dir = os.path.join(video_dir, "proc")
+                os.makedirs(out_dir, exist_ok=True)
+                
+                self.progress_update.emit(f"Processing video: {os.path.basename(video_file)}")
+                
+                # Process individual file
+                success = self.process_single_file(video_file, out_dir, processed_files)
+                if not success and not self.should_stop:
+                    self.finished.emit(False, f"Failed to process: {os.path.basename(video_file)}")
+                    return
             
             if not self.should_stop:
                 self.finished.emit(True, f"Successfully processed {processed_files} video files!")
@@ -182,13 +209,9 @@ class VideoProcessorWorker(QThread):
             "-pix_fmt", "yuv420p",
         ]
         
-        # SLEAP-compatible frame rate handling
-        if self.frame_rate < 30:  # Only downsample if requested rate is lower
-            # Use fps filter for precise frame selection instead of -r
-            video_filters = [f"fps={self.frame_rate}"]
-        else:
-            # Keep original frame rate for high frame rates
-            video_filters = []
+        # Always apply fps filter to match user's requested frame rate
+        # This maintains video duration by duplicating/dropping frames as needed
+        video_filters = [f"fps={self.frame_rate}"]
         
         # Add audio option
         if self.remove_audio:
@@ -249,6 +272,7 @@ class VideoProcessingGUI(QMainWindow):
         self.instance_id = VideoProcessingGUI.instance_count
         
         self.selected_dirs = []
+        self.selected_videos = []
         self.worker = None
         self.init_ui()
     
@@ -442,6 +466,10 @@ class VideoProcessingGUI(QMainWindow):
         self.add_dir_btn = QPushButton("Add Folder")
         self.add_dir_btn.clicked.connect(self.add_directory)
         button_layout.addWidget(self.add_dir_btn)
+        
+        self.add_videos_btn = QPushButton("Add Video(s)")
+        self.add_videos_btn.clicked.connect(self.add_videos)
+        button_layout.addWidget(self.add_videos_btn)
         
         self.clear_dirs_btn = QPushButton("Clear All")
         self.clear_dirs_btn.clicked.connect(self.clear_directories)
@@ -653,26 +681,50 @@ class VideoProcessingGUI(QMainWindow):
         if directory and directory not in self.selected_dirs:
             self.selected_dirs.append(directory)
             self.update_directory_display()
-            self.start_btn.setEnabled(len(self.selected_dirs) > 0)
+            self.start_btn.setEnabled(len(self.selected_dirs) > 0 or len(self.selected_videos) > 0)
+    
+    def add_videos(self):
+        """Add individual video files to the processing list"""
+        video_files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Video Files",
+            "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm);;All Files (*.*)"
+        )
+        
+        if video_files:
+            # Only add videos that aren't already in the list
+            for video_file in video_files:
+                if video_file not in self.selected_videos:
+                    self.selected_videos.append(video_file)
+            self.update_directory_display()
+            self.start_btn.setEnabled(len(self.selected_dirs) > 0 or len(self.selected_videos) > 0)
     
     def clear_directories(self):
-        """Clear all selected directories"""
+        """Clear all selected directories and videos"""
         self.selected_dirs.clear()
+        self.selected_videos.clear()
         self.update_directory_display()
         self.start_btn.setEnabled(False)
     
     def update_directory_display(self):
         """Update the directory list display"""
-        if not self.selected_dirs:
-            self.dir_list_label.setText("No directories selected")
+        if not self.selected_dirs and not self.selected_videos:
+            self.dir_list_label.setText("No directories or videos selected")
         else:
-            dir_list = "\\n".join([f"• {d}" for d in self.selected_dirs])
-            self.dir_list_label.setText(f"Selected directories ({len(self.selected_dirs)}): \\n{dir_list}")
+            display_items = []
+            if self.selected_dirs:
+                display_items.append(f"Directories ({len(self.selected_dirs)}):")
+                display_items.extend([f"  • {d}" for d in self.selected_dirs])
+            if self.selected_videos:
+                display_items.append(f"\\nVideos ({len(self.selected_videos)}):")
+                display_items.extend([f"  • {v}" for v in self.selected_videos])
+            self.dir_list_label.setText("\\n".join(display_items))
     
     def start_processing(self):
         """Start video processing"""
-        if not self.selected_dirs:
-            QMessageBox.warning(self, "Warning", "Please select at least one directory.")
+        if not self.selected_dirs and not self.selected_videos:
+            QMessageBox.warning(self, "Warning", "Please select at least one directory or video file.")
             return
         
         # Get user settings
@@ -702,6 +754,7 @@ class VideoProcessingGUI(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.add_dir_btn.setEnabled(False)
+        self.add_videos_btn.setEnabled(False)
         self.clear_dirs_btn.setEnabled(False)
         
         # Show progress bar
@@ -717,7 +770,8 @@ class VideoProcessingGUI(QMainWindow):
         
         # Start worker thread
         self.worker = VideoProcessorWorker(
-            self.selected_dirs, 
+            self.selected_dirs,
+            self.selected_videos,
             frame_rate, 
             grayscale,
             apply_clahe,
@@ -769,6 +823,7 @@ class VideoProcessingGUI(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.add_dir_btn.setEnabled(True)
+        self.add_videos_btn.setEnabled(True)
         self.clear_dirs_btn.setEnabled(True)
         
         # Hide progress bar

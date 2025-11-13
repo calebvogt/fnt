@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
-    QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog
+    QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog, QSpinBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -92,14 +92,18 @@ class VideoROIConfig:
         self.save_roi_summary = True  # Default
         self.save_config = True  # Default
         self.save_tracking_plots = True  # Default
-        self.create_tracked_video = False  # Default
+        self.create_tracked_video = True  # Default - changed to True
         self.show_tracking_area = True  # Default
         self.show_rois = True  # Default
-        self.show_all_keypoints = False  # Default
+        self.show_all_keypoints = True  # Default - changed to True
         self.show_edges = True  # Default
         self.show_keypoint_labels = False  # Default
+        self.show_track_labels = False  # Default - show track IDs on video
+        self.show_track_trail = False  # Default - show trail behind tracked keypoints
+        self.track_trail_length = 30  # Default trail length in frames
         self.save_data_view = False  # Default - video + live statistics panel
         self.overwrite_files = True  # Default
+        self.has_tracks = False  # Detected from CSV
     
     def add_roi(self, name: str, polygon: List[Tuple[int, int]]):
         """Add or update an ROI (maintains order if updating)."""
@@ -160,6 +164,9 @@ class VideoROIConfig:
             'show_all_keypoints': self.show_all_keypoints,
             'show_edges': self.show_edges,
             'show_keypoint_labels': self.show_keypoint_labels,
+            'show_track_labels': self.show_track_labels,
+            'show_track_trail': self.show_track_trail,
+            'track_trail_length': self.track_trail_length,
             'save_data_view': self.save_data_view,
             'overwrite_files': self.overwrite_files
         }
@@ -188,6 +195,9 @@ class VideoROIConfig:
         self.show_all_keypoints = config_dict.get('show_all_keypoints', False)
         self.show_edges = config_dict.get('show_edges', True)
         self.show_keypoint_labels = config_dict.get('show_keypoint_labels', False)
+        self.show_track_labels = config_dict.get('show_track_labels', False)
+        self.show_track_trail = config_dict.get('show_track_trail', False)
+        self.track_trail_length = config_dict.get('track_trail_length', 30)
         self.save_data_view = config_dict.get('save_data_view', False)
         self.overwrite_files = config_dict.get('overwrite_files', True)
 
@@ -255,11 +265,10 @@ class ROIProcessor(QThread):
     
     def clear_existing_outputs(self, config: VideoROIConfig):
         """
-        Clear all existing output files for this video EXCEPT the JSON config file.
-        The JSON config will be overwritten/updated with new run information.
+        Clear all existing output files for this video including the JSON config.
+        Since we're re-analyzing, everything gets regenerated with fresh data.
         
-        Deletes: CSV files, PNG plots, tracked videos
-        Preserves: JSON config file (will be updated)
+        Deletes: All files in the analysis folder (CSV, PNG, tracked videos, JSON)
         """
         try:
             video_base = os.path.basename(config.video_path)
@@ -272,7 +281,7 @@ class ROIProcessor(QThread):
             if not os.path.exists(analysis_folder_path):
                 return  # Nothing to clear
             
-            # Get list of all files in the analysis folder
+            # Delete all files in the analysis folder
             files_deleted = 0
             for filename in os.listdir(analysis_folder_path):
                 file_path = os.path.join(analysis_folder_path, filename)
@@ -281,11 +290,7 @@ class ROIProcessor(QThread):
                 if os.path.isdir(file_path):
                     continue
                 
-                # Skip JSON config files - they will be overwritten/updated
-                if filename.endswith('_roiConfig.json'):
-                    continue
-                
-                # Delete all other files (CSV, PNG, MP4, etc.)
+                # Delete all files (CSV, PNG, MP4, JSON, etc.)
                 try:
                     os.remove(file_path)
                     files_deleted += 1
@@ -293,7 +298,7 @@ class ROIProcessor(QThread):
                     self.status.emit(f"Warning: Could not delete {filename}: {str(e)}")
             
             if files_deleted > 0:
-                self.status.emit(f"✓ Cleared {files_deleted} existing output file(s) (JSON config preserved)")
+                self.status.emit(f"✓ Cleared {files_deleted} existing output file(s) from analysis folder")
         
         except Exception as e:
             self.status.emit(f"Warning: Error clearing existing outputs: {str(e)}")
@@ -547,6 +552,9 @@ class ROIProcessor(QThread):
         After interpolation, re-filter to remove any interpolated points outside tracking area.
         This is the SECOND step - applied after tracking area filtering.
         
+        If tracks are detected, interpolation is applied per-track to avoid mixing data
+        between different individuals.
+        
         Args:
             df: DataFrame with tracking data (already filtered by tracking area)
             config: Video configuration with tracking area
@@ -567,43 +575,96 @@ class ROIProcessor(QThread):
         total_interpolated = 0
         total_removed_after_interpolation = 0
         
-        # For each keypoint, interpolate x and y coordinates
-        for kp in all_keypoints:
-            x_col = f"{kp}.x"
-            y_col = f"{kp}.y"
+        # Check if we have track data
+        has_tracks = 'track' in df.columns
+        
+        if has_tracks:
+            # Process each track separately to avoid mixing individuals
+            self.status.emit("Detected track data - interpolating per-track...")
+            track_ids = df['track'].dropna().unique()
             
-            if x_col in df.columns and y_col in df.columns:
-                # Count NaNs before interpolation
-                x_nans_before = df[x_col].isna().sum()
-                y_nans_before = df[y_col].isna().sum()
+            for track_id in track_ids:
+                # Get rows for this track only
+                track_mask = df['track'] == track_id
+                track_df = df[track_mask].copy()
                 
-                # Forward-only interpolation: only starts after first valid value
-                df[x_col] = df[x_col].interpolate(method='linear', limit_direction='forward')
-                df[y_col] = df[y_col].interpolate(method='linear', limit_direction='forward')
-                
-                # Count NaNs after interpolation
-                x_nans_after = df[x_col].isna().sum()
-                y_nans_after = df[y_col].isna().sum()
-                
-                x_filled = x_nans_before - x_nans_after
-                y_filled = y_nans_before - y_nans_after
-                total_interpolated += x_filled + y_filled
-                
-                # NOW: Re-filter interpolated points to remove any that fall outside tracking area
-                if config.tracking_area_set and config.tracking_area:
-                    for frame_idx, row in df.iterrows():
-                        x = row[x_col]
-                        y = row[y_col]
+                # For each keypoint, interpolate x and y coordinates within this track
+                for kp in all_keypoints:
+                    x_col = f"{kp}.x"
+                    y_col = f"{kp}.y"
+                    
+                    if x_col in track_df.columns and y_col in track_df.columns:
+                        # Count NaNs before interpolation
+                        x_nans_before = track_df[x_col].isna().sum()
+                        y_nans_before = track_df[y_col].isna().sum()
                         
-                        # If point is valid but outside tracking area, remove it
-                        if not pd.isna(x) and not pd.isna(y):
-                            if not self.point_in_polygon((x, y), config.tracking_area):
-                                df.at[frame_idx, x_col] = np.nan
-                                df.at[frame_idx, y_col] = np.nan
-                                total_removed_after_interpolation += 1
+                        # Forward-only interpolation: only starts after first valid value
+                        track_df[x_col] = track_df[x_col].interpolate(method='linear', limit_direction='forward')
+                        track_df[y_col] = track_df[y_col].interpolate(method='linear', limit_direction='forward')
+                        
+                        # Count NaNs after interpolation
+                        x_nans_after = track_df[x_col].isna().sum()
+                        y_nans_after = track_df[y_col].isna().sum()
+                        
+                        x_filled = x_nans_before - x_nans_after
+                        y_filled = y_nans_before - y_nans_after
+                        total_interpolated += x_filled + y_filled
+                        
+                        # Re-filter interpolated points to remove any that fall outside tracking area
+                        if config.tracking_area_set and config.tracking_area:
+                            for frame_idx in track_df.index:
+                                x = track_df.at[frame_idx, x_col]
+                                y = track_df.at[frame_idx, y_col]
+                                
+                                # If point is valid but outside tracking area, remove it
+                                if not pd.isna(x) and not pd.isna(y):
+                                    if not self.point_in_polygon((x, y), config.tracking_area):
+                                        track_df.at[frame_idx, x_col] = np.nan
+                                        track_df.at[frame_idx, y_col] = np.nan
+                                        total_removed_after_interpolation += 1
+                
+                # Update the main dataframe with interpolated track data
+                df.loc[track_mask, [col for col in track_df.columns if col != 'track']] = track_df[[col for col in track_df.columns if col != 'track']]
+        
+        else:
+            # Original behavior: interpolate across entire dataset (no tracks)
+            for kp in all_keypoints:
+                x_col = f"{kp}.x"
+                y_col = f"{kp}.y"
+                
+                if x_col in df.columns and y_col in df.columns:
+                    # Count NaNs before interpolation
+                    x_nans_before = df[x_col].isna().sum()
+                    y_nans_before = df[y_col].isna().sum()
+                    
+                    # Forward-only interpolation: only starts after first valid value
+                    df[x_col] = df[x_col].interpolate(method='linear', limit_direction='forward')
+                    df[y_col] = df[y_col].interpolate(method='linear', limit_direction='forward')
+                    
+                    # Count NaNs after interpolation
+                    x_nans_after = df[x_col].isna().sum()
+                    y_nans_after = df[y_col].isna().sum()
+                    
+                    x_filled = x_nans_before - x_nans_after
+                    y_filled = y_nans_before - y_nans_after
+                    total_interpolated += x_filled + y_filled
+                    
+                    # Re-filter interpolated points to remove any that fall outside tracking area
+                    if config.tracking_area_set and config.tracking_area:
+                        for frame_idx, row in df.iterrows():
+                            x = row[x_col]
+                            y = row[y_col]
+                            
+                            # If point is valid but outside tracking area, remove it
+                            if not pd.isna(x) and not pd.isna(y):
+                                if not self.point_in_polygon((x, y), config.tracking_area):
+                                    df.at[frame_idx, x_col] = np.nan
+                                    df.at[frame_idx, y_col] = np.nan
+                                    total_removed_after_interpolation += 1
         
         if total_interpolated > 0:
-            self.status.emit(f"Interpolated {total_interpolated} coordinate values across all keypoints")
+            track_msg = f" (per-track)" if has_tracks else ""
+            self.status.emit(f"Interpolated {total_interpolated} coordinate values across all keypoints{track_msg}")
         else:
             self.status.emit("No missing values to interpolate")
         
@@ -1057,6 +1118,12 @@ class ROIProcessor(QThread):
         # Automatically detect skeleton edges based on proximity in first valid frame
         skeleton_edges = self.detect_skeleton_edges(df, all_keypoints)
         
+        # Initialize trail history for tracked keypoints (if trails enabled)
+        trail_history = {}  # {(keypoint, track_id): [(x, y), (x, y), ...]}
+        if config.show_track_trail and config.has_tracks:
+            for keypoint in config.selected_keypoints:
+                trail_history[keypoint] = {}  # Will store {track_id: [positions]}
+        
         # Check if CSV has frame_idx column, otherwise use index
         if 'frame_idx' in df.columns:
             # Create a lookup dictionary: frame_number -> row_index
@@ -1117,6 +1184,17 @@ class ROIProcessor(QThread):
                 # Store keypoint positions for edge drawing
                 keypoint_positions = {}
                 
+                # Get track ID if available
+                track_id = None
+                if config.has_tracks and 'track' in df.columns:
+                    track_id = row['track']
+                    if pd.notna(track_id):
+                        # Extract numeric part from track ID (e.g., 'track_0' -> 0)
+                        if isinstance(track_id, str) and track_id.startswith('track_'):
+                            track_id = int(track_id.split('_')[1])
+                        else:
+                            track_id = int(track_id)
+                
                 # First pass: collect keypoint positions
                 # Note: Points outside tracking area are already NaN from filtering step
                 for keypoint in keypoints_to_show:
@@ -1129,15 +1207,44 @@ class ROIProcessor(QThread):
                         
                         # If valid (not NaN), include it
                         if not pd.isna(x) and not pd.isna(y):
-                            keypoint_positions[keypoint] = (int(x), int(y))
+                            pos = (int(x), int(y))
+                            keypoint_positions[keypoint] = pos
+                            
+                            # Update trail history for this keypoint and track
+                            if config.show_track_trail and config.has_tracks and track_id is not None:
+                                if keypoint in trail_history:
+                                    if track_id not in trail_history[keypoint]:
+                                        trail_history[keypoint][track_id] = []
+                                    trail_history[keypoint][track_id].append(pos)
+                                    # Keep only last N frames
+                                    if len(trail_history[keypoint][track_id]) > config.track_trail_length:
+                                        trail_history[keypoint][track_id].pop(0)
                 
-                # Draw skeleton edges FIRST (so they appear below keypoints)
+                # Draw trails FIRST (behind everything)
+                if config.show_track_trail and config.has_tracks:
+                    for keypoint in config.selected_keypoints:
+                        if keypoint in trail_history:
+                            for tid, positions in trail_history[keypoint].items():
+                                if len(positions) > 1:
+                                    # Draw trail with fading effect
+                                    for i in range(len(positions) - 1):
+                                        # Calculate alpha/thickness based on age
+                                        alpha = (i + 1) / len(positions)
+                                        thickness = max(1, int(3 * alpha))
+                                        # Color: use different colors per track
+                                        color_idx = tid % 6
+                                        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), 
+                                                 (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+                                        color = colors[color_idx]
+                                        cv2.line(frame, positions[i], positions[i + 1], color, thickness)
+                
+                # Draw skeleton edges SECOND (so they appear below keypoints)
                 if config.show_edges:
                     for kp1, kp2 in skeleton_edges:
                         if kp1 in keypoint_positions and kp2 in keypoint_positions:
                             pt1 = keypoint_positions[kp1]
                             pt2 = keypoint_positions[kp2]
-                            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)  # Yellow lines
+                            cv2.line(frame, pt1, pt2, (0, 255, 255), 1)  # Yellow lines, 1 pixel thick
                 
                 # Draw keypoints SECOND (so they appear above edges)
                 for keypoint in keypoints_to_show:
@@ -1156,6 +1263,21 @@ class ROIProcessor(QThread):
                         if config.show_keypoint_labels:
                             cv2.putText(frame, keypoint, (x + 10, y), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Draw track label LAST (on top of everything)
+                if config.show_track_labels and config.has_tracks and track_id is not None:
+                    # Find a representative keypoint position for label (use first selected keypoint)
+                    if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
+                        x, y = keypoint_positions[config.selected_keypoints[0]]
+                        # Draw track ID label with background
+                        label = f"Track {track_id}"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                        # Draw background rectangle
+                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10), 
+                                    (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
+                        # Draw text
+                        cv2.putText(frame, label, (x, y - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             out.write(frame)
             video_frame_number += 1
@@ -1205,6 +1327,12 @@ class ROIProcessor(QThread):
         
         # Detect skeleton edges
         skeleton_edges = self.detect_skeleton_edges(df, all_keypoints)
+        
+        # Initialize trail history for tracked keypoints (if trails enabled)
+        trail_history = {}  # {keypoint: {track_id: [(x, y), ...]}}
+        if config.show_track_trail and config.has_tracks:
+            for keypoint in config.selected_keypoints:
+                trail_history[keypoint] = {}  # Will store {track_id: [positions]}
         
         # Get selected keypoints and ROI names
         keypoints_to_track = config.selected_keypoints if config.selected_keypoints else []
@@ -1283,6 +1411,17 @@ class ROIProcessor(QThread):
                 # Store keypoint positions for edge drawing
                 keypoint_positions = {}
                 
+                # Get track ID if available
+                track_id = None
+                if config.has_tracks and 'track' in df.columns:
+                    track_id = row['track']
+                    if pd.notna(track_id):
+                        # Extract numeric part from track ID (e.g., 'track_0' -> 0)
+                        if isinstance(track_id, str) and track_id.startswith('track_'):
+                            track_id = int(track_id.split('_')[1])
+                        else:
+                            track_id = int(track_id)
+                
                 # First pass: collect keypoint positions
                 for keypoint in keypoints_to_show:
                     x_col = f"{keypoint}.x"
@@ -1294,17 +1433,46 @@ class ROIProcessor(QThread):
                         
                         # If valid (not NaN), include it
                         if not pd.isna(x) and not pd.isna(y):
-                            keypoint_positions[keypoint] = (int(x), int(y))
+                            pos = (int(x), int(y))
+                            keypoint_positions[keypoint] = pos
+                            
+                            # Update trail history for this keypoint and track
+                            if config.show_track_trail and config.has_tracks and track_id is not None:
+                                if keypoint in trail_history:
+                                    if track_id not in trail_history[keypoint]:
+                                        trail_history[keypoint][track_id] = []
+                                    trail_history[keypoint][track_id].append(pos)
+                                    # Keep only last N frames
+                                    if len(trail_history[keypoint][track_id]) > config.track_trail_length:
+                                        trail_history[keypoint][track_id].pop(0)
                 
-                # Draw skeleton edges FIRST (so they appear below keypoints)
+                # Draw trails FIRST (behind everything)
+                if config.show_track_trail and config.has_tracks:
+                    for keypoint in config.selected_keypoints:
+                        if keypoint in trail_history:
+                            for tid, positions in trail_history[keypoint].items():
+                                if len(positions) > 1:
+                                    # Draw trail with fading effect
+                                    for i in range(len(positions) - 1):
+                                        # Calculate alpha/thickness based on age
+                                        alpha = (i + 1) / len(positions)
+                                        thickness = max(1, int(3 * alpha))
+                                        # Color: use different colors per track
+                                        color_idx = tid % 6
+                                        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), 
+                                                 (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+                                        color = colors[color_idx]
+                                        cv2.line(frame, positions[i], positions[i + 1], color, thickness)
+                
+                # Draw skeleton edges SECOND (so they appear below keypoints)
                 if config.show_edges:
                     for kp1, kp2 in skeleton_edges:
                         if kp1 in keypoint_positions and kp2 in keypoint_positions:
                             pt1 = keypoint_positions[kp1]
                             pt2 = keypoint_positions[kp2]
-                            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)  # Yellow lines
+                            cv2.line(frame, pt1, pt2, (0, 255, 255), 1)  # Yellow lines, 1 pixel thick
                 
-                # Draw keypoints SECOND (so they appear above edges)
+                # Draw keypoints THIRD (so they appear above edges)
                 for keypoint in keypoints_to_show:
                     if keypoint in keypoint_positions:
                         x, y = keypoint_positions[keypoint]
@@ -1321,6 +1489,21 @@ class ROIProcessor(QThread):
                         if config.show_keypoint_labels:
                             cv2.putText(frame, keypoint, (x + 10, y), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Draw track label LAST (on top of everything)
+                if config.show_track_labels and config.has_tracks and track_id is not None:
+                    # Find a representative keypoint position for label (use first selected keypoint)
+                    if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
+                        x, y = keypoint_positions[config.selected_keypoints[0]]
+                        # Draw track ID label with background
+                        label = f"Track {track_id}"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                        # Draw background rectangle
+                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10), 
+                                    (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
+                        # Draw text
+                        cv2.putText(frame, label, (x, y - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             # ===== UPDATE CUMULATIVE STATISTICS =====
             if video_frame_number < len(occupancy_df):
@@ -1899,6 +2082,42 @@ class ROIToolGUI(QMainWindow):
         self.chk_show_edges.setChecked(True)
         video_options_layout.addWidget(self.chk_show_edges)
         
+        # Track-specific options (only visible if tracks are detected)
+        self.track_options_widget = QWidget()
+        track_options_layout = QVBoxLayout()
+        track_options_layout.setContentsMargins(0, 5, 0, 0)
+        
+        track_label = QLabel("Track Options (when tracks detected):")
+        track_label.setStyleSheet("color: #999999; font-style: italic; font-size: 10px;")
+        track_options_layout.addWidget(track_label)
+        
+        self.chk_show_track_labels = QCheckBox("Show track labels")
+        self.chk_show_track_labels.setChecked(False)
+        self.chk_show_track_labels.setToolTip("Show track ID numbers on video (requires track column in CSV)")
+        track_options_layout.addWidget(self.chk_show_track_labels)
+        
+        # Trail length option
+        trail_layout = QHBoxLayout()
+        self.chk_show_track_trail = QCheckBox("Show track trail:")
+        self.chk_show_track_trail.setChecked(False)
+        self.chk_show_track_trail.setToolTip("Draw trail showing path of tracked keypoints")
+        trail_layout.addWidget(self.chk_show_track_trail)
+        
+        self.spin_trail_length = QSpinBox()
+        self.spin_trail_length.setMinimum(5)
+        self.spin_trail_length.setMaximum(1000)
+        self.spin_trail_length.setValue(30)
+        self.spin_trail_length.setSuffix(" frames")
+        self.spin_trail_length.setToolTip("Length of trail in frames")
+        self.spin_trail_length.setMaximumWidth(120)
+        trail_layout.addWidget(self.spin_trail_length)
+        trail_layout.addStretch()
+        
+        track_options_layout.addLayout(trail_layout)
+        self.track_options_widget.setLayout(track_options_layout)
+        self.track_options_widget.setVisible(False)  # Hidden until tracks detected
+        video_options_layout.addWidget(self.track_options_widget)
+        
         self.chk_data_view = QCheckBox("Data view (video + live statistics panel)")
         self.chk_data_view.setChecked(False)
         video_options_layout.addWidget(self.chk_data_view)
@@ -2192,6 +2411,9 @@ class ROIToolGUI(QMainWindow):
         try:
             df = pd.read_csv(config.csv_path, nrows=0)  # Just read headers
             
+            # Check if CSV has track column
+            config.has_tracks = 'track' in df.columns
+            
             # Extract unique keypoint names from columns that have both .x and .y
             # This filters out things like "instance.score" which only has .score
             keypoints = set()
@@ -2208,6 +2430,10 @@ class ROIToolGUI(QMainWindow):
             
             # Update keypoint checkboxes
             self.update_keypoint_checkboxes(config)
+            
+            # Show/hide track options based on detection
+            if hasattr(self, 'track_options_widget'):
+                self.track_options_widget.setVisible(config.has_tracks)
             
         except Exception as e:
             QMessageBox.warning(self, "CSV Error", f"Could not read CSV: {str(e)}")
@@ -2228,25 +2454,25 @@ class ROIToolGUI(QMainWindow):
             if not os.path.exists(analysis_folder_path):
                 return  # No existing config
             
-            # Look for config file
-            if csv_base.startswith(video_base):
-                after_video = csv_base[len(video_base):]
-                if '.predictions' in after_video:
-                    datetime_part = after_video.split('.predictions')[0]
-                    config_filename = f"{video_base}{datetime_part}_roiConfig.json"
-                    config_path = os.path.join(analysis_folder_path, config_filename)
-                    
-                    if os.path.exists(config_path):
-                        # Load config
-                        with open(config_path, 'r') as f:
-                            config_dict = json.load(f)
-                        
-                        # Apply config to VideoROIConfig
-                        config.from_config_dict(config_dict)
-                        
-                        # Show message to user
-                        self.lbl_instructions.setText(f"✓ Loaded existing ROI configuration from previous analysis")
-                        self.lbl_instructions.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: bold; margin: 10px;")
+            # Look for ANY config file ending with _roiConfig.json
+            # This allows loading configs even if the CSV timestamp changed after re-tracking
+            config_path = None
+            for filename in os.listdir(analysis_folder_path):
+                if filename.endswith('_roiConfig.json'):
+                    config_path = os.path.join(analysis_folder_path, filename)
+                    break  # Use the first config file found
+            
+            if config_path and os.path.exists(config_path):
+                # Load config
+                with open(config_path, 'r') as f:
+                    config_dict = json.load(f)
+                
+                # Apply config to VideoROIConfig
+                config.from_config_dict(config_dict)
+                
+                # Show message to user
+                self.lbl_instructions.setText(f"✓ Loaded existing ROI configuration from previous analysis")
+                self.lbl_instructions.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: bold; margin: 10px;")
                         
         except Exception as e:
             # Silently fail - don't bother user if config can't be loaded
@@ -2829,6 +3055,9 @@ class ROIToolGUI(QMainWindow):
         config.show_all_keypoints = self.chk_show_all_keypoints.isChecked()
         config.show_edges = self.chk_show_edges.isChecked()
         config.show_keypoint_labels = self.chk_show_keypoint_labels.isChecked()
+        config.show_track_labels = self.chk_show_track_labels.isChecked() if hasattr(self, 'chk_show_track_labels') else False
+        config.show_track_trail = self.chk_show_track_trail.isChecked() if hasattr(self, 'chk_show_track_trail') else False
+        config.track_trail_length = self.spin_trail_length.value() if hasattr(self, 'spin_trail_length') else 30
         config.save_data_view = self.chk_data_view.isChecked()
         config.overwrite_files = self.chk_overwrite.isChecked()
     
@@ -2849,6 +3078,12 @@ class ROIToolGUI(QMainWindow):
         self.chk_show_all_keypoints.setChecked(config.show_all_keypoints)
         self.chk_show_edges.setChecked(config.show_edges)
         self.chk_show_keypoint_labels.setChecked(config.show_keypoint_labels)
+        if hasattr(self, 'chk_show_track_labels'):
+            self.chk_show_track_labels.setChecked(config.show_track_labels)
+        if hasattr(self, 'chk_show_track_trail'):
+            self.chk_show_track_trail.setChecked(config.show_track_trail)
+        if hasattr(self, 'spin_trail_length'):
+            self.spin_trail_length.setValue(config.track_trail_length)
         self.chk_data_view.setChecked(config.save_data_view)
         self.chk_overwrite.setChecked(config.overwrite_files)
     
