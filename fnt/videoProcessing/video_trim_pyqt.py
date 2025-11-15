@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QFileDialog, QMessageBox, QGroupBox, QComboBox,
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QApplication,
-    QProgressBar, QCheckBox
+    QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -259,7 +259,7 @@ class VideoTrimTool(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Trim and Crop - FieldNeuroToolbox")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1600, 950)  # Increased size to prevent cutoff
         
         # State
         self.video_configs = []
@@ -363,6 +363,7 @@ class VideoTrimTool(QMainWindow):
     def create_left_panel(self):
         """Create the left panel with video list and settings"""
         panel = QWidget()
+        panel.setMaximumWidth(450)  # Constrain the width
         layout = QVBoxLayout()
         panel.setLayout(layout)
         
@@ -373,17 +374,30 @@ class VideoTrimTool(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
+        # Create scroll area for ALL sections
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # No horizontal scroll
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout()
+        scroll_content.setLayout(scroll_layout)
+        
         # Video selection section
         video_section = self.create_video_selection_section()
-        layout.addWidget(video_section)
+        scroll_layout.addWidget(video_section)
         
         # Settings section
         settings_section = self.create_settings_section()
-        layout.addWidget(settings_section)
+        scroll_layout.addWidget(settings_section)
         
         # Processing section
         processing_section = self.create_processing_section()
-        layout.addWidget(processing_section)
+        scroll_layout.addWidget(processing_section)
+        
+        # Add scroll area to main layout
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area)
         
         return panel
     
@@ -543,9 +557,50 @@ class VideoTrimTool(QMainWindow):
         layout = QVBoxLayout()
         
         # Queue status
-        self.queue_status_label = QLabel("Videos in queue: 0")
+        self.queue_status_label = QLabel("Clips in queue: 0")
         self.queue_status_label.setFont(QFont("Arial", 10, QFont.Bold))
         layout.addWidget(self.queue_status_label)
+        
+        # Queue list widget
+        queue_label = QLabel("Queued Clips:")
+        queue_label.setFont(QFont("Arial", 9, QFont.Bold))
+        layout.addWidget(queue_label)
+        
+        self.queue_table = QTableWidget()
+        self.queue_table.setColumnCount(4)  # Added Remove column
+        self.queue_table.setHorizontalHeaderLabels(["", "Clip Name", "Duration", "Origin"])
+        self.queue_table.setMinimumHeight(150)  # Show at least 5 rows
+        self.queue_table.setEditTriggers(QTableWidget.DoubleClicked)  # Allow double-click editing on clip name
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.queue_table.horizontalHeader().setStretchLastSection(False)
+        self.queue_table.setColumnWidth(0, 30)   # Remove button
+        self.queue_table.setColumnWidth(1, 140)  # Clip Name
+        self.queue_table.setColumnWidth(2, 70)   # Duration
+        self.queue_table.setColumnWidth(3, 120)  # Origin Video
+        self.queue_table.verticalHeader().setDefaultSectionSize(22)  # Smaller row height
+        self.queue_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #2b2b2b;
+                border: 1px solid #3f3f3f;
+                color: #cccccc;
+                font-size: 8pt;
+                gridline-color: #3f3f3f;
+            }
+            QTableWidget::item {
+                padding: 1px;
+            }
+            QHeaderView::section {
+                background-color: #3f3f3f;
+                color: #cccccc;
+                padding: 3px;
+                border: 1px solid #2b2b2b;
+                font-weight: bold;
+                font-size: 8pt;
+            }
+        """)
+        self.queue_table.cellChanged.connect(self.on_clip_name_changed)
+        layout.addWidget(self.queue_table)
         
         # Progress
         self.progress_bar = QProgressBar()
@@ -590,7 +645,7 @@ class VideoTrimTool(QMainWindow):
         
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
-        self.output_text.setMaximumHeight(150)
+        self.output_text.setMinimumHeight(250)  # Increased from 150
         self.output_text.setStyleSheet("""
             QTextEdit {
                 background-color: #1e1e1e;
@@ -715,6 +770,7 @@ class VideoTrimTool(QMainWindow):
         self.video_configs = []
         self.video_list.clear()
         self.processing_queue = []
+        self.queue_table.setRowCount(0)  # Clear all rows from table
         self.update_queue_status()
         self.btn_previous.setEnabled(False)
         self.btn_next.setEnabled(False)
@@ -1014,43 +1070,147 @@ class VideoTrimTool(QMainWindow):
         self.preview_label.setPixmap(scaled_pixmap)
     
     def add_to_queue(self):
-        """Add current video to processing queue"""
+        """Add current video clip to processing queue"""
         if self.current_config_idx >= len(self.video_configs):
             return
         
         config = self.video_configs[self.current_config_idx]
         
-        # Update config with current UI values
-        config.duration = self.get_duration_from_ui()
-        config.output_filename = self.output_filename.text().strip()
+        # Get current UI values
+        output_filename = self.output_filename.text().strip()
         
-        if not config.output_filename:
+        if not output_filename:
             QMessageBox.warning(self, "Invalid Filename", "Please enter an output filename.")
             return
         
-        if not config.output_filename.lower().endswith('.mp4'):
-            config.output_filename += '.mp4'
+        if not output_filename.lower().endswith('.mp4'):
+            output_filename += '.mp4'
         
-        # Mark as configured
-        config.configured = True
+        # Check for duplicate filenames in queue
+        for queued_config in self.processing_queue:
+            if queued_config.output_filename == output_filename:
+                reply = QMessageBox.warning(
+                    self, 
+                    "Duplicate Filename", 
+                    f"The filename '{output_filename}' is already in the processing queue.\n\nDo you want to add it anyway? (This will overwrite the previous file)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
         
-        # Add to queue if not already there
-        if self.current_config_idx not in self.processing_queue:
-            self.processing_queue.append(self.current_config_idx)
+        # Create a copy of the config for this specific clip
+        clip_config = VideoTrimConfig(config.video_path)
+        clip_config.video_path = config.video_path
+        clip_config.start_time = config.start_time
+        clip_config.duration = self.get_duration_from_ui()
+        clip_config.crop_polygon = config.crop_polygon.copy()  # Keep the crop
+        clip_config.output_filename = output_filename
+        clip_config.configured = True
+        clip_config.width = config.width
+        clip_config.height = config.height
+        clip_config.fps = config.fps
+        clip_config.total_duration = config.total_duration
         
-        # Update list item with checkmark
-        item = self.video_list.item(self.current_config_idx)
-        item.setText(f"✓ {os.path.basename(config.video_path)}")
+        # Add to queue
+        self.processing_queue.append(clip_config)
+        
+        # Add to queue table
+        row_position = self.queue_table.rowCount()
+        self.queue_table.insertRow(row_position)
+        
+        # Block signals to prevent cellChanged from firing during setup
+        self.queue_table.blockSignals(True)
+        
+        # Remove button (red minus sign)
+        remove_btn = QPushButton("🗑")
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                border: none;
+                padding: 2px;
+                font-size: 10pt;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        remove_btn.setMaximumSize(25, 20)
+        remove_btn.clicked.connect(lambda checked, row=row_position: self.remove_clip_from_queue(row))
+        self.queue_table.setCellWidget(row_position, 0, remove_btn)
+        
+        # Clip Name (editable by double-click)
+        clip_name_item = QTableWidgetItem(output_filename)
+        clip_name_item.setFlags(clip_name_item.flags() | Qt.ItemIsEditable)
+        self.queue_table.setItem(row_position, 1, clip_name_item)
+        
+        # Duration (read-only)
+        duration_str = self.format_time(clip_config.duration)
+        duration_item = QTableWidgetItem(duration_str)
+        duration_item.setFlags(duration_item.flags() & ~Qt.ItemIsEditable)
+        self.queue_table.setItem(row_position, 2, duration_item)
+        
+        # Origin Video (read-only)
+        origin_video = os.path.basename(config.video_path)
+        origin_item = QTableWidgetItem(origin_video)
+        origin_item.setFlags(origin_item.flags() & ~Qt.ItemIsEditable)
+        self.queue_table.setItem(row_position, 3, origin_item)
+        
+        # Re-enable signals
+        self.queue_table.blockSignals(False)
         
         self.update_queue_status()
         
-        # Auto-advance to next video
-        if self.current_config_idx < len(self.video_configs) - 1:
-            self.next_video()
+        # Reset output filename to default (indicates new clip from same video)
+        base_name = os.path.splitext(os.path.basename(config.video_path))[0]
+        config.output_filename = f"{base_name}_trimmed.mp4"
+        self.output_filename.setText(config.output_filename)
+        
+        # DON'T auto-advance to next video - user can make multiple clips from same video
+        # Crop stays applied for next clip
+    
+    def remove_clip_from_queue(self, row):
+        """Remove a clip from the queue by row index"""
+        if 0 <= row < len(self.processing_queue):
+            # Remove from processing queue
+            self.processing_queue.pop(row)
+            
+            # Remove from table
+            self.queue_table.removeRow(row)
+            
+            # Update remaining remove button connections (row indices have shifted)
+            for i in range(row, self.queue_table.rowCount()):
+                widget = self.queue_table.cellWidget(i, 0)
+                if widget:
+                    # Reconnect with updated row index
+                    widget.clicked.disconnect()
+                    widget.clicked.connect(lambda checked, r=i: self.remove_clip_from_queue(r))
+            
+            self.update_queue_status()
+    
+    def on_clip_name_changed(self, row, column):
+        """Handle clip name changes in the table"""
+        # Only process changes to column 1 (Clip Name)
+        if column == 1 and 0 <= row < len(self.processing_queue):
+            new_name = self.queue_table.item(row, column).text().strip()
+            
+            if new_name:
+                # Ensure .mp4 extension
+                if not new_name.lower().endswith('.mp4'):
+                    new_name += '.mp4'
+                
+                # Update the config
+                self.processing_queue[row].output_filename = new_name
+                
+                # Update the table cell (in case we added .mp4)
+                self.queue_table.blockSignals(True)
+                self.queue_table.item(row, column).setText(new_name)
+                self.queue_table.blockSignals(False)
     
     def update_queue_status(self):
         """Update queue status label"""
-        self.queue_status_label.setText(f"Videos in queue: {len(self.processing_queue)}")
+        self.queue_status_label.setText(f"Clips in queue: {len(self.processing_queue)}")
         self.btn_start_batch.setEnabled(len(self.processing_queue) > 0)
     
     def start_batch_processing(self):
@@ -1061,8 +1221,8 @@ class VideoTrimTool(QMainWindow):
         # Clear output window
         self.output_text.clear()
         
-        # Get configs for queued videos
-        configs_to_process = [self.video_configs[i] for i in self.processing_queue]
+        # processing_queue now contains VideoTrimConfig objects directly
+        configs_to_process = self.processing_queue
         
         # Start worker
         self.processor = BatchTrimWorker(configs_to_process)
@@ -1118,13 +1278,8 @@ class VideoTrimTool(QMainWindow):
         
         # Clear queue
         self.processing_queue = []
+        self.queue_table.setRowCount(0)  # Clear all rows from table
         self.update_queue_status()
-        
-        # Remove checkmarks
-        for i in range(len(self.video_configs)):
-            item = self.video_list.item(i)
-            config = self.video_configs[i]
-            item.setText(f"📹 {os.path.basename(config.video_path)}")
     
     def format_time(self, seconds):
         """Format seconds as HH:MM:SS"""
