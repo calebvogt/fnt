@@ -1,5 +1,11 @@
 # ToDo
 
+# rfid analysis
+- incorporate rfid tab
+- create gui that incorporates all aspects of my rfid processing pipeline "create_X.r";
+- add json for getting metadata information for a given trial
+- 
+
 # video tracking
 - improve the video tracking/optical flow SAM module tab; still underperforming
 

@@ -554,9 +554,14 @@ class FNTMainWindow(QMainWindow):
         try:
             from fnt.videoProcessing.video_concatenate_pyqt import VideoConcatenationGUI
             
-            # Create and show the video concatenation window
-            self.video_concatenation_window = VideoConcatenationGUI()
-            self.video_concatenation_window.show()
+            # Create a new instance each time to allow multiple windows
+            video_concatenation_window = VideoConcatenationGUI()
+            video_concatenation_window.show()
+            
+            # Store reference to prevent garbage collection (use list to allow multiple instances)
+            if not hasattr(self, 'video_concatenation_windows'):
+                self.video_concatenation_windows = []
+            self.video_concatenation_windows.append(video_concatenation_window)
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video concatenation tool: {str(e)}")
