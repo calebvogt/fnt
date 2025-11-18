@@ -96,7 +96,10 @@ def uwb_animate_paths():
     root = tk.Tk()
     root.withdraw()
     print("Please select your SQLite database file...")
-    file_path = filedialog.askopenfilename(title="Select SQLite File", filetypes=[("SQLite Files", "*.sqlite")])
+    file_path = filedialog.askopenfilename(
+        title="Select Database File", 
+        filetypes=[("Database Files", "*.sqlite *.sql"), ("SQLite Files", "*.sqlite"), ("SQL Files", "*.sql"), ("All Files", "*.*")]
+    )
 
     if not file_path:
         print("No file selected. Exiting.")

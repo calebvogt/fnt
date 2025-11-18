@@ -4,10 +4,12 @@ import sqlite3
 import numpy as np
 import pandas as pd
 import pytz
-import subprocess
 import gc
 import json
 import shutil
+import xml.etree.ElementTree as ET
+import cv2
+from multiprocessing import Pool, cpu_count
 import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
@@ -20,7 +22,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
                              QSpinBox, QSplitter, QFrame, QSlider, QLineEdit,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QTextEdit)
+                             QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
@@ -56,7 +58,7 @@ class IdentityAssignmentDialog(QDialog):
             
             # Identity text input
             identity_edit = QLineEdit()
-            identity_edit.setPlaceholderText(f"e.g., Animal{tag}")
+            identity_edit.setPlaceholderText(f"e.g., {tag}")
             
             # Load existing values if available
             if tag in self.identities:
@@ -66,7 +68,7 @@ class IdentityAssignmentDialog(QDialog):
             else:
                 # Default values
                 sex_combo.setCurrentIndex(0)  # Default to M
-                identity_edit.setText(f"Tag{tag}")
+                identity_edit.setText(f"{tag}")
             
             # Horizontal layout for sex and identity
             tag_layout = QHBoxLayout()
@@ -75,7 +77,9 @@ class IdentityAssignmentDialog(QDialog):
             tag_layout.addWidget(QLabel("ID:"))
             tag_layout.addWidget(identity_edit)
             
-            form_layout.addRow(f"Tag {tag}:", tag_layout)
+            # Convert DEC to HEX for display
+            hex_id = hex(tag).upper().replace('0X', '')
+            form_layout.addRow(f"HexID {hex_id}:", tag_layout)
             
             self.sex_combos[tag] = sex_combo
             self.identity_edits[tag] = identity_edit
@@ -97,7 +101,7 @@ class IdentityAssignmentDialog(QDialog):
             sex = self.sex_combos[tag].currentText()
             identity = self.identity_edits[tag].text().strip()
             if not identity:
-                identity = f"Tag{tag}"
+                identity = str(tag)
             result[tag] = {'sex': sex, 'identity': identity}
         return result
 
@@ -109,10 +113,12 @@ class PlotSaverWorker(QThread):
     
     def __init__(self, db_path, table_name, selected_tags, downsample, smoothing_method, 
                  plot_types=None, overwrite=True, rolling_window=10, timezone='US/Mountain',
-                 tag_identities=None, use_identities=False):
+                 tag_identities=None, use_identities=False, background_image=None,
+                 bg_width_meters=None, bg_height_meters=None, csv_path=None):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
+        self.csv_path = csv_path
         self.selected_tags = selected_tags
         self.downsample = downsample
         self.smoothing_method = smoothing_method
@@ -126,54 +132,66 @@ class PlotSaverWorker(QThread):
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
         self.use_identities = use_identities
+        self.background_image = background_image
+        self.bg_width_meters = bg_width_meters
+        self.bg_height_meters = bg_height_meters
         
     def run(self):
         try:
-            self.progress.emit("Loading data from database...")
-            
-            # Connect to database
-            conn = sqlite3.connect(self.db_path)
-            query = f"SELECT * FROM {self.table_name}"
-            data = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            self.progress.emit(f"Loaded {len(data)} records")
-            
-            # Process data
-            data['Timestamp'] = pd.to_datetime(data['timestamp'], unit='ms', origin='unix', utc=True)
-            tz = pytz.timezone(self.timezone)
-            data['Timestamp'] = data['Timestamp'].dt.tz_convert(tz)
-            
-            # Convert location to meters
-            data['location_x'] *= 0.0254
-            data['location_y'] *= 0.0254
-            
-            # Flip Y-axis so 0,0 is at bottom-left
-            data['location_y'] = -data['location_y']
-            
-            data = data.sort_values(by=['shortid', 'Timestamp'])
-            
-            # Filter to selected tags
-            if self.selected_tags:
-                data = data[data['shortid'].isin(self.selected_tags)]
-            
-            # Apply custom sex and identities if configured
-            if self.use_identities and self.tag_identities:
-                data['sex'] = data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
-                data['identity'] = data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('identity', f'Tag{x}'))
+            # Load from CSV if available (much faster and ensures consistency)
+            if self.csv_path and os.path.exists(self.csv_path):
+                self.progress.emit("Loading data from CSV...")
+                data = pd.read_csv(self.csv_path)
+                
+                # Parse Timestamp column (let pandas infer the format automatically)
+                # This handles timezone-aware timestamps like "2025-10-13 18:09:10-06:00"
+                data['Timestamp'] = pd.to_datetime(data['Timestamp'], format='mixed')
+                
+                self.progress.emit(f"Loaded {len(data)} records from CSV")
             else:
-                data['sex'] = 'M'
-                data['identity'] = data['shortid'].apply(lambda x: f'Tag{x}')
-            
-            # Apply smoothing FIRST (on full resolution data)
-            if self.smoothing_method != "None":
-                self.progress.emit("Applying smoothing to full resolution data...")
-                data = self.apply_smoothing(data, self.smoothing_method)
-            
-            # Downsample AFTER smoothing (if requested)
-            if self.downsample:
-                self.progress.emit("Downsampling to 1Hz...")
-                data = self.apply_downsampling(data)
+                # Fallback: Load from database (old behavior)
+                self.progress.emit("Loading data from database...")
+                
+                # Connect to database
+                conn = sqlite3.connect(self.db_path)
+                query = f"SELECT * FROM {self.table_name}"
+                data = pd.read_sql_query(query, conn)
+                conn.close()
+                
+                self.progress.emit(f"Loaded {len(data)} records")
+                
+                # Process data
+                data['Timestamp'] = pd.to_datetime(data['timestamp'], unit='ms', origin='unix', utc=True)
+                tz = pytz.timezone(self.timezone)
+                data['Timestamp'] = data['Timestamp'].dt.tz_convert(tz)
+                
+                # Convert location to meters
+                data['location_x'] *= 0.0254
+                data['location_y'] *= 0.0254
+                
+                data = data.sort_values(by=['shortid', 'Timestamp'])
+                
+                # Filter to selected tags
+                if self.selected_tags:
+                    data = data[data['shortid'].isin(self.selected_tags)]
+                
+                # Apply custom sex and identities if configured
+                if self.use_identities and self.tag_identities:
+                    data['sex'] = data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
+                    data['identity'] = data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('identity', f'Tag{x}'))
+                else:
+                    data['sex'] = 'M'
+                    data['identity'] = data['shortid'].apply(lambda x: f'Tag{x}')
+                
+                # Apply smoothing FIRST (on full resolution data)
+                if self.smoothing_method != "None":
+                    self.progress.emit("Applying smoothing to full resolution data...")
+                    data = self.apply_smoothing(data, self.smoothing_method)
+                
+                # Downsample AFTER smoothing (if requested)
+                if self.downsample:
+                    self.progress.emit("Downsampling to 1Hz...")
+                    data = self.apply_downsampling(data)
             
             # Get output directory - use the analysis folder
             db_dir = os.path.dirname(self.db_path)
@@ -282,6 +300,13 @@ class PlotSaverWorker(QThread):
         x_min, x_max = data[x_col].min(), data[x_col].max()
         y_min, y_max = data[y_col].min(), data[y_col].max()
         
+        # If background image exists, adjust limits to include it (using meters)
+        if self.background_image is not None and self.bg_width_meters is not None:
+            x_min = min(x_min, 0)
+            x_max = max(x_max, self.bg_width_meters)
+            y_min = min(y_min, 0)
+            y_max = max(y_max, self.bg_height_meters)
+        
         # Add padding
         x_range = x_max - x_min
         y_range = y_max - y_min
@@ -300,11 +325,21 @@ class PlotSaverWorker(QThread):
         
         # Create one plot per tag
         for tag in unique_tags:
-            output_path = os.path.join(output_dir, f'{db_name}_DailyPaths_Tag{tag}.png')
+            # Generate filename with HexID or sex-identity
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                file_suffix = f"{sex}-{identity}"
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                file_suffix = f"HexID{hex_id}"
+            
+            output_path = os.path.join(output_dir, f'{db_name}_DailyPaths_{file_suffix}.png')
             
             # Check if file exists and overwrite is False
             if not self.overwrite and os.path.exists(output_path):
-                self.progress.emit(f"Skipped (exists): {db_name}_DailyPaths_Tag{tag}.png")
+                self.progress.emit(f"Skipped (exists): {db_name}_DailyPaths_{file_suffix}.png")
                 continue
             
             tag_data = data[data['shortid'] == tag]
@@ -335,14 +370,14 @@ class PlotSaverWorker(QThread):
                 ax.grid(True, alpha=0.3)
                 ax.set_aspect('equal')
             
-            fig.suptitle(f'Daily Paths - Tag {tag}', fontsize=14, fontweight='bold')
+            fig.suptitle(f'Daily Paths - {file_suffix}', fontsize=14, fontweight='bold')
             fig.tight_layout()
             
             fig.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
             generated += 1
             
-            self.progress.emit(f"Saved: {db_name}_DailyPaths_Tag{tag}.png")
+            self.progress.emit(f"Saved: {db_name}_DailyPaths_{file_suffix}.png")
         
         return generated
     
@@ -361,15 +396,47 @@ class PlotSaverWorker(QThread):
         fig = Figure(figsize=(10, 8))
         ax = fig.add_subplot(111)
         
+        # Display background image if available (with 0,0 at lower-left corner)
+        if self.background_image is not None:
+            if self.bg_width_meters is not None and self.bg_height_meters is not None:
+                # Use scaled dimensions in meters
+                ax.imshow(self.background_image, 
+                         extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+                         origin='lower',
+                         aspect='auto',
+                         alpha=0.6,
+                         zorder=0)
+            else:
+                # Fallback to pixel dimensions
+                img_height, img_width = self.background_image.shape[:2]
+                ax.imshow(self.background_image, 
+                         extent=[0, img_width, 0, img_height],
+                         origin='lower',
+                         aspect='auto',
+                         alpha=0.6,
+                         zorder=0)
+        
         x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
         y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
         
-        colors = plt.cm.tab10(np.linspace(0, 1, len(data['shortid'].unique())))
-        
-        for i, tag in enumerate(data['shortid'].unique()):
+        # Plot each tag with sex-based coloring
+        for tag in data['shortid'].unique():
             tag_data = data[data['shortid'] == tag]
+            
+            # Determine label and color based on identity configuration
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                label = f"{sex}-{identity}"
+                color = 'blue' if sex == 'M' else 'red'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                label = f"HexID {hex_id}"
+                color = 'blue'  # Default to blue
+            
             ax.plot(tag_data[x_col], tag_data[y_col], 
-                   linewidth=1, alpha=0.7, color=colors[i], label=f'Tag {tag}')
+                   linewidth=1, alpha=0.7, color=color, label=label)
         
         ax.set_xlabel('X Position (m)', fontsize=10)
         ax.set_ylabel('Y Position (m)', fontsize=10)
@@ -455,16 +522,20 @@ class PlotSaverWorker(QThread):
         
         # Create one plot per tag with all days
         for tag in unique_tags:
-            # Get identity if available
-            if 'identity' in data.columns:
-                tag_identity = data[data['shortid'] == tag]['identity'].iloc[0]
+            # Generate filename with HexID or sex-identity
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                file_suffix = f"{sex}-{identity}"
             else:
-                tag_identity = f'Tag{tag}'
+                hex_id = hex(tag).upper().replace('0X', '')
+                file_suffix = f"HexID{hex_id}"
             
-            output_path = os.path.join(output_dir, f'{db_name}_3D_Occupancy_{tag_identity}.png')
+            output_path = os.path.join(output_dir, f'{db_name}_3D_Occupancy_{file_suffix}.png')
             
             if not self.overwrite and os.path.exists(output_path):
-                self.progress.emit(f"Skipped (exists): {db_name}_3D_Occupancy_{tag_identity}.png")
+                self.progress.emit(f"Skipped (exists): {db_name}_3D_Occupancy_{file_suffix}.png")
                 continue
             
             tag_data = data[data['shortid'] == tag]
@@ -505,13 +576,13 @@ class PlotSaverWorker(QThread):
                 ax.set_zlabel('Count', fontsize=8)
                 ax.set_title(f'Day {day}', fontsize=10)
             
-            fig.suptitle(f'3D Occupancy - {tag_identity}', fontsize=14, fontweight='bold')
+            fig.suptitle(f'3D Occupancy - {file_suffix}', fontsize=14, fontweight='bold')
             fig.tight_layout()
             fig.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
             generated += 1
             
-            self.progress.emit(f"Saved: {db_name}_3D_Occupancy_{tag_identity}.png")
+            self.progress.emit(f"Saved: {db_name}_3D_Occupancy_{file_suffix}.png")
         
         return generated
     
@@ -531,7 +602,7 @@ class PlotSaverWorker(QThread):
         
         for tag in data['shortid'].unique():
             tag_data = data[data['shortid'] == tag]
-            hourly_counts = tag_data.set_index('Timestamp').resample('H').size()
+            hourly_counts = tag_data.set_index('Timestamp').resample('h').size()
             ax.plot(hourly_counts.index, hourly_counts.values, label=f'Tag {tag}', linewidth=1.5)
         
         ax.set_xlabel('Time', fontsize=10)
@@ -579,7 +650,17 @@ class PlotSaverWorker(QThread):
         for tag in data['shortid'].unique():
             tag_data = data[data['shortid'] == tag]['velocity'].dropna()
             if len(tag_data) > 0:
-                ax.hist(tag_data, bins=50, alpha=0.5, label=f'Tag {tag}', density=True)
+                # Generate label with HexID or sex-identity
+                if self.use_identities and tag in self.tag_identities:
+                    info = self.tag_identities[tag]
+                    sex = info.get('sex', 'M')
+                    identity = info.get('identity', str(tag))
+                    label = f"{sex}-{identity}"
+                else:
+                    hex_id = hex(tag).upper().replace('0X', '')
+                    label = f"HexID {hex_id}"
+                
+                ax.hist(tag_data, bins=50, alpha=0.5, label=label, density=True)
         
         ax.set_xlabel('Velocity (m/s)', fontsize=10)
         ax.set_ylabel('Density', fontsize=10)
@@ -606,6 +687,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.trail_length = 30  # Changed to seconds
         self.preview_loaded = False
         
+        # Export control flags
+        self.export_cancelled = False
+        self.exporting = False
+        
         # Playback control variables
         self.is_playing = False
         self.playback_speed = 1  # 1x, 2x, 4x, etc.
@@ -614,6 +699,14 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Tag identity and sex mapping
         self.tag_identities = {}  # {tag_id: {'sex': 'M', 'identity': 'Animal1'}}
+        
+        # XML configuration and background image
+        self.xml_config_path = None
+        self.background_image_path = None
+        self.background_image = None  # Loaded matplotlib image
+        self.xml_scale = None  # Scale from XML in inches/pixel
+        self.bg_width_meters = None  # Background image width in meters
+        self.bg_height_meters = None  # Background image height in meters
         
         self.initUI()
         
@@ -786,22 +879,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_no_tags.setStyleSheet("color: #666666; font-style: italic;")
         self.tag_layout.addWidget(self.lbl_no_tags)
         
-        # Select All/None buttons
-        tag_btn_layout = QHBoxLayout()
-        btn_select_all = QPushButton("Select All")
-        btn_select_all.clicked.connect(self.select_all_tags)
-        btn_select_none = QPushButton("Select None")
-        btn_select_none.clicked.connect(self.select_none_tags)
-        tag_btn_layout.addWidget(btn_select_all)
-        tag_btn_layout.addWidget(btn_select_none)
-        self.tag_layout.addLayout(tag_btn_layout)
-        
-        # Button to open identity assignment dialog (no checkbox, always available)
-        self.btn_assign_identities = QPushButton("Configure Identities...")
-        self.btn_assign_identities.clicked.connect(self.open_identity_dialog)
-        self.btn_assign_identities.setEnabled(False)
-        self.btn_assign_identities.setToolTip("Assign custom sex (M/F) and alphanumeric IDs to selected tags")
-        self.tag_layout.addWidget(self.btn_assign_identities)
+        # Note: Select All/None and Configure Identities buttons will be added
+        # dynamically below the tag checkboxes in load_tags_from_table()
         
         self.tag_group.setLayout(self.tag_layout)
         layout.addWidget(self.tag_group)
@@ -858,19 +937,38 @@ class UWBQuickVisualizationWindow(QWidget):
         trail_length_layout.addWidget(self.spin_trail_length)
         options_layout.addLayout(trail_length_layout)
         
-        # Downsample (moved to below trail options, above Load Preview button)
+        # Downsample (moved to below trail options)
         self.chk_downsample = QCheckBox("Downsample to 1Hz")
         self.chk_downsample.setChecked(True)
         self.chk_downsample.setToolTip("Downsample output to 1Hz (smoothing is applied to full resolution data first)")
         self.chk_downsample.stateChanged.connect(self.mark_options_changed)
         options_layout.addWidget(self.chk_downsample)
         
-        # Load Preview button (moved here)
+        # Load Background and Load Preview buttons in horizontal layout
+        load_buttons_layout = QHBoxLayout()
+        
+        # Load Background Image button
+        self.btn_load_background = QPushButton("Load Background")
+        self.btn_load_background.clicked.connect(self.select_background_image)
+        self.btn_load_background.setEnabled(False)
+        self.btn_load_background.setToolTip("Load a background map/floorplan image to overlay on visualizations")
+        self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        load_buttons_layout.addWidget(self.btn_load_background)
+        
+        # Load Preview button
         self.btn_load_preview = QPushButton("Load Preview")
         self.btn_load_preview.clicked.connect(self.load_preview)
         self.btn_load_preview.setEnabled(False)
-        self.btn_load_preview.setStyleSheet("padding: 10px; font-size: 12px; font-weight: bold;")
-        options_layout.addWidget(self.btn_load_preview)
+        self.btn_load_preview.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
+        load_buttons_layout.addWidget(self.btn_load_preview)
+        
+        options_layout.addLayout(load_buttons_layout)
+        
+        # Label to show background image status
+        self.lbl_background_status = QLabel("No background image loaded")
+        self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
+        self.lbl_background_status.setWordWrap(True)
+        options_layout.addWidget(self.lbl_background_status)
         
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
@@ -887,7 +985,7 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Save Plots checkbox (master)
         self.chk_save_plots = QCheckBox("Save Plots")
-        self.chk_save_plots.setChecked(False)  # Default unchecked
+        self.chk_save_plots.setChecked(True)  # Default checked
         self.chk_save_plots.stateChanged.connect(self.on_save_plots_toggled)
         self.chk_save_plots.setToolTip("Generate and save visualization plots")
         export_layout.addWidget(self.chk_save_plots)
@@ -915,12 +1013,12 @@ class UWBQuickVisualizationWindow(QWidget):
             plot_types_layout.addWidget(cb)
         
         self.plot_types_widget.setLayout(plot_types_layout)
-        self.plot_types_widget.setVisible(False)  # Hidden by default
+        self.plot_types_widget.setVisible(True)  # Visible by default since Save Plots is checked
         export_layout.addWidget(self.plot_types_widget)
         
         # Save Animation checkbox (master)
         self.chk_save_animation = QCheckBox("Save Animation")
-        self.chk_save_animation.setChecked(False)  # Default unchecked
+        self.chk_save_animation.setChecked(True)  # Default checked
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
         self.chk_save_animation.setToolTip("Generate animated video of tracking data")
         export_layout.addWidget(self.chk_save_animation)
@@ -940,14 +1038,24 @@ class UWBQuickVisualizationWindow(QWidget):
         trail_layout.addWidget(self.spin_animation_trail)
         animation_options_layout.addLayout(trail_layout)
         
+        # Animation Speed
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel("Animation Speed:"))
+        self.combo_animation_speed = QComboBox()
+        self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "160x", "200x", "400x", "500x", "1000x"])
+        self.combo_animation_speed.setCurrentText("40x")
+        self.combo_animation_speed.setToolTip("Playback speed multiplier (e.g., 10x = 10 seconds of real time per second of video)")
+        speed_layout.addWidget(self.combo_animation_speed)
+        animation_options_layout.addLayout(speed_layout)
+        
         # Animation FPS
         fps_layout = QHBoxLayout()
         fps_layout.addWidget(QLabel("FPS:"))
-        self.spin_animation_fps = QSpinBox()
-        self.spin_animation_fps.setRange(1, 60)
-        self.spin_animation_fps.setValue(20)
-        self.spin_animation_fps.setToolTip("Frames per second for output video")
-        fps_layout.addWidget(self.spin_animation_fps)
+        self.combo_animation_fps = QComboBox()
+        self.combo_animation_fps.addItems(["1", "5", "10", "20", "30"])
+        self.combo_animation_fps.setCurrentText("1")
+        self.combo_animation_fps.setToolTip("Frames per second for output video (affects smoothness)")
+        fps_layout.addWidget(self.combo_animation_fps)
         animation_options_layout.addLayout(fps_layout)
         
         # Time window per frame
@@ -969,18 +1077,45 @@ class UWBQuickVisualizationWindow(QWidget):
         color_layout.addWidget(self.combo_color_by)
         animation_options_layout.addLayout(color_layout)
         
-        # Viewing angle
-        angle_layout = QHBoxLayout()
-        angle_layout.addWidget(QLabel("Viewing angle (degrees):"))
-        self.spin_viewing_angle = QSpinBox()
-        self.spin_viewing_angle.setRange(15, 180)
-        self.spin_viewing_angle.setValue(45)
-        self.spin_viewing_angle.setToolTip("Viewing angle for direction indicator")
-        angle_layout.addWidget(self.spin_viewing_angle)
-        animation_options_layout.addLayout(angle_layout)
+        # Video quality option
+        quality_layout = QHBoxLayout()
+        quality_layout.addWidget(QLabel("Video Quality:"))
+        self.combo_video_quality = QComboBox()
+        self.combo_video_quality.addItems(["Draft (Fast)", "Standard", "High Quality"])
+        self.combo_video_quality.setCurrentText("Standard")
+        self.combo_video_quality.setToolTip("Draft=75dpi (4x faster), Standard=100dpi, High=150dpi")
+        quality_layout.addWidget(self.combo_video_quality)
+        animation_options_layout.addLayout(quality_layout)
+        
+        # Estimated frame count label
+        self.lbl_estimated_frames = QLabel("Estimated frames: -- (load data first)")
+        self.lbl_estimated_frames.setStyleSheet("color: #888; font-size: 10pt; font-style: italic;")
+        animation_options_layout.addWidget(self.lbl_estimated_frames)
+        
+        # Connect animation parameter changes to update estimate
+        self.combo_animation_speed.currentTextChanged.connect(self.update_frame_estimate)
+        self.combo_animation_fps.currentTextChanged.connect(self.update_frame_estimate)
+        
+        # Daily animations checkbox
+        self.chk_daily_animations = QCheckBox("Generate daily animations (one per day)")
+        self.chk_daily_animations.setChecked(False)
+        self.chk_daily_animations.stateChanged.connect(self.on_daily_animations_toggled)
+        self.chk_daily_animations.setToolTip("Create separate animation for each day (midnight to midnight)")
+        animation_options_layout.addWidget(self.chk_daily_animations)
+        
+        # Container for daily animation day selection (hidden by default)
+        self.daily_animation_days_widget = QWidget()
+        daily_days_layout = QVBoxLayout()
+        daily_days_layout.setContentsMargins(20, 5, 0, 5)
+        self.daily_animation_day_checkboxes = {}
+        self.daily_days_layout_inner = QVBoxLayout()
+        daily_days_layout.addLayout(self.daily_days_layout_inner)
+        self.daily_animation_days_widget.setLayout(daily_days_layout)
+        self.daily_animation_days_widget.setVisible(False)
+        animation_options_layout.addWidget(self.daily_animation_days_widget)
         
         self.animation_options_widget.setLayout(animation_options_layout)
-        self.animation_options_widget.setVisible(False)  # Hidden by default
+        self.animation_options_widget.setVisible(True)  # Visible by default
         export_layout.addWidget(self.animation_options_widget)
         
         # Overwrite checkbox (moved to bottom, applies to all exports)
@@ -992,12 +1127,54 @@ class UWBQuickVisualizationWindow(QWidget):
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
         
+        # Progress bar (hidden by default)
+        self.progress_widget = QWidget()
+        progress_layout = QVBoxLayout()
+        progress_layout.setContentsMargins(0, 5, 0, 5)
+        
+        self.lbl_export_progress = QLabel("")
+        self.lbl_export_progress.setStyleSheet("color: #00aa00; font-weight: bold;")
+        progress_layout.addWidget(self.lbl_export_progress)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #555555;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1e1e1e;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
+        
+        self.progress_widget.setLayout(progress_layout)
+        self.progress_widget.setVisible(False)
+        layout.addWidget(self.progress_widget)
+        
+        # Export buttons layout
+        export_buttons_layout = QHBoxLayout()
+        
         # Export button
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_data)
         self.btn_export.setEnabled(False)
-        self.btn_export.setStyleSheet("padding: 10px; font-size: 12px; font-weight: bold;")
-        layout.addWidget(self.btn_export)
+        self.btn_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
+        export_buttons_layout.addWidget(self.btn_export)
+        
+        # Stop export button (hidden by default)
+        self.btn_stop_export = QPushButton("Stop Export")
+        self.btn_stop_export.clicked.connect(self.stop_export)
+        self.btn_stop_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold; background-color: #d41100;")
+        self.btn_stop_export.setVisible(False)
+        export_buttons_layout.addWidget(self.btn_stop_export)
+        
+        layout.addLayout(export_buttons_layout)
         
         # Messages window
         messages_label = QLabel("Messages:")
@@ -1155,6 +1332,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self.combo_table.addItems(tables)
             self.combo_table.setEnabled(True)
             self.btn_preview_table.setEnabled(True)
+            self.btn_load_background.setEnabled(True)  # Enable background image loading
             
             if len(tables) == 1:
                 self.combo_table.setCurrentIndex(0)
@@ -1162,8 +1340,157 @@ class UWBQuickVisualizationWindow(QWidget):
             # Check for existing config file and load it
             self.load_config_if_exists()
             
+            # Check for XML configuration file in the database directory
+            self.load_xml_config()
+            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
+    
+    def load_xml_config(self):
+        """Look for XML configuration file in the database directory"""
+        if not self.db_path:
+            return
+        
+        db_dir = os.path.dirname(self.db_path)
+        
+        # Look for .xml files in the same directory
+        xml_files = [f for f in os.listdir(db_dir) if f.endswith('.xml')]
+        
+        if not xml_files:
+            self.log_message("No XML configuration file found in database directory")
+            return
+        
+        # If multiple XML files, use the first one or one matching config/Config pattern
+        xml_file = None
+        for f in xml_files:
+            if 'config' in f.lower():
+                xml_file = f
+                break
+        if not xml_file:
+            xml_file = xml_files[0]
+        
+        self.xml_config_path = os.path.join(db_dir, xml_file)
+        self.log_message(f"Found XML config: {xml_file}")
+        
+        try:
+            self.parse_xml_config()
+        except Exception as e:
+            self.log_message(f"Warning: Could not parse XML config: {str(e)}")
+    
+    def parse_xml_config(self):
+        """Parse XML configuration file and check for background image"""
+        if not self.xml_config_path or not os.path.exists(self.xml_config_path):
+            return
+        
+        try:
+            tree = ET.parse(self.xml_config_path)
+            root = tree.getroot()
+            
+            # Extract scale attribute (inches/pixel)
+            for elem in root.iter():
+                if 'scale' in elem.attrib:
+                    try:
+                        self.xml_scale = float(elem.attrib['scale'])
+                        self.log_message(f"Found XML scale: {self.xml_scale} inches/pixel")
+                        break
+                    except:
+                        pass
+            
+            # Look for background image reference
+            # XML structure might vary, check common patterns
+            bg_image_element = None
+            
+            # Check for various possible XML paths
+            possible_paths = [
+                './/BackgroundImage',
+                './/backgroundImage',
+                './/background_image',
+                './/MapImage',
+                './/mapImage',
+                './/map_image',
+                './/Image',
+            ]
+            
+            for path in possible_paths:
+                bg_image_element = root.find(path)
+                if bg_image_element is not None:
+                    break
+            
+            # Also check for attributes that might contain image filename
+            if bg_image_element is None:
+                for elem in root.iter():
+                    if elem.text and any(ext in elem.text.lower() for ext in ['.png', '.jpg', '.jpeg', '.bmp']):
+                        bg_image_element = elem
+                        break
+            
+            if bg_image_element is not None and bg_image_element.text:
+                image_filename = bg_image_element.text.strip()
+                self.log_message(f"XML references background image: {image_filename}")
+                
+                # Prompt user to select the background image
+                reply = QMessageBox.question(
+                    self, 
+                    "Background Image Found",
+                    f"XML config references a background image: {image_filename}\\n\\n"
+                    "Would you like to select the background image file?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.select_background_image()
+            else:
+                self.log_message("XML config does not reference a background image")
+                
+        except Exception as e:
+            self.log_message(f"Error parsing XML: {str(e)}")
+    
+    def select_background_image(self):
+        """Allow user to select a background image"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Background Image",
+            os.path.dirname(self.db_path) if self.db_path else "",
+            "Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*.*)"
+        )
+        
+        if file_path and os.path.exists(file_path):
+            self.background_image_path = file_path
+            self.log_message(f"Background image loaded: {os.path.basename(file_path)}")
+            
+            # Load the image for matplotlib
+            try:
+                self.background_image = plt.imread(file_path)
+                self.log_message(f"Background image size: {self.background_image.shape}")
+                
+                # Calculate dimensions in meters using XML scale if available
+                img_height_px, img_width_px = self.background_image.shape[:2]
+                if self.xml_scale:
+                    # Convert: pixels * inches/pixel * meters/inch = meters
+                    # 1 inch = 0.0254 meters
+                    self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
+                    self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
+                    self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m")
+                else:
+                    # Fallback: use pixel dimensions (no scaling)
+                    self.bg_width_meters = img_width_px
+                    self.bg_height_meters = img_height_px
+                    self.log_message("No XML scale found, using pixel dimensions")
+                
+                # Update status label
+                self.lbl_background_status.setText(f"✓ Background: {os.path.basename(file_path)}")
+                self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                
+                # If preview is already loaded, update the visualization
+                if self.preview_loaded and self.data is not None:
+                    self.update_visualization(self.time_slider.value())
+            except Exception as e:
+                self.log_message(f"Error loading background image: {str(e)}")
+                self.background_image = None
+                self.background_image_path = None
+                self.bg_width_meters = None
+                self.bg_height_meters = None
+                self.lbl_background_status.setText("Error loading background image")
+                self.lbl_background_status.setStyleSheet("color: #aa0000; font-style: italic; font-size: 9px;")
     
     def on_table_selected(self, table_name):
         """Handle table selection"""
@@ -1260,6 +1587,74 @@ class UWBQuickVisualizationWindow(QWidget):
         enabled = self.chk_save_animation.isChecked()
         self.animation_options_widget.setVisible(enabled)
     
+    def update_frame_estimate(self):
+        """Update estimated frame count based on animation settings and loaded data"""
+        if self.data is None or 'Timestamp' not in self.data.columns:
+            self.lbl_estimated_frames.setText("Estimated frames: -- (load data first)")
+            return
+        
+        try:
+            # Get animation parameters
+            fps = int(self.combo_animation_fps.currentText())
+            speed_text = self.combo_animation_speed.currentText()
+            speed_multiplier = int(speed_text.replace('x', ''))
+            
+            # Calculate frame interval (real seconds per frame)
+            frame_interval = speed_multiplier / fps
+            
+            # Get total time span of data
+            time_span = (self.data['Timestamp'].max() - self.data['Timestamp'].min()).total_seconds()
+            
+            # Estimate number of frames
+            estimated_frames = int(time_span / frame_interval)
+            
+            # Format with commas for readability
+            frames_formatted = f"{estimated_frames:,}"
+            
+            # Calculate estimated video duration
+            video_duration = estimated_frames / fps
+            
+            if video_duration >= 60:
+                duration_str = f"{video_duration/60:.1f} min"
+            else:
+                duration_str = f"{video_duration:.1f} sec"
+            
+            self.lbl_estimated_frames.setText(
+                f"Estimated frames: {frames_formatted} (~{duration_str} video @ {fps} FPS)"
+            )
+        except Exception as e:
+            self.lbl_estimated_frames.setText(f"Estimated frames: Error calculating ({str(e)})")
+    
+    def on_daily_animations_toggled(self):
+        """Handle daily animations checkbox toggle"""
+        enabled = self.chk_daily_animations.isChecked()
+        self.daily_animation_days_widget.setVisible(enabled)
+    
+    def populate_animation_days(self):
+        """Populate day checkboxes based on loaded data"""
+        # Clear existing checkboxes
+        for cb in self.daily_animation_day_checkboxes.values():
+            cb.deleteLater()
+        self.daily_animation_day_checkboxes.clear()
+        
+        if self.data is None or 'Timestamp' not in self.data.columns:
+            return
+        
+        # Get unique dates
+        dates = pd.to_datetime(self.data['Timestamp']).dt.date.unique()
+        dates = sorted(dates)
+        
+        # Create checkboxes for each day
+        for i, date in enumerate(dates):
+            date_str = date.strftime('%Y-%m-%d')
+            cb = QCheckBox(f"Day {i+1}: {date_str}")
+            cb.setChecked(True)  # Default all checked
+            cb.setToolTip(f"Generate animation for {date_str} (midnight to midnight)")
+            self.daily_animation_day_checkboxes[date_str] = cb
+            self.daily_days_layout_inner.addWidget(cb)
+        
+        self.log_message(f"Found {len(dates)} unique days in dataset")
+    
     def open_identity_dialog(self):
         """Open dialog to assign identities to tags"""
         if not self.available_tags:
@@ -1279,6 +1674,25 @@ class UWBQuickVisualizationWindow(QWidget):
             # Update tag checkbox labels to reflect new identities
             self.update_tag_labels()
             self.lbl_status.setText(f"Identity assignments saved for {len(self.tag_identities)} tags")
+    
+    def stop_export(self):
+        """Cancel ongoing export operations"""
+        self.export_cancelled = True
+        self.log_message("⚠ Export cancellation requested...")
+        
+        # Stop worker thread if running
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+            self.log_message("✗ Plot export cancelled")
+        
+        # Reset UI
+        self.exporting = False
+        self.btn_export.setEnabled(True)
+        self.btn_stop_export.setVisible(False)
+        self.progress_widget.setVisible(False)
+        self.progress_bar.setValue(0)
+        self.lbl_export_progress.setText("")
     
     def mark_options_changed(self):
         """Mark that options have changed, requiring reload"""
@@ -1314,13 +1728,52 @@ class UWBQuickVisualizationWindow(QWidget):
             self.lbl_no_tags.deleteLater()
             self.lbl_no_tags = None
         
+        # Remove existing buttons if they exist
+        if hasattr(self, 'tag_buttons_layout'):
+            while self.tag_buttons_layout.count():
+                item = self.tag_buttons_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self.tag_layout.removeItem(self.tag_buttons_layout)
+        
+        if hasattr(self, 'btn_assign_identities'):
+            self.btn_assign_identities.deleteLater()
+        
         for tag in self.available_tags:
-            cb = QCheckBox(f"Tag {tag}")
+            hex_id = hex(tag).upper().replace('0X', '')
+            # Show HexID with default identity if configured, otherwise just HexID with default sex and numeric ID
+            if tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                cb = QCheckBox(f"HexID {hex_id} ({sex}, {identity})")
+            else:
+                cb = QCheckBox(f"HexID {hex_id} (M, {tag})")
             cb.setChecked(True)
             cb.stateChanged.connect(self.mark_options_changed)  # Track changes
             cb.stateChanged.connect(self.update_identity_button_state)  # Enable/disable identity button
             self.tag_checkboxes[tag] = cb
-            self.tag_layout.insertWidget(self.tag_layout.count() - 1, cb)
+            self.tag_layout.addWidget(cb)
+        
+        # Add Select All/None buttons below checkboxes
+        self.tag_buttons_layout = QHBoxLayout()
+        btn_select_all = QPushButton("Select All")
+        btn_select_all.setStyleSheet("padding: 6px; font-size: 10px;")
+        btn_select_all.clicked.connect(self.select_all_tags)
+        btn_select_none = QPushButton("Select None")
+        btn_select_none.setStyleSheet("padding: 6px; font-size: 10px;")
+        btn_select_none.clicked.connect(self.select_none_tags)
+        self.tag_buttons_layout.addWidget(btn_select_all)
+        self.tag_buttons_layout.addWidget(btn_select_none)
+        self.tag_layout.addLayout(self.tag_buttons_layout)
+        
+        # Add Configure Identities button below Select All/None
+        self.btn_assign_identities = QPushButton("Configure Identities...")
+        self.btn_assign_identities.clicked.connect(self.open_identity_dialog)
+        self.btn_assign_identities.setEnabled(False)
+        self.btn_assign_identities.setToolTip("Assign custom sex (M/F) and alphanumeric IDs to selected tags")
+        self.btn_assign_identities.setStyleSheet("padding: 6px; font-size: 10px;")
+        self.tag_layout.addWidget(self.btn_assign_identities)
         
         # Apply pending tag selection from loaded config
         self.apply_pending_tag_selection()
@@ -1336,13 +1789,14 @@ class UWBQuickVisualizationWindow(QWidget):
     def update_tag_labels(self):
         """Update tag checkbox labels to reflect sex and ID information"""
         for tag, cb in self.tag_checkboxes.items():
+            hex_id = hex(tag).upper().replace('0X', '')
             if tag in self.tag_identities:
                 info = self.tag_identities[tag]
                 sex = info.get('sex', 'M')
-                identity = info.get('identity', f'Tag{tag}')
-                cb.setText(f"Tag {tag} ({sex}, {identity})")
+                identity = info.get('identity', str(tag))
+                cb.setText(f"HexID {hex_id} ({sex}, {identity})")
             else:
-                cb.setText(f"Tag {tag}")
+                cb.setText(f"HexID {hex_id} (M, {tag})")
     
     def select_all_tags(self):
         """Select all tags"""
@@ -1393,9 +1847,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.data['location_x'] *= 0.0254
             self.data['location_y'] *= 0.0254
             
-            # Flip Y-axis so 0,0 is at bottom-left
-            self.data['location_y'] = -self.data['location_y']
-            
             self.data = self.data.sort_values(by=['shortid', 'Timestamp'])
             
             # Filter tags
@@ -1442,6 +1893,13 @@ class UWBQuickVisualizationWindow(QWidget):
             self.preview_loaded = True
             self.btn_load_preview.setEnabled(False)
             self.btn_export.setEnabled(True)
+            
+            # Populate animation days
+            self.populate_animation_days()
+            
+            # Update frame estimate
+            self.update_frame_estimate()
+            
             self.log_message(f"✓ Preview loaded: {len(self.data)} data points across {len(unique_times)} unique timestamps")
             
         except Exception as e:
@@ -1490,13 +1948,25 @@ class UWBQuickVisualizationWindow(QWidget):
         current_timestamp = self.unique_timestamps[slider_value]
         self.lbl_time.setText(current_timestamp.strftime('%Y-%m-%d %H:%M:%S'))
         
+        # Display background image if available (with 0,0 at lower-left corner)
+        if self.background_image is not None and self.bg_width_meters is not None:
+            try:
+                # Display image with extent in meters: [left, right, bottom, top]
+                # Origin (0,0) at lower-left corner
+                self.ax.imshow(self.background_image, 
+                              extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+                              origin='lower',
+                              aspect='auto',
+                              alpha=0.6,
+                              zorder=0)
+            except Exception as e:
+                self.log_message(f"Error drawing background: {str(e)}")
+        
         # Get all data up to and including current timestamp
         current_data = self.data[self.data['Timestamp'] <= current_timestamp]
         
-        # Plot each tag
-        colors = plt.cm.tab10(np.linspace(0, 1, len(self.data['shortid'].unique())))
-        
-        for i, tag in enumerate(sorted(self.data['shortid'].unique())):
+        # Plot each tag with sex-based coloring
+        for tag in sorted(self.data['shortid'].unique()):
             tag_all_data = current_data[current_data['shortid'] == tag]
             
             if len(tag_all_data) == 0:
@@ -1504,6 +1974,18 @@ class UWBQuickVisualizationWindow(QWidget):
             
             # Get the most recent position for this tag at current time
             current_pos = tag_all_data.iloc[-1]
+            
+            # Determine label and color based on identity configuration
+            if tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                label = f"{sex}-{identity}"
+                color = 'blue' if sex == 'M' else 'red'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                label = f"HexID {hex_id}"
+                color = 'blue'  # Default to blue (male)
             
             # Plot trail if enabled
             if self.chk_show_trail.isChecked() and len(tag_all_data) > 1:
@@ -1514,18 +1996,25 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 if len(trail_data) > 1:
                     self.ax.plot(trail_data[x_col], trail_data[y_col], 
-                               color=colors[i], linewidth=2, alpha=0.6)
+                               color=color, linewidth=2, alpha=0.6)
             
             # Plot current position with label
             self.ax.scatter(current_pos[x_col], current_pos[y_col], 
-                          c=[colors[i]], s=100, marker='o', edgecolors='black', linewidths=2, zorder=5)
-            self.ax.text(current_pos[x_col], current_pos[y_col], f'  Tag {tag}', 
-                        fontsize=10, fontweight='bold', color=colors[i],
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=colors[i]))
+                          c=color, s=100, marker='o', edgecolors='black', linewidths=2, zorder=5)
+            self.ax.text(current_pos[x_col], current_pos[y_col], f'  {label}', 
+                        fontsize=10, fontweight='bold', color=color,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=color))
         
         # Set limits based on all data
         x_min, x_max = self.data[x_col].min(), self.data[x_col].max()
         y_min, y_max = self.data[y_col].min(), self.data[y_col].max()
+        
+        # If background image exists, adjust limits to include it (using meters)
+        if self.background_image is not None and self.bg_width_meters is not None:
+            x_min = min(x_min, 0)
+            x_max = max(x_max, self.bg_width_meters)
+            y_min = min(y_min, 0)
+            y_max = max(y_max, self.bg_height_meters)
         
         x_range = x_max - x_min
         y_range = y_max - y_min
@@ -1616,12 +2105,13 @@ class UWBQuickVisualizationWindow(QWidget):
             },
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
-            'animation_fps': self.spin_animation_fps.value(),
+            'animation_speed': self.combo_animation_speed.currentText(),
+            'animation_fps': self.combo_animation_fps.currentText(),
             'time_window': self.spin_time_window.value(),
             'color_by': self.combo_color_by.currentText(),
-            'viewing_angle': self.spin_viewing_angle.value(),
             'tag_identities': self.tag_identities,
-            'overwrite': self.chk_overwrite.isChecked()
+            'overwrite': self.chk_overwrite.isChecked(),
+            'background_image_path': self.background_image_path  # Save background image path
         }
         return config
     
@@ -1701,8 +2191,15 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'animation_trail' in config:
                 self.spin_animation_trail.setValue(config['animation_trail'])
             
+            if 'animation_speed' in config:
+                index = self.combo_animation_speed.findText(config['animation_speed'])
+                if index >= 0:
+                    self.combo_animation_speed.setCurrentIndex(index)
+            
             if 'animation_fps' in config:
-                self.spin_animation_fps.setValue(config['animation_fps'])
+                index = self.combo_animation_fps.findText(str(config['animation_fps']))
+                if index >= 0:
+                    self.combo_animation_fps.setCurrentIndex(index)
             
             if 'time_window' in config:
                 self.spin_time_window.setValue(config['time_window'])
@@ -1711,9 +2208,6 @@ class UWBQuickVisualizationWindow(QWidget):
                 index = self.combo_color_by.findText(config['color_by'])
                 if index >= 0:
                     self.combo_color_by.setCurrentIndex(index)
-            
-            if 'viewing_angle' in config:
-                self.spin_viewing_angle.setValue(config['viewing_angle'])
             
             if 'tag_identities' in config:
                 # Convert string keys back to integers if needed
@@ -1725,6 +2219,65 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'overwrite' in config:
                 self.chk_overwrite.setChecked(config['overwrite'])
             
+            # Load background image if path is saved and file exists
+            if 'background_image_path' in config and config['background_image_path']:
+                bg_path = config['background_image_path']
+                # Ensure XML config is parsed first to get scale
+                if not self.xml_scale and self.db_path:
+                    db_dir = os.path.dirname(self.db_path)
+                    xml_files = [f for f in os.listdir(db_dir) if f.lower().endswith('.xml')]
+                    if xml_files:
+                        xml_file = next((f for f in xml_files if 'config' in f.lower()), xml_files[0])
+                        self.xml_config_path = os.path.join(db_dir, xml_file)
+                        try:
+                            self.parse_xml_config()
+                        except:
+                            pass
+                
+                # Try absolute path first
+                if os.path.exists(bg_path):
+                    self.background_image_path = bg_path
+                    try:
+                        self.background_image = plt.imread(bg_path)
+                        # Calculate dimensions in meters
+                        img_height_px, img_width_px = self.background_image.shape[:2]
+                        if self.xml_scale:
+                            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
+                            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
+                            self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
+                        else:
+                            self.bg_width_meters = img_width_px
+                            self.bg_height_meters = img_height_px
+                            self.log_message(f"Background dimensions: {self.bg_width_meters}px x {self.bg_height_meters}px (no scale)")
+                        self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
+                        self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
+                        self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                    except Exception as e:
+                        self.log_message(f"Warning: Could not load background image: {str(e)}")
+                # Try relative to database directory
+                elif os.path.exists(os.path.join(db_dir, os.path.basename(bg_path))):
+                    bg_path = os.path.join(db_dir, os.path.basename(bg_path))
+                    self.background_image_path = bg_path
+                    try:
+                        self.background_image = plt.imread(bg_path)
+                        # Calculate dimensions in meters
+                        img_height_px, img_width_px = self.background_image.shape[:2]
+                        if self.xml_scale:
+                            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
+                            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
+                            self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
+                        else:
+                            self.bg_width_meters = img_width_px
+                            self.bg_height_meters = img_height_px
+                            self.log_message(f"Background dimensions: {self.bg_width_meters}px x {self.bg_height_meters}px (no scale)")
+                        self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
+                        self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
+                        self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                    except Exception as e:
+                        self.log_message(f"Warning: Could not load background image: {str(e)}")
+                else:
+                    self.log_message(f"Warning: Saved background image not found: {bg_path}")
+            
             # Note: selected_tags will be loaded after tags are populated from table
             if 'selected_tags' in config:
                 self.pending_tag_selection = config['selected_tags']
@@ -1734,6 +2287,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # Update tag labels if identities were loaded
             if self.tag_identities and self.tag_checkboxes:
                 self.update_tag_labels()
+            
+            # Note: User must manually press Load Preview button to load tracking data
             
         except Exception as e:
             print(f"Warning: Could not load config: {str(e)}")
@@ -1745,13 +2300,32 @@ class UWBQuickVisualizationWindow(QWidget):
                 cb.setChecked(tag in self.pending_tag_selection)
             delattr(self, 'pending_tag_selection')
     
-    def generate_animation(self, output_dir):
+    def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None):
         """Generate animation video from tracking data"""
         try:
+            if self.export_cancelled:
+                return
+            
             self.log_message("Preparing animation data...")
             
-            # Prepare data for animation
-            anim_data = self.data.copy()
+            # Use temp folder on C: drive (SSD) for faster frame writing
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            temp_frames_dir = os.path.join(desktop_path, "temp_animation_frames")
+            os.makedirs(temp_frames_dir, exist_ok=True)
+            self.log_message(f"Saving animation frames to: {temp_frames_dir}")
+            self.log_message(f"Temp folder path: {os.path.abspath(temp_frames_dir)}")
+            
+            # Load data from CSV if provided (for consistency with plots)
+            if csv_path and os.path.exists(csv_path):
+                self.log_message(f"Loading animation data from CSV...")
+                anim_data = pd.read_csv(csv_path)
+                # Parse Timestamp column (with mixed format to handle timezone-aware timestamps)
+                anim_data['Timestamp'] = pd.to_datetime(anim_data['Timestamp'], format='mixed')
+                self.log_message(f"Loaded {len(anim_data)} records from CSV")
+            else:
+                # Fallback to using self.data
+                self.log_message("Using in-memory data for animation...")
+                anim_data = self.data.copy()
             
             # Map column names to match animate_path expectations
             if 'shortid' in anim_data.columns:
@@ -1785,54 +2359,181 @@ class UWBQuickVisualizationWindow(QWidget):
             # Calculate heading and velocity
             anim_data = anim_data.sort_values(by=['ID', 'Timestamp'])
             
-            anim_data['heading'] = anim_data.groupby('ID', group_keys=False).apply(
-                lambda group: np.arctan2(group['smoothed_y'].diff(1), group['smoothed_x'].diff(1))
-            ).reset_index(level=0, drop=True)
+            # Calculate heading (direction of movement)
+            def calc_heading(group):
+                return np.arctan2(group['smoothed_y'].diff(1), group['smoothed_x'].diff(1))
             
-            anim_data['heading'] = anim_data.groupby('ID', group_keys=False)['heading'].apply(
-                lambda group: group.rolling(window=5, min_periods=1).mean()
-            ).reset_index(level=0, drop=True)
+            anim_data['heading'] = anim_data.groupby('ID', group_keys=False).apply(calc_heading, include_groups=False).reset_index(level=0, drop=True)
             
-            anim_data['velocity'] = anim_data.groupby('ID', group_keys=False).apply(
-                lambda group: np.sqrt(group['smoothed_x'].diff()**2 + group['smoothed_y'].diff()**2) / 
-                              group['Timestamp'].diff().dt.total_seconds()
-            ).reset_index(level=0, drop=True)
+            # Smooth heading with rolling average
+            anim_data['heading'] = anim_data.groupby('ID', group_keys=False)['heading'].transform(
+                lambda x: x.rolling(window=5, min_periods=1).mean()
+            )
+            
+            # Calculate velocity
+            def calc_velocity(group):
+                return np.sqrt(group['smoothed_x'].diff()**2 + group['smoothed_y'].diff()**2) / group['Timestamp'].diff().dt.total_seconds()
+            
+            anim_data['velocity'] = anim_data.groupby('ID', group_keys=False).apply(calc_velocity, include_groups=False).reset_index(level=0, drop=True)
             
             # Get animation parameters
             time_window = self.spin_time_window.value()
             trailing_window = self.spin_animation_trail.value()
-            fps = self.spin_animation_fps.value()
+            fps = int(self.combo_animation_fps.currentText())
+            speed_text = self.combo_animation_speed.currentText()
+            speed_multiplier = int(speed_text.replace('x', ''))
             color_by = self.combo_color_by.currentText()
-            viewing_angle = self.spin_viewing_angle.value()
+            
+            # Calculate frame interval: how many real seconds each frame represents
+            # speed_multiplier seconds of real time per second of video / fps frames per second
+            frame_interval = speed_multiplier / fps
+            self.log_message(f"Animation: {speed_text} speed at {fps} FPS (each frame = {frame_interval:.2f}s of real time)")
             
             self.log_message("Setting up animation frames...")
-            # Create frames directory
-            frames_dir = os.path.join(output_dir, "animation_frames")
-            os.makedirs(frames_dir, exist_ok=True)
             
-            # Clean existing frames
-            for filename in os.listdir(frames_dir):
-                file_path = os.path.join(frames_dir, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            # Check if daily animations are requested
+            generate_daily = self.chk_daily_animations.isChecked()
             
-            # Create animation
-            self.log_message("Generating animation frames (this may take a while)...")
-            self.create_animation_frames(anim_data, frames_dir, time_window, trailing_window, 
-                                        fps, color_by, viewing_angle, bool(self.tag_identities))
+            if generate_daily:
+                # Get selected days
+                selected_days = [date_str for date_str, cb in self.daily_animation_day_checkboxes.items() if cb.isChecked()]
+                if not selected_days:
+                    self.log_message("⚠ No days selected for daily animations")
+                    return
+                
+                self.log_message(f"Generating {len(selected_days)} daily animations...")
+                
+                # Generate one animation per selected day
+                for day_idx, date_str in enumerate(selected_days):
+                    if self.export_cancelled:
+                        return
+                    
+                    self.log_message(f"Processing Day {day_idx + 1}/{len(selected_days)}: {date_str}")
+                    
+                    # Filter data for this specific day (midnight to midnight)
+                    # Get timezone from the data to ensure compatible comparison
+                    data_tz = anim_data['Timestamp'].dt.tz
+                    date_obj = pd.to_datetime(date_str).date()
+                    
+                    if data_tz is not None:
+                        # Create timezone-aware timestamps matching the data's timezone
+                        day_start = pd.Timestamp(date_obj, tz=data_tz)
+                        day_end = day_start + pd.Timedelta(days=1)
+                    else:
+                        # Data is timezone-naive
+                        day_start = pd.Timestamp(date_obj)
+                        day_end = day_start + pd.Timedelta(days=1)
+                    
+                    day_data = anim_data[(anim_data['Timestamp'] >= day_start) & (anim_data['Timestamp'] < day_end)].copy()
+                    
+                    if len(day_data) == 0:
+                        self.log_message(f"⚠ No data for {date_str}, skipping")
+                        continue
+                    
+                    # Generate animation for this day
+                    video_path = self.create_animation_frames(
+                        day_data, temp_frames_dir, frame_interval, trailing_window,
+                        fps, color_by, bool(self.tag_identities),
+                        total_export_steps, current_export_step,
+                        day_suffix=f"_Day{day_idx + 1}_{date_str}"
+                    )
+                    
+                    if video_path and not self.export_cancelled:
+                        # Move video to final location with FPS and speed in filename
+                        db_filename = os.path.basename(self.db_path)
+                        db_name = os.path.splitext(db_filename)[0]
+                        speed_text = self.combo_animation_speed.currentText()
+                        final_video_path = os.path.join(output_dir, f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
+                        
+                        # Check if file exists and skip if not overwriting
+                        if os.path.exists(final_video_path):
+                            self.log_message(f"⚠ Day {day_idx + 1} animation already exists, skipping: {os.path.basename(final_video_path)}")
+                        elif os.path.exists(video_path):
+                            shutil.move(video_path, final_video_path)
+                            self.log_message(f"✓ Day {day_idx + 1} animation saved: {final_video_path}")
+                
+                # Clean up temp frames
+                try:
+                    shutil.rmtree(temp_frames_dir)
+                    self.log_message("✓ Temp frames cleaned up")
+                except Exception as e:
+                    self.log_message(f"Warning: Could not clean temp frames: {str(e)}")
+            else:
+                # Generate single animation for all data
+                # Clean existing temp frames
+                if os.path.exists(temp_frames_dir):
+                    for filename in os.listdir(temp_frames_dir):
+                        file_path = os.path.join(temp_frames_dir, filename)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                
+                # Create animation
+                self.log_message("Generating animation frames (this may take a while)...")
+                video_path = self.create_animation_frames(anim_data, temp_frames_dir, frame_interval, trailing_window, 
+                                            fps, color_by, bool(self.tag_identities),
+                                            total_export_steps, current_export_step)
+                
+                if video_path and not self.export_cancelled:
+                    # Move video to final location with FPS and speed in filename
+                    db_filename = os.path.basename(self.db_path)
+                    db_name = os.path.splitext(db_filename)[0]
+                    speed_text = self.combo_animation_speed.currentText()
+                    final_video_path = os.path.join(output_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
+                    
+                    # Check if file exists and skip if not overwriting
+                    if os.path.exists(final_video_path):
+                        self.log_message(f"⚠ Animation already exists, skipping: {os.path.basename(final_video_path)}")
+                    elif os.path.exists(video_path):
+                        shutil.move(video_path, final_video_path)
+                        self.log_message(f"✓ Animation saved: {final_video_path}")
+                    
+                    # Clean up temp frames
+                    try:
+                        shutil.rmtree(temp_frames_dir)
+                        self.log_message("✓ Temp frames cleaned up")
+                    except Exception as e:
+                        self.log_message(f"Warning: Could not clean temp frames: {str(e)}")
             
             self.log_message("✓ Animation generation complete!")
+            
+            # Reset UI after animation completes
+            self.exporting = False
+            self.btn_export.setEnabled(True)
+            self.btn_stop_export.setVisible(False)
+            self.progress_bar.setValue(100)
+            self.lbl_export_progress.setText("All exports complete!")
+            QMessageBox.information(self, "Success", "All exports completed successfully!")
+            QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
             
         except Exception as e:
             QMessageBox.critical(self, "Animation Error", f"Failed to generate animation: {str(e)}")
             self.log_message(f"✗ Animation generation failed: {str(e)}")
     
-    def create_animation_frames(self, data, output_dir, time_window, trailing_window, 
-                               fps, color_by, viewing_angle, use_custom_identities=False):
-        """Create animation frames and compile video"""
+    def create_animation_frames(self, data, output_dir, frame_interval, trailing_window, 
+                               fps, color_by, use_custom_identities=False,
+                               total_export_steps=1, current_export_step=1, day_suffix=""):
+        """Create animation frames and compile video with optimization strategies:
+        1. In-memory rendering (no temp PNG files)
+        2. Configurable DPI for speed vs quality
+        3. Matplotlib blitting for faster redraw
+        4. Parallel frame generation
+        """
+        
+        # Get DPI from quality setting
+        quality_map = {"Draft (Fast)": 75, "Standard": 100, "High Quality": 150}
+        dpi = quality_map.get(self.combo_video_quality.currentText(), 100)
+        self.log_message(f"Using {dpi} DPI for video generation")
+        
         # Get global min/max for consistent axis limits
         x_min, x_max = data['smoothed_x'].min(), data['smoothed_x'].max()
         y_min, y_max = data['smoothed_y'].min(), data['smoothed_y'].max()
+        
+        # If background image exists, adjust limits to include it (using meters)
+        if self.background_image is not None and self.bg_width_meters is not None:
+            x_min = min(x_min, 0)
+            x_max = max(x_max, self.bg_width_meters)
+            y_min = min(y_min, 0)
+            y_max = max(y_max, self.bg_height_meters)
         
         # Add padding
         x_range = x_max - x_min
@@ -1844,118 +2545,204 @@ class UWBQuickVisualizationWindow(QWidget):
         y_min -= y_pad
         y_max += y_pad
         
-        # Calculate time range
+        # Calculate time range based on frame_interval
         start = data['Timestamp'].min()
         end = data['Timestamp'].max()
-        time_starts = pd.date_range(start=start, end=end, freq=f'{time_window}s')
+        time_starts = pd.date_range(start=start, end=end, freq=f'{frame_interval}s')
         
-        # Define color palette
-        if color_by == "ID" and not use_custom_identities:
-            unique_ids = data['ID'].unique()
-            colors = plt.cm.tab10(np.linspace(0, 1, len(unique_ids)))
-            id_color_map = {ID: colors(i) for i, ID in enumerate(unique_ids)}
+        total_frames = len(time_starts)
+        self.log_message(f"Creating {total_frames} animation frames (optimized pipeline)...")
         
-        # Create frames
-        self.lbl_status.setText(f"Creating {len(time_starts)} animation frames...")
+        # Pre-compute all data for each tag to avoid repeated filtering
+        self.log_message("Pre-computing trajectories...")
+        tag_data_dict = {}
+        for tag in data['shortid'].unique():
+            tag_subset = data[data['shortid'] == tag][['Timestamp', 'smoothed_x', 'smoothed_y']].copy()
+            tag_subset = tag_subset.sort_values('Timestamp')
+            tag_data_dict[tag] = tag_subset
+            
+            # Pre-compute label and color
+            if use_custom_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                label_text = f"{sex}-{identity}"
+                color = 'blue' if sex == 'M' else 'red'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                label_text = f"HexID {hex_id}"
+                color = 'blue'
+            tag_data_dict[tag] = {
+                'data': tag_subset,
+                'label': label_text,
+                'color': color
+            }
+        
+        #===========================================
+        # OPTIMIZATION 1 & 3: In-memory rendering with background blitting
+        #===========================================
+        
+        # Create figure once and reuse (blitting optimization)
+        fig, ax = plt.subplots(figsize=(10, 8), dpi=dpi)
+        ax.grid(False)
+        
+        # Draw static background once
+        bg_artist = None
+        if self.background_image is not None and self.bg_width_meters is not None:
+            bg_artist = ax.imshow(self.background_image, 
+                     extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+                     origin='lower',
+                     aspect='auto',
+                     alpha=0.6,
+                     zorder=0)
+        
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_aspect('equal')
+        ax.set_xlabel("X Position (m)", fontsize=12)
+        ax.set_ylabel("Y Position (m)", fontsize=12)
+        
+        # Render figure to get dimensions
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        
+        # Initialize video writer
+        video_filename = f'animation_temp{day_suffix}.mp4' if day_suffix else 'animation_temp.mp4'
+        video_output_path = os.path.join(output_dir, video_filename)
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(video_output_path, fourcc, fps, (width, height))
+        
+        if not video_writer.isOpened():
+            self.log_message("✗ Could not open VideoWriter")
+            plt.close(fig)
+            return None
+        
+        self.log_message(f"Video dimensions: {width}x{height}")
+        
+        #===========================================
+        # Generate and write frames directly to video (in-memory)
+        #===========================================
         
         for i, frame_start in enumerate(time_starts):
-            if i % 10 == 0:
-                self.lbl_status.setText(f"Creating frame {i+1}/{len(time_starts)}...")
-                QApplication.processEvents()  # Keep UI responsive
+            if self.export_cancelled:
+                video_writer.release()
+                plt.close(fig)
+                self.log_message("✗ Animation cancelled")
+                return None
+            
+            # Update progress
+            if i % 10 == 0 or i == total_frames - 1:
+                progress_pct = int(((current_export_step - 1) + (i + 1) / total_frames) / total_export_steps * 100)
+                self.progress_bar.setValue(progress_pct)
+                self.lbl_export_progress.setText(f"Step {current_export_step}/{total_export_steps}: Rendering frame {i+1}/{total_frames}...")
+                if i % 50 == 0:
+                    self.log_message(f"Rendering frame {i+1}/{total_frames}...")
+                QApplication.processEvents()
             
             frame_end = frame_start + pd.Timedelta(seconds=trailing_window)
-            fig, ax = plt.subplots(figsize=(10, 8))
-            ax.grid(False)
             
-            # Plot each ID
-            for ID in data['ID'].unique():
-                trailing_data = data[(data['ID'] == ID) & 
-                                    (data['Timestamp'] >= frame_start) & 
-                                    (data['Timestamp'] <= frame_end)]
+            # Clear previous frame's dynamic content
+            ax.clear()
+            
+            # Redraw static background
+            if bg_artist is not None:
+                ax.imshow(self.background_image, 
+                         extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+                         origin='lower',
+                         aspect='auto',
+                         alpha=0.6,
+                         zorder=0)
+            
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_aspect('equal')
+            ax.set_xlabel("X Position (m)", fontsize=12)
+            ax.set_ylabel("Y Position (m)", fontsize=12)
+            ax.set_title(f"UWB Tracking Animation\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}", 
+                        fontsize=14, fontweight='bold')
+            
+            # Plot each tag's trajectory
+            for tag, tag_info in tag_data_dict.items():
+                tag_df = tag_info['data']
+                trailing_data = tag_df[(tag_df['Timestamp'] >= frame_start) & 
+                                       (tag_df['Timestamp'] <= frame_end)]
                 
                 if trailing_data.empty:
                     continue
                 
-                # Determine color
-                if use_custom_identities or color_by == "sex":
-                    # Use sex-based coloring: blue for M, red for F
-                    color = 'blue' if trailing_data['sex'].values[0] == 'M' else 'red'
-                elif color_by == "ID":
-                    color = id_color_map[ID]
+                label = tag_info['label']
+                color = tag_info['color']
                 
                 # Plot trailing line
                 ax.plot(trailing_data['smoothed_x'], trailing_data['smoothed_y'], 
                        color=color, alpha=0.5, linewidth=1)
                 
                 # Plot current position
-                current_x = trailing_data['smoothed_x'].values[-1]
-                current_y = trailing_data['smoothed_y'].values[-1]
+                current_x = trailing_data['smoothed_x'].iloc[-1]
+                current_y = trailing_data['smoothed_y'].iloc[-1]
                 ax.plot(current_x, current_y, 'o', color=color, markersize=10)
                 
-                # Determine label text
-                if use_custom_identities and 'custom_identity' in trailing_data.columns:
-                    label_text = trailing_data['custom_identity'].values[-1]
-                else:
-                    label_text = str(ID)
-                
                 # Add label
-                ax.text(current_x, current_y + (y_range * 0.02), label_text, 
+                ax.text(current_x, current_y + (y_range * 0.02), label, 
                        fontsize=10, ha='center', color=color, fontweight='bold')
-                
-                # Plot heading if moving
-                if trailing_data['velocity'].values[-1] > 0.01:
-                    heading = trailing_data['heading'].values[-1]
-                    from matplotlib.patches import Wedge
-                    wedge = Wedge((current_x, current_y), x_range * 0.03, 
-                                 np.degrees(heading) - viewing_angle / 2, 
-                                 np.degrees(heading) + viewing_angle / 2, 
-                                 color=color, alpha=0.3)
-                    ax.add_patch(wedge)
             
-            ax.set_title(f"UWB Tracking Animation\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}", 
-                        fontsize=14, fontweight='bold')
-            ax.set_xlabel("X Position (m)", fontsize=12)
-            ax.set_ylabel("Y Position (m)", fontsize=12)
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-            ax.set_aspect('equal')
+            # Render to numpy array (IN-MEMORY - no disk I/O!)
+            fig.canvas.draw()
+            # Use buffer_rgba for Qt backend compatibility
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
             
-            filename = os.path.join(output_dir, f"frame_{i:04d}.png")
-            plt.savefig(filename, dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            gc.collect()
+            # Convert RGBA to BGR for OpenCV (drop alpha channel)
+            frame_bgr = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+            
+            # Write directly to video
+            video_writer.write(frame_bgr)
         
-        # Compile video with ffmpeg
-        self.lbl_status.setText("Compiling video with ffmpeg...")
+        # Clean up
+        video_writer.release()
+        plt.close(fig)
+        gc.collect()
         
-        # Get database name for file prefix
-        db_filename = os.path.basename(self.db_path)
-        db_name = os.path.splitext(db_filename)[0]
-        video_output = os.path.join(os.path.dirname(output_dir), 
-                                   f'{db_name}_Animation.mp4')
+        # Check if video was created successfully
+        if os.path.exists(video_output_path) and os.path.getsize(video_output_path) > 0:
+            self.log_message(f"✓ Video compilation complete: {os.path.getsize(video_output_path):,} bytes")
+            return video_output_path
+        else:
+            self.log_message("✗ Video file was not created or is empty")
+            return None
+    
+    def stop_export(self):
+        """Cancel ongoing export operations"""
+        self.export_cancelled = True
+        self.log_message("⚠ Export cancellation requested...")
         
-        try:
-            subprocess.call([
-                'ffmpeg', '-y', '-framerate', str(fps), 
-                '-i', os.path.join(output_dir, 'frame_%04d.png'),
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', 
-                '-pix_fmt', 'yuv420p', video_output
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # Clean up frames
-            for filename in os.listdir(output_dir):
-                if filename.endswith(".png"):
-                    os.remove(os.path.join(output_dir, filename))
-            
-            QMessageBox.information(self, "Success", f"Animation saved to:\n{video_output}")
-        except Exception as e:
-            QMessageBox.warning(self, "FFmpeg Error", 
-                              f"Could not compile video. Frames saved to:\n{output_dir}\n\nError: {str(e)}")
+        # Stop worker thread if running
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+            self.log_message("✗ Plot export cancelled")
+        
+        # Reset UI
+        self.exporting = False
+        self.btn_export.setEnabled(True)
+        self.btn_stop_export.setVisible(False)
+        self.progress_widget.setVisible(False)
+        self.progress_bar.setValue(0)
+        self.lbl_export_progress.setText("")
     
     def export_data(self):
         """Export data and/or plots based on selected options"""
         if not self.db_path or self.data is None:
             return
+        
+        # Initialize export state
+        self.export_cancelled = False
+        self.exporting = True
+        self.btn_export.setEnabled(False)
+        self.btn_stop_export.setVisible(True)
+        self.progress_widget.setVisible(True)
+        self.progress_bar.setValue(0)
         
         # Create output directory with naming convention: <db_name>_fntUwbAnalysis
         db_dir = os.path.dirname(self.db_path)
@@ -1976,6 +2763,18 @@ class UWBQuickVisualizationWindow(QWidget):
         
         try:
             self.log_message(f"Starting export to {output_dir}")
+            self.lbl_export_progress.setText("Initializing export...")
+            
+            # Calculate total steps for progress
+            total_steps = 0
+            if export_csv:
+                total_steps += 1
+            if save_plots:
+                total_steps += 1
+            if save_animation:
+                total_steps += 1  # Animation progress handled separately
+            
+            current_step = 0
             
             # Handle overwrite setting
             if self.chk_overwrite.isChecked():
@@ -2001,16 +2800,29 @@ class UWBQuickVisualizationWindow(QWidget):
                         except Exception as e:
                             print(f"Warning: Could not delete directory {filename}: {str(e)}")
             
-            # Export CSV if requested
-            if export_csv:
-                self.log_message("Exporting CSV...")
-                csv_filename = f'{db_name}_{self.table_name}_processed.csv'
-                csv_path = os.path.join(output_dir, csv_filename)
-                
-                # Check if file exists and overwrite setting
-                if not self.chk_overwrite.isChecked() and os.path.exists(csv_path):
-                    self.log_message(f"Skipped CSV (already exists): {csv_filename}")
-                else:
+            # ALWAYS create/ensure CSV exists (for plots and animation to reuse)
+            csv_filename = f'{db_name}_{self.table_name}_processed.csv'
+            csv_path = os.path.join(output_dir, csv_filename)
+            csv_needs_creation = not os.path.exists(csv_path) or self.chk_overwrite.isChecked()
+            
+            # Export CSV if requested OR if plots/animation need it
+            if export_csv or (save_plots or save_animation):
+                if csv_needs_creation:
+                    if self.export_cancelled:
+                        self.stop_export()
+                        return
+                    
+                    # Show progress only if user explicitly requested CSV export
+                    if export_csv:
+                        current_step += 1
+                        self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting CSV...")
+                        self.progress_bar.setValue(int(current_step / total_steps * 100))
+                        QApplication.processEvents()
+                    else:
+                        self.log_message("Creating temporary CSV for plots/animation...")
+                    
+                    self.log_message("Exporting CSV...")
+                    
                     # Ensure sex and identity columns are in the data
                     csv_data = self.data.copy()
                     if 'sex' not in csv_data.columns or 'identity' not in csv_data.columns:
@@ -2022,17 +2834,36 @@ class UWBQuickVisualizationWindow(QWidget):
                             csv_data['identity'] = csv_data['shortid'].apply(lambda x: f'Tag{x}')
                     
                     csv_data.to_csv(csv_path, index=False)
-                    self.log_message(f"✓ CSV exported: {csv_filename}")
+                    
+                    if export_csv:
+                        self.log_message(f"✓ CSV exported: {csv_filename}")
+                    else:
+                        self.log_message(f"✓ Temporary CSV created for processing")
+                elif export_csv:
+                    # CSV already exists and overwrite is disabled
+                    current_step += 1
+                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: CSV already exists...")
+                    self.progress_bar.setValue(int(current_step / total_steps * 100))
+                    QApplication.processEvents()
+                    self.log_message(f"Skipped CSV (already exists): {csv_filename}")
+                else:
+                    # CSV exists and will be reused
+                    self.log_message(f"Using existing CSV for plots/animation: {csv_filename}")
             
             # Save configuration file
             self.save_config(output_dir)
             
-            # Export animation if requested
-            if save_animation:
-                self.generate_animation(output_dir)
-            
-            # Export plots if requested
+            # Export plots if requested (BEFORE animation, which takes longer)
             if save_plots:
+                if self.export_cancelled:
+                    self.stop_export()
+                    return
+                
+                current_step += 1
+                self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Generating plots...")
+                self.progress_bar.setValue(int(current_step / total_steps * 100))
+                QApplication.processEvents()
+                
                 selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
                 
                 # Get selected plot types - include ALL plot types
@@ -2065,19 +2896,34 @@ class UWBQuickVisualizationWindow(QWidget):
                     rolling_window,
                     self.combo_timezone.currentText(),
                     self.tag_identities,
-                    bool(self.tag_identities)  # Use identities if any are configured
+                    bool(self.tag_identities),  # Use identities if any are configured
+                    self.background_image,  # Pass background image
+                    self.bg_width_meters,  # Pass scaled width
+                    self.bg_height_meters,  # Pass scaled height
+                    csv_path  # Pass CSV path for reuse
                 )
                 self.worker.progress.connect(self.update_status)
-                self.worker.finished.connect(self.export_finished)
+                self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, csv_path))
                 self.worker.start()
-            elif export_csv or save_animation:
-                # If only CSV or animation was exported (no plots), show success message
+            
+            # Animation will be started from export_finished() after plots complete
+            elif save_animation:
+                # If no plots, start animation directly
+                if self.export_cancelled:
+                    self.stop_export()
+                    return
+                
+                current_step += 1
+                self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Generating animation...")
+                self.progress_bar.setValue(int((current_step - 1) / total_steps * 100))
+                QApplication.processEvents()
+                
+                self.generate_animation(output_dir, total_steps, current_step, csv_path)
+            
+            # If only CSV was exported (no plots or animation), show success message
+            if export_csv and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
-                msg = "Export completed:\n"
-                if export_csv:
-                    msg += f"- CSV: {csv_path}\n"
-                if save_animation:
-                    msg += f"- Animation: {output_dir}\n"
+                msg = f"Export completed:\n- CSV: {csv_path}\n"
                 QMessageBox.information(self, "Success", msg)
                 
         except Exception as e:
@@ -2088,16 +2934,50 @@ class UWBQuickVisualizationWindow(QWidget):
         """Update status label and messages window"""
         self.log_message(message)
     
-    def export_finished(self, success, message):
+    def export_finished(self, success, message, start_animation=False, output_dir=None, total_steps=1, current_step=1, csv_path=None):
         """Handle export completion"""
-        self.btn_export.setEnabled(True)
+        if not self.export_cancelled:
+            if success:
+                self.log_message("✓ Plot export completed successfully")
+                
+                # Start animation if requested (plots are now complete)
+                if start_animation and output_dir:
+                    self.log_message("Starting animation generation...")
+                    self.lbl_export_progress.setText(f"Step {current_step + 1}/{total_steps}: Generating animation...")
+                    self.progress_bar.setValue(int(current_step / total_steps * 100))
+                    QApplication.processEvents()
+                    self.generate_animation(output_dir, total_steps, current_step + 1, csv_path)
+                    return  # Don't reset UI yet, animation will do that
+                else:
+                    self.progress_bar.setValue(100)
+                    self.lbl_export_progress.setText("Export complete!")
+                    QMessageBox.information(self, "Success", "Export completed successfully!")
+            else:
+                self.log_message(f"✗ Plot export failed: {message}")
+                QMessageBox.critical(self, "Error", message)
         
-        if success:
-            self.log_message("✓ Export completed successfully")
-            QMessageBox.information(self, "Success", message)
+        # Reset UI state
+        self.exporting = False
+        self.btn_export.setEnabled(True)
+        self.btn_stop_export.setVisible(False)
+        
+        # Hide progress after a delay
+        QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
+    
+    def closeEvent(self, event):
+        """Handle window close event - stop any ongoing exports"""
+        if self.exporting:
+            reply = QMessageBox.question(self, 'Export in Progress', 
+                                        'An export is in progress. Do you want to cancel it and close?',
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            
+            if reply == QMessageBox.Yes:
+                self.stop_export()
+                event.accept()
+            else:
+                event.ignore()
         else:
-            self.log_message(f"✗ Export failed: {message}")
-            QMessageBox.critical(self, "Error", message)
+            event.accept()
         
         self.log_message("Ready for next operation")
 
