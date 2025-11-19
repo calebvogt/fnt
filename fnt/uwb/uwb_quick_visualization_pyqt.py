@@ -20,7 +20,7 @@ from scipy.signal import savgol_filter
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
-                             QSpinBox, QSplitter, QFrame, QSlider, QLineEdit,
+                             QSpinBox, QDoubleSpinBox, QSplitter, QFrame, QSlider, QLineEdit,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -141,7 +141,7 @@ class PlotSaverWorker(QThread):
             # Load from CSV if available (much faster and ensures consistency)
             if self.csv_path and os.path.exists(self.csv_path):
                 self.progress.emit("Loading data from CSV...")
-                data = pd.read_csv(self.csv_path)
+                data = pd.read_csv(self.csv_path, low_memory=False)
                 
                 # Parse Timestamp column (let pandas infer the format automatically)
                 # This handles timezone-aware timestamps like "2025-10-13 18:09:10-06:00"
@@ -239,6 +239,30 @@ class PlotSaverWorker(QThread):
             
             if self.plot_types.get('velocity_distribution', False):
                 result = self.save_velocity_distribution(data, output_dir, db_name)
+                if result:
+                    generated_count += 1
+                else:
+                    skipped_count += 1
+            
+            if self.plot_types.get('cumulative_distance', False):
+                result = self.save_cumulative_distance(data, output_dir, db_name)
+                if result:
+                    generated_count += 1
+                else:
+                    skipped_count += 1
+            
+            if self.plot_types.get('velocity_timeline', False):
+                result = self.save_velocity_timeline(data, output_dir, db_name)
+                if result:
+                    generated_count += result
+            
+            if self.plot_types.get('actogram', False):
+                result = self.save_actogram(data, output_dir, db_name)
+                if result:
+                    generated_count += result
+            
+            if self.plot_types.get('data_quality', False):
+                result = self.save_data_quality(data, output_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
@@ -673,6 +697,292 @@ class PlotSaverWorker(QThread):
         
         self.progress.emit(f"Saved: {db_name}_VelocityDistribution.png")
         return True
+    
+    def save_cumulative_distance(self, data, output_dir, db_name):
+        """Save cumulative distance plots (reset daily)
+        Returns: True if generated, False if skipped"""
+        self.progress.emit("Generating cumulative distance plots...")
+        
+        output_path = os.path.join(output_dir, f'{db_name}_CumulativeDistance.png')
+        
+        if not self.overwrite and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_CumulativeDistance.png")
+            return False
+        
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+        
+        # Calculate distance between consecutive points
+        data = data.sort_values(['shortid', 'Timestamp'])
+        data['distance_step'] = data.groupby('shortid', group_keys=False).apply(
+            lambda group: np.sqrt(
+                group[x_col].diff()**2 + group[y_col].diff()**2
+            ).fillna(0)
+        ).reset_index(level=0, drop=True)
+        
+        # Cumulative distance per day (reset each day)
+        data['cumulative_distance'] = data.groupby(['shortid', 'Date'])['distance_step'].cumsum()
+        data['time_of_day'] = (data['Timestamp'] - data['Timestamp'].dt.normalize()).dt.total_seconds() / 3600
+        
+        unique_days = sorted(data['Date'].unique())
+        num_days = len(unique_days)
+        num_cols = min(4, num_days)
+        num_rows = (num_days + num_cols - 1) // num_cols
+        
+        fig = Figure(figsize=(5 * num_cols, 4 * num_rows))
+        
+        for i, day in enumerate(unique_days):
+            ax = fig.add_subplot(num_rows, num_cols, i + 1)
+            day_data = data[data['Date'] == day]
+            
+            for tag in day_data['shortid'].unique():
+                tag_data = day_data[day_data['shortid'] == tag]
+                
+                # Generate label
+                if self.use_identities and tag in self.tag_identities:
+                    info = self.tag_identities[tag]
+                    sex = info.get('sex', 'M')
+                    identity = info.get('identity', str(tag))
+                    label = f"{sex}-{identity}"
+                else:
+                    hex_id = hex(tag).upper().replace('0X', '')
+                    label = f"HexID {hex_id}"
+                
+                ax.plot(tag_data['time_of_day'], tag_data['cumulative_distance'], label=label, alpha=0.7)
+            
+            ax.set_xlabel('Hour of Day', fontsize=9)
+            ax.set_ylabel('Distance (m)', fontsize=9)
+            ax.set_title(f'Day {i+1}: {day}', fontsize=10)
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+        
+        fig.suptitle('Cumulative Distance Traveled by Day', fontsize=12, fontweight='bold')
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        self.progress.emit(f"Saved: {db_name}_CumulativeDistance.png")
+        return True
+    
+    def save_velocity_timeline(self, data, output_dir, db_name):
+        """Save velocity timeline plots
+        Returns: number of plots generated"""
+        self.progress.emit("Generating velocity timeline plots...")
+        
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+        
+        # Calculate velocity
+        data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().dt.total_seconds()
+        data['distance'] = np.sqrt(
+            (data[x_col] - data.groupby('shortid')[x_col].shift())**2 +
+            (data[y_col] - data.groupby('shortid')[y_col].shift())**2
+        )
+        data['velocity'] = data['distance'] / data['time_diff']
+        data = data[(data['velocity'] <= 2) | (data['velocity'].isna())]
+        
+        generated = 0
+        for tag in data['shortid'].unique():
+            # Generate filename
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                filename = f'{db_name}_VelocityTimeline_{sex}-{identity}.png'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                filename = f'{db_name}_VelocityTimeline_HexID{hex_id}.png'
+            
+            output_path = os.path.join(output_dir, filename)
+            
+            if not self.overwrite and os.path.exists(output_path):
+                self.progress.emit(f"Skipped (exists): {filename}")
+                continue
+            
+            tag_data = data[data['shortid'] == tag].copy()
+            
+            fig = Figure(figsize=(12, 6))
+            ax = fig.add_subplot(111)
+            
+            ax.plot(tag_data['Timestamp'], tag_data['velocity'], alpha=0.6, linewidth=0.5, color='blue')
+            ax.axhline(y=0.1, color='red', linestyle='--', label='Activity threshold (0.1 m/s)')
+            
+            ax.set_xlabel('Time', fontsize=10)
+            ax.set_ylabel('Velocity (m/s)', fontsize=10)
+            
+            # Generate title
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                ax.set_title(f'Velocity Timeline: {sex}-{identity}', fontsize=12, fontweight='bold')
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                ax.set_title(f'Velocity Timeline: HexID {hex_id}', fontsize=12, fontweight='bold')
+            
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            fig.savefig(output_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            
+            self.progress.emit(f"Saved: {filename}")
+            generated += 1
+        
+        return generated
+    
+    def save_actogram(self, data, output_dir, db_name):
+        """Save circadian actogram plots
+        Returns: number of plots generated"""
+        self.progress.emit("Generating actogram plots...")
+        
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+        
+        # Calculate velocity for activity
+        data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().dt.total_seconds()
+        data['distance'] = np.sqrt(
+            (data[x_col] - data.groupby('shortid')[x_col].shift())**2 +
+            (data[y_col] - data.groupby('shortid')[y_col].shift())**2
+        )
+        data['velocity'] = data['distance'] / data['time_diff']
+        data = data[(data['velocity'] <= 2) | (data['velocity'].isna())]
+        
+        # Add hour and day columns
+        data['hour'] = data['Timestamp'].dt.hour + data['Timestamp'].dt.minute / 60
+        unique_dates = sorted(data['Date'].unique())
+        date_to_day = {date: i+1 for i, date in enumerate(unique_dates)}
+        data['Day'] = data['Date'].map(date_to_day)
+        
+        generated = 0
+        for tag in data['shortid'].unique():
+            # Generate filename
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                filename = f'{db_name}_Actogram_{sex}-{identity}.png'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                filename = f'{db_name}_Actogram_HexID{hex_id}.png'
+            
+            output_path = os.path.join(output_dir, filename)
+            
+            if not self.overwrite and os.path.exists(output_path):
+                self.progress.emit(f"Skipped (exists): {filename}")
+                continue
+            
+            tag_data = data[data['shortid'] == tag].copy()
+            
+            # Bin activity by hour and day
+            tag_data['active'] = (tag_data['velocity'] > 0.1).astype(int)
+            activity_grid = tag_data.groupby(['Day', 'hour'])['active'].sum().unstack(fill_value=0)
+            
+            fig = Figure(figsize=(12, max(6, len(unique_dates) * 0.3)))
+            ax = fig.add_subplot(111)
+            
+            im = ax.imshow(activity_grid.values, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+            ax.set_xlabel('Hour of Day', fontsize=10)
+            ax.set_ylabel('Day', fontsize=10)
+            ax.set_xticks(range(0, 24, 2))
+            ax.set_xticklabels(range(0, 24, 2))
+            
+            # Generate title
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                ax.set_title(f'Circadian Actogram: {sex}-{identity}', fontsize=12, fontweight='bold')
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                ax.set_title(f'Circadian Actogram: HexID {hex_id}', fontsize=12, fontweight='bold')
+            
+            fig.colorbar(im, ax=ax, label='Activity Count')
+            fig.tight_layout()
+            fig.savefig(output_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            
+            self.progress.emit(f"Saved: {filename}")
+            generated += 1
+        
+        return generated
+    
+    def save_data_quality(self, data, output_dir, db_name):
+        """Save data quality metrics table
+        Returns: True if generated, False if skipped"""
+        self.progress.emit("Generating data quality metrics...")
+        
+        output_path = os.path.join(output_dir, f'{db_name}_DataQuality.png')
+        
+        if not self.overwrite and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_DataQuality.png")
+            return False
+        
+        quality_data = []
+        for tag in sorted(data['shortid'].unique()):
+            tag_data = data[data['shortid'] == tag].sort_values('Timestamp')
+            gaps = tag_data['Timestamp'].diff().dt.total_seconds()
+            
+            # Generate label
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                label = f"{sex}-{identity}"
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                label = f"HexID {hex_id}"
+            
+            median_gap = gaps.median()
+            max_gap = gaps.max()
+            large_gaps = (gaps > 60).sum()
+            
+            quality_data.append([
+                label,
+                f"{median_gap:.2f}s" if pd.notna(median_gap) else "N/A",
+                f"{max_gap:.2f}s" if pd.notna(max_gap) else "N/A",
+                str(large_gaps)
+            ])
+        
+        fig = Figure(figsize=(10, max(4, len(quality_data) * 0.5)))
+        ax = fig.add_subplot(111)
+        ax.axis('off')
+        
+        table = ax.table(cellText=quality_data,
+                        colLabels=['Tag', 'Median Gap', 'Max Gap', 'Gaps >60s'],
+                        cellLoc='center',
+                        loc='center',
+                        colWidths=[0.25, 0.25, 0.25, 0.25])
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2.5)
+        
+        # Style header
+        for i in range(4):
+            table[(0, i)].set_facecolor('#4472C4')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        
+        ax.set_title('Data Quality Metrics', fontsize=12, fontweight='bold', pad=20)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        self.progress.emit(f"Saved: {db_name}_DataQuality.png")
+        return True
 
 
 class UWBQuickVisualizationWindow(QWidget):
@@ -707,6 +1017,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_scale = None  # Scale from XML in inches/pixel
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
+        self.arena_zones = None  # DataFrame with zone coordinates from XML
         
         self.initUI()
         
@@ -721,6 +1032,126 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         # Also update legacy status label for compatibility
         self.lbl_status.setText(message)
+    
+    def save_message_log(self, output_dir):
+        """Save the message log to a text file"""
+        try:
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+            log_path = os.path.join(output_dir, f"{db_name}_messageLog.txt")
+            
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write(self.txt_messages.toPlainText())
+            
+            self.log_message(f"✓ Message log saved: {os.path.basename(log_path)}")
+        except Exception as e:
+            self.log_message(f"Warning: Could not save message log: {str(e)}")
+    
+    def save_run_summary(self, output_dir):
+        """Save run summary with filtering statistics to CSV"""
+        try:
+            from datetime import datetime
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+            summary_path = os.path.join(output_dir, f"{db_name}_runSummary.csv")
+            
+            # Collect run parameters
+            summary_data = {
+                'Parameter': [],
+                'Value': []
+            }
+            
+            # General info
+            summary_data['Parameter'].append('Run Date')
+            summary_data['Value'].append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            
+            summary_data['Parameter'].append('Database')
+            summary_data['Value'].append(os.path.basename(self.db_path))
+            
+            summary_data['Parameter'].append('Table')
+            summary_data['Value'].append(self.table_name)
+            
+            summary_data['Parameter'].append('Timezone')
+            summary_data['Value'].append(self.combo_timezone.currentText())
+            
+            # Selected tags
+            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+            summary_data['Parameter'].append('Selected Tags')
+            summary_data['Value'].append(', '.join([str(t) for t in selected_tags]))
+            
+            # Filtering settings
+            summary_data['Parameter'].append('Velocity Filter Enabled')
+            summary_data['Value'].append('Yes' if self.chk_velocity_filter.isChecked() else 'No')
+            
+            if self.chk_velocity_filter.isChecked():
+                summary_data['Parameter'].append('Velocity Threshold (m/s)')
+                summary_data['Value'].append(self.spin_velocity_threshold.value())
+            
+            summary_data['Parameter'].append('Jump Filter Enabled')
+            summary_data['Value'].append('Yes' if self.chk_jump_filter.isChecked() else 'No')
+            
+            if self.chk_jump_filter.isChecked():
+                summary_data['Parameter'].append('Jump Threshold (m)')
+                summary_data['Value'].append(self.spin_jump_threshold.value())
+            
+            summary_data['Parameter'].append('Time Gap Threshold (s)')
+            summary_data['Value'].append(self.spin_time_gap.value())
+            
+            # Smoothing settings
+            summary_data['Parameter'].append('Smoothing')
+            summary_data['Value'].append(self.combo_smoothing.currentText())
+            
+            # Downsampling
+            summary_data['Parameter'].append('Downsampled to 1Hz')
+            summary_data['Value'].append('Yes' if self.chk_downsample.isChecked() else 'No')
+            
+            # Filtering statistics (if available)
+            if hasattr(self, 'filter_stats') and self.filter_stats:
+                summary_data['Parameter'].append('')
+                summary_data['Value'].append('')
+                
+                summary_data['Parameter'].append('--- Filtering Statistics ---')
+                summary_data['Value'].append('')
+                
+                summary_data['Parameter'].append('Initial Data Points')
+                summary_data['Value'].append(self.filter_stats.get('initial_count', 'N/A'))
+                
+                summary_data['Parameter'].append('Points Removed (Velocity)')
+                summary_data['Value'].append(self.filter_stats.get('removed_velocity', 0))
+                
+                summary_data['Parameter'].append('Points Removed (Jump)')
+                summary_data['Value'].append(self.filter_stats.get('removed_jump', 0))
+                
+                summary_data['Parameter'].append('Final Data Points')
+                summary_data['Value'].append(self.filter_stats.get('final_count', 'N/A'))
+                
+                summary_data['Parameter'].append('Percent Filtered')
+                summary_data['Value'].append(f"{self.filter_stats.get('percent_filtered', 0):.2f}%")
+            
+            # Export options
+            summary_data['Parameter'].append('')
+            summary_data['Value'].append('')
+            
+            summary_data['Parameter'].append('--- Export Options ---')
+            summary_data['Value'].append('')
+            
+            summary_data['Parameter'].append('CSV Exported')
+            summary_data['Value'].append('Yes' if self.chk_export_csv.isChecked() else 'No')
+            
+            summary_data['Parameter'].append('Plots Generated')
+            summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
+            
+            summary_data['Parameter'].append('Animation Generated')
+            summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
+            
+            summary_data['Parameter'].append('Behaviors Detected')
+            summary_data['Value'].append('Yes' if self.chk_detect_behaviors.isChecked() else 'No')
+            
+            # Create DataFrame and save
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_csv(summary_path, index=False)
+            
+            self.log_message(f"✓ Run summary saved: {os.path.basename(summary_path)}")
+        except Exception as e:
+            self.log_message(f"Warning: Could not save run summary: {str(e)}")
     
     def initUI(self):
         self.setWindowTitle("UWB Quick Visualization")
@@ -817,7 +1248,7 @@ class UWBQuickVisualizationWindow(QWidget):
         right_panel = self.create_visualization_panel()
         splitter.addWidget(right_panel)
         
-        splitter.setSizes([350, 1050])
+        splitter.setSizes([400, 1000])
         
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
@@ -937,6 +1368,59 @@ class UWBQuickVisualizationWindow(QWidget):
         trail_length_layout.addWidget(self.spin_trail_length)
         options_layout.addLayout(trail_length_layout)
         
+        # Velocity Filtering
+        velocity_filter_layout = QHBoxLayout()
+        self.chk_velocity_filter = QCheckBox("Apply velocity filtering (remove points >")
+        self.chk_velocity_filter.setChecked(True)
+        self.chk_velocity_filter.setToolTip("Remove data points with unrealistic velocities before smoothing")
+        self.chk_velocity_filter.stateChanged.connect(self.mark_options_changed)
+        velocity_filter_layout.addWidget(self.chk_velocity_filter)
+        
+        self.spin_velocity_threshold = QDoubleSpinBox()
+        self.spin_velocity_threshold.setRange(0.1, 10.0)
+        self.spin_velocity_threshold.setValue(2.0)
+        self.spin_velocity_threshold.setSuffix(" m/s)")
+        self.spin_velocity_threshold.setDecimals(1)
+        self.spin_velocity_threshold.setSingleStep(0.1)
+        self.spin_velocity_threshold.setToolTip("Maximum allowed velocity in meters per second")
+        self.spin_velocity_threshold.valueChanged.connect(self.mark_options_changed)
+        velocity_filter_layout.addWidget(self.spin_velocity_threshold)
+        velocity_filter_layout.addStretch()
+        options_layout.addLayout(velocity_filter_layout)
+        
+        # Jump Filtering (distance threshold)
+        jump_filter_layout = QHBoxLayout()
+        self.chk_jump_filter = QCheckBox("Apply jump filtering (remove jumps >")
+        self.chk_jump_filter.setChecked(True)
+        self.chk_jump_filter.setToolTip("Remove data points with unrealistic spatial jumps before smoothing")
+        self.chk_jump_filter.stateChanged.connect(self.mark_options_changed)
+        jump_filter_layout.addWidget(self.chk_jump_filter)
+        
+        self.spin_jump_threshold = QDoubleSpinBox()
+        self.spin_jump_threshold.setRange(0.1, 10.0)
+        self.spin_jump_threshold.setValue(2.0)
+        self.spin_jump_threshold.setSuffix(" m)")
+        self.spin_jump_threshold.setDecimals(1)
+        self.spin_jump_threshold.setSingleStep(0.1)
+        self.spin_jump_threshold.setToolTip("Maximum allowed distance jump in meters")
+        self.spin_jump_threshold.valueChanged.connect(self.mark_options_changed)
+        jump_filter_layout.addWidget(self.spin_jump_threshold)
+        jump_filter_layout.addStretch()
+        options_layout.addLayout(jump_filter_layout)
+        
+        # Time Window Grouping
+        time_window_layout = QHBoxLayout()
+        time_window_layout.addWidget(QLabel("Time gap grouping:"))
+        self.spin_time_gap = QSpinBox()
+        self.spin_time_gap.setRange(5, 300)
+        self.spin_time_gap.setValue(30)
+        self.spin_time_gap.setSuffix(" sec")
+        self.spin_time_gap.setToolTip("Group data by time gaps larger than this (prevents filtering across battery restarts)")
+        self.spin_time_gap.valueChanged.connect(self.mark_options_changed)
+        time_window_layout.addWidget(self.spin_time_gap)
+        time_window_layout.addStretch()
+        options_layout.addLayout(time_window_layout)
+        
         # Downsample (moved to below trail options)
         self.chk_downsample = QCheckBox("Downsample to 1Hz")
         self.chk_downsample.setChecked(True)
@@ -954,13 +1438,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_load_background.setToolTip("Load a background map/floorplan image to overlay on visualizations")
         self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
         load_buttons_layout.addWidget(self.btn_load_background)
-        
-        # Load Preview button
-        self.btn_load_preview = QPushButton("Load Preview")
-        self.btn_load_preview.clicked.connect(self.load_preview)
-        self.btn_load_preview.setEnabled(False)
-        self.btn_load_preview.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
-        load_buttons_layout.addWidget(self.btn_load_preview)
         
         options_layout.addLayout(load_buttons_layout)
         
@@ -983,6 +1460,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_csv.setToolTip("Export processed data as CSV with current settings applied")
         export_layout.addWidget(self.chk_export_csv)
         
+        # Detect Behaviors checkbox
+        self.chk_detect_behaviors = QCheckBox("Detect Behaviors")
+        self.chk_detect_behaviors.setChecked(False)
+        self.chk_detect_behaviors.setToolTip("Analyze and export behavioral patterns and social interactions")
+        export_layout.addWidget(self.chk_detect_behaviors)
+        
         # Save Plots checkbox (master)
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(True)  # Default checked
@@ -1002,7 +1485,11 @@ class UWBQuickVisualizationWindow(QWidget):
             ("battery_levels", "Battery Levels", "Battery voltage over time"),
             ("3d_occupancy", "3D Occupancy Heatmap", "3D visualization of occupancy over time"),
             ("activity_timeline", "Activity Timeline", "Data points per hour over time"),
-            ("velocity_distribution", "Velocity Distribution", "Velocity distribution for each tag")
+            ("velocity_distribution", "Velocity Distribution", "Velocity distribution for each tag"),
+            ("cumulative_distance", "Cumulative Distance", "Distance traveled over time (reset daily)"),
+            ("velocity_timeline", "Velocity Timeline", "Velocity over time with activity threshold"),
+            ("actogram", "Circadian Actogram", "24-hour activity patterns across days"),
+            ("data_quality", "Data Quality Metrics", "Table showing data gaps and quality statistics")
         ]
         
         for key, plot_name, plot_desc in plot_types:
@@ -1042,7 +1529,7 @@ class UWBQuickVisualizationWindow(QWidget):
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
-        self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "160x", "200x", "400x", "500x", "1000x"])
+        self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "100x", "120x", "150x", "160x", "200x", "400x", "500x", "1000x"])
         self.combo_animation_speed.setCurrentText("40x")
         self.combo_animation_speed.setToolTip("Playback speed multiplier (e.g., 10x = 10 seconds of real time per second of video)")
         speed_layout.addWidget(self.combo_animation_speed)
@@ -1159,6 +1646,14 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Export buttons layout
         export_buttons_layout = QHBoxLayout()
+        
+        # Load Preview button (optional - user can export directly without preview)
+        self.btn_load_preview = QPushButton("Load Preview")
+        self.btn_load_preview.clicked.connect(self.load_preview)
+        self.btn_load_preview.setEnabled(False)
+        self.btn_load_preview.setStyleSheet("padding: 8px; font-size: 11px;")
+        self.btn_load_preview.setToolTip("Optional: Load interactive preview to visualize tracking data")
+        export_buttons_layout.addWidget(self.btn_load_preview)
         
         # Export button
         self.btn_export = QPushButton("Export")
@@ -1396,6 +1891,45 @@ class UWBQuickVisualizationWindow(QWidget):
                     except:
                         pass
             
+            # Parse zone coordinates from Zones section
+            zones_element = root.find('Zones')
+            if zones_element is not None:
+                zone_data = []
+                for zone in zones_element.findall('Zone'):
+                    zone_name = zone.get('name')
+                    if zone_name is None:
+                        continue
+                    
+                    shape = zone.find('Shape')
+                    if shape is None:
+                        continue
+                    
+                    for point in shape.findall('Point'):
+                        x_str = point.get('x')
+                        y_str = point.get('y')
+                        
+                        if x_str is not None and y_str is not None:
+                            try:
+                                # Convert coordinates to meters (inches to meters)
+                                x_meters = float(x_str) * 0.0254
+                                y_meters = float(y_str) * 0.0254
+                                zone_data.append({
+                                    'zone': zone_name,
+                                    'x': x_meters,
+                                    'y': y_meters
+                                })
+                            except ValueError:
+                                continue
+                
+                if zone_data:
+                    self.arena_zones = pd.DataFrame(zone_data)
+                    num_zones = len(self.arena_zones['zone'].unique())
+                    self.log_message(f"Parsed {num_zones} zones with {len(zone_data)} coordinate points from XML")
+                else:
+                    self.log_message("No valid zone coordinates found in XML")
+            else:
+                self.log_message("No Zones section found in XML")
+            
             # Look for background image reference
             # XML structure might vary, check common patterns
             bg_image_element = None
@@ -1630,8 +2164,25 @@ class UWBQuickVisualizationWindow(QWidget):
         enabled = self.chk_daily_animations.isChecked()
         self.daily_animation_days_widget.setVisible(enabled)
     
+    def populate_animation_days_from_list(self, date_strings):
+        """Populate day checkboxes from a list of date strings (works without loading full data)"""
+        # Clear existing checkboxes
+        for cb in self.daily_animation_day_checkboxes.values():
+            cb.deleteLater()
+        self.daily_animation_day_checkboxes.clear()
+        
+        if not date_strings:
+            return
+        
+        # Create checkboxes for each day
+        for i, date_str in enumerate(date_strings):
+            cb = QCheckBox(f"Day {i+1}: {date_str}")
+            cb.setChecked(True)  # Default to all days selected
+            self.daily_animation_day_checkboxes[date_str] = cb
+            self.daily_days_layout_inner.addWidget(cb)
+    
     def populate_animation_days(self):
-        """Populate day checkboxes based on loaded data"""
+        """Populate day checkboxes based on loaded data (called after preview loads)"""
         # Clear existing checkboxes
         for cb in self.daily_animation_day_checkboxes.values():
             cb.deleteLater()
@@ -1643,15 +2194,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # Get unique dates
         dates = pd.to_datetime(self.data['Timestamp']).dt.date.unique()
         dates = sorted(dates)
+        date_strings = [date.strftime('%Y-%m-%d') for date in dates]
         
-        # Create checkboxes for each day
-        for i, date in enumerate(dates):
-            date_str = date.strftime('%Y-%m-%d')
-            cb = QCheckBox(f"Day {i+1}: {date_str}")
-            cb.setChecked(True)  # Default all checked
-            cb.setToolTip(f"Generate animation for {date_str} (midnight to midnight)")
-            self.daily_animation_day_checkboxes[date_str] = cb
-            self.daily_days_layout_inner.addWidget(cb)
+        # Use the list-based function
+        self.populate_animation_days_from_list(date_strings)
         
         self.log_message(f"Found {len(dates)} unique days in dataset")
     
@@ -1674,6 +2220,16 @@ class UWBQuickVisualizationWindow(QWidget):
             # Update tag checkbox labels to reflect new identities
             self.update_tag_labels()
             self.lbl_status.setText(f"Identity assignments saved for {len(self.tag_identities)} tags")
+            
+            # Auto-save configuration to JSON
+            if self.db_path:
+                db_dir = os.path.dirname(self.db_path)
+                db_filename = os.path.basename(self.db_path)
+                db_name = os.path.splitext(db_filename)[0]
+                output_dir = os.path.join(db_dir, f"{db_name}_fntUwbAnalysis")
+                os.makedirs(output_dir, exist_ok=True)
+                self.save_config(output_dir)
+                self.log_message("✓ Configuration auto-saved to JSON")
     
     def stop_export(self):
         """Cancel ongoing export operations"""
@@ -1713,10 +2269,39 @@ class UWBQuickVisualizationWindow(QWidget):
             
             self.available_tags = df['shortid'].tolist()
             self.update_tag_selection()
+            
+            # Enable both preview AND export (user can choose either)
             self.btn_load_preview.setEnabled(True)
+            self.btn_export.setEnabled(True)
+            
+            # Load unique days for daily animation options
+            self.load_unique_days_from_database()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load tags: {str(e)}")
+    
+    def load_unique_days_from_database(self):
+        """Load unique days from database without loading full data"""
+        if not self.db_path or not self.table_name:
+            return
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # Query for distinct dates
+            query = f"""
+                SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), 'localtime') as date
+                FROM {self.table_name}
+                ORDER BY date
+            """
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if len(df) > 0:
+                self.populate_animation_days_from_list(df['date'].tolist())
+                self.log_message(f"Found {len(df)} unique days in database")
+            
+        except Exception as e:
+            self.log_message(f"Could not load unique days: {str(e)}")
     
     def update_tag_selection(self):
         """Update tag checkboxes"""
@@ -1862,7 +2447,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.data['sex'] = 'M'
                 self.data['identity'] = self.data['shortid'].apply(lambda x: f'Tag{x}')
             
-            # Apply smoothing FIRST (on full resolution data)
+            # Apply filtering BEFORE smoothing (removes outliers)
+            if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
+                self.log_message("Applying velocity/jump filtering...")
+                self.data = self.apply_filters(self.data)
+            
+            # Apply smoothing AFTER filtering (on full resolution data)
             if self.combo_smoothing.currentText() != "None":
                 self.log_message("Applying smoothing to full resolution data...")
                 self.apply_smoothing()
@@ -1907,9 +2497,11 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"✗ Error loading data: {str(e)}")
     
     def apply_smoothing(self):
-        """Apply smoothing to data"""
-        method = self.combo_smoothing.currentText()
-        
+        """Apply smoothing to self.data"""
+        self.data = self.apply_smoothing_to_data(self.data, self.combo_smoothing.currentText())
+    
+    def apply_smoothing_to_data(self, data, method):
+        """Apply smoothing to a dataframe (works on any dataframe, not just self.data)"""
         def apply_savgol(group):
             window_length = min(31, len(group))
             if window_length % 2 == 0:
@@ -1920,8 +2512,8 @@ class UWBQuickVisualizationWindow(QWidget):
             return group
         
         if method == "Savitzky-Golay":
-            self.data['smoothed_x'] = self.data.groupby('shortid')['location_x'].transform(apply_savgol)
-            self.data['smoothed_y'] = self.data.groupby('shortid')['location_y'].transform(apply_savgol)
+            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol)
+            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol)
         elif method == "Rolling Average":
             # Get window size in seconds from spinbox
             window_seconds = self.spin_rolling_window.value()
@@ -1929,10 +2521,130 @@ class UWBQuickVisualizationWindow(QWidget):
             # Calculate window size in number of samples (assuming 1Hz after downsampling)
             window_size = max(3, window_seconds)  # Minimum window of 3
             
-            self.data['smoothed_x'] = self.data.groupby('shortid')['location_x'].transform(
+            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-            self.data['smoothed_y'] = self.data.groupby('shortid')['location_y'].transform(
+            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
+        
+        return data
+    
+    def apply_filters(self, data):
+        """Apply velocity and jump filtering with time window grouping"""
+        initial_count = len(data)
+        
+        # Calculate time differences and group by time gaps (prevents filtering across battery restarts)
+        time_gap_threshold = self.spin_time_gap.value()
+        data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
+        data['time_diff_s'] = np.ceil(data['time_diff']).astype(int)
+        data['tw_group'] = data.groupby('shortid')['time_diff_s'].apply(
+            lambda x: (x > time_gap_threshold).cumsum()
+        ).reset_index(level=0, drop=True)
+        
+        # Calculate distance and velocity within time window groups
+        data['distance'] = np.sqrt(
+            (data['location_x'] - data.groupby(['shortid', 'tw_group'])['location_x'].shift())**2 +
+            (data['location_y'] - data.groupby(['shortid', 'tw_group'])['location_y'].shift())**2
+        )
+        data['velocity'] = data['distance'] / data['time_diff']
+        
+        # Apply velocity filtering if enabled
+        if self.chk_velocity_filter.isChecked():
+            velocity_threshold = self.spin_velocity_threshold.value()
+            before_velocity = len(data)
+            data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())]
+            removed_velocity = before_velocity - len(data)
+            if removed_velocity > 0:
+                self.log_message(f"  Removed {removed_velocity} points with velocity > {velocity_threshold} m/s")
+        
+        # Apply jump filtering if enabled
+        if self.chk_jump_filter.isChecked():
+            jump_threshold = self.spin_jump_threshold.value()
+            before_jump = len(data)
+            data['is_jump'] = (data['distance'] > jump_threshold)
+            data = data[~data['is_jump']]
+            removed_jump = before_jump - len(data)
+            if removed_jump > 0:
+                self.log_message(f"  Removed {removed_jump} points with distance jump > {jump_threshold} m")
+        
+        # Clean up temporary columns
+        data = data.drop(columns=['time_diff', 'time_diff_s', 'tw_group', 'distance', 'velocity'], errors='ignore')
+        if 'is_jump' in data.columns:
+            data = data.drop(columns=['is_jump'])
+        
+        final_count = len(data)
+        if initial_count != final_count:
+            self.log_message(f"  Total filtered: {initial_count - final_count} points ({100*(initial_count-final_count)/initial_count:.1f}%)")
+        
+        return data
+    
+    def apply_filters_to_data(self, data):
+        """Apply velocity and jump filtering with time window grouping to any dataframe"""
+        initial_count = len(data)
+        removed_velocity = 0
+        removed_jump = 0
+        
+        # Make explicit copy at start to avoid any SettingWithCopyWarning
+        data = data.copy()
+        
+        # Calculate time differences and group by time gaps (prevents filtering across battery restarts)
+        time_gap_threshold = self.spin_time_gap.value()
+        data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
+        data['time_diff_s'] = np.ceil(data['time_diff']).astype(int)
+        data['tw_group'] = data.groupby('shortid')['time_diff_s'].apply(
+            lambda x: (x > time_gap_threshold).cumsum()
+        ).reset_index(level=0, drop=True)
+        
+        # Calculate distance and velocity within time window groups
+        data['distance'] = np.sqrt(
+            (data['location_x'] - data.groupby(['shortid', 'tw_group'])['location_x'].shift())**2 +
+            (data['location_y'] - data.groupby(['shortid', 'tw_group'])['location_y'].shift())**2
+        )
+        data['velocity'] = data['distance'] / data['time_diff']
+        
+        # Apply velocity filtering if enabled
+        if self.chk_velocity_filter.isChecked():
+            velocity_threshold = self.spin_velocity_threshold.value()
+            before_velocity = len(data)
+            data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())].copy()
+            removed_velocity = before_velocity - len(data)
+            if removed_velocity > 0:
+                self.log_message(f"  Removed {removed_velocity} points with velocity > {velocity_threshold} m/s")
+        else:
+            removed_velocity = 0
+        
+        # Apply jump filtering if enabled
+        if self.chk_jump_filter.isChecked():
+            jump_threshold = self.spin_jump_threshold.value()
+            before_jump = len(data)
+            data['is_jump'] = (data['distance'] > jump_threshold)
+            data = data[~data['is_jump']].copy()
+            removed_jump = before_jump - len(data)
+            if removed_jump > 0:
+                self.log_message(f"  Removed {removed_jump} points with distance jump > {jump_threshold} m")
+        else:
+            removed_jump = 0
+        
+        # Clean up temporary columns
+        data = data.drop(columns=['time_diff', 'time_diff_s', 'tw_group', 'distance', 'velocity'], errors='ignore')
+        if 'is_jump' in data.columns:
+            data = data.drop(columns=['is_jump'])
+        
+        final_count = len(data)
+        if initial_count != final_count:
+            self.log_message(f"  Total filtered: {initial_count - final_count} points ({100*(initial_count-final_count)/initial_count:.1f}%)")
+        
+        # Store stats for summary report
+        if not hasattr(self, 'filter_stats'):
+            self.filter_stats = {}
+        self.filter_stats = {
+            'initial_count': initial_count,
+            'removed_velocity': removed_velocity,
+            'removed_jump': removed_jump,
+            'final_count': final_count,
+            'percent_filtered': 100 * (initial_count - final_count) / initial_count if initial_count > 0 else 0
+        }
+        
+        return data
     
     def update_visualization(self, slider_value):
         """Update visualization based on slider position"""
@@ -1961,6 +2673,25 @@ class UWBQuickVisualizationWindow(QWidget):
                               zorder=0)
             except Exception as e:
                 self.log_message(f"Error drawing background: {str(e)}")
+        
+        # Draw arena zones if available
+        if self.arena_zones is not None and not self.arena_zones.empty:
+            try:
+                from matplotlib.patches import Polygon
+                for zone_name in self.arena_zones['zone'].unique():
+                    zone_points = self.arena_zones[self.arena_zones['zone'] == zone_name]
+                    coords = zone_points[['x', 'y']].values
+                    if len(coords) >= 3:  # Need at least 3 points for a polygon
+                        poly = Polygon(coords, fill=False, edgecolor='black', linewidth=1.5, linestyle='--', zorder=1)
+                        self.ax.add_patch(poly)
+                        # Add zone label at centroid
+                        centroid_x = coords[:, 0].mean()
+                        centroid_y = coords[:, 1].mean()
+                        self.ax.text(centroid_x, centroid_y, zone_name, 
+                                   fontsize=8, ha='center', va='center', 
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5))
+            except Exception as e:
+                self.log_message(f"Error drawing zones: {str(e)}")
         
         # Get all data up to and including current timestamp
         current_data = self.data[self.data['Timestamp'] <= current_timestamp]
@@ -2091,9 +2822,15 @@ class UWBQuickVisualizationWindow(QWidget):
             'downsample': self.chk_downsample.isChecked(),
             'smoothing_method': self.combo_smoothing.currentText(),
             'rolling_window': self.spin_rolling_window.value(),
+            'velocity_filter': self.chk_velocity_filter.isChecked(),
+            'velocity_threshold': self.spin_velocity_threshold.value(),
+            'jump_filter': self.chk_jump_filter.isChecked(),
+            'jump_threshold': self.spin_jump_threshold.value(),
+            'time_gap': self.spin_time_gap.value(),
             'show_trail': self.chk_show_trail.isChecked(),
             'trail_length': self.spin_trail_length.value(),
             'export_csv': self.chk_export_csv.isChecked(),
+            'detect_behaviors': self.chk_detect_behaviors.isChecked(),
             'save_plots': self.chk_save_plots.isChecked(),
             'plot_types': {
                 'daily_paths': self.plot_type_checkboxes['daily_paths'].isChecked(),
@@ -2101,7 +2838,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 'battery_levels': self.plot_type_checkboxes['battery_levels'].isChecked(),
                 '3d_occupancy': self.plot_type_checkboxes['3d_occupancy'].isChecked(),
                 'activity_timeline': self.plot_type_checkboxes['activity_timeline'].isChecked(),
-                'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked()
+                'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked(),
+                'cumulative_distance': self.plot_type_checkboxes['cumulative_distance'].isChecked(),
+                'velocity_timeline': self.plot_type_checkboxes['velocity_timeline'].isChecked(),
+                'actogram': self.plot_type_checkboxes['actogram'].isChecked(),
+                'data_quality': self.plot_type_checkboxes['data_quality'].isChecked()
             },
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
@@ -2111,7 +2852,8 @@ class UWBQuickVisualizationWindow(QWidget):
             'color_by': self.combo_color_by.currentText(),
             'tag_identities': self.tag_identities,
             'overwrite': self.chk_overwrite.isChecked(),
-            'background_image_path': self.background_image_path  # Save background image path
+            'background_image_path': self.background_image_path,  # Save background image path
+            'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None  # Save zone data
         }
         return config
     
@@ -2168,6 +2910,21 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'rolling_window' in config:
                 self.spin_rolling_window.setValue(config['rolling_window'])
             
+            if 'velocity_filter' in config:
+                self.chk_velocity_filter.setChecked(config['velocity_filter'])
+            
+            if 'velocity_threshold' in config:
+                self.spin_velocity_threshold.setValue(config['velocity_threshold'])
+            
+            if 'jump_filter' in config:
+                self.chk_jump_filter.setChecked(config['jump_filter'])
+            
+            if 'jump_threshold' in config:
+                self.spin_jump_threshold.setValue(config['jump_threshold'])
+            
+            if 'time_gap' in config:
+                self.spin_time_gap.setValue(config['time_gap'])
+            
             if 'show_trail' in config:
                 self.chk_show_trail.setChecked(config['show_trail'])
             
@@ -2176,6 +2933,9 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'export_csv' in config:
                 self.chk_export_csv.setChecked(config['export_csv'])
+            
+            if 'detect_behaviors' in config:
+                self.chk_detect_behaviors.setChecked(config['detect_behaviors'])
             
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
@@ -2282,6 +3042,14 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'selected_tags' in config:
                 self.pending_tag_selection = config['selected_tags']
             
+            # Load zone data if present
+            if 'arena_zones' in config and config['arena_zones'] is not None:
+                self.arena_zones = pd.DataFrame(config['arena_zones'])
+                if not self.arena_zones.empty:
+                    num_zones = self.arena_zones['zone'].nunique()
+                    num_points = len(self.arena_zones)
+                    self.log_message(f"Loaded {num_zones} zones with {num_points} coordinate points from config")
+            
             self.log_message(f"Loaded previous configuration from {config_path}")
             
             # Update tag labels if identities were loaded
@@ -2318,7 +3086,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Load data from CSV if provided (for consistency with plots)
             if csv_path and os.path.exists(csv_path):
                 self.log_message(f"Loading animation data from CSV...")
-                anim_data = pd.read_csv(csv_path)
+                anim_data = pd.read_csv(csv_path, low_memory=False)
                 # Parse Timestamp column (with mixed format to handle timezone-aware timestamps)
                 anim_data['Timestamp'] = pd.to_datetime(anim_data['Timestamp'], format='mixed')
                 self.log_message(f"Loaded {len(anim_data)} records from CSV")
@@ -2430,12 +3198,16 @@ class UWBQuickVisualizationWindow(QWidget):
                         self.log_message(f"⚠ No data for {date_str}, skipping")
                         continue
                     
+                    # Get speed text for display
+                    speed_text = self.combo_animation_speed.currentText()
+                    
                     # Generate animation for this day
                     video_path = self.create_animation_frames(
                         day_data, temp_frames_dir, frame_interval, trailing_window,
                         fps, color_by, bool(self.tag_identities),
                         total_export_steps, current_export_step,
-                        day_suffix=f"_Day{day_idx + 1}_{date_str}"
+                        day_suffix=f"_Day{day_idx + 1}_{date_str}",
+                        speed_text=speed_text
                     )
                     
                     if video_path and not self.export_cancelled:
@@ -2469,9 +3241,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 # Create animation
                 self.log_message("Generating animation frames (this may take a while)...")
+                speed_text = self.combo_animation_speed.currentText()
                 video_path = self.create_animation_frames(anim_data, temp_frames_dir, frame_interval, trailing_window, 
                                             fps, color_by, bool(self.tag_identities),
-                                            total_export_steps, current_export_step)
+                                            total_export_steps, current_export_step,
+                                            speed_text=speed_text)
                 
                 if video_path and not self.export_cancelled:
                     # Move video to final location with FPS and speed in filename
@@ -2511,7 +3285,7 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def create_animation_frames(self, data, output_dir, frame_interval, trailing_window, 
                                fps, color_by, use_custom_identities=False,
-                               total_export_steps=1, current_export_step=1, day_suffix=""):
+                               total_export_steps=1, current_export_step=1, day_suffix="", speed_text=""):
         """Create animation frames and compile video with optimization strategies:
         1. In-memory rendering (no temp PNG files)
         2. Configurable DPI for speed vs quality
@@ -2548,7 +3322,12 @@ class UWBQuickVisualizationWindow(QWidget):
         # Calculate time range based on frame_interval
         start = data['Timestamp'].min()
         end = data['Timestamp'].max()
-        time_starts = pd.date_range(start=start, end=end, freq=f'{frame_interval}s')
+        
+        # Generate time points manually to avoid floating point precision issues with pd.date_range
+        total_seconds = (end - start).total_seconds()
+        num_frames = int(total_seconds / frame_interval) + 1
+        time_starts = [start + pd.Timedelta(seconds=i * frame_interval) for i in range(num_frames)]
+        time_starts = [t for t in time_starts if t <= end]  # Filter to ensure we don't exceed end time
         
         total_frames = len(time_starts)
         self.log_message(f"Creating {total_frames} animation frames (optimized pipeline)...")
@@ -2595,6 +3374,29 @@ class UWBQuickVisualizationWindow(QWidget):
                      aspect='auto',
                      alpha=0.6,
                      zorder=0)
+        
+        # Draw arena zones if available (static, drawn once)
+        zone_artists = []
+        if self.arena_zones is not None and not self.arena_zones.empty:
+            try:
+                from matplotlib.patches import Polygon
+                for zone_name in self.arena_zones['zone'].unique():
+                    zone_points = self.arena_zones[self.arena_zones['zone'] == zone_name]
+                    coords = zone_points[['x', 'y']].values
+                    if len(coords) >= 3:  # Need at least 3 points for a polygon
+                        poly = Polygon(coords, fill=False, edgecolor='black', linewidth=1.5, linestyle='--', zorder=1)
+                        ax.add_patch(poly)
+                        zone_artists.append(poly)
+                        # Add zone label at centroid
+                        centroid_x = coords[:, 0].mean()
+                        centroid_y = coords[:, 1].mean()
+                        text = ax.text(centroid_x, centroid_y, zone_name, 
+                                     fontsize=8, ha='center', va='center', 
+                                     bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
+                                     zorder=1)
+                        zone_artists.append(text)
+            except Exception as e:
+                self.log_message(f"Error drawing zones in animation: {str(e)}")
         
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
@@ -2659,8 +3461,13 @@ class UWBQuickVisualizationWindow(QWidget):
             ax.set_aspect('equal')
             ax.set_xlabel("X Position (m)", fontsize=12)
             ax.set_ylabel("Y Position (m)", fontsize=12)
-            ax.set_title(f"UWB Tracking Animation\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}", 
-                        fontsize=14, fontweight='bold')
+            
+            # Build title with speed if provided
+            title_text = "UWB Tracking Animation"
+            if speed_text:
+                title_text += f" - Speed: {speed_text}"
+            title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
+            ax.set_title(title_text, fontsize=14, fontweight='bold')
             
             # Plot each tag's trajectory
             for tag, tag_info in tag_data_dict.items():
@@ -2733,8 +3540,12 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def export_data(self):
         """Export data and/or plots based on selected options"""
-        if not self.db_path or self.data is None:
+        if not self.db_path:
+            QMessageBox.warning(self, "No Database", "Please select a database first")
             return
+        
+        # Note: self.data can be None if user exports without loading preview
+        # This is OK - plots and animations will load data directly from CSV/database
         
         # Initialize export state
         self.export_cancelled = False
@@ -2823,8 +3634,49 @@ class UWBQuickVisualizationWindow(QWidget):
                     
                     self.log_message("Exporting CSV...")
                     
+                    # Load data if not already in memory (user didn't load preview)
+                    if self.data is None:
+                        self.log_message("Loading data from database...")
+                        conn = sqlite3.connect(self.db_path)
+                        query = f"SELECT * FROM {self.table_name}"
+                        csv_data = pd.read_sql_query(query, conn)
+                        conn.close()
+                        
+                        # Process data same as load_preview
+                        csv_data['Timestamp'] = pd.to_datetime(csv_data['timestamp'], unit='ms', origin='unix', utc=True)
+                        tz = pytz.timezone(self.combo_timezone.currentText())
+                        csv_data['Timestamp'] = csv_data['Timestamp'].dt.tz_convert(tz)
+                        csv_data['location_x'] *= 0.0254
+                        csv_data['location_y'] *= 0.0254
+                        csv_data = csv_data.sort_values(by=['shortid', 'Timestamp'])
+                        
+                        # Filter to selected tags
+                        selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+                        if selected_tags:
+                            csv_data = csv_data[csv_data['shortid'].isin(selected_tags)]
+                        
+                        # Apply filtering if requested (before smoothing)
+                        if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
+                            self.log_message("Applying velocity/jump filtering...")
+                            # Need to temporarily set the data for apply_filters to work
+                            temp_data = csv_data
+                            csv_data = self.apply_filters_to_data(csv_data)
+                        
+                        # Apply smoothing if requested (after filtering)
+                        if self.combo_smoothing.currentText() != "None":
+                            self.log_message("Applying smoothing...")
+                            csv_data = self.apply_smoothing_to_data(csv_data, self.combo_smoothing.currentText())
+                        
+                        # Downsample if requested
+                        if self.chk_downsample.isChecked():
+                            self.log_message("Downsampling to 1Hz...")
+                            csv_data['time_sec'] = (csv_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
+                            csv_data = csv_data.groupby(['shortid', 'time_sec']).first().reset_index()
+                    else:
+                        # Use already loaded data
+                        csv_data = self.data.copy()
+                    
                     # Ensure sex and identity columns are in the data
-                    csv_data = self.data.copy()
                     if 'sex' not in csv_data.columns or 'identity' not in csv_data.columns:
                         if self.tag_identities:
                             csv_data['sex'] = csv_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
@@ -2853,6 +3705,99 @@ class UWBQuickVisualizationWindow(QWidget):
             # Save configuration file
             self.save_config(output_dir)
             
+            # Save message log and run summary
+            self.save_message_log(output_dir)
+            self.save_run_summary(output_dir)
+            
+            # Detect behaviors if requested
+            detect_behaviors = self.chk_detect_behaviors.isChecked()
+            if detect_behaviors:
+                if self.export_cancelled:
+                    self.stop_export()
+                    return
+                
+                self.log_message("=" * 50)
+                self.log_message("Starting behavioral analysis...")
+                self.lbl_export_progress.setText("Analyzing behaviors and social interactions...")
+                QApplication.processEvents()
+                
+                try:
+                    from fnt.uwb.behavior_detection import BehaviorDetector
+                    
+                    # Load CSV data if not already loaded
+                    if not os.path.exists(csv_path):
+                        self.log_message("Error: CSV file not found for behavior analysis")
+                    else:
+                        behavior_data = pd.read_csv(csv_path, low_memory=False)
+                        behavior_data['Timestamp'] = pd.to_datetime(behavior_data['Timestamp'], format='ISO8601')
+                        
+                        # Initialize behavior detector with default thresholds
+                        detector = BehaviorDetector(
+                            speed_threshold_rest=0.05,      # m/s
+                            speed_threshold_active=0.3,     # m/s
+                            distance_threshold_social=0.5,  # m
+                            window_seconds=10.0,
+                            overlap_seconds=5.0
+                        )
+                        
+                        # Run behavior detection
+                        behavior_timeline, social_interactions = detector.analyze_behaviors(
+                            behavior_data, 
+                            log_callback=self.log_message
+                        )
+                        
+                        # Generate summary reports
+                        if not behavior_timeline.empty:
+                            # Behavior summary per animal
+                            behavior_summary = detector.generate_behavior_summary(
+                                behavior_timeline, 
+                                social_interactions,
+                                tag_identities=self.tag_identities
+                            )
+                            
+                            # Social interaction summary
+                            social_summary = detector.generate_social_interaction_summary(
+                                social_interactions,
+                                tag_identities=self.tag_identities
+                            )
+                            
+                            # Export behavior timeline (detailed)
+                            behavior_timeline_path = os.path.join(output_dir, f'{db_name}_behavior_timeline.csv')
+                            behavior_timeline.to_csv(behavior_timeline_path, index=False)
+                            self.log_message(f"✓ Exported behavior timeline: {os.path.basename(behavior_timeline_path)}")
+                            
+                            # Export behavior summary
+                            behavior_summary_path = os.path.join(output_dir, f'{db_name}_behavior_summary.csv')
+                            behavior_summary.to_csv(behavior_summary_path, index=False)
+                            self.log_message(f"✓ Exported behavior summary: {os.path.basename(behavior_summary_path)}")
+                            
+                            # Export social interactions (detailed)
+                            if not social_interactions.empty:
+                                social_interactions_path = os.path.join(output_dir, f'{db_name}_social_interactions.csv')
+                                social_interactions.to_csv(social_interactions_path, index=False)
+                                self.log_message(f"✓ Exported social interactions: {os.path.basename(social_interactions_path)}")
+                            
+                            # Export social interaction summary
+                            if not social_summary.empty:
+                                social_summary_path = os.path.join(output_dir, f'{db_name}_social_summary.csv')
+                                social_summary.to_csv(social_summary_path, index=False)
+                                self.log_message(f"✓ Exported social interaction summary: {os.path.basename(social_summary_path)}")
+                            else:
+                                self.log_message("No social interactions detected")
+                            
+                            self.log_message("✓ Behavioral analysis complete!")
+                        else:
+                            self.log_message("Warning: No behaviors detected in data")
+                        
+                except ImportError as e:
+                    self.log_message(f"Error: Could not import behavior detection module: {e}")
+                except Exception as e:
+                    self.log_message(f"Error during behavioral analysis: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                self.log_message("=" * 50)
+            
             # Export plots if requested (BEFORE animation, which takes longer)
             if save_plots:
                 if self.export_cancelled:
@@ -2873,7 +3818,11 @@ class UWBQuickVisualizationWindow(QWidget):
                     'battery_levels': self.plot_type_checkboxes['battery_levels'].isChecked(),
                     '3d_occupancy': self.plot_type_checkboxes['3d_occupancy'].isChecked(),
                     'activity_timeline': self.plot_type_checkboxes['activity_timeline'].isChecked(),
-                    'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked()
+                    'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked(),
+                    'cumulative_distance': self.plot_type_checkboxes['cumulative_distance'].isChecked(),
+                    'velocity_timeline': self.plot_type_checkboxes['velocity_timeline'].isChecked(),
+                    'actogram': self.plot_type_checkboxes['actogram'].isChecked(),
+                    'data_quality': self.plot_type_checkboxes['data_quality'].isChecked()
                 }
                 
                 # Get overwrite setting

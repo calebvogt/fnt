@@ -18,6 +18,11 @@ class CompressWorker(QThread):
         super().__init__()
         self.folder_path = folder_path
         self.output_folder = output_folder
+        self._stop_requested = False
+    
+    def stop(self):
+        """Request the worker to stop processing"""
+        self._stop_requested = True
         
     def run(self):
         try:
@@ -36,6 +41,13 @@ class CompressWorker(QThread):
             
             # Process each file
             for idx, wav_file in enumerate(wav_files, 1):
+                # Check if stop was requested
+                if self._stop_requested:
+                    self.progress.emit("\n" + "="*50)
+                    self.progress.emit("⚠️ Processing stopped by user")
+                    self.finished.emit(False, "Processing stopped by user")
+                    return
+                
                 input_path = os.path.join(self.folder_path, wav_file)
                 output_path = os.path.join(self.output_folder, os.path.splitext(wav_file)[0] + ".wav")
                 
@@ -43,13 +55,14 @@ class CompressWorker(QThread):
                 self.file_progress.emit(idx, len(wav_files))
                 self.progress.emit(f"\n[{idx}/{len(wav_files)}] Processing: {wav_file}")
                 
-                # ffmpeg command: downsample to 250kHz, mono, ADPCM compression
+                # ffmpeg command: downsample to 250kHz, mono, PCM 16-bit
+                # Using PCM instead of ADPCM for better compatibility with Audacity
                 cmd = [
                     "ffmpeg",
                     "-i", input_path,
                     "-ar", "250000",  # 250kHz sample rate
                     "-ac", "1",       # mono
-                    "-c:a", "adpcm_ima_wav",  # ADPCM compression
+                    "-c:a", "pcm_s16le",  # PCM 16-bit little-endian (standard WAV)
                     "-y",  # overwrite output
                     output_path
                 ]
@@ -192,7 +205,7 @@ class CompressWavsWindow(QMainWindow):
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
         header_layout.addWidget(title)
         
-        subtitle = QLabel("Compress WAV files using ADPCM encoding (250kHz, mono)")
+        subtitle = QLabel("Downsample WAV files to 250kHz mono PCM format")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
@@ -247,6 +260,32 @@ class CompressWavsWindow(QMainWindow):
         self.btn_process.clicked.connect(self.start_compression)
         self.btn_process.setEnabled(False)
         btn_layout.addWidget(self.btn_process)
+        
+        self.btn_stop = QPushButton("Stop Processing")
+        self.btn_stop.clicked.connect(self.stop_compression)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #c42b1c;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #a52314;
+            }
+            QPushButton:pressed {
+                background-color: #8b1d10;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #888888;
+            }
+        """)
+        btn_layout.addWidget(self.btn_stop)
         btn_layout.addStretch()
         
         close_btn = QPushButton("Close")
@@ -315,6 +354,7 @@ class CompressWavsWindow(QMainWindow):
         # Disable buttons during processing
         self.btn_select.setEnabled(False)
         self.btn_process.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         
         # Show progress bar
         self.progress_bar.setVisible(True)
@@ -345,11 +385,19 @@ class CompressWavsWindow(QMainWindow):
             self.txt_output_display.verticalScrollBar().maximum()
         )
         
+    def stop_compression(self):
+        """Stop the compression process"""
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.btn_stop.setEnabled(False)
+            self.txt_output_display.append("\nStopping processing...")
+    
     def compression_finished(self, success, message):
         """Handle compression completion"""
         # Re-enable buttons
         self.btn_select.setEnabled(True)
         self.btn_process.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         
         # Hide progress bar
         self.progress_bar.setVisible(False)

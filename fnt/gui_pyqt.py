@@ -361,7 +361,6 @@ class FNTMainWindow(QMainWindow):
         
         quick_buttons = [
             ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
-            ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -373,8 +372,6 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
-            ("UWB Data Processing", "Preprocess and export UWB tracking data", self.run_uwb_preprocess),
-            ("Animate UWB Paths", "Create animated videos of tracking paths", self.run_uwb_animate),
             ("Behavioral Analysis", "Analyze behavioral patterns from tracking", self.run_uwb_behavioral),
             ("Plot UWB Paths", "Generate static plots of tracking data", self.run_plot_uwb_path),
         ]
@@ -665,17 +662,6 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"WAV compression failed: {str(e)}")
     
     # UWB Processing Methods
-    def run_uwb_quick_plots(self):
-        """Launch UWB Quick Plots tool"""
-        try:
-            from fnt.uwb.uwb_quick_plots_pyqt import UWBQuickPlotsWindow
-            
-            # Create and show the UWB quick plots window
-            self.uwb_quick_plots_window = UWBQuickPlotsWindow()
-            self.uwb_quick_plots_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB Quick Plots failed: {str(e)}")
-    
     def run_uwb_quick_visualization(self):
         """Launch UWB Quick Visualization tool"""
         try:
@@ -686,20 +672,6 @@ class FNTMainWindow(QMainWindow):
             self.uwb_quick_viz_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"UWB Quick Visualization failed: {str(e)}")
-    
-    def run_uwb_preprocess(self):
-        """Launch UWB data preprocessing"""
-        def func():
-            from fnt.uwb.uwb_preprocess_sql import uwb_smoothing
-            uwb_smoothing()
-        self.run_function_safely(func, "UWB Data Processing")
-    
-    def run_uwb_animate(self):
-        """Launch UWB path animation"""
-        def func():
-            from fnt.uwb.uwb_animate import uwb_animate_paths
-            uwb_animate_paths()
-        self.run_function_safely(func, "UWB Path Animation")
     
     def run_uwb_behavioral(self):
         """Launch UWB behavioral analysis"""
