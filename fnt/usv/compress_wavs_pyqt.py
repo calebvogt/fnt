@@ -4,7 +4,7 @@ import subprocess
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QTextEdit, QFileDialog, 
                              QMessageBox, QGroupBox, QLineEdit, QProgressBar, QFrame,
-                             QScrollArea)
+                             QScrollArea, QComboBox)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont
 
@@ -14,10 +14,11 @@ class CompressWorker(QThread):
     file_progress = pyqtSignal(int, int)  # current file, total files
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, folder_path, output_folder):
+    def __init__(self, folder_path, output_folder, codec):
         super().__init__()
         self.folder_path = folder_path
         self.output_folder = output_folder
+        self.codec = codec
         self._stop_requested = False
     
     def stop(self):
@@ -38,6 +39,7 @@ class CompressWorker(QThread):
                 return
             
             self.progress.emit(f"Found {len(wav_files)} WAV file(s)\n")
+            self.progress.emit(f"Using codec: {self.codec}\n")
             
             # Process each file
             for idx, wav_file in enumerate(wav_files, 1):
@@ -55,14 +57,13 @@ class CompressWorker(QThread):
                 self.file_progress.emit(idx, len(wav_files))
                 self.progress.emit(f"\n[{idx}/{len(wav_files)}] Processing: {wav_file}")
                 
-                # ffmpeg command: downsample to 250kHz, mono, PCM 16-bit
-                # Using PCM instead of ADPCM for better compatibility with Audacity
+                # ffmpeg command: downsample to 250kHz, mono, selected codec
                 cmd = [
                     "ffmpeg",
                     "-i", input_path,
                     "-ar", "250000",  # 250kHz sample rate
                     "-ac", "1",       # mono
-                    "-c:a", "pcm_s16le",  # PCM 16-bit little-endian (standard WAV)
+                    "-c:a", self.codec,
                     "-y",  # overwrite output
                     output_path
                 ]
@@ -102,7 +103,7 @@ class CompressWorker(QThread):
 class CompressWavsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.folder_path = None
+        self.folder_paths = []  # Changed to list for multiple folders
         self.worker = None
         self.initUI()
         
@@ -231,9 +232,15 @@ class CompressWavsWindow(QMainWindow):
         
         # Folder selection button
         btn_layout = QHBoxLayout()
-        self.btn_select = QPushButton("Select Folder")
+        self.btn_select = QPushButton("Add Folder")
         self.btn_select.clicked.connect(self.select_folder)
         btn_layout.addWidget(self.btn_select)
+        
+        self.btn_clear = QPushButton("Clear All")
+        self.btn_clear.clicked.connect(self.clear_folders)
+        self.btn_clear.setEnabled(False)
+        btn_layout.addWidget(self.btn_clear)
+        
         btn_layout.addStretch()
         folder_layout.addLayout(btn_layout)
         
@@ -245,6 +252,25 @@ class CompressWavsWindow(QMainWindow):
         output_layout.addWidget(self.txt_output)
         output_layout.addStretch()
         folder_layout.addLayout(output_layout)
+        
+        # Codec selection
+        codec_layout = QHBoxLayout()
+        codec_layout.addWidget(QLabel("Compression format:"))
+        self.codec_combo = QComboBox()
+        self.codec_combo.addItem("ADPCM IMA WAV (Best compression, Audacity incompatible)", "adpcm_ima_wav")
+        self.codec_combo.addItem("8-bit PCM WAV (Audacity compatible)", "pcm_u8")
+        self.codec_combo.setCurrentIndex(0)  # Default to ADPCM
+        self.codec_combo.setMaximumWidth(450)
+        self.codec_combo.currentIndexChanged.connect(self.update_codec_info)
+        codec_layout.addWidget(self.codec_combo)
+        codec_layout.addStretch()
+        folder_layout.addLayout(codec_layout)
+        
+        # Codec info label
+        self.codec_info_label = QLabel("• Best compression (~450 MB/hour)\n• Compatible with DeepAudioSegmenter\n• Audacity incompatible")
+        self.codec_info_label.setStyleSheet("color: #999999; font-style: italic; margin-top: 5px; margin-left: 20px;")
+        self.codec_info_label.setWordWrap(True)
+        folder_layout.addWidget(self.codec_info_label)
         
         info_label = QLabel("Compressed files saved to output subfolder in input directory")
         info_label.setStyleSheet("color: #999999; font-style: italic; margin-top: 10px;")
@@ -319,6 +345,22 @@ class CompressWavsWindow(QMainWindow):
         
         progress_group.setLayout(progress_layout)
         layout.addWidget(progress_group)
+    
+    def update_codec_info(self):
+        """Update the codec information label based on selection"""
+        codec = self.codec_combo.currentData()
+        if codec == "adpcm_ima_wav":
+            self.codec_info_label.setText(
+                "• Best compression (~450 MB/hour)\n"
+                "• Compatible with DeepAudioSegmenter\n"
+                "• Audacity incompatible"
+            )
+        elif codec == "pcm_u8":
+            self.codec_info_label.setText(
+                "• Moderate compression (~900 MB/hour)\n"
+                "• Audacity compatible\n"
+                "• Universal compatibility"
+            )
         
     def select_folder(self):
         """Select folder containing WAV files"""
@@ -330,31 +372,60 @@ class CompressWavsWindow(QMainWindow):
         )
         
         if folder:
-            self.folder_path = folder
-            self.lbl_folder.setText(f"• {folder}")
-            self.lbl_folder.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 40px; color: #cccccc;")
-            self.btn_process.setEnabled(True)
-            self.txt_output_display.clear()
-            self.txt_output_display.append(f"Selected folder: {folder}\n")
+            # Check if folder already added
+            if folder in self.folder_paths:
+                QMessageBox.information(self, "Already Added", "This folder has already been added.")
+                return
             
-            # Count WAV files
-            wav_files = [f for f in os.listdir(folder) if f.lower().endswith(".wav")]
-            self.txt_output_display.append(f"Found {len(wav_files)} WAV file(s)\n")
+            self.folder_paths.append(folder)
+            
+            # Update display
+            self.update_folder_display()
+            self.btn_process.setEnabled(True)
+            self.btn_clear.setEnabled(True)
+    
+    def clear_folders(self):
+        """Clear all selected folders"""
+        self.folder_paths.clear()
+        self.update_folder_display()
+        self.btn_process.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+    
+    def update_folder_display(self):
+        """Update the folder display label"""
+        if not self.folder_paths:
+            self.lbl_folder.setText("No folder selected")
+            self.lbl_folder.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 40px; color: #cccccc;")
+            self.txt_output_display.clear()
+        else:
+            folder_text = "\n".join([f"• {folder}" for folder in self.folder_paths])
+            self.lbl_folder.setText(folder_text)
+            self.lbl_folder.setStyleSheet("border: 1px solid #3f3f3f; padding: 10px; background-color: #1e1e1e; min-height: 40px; color: #cccccc;")
+            
+            # Count total WAV files
+            self.txt_output_display.clear()
+            total_wavs = 0
+            for folder in self.folder_paths:
+                wav_files = [f for f in os.listdir(folder) if f.lower().endswith(".wav")]
+                total_wavs += len(wav_files)
+                self.txt_output_display.append(f"{os.path.basename(folder)}: {len(wav_files)} WAV file(s)")
+            self.txt_output_display.append(f"\nTotal: {total_wavs} WAV file(s) across {len(self.folder_paths)} folder(s)\n")
             
     def start_compression(self):
         """Start the compression process"""
-        if not self.folder_path:
-            QMessageBox.warning(self, "No Folder", "Please select a folder first.")
+        if not self.folder_paths:
+            QMessageBox.warning(self, "No Folder", "Please add at least one folder first.")
             return
         
-        # Get output folder name
-        output_name = self.txt_output.text().strip() or "proc"
-        output_folder = os.path.join(self.folder_path, output_name)
+        # Get codec
+        codec = self.codec_combo.currentData()
         
         # Disable buttons during processing
         self.btn_select.setEnabled(False)
+        self.btn_clear.setEnabled(False)
         self.btn_process.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.codec_combo.setEnabled(False)
         
         # Show progress bar
         self.progress_bar.setVisible(True)
@@ -362,14 +433,58 @@ class CompressWavsWindow(QMainWindow):
         
         # Clear log
         self.txt_output_display.clear()
-        self.txt_output_display.append("Starting compression...\n")
+        self.txt_output_display.append(f"Starting compression of {len(self.folder_paths)} folder(s)...\n")
+        
+        # Process folders sequentially
+        self.current_folder_index = 0
+        self.codec = codec
+        self.process_next_folder()
+    
+    def process_next_folder(self):
+        """Process the next folder in the list"""
+        if self.current_folder_index >= len(self.folder_paths):
+            # All folders processed
+            self.txt_output_display.append("\n" + "="*50)
+            self.txt_output_display.append("✅ All folders processed successfully!")
+            self.compression_finished(True, f"Successfully processed {len(self.folder_paths)} folder(s)!")
+            return
+        
+        folder_path = self.folder_paths[self.current_folder_index]
+        output_name = self.txt_output.text().strip() or "proc"
+        output_folder = os.path.join(folder_path, output_name)
+        
+        self.txt_output_display.append("\n" + "="*50)
+        self.txt_output_display.append(f"Processing folder {self.current_folder_index + 1}/{len(self.folder_paths)}: {os.path.basename(folder_path)}")
+        self.txt_output_display.append("="*50 + "\n")
         
         # Create and start worker thread
-        self.worker = CompressWorker(self.folder_path, output_folder)
+        self.worker = CompressWorker(folder_path, output_folder, self.codec)
         self.worker.progress.connect(self.update_progress)
         self.worker.file_progress.connect(self.update_file_progress)
-        self.worker.finished.connect(self.compression_finished)
+        self.worker.finished.connect(self.folder_compression_finished)
         self.worker.start()
+    
+    def folder_compression_finished(self, success, message):
+        """Handle completion of a single folder"""
+        if success:
+            self.txt_output_display.append(f"✓ Folder {self.current_folder_index + 1} completed")
+            self.current_folder_index += 1
+            # Process next folder
+            self.process_next_folder()
+        else:
+            # Error occurred
+            self.txt_output_display.append(f"✗ Folder {self.current_folder_index + 1} failed: {message}")
+            reply = QMessageBox.question(
+                self, 
+                "Error", 
+                f"Error processing folder: {message}\n\nContinue with remaining folders?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.current_folder_index += 1
+                self.process_next_folder()
+            else:
+                self.compression_finished(False, "Processing stopped after error")
     
     def update_file_progress(self, current, total):
         """Update file progress bar"""
@@ -396,8 +511,10 @@ class CompressWavsWindow(QMainWindow):
         """Handle compression completion"""
         # Re-enable buttons
         self.btn_select.setEnabled(True)
+        self.btn_clear.setEnabled(True)
         self.btn_process.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.codec_combo.setEnabled(True)
         
         # Hide progress bar
         self.progress_bar.setVisible(False)

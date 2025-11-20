@@ -1,30 +1,6 @@
 # ToDo
 
-# rfid analysis
-- incorporate rfid tab
-- create gui that incorporates all aspects of my rfid processing pipeline "create_X.r";
-- add json for getting metadata information for a given trial
-- 
-
-# video tracking
-- improve the video tracking/optical flow SAM module tab; still underperforming
-
-# video processing
- - explore CLAHE algo implementation for video processing; may not be necessary
-
- # sleap ROI Tool
-- allow scroll wheel zoom and click to pan feature in the video preview. 
-
-# Sleap EthoScope / Behavioral Catagorizer
-- create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
-- 
-
  # UWB
-- add ability to "play" the preview window
-- add animate video functionality to quick viz tool. export options
-- add battery level figure to export options
-- create smoothed plots
-- UWB Plots: velocity threshold input not taking, always defaulting to 0.1 (default) even if user inputs values. 
 - behavioral classification module
 - For animation output, add ability to check boxes related to whether aligned IR cameras should be shown, different types of plots, etc, broken up into panels. 
 - In the long term, it may also be really cool to have a command center at voleterra that shows plots that are update every 10 minutes or so with what is going on out in the field. 
@@ -45,3 +21,21 @@
 - add ability to overlay the usv calls with the video, temporally aligned based on shared timestamp (show DAS detection overlay)
 - create UMAP of prairie vole vocalization types
 - 
+
+
+# video tracking
+- improve the video tracking/optical flow SAM module tab; still underperforming
+
+# video processing
+ - explore CLAHE algo implementation for video processing; may not be necessary
+
+ # sleap tools
+- for roi tool; auto load the keypoint tracking and allow user to scroll through with the track labels. 
+ - do NOT use sleap-render commmand from CLI; it is wicked slow. 
+- allow scroll wheel zoom and click to pan feature in the video preview. 
+
+
+# Sleap EthoScope / Behavioral Catagorizer
+- create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
+- 
+

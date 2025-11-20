@@ -1,11 +1,13 @@
 import os
 import sys
+import subprocess
+import tempfile
 import numpy as np
 import soundfile as sf
 from scipy import signal
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
-                             QGroupBox, QLineEdit, QSpinBox, QDoubleSpinBox)
+                             QGroupBox, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -29,17 +31,85 @@ class AudioTrimWindow(QWidget):
         self.setWindowTitle("Trim Audio File - USV Processing")
         self.setGeometry(100, 100, 1200, 800)
         
+        # Apply dark theme styling
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                color: #cccccc;
+                font-family: Arial;
+            }
+            QLabel {
+                color: #cccccc;
+                background-color: transparent;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+                color: #888888;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #3f3f3f;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 8px;
+                color: #cccccc;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox {
+                padding: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QCheckBox {
+                color: #cccccc;
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0078d4;
+                border-color: #0078d4;
+            }
+        """)
+        
         layout = QVBoxLayout()
         
         # Title
         title = QLabel("Trim Audio File with Frequency Filter")
         title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setStyleSheet("color: #0078d4; background-color: transparent;")
         layout.addWidget(title)
         
         # Description
         desc = QLabel("Load an audio file, visualize spectrogram, select time range, and filter frequency range")
         desc.setFont(QFont("Arial", 10))
-        desc.setStyleSheet("color: #666666; margin-bottom: 10px;")
+        desc.setStyleSheet("color: #999999; margin-bottom: 10px; font-style: italic; background-color: transparent;")
         layout.addWidget(desc)
         
         # File selection group
@@ -54,7 +124,7 @@ class AudioTrimWindow(QWidget):
         file_layout.addLayout(btn_layout)
         
         self.lbl_file = QLabel("No file loaded")
-        self.lbl_file.setStyleSheet("color: #666666; font-style: italic;")
+        self.lbl_file.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         file_layout.addWidget(self.lbl_file)
         
         file_group.setLayout(file_layout)
@@ -74,7 +144,7 @@ class AudioTrimWindow(QWidget):
         
         # Info label
         self.lbl_info = QLabel("Use the pan/zoom tools to navigate the spectrogram")
-        self.lbl_info.setStyleSheet("color: #666666; font-style: italic; margin-top: 5px;")
+        self.lbl_info.setStyleSheet("color: #999999; font-style: italic; margin-top: 5px; background-color: transparent;")
         spec_layout.addWidget(self.lbl_info)
         
         spec_group.setLayout(spec_layout)
@@ -128,8 +198,14 @@ class AudioTrimWindow(QWidget):
         
         # Duration display
         self.lbl_duration = QLabel("Selected duration: 0.000 s")
-        self.lbl_duration.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        self.lbl_duration.setStyleSheet("font-weight: bold; margin-top: 5px; color: #cccccc; background-color: transparent;")
         trim_layout.addWidget(self.lbl_duration)
+        
+        # Heterodyne option
+        self.chk_heterodyne = QCheckBox("Heterodyne Audio (shift ultrasonic frequencies down)")
+        self.chk_heterodyne.setChecked(False)
+        self.chk_heterodyne.setToolTip("Apply heterodyning to shift high-frequency USVs to audible range (carrier: 40kHz)")
+        trim_layout.addWidget(self.chk_heterodyne)
         
         trim_group.setLayout(trim_layout)
         layout.addWidget(trim_group)
@@ -152,7 +228,6 @@ class AudioTrimWindow(QWidget):
         self.btn_process = QPushButton("Trim and Save Audio")
         self.btn_process.clicked.connect(self.trim_audio)
         self.btn_process.setEnabled(False)
-        self.btn_process.setStyleSheet("padding: 10px; font-size: 12px; font-weight: bold;")
         btn_layout.addWidget(self.btn_process)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
@@ -172,9 +247,31 @@ class AudioTrimWindow(QWidget):
             return
         
         try:
-            # Load audio file
+            # Try loading with soundfile first (handles most formats)
             self.audio_file = file_path
-            self.audio_data, self.sample_rate = sf.read(file_path)
+            try:
+                self.audio_data, self.sample_rate = sf.read(file_path, dtype='float32')
+            except:
+                # Fallback: use ffmpeg to convert ADPCM to PCM WAV, then load
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    temp_path = tmp_file.name
+                
+                try:
+                    # Use ffmpeg to convert to standard PCM WAV
+                    subprocess.run([
+                        'ffmpeg',
+                        '-i', file_path,
+                        '-acodec', 'pcm_s16le',  # Convert to 16-bit PCM
+                        '-y',
+                        temp_path
+                    ], check=True, capture_output=True)
+                    
+                    # Now load the converted file
+                    self.audio_data, self.sample_rate = sf.read(temp_path, dtype='float32')
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
             
             # Convert to mono if stereo
             if len(self.audio_data.shape) > 1:
@@ -182,7 +279,7 @@ class AudioTrimWindow(QWidget):
             
             # Update UI
             self.lbl_file.setText(f"{os.path.basename(file_path)}")
-            self.lbl_file.setStyleSheet("color: black;")
+            self.lbl_file.setStyleSheet("color: #cccccc; background-color: transparent;")
             
             # Update time spinbox maximum
             duration = len(self.audio_data) / self.sample_rate
@@ -259,6 +356,18 @@ class AudioTrimWindow(QWidget):
         end = self.spin_end.value()
         duration = max(0, end - start)
         self.lbl_duration.setText(f"Selected duration: {duration:.3f} s")
+    
+    def heterodyne_signal(self, data, carrier_freq=40000, lowcut=1000, highcut=50000):
+        """Apply heterodyning to shift ultrasonic frequencies down"""
+        t = np.arange(len(data)) / self.sample_rate
+        carrier = np.cos(2 * np.pi * carrier_freq * t)
+        mixed = data * carrier
+        
+        # Band-pass filter to isolate difference frequencies
+        sos = signal.butter(4, [lowcut, highcut], btype='band', fs=self.sample_rate, output='sos')
+        filtered = signal.sosfilt(sos, mixed)
+        
+        return filtered
         
     def trim_audio(self):
         """Trim the audio file with time and frequency filtering"""
@@ -305,6 +414,10 @@ class AudioTrimWindow(QWidget):
                     f"Frequency range exceeds Nyquist frequency ({nyquist:.0f} Hz).\n"
                     "Skipping frequency filter."
                 )
+            
+            # Apply heterodyning if requested
+            if self.chk_heterodyne.isChecked():
+                trimmed_audio = self.heterodyne_signal(trimmed_audio)
             
             # Get output path
             output_name = self.txt_output.text().strip()
