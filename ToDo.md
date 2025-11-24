@@ -1,6 +1,10 @@
 # ToDo
 
  # UWB
+- animation fix; the trailing track persists and fades until the last frames. something is up with the timing of the display, point movement ends prematurely until track ends, losing time at the end of the day. 
+- add ROI analysis with JSON memory integration for ROI labels
+- social behavior refinement? Deactivate this module, too costly to run at the moment
+- Spatial behavior analysis - deactivate, too costly to run. 
 - behavioral classification module
 - For animation output, add ability to check boxes related to whether aligned IR cameras should be shown, different types of plots, etc, broken up into panels. 
 - In the long term, it may also be really cool to have a command center at voleterra that shows plots that are update every 10 minutes or so with what is going on out in the field. 
