@@ -174,7 +174,9 @@ class FNTMainWindow(QMainWindow):
         self.create_video_tracking_tab()
         self.create_uwb_tab()
         self.create_usv_tab()
-        self.create_github_tab()
+        self.create_rfid_tab()
+        self.create_fed_tab()
+        self.create_wifp_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -271,7 +273,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "Video Processing")
+        self.tabs.addTab(tab, "Video")
     
     def create_sleap_tab(self):
         """Create the SLEAP processing tab"""
@@ -313,7 +315,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "SLEAP Analysis")
+        self.tabs.addTab(tab, "SLEAP")
     
     def create_usv_tab(self):
         """Create the USV processing tab"""
@@ -342,7 +344,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "USV Processing")
+        self.tabs.addTab(tab, "USV")
     
     def create_uwb_tab(self):
         """Create the UWB processing tab"""
@@ -382,35 +384,8 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "UWB Processing")
+        self.tabs.addTab(tab, "UWB")
     
-    def create_github_tab(self):
-        """Create the GitHub preprocessing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
-        
-        # Description
-        desc = QLabel("Tools for preparing data files for GitHub repositories")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # GitHub preprocessing group
-        group = QGroupBox("GitHub Data Preparation")
-        group_layout = QGridLayout()
-        
-        buttons = [
-            ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "GitHub Preprocessing")
-
     def create_video_tracking_tab(self):
         """Create the video tracking tab"""
         tab = QWidget()
@@ -452,6 +427,116 @@ class FNTMainWindow(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Video Tracking")
 
+    def create_rfid_tab(self):
+        """Create the RFID processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("RFID tracking and analysis tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # RFID processing group
+        group = QGroupBox("RFID Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future RFID tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> RFID tracking and analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• RFID data import and preprocessing<br>"
+            "• Social interaction analysis<br>"
+            "• Spatial tracking visualization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "RFID")
+    
+    def create_fed_tab(self):
+        """Create the FED processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Feeding Experimentation Device (FED) data analysis")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # FED processing group
+        group = QGroupBox("FED Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future FED tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> FED data analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• FED data import and preprocessing<br>"
+            "• Feeding pattern analysis<br>"
+            "• Circadian rhythm visualization<br>"
+            "• Multi-device synchronization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "FED")
+    
+    def create_wifp_tab(self):
+        """Create the WiFP processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Wireless Instantaneous Force Plate (WiFP) analysis tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # WiFP processing group
+        group = QGroupBox("WiFP Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future WiFP tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> WiFP data analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• WiFP data import and preprocessing<br>"
+            "• Force/weight measurement analysis<br>"
+            "• Temporal pattern visualization<br>"
+            "• Multi-plate synchronization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "WiFP")
+    
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -463,7 +548,19 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Utilities group
+        # General Utilities group
+        general_group = QGroupBox("General Utilities")
+        general_layout = QGridLayout()
+        
+        general_buttons = [
+            ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
+        ]
+        
+        self.create_button_grid(general_layout, general_buttons)
+        general_group.setLayout(general_layout)
+        layout.addWidget(general_group)
+        
+        # Utilities & Information group
         group = QGroupBox("Utilities & Information")
         group_layout = QGridLayout()
         
