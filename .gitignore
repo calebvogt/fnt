@@ -1,39 +1,17 @@
-.DS_Store
-fnt/__pycache__/__init__.cpython-313.pyc
-fnt/__pycache__/gui_pyqt.cpython-313.pyc
-fnt/usv/__pycache__/__init__.cpython-313.pyc
-fnt/usv/__pycache__/audio_trim_pyqt.cpython-313.pyc
-fnt/usv/__pycache__/compress_wavs_pyqt.cpython-313.pyc
-fnt/usv/__pycache__/das_summary.cpython-313.pyc
-fnt/usv/__pycache__/usv_heterodyne.cpython-313.pyc
-fnt/usv/__pycache__/usv_merge_audio_video.cpython-313.pyc
-fnt/uwb/__pycache__/__init__.cpython-313.pyc
-fnt/uwb/__pycache__/animate_path.cpython-313.pyc
-fnt/uwb/__pycache__/behavioral_classifier.cpython-313.pyc
-fnt/uwb/__pycache__/plot_path.cpython-313.pyc
-fnt/uwb/__pycache__/plot_uwb_path.cpython-313.pyc
-fnt/uwb/__pycache__/preview_database.cpython-313.pyc
-fnt/uwb/__pycache__/test_behavioral_classifier.cpython-313.pyc
-fnt/uwb/__pycache__/test_tag_gui.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_animate.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_behavioral_analysis.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_plots copy.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_plots.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_preprocess_sql.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_quick_plots_pyqt.cpython-313.pyc
-fnt/uwb/__pycache__/uwb_quick_visualization_pyqt.cpython-313.pyc
-fnt/videoProcessing/__pycache__/__init__.cpython-313.pyc
-fnt/videoProcessing/__pycache__/video_concatenate_pyqt.cpython-313.pyc
-fnt/videoProcessing/__pycache__/video_trim_pyqt.cpython-313.pyc
-fnt/videoProcessing/__pycache__/videoProcessing.cpython-313.pyc
-fnt/videoTracking/__pycache__/__init__.cpython-313.pyc
-fnt/videoTracking/__pycache__/mask_pose_tracker_gui.cpython-313.pyc
-fnt/videoTracking/__pycache__/sam_tracker_base.cpython-313.pyc
-fnt/videoTracking/__pycache__/simple_tracker_gui.cpython-313.pyc
-fnt/videoTracking/__pycache__/simple_tracker_gui_v2.cpython-313.pyc
-fnt/sleapProcessing/__pycache__/sleap_roi_tool_pyqt.cpython-314.pyc
+# Python compiled files
 *.pyc
+*.pyo
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
 
 # SAM model checkpoints (large files, downloaded locally)
 SAM_models/
-*.pyc
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
