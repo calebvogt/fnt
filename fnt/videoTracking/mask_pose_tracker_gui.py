@@ -40,17 +40,19 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
-    QGroupBox, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox
+    QGroupBox, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QSlider
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 
+# Import SAM 2 components
 try:
-    from .sam_tracker_base import SAMTrackerBase, calculate_distance_traveled, calculate_time_in_zone
-    SAM_TRACKER_AVAILABLE = True
+    from .sam2_tracker import SAM2MultiObjectTracker
+    from .sam2_checkpoint_manager import get_sam2_checkpoint, SAM2CheckpointDialog
+    SAM2_AVAILABLE = True
 except ImportError:
-    SAM_TRACKER_AVAILABLE = False
-    print("Warning: SAM tracker base not available")
+    SAM2_AVAILABLE = False
+    print("Warning: SAM 2 not available")
 
 
 class InteractiveVideoWidget(QLabel):
@@ -59,6 +61,7 @@ class InteractiveVideoWidget(QLabel):
     # Signals
     click_signal = pyqtSignal(int, int)  # (x, y) click coordinate
     rectangle_drawn = pyqtSignal(int, int, int, int, object, float)  # (x, y, width, height, corners, rotation_angle)
+    first_corner_clicked = pyqtSignal()  # Signal when first corner is clicked (for status update)
     
     def __init__(self):
         super().__init__()
@@ -113,94 +116,10 @@ class InteractiveVideoWidget(QLabel):
         
         # Draw overlays - rectangle arena
         if self.rectangle_start is not None and self.rectangle_end is not None:
-            # If we have rotated corners, use them; otherwise use bounding box
-            if self.rectangle_corners and abs(self.rotation_angle) > 0.1:
-                # Draw rotated rectangle using corners
-                pts = np.array(self.rectangle_corners, np.int32)
-                pts = pts.reshape((-1, 1, 2))
-                cv2.polylines(display_frame, [pts], True, (0, 255, 0), 2)
-                
-                # Calculate center from stored value
-                center_x, center_y = self.rectangle_center if self.rectangle_center else (
-                    int(sum(c[0] for c in self.rectangle_corners) / 4),
-                    int(sum(c[1] for c in self.rectangle_corners) / 4)
-                )
-                
-                # Draw manipulation handles if in rectangle mode
-                if self.drawing_mode == 'rectangle':
-                    # Draw corner handles at actual corners
-                    for corner in self.rectangle_corners:
-                        cv2.circle(display_frame, corner, 8, (0, 255, 0), -1)
-                        cv2.circle(display_frame, corner, 10, (255, 255, 255), 2)
-                    
-                    # Draw rotation handle above rectangle
-                    # Use the topmost point
-                    ys = [c[1] for c in self.rectangle_corners]
-                    top_y = min(ys)
-                    rotation_handle = (int(center_x), max(20, top_y - 40))
-                    
-                    cv2.line(display_frame, (int(center_x), top_y), rotation_handle, (255, 255, 0), 2)
-                    cv2.circle(display_frame, rotation_handle, 12, (255, 255, 0), -1)
-                    cv2.circle(display_frame, rotation_handle, 14, (255, 255, 255), 2)
-                    cv2.putText(display_frame, "R", (rotation_handle[0] - 7, rotation_handle[1] + 7),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                
-                # Draw center zone (60% of original dimensions, also rotated)
-                # Scale corners towards center by 60%
-                inner_corners = []
-                for corner in self.rectangle_corners:
-                    # Vector from center to corner
-                    dx = corner[0] - center_x
-                    dy = corner[1] - center_y
-                    # Scale by 0.6
-                    inner_x = int(center_x + dx * 0.6)
-                    inner_y = int(center_y + dy * 0.6)
-                    inner_corners.append((inner_x, inner_y))
-                
-                inner_pts = np.array(inner_corners, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(display_frame, [inner_pts], True, (255, 255, 0), 2)
-                
-            else:
-                # Draw normal axis-aligned rectangle
-                x1, y1 = self.rectangle_start
-                x2, y2 = self.rectangle_end
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Draw manipulation handles if in rectangle mode
-                if self.drawing_mode == 'rectangle':
-                    corners = self.get_rectangle_corners()
-                    if corners:
-                        # Draw corner handles (resize)
-                        for corner in corners:
-                            cv2.circle(display_frame, corner, 8, (0, 255, 0), -1)
-                            cv2.circle(display_frame, corner, 10, (255, 255, 255), 2)
-                        
-                        # Draw rotation handle (above top center)
-                        rotation_handle = self.get_rotation_handle_position()
-                        if rotation_handle:
-                            # Draw line from top center to rotation handle
-                            center_top = ((x1 + x2) // 2, min(y1, y2))
-                            cv2.line(display_frame, center_top, rotation_handle, (255, 255, 0), 2)
-                            # Draw circular rotation handle
-                            cv2.circle(display_frame, rotation_handle, 12, (255, 255, 0), -1)
-                            cv2.circle(display_frame, rotation_handle, 14, (255, 255, 255), 2)
-                            # Draw "R" for rotate
-                            cv2.putText(display_frame, "R", (rotation_handle[0] - 7, rotation_handle[1] + 7),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                
-                # Draw center zone (inner 60% of arena)
-                width = abs(x2 - x1)
-                height = abs(y2 - y1)
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
-                inner_w = int(width * 0.6 / 2)
-                inner_h = int(height * 0.6 / 2)
-                cv2.rectangle(
-                    display_frame,
-                    (center_x - inner_w, center_y - inner_h),
-                    (center_x + inner_w, center_y + inner_h),
-                    (255, 255, 0), 2
-                )
+            # Draw simple green rectangle (no handles, no inner zones)
+            x1, y1 = self.rectangle_start
+            x2, y2 = self.rectangle_end
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
         # Draw trajectory
         if len(self.trajectory_points) > 1:
@@ -403,53 +322,11 @@ class InteractiveVideoWidget(QLabel):
         return None
         
     def mousePressEvent(self, event):
-        """Handle mouse press for click selection, rectangle drawing, or manipulation."""
+        """Handle mouse press for rectangle drawing (two clicks)."""
         if self.original_frame is None:
             return
-            
-        img_x, img_y = self.widget_to_image_coords(event.x(), event.y())
         
-        # Check if clicking on existing rectangle for manipulation
-        if self.drawing_mode == 'rectangle' and self.rectangle_start is not None and self.rectangle_end is not None:
-            manipulation_zone = self.detect_rectangle_manipulation_zone(img_x, img_y)
-            if manipulation_zone:
-                # Special case for rotation - start drag mode
-                if manipulation_zone == 'rotate':
-                    self.manipulation_mode = 'rotate'
-                    self.drag_start_pos = (img_x, img_y)
-                    
-                    # Initialize rectangle center and dimensions if not set
-                    if self.rectangle_center is None:
-                        x1, y1 = self.rectangle_start
-                        x2, y2 = self.rectangle_end
-                        self.rectangle_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-                        self.rectangle_width = abs(x2 - x1)
-                        self.rectangle_height = abs(y2 - y1)
-                    
-                    # Calculate starting angle from center to mouse
-                    cx, cy = self.rectangle_center
-                    dx = img_x - cx
-                    dy = img_y - cy
-                    self.drag_start_angle = np.degrees(np.arctan2(dy, dx))
-                    return
-                else:
-                    # For other manipulations, start drag mode
-                    self.manipulation_mode = manipulation_zone
-                    self.drag_start_pos = (img_x, img_y)
-                    self.original_rectangle = (self.rectangle_start, self.rectangle_end)
-                    
-                    # Store original rotation state for resize/move operations
-                    if self.rectangle_center is None:
-                        x1, y1 = self.rectangle_start
-                        x2, y2 = self.rectangle_end
-                        self.rectangle_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-                        self.rectangle_width = abs(x2 - x1)
-                        self.rectangle_height = abs(y2 - y1)
-                    
-                    self.original_center = self.rectangle_center
-                    self.original_width = self.rectangle_width
-                    self.original_height = self.rectangle_height
-                    return
+        img_x, img_y = self.widget_to_image_coords(event.x(), event.y())
         
         if self.drawing_mode is None:
             return
@@ -457,14 +334,18 @@ class InteractiveVideoWidget(QLabel):
         if self.drawing_mode == 'click':
             # Single click selection
             self.click_signal.emit(img_x, img_y)
-            
+        
         elif self.drawing_mode == 'rectangle':
-            # Rectangle drawing - first click sets corner, second click sets opposite corner
+            # Two-click rectangle drawing
             if self.rectangle_start is None:
+                # First click - set start corner
                 self.rectangle_start = (img_x, img_y)
                 self.temp_rectangle_point = (img_x, img_y)
+                self._update_display()
+                # Signal to parent to update status
+                self.first_corner_clicked.emit()
             else:
-                # Second click completes rectangle
+                # Second click - complete rectangle
                 self.rectangle_end = (img_x, img_y)
                 x1, y1 = self.rectangle_start
                 x2, y2 = self.rectangle_end
@@ -476,107 +357,17 @@ class InteractiveVideoWidget(QLabel):
                 # Create non-rotated corners for initial rectangle
                 corners = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
                 self.rectangle_drawn.emit(x, y, w, h, corners, 0.0)  # 0 rotation for initial draw
-                # Don't disable drawing mode anymore - allow manipulation
+                self.drawing_mode = None  # Disable drawing mode after completion
                 self._update_display()
                 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for rectangle preview or manipulation."""
+        """Handle mouse move for rectangle preview during two-click drawing."""
         if self.original_frame is None:
             return
         
         img_x, img_y = self.widget_to_image_coords(event.x(), event.y())
         
-        # Handle rotation manipulation
-        if self.manipulation_mode == 'rotate' and self.rectangle_center and self.drag_start_angle is not None:
-            # Calculate current angle from center to mouse
-            cx, cy = self.rectangle_center
-            dx = img_x - cx
-            dy = img_y - cy
-            current_angle = np.degrees(np.arctan2(dy, dx))
-            
-            # Calculate angle difference
-            angle_delta = current_angle - self.drag_start_angle
-            
-            # Update rotation angle
-            self.rotation_angle = angle_delta % 360
-            
-            # Update rectangle corners
-            self.update_rectangle_corners()
-            self._update_display()
-            return
-        
-        # Handle other rectangle manipulations
-        if self.manipulation_mode and self.drag_start_pos:
-            dx = img_x - self.drag_start_pos[0]
-            dy = img_y - self.drag_start_pos[1]
-            
-            if self.manipulation_mode == 'move':
-                # Move entire rectangle - translate center
-                if hasattr(self, 'original_center'):
-                    orig_cx, orig_cy = self.original_center
-                    self.rectangle_center = (orig_cx + dx, orig_cy + dy)
-                    self.update_rectangle_corners()
-                else:
-                    # Fallback for non-rotated
-                    if self.original_rectangle:
-                        orig_start, orig_end = self.original_rectangle
-                        x1, y1 = orig_start
-                        x2, y2 = orig_end
-                        self.rectangle_start = (x1 + dx, y1 + dy)
-                        self.rectangle_end = (x2 + dx, y2 + dy)
-                
-            elif self.manipulation_mode.startswith('resize_'):
-                # Resize operations - need to handle rotated rectangles
-                if abs(self.rotation_angle) > 0.1 and hasattr(self, 'original_width'):
-                    # For rotated rectangles, calculate resize based on drag distance
-                    # Project the drag vector onto the width/height axes of the rotated rectangle
-                    angle_rad = np.radians(self.rotation_angle)
-                    cos_a = np.cos(angle_rad)
-                    sin_a = np.sin(angle_rad)
-                    
-                    # Project drag onto rotated axes
-                    dx_local = dx * cos_a + dy * sin_a
-                    dy_local = -dx * sin_a + dy * cos_a
-                    
-                    # Adjust width/height based on which corner is being dragged
-                    if self.manipulation_mode == 'resize_tl':
-                        self.rectangle_width = max(20, self.original_width - 2 * dx_local)
-                        self.rectangle_height = max(20, self.original_height - 2 * dy_local)
-                    elif self.manipulation_mode == 'resize_tr':
-                        self.rectangle_width = max(20, self.original_width + 2 * dx_local)
-                        self.rectangle_height = max(20, self.original_height - 2 * dy_local)
-                    elif self.manipulation_mode == 'resize_br':
-                        self.rectangle_width = max(20, self.original_width + 2 * dx_local)
-                        self.rectangle_height = max(20, self.original_height + 2 * dy_local)
-                    elif self.manipulation_mode == 'resize_bl':
-                        self.rectangle_width = max(20, self.original_width - 2 * dx_local)
-                        self.rectangle_height = max(20, self.original_height + 2 * dy_local)
-                    
-                    self.update_rectangle_corners()
-                else:
-                    # Non-rotated resize - original logic
-                    if self.original_rectangle:
-                        orig_start, orig_end = self.original_rectangle
-                        x1, y1 = orig_start
-                        x2, y2 = orig_end
-                        
-                        if self.manipulation_mode == 'resize_tl':
-                            self.rectangle_start = (x1 + dx, y1 + dy)
-                            self.rectangle_end = orig_end
-                        elif self.manipulation_mode == 'resize_tr':
-                            self.rectangle_start = (x1, y1 + dy)
-                            self.rectangle_end = (x2 + dx, y2)
-                        elif self.manipulation_mode == 'resize_br':
-                            self.rectangle_start = orig_start
-                            self.rectangle_end = (x2 + dx, y2 + dy)
-                        elif self.manipulation_mode == 'resize_bl':
-                            self.rectangle_start = (x1 + dx, y1)
-                            self.rectangle_end = (x2, y2 + dy)
-            
-            self._update_display()
-            return
-        
-        # Handle rectangle drawing preview
+        # Handle rectangle drawing preview (between first and second click)
         if self.drawing_mode == 'rectangle' and self.rectangle_start is not None and self.rectangle_end is None:
             self.temp_rectangle_point = (img_x, img_y)
             
@@ -593,37 +384,7 @@ class InteractiveVideoWidget(QLabel):
             pixmap = QPixmap.fromImage(q_image)
             scaled_pixmap = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.setPixmap(scaled_pixmap)
-    
-    def mouseReleaseEvent(self, event):
-        """Handle mouse release to finish manipulation."""
-        if self.manipulation_mode:
-            # Emit updated rectangle coordinates
-            if self.rectangle_corners and abs(self.rotation_angle) > 0.1:
-                # For rotated rectangles, use bounding box
-                xs = [c[0] for c in self.rectangle_corners]
-                ys = [c[1] for c in self.rectangle_corners]
-                x = min(xs)
-                y = min(ys)
-                w = max(xs) - min(xs)
-                h = max(ys) - min(ys)
-            else:
-                # For non-rotated, use normal bounding box
-                x1, y1 = self.rectangle_start
-                x2, y2 = self.rectangle_end
-                x = min(x1, x2)
-                y = min(y1, y2)
-                w = abs(x2 - x1)
-                h = abs(y2 - y1)
-            
-            # Emit with corners and rotation angle
-            corners = self.rectangle_corners if self.rectangle_corners else [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-            self.rectangle_drawn.emit(x, y, w, h, corners, self.rotation_angle)
-            
-            # Reset manipulation state
-            self.manipulation_mode = None
-            self.drag_start_pos = None
-            self.drag_start_angle = None
-            self.original_rectangle = None
+
             
     def clear_overlays(self):
         """Clear all drawing overlays."""
@@ -649,7 +410,7 @@ class InteractiveVideoWidget(QLabel):
 
 
 class TrackingWorker(QThread):
-    """Worker thread for video tracking."""
+    """Worker thread for SAM 2 video tracking."""
     
     # Signals
     progress_signal = pyqtSignal(int, int)  # (current_frame, total_frames)
@@ -662,207 +423,91 @@ class TrackingWorker(QThread):
         self,
         video_path: str,
         sam_checkpoint: str,
-        click_point: Tuple[int, int],
-        arena_rectangle: Tuple[int, int, int, int],  # Changed from arena_circle
-        arena_corners,  # List of 4 (x,y) tuples for rotated rectangle
-        arena_rotation: float,  # Rotation angle in degrees
-        sam_update_interval: int,
-        model_type: str,
-        device: str,
-        flow_window_size: int = 21,
-        tracking_method: str = "optical_flow"
+        sam_config: str,
+        bounding_box: Tuple[int, int, int, int],  # (x1, y1, x2, y2)
+        device: str
     ):
         super().__init__()
         self.video_path = video_path
         self.sam_checkpoint = sam_checkpoint
-        self.click_point = click_point
-        self.arena_rectangle = arena_rectangle  # (x, y, width, height)
-        self.arena_corners = arena_corners  # Rotated corners
-        self.arena_rotation = arena_rotation  # Rotation angle
-        self.sam_update_interval = sam_update_interval
-        self.model_type = model_type
+        self.sam_config = sam_config
+        self.bounding_box = bounding_box
         self.device = device
-        self.flow_window_size = flow_window_size
-        self.tracking_method = tracking_method
         self.is_cancelled = False
         
     def run(self):
-        """Run tracking process."""
+        """Run SAM 2 tracking process."""
         try:
-            # Initialize tracker
-            tracker = SAMTrackerBase(
-                video_path=self.video_path,
-                sam_checkpoint=self.sam_checkpoint,
-                model_type=self.model_type,
-                device=self.device,
-                sam_update_interval=self.sam_update_interval,
-                flow_window_size=self.flow_window_size,
-                tracking_method=self.tracking_method
+            # Initialize SAM 2 tracker
+            tracker = SAM2MultiObjectTracker(
+                checkpoint_path=self.sam_checkpoint,
+                config_name=self.sam_config,
+                device=self.device
             )
             
-            # Open video
-            if not tracker.initialize_video():
-                self.error_signal.emit("Failed to open video")
-                return
-                
-            # Load SAM model
-            if not tracker.initialize_sam():
-                self.error_signal.emit("Failed to load SAM model")
-                return
-                
-            # Read first frame
-            tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = tracker.cap.read()
-            if not ret:
-                self.error_signal.emit("Failed to read first frame")
-                return
-                
-            # Convert BGR to RGB for SAM
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Initialize video
+            tracker.init_video(self.video_path)
             
-            # Initialize tracking
-            if not tracker.initialize_tracking(frame_rgb, self.click_point):
-                self.error_signal.emit("Failed to initialize tracking")
-                return
-                
-            # Process all frames
-            frame_idx = 0
-            while not self.is_cancelled:
-                ret, frame = tracker.cap.read()
-                if not ret:
+            # Add bounding box prompt
+            x1, y1, x2, y2 = self.bounding_box
+            box = np.array([x1, y1, x2, y2], dtype=np.float32)
+            tracker.add_box_prompt(box=box, frame_idx=0, obj_id=1, label="Animal")
+            
+            # Open video for visualization
+            cap = cv2.VideoCapture(self.video_path)
+            
+            # Track through video
+            for frame_idx, object_ids, video_masks in tracker.track_objects():
+                if self.is_cancelled:
                     break
-                    
-                frame_idx += 1
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Track
-                result = tracker.process_frame(frame_rgb, frame_idx)
-                if result is not None:
-                    x, y, confidence = result
-                    tracker.trajectory.append((frame_idx, x, y, confidence))
-                    self.position_signal.emit(x, y, confidence)
+                # Read frame for visualization
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                
+                # Get mask and centroid (use position index 0, not object ID)
+                mask = video_masks[0][0].cpu().numpy() if TORCH_AVAILABLE and torch else video_masks[0][0]
+                
+                # Calculate centroid
+                moments = cv2.moments(mask.astype(np.uint8))
+                if moments["m00"] > 0:
+                    cx = moments["m10"] / moments["m00"]
+                    cy = moments["m01"] / moments["m00"]
                     
-                    # Create frame overlay for live preview
-                    display_frame = frame_rgb.copy()
+                    # Emit position update
+                    self.position_signal.emit(cx, cy, 1.0)
                     
-                    # Draw current position
-                    cv2.circle(display_frame, (int(x), int(y)), 8, (0, 255, 0), -1)
+                    # Create visualization
+                    display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
-                    # Draw arena rectangle (rotated if applicable)
-                    if self.arena_corners:
-                        # Draw rotated rectangle using corners
-                        corners_array = np.array(self.arena_corners, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(display_frame, [corners_array], True, (255, 165, 0), 2)
-                    else:
-                        # Draw axis-aligned rectangle (fallback)
-                        arena_x, arena_y, arena_w, arena_h = self.arena_rectangle
-                        cv2.rectangle(
-                            display_frame,
-                            (arena_x, arena_y),
-                            (arena_x + arena_w, arena_y + arena_h),
-                            (255, 165, 0),
-                            2
-                        )
+                    # Draw mask overlay
+                    mask_overlay = np.zeros_like(display_frame)
+                    mask_overlay[mask > 0] = [0, 255, 0]
+                    display_frame = cv2.addWeighted(display_frame, 1.0, mask_overlay, 0.3, 0)
                     
-                    # Draw center zone (inner 60%)
-                    arena_x, arena_y, arena_w, arena_h = self.arena_rectangle
-                    if self.arena_corners and abs(self.arena_rotation) > 0.1:
-                        # For rotated rectangles, calculate center zone corners
-                        # Scale down by 0.6 around center
-                        cx = arena_x + arena_w / 2
-                        cy = arena_y + arena_h / 2
-                        inner_w = arena_w * 0.6
-                        inner_h = arena_h * 0.6
-                        
-                        # Calculate inner rectangle corners (before rotation)
-                        inner_corners = [
-                            (-inner_w/2, -inner_h/2),
-                            (inner_w/2, -inner_h/2),
-                            (inner_w/2, inner_h/2),
-                            (-inner_w/2, inner_h/2)
-                        ]
-                        
-                        # Rotate and translate inner corners
-                        angle_rad = np.radians(self.arena_rotation)
-                        cos_a = np.cos(angle_rad)
-                        sin_a = np.sin(angle_rad)
-                        
-                        rotated_inner = []
-                        for x, y in inner_corners:
-                            x_rot = x * cos_a - y * sin_a + cx
-                            y_rot = x * sin_a + y * cos_a + cy
-                            rotated_inner.append((int(x_rot), int(y_rot)))
-                        
-                        inner_array = np.array(rotated_inner, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(display_frame, [inner_array], True, (255, 255, 0), 1)
-                    else:
-                        # For non-rotated rectangles, use simple rectangle
-                        center_margin_w = int(arena_w * 0.2)
-                        center_margin_h = int(arena_h * 0.2)
-                        cv2.rectangle(
-                            display_frame,
-                            (arena_x + center_margin_w, arena_y + center_margin_h),
-                            (arena_x + arena_w - center_margin_w, arena_y + arena_h - center_margin_h),
-                            (255, 255, 0),
-                            1
-                        )
+                    # Draw centroid
+                    cv2.circle(display_frame, (int(cx), int(cy)), 8, (0, 255, 0), -1)
                     
-                    # Draw trajectory (last 50 points)
-                    if len(tracker.trajectory) > 1:
-                        recent_points = tracker.trajectory[-50:]
-                        for i in range(1, len(recent_points)):
-                            pt1 = (int(recent_points[i-1][1]), int(recent_points[i-1][2]))
-                            pt2 = (int(recent_points[i][1]), int(recent_points[i][2]))
-                            cv2.line(display_frame, pt1, pt2, (0, 200, 255), 1)
-                    
-                    # Emit frame for live preview
+                    # Emit frame update
                     self.frame_signal.emit(display_frame)
-                    
+                
                 # Emit progress
-                if frame_idx % 10 == 0:
-                    self.progress_signal.emit(frame_idx, tracker.total_frames)
-                    
+                self.progress_signal.emit(frame_idx, tracker.total_frames)
+            
+            cap.release()
+            
             # Export trajectory
-            df = tracker.export_trajectory()
-            
-            # Calculate OFT-specific metrics
-            if len(df) > 0:
-                # Distance traveled
-                distance = calculate_distance_traveled(df)
-                
-                # Time in center zone (inner 60% of arena rectangle)
-                x, y, width, height = self.arena_rectangle
-                # Create center zone as inner 60% of rectangle
-                center_margin_w = int(width * 0.2)  # 20% margin on each side = 60% center
-                center_margin_h = int(height * 0.2)
-                center_poly = np.array([
-                    [x + center_margin_w, y + center_margin_h],
-                    [x + width - center_margin_w, y + center_margin_h],
-                    [x + width - center_margin_w, y + height - center_margin_h],
-                    [x + center_margin_w, y + height - center_margin_h]
-                ], dtype=np.int32)
-                time_in_center = calculate_time_in_zone(df, center_poly, tracker.fps)
-                
-                # Add metadata
-                metadata_path = Path(self.video_path).parent / f"{Path(self.video_path).stem}_oft_metrics.txt"
-                with open(metadata_path, 'w') as f:
-                    f.write(f"OFT Tracking Metrics\n")
-                    f.write(f"====================\n\n")
-                    f.write(f"Video: {Path(self.video_path).name}\n")
-                    f.write(f"Total frames: {tracker.total_frames}\n")
-                    f.write(f"Duration: {tracker.total_frames / tracker.fps:.2f} s\n")
-                    f.write(f"FPS: {tracker.fps:.2f}\n\n")
-                    f.write(f"Distance traveled: {distance:.1f} pixels\n")
-                    f.write(f"Time in center zone: {time_in_center:.2f} s ({time_in_center / (tracker.total_frames / tracker.fps) * 100:.1f}%)\n")
-                    f.write(f"Average speed: {df['speed'].mean():.2f} pixels/s\n")
-                    
-            tracker.cleanup()
-            
+            trajectories = tracker.export_trajectories()
             output_path = str(Path(self.video_path).parent / f"{Path(self.video_path).stem}_trajectory.csv")
+            
             self.finished_signal.emit(output_path)
             
         except Exception as e:
             self.error_signal.emit(f"Tracking error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             
     def cancel(self):
         """Cancel tracking."""
@@ -874,17 +519,15 @@ class MaskPoseTrackerGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mask Pose Tracker - FieldNeuroToolbox")
+        self.setWindowTitle("Mask Tracker - FieldNeuroToolbox")
         self.setGeometry(100, 100, 1200, 800)
         
         # State
         self.video_paths = []
         self.current_video_idx = 0
         self.sam_checkpoint_path = None
-        self.click_point = None
-        self.arena_rectangle = None  # Changed from arena_circle
-        self.arena_corners = None  # Store rotated corners
-        self.arena_rotation = 0.0  # Store rotation angle
+        self.sam_config_name = None
+        self.bounding_box = None  # (x1, y1, x2, y2) for tracking
         self.tracking_worker = None
         
         # Apply dark theme
@@ -952,6 +595,9 @@ class MaskPoseTrackerGUI(QMainWindow):
         
         self.init_ui()
         
+        # Check for SAM 2 checkpoint after UI is initialized
+        self.check_sam2_checkpoint()
+        
     def init_ui(self):
         """Initialize user interface."""
         central_widget = QWidget()
@@ -974,6 +620,20 @@ class MaskPoseTrackerGUI(QMainWindow):
         self.video_list_label = QLabel("No videos selected")
         self.video_list_label.setWordWrap(True)
         file_layout.addWidget(self.video_list_label)
+        
+        # Frame navigation slider
+        file_layout.addWidget(QLabel("Frame Navigation:"))
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(0)
+        self.frame_slider.setValue(0)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.valueChanged.connect(self.on_frame_slider_changed)
+        file_layout.addWidget(self.frame_slider)
+        
+        self.frame_label = QLabel("Frame: 0 / 0")
+        self.frame_label.setStyleSheet("color: #888888; font-size: 9px;")
+        file_layout.addWidget(self.frame_label)
         
         file_group.setLayout(file_layout)
         left_layout.addWidget(file_group)
@@ -1031,96 +691,18 @@ class MaskPoseTrackerGUI(QMainWindow):
         self.load_first_frame_btn.setEnabled(False)
         setup_layout.addWidget(self.load_first_frame_btn)
         
-        self.click_animal_btn = QPushButton("Click on Animal")
-        self.click_animal_btn.clicked.connect(self.start_click_mode)
-        self.click_animal_btn.setEnabled(False)
-        setup_layout.addWidget(self.click_animal_btn)
+        self.draw_box_btn = QPushButton("Draw Bounding Box on Animal")
+        self.draw_box_btn.clicked.connect(self.start_draw_bounding_box)
+        self.draw_box_btn.setEnabled(False)
+        setup_layout.addWidget(self.draw_box_btn)
         
-        self.click_status_label = QLabel("Status: Not initialized")
-        setup_layout.addWidget(self.click_status_label)
+        self.redraw_box_btn = QPushButton("Redraw Bounding Box")
+        self.redraw_box_btn.clicked.connect(self.redraw_bounding_box)
+        self.redraw_box_btn.setEnabled(False)
+        setup_layout.addWidget(self.redraw_box_btn)
         
-        self.draw_arena_btn = QPushButton("Draw Arena Rectangle")
-        self.draw_arena_btn.clicked.connect(self.start_draw_rectangle)
-        self.draw_arena_btn.setEnabled(False)
-        setup_layout.addWidget(self.draw_arena_btn)
-        
-        self.arena_status_label = QLabel("Arena: Not defined")
-        setup_layout.addWidget(self.arena_status_label)
-        
-        # SAM Update Interval with explanation
-        interval_layout = QHBoxLayout()
-        interval_layout.addWidget(QLabel("SAM Update Interval:"))
-        self.sam_interval_spin = QSpinBox()
-        self.sam_interval_spin.setRange(10, 1000)  # Increased from 300 to 1000 for CPU users
-        self.sam_interval_spin.setValue(30)
-        self.sam_interval_spin.setSuffix(" frames")
-        self.sam_interval_spin.setToolTip(
-            "How often SAM re-segments the animal:\n\n"
-            "ARCHITECTURE:\n"
-            "• Frame 1, 30, 60, etc.: SAM segments (SLOW but accurate)\n"
-            "• Frames 2-29, 31-59, etc.: Optical flow tracks (FAST)\n\n"
-            "GPU users: 20-50 frames recommended\n"
-            "CPU users: 100-500 frames (SAM is very slow on CPU)\n\n"
-            "If animal moves quickly or arena is cluttered, use lower values."
-        )
-        interval_layout.addWidget(self.sam_interval_spin)
-        setup_layout.addLayout(interval_layout)
-        
-        # Add explanation label
-        interval_help = QLabel(
-            "<b>How it works:</b> SAM segments every N frames (accurate but slow). "
-            "Between SAM updates, fast optical flow tracks the blob. "
-            "Hybrid approach = SAM accuracy + optical flow speed."
-        )
-        interval_help.setWordWrap(True)
-        interval_help.setStyleSheet("color: #0078d4; font-size: 10px; padding: 2px 10px; background-color: #1e1e1e; border-left: 3px solid #0078d4;")
-        setup_layout.addWidget(interval_help)
-        
-        # Tracking method selector
-        tracking_method_layout = QHBoxLayout()
-        tracking_method_layout.addWidget(QLabel("Tracking Method:"))
-        self.tracking_method_combo = QComboBox()
-        self.tracking_method_combo.addItems(["Optical Flow (Precise)", "Centroid Matching (Fast)"])
-        self.tracking_method_combo.setCurrentIndex(0)  # Default to optical flow
-        self.tracking_method_combo.setToolTip(
-            "Choose tracking algorithm:\n\n"
-            "Optical Flow: Very precise, tracks feature points, slower (~5-10 fps)\n"
-            "  - Best for: High-quality tracking, detailed analysis\n"
-            "  - Use when: Accuracy is critical\n\n"
-            "Centroid Matching: Fast blob detection, ~10-30x faster\n"
-            "  - Best for: Quick previews, real-time tracking\n"
-            "  - Use when: Speed matters more than precision\n\n"
-            "Both use SAM for periodic refinement."
-        )
-        self.tracking_method_combo.currentIndexChanged.connect(self.on_tracking_method_changed)
-        tracking_method_layout.addWidget(self.tracking_method_combo)
-        tracking_method_layout.addStretch()
-        setup_layout.addLayout(tracking_method_layout)
-        
-        tracking_help = QLabel("Fast centroid is good for most cases; optical flow for maximum accuracy")
-        tracking_help.setWordWrap(True)
-        tracking_help.setStyleSheet("color: #888888; font-size: 9px; font-style: italic; padding: 2px 10px;")
-        setup_layout.addWidget(tracking_help)
-        
-        # Optical Flow Window Size
-        flow_window_layout = QHBoxLayout()
-        flow_window_layout.addWidget(QLabel("Optical Flow Window:"))
-        self.flow_window_spin = QSpinBox()
-        self.flow_window_spin.setRange(5, 201)  # Increased max from 51 to 201
-        self.flow_window_spin.setSingleStep(2)  # Step by 2 to keep odd
-        self.flow_window_spin.setValue(101)  # Default 101x101 (better for erratic movement)
-        self.flow_window_spin.setSuffix(" px")
-        self.flow_window_spin.setToolTip(
-            "Size of the pixel neighborhood tracked by optical flow.\n\n"
-            "Smaller (7-21): Faster, tracks fine details, may lose track easier\n"
-            "Medium (31-71): Balanced - good for most cases\n"
-            "Larger (81-201): Very robust, less likely to lose track, slower\n\n"
-            "If tracking is unstable, try increasing this value.\n"
-            "Values above 100 are recommended for challenging videos."
-        )
-        flow_window_layout.addWidget(self.flow_window_spin)
-        flow_window_layout.addStretch()
-        setup_layout.addLayout(flow_window_layout)
+        self.box_status_label = QLabel("Status: Not initialized")
+        setup_layout.addWidget(self.box_status_label)
         
         flow_help = QLabel("Window = pixel neighborhood around centroid tracked between SAM updates")
         flow_help.setWordWrap(True)
@@ -1158,8 +740,8 @@ class MaskPoseTrackerGUI(QMainWindow):
         
         # Right panel - Video display
         self.video_widget = InteractiveVideoWidget()
-        self.video_widget.click_signal.connect(self.on_click_selected)
-        self.video_widget.rectangle_drawn.connect(self.on_rectangle_drawn)
+        self.video_widget.rectangle_drawn.connect(self.on_bounding_box_drawn)
+        self.video_widget.first_corner_clicked.connect(self.on_first_corner_clicked)
         
         main_layout.addWidget(left_panel)
         main_layout.addWidget(self.video_widget, stretch=1)
@@ -1182,34 +764,158 @@ class MaskPoseTrackerGUI(QMainWindow):
                 f"<b>Selected {len(file_paths)} video(s)</b> (Video 1/{len(file_paths)}):<br>"
                 f"{video_names}{more_text}"
             )
-            self.load_first_frame_btn.setEnabled(True)
+            # Auto-load first frame with slider
+            self.load_first_frame_with_slider()
             
     def select_sam_checkpoint(self):
-        """Select SAM model checkpoint file and auto-detect model type."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select SAM Checkpoint",
-            "",
-            "PyTorch Model (*.pth);;All Files (*)"
-        )
+        """Select or download SAM 2 checkpoint."""
+        if not SAM2_AVAILABLE:
+            QMessageBox.warning(
+                self,
+                "SAM 2 Not Available",
+                "SAM 2 is not installed. Please install with:\n\n"
+                "pip install git+https://github.com/facebookresearch/sam2.git"
+            )
+            return
         
-        if file_path:
-            self.sam_checkpoint_path = file_path
-            filename = Path(file_path).name
-            self.sam_path_label.setText(f"Checkpoint: {filename}")
+        # Create custom dialog with proper button labels
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Select SAM 2 Checkpoint")
+        msg.setText("Would you like to:")
+        msg.setInformativeText("• Download a new checkpoint (recommended)\n• Browse for an existing checkpoint file")
+        
+        download_btn = msg.addButton("Download New", QMessageBox.AcceptRole)
+        browse_btn = msg.addButton("Browse", QMessageBox.ActionRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+        
+        msg.exec_()
+        clicked_button = msg.clickedButton()
+        
+        if clicked_button == download_btn:
+            # Download new checkpoint
+            checkpoint_path, config_name = get_sam2_checkpoint(parent=self)
+            if checkpoint_path:
+                self.sam_checkpoint_path = str(checkpoint_path)
+                self.sam_config_name = config_name
+                self.sam_path_label.setText(f"✓ {checkpoint_path.name}")
+                self.sam_path_label.setStyleSheet("color: #4CAF50;")
+                self.model_type_label.setText(f"Config: {config_name}")
+                
+        elif clicked_button == browse_btn:
+            # Browse for existing file
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select SAM 2 Checkpoint",
+                "",
+                "PyTorch Model (*.pt *.pth);;All Files (*)"
+            )
             
-            # Auto-detect model type from filename
-            if "vit_h" in filename.lower():
-                model_type = "vit_h (Huge - Best accuracy)"
-            elif "vit_l" in filename.lower():
-                model_type = "vit_l (Large - Balanced)"
-            elif "vit_b" in filename.lower():
-                model_type = "vit_b (Base - Fastest)"
+            if file_path:
+                self.sam_checkpoint_path = file_path
+                filename = Path(file_path).name
+                self.sam_path_label.setText(f"Checkpoint: {filename}")
+                
+                # Auto-detect config from filename
+                if "tiny" in filename.lower():
+                    self.sam_config_name = "sam2.1_hiera_t.yaml"
+                elif "small" in filename.lower():
+                    self.sam_config_name = "sam2.1_hiera_s.yaml"
+                elif "base" in filename.lower():
+                    self.sam_config_name = "sam2.1_hiera_b+.yaml"
+                elif "large" in filename.lower():
+                    self.sam_config_name = "sam2.1_hiera_l.yaml"
+                else:
+                    self.sam_config_name = "sam2.1_hiera_l.yaml"
+                
+                self.model_type_label.setText(f"Config: {self.sam_config_name}")
+                self.model_type_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+    
+    def check_sam2_checkpoint(self):
+        """Check if SAM 2 checkpoint exists, prompt user to download if needed."""
+        if not SAM2_AVAILABLE:
+            QMessageBox.warning(
+                self,
+                "SAM 2 Not Available",
+                "SAM 2 is not installed. Please install with:\n\n"
+                "pip install git+https://github.com/facebookresearch/sam2.git"
+            )
+            return
+        
+        # Check default SAM_models directory
+        default_dir = Path(__file__).parent.parent.parent / "SAM_models"
+        
+        # Check if any checkpoints exist
+        existing_checkpoints = []
+        if default_dir.exists():
+            existing_checkpoints = list(default_dir.glob("sam2*.pt"))
+        
+        if not existing_checkpoints:
+            # Create custom dialog with proper button labels
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("SAM 2 Checkpoint Required")
+            msg.setText("The Mask Tracker requires a SAM 2 model checkpoint.")
+            msg.setInformativeText("Would you like to download one now?\n\n(Models will be saved to SAM_models folder for future use)")
+            
+            download_btn = msg.addButton("Download", QMessageBox.AcceptRole)
+            browse_btn = msg.addButton("Browse", QMessageBox.ActionRole)
+            cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg.exec_()
+            clicked_button = msg.clickedButton()
+            
+            if clicked_button == download_btn:
+                checkpoint_path, config_name = get_sam2_checkpoint(parent=self)
+                if checkpoint_path:
+                    self.sam_checkpoint_path = str(checkpoint_path)
+                    self.sam_config_name = config_name
+                    self.sam_path_label.setText(f"✓ {checkpoint_path.name}")
+                    self.sam_path_label.setStyleSheet("color: #4CAF50;")
+            elif clicked_button == browse_btn:
+                # Browse for existing file
+                file_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select SAM 2 Checkpoint",
+                    "",
+                    "PyTorch Model (*.pt *.pth);;All Files (*)"
+                )
+                
+                if file_path:
+                    self.sam_checkpoint_path = file_path
+                    filename = Path(file_path).name
+                    self.sam_path_label.setText(f"✓ {filename}")
+                    self.sam_path_label.setStyleSheet("color: #4CAF50;")
+                    
+                    # Auto-detect config from filename
+                    if "tiny" in filename.lower():
+                        self.sam_config_name = "sam2.1_hiera_t.yaml"
+                    elif "small" in filename.lower():
+                        self.sam_config_name = "sam2.1_hiera_s.yaml"
+                    elif "base" in filename.lower():
+                        self.sam_config_name = "sam2.1_hiera_b+.yaml"
+                    elif "large" in filename.lower():
+                        self.sam_config_name = "sam2.1_hiera_l.yaml"
+                    else:
+                        self.sam_config_name = "sam2.1_hiera_l.yaml"
+        else:
+            # Use first available checkpoint
+            self.sam_checkpoint_path = str(existing_checkpoints[0])
+            # Determine config from checkpoint name
+            ckpt_name = existing_checkpoints[0].name
+            if "tiny" in ckpt_name:
+                self.sam_config_name = "sam2.1_hiera_t.yaml"
+            elif "small" in ckpt_name:
+                self.sam_config_name = "sam2.1_hiera_s.yaml"
+            elif "base" in ckpt_name:
+                self.sam_config_name = "sam2.1_hiera_b+.yaml"
+            elif "large" in ckpt_name:
+                self.sam_config_name = "sam2.1_hiera_l.yaml"
             else:
-                model_type = "Unknown (will try vit_h)"
+                self.sam_config_name = "sam2.1_hiera_l.yaml"
             
-            self.model_type_label.setText(f"Model Type: {model_type}")
-            self.model_type_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+            self.sam_path_label.setText(f"✓ {existing_checkpoints[0].name}")
+            self.sam_path_label.setStyleSheet("color: #4CAF50;")
             
     def get_model_type_from_checkpoint(self) -> str:
         """Extract model type from checkpoint filename."""
@@ -1249,127 +955,118 @@ class MaskPoseTrackerGUI(QMainWindow):
         if ret:
             self.video_widget.set_frame(frame)
             self.video_widget.clear_overlays()
-            self.click_point = None
-            self.arena_rectangle = None
-            self.click_status_label.setText("Status: Frame loaded - click on animal to see SAM segmentation")
-            self.arena_status_label.setText("Arena: Not defined")
-            self.click_animal_btn.setEnabled(True)
+            self.bounding_box = None
+            self.box_status_label.setText("Status: Frame loaded - draw bounding box around animal")
+            self.draw_box_btn.setEnabled(True)
             self.start_tracking_btn.setEnabled(False)
         else:
             QMessageBox.warning(self, "Error", "Failed to load first frame")
+    
+    def load_first_frame_with_slider(self):
+        """Load video and enable frame slider for navigation."""
+        if not self.video_paths:
+            return
+        
+        video_path = self.video_paths[self.current_video_idx]
+        
+        # Open video to get frame count
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ret, frame = cap.read()
+        cap.release()
+        
+        if ret:
+            # Store video capture for slider navigation
+            self.video_cap = cv2.VideoCapture(video_path)
+            self.total_frames = total_frames
             
-    def start_click_mode(self):
-        """Enable click mode for animal selection."""
-        self.video_widget.drawing_mode = 'click'
-        self.click_animal_btn.setEnabled(False)
-        self.click_status_label.setText("Status: Click on the animal in the video")
-        
-    def on_click_selected(self, x: int, y: int):
-        """Handle animal selection click and show SAM mask for clicked point."""
-        self.click_point = (x, y)
-        self.video_widget.drawing_mode = None
-        self.click_status_label.setText(f"Status: Generating SAM mask at ({x}, {y})...")
-        
-        # Run SAM segmentation to show mask overlay for the clicked point
-        if self.sam_checkpoint_path and self.video_widget.original_frame is not None:
-            try:
-                from fnt.videoTracking.sam_tracker_base import SAMTrackerBase
-                import torch
-                
-                # Create temporary tracker just for mask preview
-                temp_tracker = SAMTrackerBase(
-                    video_path=self.video_paths[self.current_video_idx],
-                    sam_checkpoint=self.sam_checkpoint_path,
-                    model_type=self.get_model_type_from_checkpoint(),
-                    device=self.device_combo.text()
-                )
-                
-                # Initialize SAM
-                if temp_tracker.initialize_sam():
-                    # Get current frame
-                    frame = self.video_widget.original_frame.copy()
-                    if not self.video_widget.is_rgb:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    else:
-                        frame_rgb = frame.copy()
-                    
-                    # Initialize tracking to get mask
-                    if temp_tracker.initialize_tracking(frame_rgb, (x, y)):
-                        # Get the mask
-                        mask = temp_tracker.current_mask
-                        
-                        # Create overlay
-                        overlay = frame_rgb.copy()
-                        # Color the mask area (semi-transparent green)
-                        overlay[mask > 0] = overlay[mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5
-                        
-                        # Draw click point
-                        cv2.circle(overlay, (x, y), 5, (255, 0, 0), -1)
-                        cv2.circle(overlay, (x, y), 7, (255, 255, 255), 2)
-                        
-                        # Update display
-                        self.video_widget.set_frame(overlay, is_rgb=True)
-                        self.click_status_label.setText(f"Status: Animal selected at ({x}, {y}) - SAM mask shown in green")
-                    else:
-                        self.click_status_label.setText(f"Status: Animal selected at ({x}, {y}) - SAM mask failed")
-                else:
-                    self.click_status_label.setText(f"Status: Animal selected at ({x}, {y}) - SAM initialization failed")
-                    
-                # Cleanup
-                temp_tracker.cleanup()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-            except Exception as e:
-                self.click_status_label.setText(f"Status: Animal selected at ({x}, {y}) - Mask preview error: {str(e)}")
+            # Setup slider
+            self.frame_slider.setMaximum(total_frames - 1)
+            self.frame_slider.setValue(0)
+            self.frame_slider.setEnabled(True)
+            self.frame_label.setText(f"Frame: 0 / {total_frames}")
+            
+            # Display first frame
+            self.video_widget.set_frame(frame)
+            self.video_widget.clear_overlays()
+            self.bounding_box = None
+            self.box_status_label.setText("Status: Use slider to find good frame, then draw bounding box")
+            self.draw_box_btn.setEnabled(True)
+            self.start_tracking_btn.setEnabled(False)
+            self.load_first_frame_btn.setEnabled(False)
         else:
-            self.click_status_label.setText(f"Status: Animal selected at ({x}, {y})")
-        
-        self.draw_arena_btn.setEnabled(True)
-        self.click_animal_btn.setEnabled(True)
-        
-    def start_draw_rectangle(self):
-        """Enable rectangle drawing mode for arena definition."""
-        self.video_widget.drawing_mode = 'rectangle'
-        self.draw_arena_btn.setEnabled(False)
-        self.arena_status_label.setText("Arena: Click first corner, then opposite corner")
-        
-    def on_rectangle_drawn(self, x: int, y: int, width: int, height: int, corners, rotation_angle: float):
-        """Handle arena rectangle drawn."""
-        self.arena_rectangle = (x, y, width, height)
-        self.arena_corners = corners  # Store rotated corners
-        self.arena_rotation = rotation_angle  # Store rotation angle
-        self.arena_status_label.setText(f"Arena: {width}x{height} px at ({x}, {y}), rotation: {rotation_angle:.1f}°")
-        self.draw_arena_btn.setEnabled(True)
-        
-        # Enable tracking if all prerequisites met
-        if self.click_point and self.sam_checkpoint_path:
-            self.start_tracking_btn.setEnabled(True)
+            QMessageBox.warning(self, "Error", "Failed to load video")
+    
+    def on_frame_slider_changed(self, value):
+        """Update display when slider moves."""
+        if hasattr(self, 'video_cap') and self.video_cap is not None:
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, value)
+            ret, frame = self.video_cap.read()
+            if ret:
+                self.video_widget.set_frame(frame)
+                # Preserve existing bounding box overlay
+                if self.bounding_box:
+                    self.video_widget.rectangle_start = (self.bounding_box[0], self.bounding_box[1])
+                    self.video_widget.rectangle_end = (self.bounding_box[2], self.bounding_box[3])
+                    self.video_widget._update_display()
+                self.frame_label.setText(f"Frame: {value} / {self.total_frames}")
             
+    def start_draw_bounding_box(self):
+        """Enable bounding box drawing mode for animal selection."""
+        self.video_widget.drawing_mode = 'rectangle'
+        self.video_widget.rectangle_start = None
+        self.video_widget.rectangle_end = None
+        self.video_widget.temp_rectangle_point = None
+        self.draw_box_btn.setEnabled(False)
+        self.redraw_box_btn.setEnabled(False)
+        self.box_status_label.setText("Status: Click first corner of box")
+        
+    def redraw_bounding_box(self):
+        """Clear current box and redraw."""
+        self.bounding_box = None
+        self.video_widget.rectangle_start = None
+        self.video_widget.rectangle_end = None
+        self.video_widget.temp_rectangle_point = None
+        self.video_widget._update_display()
+        self.start_draw_bounding_box()
+    
+    def on_first_corner_clicked(self):
+        """Update status after first corner is clicked."""
+        self.box_status_label.setText("Status: Click opposite corner to complete box")
+    
+    def on_bounding_box_drawn(self, x: int, y: int, width: int, height: int, corners, rotation_angle: float):
+        """Handle bounding box drawn around animal."""
+        # Convert to x1, y1, x2, y2 format
+        x1 = x
+        y1 = y
+        x2 = x + width
+        y2 = y + height
+        
+        self.bounding_box = (x1, y1, x2, y2)
+        
+        self.box_status_label.setText(f"Bounding box: ({x1}, {y1}) to ({x2}, {y2})")
+        self.box_status_label.setStyleSheet("QLabel { color: #00ff00; font-weight: bold; }")
+        
+        self.draw_box_btn.setEnabled(True)
+        self.redraw_box_btn.setEnabled(True)
+        self.start_tracking_btn.setEnabled(True)
+        
     def start_tracking(self):
-        """Start tracking process."""
-        if not self.click_point or not self.arena_rectangle or not self.sam_checkpoint_path:
-            QMessageBox.warning(self, "Setup Incomplete", "Please complete all setup steps:\n1. Select animal\n2. Draw arena\n3. Select SAM checkpoint")
+        """Start SAM 2 video tracking."""
+        if not self.bounding_box or not self.sam_checkpoint_path:
+            QMessageBox.warning(self, "Setup Incomplete", "Please complete all setup steps:\n1. Draw bounding box on animal\n2. Select SAM checkpoint")
             return
             
         video_path = self.video_paths[self.current_video_idx]
-        
-        # Determine tracking method
-        tracking_method = "optical_flow" if self.tracking_method_combo.currentIndex() == 0 else "centroid"
+        device = self.device_combo.text().strip() or "cpu"
         
         # Create worker thread
         self.tracking_worker = TrackingWorker(
             video_path=video_path,
             sam_checkpoint=self.sam_checkpoint_path,
-            click_point=self.click_point,
-            arena_rectangle=self.arena_rectangle,  # Changed from arena_circle
-            arena_corners=self.arena_corners,  # Rotated corners
-            arena_rotation=self.arena_rotation,  # Rotation angle
-            sam_update_interval=self.sam_interval_spin.value(),
-            model_type=self.get_model_type_from_checkpoint(),  # Auto-detect from filename
-            device=self.device_combo.text(),
-            flow_window_size=self.flow_window_spin.value(),
-            tracking_method=tracking_method
+            sam_config=self.sam_config_name,
+            bounding_box=self.bounding_box,
+            device=device
         )
         
         # Connect signals
@@ -1453,14 +1150,14 @@ class MaskPoseTrackerGUI(QMainWindow):
 
 
 def main():
-    """Run the OFT Tracker GUI."""
+    """Run the Mask Tracker GUI."""
     app = QApplication(sys.argv)
     
-    if not SAM_TRACKER_AVAILABLE:
+    if not SAM2_AVAILABLE:
         QMessageBox.critical(
             None,
-            "Dependencies Missing",
-            "SAM tracker dependencies not available.\n\nInstall with:\npip install opencv-python torch segment-anything pandas numpy"
+            "SAM 2 Not Available",
+            "SAM 2 is required for mask tracking.\n\nInstall with:\npip install git+https://github.com/facebookresearch/sam2.git"
         )
         return
         

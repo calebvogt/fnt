@@ -33,3 +33,7 @@ fnt/videoTracking/__pycache__/simple_tracker_gui.cpython-313.pyc
 fnt/videoTracking/__pycache__/simple_tracker_gui_v2.cpython-313.pyc
 fnt/sleapProcessing/__pycache__/sleap_roi_tool_pyqt.cpython-314.pyc
 *.pyc
+
+# SAM model checkpoints (large files, downloaded locally)
+SAM_models/
+*.pyc

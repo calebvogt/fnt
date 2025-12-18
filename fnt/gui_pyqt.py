@@ -63,7 +63,7 @@ class FNTMainWindow(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("FieldNeuroToolbox (FNT) v0.1")
+        self.setWindowTitle("FieldNeuroToolbox (FNT) v1.0")
         self.setGeometry(100, 100, 1000, 700)
         self.setMinimumSize(800, 600)
         
@@ -402,8 +402,8 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
+            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
             ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
-            ("Mask Pose Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -1083,7 +1083,7 @@ class FNTMainWindow(QMainWindow):
     # Utility Methods
     def show_about(self):
         """Show about dialog"""
-        about_text = """<h2>FieldNeuroToolbox (FNT) v0.1</h2>
+        about_text = """<h2>FieldNeuroToolbox (FNT) v1.0</h2>
         
         <p>A comprehensive preprocessing and analysis toolbox for neurobehavioral data.</p>
         
@@ -1225,7 +1225,7 @@ def main():
     
     # Set application properties
     app.setApplicationName("FieldNeuroToolbox")
-    app.setApplicationVersion("0.1")
+    app.setApplicationVersion("1.0")
     app.setOrganizationName("FNT")
     
     # Set application icon (check multiple possible locations)
