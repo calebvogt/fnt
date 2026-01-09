@@ -554,6 +554,7 @@ class FNTMainWindow(QMainWindow):
         
         general_buttons = [
             ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
+            ("GitHub Data Transfer", "Copy CSVs/TXT/JSON to GitHub repo, auto-split large files", self.run_github_csv_transfer),
         ]
         
         self.create_button_grid(general_layout, general_buttons)
@@ -815,6 +816,17 @@ class FNTMainWindow(QMainWindow):
             self.split_large_files()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
+    
+    def run_github_csv_transfer(self):
+        """Launch GitHub CSV Transfer tool for copying data files to a GitHub repo"""
+        try:
+            from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
+            
+            # Store as instance variable to prevent garbage collection
+            self.github_csv_transfer_window = GitHubCSVTransferWindow()
+            self.github_csv_transfer_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"GitHub CSV Transfer failed: {str(e)}")
     
 
     def split_large_files(self):
