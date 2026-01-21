@@ -35,11 +35,12 @@ class ConcatenationWorker(QThread):
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
-    def __init__(self, input_dirs, output_filename, sort_order="default"):
+    def __init__(self, input_dirs, output_filename, sort_order="default", instance_id=1):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
         self.sort_order = sort_order
+        self.instance_id = instance_id
         self.should_stop = False
     
     def stop(self):
@@ -221,16 +222,24 @@ class ConcatenationWorker(QThread):
 class VideoConcatenationGUI(QMainWindow):
     """Main GUI window for video concatenation"""
     
+    # Class variable to track instance count
+    instance_count = 0
+    
     def __init__(self):
         super().__init__()
+        
+        # Increment instance counter and set unique ID
+        VideoConcatenationGUI.instance_count += 1
+        self.instance_id = VideoConcatenationGUI.instance_count
+        
         self.selected_dirs = []
         self.worker = None
         self.init_ui()
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("Video Concatenation Tool - FieldNeuroToolbox")
-        self.setGeometry(200, 200, 900, 700)
+        self.setWindowTitle(f"Video Concatenation Tool #{self.instance_id} - FieldNeuroToolbox")
+        self.setGeometry(200 + (self.instance_id - 1) * 50, 200 + (self.instance_id - 1) * 50, 900, 700)
         self.setMinimumSize(700, 600)
         
         # Set application style - Dark Mode
@@ -352,7 +361,7 @@ class VideoConcatenationGUI(QMainWindow):
         header_layout = QVBoxLayout()
         header_frame.setLayout(header_layout)
         
-        title = QLabel("Video Concatenation Tool")
+        title = QLabel(f"Video Concatenation Tool #{self.instance_id}")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 18, QFont.Bold))
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
@@ -561,7 +570,7 @@ class VideoConcatenationGUI(QMainWindow):
         self.log_message(f"Sort order: {self.sort_order_combo.currentText()}")
         
         # Start worker thread
-        self.worker = ConcatenationWorker(self.selected_dirs, output_filename, sort_order)
+        self.worker = ConcatenationWorker(self.selected_dirs, output_filename, sort_order, self.instance_id)
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
@@ -641,10 +650,11 @@ def video_concatenate():
     window = VideoConcatenationGUI()
     window.show()
     
-    # Only run event loop if this is a standalone application
-    if __name__ == "__main__":
-        sys.exit(app.exec_())
+    return window
 
 
 if __name__ == "__main__":
-    video_concatenate()
+    app = QApplication(sys.argv)
+    window = VideoConcatenationGUI()
+    window.show()
+    sys.exit(app.exec_())

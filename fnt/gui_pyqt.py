@@ -63,7 +63,7 @@ class FNTMainWindow(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("FieldNeuroToolbox (FNT) v0.1")
+        self.setWindowTitle("FieldNeuroToolbox (FNT) v1.0")
         self.setGeometry(100, 100, 1000, 700)
         self.setMinimumSize(800, 600)
         
@@ -168,13 +168,15 @@ class FNTMainWindow(QMainWindow):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         
-        # Create tabs
+        # Create tabs - Original order
         self.create_video_tab()
         self.create_sleap_tab()
         self.create_video_tracking_tab()
-        self.create_usv_tab()
         self.create_uwb_tab()
-        self.create_github_tab()
+        self.create_usv_tab()
+        self.create_rfid_tab()
+        self.create_fed_tab()
+        self.create_wifp_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -261,7 +263,7 @@ class FNTMainWindow(QMainWindow):
         # Create buttons with descriptions
         buttons = [
             ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
-            ("Video Trimming", "Interactively trim video files with preview", self.run_video_trim),
+            ("Video Trim and Crop", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
         ]
         
@@ -271,7 +273,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "Video Processing")
+        self.tabs.addTab(tab, "Video")
     
     def create_sleap_tab(self):
         """Create the SLEAP processing tab"""
@@ -292,15 +294,28 @@ class FNTMainWindow(QMainWindow):
             ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
             ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
             ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
         ]
         
         self.create_button_grid(group_layout, buttons)
         group.setLayout(group_layout)
         layout.addWidget(group)
         
+        # SLEAP post-processing group
+        post_group = QGroupBox("SLEAP Post-Processing")
+        post_layout = QGridLayout()
+        
+        post_buttons = [
+            ("ROI Tool", "Define ROIs and analyze spatial occupancy", self.run_sleap_roi_tool),
+        ]
+        
+        self.create_button_grid(post_layout, post_buttons)
+        post_group.setLayout(post_layout)
+        layout.addWidget(post_group)
+        
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "SLEAP Analysis")
+        self.tabs.addTab(tab, "SLEAP")
     
     def create_usv_tab(self):
         """Create the USV processing tab"""
@@ -329,7 +344,7 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "USV Processing")
+        self.tabs.addTab(tab, "USV")
     
     def create_uwb_tab(self):
         """Create the UWB processing tab"""
@@ -347,7 +362,7 @@ class FNTMainWindow(QMainWindow):
         quick_layout = QGridLayout()
         
         quick_buttons = [
-            ("UWB Quick Plots", "Generate quick visualization plots from tracking data", self.run_uwb_quick_plots),
+            ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -359,8 +374,6 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
-            ("UWB Data Processing", "Preprocess and export UWB tracking data", self.run_uwb_preprocess),
-            ("Animate UWB Paths", "Create animated videos of tracking paths", self.run_uwb_animate),
             ("Behavioral Analysis", "Analyze behavioral patterns from tracking", self.run_uwb_behavioral),
             ("Plot UWB Paths", "Generate static plots of tracking data", self.run_plot_uwb_path),
         ]
@@ -371,35 +384,8 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
         tab.setLayout(layout)
-        self.tabs.addTab(tab, "UWB Processing")
+        self.tabs.addTab(tab, "UWB")
     
-    def create_github_tab(self):
-        """Create the GitHub preprocessing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
-        
-        # Description
-        desc = QLabel("Tools for preparing data files for GitHub repositories")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # GitHub preprocessing group
-        group = QGroupBox("GitHub Data Preparation")
-        group_layout = QGridLayout()
-        
-        buttons = [
-            ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "GitHub Preprocessing")
-
     def create_video_tracking_tab(self):
         """Create the video tracking tab"""
         tab = QWidget()
@@ -411,13 +397,13 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Simple tracking group
-        group = QGroupBox("Simple Tracking Tools")
+        # SAM-based tracking group
+        group = QGroupBox("SAM-Based Tracking Tools")
         group_layout = QGridLayout()
         
         buttons = [
-            ("Open Field Test", "Track single or multiple animals in open arena with center zone metrics", self.run_oft_tracker),
-            ("Light Dark Box", "Track animal with occlusion handling for dark compartment", self.run_ldb_tracker),
+            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
+            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -441,6 +427,116 @@ class FNTMainWindow(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Video Tracking")
 
+    def create_rfid_tab(self):
+        """Create the RFID processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("RFID tracking and analysis tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # RFID processing group
+        group = QGroupBox("RFID Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future RFID tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> RFID tracking and analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• RFID data import and preprocessing<br>"
+            "• Social interaction analysis<br>"
+            "• Spatial tracking visualization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "RFID")
+    
+    def create_fed_tab(self):
+        """Create the FED processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Feeding Experimentation Device (FED) data analysis")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # FED processing group
+        group = QGroupBox("FED Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future FED tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> FED data analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• FED data import and preprocessing<br>"
+            "• Feeding pattern analysis<br>"
+            "• Circadian rhythm visualization<br>"
+            "• Multi-device synchronization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "FED")
+    
+    def create_wifp_tab(self):
+        """Create the WiFP processing tab"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        
+        # Description
+        desc = QLabel("Wireless Instantaneous Force Plate (WiFP) analysis tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+        
+        # WiFP processing group
+        group = QGroupBox("WiFP Analysis Tools")
+        group_layout = QGridLayout()
+        
+        # Placeholder for future WiFP tools
+        info_label = QLabel(
+            "<b>Coming Soon:</b> WiFP data analysis tools will be added here.<br><br>"
+            "Planned features:<br>"
+            "• WiFP data import and preprocessing<br>"
+            "• Force/weight measurement analysis<br>"
+            "• Temporal pattern visualization<br>"
+            "• Multi-plate synchronization<br>"
+            "• Integration with behavioral data"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setWordWrap(True)
+        group_layout.addWidget(info_label, 0, 0)
+        
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+        
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "WiFP")
+    
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -452,7 +548,20 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Utilities group
+        # General Utilities group
+        general_group = QGroupBox("General Utilities")
+        general_layout = QGridLayout()
+        
+        general_buttons = [
+            ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
+            ("GitHub Data Transfer", "Copy CSVs/TXT/JSON to GitHub repo, auto-split large files", self.run_github_csv_transfer),
+        ]
+        
+        self.create_button_grid(general_layout, general_buttons)
+        general_group.setLayout(general_layout)
+        layout.addWidget(general_group)
+        
+        # Utilities & Information group
         group = QGroupBox("Utilities & Information")
         group_layout = QGridLayout()
         
@@ -540,9 +649,14 @@ class FNTMainWindow(QMainWindow):
         try:
             from fnt.videoProcessing.video_concatenate_pyqt import VideoConcatenationGUI
             
-            # Create and show the video concatenation window
-            self.video_concatenation_window = VideoConcatenationGUI()
-            self.video_concatenation_window.show()
+            # Create a new instance each time to allow multiple windows
+            video_concatenation_window = VideoConcatenationGUI()
+            video_concatenation_window.show()
+            
+            # Store reference to prevent garbage collection (use list to allow multiple instances)
+            if not hasattr(self, 'video_concatenation_windows'):
+                self.video_concatenation_windows = []
+            self.video_concatenation_windows.append(video_concatenation_window)
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video concatenation tool: {str(e)}")
@@ -566,16 +680,16 @@ class FNTMainWindow(QMainWindow):
     
     # SLEAP Processing Methods
     def run_sleap_inference_only(self):
-        """Launch SLEAP inference only with PyQt interface"""
+        """Launch SLEAP inference tool with PyQt interface"""
         try:
-            from fnt.sleapProcessing.batch_video_inference_only_pyqt import VideoInferenceWindow
+            from fnt.sleapProcessing.sleap_inference_tool_pyqt import VideoInferenceWindow
             
             # Create and show the video inference window
             self.video_inference_window = VideoInferenceWindow()
             self.video_inference_window.show()
             
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch video inference tool: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to launch SLEAP inference tool: {str(e)}")
     
     def run_sleap_convert(self):
         """Launch SLEAP file conversion"""
@@ -590,6 +704,30 @@ class FNTMainWindow(QMainWindow):
             from fnt.sleapProcessing.batch_slp_retrack import main
             main()
         self.run_function_safely(func, "SLEAP Re-tracking")
+    
+    def run_sleap_render_videos(self):
+        """Launch SLEAP video rendering from existing .slp files"""
+        try:
+            from fnt.sleapProcessing.batch_render_videos_pyqt import RenderVideosWindow
+            
+            # Create and show the render videos window
+            self.render_videos_window = RenderVideosWindow()
+            self.render_videos_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
+    
+    def run_sleap_roi_tool(self):
+        """Launch SLEAP ROI Analysis Tool"""
+        try:
+            from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
+            
+            # Create and show the ROI tool window
+            self.roi_tool_window = ROIToolGUI()
+            self.roi_tool_window.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
     
     # USV Processing Methods - Call existing tkinter functions
     def run_usv_heterodyne(self):
@@ -622,30 +760,16 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"WAV compression failed: {str(e)}")
     
     # UWB Processing Methods
-    def run_uwb_quick_plots(self):
-        """Launch UWB Quick Plots tool"""
+    def run_uwb_quick_visualization(self):
+        """Launch UWB Quick Visualization tool"""
         try:
-            from fnt.uwb.uwb_quick_plots_pyqt import UWBQuickPlotsWindow
+            from fnt.uwb.uwb_quick_visualization_pyqt import UWBQuickVisualizationWindow
             
-            # Create and show the UWB quick plots window
-            self.uwb_quick_plots_window = UWBQuickPlotsWindow()
-            self.uwb_quick_plots_window.show()
+            # Create and show the UWB quick visualization window
+            self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
+            self.uwb_quick_viz_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB Quick Plots failed: {str(e)}")
-    
-    def run_uwb_preprocess(self):
-        """Launch UWB data preprocessing"""
-        def func():
-            from fnt.uwb.uwb_preprocess_sql import uwb_smoothing
-            uwb_smoothing()
-        self.run_function_safely(func, "UWB Data Processing")
-    
-    def run_uwb_animate(self):
-        """Launch UWB path animation"""
-        def func():
-            from fnt.uwb.uwb_animate import uwb_animate_paths
-            uwb_animate_paths()
-        self.run_function_safely(func, "UWB Path Animation")
+            QMessageBox.critical(self, "Error", f"UWB Quick Visualization failed: {str(e)}")
     
     def run_uwb_behavioral(self):
         """Launch UWB behavioral analysis"""
@@ -662,27 +786,27 @@ class FNTMainWindow(QMainWindow):
         self.run_function_safely(func, "UWB Path Plotting")
     
     # Video Tracking Methods
-    def run_oft_tracker(self):
-        """Launch Open Field Test tracker with SAM"""
+    def run_mask_pose_tracker(self):
+        """Launch Mask Pose Tracker with SAM"""
         try:
-            from fnt.videoTracking.oft_tracker_gui import OFTTrackerGUI
+            from fnt.videoTracking.mask_pose_tracker_gui import MaskPoseTrackerGUI
             
-            # Create and show the OFT tracker window
-            self.oft_tracker_window = OFTTrackerGUI()
-            self.oft_tracker_window.show()
+            # Create and show the Mask Pose Tracker window
+            self.mask_pose_tracker_window = MaskPoseTrackerGUI()
+            self.mask_pose_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch OFT tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
+            QMessageBox.critical(self, "Error", f"Failed to launch Mask Pose Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
     
-    def run_ldb_tracker(self):
-        """Launch Light Dark Box tracker with SAM"""
+    def run_simple_tracker(self):
+        """Launch Simple Tracker (CPU-only, no SAM)"""
         try:
-            from fnt.videoTracking.ldb_tracker_gui import LDBTrackerGUI
+            from fnt.videoTracking.simple_tracker_gui_v2 import SimpleTrackerGUI
             
-            # Create and show the LDB tracker window
-            self.ldb_tracker_window = LDBTrackerGUI()
-            self.ldb_tracker_window.show()
+            # Create and show the Simple Tracker window
+            self.simple_tracker_window = SimpleTrackerGUI()
+            self.simple_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch LDB tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
+            QMessageBox.critical(self, "Error", f"Failed to launch Simple Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python pandas numpy scipy")
     
     # GitHub Processing Methods - Pure PyQt implementations
     def run_file_splitter(self):
@@ -692,6 +816,17 @@ class FNTMainWindow(QMainWindow):
             self.split_large_files()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
+    
+    def run_github_csv_transfer(self):
+        """Launch GitHub CSV Transfer tool for copying data files to a GitHub repo"""
+        try:
+            from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
+            
+            # Store as instance variable to prevent garbage collection
+            self.github_csv_transfer_window = GitHubCSVTransferWindow()
+            self.github_csv_transfer_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"GitHub CSV Transfer failed: {str(e)}")
     
 
     def split_large_files(self):
@@ -960,7 +1095,7 @@ class FNTMainWindow(QMainWindow):
     # Utility Methods
     def show_about(self):
         """Show about dialog"""
-        about_text = """<h2>FieldNeuroToolbox (FNT) v0.1</h2>
+        about_text = """<h2>FieldNeuroToolbox (FNT) v1.0</h2>
         
         <p>A comprehensive preprocessing and analysis toolbox for neurobehavioral data.</p>
         
@@ -1102,7 +1237,7 @@ def main():
     
     # Set application properties
     app.setApplicationName("FieldNeuroToolbox")
-    app.setApplicationVersion("0.1")
+    app.setApplicationVersion("1.0")
     app.setOrganizationName("FNT")
     
     # Set application icon (check multiple possible locations)

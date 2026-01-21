@@ -1,13 +1,14 @@
 """
-SLEAP Video Inference Only - PyQt5 Implementation
+SLEAP Inference Tool - PyQt5 Implementation
 
-Run SLEAP inference without tracking on video files.
+Run SLEAP inference with optional tracking on video files.
 Supports both top-down (centroid + centered instance) and bottom-up models.
 Automatically converts output to CSV format.
 """
 
 import os
 import subprocess
+import glob
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
@@ -23,11 +24,12 @@ class InferenceWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, video_folders, model_paths, overwrite_existing, create_csv=True, add_tracking=False, 
+    def __init__(self, video_folders, individual_videos, model_paths, overwrite_existing, create_csv=True, add_tracking=False, 
                  tracker_method="simple", similarity_method="instance", match_method="greedy", 
-                 max_tracks=0, track_window=5, robust_quantile=1.0, conda_env=None):
+                 max_tracks=0, track_window=10, robust_quantile=0.95, post_connect_breaks=False, conda_env=None):
         super().__init__()
         self.video_folders = video_folders
+        self.individual_videos = individual_videos
         self.model_paths = model_paths
         self.overwrite_existing = overwrite_existing
         self.create_csv = create_csv
@@ -38,16 +40,28 @@ class InferenceWorker(QThread):
         self.max_tracks = max_tracks
         self.track_window = track_window
         self.robust_quantile = robust_quantile
+        self.post_connect_breaks = post_connect_breaks
         self.conda_env = conda_env
+        self._stop_requested = False
+    
+    def request_stop(self):
+        """Request the worker to stop processing"""
+        self._stop_requested = True
+        self.progress.emit("\n⚠️ Stop requested by user...")
         
     def run(self):
         try:
             total_processed = 0
             total_skipped = 0
             
+            # Process folders
             for folder in self.video_folders:
+                if self._stop_requested:
+                    break
+                    
                 video_files = [f for f in os.listdir(folder)
-                              if f.lower().endswith((".mp4", ".avi", ".mov"))]
+                              if f.lower().endswith((".mp4", ".avi", ".mov"))
+                              and not f.endswith("_roiTracked.mp4")]  # Ignore ROI tracked videos
                 
                 if not video_files:
                     self.progress.emit(f"⚠️ No video files found in: {folder}\n")
@@ -57,16 +71,31 @@ class InferenceWorker(QThread):
                 self.progress.emit(f"Found {len(video_files)} video file(s)\n")
                 
                 for video_file in video_files:
+                    if self._stop_requested:
+                        break
+                        
                     full_path = os.path.join(folder, video_file)
-                    slp_path = self.get_output_path(full_path)
-                    csv_path = slp_path.replace(".predictions.slp", ".predictions.analysis.csv")
                     
-                    if not self.overwrite_existing and (os.path.exists(slp_path) or os.path.exists(csv_path)):
+                    # Check for existing prediction files with any timestamp
+                    existing_files = self.find_existing_predictions(full_path)
+                    
+                    if existing_files and not self.overwrite_existing:
                         self.progress.emit(f"⏭️ Skipping {video_file} (existing predictions detected)")
                         total_skipped += 1
                         continue
                     
+                    # Delete existing files if overwrite is enabled
+                    if existing_files and self.overwrite_existing:
+                        self.progress.emit(f"🗑️ Deleting {len(existing_files)} existing prediction file(s) for {video_file}")
+                        for existing_file in existing_files:
+                            try:
+                                os.remove(existing_file)
+                                self.progress.emit(f"   Deleted: {os.path.basename(existing_file)}")
+                            except Exception as e:
+                                self.progress.emit(f"   ⚠️ Failed to delete {os.path.basename(existing_file)}: {str(e)}")
+                    
                     # Run inference
+                    slp_path = self.get_output_path(full_path)
                     success = self.run_inference_on_video(full_path)
                     if success:
                         total_processed += 1
@@ -75,17 +104,80 @@ class InferenceWorker(QThread):
                     else:
                         self.progress.emit(f"❌ Failed to process {video_file}")
             
+            # Process individual videos
+            if self.individual_videos:
+                self.progress.emit(f"\n📹 Processing {len(self.individual_videos)} individual video(s)\n")
+            
+            for video_path in self.individual_videos:
+                if self._stop_requested:
+                    break
+                
+                video_file = os.path.basename(video_path)
+                
+                # Check for existing prediction files with any timestamp
+                existing_files = self.find_existing_predictions(video_path)
+                
+                if existing_files and not self.overwrite_existing:
+                    self.progress.emit(f"⏭️ Skipping {video_file} (existing predictions detected)")
+                    total_skipped += 1
+                    continue
+                
+                # Delete existing files if overwrite is enabled
+                if existing_files and self.overwrite_existing:
+                    self.progress.emit(f"🗑️ Deleting {len(existing_files)} existing prediction file(s) for {video_file}")
+                    for existing_file in existing_files:
+                        try:
+                            os.remove(existing_file)
+                            self.progress.emit(f"   Deleted: {os.path.basename(existing_file)}")
+                        except Exception as e:
+                            self.progress.emit(f"   ⚠️ Failed to delete {os.path.basename(existing_file)}: {str(e)}")
+                
+                # Run inference
+                slp_path = self.get_output_path(video_path)
+                success = self.run_inference_on_video(video_path)
+                if success:
+                    total_processed += 1
+                    # Convert to CSV
+                    self.convert_to_csv(slp_path)
+                else:
+                    self.progress.emit(f"❌ Failed to process {video_file}")
+            
             summary = f"\n{'='*60}\n"
-            summary += f"✅ Inference complete!\n"
+            if self._stop_requested:
+                summary += f"⚠️ Inference stopped by user!\n"
+            else:
+                summary += f"✅ Inference complete!\n"
             summary += f"Videos processed: {total_processed}\n"
             summary += f"Videos skipped: {total_skipped}\n"
             summary += f"Total videos: {total_processed + total_skipped}\n"
             
             self.progress.emit(summary)
-            self.finished.emit(True, "Inference completed successfully!")
+            
+            if self._stop_requested:
+                self.finished.emit(False, "Inference stopped by user")
+            else:
+                self.finished.emit(True, "Inference completed successfully!")
             
         except Exception as e:
             self.finished.emit(False, f"Error during inference: {str(e)}")
+    
+    def find_existing_predictions(self, video_path):
+        """Find all existing prediction files for a video (with any timestamp)"""
+        base = os.path.basename(video_path)
+        parent = os.path.dirname(video_path)
+        
+        # Search patterns for .slp, .csv, and .mp4 prediction files
+        patterns = [
+            os.path.join(parent, f"{base}.*.predictions.slp"),
+            os.path.join(parent, f"{base}.*.predictions.analysis.csv"),
+            os.path.join(parent, f"{base}.*.predictions.mp4")
+        ]
+        
+        existing_files = []
+        for pattern in patterns:
+            existing_files.extend(glob.glob(pattern))
+        
+        return existing_files
     
     def get_output_path(self, video_path):
         """Generate output file path with timestamp"""
@@ -96,40 +188,53 @@ class InferenceWorker(QThread):
         return os.path.join(parent, filename)
     
     def run_inference_on_video(self, video_file):
-        """Run SLEAP inference on a single video"""
+        """Run SLEAP inference on a single video using SLEAP v1.5.2 syntax"""
         cmd = ["sleap-track", video_file]
         
-        # In SLEAP v1.5.1, -m expects the model directory, not the training_config.json file
+        # Add model paths
         for model_path in self.model_paths:
-            cmd += ["-m", model_path]  # Pass the directory directly
+            cmd += ["-m", model_path]
         
         output_file = self.get_output_path(video_file)
         
-        # Basic inference parameters for SLEAP v1.5.1
+        # Basic inference parameters
         cmd += [
             "-o", output_file,
             "--batch_size", "4",
             "--gpu", "auto",
-            "--peak_threshold", "0.2"  # This IS available in v1.5.1!
+            "--peak_threshold", "0.2"
         ]
         
-        # Add tracking parameters if enabled (using correct v1.5.1 syntax)
+        # Add tracking parameters if enabled (SLEAP v1.5.2 syntax)
         if self.add_tracking:
-            cmd += [
-                "--tracking.tracker", self.tracker_method,
-                "--tracking.similarity", self.similarity_method,
-                "--tracking.match", self.match_method
-            ]
+            # Add max_instances first (required for post_connect_single_breaks)
+            if self.max_tracks > 0:
+                cmd += ["--max_instances", str(self.max_tracks)]
             
-            # Add advanced tracking parameters if provided
-            if hasattr(self, 'max_tracks') and self.max_tracks > 0:
+            cmd += ["--tracking.tracker", self.tracker_method]
+            
+            # Add similarity method
+            cmd += ["--tracking.similarity", self.similarity_method]
+            
+            # Add match method
+            cmd += ["--tracking.match", self.match_method]
+            
+            # Add max_tracks parameter
+            if self.max_tracks > 0:
                 cmd += ["--tracking.max_tracks", str(self.max_tracks)]
             
-            if hasattr(self, 'track_window') and self.track_window != 5:  # 5 is default
+            # Add track window (default is 5, but we use 10)
+            if self.track_window != 5:
                 cmd += ["--tracking.track_window", str(self.track_window)]
                 
-            if hasattr(self, 'robust_quantile') and self.robust_quantile != 1.0:  # 1.0 is default
+            # Add robust quantile setting
+            # In SLEAP 1.5.2: if robust_quantile < 1.0, use robust mode; if 1.0, use max (non-robust)
+            if self.robust_quantile < 1.0:
                 cmd += ["--tracking.robust", str(self.robust_quantile)]
+            
+            # Add post-processing option if enabled (requires max_instances to be set)
+            if self.post_connect_breaks:
+                cmd += ["--tracking.post_connect_single_breaks", "1"]
         
         self.progress.emit(f"\n🔁 Running inference on: {os.path.basename(video_file)}")
         
@@ -145,7 +250,6 @@ class InferenceWorker(QThread):
         
         try:
             # Execute command using conda run
-            # Note: SLEAP doesn't stream progress, so we'll show a generic progress indicator
             self.progress.emit("🔄 Running SLEAP inference... (this may take several minutes)")
             self.progress.emit("⏳ SLEAP is processing frames - progress will appear when complete")
             
@@ -218,6 +322,7 @@ class InferenceWorker(QThread):
                 
         except Exception as e:
             self.progress.emit(f"⚠️ CSV conversion error: {str(e)}")
+    
 
 
 class VideoInferenceWindow(QWidget):
@@ -226,6 +331,7 @@ class VideoInferenceWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.video_folders = []
+        self.individual_videos = []  # Track individual video files separately
         self.model_paths = []
         self.is_top_down = False
         self.worker = None
@@ -237,8 +343,8 @@ class VideoInferenceWindow(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("SLEAP Video Inference Only")
-        self.setGeometry(100, 100, 1000, 800)  # Increased from 900x700 to 1000x800
-        self.setMinimumSize(900, 750)  # Increased from 800x600 to 900x750
+        self.setGeometry(100, 100, 1000, 950)  # Increased height to accommodate tracking options
+        self.setMinimumSize(900, 900)  # Increased minimum height
         
         # Apply dark theme styling
         self.setStyleSheet("""
@@ -324,6 +430,10 @@ class VideoInferenceWindow(QWidget):
         btn_add_folder = QPushButton("Add Folder")
         btn_add_folder.clicked.connect(self.add_video_folder)
         btn_layout.addWidget(btn_add_folder)
+        
+        btn_add_videos = QPushButton("Add Video(s)")
+        btn_add_videos.clicked.connect(self.add_individual_videos)
+        btn_layout.addWidget(btn_add_videos)
         
         btn_clear_folders = QPushButton("Clear All")
         btn_clear_folders.clicked.connect(self.clear_video_folders)
@@ -430,7 +540,7 @@ class VideoInferenceWindow(QWidget):
         
         # Tracking Options
         self.chk_tracking = QCheckBox("Add Tracking (assign identities across frames)")
-        self.chk_tracking.setChecked(False)
+        self.chk_tracking.setChecked(True)  # Changed to True by default
         self.chk_tracking.stateChanged.connect(self.toggle_tracking_options)
         options_layout.addWidget(self.chk_tracking)
         
@@ -535,7 +645,7 @@ class VideoInferenceWindow(QWidget):
         self.spin_track_window = QSpinBox()
         self.spin_track_window.setMinimum(1)
         self.spin_track_window.setMaximum(20)
-        self.spin_track_window.setValue(5)
+        self.spin_track_window.setValue(10)  # Default is 10 in SLEAP 1.5.2
         self.spin_track_window.setToolTip("How many frames back to look for matches")
         self.spin_track_window.setStyleSheet("""
             QSpinBox {
@@ -553,8 +663,8 @@ class VideoInferenceWindow(QWidget):
         self.spin_robust.setMinimum(0.0)
         self.spin_robust.setMaximum(1.0)
         self.spin_robust.setSingleStep(0.05)
-        self.spin_robust.setValue(1.0)
-        self.spin_robust.setToolTip("Robust quantile of similarity score (1.0 = non-robust)")
+        self.spin_robust.setValue(0.95)  # Default is 0.95 (robust) in SLEAP 1.5.2
+        self.spin_robust.setToolTip("Robust quantile of similarity score (1.0 = use max, non-robust)")
         self.spin_robust.setStyleSheet("""
             QDoubleSpinBox {
                 background-color: #1e1e1e;
@@ -567,20 +677,58 @@ class VideoInferenceWindow(QWidget):
         grid_layout.addWidget(self.spin_robust, 2, 3)
         
         tracking_layout.addLayout(grid_layout)
+        
+        # Post-processing checkbox
+        self.chk_post_connect = QCheckBox("Connect single track breaks (post-processing)")
+        self.chk_post_connect.setChecked(False)
+        self.chk_post_connect.setToolTip("Fill in single-frame gaps in tracks after tracking")
+        tracking_layout.addWidget(self.chk_post_connect)
+        
         self.tracking_widget.setLayout(tracking_layout)
-        self.tracking_widget.setVisible(False)  # Hidden by default
+        self.tracking_widget.setVisible(True)  # Visible by default since tracking is checked
         options_layout.addWidget(self.tracking_widget)
         
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
         
-        # Run Button
+        # Run and Stop Buttons
         btn_layout = QHBoxLayout()
-        self.btn_run = QPushButton("Run Inference")
+        self.btn_run = QPushButton("▶️ Run Inference")
         self.btn_run.clicked.connect(self.run_inference)
         self.btn_run.setEnabled(False)
-        self.btn_run.setStyleSheet("padding: 10px; font-size: 13px;")
+        self.btn_run.setStyleSheet("""
+            QPushButton {
+                background-color: #16825d;
+                padding: 10px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #1a9667;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+            }
+        """)
         btn_layout.addWidget(self.btn_run)
+        
+        self.btn_stop = QPushButton("⏹️ Stop Processing")
+        self.btn_stop.clicked.connect(self.stop_inference)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #c42b1c;
+                padding: 10px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #d83b2c;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f3f;
+            }
+        """)
+        btn_layout.addWidget(self.btn_stop)
+        
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
@@ -627,11 +775,38 @@ class VideoInferenceWindow(QWidget):
             else:
                 QMessageBox.information(self, "Duplicate Folder", "This folder has already been added.")
     
+    def add_individual_videos(self):
+        """Add individual video files to the processing list"""
+        video_files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Video File(s) for Inference",
+            "",
+            "Video Files (*.mp4 *.avi *.mov);;All Files (*)"
+        )
+        
+        if video_files:
+            added = 0
+            for video_path in video_files:
+                # Add video if not already in list
+                if video_path not in self.individual_videos:
+                    self.individual_videos.append(video_path)
+                    # Display just the filename in the list
+                    video_name = os.path.basename(video_path)
+                    self.folder_list.addItem(f"📹 {video_name}")
+                    added += 1
+            
+            if added > 0:
+                self.log(f"✅ Added {added} individual video(s)")
+                self.update_run_button()
+            else:
+                self.log("ℹ️ All selected videos were already in the list")
+    
     def clear_video_folders(self):
-        """Clear all video folders"""
+        """Clear all video folders and individual videos"""
         self.video_folders.clear()
+        self.individual_videos.clear()
         self.folder_list.clear()
-        self.log("🗑️ Cleared all video folders")
+        self.log("🗑️ Cleared all video folders and individual videos")
         self.update_run_button()
     
     def toggle_tracking_options(self, state):
@@ -784,6 +959,46 @@ class VideoInferenceWindow(QWidget):
             self.log(f"❌ Error testing SLEAP: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error testing SLEAP: {str(e)}")
     
+    def find_centered_instance_model(self, centroid_folder):
+        """Automatically find the matching centered instance model based on centroid folder.
+        
+        Looks for a sibling folder with the same date and n=X pattern but with 'centered_instance' in the name.
+        Example: 
+            Centroid: .../251110_231303.centroid.n=250
+            Centered: .../251110_231345.centered_instance.n=250
+        """
+        import re
+        
+        parent_dir = os.path.dirname(centroid_folder)
+        centroid_basename = os.path.basename(centroid_folder)
+        
+        # Extract date pattern (YYMMDD_HHMMSS) and n=X from centroid folder
+        date_match = re.search(r'(\d{6}_\d{6})', centroid_basename)
+        n_match = re.search(r'n=(\d+)', centroid_basename)
+        
+        if not date_match or not n_match:
+            return None
+        
+        date_prefix = date_match.group(1)[:6]  # Just the YYMMDD part
+        n_value = n_match.group(1)
+        
+        # Look for matching centered_instance folder
+        if not os.path.exists(parent_dir):
+            return None
+        
+        for folder_name in os.listdir(parent_dir):
+            folder_path = os.path.join(parent_dir, folder_name)
+            if not os.path.isdir(folder_path):
+                continue
+            
+            # Check if it matches the pattern: same date prefix, contains 'centered_instance', and same n=X
+            if (folder_name.startswith(date_prefix) and 
+                'centered_instance' in folder_name.lower() and 
+                f'n={n_value}' in folder_name):
+                return folder_path
+        
+        return None
+    
     def select_topdown_models(self):
         """Select top-down models (centroid + centered instance)"""
         self.is_top_down = True
@@ -798,13 +1013,20 @@ class VideoInferenceWindow(QWidget):
         if not centroid_folder:
             return
         
-        # Select centered instance model
-        centered_folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select CENTERED INSTANCE model folder"
-        )
-        if not centered_folder:
-            return
+        # Try to automatically find centered instance model
+        centered_folder = self.find_centered_instance_model(centroid_folder)
+        
+        if centered_folder:
+            self.log(f"🔍 Auto-detected centered instance model: {os.path.basename(centered_folder)}")
+        else:
+            # Fallback to manual selection if auto-detection fails
+            self.log("⚠️ Could not auto-detect centered instance model. Please select manually.")
+            centered_folder = QFileDialog.getExistingDirectory(
+                self,
+                "Select CENTERED INSTANCE model folder"
+            )
+            if not centered_folder:
+                return
         
         self.model_paths = [centroid_folder, centered_folder]
         self.model_list.addItem(f"Centroid: {centroid_folder}")
@@ -839,7 +1061,7 @@ class VideoInferenceWindow(QWidget):
     
     def update_run_button(self):
         """Enable/disable run button based on configuration"""
-        has_videos = len(self.video_folders) > 0
+        has_videos = len(self.video_folders) > 0 or len(self.individual_videos) > 0
         has_models = len(self.model_paths) > 0
         has_environment = self.combo_environment.currentData() is not None
         
@@ -860,13 +1082,18 @@ class VideoInferenceWindow(QWidget):
         video_count = 0
         for folder in self.video_folders:
             video_files = [f for f in os.listdir(folder)
-                          if f.lower().endswith((".mp4", ".avi", ".mov"))]
+                          if f.lower().endswith((".mp4", ".avi", ".mov"))
+                          and not f.endswith("_roiTracked.mp4")]  # Ignore ROI tracked videos
             video_count += len(video_files)
+        
+        # Add individual videos to count
+        video_count += len(self.individual_videos)
         
         model_type = "Top-Down (Centroid + Centered)" if self.is_top_down else "Bottom-Up"
         
         msg = f"Ready to run inference:\n\n"
         msg += f"Video folders: {len(self.video_folders)}\n"
+        msg += f"Individual videos: {len(self.individual_videos)}\n"
         msg += f"Total videos: {video_count}\n"
         msg += f"Model type: {model_type}\n"
         msg += f"Overwrite existing: {'Yes' if self.chk_overwrite.isChecked() else 'No'}\n"
@@ -877,6 +1104,7 @@ class VideoInferenceWindow(QWidget):
             msg += f"  - Similarity: {self.combo_similarity.currentText()}\n"
             msg += f"  - Match: {self.combo_match.currentText()}\n"
             msg += f"  - Max Tracks: {self.spin_max_tracks.value() if self.spin_max_tracks.value() > 0 else 'No limit'}\n"
+            msg += f"  - Post-connect breaks: {'Yes' if self.chk_post_connect.isChecked() else 'No'}\n"
         msg += "\nContinue?"
         
         reply = QMessageBox.question(
@@ -890,11 +1118,14 @@ class VideoInferenceWindow(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # Disable controls during processing
+        # Disable run button, enable stop button during processing
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.log("\n" + "="*60)
         self.log("🚀 Starting SLEAP inference...")
         self.log(f"Model type: {model_type}")
+        self.log(f"Video folders: {len(self.video_folders)}")
+        self.log(f"Individual videos: {len(self.individual_videos)}")
         self.log(f"Video folders: {len(self.video_folders)}")
         self.log(f"Total videos: {video_count}")
         self.log("="*60 + "\n")
@@ -902,6 +1133,7 @@ class VideoInferenceWindow(QWidget):
         # Start worker thread
         self.worker = InferenceWorker(
             self.video_folders,
+            self.individual_videos,
             self.model_paths,
             self.chk_overwrite.isChecked(),
             self.chk_create_csv.isChecked(),
@@ -910,17 +1142,34 @@ class VideoInferenceWindow(QWidget):
             self.combo_similarity.currentText(),
             self.combo_match.currentText(),
             self.spin_max_tracks.value() if hasattr(self, 'spin_max_tracks') else 0,
-            self.spin_track_window.value() if hasattr(self, 'spin_track_window') else 5,
-            self.spin_robust.value() if hasattr(self, 'spin_robust') else 1.0,
+            self.spin_track_window.value() if hasattr(self, 'spin_track_window') else 10,
+            self.spin_robust.value() if hasattr(self, 'spin_robust') else 0.95,
+            self.chk_post_connect.isChecked() if hasattr(self, 'chk_post_connect') else False,
             self.combo_environment.currentData()
         )
         self.worker.progress.connect(self.log)
         self.worker.finished.connect(self.on_inference_finished)
         self.worker.start()
     
+    def stop_inference(self):
+        """Stop the running inference process"""
+        if self.worker and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Stop Processing",
+                "Are you sure you want to stop the inference process?\n\nThe current video will finish processing.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.worker.request_stop()
+                self.btn_stop.setEnabled(False)
+    
     def on_inference_finished(self, success, message):
         """Handle inference completion"""
         self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         
         if success:
             QMessageBox.information(

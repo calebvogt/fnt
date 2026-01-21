@@ -1,1 +1,17 @@
+# Python compiled files
 *.pyc
+*.pyo
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# SAM model checkpoints (large files, downloaded locally)
+SAM_models/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
