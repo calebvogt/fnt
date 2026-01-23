@@ -20,7 +20,17 @@
 - Show the UWB tracking alongside the actual footage; 
 - 
 
+# Doric WiFP
+- RIP my old matlab code from changwoo and get it to work with the WiFP data. 
+- basically we want to replicate many of the features outlined here: https://neuro.doriclenses.com/pages/data-analysis-solutions
+
+
+
+# FED devices
+- make a basic pipeline and visualization tool; can likely rip fromm their own python based tool and just incorporate it here. 
+
 # USV
+- make my own USV detector to replace DASl; ML or other. 
 - USV analysis; implement unsupervised clustering, and quick plots feature
 - add ability to overlay the usv calls with the video, temporally aligned based on shared timestamp (show DAS detection overlay)
 - create UMAP of prairie vole vocalization types

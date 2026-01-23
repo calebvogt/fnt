@@ -21,6 +21,7 @@ dependencies = [
     "moviepy",
     "PyQt5",
     "requests>=2.31.0",
+    "h5py",  # For reading Doric .doric (HDF5) files
     # Video tracking dependencies (SAM 2)
     "torch>=2.5.1",
     "torchvision>=0.20.1",

@@ -501,37 +501,51 @@ class FNTMainWindow(QMainWindow):
         self.tabs.addTab(tab, "FED")
     
     def create_wifp_tab(self):
-        """Create the WiFP processing tab"""
+        """Create the WiFP (Wireless Fiber Photometry) processing tab"""
         tab = QWidget()
         layout = QVBoxLayout()
         
         # Description
-        desc = QLabel("Wireless Instantaneous Force Plate (WiFP) analysis tools")
+        desc = QLabel("Doric Wireless Fiber Photometry (WiFP) analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # WiFP processing group
-        group = QGroupBox("WiFP Analysis Tools")
-        group_layout = QGridLayout()
+        # Doric Processing group
+        doric_group = QGroupBox("Doric WiFP Processing")
+        doric_layout = QGridLayout()
         
-        # Placeholder for future WiFP tools
+        doric_buttons = [
+            ("Process .doric Files", "Batch process .doric files: calculate ΔF/F, sync with video, export CSV", self.run_doric_processor),
+            ("Explore .doric Structure", "View the internal HDF5 structure of a .doric file", self.run_doric_explorer),
+        ]
+        
+        self.create_button_grid(doric_layout, doric_buttons)
+        doric_group.setLayout(doric_layout)
+        layout.addWidget(doric_group)
+        
+        # Info panel
+        info_group = QGroupBox("About WiFP Processing")
+        info_layout = QVBoxLayout()
+        
         info_label = QLabel(
-            "<b>Coming Soon:</b> WiFP data analysis tools will be added here.<br><br>"
-            "Planned features:<br>"
-            "• WiFP data import and preprocessing<br>"
-            "• Force/weight measurement analysis<br>"
-            "• Temporal pattern visualization<br>"
-            "• Multi-plate synchronization<br>"
-            "• Integration with behavioral data"
+            "<b>Workflow:</b><br>"
+            "1. Record behavior video and fiber photometry with Doric WiFP system<br>"
+            "2. Use 'Process .doric Files' to calculate ΔF/F with isosbestic correction<br>"
+            "3. Outputs: CSV (Frame, Time, ΔF/F) + combined video with trace overlay<br><br>"
+            "<b>Supported:</b><br>"
+            "• Auto-detection of 470nm signal and 405/415nm isosbestic channels<br>"
+            "• Video synchronization using timestamps from .doric file<br>"
+            "• Batch processing of entire folders<br>"
+            "• Manual channel selection if auto-detection fails"
         )
         info_label.setTextFormat(Qt.RichText)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
         info_label.setWordWrap(True)
-        group_layout.addWidget(info_label, 0, 0)
+        info_layout.addWidget(info_label)
         
-        group.setLayout(group_layout)
-        layout.addWidget(group)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
         
         layout.addStretch()
         tab.setLayout(layout)
@@ -828,6 +842,56 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"GitHub CSV Transfer failed: {str(e)}")
     
+    # Doric WiFP Processing Methods
+    def run_doric_processor(self):
+        """Launch Doric WiFP Fiber Photometry Processor"""
+        try:
+            from fnt.DoricFP.doric_processor_pyqt import DoricProcessorWindow
+            
+            # Create and show the processor window
+            self.doric_processor_window = DoricProcessorWindow()
+            self.doric_processor_window.show()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", 
+                f"Failed to launch Doric Processor: {str(e)}\n\n"
+                "Make sure dependencies are installed:\n"
+                "pip install h5py scipy pandas numpy matplotlib opencv-python"
+            )
+    
+    def run_doric_explorer(self):
+        """Run the .doric file structure explorer"""
+        try:
+            from fnt.DoricFP.explore_doric_structure import main as explore_main
+            import subprocess
+            import sys
+            
+            # Select a .doric file
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Select .doric File", "",
+                "Doric Files (*.doric);;All Files (*.*)"
+            )
+            
+            if not file_path:
+                return
+            
+            # Run the explorer script in a terminal to see output
+            python_exe = sys.executable
+            script_path = Path(__file__).parent / "DoricFP" / "explore_doric_structure.py"
+            
+            # Run in new terminal window
+            if sys.platform == 'win32':
+                subprocess.Popen(
+                    ['start', 'cmd', '/k', python_exe, str(script_path), file_path],
+                    shell=True
+                )
+            else:
+                subprocess.Popen([python_exe, str(script_path), file_path])
+            
+            self.status_bar.showMessage(f"Exploring: {Path(file_path).name}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to explore .doric file: {str(e)}")
 
     def split_large_files(self):
         """Split large files into smaller chunks for GitHub"""
