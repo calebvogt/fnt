@@ -431,37 +431,45 @@ class FNTMainWindow(QMainWindow):
         """Create the RFID processing tab"""
         tab = QWidget()
         layout = QVBoxLayout()
-        
+
         # Description
-        desc = QLabel("RFID tracking and analysis tools")
+        desc = QLabel("RFID tracking and social behavior analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # RFID processing group
-        group = QGroupBox("RFID Analysis Tools")
+        group = QGroupBox("RFID Preprocessing Pipeline")
         group_layout = QGridLayout()
-        
-        # Placeholder for future RFID tools
-        info_label = QLabel(
-            "<b>Coming Soon:</b> RFID tracking and analysis tools will be added here.<br><br>"
-            "Planned features:<br>"
-            "• RFID data import and preprocessing<br>"
-            "• Social interaction analysis<br>"
-            "• Spatial tracking visualization<br>"
-            "• Integration with behavioral data"
-        )
-        info_label.setTextFormat(Qt.RichText)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
-        info_label.setWordWrap(True)
-        group_layout.addWidget(info_label, 0, 0)
-        
+
+        buttons = [
+            ("RFID Preprocessing Tool",
+             "Universal RFID preprocessing: raw data → movement bouts → GBI → social networks",
+             self.run_rfid_preprocessing),
+        ]
+
+        self.create_button_grid(group_layout, buttons)
         group.setLayout(group_layout)
         layout.addWidget(group)
-        
+
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "RFID")
+
+    def run_rfid_preprocessing(self):
+        """Launch RFID Preprocessing Tool"""
+        try:
+            from fnt.rfid.rfid_preprocessing_pyqt import RFIDPreprocessingWindow
+
+            self.rfid_preprocessing_window = RFIDPreprocessingWindow()
+            self.rfid_preprocessing_window.show()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to launch RFID tool: {str(e)}\n\n"
+                "Make sure dependencies are installed:\n"
+                "pip install networkx openpyxl"
+            )
     
     def create_fed_tab(self):
         """Create the FED processing tab"""
