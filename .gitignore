@@ -16,3 +16,4 @@ SAM_models/
 dist/
 build/
 *.pyc
+.DS_Store

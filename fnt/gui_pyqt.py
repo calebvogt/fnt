@@ -333,6 +333,7 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
         
         buttons = [
+            ("USV Detector", "Automatic detection of ultrasonic vocalizations", self.run_usv_detector),
             ("Compress Audio Files", "Compress WAV files for storage", self.run_compress_wavs),
             ("USV Heterodyne Processing", "Process ultrasonic recordings", self.run_usv_heterodyne),
             ("Trim Audio File", "Trim audio with spectrogram visualization and frequency filtering", self.run_audio_trim),
@@ -752,6 +753,17 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
     
     # USV Processing Methods - Call existing tkinter functions
+    def run_usv_detector(self):
+        """Launch USV Detector for automatic vocalization detection"""
+        try:
+            from fnt.usv.usv_detector_pyqt import USVDetectorWindow
+
+            # Create and show the USV detector window
+            self.usv_detector_window = USVDetectorWindow()
+            self.usv_detector_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"USV Detector failed: {str(e)}")
+
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""
         def func():
