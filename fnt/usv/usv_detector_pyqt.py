@@ -12,8 +12,9 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox,
     QGroupBox, QSpinBox, QDoubleSpinBox, QProgressBar,
-    QTextEdit, QComboBox, QCheckBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTextEdit, QComboBox, QTabWidget, QListWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -22,36 +23,44 @@ from .usv_detector import (
     USVDetectorConfig, DSPDetector, batch_process,
     get_prairie_vole_config, generate_summary
 )
+from .usv_detector.batch import process_single_file
 
 
 class DetectionWorker(QThread):
     """Worker thread for running detection without blocking the GUI."""
 
     progress = pyqtSignal(str, int, int)  # filename, current, total
+    file_complete = pyqtSignal(str, int, int)  # filename, current, total (emitted AFTER completion)
     finished = pyqtSignal(list)  # results
     error = pyqtSignal(str)  # error message
 
-    def __init__(self, input_folder: str, output_folder: str, config: USVDetectorConfig):
+    def __init__(self, input_files: list, config: USVDetectorConfig):
         super().__init__()
-        self.input_folder = input_folder
-        self.output_folder = output_folder
+        self.input_files = input_files  # List of WAV file paths
         self.config = config
         self._is_cancelled = False
 
     def run(self):
         """Run the detection process."""
         try:
-            def progress_callback(filename, current, total):
+            results = []
+            total = len(self.input_files)
+
+            for i, wav_path in enumerate(self.input_files):
                 if self._is_cancelled:
                     raise InterruptedError("Processing cancelled by user")
-                self.progress.emit(filename, current, total)
 
-            results = batch_process(
-                self.input_folder,
-                config=self.config,
-                output_folder=self.output_folder,
-                progress_callback=progress_callback
-            )
+                # Emit progress BEFORE processing (shows which file is being processed)
+                filename = os.path.basename(wav_path)
+                self.progress.emit(filename, i, total)
+
+                # Process the file
+                output_dir = os.path.dirname(wav_path)
+                result = process_single_file(wav_path, self.config, output_dir)
+                results.append(result)
+
+                # Emit file_complete AFTER processing is done
+                self.file_complete.emit(filename, i + 1, total)
 
             if not self._is_cancelled:
                 self.finished.emit(results)
@@ -71,8 +80,7 @@ class USVDetectorWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.input_folder = None
-        self.output_folder = None
+        self.input_files = []  # List of WAV file paths
         self.worker = None
         self.results = []
         self.initUI()
@@ -132,7 +140,7 @@ class USVDetectorWindow(QWidget):
                 background-color: #1e1e1e;
                 color: #cccccc;
             }
-            QTextEdit {
+            QTextEdit, QListWidget {
                 background-color: #1e1e1e;
                 color: #cccccc;
                 border: 1px solid #3f3f3f;
@@ -148,21 +156,6 @@ class USVDetectorWindow(QWidget):
             QProgressBar::chunk {
                 background-color: #0078d4;
                 border-radius: 2px;
-            }
-            QCheckBox {
-                color: #cccccc;
-                spacing: 5px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border: 1px solid #3f3f3f;
-                border-radius: 3px;
-                background-color: #1e1e1e;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #0078d4;
-                border-color: #0078d4;
             }
             QTableWidget {
                 background-color: #1e1e1e;
@@ -219,48 +212,45 @@ class USVDetectorWindow(QWidget):
         processing_tab = QWidget()
         processing_layout = QVBoxLayout()
 
-        # Folder selection group
-        folder_group = QGroupBox("Folders")
-        folder_layout = QVBoxLayout()
+        # Input selection group
+        input_group = QGroupBox("Input Selection")
+        input_layout = QVBoxLayout()
 
-        # Input folder
-        input_layout = QHBoxLayout()
-        input_layout.addWidget(QLabel("Input Folder:"))
-        self.lbl_input = QLabel("No folder selected")
-        self.lbl_input.setStyleSheet("color: #999999; font-style: italic;")
-        input_layout.addWidget(self.lbl_input, 1)
-        self.btn_input = QPushButton("Browse...")
-        self.btn_input.clicked.connect(self.select_input_folder)
-        input_layout.addWidget(self.btn_input)
-        folder_layout.addLayout(input_layout)
+        # Buttons row
+        btn_row = QHBoxLayout()
+        self.btn_add_folder = QPushButton("Add Folder")
+        self.btn_add_folder.clicked.connect(self.add_folder)
+        btn_row.addWidget(self.btn_add_folder)
 
-        # Output folder
-        output_layout = QHBoxLayout()
-        output_layout.addWidget(QLabel("Output Folder:"))
-        self.lbl_output = QLabel("Same as input")
-        self.lbl_output.setStyleSheet("color: #999999; font-style: italic;")
-        output_layout.addWidget(self.lbl_output, 1)
-        self.btn_output = QPushButton("Browse...")
-        self.btn_output.clicked.connect(self.select_output_folder)
-        output_layout.addWidget(self.btn_output)
-        folder_layout.addLayout(output_layout)
+        self.btn_add_files = QPushButton("Add Files")
+        self.btn_add_files.clicked.connect(self.add_files)
+        btn_row.addWidget(self.btn_add_files)
 
-        folder_group.setLayout(folder_layout)
-        processing_layout.addWidget(folder_group)
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear_files)
+        self.btn_clear.setStyleSheet("""
+            QPushButton {
+                background-color: #6c6c6c;
+            }
+            QPushButton:hover {
+                background-color: #5a5a5a;
+            }
+        """)
+        btn_row.addWidget(self.btn_clear)
+        btn_row.addStretch()
+        input_layout.addLayout(btn_row)
+
+        # File count label
+        self.lbl_file_count = QLabel("No files selected")
+        self.lbl_file_count.setStyleSheet("color: #999999; font-style: italic;")
+        input_layout.addWidget(self.lbl_file_count)
+
+        input_group.setLayout(input_layout)
+        processing_layout.addWidget(input_group)
 
         # Parameters group
         params_group = QGroupBox("Detection Parameters")
         params_layout = QVBoxLayout()
-
-        # Species preset
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(QLabel("Species Preset:"))
-        self.combo_preset = QComboBox()
-        self.combo_preset.addItems(["Prairie Vole", "Mouse", "Rat", "Custom"])
-        self.combo_preset.currentTextChanged.connect(self.on_preset_changed)
-        preset_layout.addWidget(self.combo_preset)
-        preset_layout.addStretch()
-        params_layout.addLayout(preset_layout)
 
         # Frequency range
         freq_layout = QHBoxLayout()
@@ -306,11 +296,6 @@ class USVDetectorWindow(QWidget):
         dur_layout.addWidget(self.spin_max_dur)
         dur_layout.addStretch()
         params_layout.addLayout(dur_layout)
-
-        # Classify calls checkbox
-        self.chk_classify = QCheckBox("Classify call types (sweep_up, inverted_u, flat, etc.)")
-        self.chk_classify.setChecked(True)
-        params_layout.addWidget(self.chk_classify)
 
         params_group.setLayout(params_layout)
         processing_layout.addWidget(params_group)
@@ -416,54 +401,55 @@ class USVDetectorWindow(QWidget):
         scrollbar = self.txt_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def select_input_folder(self):
-        """Select input folder."""
+    def add_folder(self):
+        """Add all WAV files from a folder."""
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Input Folder", ""
+            self, "Select Folder with WAV Files", ""
         )
         if folder:
-            self.input_folder = folder
-            self.lbl_input.setText(folder)
-            self.lbl_input.setStyleSheet("color: #cccccc;")
+            # Find all WAV files in folder (case-insensitive)
+            wav_files = list(Path(folder).glob("*.wav")) + list(Path(folder).glob("*.WAV"))
+            new_files = [str(f) for f in wav_files if str(f) not in self.input_files]
+
+            if new_files:
+                self.input_files.extend(new_files)
+                self.update_file_count()
+                self.log(f"Added {len(new_files)} WAV files from: {folder}")
+            else:
+                self.log(f"No new WAV files found in: {folder}")
+
+    def add_files(self):
+        """Add individual WAV files."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select WAV Files",
+            "",
+            "WAV Files (*.wav *.WAV);;All Files (*.*)"
+        )
+        if files:
+            new_files = [f for f in files if f not in self.input_files]
+            if new_files:
+                self.input_files.extend(new_files)
+                self.update_file_count()
+                self.log(f"Added {len(new_files)} WAV files")
+
+    def clear_files(self):
+        """Clear all selected files."""
+        self.input_files = []
+        self.update_file_count()
+        self.log("Cleared all files")
+
+    def update_file_count(self):
+        """Update the file count label and enable/disable process button."""
+        count = len(self.input_files)
+        if count == 0:
+            self.lbl_file_count.setText("No files selected")
+            self.lbl_file_count.setStyleSheet("color: #999999; font-style: italic;")
+            self.btn_process.setEnabled(False)
+        else:
+            self.lbl_file_count.setText(f"{count} WAV file(s) selected")
+            self.lbl_file_count.setStyleSheet("color: #cccccc;")
             self.btn_process.setEnabled(True)
-
-            # Count WAV files
-            wav_count = len(list(Path(folder).glob("*.wav")))
-            self.log(f"Selected input folder: {folder}")
-            self.log(f"Found {wav_count} WAV files")
-
-    def select_output_folder(self):
-        """Select output folder."""
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", ""
-        )
-        if folder:
-            self.output_folder = folder
-            self.lbl_output.setText(folder)
-            self.lbl_output.setStyleSheet("color: #cccccc;")
-            self.log(f"Selected output folder: {folder}")
-
-    def on_preset_changed(self, preset: str):
-        """Handle species preset change."""
-        if preset == "Prairie Vole":
-            self.spin_min_freq.setValue(25000)
-            self.spin_max_freq.setValue(65000)
-            self.spin_threshold.setValue(10.0)
-            self.spin_min_dur.setValue(5.0)
-            self.spin_max_dur.setValue(300.0)
-        elif preset == "Mouse":
-            self.spin_min_freq.setValue(30000)
-            self.spin_max_freq.setValue(100000)
-            self.spin_threshold.setValue(12.0)
-            self.spin_min_dur.setValue(3.0)
-            self.spin_max_dur.setValue(500.0)
-        elif preset == "Rat":
-            self.spin_min_freq.setValue(18000)
-            self.spin_max_freq.setValue(80000)
-            self.spin_threshold.setValue(10.0)
-            self.spin_min_dur.setValue(10.0)
-            self.spin_max_dur.setValue(2000.0)
-        # Custom: leave values as-is
 
     def get_config(self) -> USVDetectorConfig:
         """Get configuration from GUI values."""
@@ -473,13 +459,12 @@ class USVDetectorWindow(QWidget):
             energy_threshold_db=self.spin_threshold.value(),
             min_duration_ms=self.spin_min_dur.value(),
             max_duration_ms=self.spin_max_dur.value(),
-            classify_calls=self.chk_classify.isChecked(),
         )
 
     def start_processing(self):
         """Start the detection process."""
-        if not self.input_folder:
-            QMessageBox.warning(self, "No Input", "Please select an input folder.")
+        if not self.input_files:
+            QMessageBox.warning(self, "No Input", "Please add WAV files to process.")
             return
 
         # Validate parameters
@@ -489,20 +474,51 @@ class USVDetectorWindow(QWidget):
             QMessageBox.warning(self, "Invalid Parameters", "\n".join(errors))
             return
 
+        # Check for existing detection files
+        existing_files = []
+        for wav_path in self.input_files:
+            base_name = Path(wav_path).stem
+            output_dir = os.path.dirname(wav_path)
+            output_path = os.path.join(output_dir, f"{base_name}{config.output_suffix}.csv")
+            if os.path.exists(output_path):
+                existing_files.append(os.path.basename(output_path))
+
+        if existing_files:
+            # Prompt user about overwriting
+            n_existing = len(existing_files)
+            if n_existing <= 5:
+                file_list = "\n".join(existing_files)
+            else:
+                file_list = "\n".join(existing_files[:5]) + f"\n... and {n_existing - 5} more"
+
+            reply = QMessageBox.question(
+                self,
+                "Existing Files Found",
+                f"Found {n_existing} existing detection file(s):\n\n{file_list}\n\n"
+                "Do you want to overwrite these files?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                self.log("Processing cancelled - user chose not to overwrite existing files")
+                return
+
         # Update UI
         self.btn_process.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.input_files))
         self.lbl_status.setText("Starting...")
         self.results = []
         self.results_table.setRowCount(0)
 
-        output = self.output_folder or self.input_folder
-        self.log(f"Starting detection with config: {config.min_freq_hz}-{config.max_freq_hz} Hz")
+        self.log(f"Starting detection on {len(self.input_files)} files")
+        self.log(f"Config: {config.min_freq_hz}-{config.max_freq_hz} Hz, threshold={config.energy_threshold_db} dB")
 
         # Start worker thread
-        self.worker = DetectionWorker(self.input_folder, output, config)
+        self.worker = DetectionWorker(self.input_files, config)
         self.worker.progress.connect(self.on_progress)
+        self.worker.file_complete.connect(self.on_file_complete)
         self.worker.finished.connect(self.on_finished)
         self.worker.error.connect(self.on_error)
         self.worker.start()
@@ -515,10 +531,14 @@ class USVDetectorWindow(QWidget):
             self.btn_cancel.setEnabled(False)
 
     def on_progress(self, filename: str, current: int, total: int):
-        """Handle progress update."""
-        self.progress_bar.setMaximum(total)
+        """Handle progress update (called BEFORE processing starts)."""
+        self.lbl_status.setText(f"Processing {current + 1}/{total}: {filename}")
+
+    def on_file_complete(self, filename: str, current: int, total: int):
+        """Handle file completion (called AFTER processing finishes)."""
+        # Update progress bar AFTER file is complete
         self.progress_bar.setValue(current)
-        self.lbl_status.setText(f"Processing {current}/{total}: {filename}")
+        self.log(f"Completed: {filename}")
 
     def on_finished(self, results: list):
         """Handle processing completion."""
@@ -558,7 +578,7 @@ class USVDetectorWindow(QWidget):
             f"Detection complete!\n\n"
             f"Files processed: {len(successful)}\n"
             f"Total calls detected: {total_calls}\n\n"
-            f"Results saved to:\n{self.output_folder or self.input_folder}"
+            f"Results saved alongside input files."
         )
 
     def on_error(self, error_msg: str):
@@ -596,16 +616,18 @@ class USVDetectorWindow(QWidget):
 
     def open_output_folder(self):
         """Open the output folder in file explorer."""
-        folder = self.output_folder or self.input_folder
-        if folder and os.path.exists(folder):
-            import subprocess
-            import platform
-            if platform.system() == "Darwin":  # macOS
-                subprocess.run(["open", folder])
-            elif platform.system() == "Windows":
-                subprocess.run(["explorer", folder])
-            else:  # Linux
-                subprocess.run(["xdg-open", folder])
+        # Open the folder of the first file
+        if self.input_files:
+            folder = os.path.dirname(self.input_files[0])
+            if folder and os.path.exists(folder):
+                import subprocess
+                import platform
+                if platform.system() == "Darwin":  # macOS
+                    subprocess.run(["open", folder])
+                elif platform.system() == "Windows":
+                    subprocess.run(["explorer", folder])
+                else:  # Linux
+                    subprocess.run(["xdg-open", folder])
 
 
 def main():

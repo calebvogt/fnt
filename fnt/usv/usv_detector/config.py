@@ -29,7 +29,7 @@ class USVDetectorConfig:
         min_gap_ms: Minimum gap between calls to merge (ms)
         chunk_duration_s: Duration of chunks for processing long files (s)
         chunk_overlap_s: Overlap between chunks (s)
-        call_types: List of call type labels for classification
+        freq_samples: Number of evenly-spaced peak frequency samples per call
         output_suffix: Suffix for output annotation files
     """
 
@@ -59,15 +59,8 @@ class USVDetectorConfig:
     chunk_duration_s: float = 60.0      # Process in 60-second chunks
     chunk_overlap_s: float = 0.5        # Small overlap to avoid boundary issues
 
-    # Classification parameters
-    classify_calls: bool = True
-    call_types: List[str] = field(default_factory=lambda: [
-        "sweep_up", "sweep_down", "inverted_u", "u_shape", "flat", "complex", "unknown"
-    ])
-
-    # Classification thresholds
-    freq_modulation_threshold: float = 5000.0   # Hz change to count as modulated
-    slope_threshold: float = 50000.0            # Hz/s to distinguish sweep direction
+    # Frequency sampling
+    freq_samples: int = 5                       # Number of peak-frequency sample points per call (3-10)
 
     # Output
     output_suffix: str = "_usv_detections"

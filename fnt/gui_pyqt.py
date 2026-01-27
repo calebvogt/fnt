@@ -232,10 +232,14 @@ class FNTMainWindow(QMainWindow):
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
         text_layout.addWidget(title)
         
-        # Subtitle
-        subtitle = QLabel("Preprocessing and analysis toolbox for neurobehavioral data")
+        # Subtitle with timestamp
+        import time as _time
+        _this_file = os.path.abspath(__file__)
+        _mtime = os.path.getmtime(_this_file)
+        _ts = _time.strftime("%y%m%d %H%M%S %Z", _time.localtime(_mtime))
+        subtitle = QLabel(f"Updated: {_ts}  |  Donaldson Lab, U. Colorado Boulder")
         subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setFont(QFont("Arial", 11))
+        subtitle.setFont(QFont("Arial", 10))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
         text_layout.addWidget(subtitle)
         
@@ -321,28 +325,39 @@ class FNTMainWindow(QMainWindow):
         """Create the USV processing tab"""
         tab = QWidget()
         layout = QVBoxLayout()
-        
+
         # Description
         desc = QLabel("Ultrasonic vocalization analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
-        # USV processing group
-        group = QGroupBox("USV Processing Tools")
-        group_layout = QGridLayout()
-        
-        buttons = [
-            ("USV Detector", "Automatic detection of ultrasonic vocalizations", self.run_usv_detector),
+
+        # USV Analysis Tools group
+        analysis_group = QGroupBox("USV Analysis Tools")
+        analysis_layout = QGridLayout()
+
+        analysis_buttons = [
+            ("USV Studio", "Unified detection, labeling, and ML classification", self.run_usv_studio),
+        ]
+
+        self.create_button_grid(analysis_layout, analysis_buttons)
+        analysis_group.setLayout(analysis_layout)
+        layout.addWidget(analysis_group)
+
+        # Audio Processing Tools group
+        audio_group = QGroupBox("Audio Processing Tools")
+        audio_layout = QGridLayout()
+
+        audio_buttons = [
             ("Compress Audio Files", "Compress WAV files for storage", self.run_compress_wavs),
             ("USV Heterodyne Processing", "Process ultrasonic recordings", self.run_usv_heterodyne),
             ("Trim Audio File", "Trim audio with spectrogram visualization and frequency filtering", self.run_audio_trim),
         ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
+
+        self.create_button_grid(audio_layout, audio_buttons)
+        audio_group.setLayout(audio_layout)
+        layout.addWidget(audio_group)
+
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "USV")
@@ -752,17 +767,16 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
     
-    # USV Processing Methods - Call existing tkinter functions
-    def run_usv_detector(self):
-        """Launch USV Detector for automatic vocalization detection"""
+    # USV Processing Methods
+    def run_usv_studio(self):
+        """Launch USV Studio - unified detection, labeling, and ML tool"""
         try:
-            from fnt.usv.usv_detector_pyqt import USVDetectorWindow
+            from fnt.usv.usv_studio_pyqt import USVStudioWindow
 
-            # Create and show the USV detector window
-            self.usv_detector_window = USVDetectorWindow()
-            self.usv_detector_window.show()
+            self.usv_studio_window = USVStudioWindow()
+            self.usv_studio_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"USV Detector failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"USV Studio failed: {str(e)}")
 
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""

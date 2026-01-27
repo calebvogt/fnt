@@ -116,9 +116,8 @@ class DSPDetector:
         # Merge close calls
         calls = self._merge_close_calls(calls)
 
-        # Classify call types
-        if self.config.classify_calls:
-            calls = self._classify_calls(calls, frequencies, times, Sxx_db)
+        # Sample peak frequencies across each call
+        calls = self._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
 
         return calls
 
@@ -232,7 +231,10 @@ class DSPDetector:
             else:
                 mean_freq_hz = peak_freq_hz
 
-            freq_bandwidth_hz = frequencies[max_freq_idx] - frequencies[min_freq_idx]
+            # Actual frequency bounds of this call
+            call_min_freq_hz = frequencies[min_freq_idx]
+            call_max_freq_hz = frequencies[max_freq_idx]
+            freq_bandwidth_hz = call_max_freq_hz - call_min_freq_hz
             duration_ms = (stop_s - start_s) * 1000
             mean_power_db = np.mean(region_spec[region_spec > -99])
             max_power_db = np.max(region_spec)
@@ -240,7 +242,8 @@ class DSPDetector:
             calls.append({
                 'start_seconds': float(start_s),
                 'stop_seconds': float(stop_s),
-                'name': 'unknown',  # Will be classified later
+                'min_freq_hz': float(call_min_freq_hz),
+                'max_freq_hz': float(call_max_freq_hz),
                 'peak_freq_hz': float(peak_freq_hz),
                 'mean_freq_hz': float(mean_freq_hz),
                 'freq_bandwidth_hz': float(freq_bandwidth_hz),
@@ -280,11 +283,13 @@ class DSPDetector:
                 prev['stop_seconds'] = call['stop_seconds']
                 prev['duration_ms'] = (prev['stop_seconds'] - prev['start_seconds']) * 1000
 
-                # Update aggregate features
+                # Update aggregate features - expand frequency bounds to encompass both calls
                 prev['peak_freq_hz'] = max(prev['peak_freq_hz'], call['peak_freq_hz'])
                 prev['max_power_db'] = max(prev['max_power_db'], call['max_power_db'])
                 prev['mean_power_db'] = (prev['mean_power_db'] + call['mean_power_db']) / 2
-                prev['freq_bandwidth_hz'] = max(prev['freq_bandwidth_hz'], call['freq_bandwidth_hz'])
+                prev['min_freq_hz'] = min(prev.get('min_freq_hz', call['min_freq_hz']), call['min_freq_hz'])
+                prev['max_freq_hz'] = max(prev.get('max_freq_hz', call['max_freq_hz']), call['max_freq_hz'])
+                prev['freq_bandwidth_hz'] = prev['max_freq_hz'] - prev['min_freq_hz']
 
                 # Update internal indices
                 if '_end_idx' in call:
@@ -317,7 +322,7 @@ class DSPDetector:
 
         return deduplicated
 
-    def _classify_calls(
+    def _sample_peak_frequencies(
         self,
         calls: List[Dict],
         frequencies: np.ndarray,
@@ -325,111 +330,36 @@ class DSPDetector:
         Sxx_db: np.ndarray
     ) -> List[Dict]:
         """
-        Classify call types based on frequency trajectory.
+        Sample peak frequencies at evenly-spaced points across each call.
 
-        Prairie vole call types:
-        - sweep_up: Frequency increases over time
-        - sweep_down: Frequency decreases over time
-        - inverted_u: Frequency rises then falls
-        - u_shape: Frequency falls then rises
-        - flat: Minimal frequency change
-        - complex: Multiple direction changes
+        Adds peak_freq_1 ... peak_freq_N columns where N = config.freq_samples.
+        Each value is the frequency of maximum amplitude at that time sample.
         """
+        n_samples = getattr(self.config, 'freq_samples', 5)
+
         for call in calls:
-            # Get call region from spectrogram
             start_idx = call.get('_start_idx', 0)
             end_idx = call.get('_end_idx', Sxx_db.shape[1] - 1)
-
-            if end_idx <= start_idx:
-                call['name'] = 'unknown'
-                continue
-
-            # Extract call spectrogram
-            call_spec = Sxx_db[:, start_idx:end_idx+1]
-
-            # Get peak frequency over time
-            peak_freq_trajectory = frequencies[np.argmax(call_spec, axis=0)]
-
-            # Classify based on trajectory
-            call['name'] = self._classify_trajectory(peak_freq_trajectory)
 
             # Clean up internal indices
             call.pop('_start_idx', None)
             call.pop('_end_idx', None)
 
+            n_frames = end_idx - start_idx + 1
+            if n_frames < 1:
+                for i in range(1, n_samples + 1):
+                    call[f'peak_freq_{i}'] = float('nan')
+                continue
+
+            # Evenly-spaced indices across the call duration
+            sample_indices = np.linspace(start_idx, end_idx, n_samples, dtype=int)
+
+            for i, col_idx in enumerate(sample_indices, 1):
+                col_idx = min(col_idx, Sxx_db.shape[1] - 1)
+                peak_freq = frequencies[np.argmax(Sxx_db[:, col_idx])]
+                call[f'peak_freq_{i}'] = float(peak_freq)
+
         return calls
-
-    def _classify_trajectory(self, freq_trajectory: np.ndarray) -> str:
-        """
-        Classify call type based on frequency trajectory.
-
-        Args:
-            freq_trajectory: Array of peak frequencies over time
-
-        Returns:
-            Call type string
-        """
-        if len(freq_trajectory) < 2:
-            return 'unknown'
-
-        # Smooth the trajectory
-        if len(freq_trajectory) > 5:
-            freq_trajectory = np.convolve(
-                freq_trajectory,
-                np.ones(3) / 3,
-                mode='valid'
-            )
-
-        if len(freq_trajectory) < 2:
-            return 'unknown'
-
-        # Calculate frequency change
-        freq_start = freq_trajectory[0]
-        freq_end = freq_trajectory[-1]
-        freq_max = np.max(freq_trajectory)
-        freq_min = np.min(freq_trajectory)
-        max_idx = np.argmax(freq_trajectory)
-        min_idx = np.argmin(freq_trajectory)
-
-        total_change = freq_end - freq_start
-        freq_range = freq_max - freq_min
-
-        # Check for minimal modulation (flat call)
-        if freq_range < self.config.freq_modulation_threshold:
-            return 'flat'
-
-        # Calculate time-normalized slope
-        duration = len(freq_trajectory)
-        slope = total_change / duration if duration > 0 else 0
-
-        # Classification logic
-        # Check for inverted-U (rises then falls)
-        if max_idx > 0 and max_idx < len(freq_trajectory) - 1:
-            rise = freq_max - freq_start
-            fall = freq_max - freq_end
-            if rise > self.config.freq_modulation_threshold and fall > self.config.freq_modulation_threshold:
-                return 'inverted_u'
-
-        # Check for U-shape (falls then rises)
-        if min_idx > 0 and min_idx < len(freq_trajectory) - 1:
-            fall = freq_start - freq_min
-            rise = freq_end - freq_min
-            if fall > self.config.freq_modulation_threshold and rise > self.config.freq_modulation_threshold:
-                return 'u_shape'
-
-        # Check for monotonic sweep
-        if total_change > self.config.freq_modulation_threshold:
-            return 'sweep_up'
-        elif total_change < -self.config.freq_modulation_threshold:
-            return 'sweep_down'
-
-        # Check for complex modulation (multiple direction changes)
-        diff = np.diff(freq_trajectory)
-        sign_changes = np.sum(np.abs(np.diff(np.sign(diff))) == 2)
-        if sign_changes >= 2:
-            return 'complex'
-
-        return 'flat'
 
     def get_spectrogram(
         self,
