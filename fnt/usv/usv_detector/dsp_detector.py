@@ -116,8 +116,15 @@ class DSPDetector:
         # Merge close calls
         calls = self._merge_close_calls(calls)
 
-        # Sample peak frequencies across each call
-        calls = self._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
+        # Sample peak frequencies across each call (optional)
+        n_samples = getattr(self.config, 'freq_samples', 5)
+        if n_samples and n_samples > 0:
+            calls = self._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
+        else:
+            # Clean up internal indices
+            for call in calls:
+                call.pop('_start_idx', None)
+                call.pop('_end_idx', None)
 
         return calls
 

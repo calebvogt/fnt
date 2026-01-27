@@ -1218,12 +1218,16 @@ class USVStudioWindow(QMainWindow):
         fft_row.addWidget(self.spin_noverlap)
         adv_layout.addLayout(fft_row)
 
-        # Frequency samples
+        # Frequency samples (optional)
         freq_samp_row = QHBoxLayout()
-        freq_samp_row.addWidget(QLabel("Freq Samples:"))
+        self.chk_freq_samples = QCheckBox("Freq Samples:")
+        self.chk_freq_samples.setChecked(False)
+        self.chk_freq_samples.toggled.connect(lambda checked: self.spin_freq_samples.setEnabled(checked))
+        freq_samp_row.addWidget(self.chk_freq_samples)
         self.spin_freq_samples = QSpinBox()
         self.spin_freq_samples.setRange(3, 10)
         self.spin_freq_samples.setValue(5)
+        self.spin_freq_samples.setEnabled(False)
         self.spin_freq_samples.setToolTip("Number of evenly-spaced peak frequency samples per call")
         freq_samp_row.addWidget(self.spin_freq_samples)
         freq_samp_row.addStretch()
@@ -1971,7 +1975,7 @@ class USVStudioWindow(QMainWindow):
             'noise_percentile': self.spin_noise_pct.value(),
             'nperseg': self.spin_nperseg.value(),
             'noverlap': self.spin_noverlap.value(),
-            'freq_samples': self.spin_freq_samples.value(),
+            'freq_samples': self.spin_freq_samples.value() if self.chk_freq_samples.isChecked() else 0,
         }
 
         # Start worker
