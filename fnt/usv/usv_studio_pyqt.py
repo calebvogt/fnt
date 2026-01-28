@@ -2912,6 +2912,9 @@ class USVStudioWindow(QMainWindow):
         elif key == Qt.Key_R and self.btn_reject.isEnabled():
             self._flash_button(self.btn_reject)
             self.reject_detection()
+        elif key == Qt.Key_D and self.btn_delete.isEnabled():
+            self._flash_button(self.btn_delete)
+            self.delete_current()
         elif key == Qt.Key_Space and self.btn_play.isEnabled():
             self._flash_button(self.btn_play)
             self.toggle_playback()
