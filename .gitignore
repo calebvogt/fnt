@@ -18,3 +18,4 @@ build/
 *.pyc
 .DS_Store
 *.wav
+*.pyc
