@@ -177,6 +177,7 @@ class FNTMainWindow(QMainWindow):
         self.create_rfid_tab()
         self.create_fed_tab()
         self.create_wifp_tab()
+        self.create_imaging_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -574,7 +575,57 @@ class FNTMainWindow(QMainWindow):
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "WiFP")
-    
+
+    def create_imaging_tab(self):
+        """Create the Imaging tab for microscopy analysis"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        # Description
+        desc = QLabel("Microscopy image viewing and processing tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        # Imaging tools group
+        group = QGroupBox("Imaging Tools")
+        group_layout = QGridLayout()
+
+        buttons = [
+            ("CZI Viewer", "View and process Zeiss CZI microscopy images with false coloring", self.run_czi_viewer),
+        ]
+
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+
+        # Info panel
+        info_group = QGroupBox("About CZI Viewer")
+        info_layout = QVBoxLayout()
+
+        info_label = QLabel(
+            "<b>Features:</b><br>"
+            "• Load and view multi-channel Zeiss CZI microscopy files<br>"
+            "• False color channels (GFP green, Cy3 magenta, etc.)<br>"
+            "• Adjust brightness, contrast, and gamma<br>"
+            "• Toggle channels on/off and view merged composite<br>"
+            "• Add text annotations to images<br>"
+            "• Export processed images to PNG or TIFF<br><br>"
+            "<b>Requirements:</b><br>"
+            "pip install aicspylibczi fsspec Pillow"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Imaging")
+
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -833,6 +884,27 @@ class FNTMainWindow(QMainWindow):
             plot_uwb_path()
         self.run_function_safely(func, "UWB Path Plotting")
     
+    # Imaging Methods
+    def run_czi_viewer(self):
+        """Launch CZI Viewer for microscopy images"""
+        try:
+            from fnt.imaging.czi_viewer_pyqt import CZIViewerWindow
+
+            self.czi_viewer_window = CZIViewerWindow()
+            self.czi_viewer_window.show()
+        except ImportError as e:
+            if "aicspylibczi" in str(e) or "No module named" in str(e):
+                QMessageBox.warning(
+                    self, "Missing Dependencies",
+                    "CZI file support requires additional packages.\n\n"
+                    "Install with:\n"
+                    "pip install aicspylibczi fsspec Pillow"
+                )
+            else:
+                QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+
     # Video Tracking Methods
     def run_mask_pose_tracker(self):
         """Launch Mask Pose Tracker with SAM"""
