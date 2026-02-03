@@ -33,6 +33,10 @@ class TextAnnotation:
     y: int
     font_size: int = 24
     color: str = "white"
+    rotation: float = 0.0  # Rotation in degrees
+    # Computed bounding box (set after rendering)
+    width: int = 0
+    height: int = 0
 
 
 class CZIImageProcessor:
