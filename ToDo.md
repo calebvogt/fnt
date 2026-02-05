@@ -51,5 +51,60 @@
 
 # Sleap EthoScope / Behavioral Catagorizer
 - create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
-- 
+-
+
+
+# Imaging Tool (CZI Viewer)
+
+## Completed
+- [x] CZI file loading with channel detection
+- [x] Per-channel brightness, contrast, gamma, sharpness adjustments
+- [x] Brightness thresholding with dual-handle slider
+- [x] Rolling ball and Gaussian background subtraction with downsampling
+- [x] False coloring with customizable palette
+- [x] Scale bar from metadata (draggable position)
+- [x] Text and shape annotations (arrow, line, circle, rectangle, freehand)
+- [x] Export to PNG/TIFF with annotations and scale bar
+- [x] Export settings JSON for traceability
+- [x] Per-file settings preservation during navigation
+
+## Cell Counting / Quantification Module (Roadmap)
+
+### Overview
+Add a "Quantification" section below Export in the left panel for automated cell/fiber counting on fluorescence microscopy images.
+
+### Phase 1: Basic Cell Counting
+- [ ] Intensity thresholding with adjustable threshold levels
+- [ ] Binary mask preview overlay on the image
+- [ ] Particle analysis with size filtering (min/max area in µm²)
+- [ ] Watershed separation for touching cells
+- [ ] Results table: count, mean area, total area, mean intensity
+
+### Phase 2: Multi-Channel Analysis
+- [ ] Count cells per channel independently
+- [ ] Colocalization analysis (% overlap between channels)
+- [ ] Cell-by-cell intensity measurements per channel
+
+### Phase 3: ROI-Based Counting
+- [ ] Draw ROI regions for localized counting
+- [ ] Compare counts across ROIs
+- [ ] Density calculations (cells per mm²)
+
+### Phase 4: Fiber Quantification
+- [ ] Skeletonization for fiber/neurite tracing
+- [ ] Total fiber length measurement
+- [ ] Branch point detection and counting
+- [ ] Fiber density per area
+
+### Phase 5: Export & Reporting
+- [ ] "Export Analysis" button
+- [ ] CSV export with all measurements
+- [ ] Overlay export showing detected objects
+- [ ] Batch processing across all loaded files
+
+### Technical Considerations
+- Use scikit-image for segmentation (threshold_otsu, watershed, label)
+- Consider deep learning option (Cellpose, StarDist) for advanced segmentation
+- Results should be linked to the current display settings for reproducibility
+- All measurements should use calibrated units (µm, µm²) when pixel size is available
 

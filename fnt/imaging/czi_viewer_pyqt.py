@@ -7,7 +7,9 @@ Follows the FNT pattern: left panel (controls) + right panel (image preview).
 import os
 import sys
 import math
+import json
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1365,13 +1367,11 @@ class ChannelControlWidget(QWidget):
     """Widget for controlling a single channel's display settings."""
 
     settings_changed = pyqtSignal()
-    roi_requested = pyqtSignal(int)  # Emits channel index when Draw ROI is clicked
 
     def __init__(self, channel_idx: int, channel_name: str,
                  suggested_color: str = "gray", parent=None):
         super().__init__(parent)
         self.channel_idx = channel_idx
-        self._bg_roi_value = 0.0
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 4, 0, 4)
@@ -1505,7 +1505,7 @@ class ChannelControlWidget(QWidget):
         lbl.setStyleSheet(label_style)
         row7.addWidget(lbl)
         self.bg_method_combo = QComboBox()
-        self.bg_method_combo.addItems(["None", "Rolling Ball", "Gaussian", "ROI"])
+        self.bg_method_combo.addItems(["None", "Rolling Ball", "Gaussian"])
         self.bg_method_combo.setFixedWidth(90)
         self.bg_method_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.bg_method_combo.currentTextChanged.connect(self._on_bg_method_changed)
@@ -1523,9 +1523,13 @@ class ChannelControlWidget(QWidget):
         lbl.setStyleSheet(label_style)
         bg_r_layout.addWidget(lbl)
         self.bg_radius_slider = QSlider(Qt.Horizontal)
-        self.bg_radius_slider.setRange(1, 200)
+        self.bg_radius_slider.setRange(1, 500)
         self.bg_radius_slider.setValue(50)
         self.bg_radius_slider.setFixedHeight(16)
+        self.bg_radius_slider.setToolTip(
+            "Radius should be larger than the largest foreground object.\n"
+            "Typical values: 50-200 for cells, 200-500 for large structures."
+        )
         # Debounce: update label immediately but delay recompute by 400ms
         self._bg_radius_debounce_timer = QTimer()
         self._bg_radius_debounce_timer.setSingleShot(True)
@@ -1539,21 +1543,6 @@ class ChannelControlWidget(QWidget):
         bg_r_layout.addWidget(self.bg_radius_val)
         main_layout.addWidget(self.bg_radius_row)
         self.bg_radius_row.hide()
-
-        # Row 7c: Draw ROI button (hidden by default, shown for ROI method)
-        self.bg_roi_row = QWidget()
-        roi_layout = QHBoxLayout(self.bg_roi_row)
-        roi_layout.setContentsMargins(0, 0, 0, 0)
-        roi_layout.setSpacing(4)
-        self.btn_draw_roi = QPushButton("Draw ROI")
-        self.btn_draw_roi.clicked.connect(lambda: self.roi_requested.emit(self.channel_idx))
-        roi_layout.addWidget(self.btn_draw_roi)
-        self.bg_roi_value_label = QLabel("ROI: —")
-        self.bg_roi_value_label.setStyleSheet("font-size: 9px; color: #aaaaaa;")
-        roi_layout.addWidget(self.bg_roi_value_label)
-        roi_layout.addStretch()
-        main_layout.addWidget(self.bg_roi_row)
-        self.bg_roi_row.hide()
 
         # Separator line
         sep = QWidget()
@@ -1590,15 +1579,8 @@ class ChannelControlWidget(QWidget):
 
     def _on_bg_method_changed(self, method_text: str):
         is_radius = method_text in ("Rolling Ball", "Gaussian")
-        is_roi = method_text == "ROI"
         self.bg_radius_row.setVisible(is_radius)
-        self.bg_roi_row.setVisible(is_roi)
         self._on_change()
-
-    def set_roi_value(self, value: float):
-        """Set the ROI background value (called externally after ROI drawing)."""
-        self._bg_roi_value = value
-        self.bg_roi_value_label.setText(f"ROI: {value:.4f}")
 
     def get_settings(self) -> ChannelDisplaySettings:
         """Get current settings for this channel."""
@@ -1606,7 +1588,6 @@ class ChannelControlWidget(QWidget):
             "None": "none",
             "Rolling Ball": "rolling_ball",
             "Gaussian": "gaussian",
-            "ROI": "roi",
         }
         return ChannelDisplaySettings(
             enabled=self.enabled_cb.isChecked(),
@@ -1620,7 +1601,6 @@ class ChannelControlWidget(QWidget):
             threshold_high=self.thresh_slider.high_value,
             bg_subtract_method=method_map.get(self.bg_method_combo.currentText(), "none"),
             bg_subtract_radius=float(self.bg_radius_slider.value()),
-            bg_subtract_roi_value=self._bg_roi_value,
         )
 
     def reset(self):
@@ -1634,8 +1614,6 @@ class ChannelControlWidget(QWidget):
         self.thresh_range_label.setText("0.00–1.00")
         self.bg_method_combo.setCurrentText("None")
         self.bg_radius_slider.setValue(50)
-        self._bg_roi_value = 0.0
-        self.bg_roi_value_label.setText("ROI: —")
 
     def set_enabled(self, enabled: bool):
         self.enabled_cb.setChecked(enabled)
@@ -1660,7 +1638,7 @@ class ChannelControlWidget(QWidget):
         # BG subtraction settings
         method_reverse = {
             "none": "None", "rolling_ball": "Rolling Ball",
-            "gaussian": "Gaussian", "roi": "ROI",
+            "gaussian": "Gaussian",
         }
         self.bg_method_combo.setCurrentText(method_reverse.get(settings.bg_subtract_method, "None"))
         self.bg_radius_slider.setValue(int(settings.bg_subtract_radius))
@@ -2340,7 +2318,6 @@ class CZIViewerWindow(QMainWindow):
                 channel_info.suggested_color
             )
             ctrl.settings_changed.connect(self._on_channel_changed)
-            ctrl.roi_requested.connect(self._on_channel_roi_requested)
             self.channel_layout.insertWidget(self.channel_layout.count() - 1, ctrl)  # Before Reset button
             self.channel_controls[channel_info.index] = ctrl
 
@@ -2665,70 +2642,6 @@ class CZIViewerWindow(QMainWindow):
             self.annotation_list.addItem(f'🔷 {shape.shape_type} ({shape.color}, {shape.line_style})')
 
     # =========================================================================
-    # Background subtraction (per-channel ROI support)
-    # =========================================================================
-
-    def _on_channel_roi_requested(self, channel_idx: int):
-        """Enter ROI drawing mode for a specific channel's background subtraction."""
-        if self.image_data is None:
-            QMessageBox.warning(self, "No Image", "Load an image first")
-            return
-        self._roi_target_channel_idx = channel_idx
-        self.preview.drawing_mode = ""
-        self.preview.annotation_mode = False
-        self.preview.roi_mode = True
-        self.preview.update()
-        self.status_bar.showMessage(f"Draw a rectangle on a background region (Channel {channel_idx})")
-
-    def _on_roi_drawn(self, x: int, y: int, w: int, h: int):
-        """Handle ROI drawn on the preview."""
-        if self.image_data is None:
-            return
-
-        ch_idx = getattr(self, '_roi_target_channel_idx', None)
-        if ch_idx is None:
-            return
-
-        channel_data = self.image_data.channel_data.get(ch_idx)
-        if channel_data is not None:
-            # Clamp ROI to image bounds
-            x = max(0, min(x, channel_data.shape[1] - 1))
-            y = max(0, min(y, channel_data.shape[0] - 1))
-            x2 = min(x + w, channel_data.shape[1])
-            y2 = min(y + h, channel_data.shape[0])
-
-            # Bounds check: if ROI area is 0, show error and return
-            if x2 <= x or y2 <= y:
-                self.status_bar.showMessage("Error: ROI area is 0. Please draw a larger rectangle.")
-                self.preview.roi_rect = None
-                self.preview.update()
-                return
-
-            # Calculate median of ROI
-            roi_data = self.processor.normalize_image(channel_data[y:y2, x:x2])
-            roi_value = float(np.median(roi_data))
-
-            # Update the channel control widget
-            ctrl = self.channel_controls.get(ch_idx)
-            ch_name = "Unknown"
-            if ctrl:
-                ctrl.set_roi_value(roi_value)
-                # Get channel name from metadata
-                for ch_info in self.image_data.metadata.channels:
-                    if ch_info.index == ch_idx:
-                        ch_name = ch_info.name
-                        break
-
-            # Clear ROI overlay
-            self.preview.roi_rect = None
-            self.preview.update()
-
-            self.status_bar.showMessage(
-                f"BG subtracted: ROI median = {roi_value:.4f} applied to channel {ch_name}"
-            )
-            self._update_display()
-
-    # =========================================================================
     # Scale bar / Image info
     # =========================================================================
 
@@ -2771,15 +2684,59 @@ class CZIViewerWindow(QMainWindow):
     # Export
     # =========================================================================
 
+    def _build_export_settings_dict(self) -> dict:
+        """Build a dictionary of all current settings for export traceability."""
+        settings = self._get_current_settings()
+        export_dict = {
+            'source_file': self.image_data.metadata.filepath,
+            'export_date': datetime.now().isoformat(),
+            'image_dimensions': {
+                'width': self.image_data.metadata.width,
+                'height': self.image_data.metadata.height,
+            },
+            'pixel_size_um': self.image_data.metadata.pixel_size_um,
+            'channels': {},
+            'scale_bar': {
+                'visible': self.preview.show_scale_bar,
+                'position': list(self.preview.scale_bar_pos) if self.preview.scale_bar_pos else None,
+            },
+            'annotations': {
+                'text_count': len(self.processor.annotations),
+                'shape_count': len(self.processor.shape_annotations),
+            }
+        }
+        # Add per-channel settings
+        for idx, s in settings.items():
+            ch_name = f"channel_{idx}"
+            for ch_info in self.image_data.metadata.channels:
+                if ch_info.index == idx:
+                    ch_name = ch_info.name
+                    break
+            export_dict['channels'][ch_name] = {
+                'enabled': s.enabled,
+                'color': s.color,
+                'brightness': s.brightness,
+                'contrast': s.contrast,
+                'gamma': s.gamma,
+                'sharpness': s.sharpness,
+                'threshold_enabled': s.threshold_enabled,
+                'threshold_low': s.threshold_low,
+                'threshold_high': s.threshold_high,
+                'bg_subtract_method': s.bg_subtract_method,
+                'bg_subtract_radius': s.bg_subtract_radius,
+            }
+        return export_dict
+
     def _export_current(self):
-        """Export current image."""
+        """Export current image with companion JSON settings file."""
         if self.image_data is None:
             QMessageBox.warning(self, "No Image", "Load an image first")
             return
 
         ext = self.export_format.currentText().lower()
         source_dir = str(Path(self.image_data.metadata.filepath).parent)
-        default_name = Path(self.image_data.metadata.filepath).stem + f"_processed.{ext}"
+        date_suffix = datetime.now().strftime('%Y%m%d')
+        default_name = Path(self.image_data.metadata.filepath).stem + f"_{date_suffix}.{ext}"
         default_path = os.path.join(source_dir, default_name)
 
         filepath, _ = QFileDialog.getSaveFileName(
@@ -2804,12 +2761,19 @@ class CZIViewerWindow(QMainWindow):
                 self.processor.export_image(merged, filepath,
                                             include_annotations=True,
                                             scale_bar_info=scale_bar_info)
-                self.status_bar.showMessage(f"Exported: {filepath}")
+
+                # Write companion JSON with settings for traceability
+                json_path = str(Path(filepath).with_suffix('.json'))
+                export_settings = self._build_export_settings_dict()
+                with open(json_path, 'w') as f:
+                    json.dump(export_settings, f, indent=2)
+
+                self.status_bar.showMessage(f"Exported: {filepath} + settings.json")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", str(e))
 
     def _export_all(self):
-        """Export all loaded images."""
+        """Export all loaded images with companion JSON settings files."""
         if not self.czi_files:
             QMessageBox.warning(self, "No Files", "No files loaded")
             return
@@ -2820,6 +2784,7 @@ class CZIViewerWindow(QMainWindow):
             return
 
         ext = self.export_format.currentText().lower()
+        date_suffix = datetime.now().strftime('%Y%m%d')
         exported = 0
 
         for filepath in self.czi_files:
@@ -2830,7 +2795,7 @@ class CZIViewerWindow(QMainWindow):
                 settings = self._get_current_settings()
                 merged = self.processor.merge_channels(data.channel_data, settings)
 
-                output_name = Path(filepath).stem + f"_processed.{ext}"
+                output_name = Path(filepath).stem + f"_{date_suffix}.{ext}"
                 output_path = os.path.join(folder, output_name)
                 # Build scale bar info if visible
                 scale_bar_info = None
@@ -2842,6 +2807,50 @@ class CZIViewerWindow(QMainWindow):
                 self.processor.export_image(merged, output_path,
                                             include_annotations=False,
                                             scale_bar_info=scale_bar_info)
+
+                # Write companion JSON with settings for traceability
+                json_path = str(Path(output_path).with_suffix('.json'))
+                export_settings = {
+                    'source_file': filepath,
+                    'export_date': datetime.now().isoformat(),
+                    'image_dimensions': {
+                        'width': data.metadata.width,
+                        'height': data.metadata.height,
+                    },
+                    'pixel_size_um': data.metadata.pixel_size_um,
+                    'channels': {},
+                    'scale_bar': {
+                        'visible': self.preview.show_scale_bar,
+                        'position': list(self.preview.scale_bar_pos) if self.preview.scale_bar_pos else None,
+                    },
+                    'annotations': {
+                        'text_count': 0,
+                        'shape_count': 0,
+                    }
+                }
+                # Add per-channel settings
+                for idx, s in settings.items():
+                    ch_name = f"channel_{idx}"
+                    for ch_info in data.metadata.channels:
+                        if ch_info.index == idx:
+                            ch_name = ch_info.name
+                            break
+                    export_settings['channels'][ch_name] = {
+                        'enabled': s.enabled,
+                        'color': s.color,
+                        'brightness': s.brightness,
+                        'contrast': s.contrast,
+                        'gamma': s.gamma,
+                        'sharpness': s.sharpness,
+                        'threshold_enabled': s.threshold_enabled,
+                        'threshold_low': s.threshold_low,
+                        'threshold_high': s.threshold_high,
+                        'bg_subtract_method': s.bg_subtract_method,
+                        'bg_subtract_radius': s.bg_subtract_radius,
+                    }
+                with open(json_path, 'w') as f:
+                    json.dump(export_settings, f, indent=2)
+
                 exported += 1
 
             except Exception as e:
@@ -2849,7 +2858,7 @@ class CZIViewerWindow(QMainWindow):
 
         QMessageBox.information(
             self, "Export Complete",
-            f"Exported {exported} of {len(self.czi_files)} files to:\n{folder}"
+            f"Exported {exported} of {len(self.czi_files)} files (+ settings.json) to:\n{folder}"
         )
 
     # =========================================================================
