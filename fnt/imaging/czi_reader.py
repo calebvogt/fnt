@@ -43,9 +43,14 @@ class CZIMetadata:
     filepath: str
     dimensions: Dict[str, int] = field(default_factory=dict)
     pixel_size_um: Optional[float] = None
+    pixel_size_y_um: Optional[float] = None
+    pixel_size_z_um: Optional[float] = None
     objective: Optional[str] = None
+    magnification: Optional[float] = None
+    numerical_aperture: Optional[float] = None
     acquisition_date: Optional[str] = None
     channels: List[CZIChannelInfo] = field(default_factory=list)
+    raw_xml: Optional[str] = None
 
     @property
     def width(self) -> int:
@@ -234,7 +239,100 @@ class CZIFileReader:
             channels=channels
         )
 
+        # Parse XML metadata for pixel sizes, objective, channel names, etc.
+        self._parse_xml_metadata()
+
         return self._metadata
+
+    def _parse_xml_metadata(self):
+        """Parse CZI XML metadata for physical dimensions, objective info, etc."""
+        if self._metadata is None or self._czi is None:
+            return
+
+        try:
+            import xml.etree.ElementTree as ET
+
+            # Get raw XML from CZI file
+            xml_str = self._czi.meta
+            if xml_str is None:
+                return
+
+            # Store raw XML for debugging
+            if isinstance(xml_str, str):
+                self._metadata.raw_xml = xml_str
+                root = ET.fromstring(xml_str)
+            else:
+                # Some versions return an ElementTree directly
+                root = xml_str
+                self._metadata.raw_xml = ET.tostring(root, encoding='unicode')
+
+            # --- Physical pixel size ---
+            # CZI stores scaling in meters
+            scaling = root.find('.//Scaling/Items')
+            if scaling is not None:
+                for distance in scaling.findall('Distance'):
+                    dim_id = distance.get('Id')
+                    value_elem = distance.find('Value')
+                    if value_elem is not None and value_elem.text:
+                        try:
+                            val_m = float(value_elem.text)
+                            val_um = val_m * 1e6  # meters to micrometers
+                            if dim_id == 'X':
+                                self._metadata.pixel_size_um = val_um
+                            elif dim_id == 'Y':
+                                self._metadata.pixel_size_y_um = val_um
+                            elif dim_id == 'Z':
+                                self._metadata.pixel_size_z_um = val_um
+                        except (ValueError, TypeError):
+                            pass
+
+            # --- Objective info ---
+            objective = root.find('.//Instrument/Objectives/Objective')
+            if objective is not None:
+                name_elem = objective.find('Name')
+                if name_elem is not None and name_elem.text:
+                    self._metadata.objective = name_elem.text
+
+                mag_elem = objective.find('NominalMagnification')
+                if mag_elem is not None and mag_elem.text:
+                    try:
+                        self._metadata.magnification = float(mag_elem.text)
+                    except (ValueError, TypeError):
+                        pass
+
+                na_elem = objective.find('LensNA')
+                if na_elem is not None and na_elem.text:
+                    try:
+                        self._metadata.numerical_aperture = float(na_elem.text)
+                    except (ValueError, TypeError):
+                        pass
+
+            # --- Acquisition date ---
+            acq_date = root.find('.//AcquisitionDateAndTime')
+            if acq_date is not None and acq_date.text:
+                self._metadata.acquisition_date = acq_date.text
+
+            # --- Channel names from XML (better than generic "Channel N") ---
+            channels_elem = root.find('.//Dimensions/Channels')
+            if channels_elem is not None:
+                xml_channels = channels_elem.findall('Channel')
+                for i, ch_elem in enumerate(xml_channels):
+                    ch_name = ch_elem.get('Name') or ch_elem.get('Id')
+                    if ch_name and i < len(self._metadata.channels):
+                        self._metadata.channels[i].name = ch_name
+                        self._metadata.channels[i].suggested_color = _suggest_color_from_name(ch_name)
+
+                        # Try to get wavelength
+                        exc_elem = ch_elem.find('.//ExcitationWavelength')
+                        if exc_elem is not None and exc_elem.text:
+                            try:
+                                self._metadata.channels[i].wavelength_nm = float(exc_elem.text)
+                            except (ValueError, TypeError):
+                                pass
+
+        except Exception as e:
+            # Don't fail on metadata parsing errors - just skip
+            print(f"Warning: Could not parse CZI XML metadata: {e}")
 
     def _scan_with_aicsimageio(self) -> CZIMetadata:
         """Scan using aicsimageio."""

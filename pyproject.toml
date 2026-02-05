@@ -22,6 +22,10 @@ dependencies = [
     "PyQt5",
     "requests>=2.31.0",
     "h5py",  # For reading Doric .doric (HDF5) files
+    "scikit-image",  # For rolling ball background subtraction in imaging module
+    "aicspylibczi>=3.1.1",  # For reading Zeiss CZI microscopy files
+    "fsspec",  # Required by aicspylibczi
+    "Pillow",  # For image export and annotation rendering
     "networkx>=3.0",  # For RFID social network analysis
     # Video tracking dependencies (SAM 2)
     "torch>=2.5.1",
