@@ -9,12 +9,18 @@ This module provides tools for:
 - Scale bar overlay from CZI metadata
 - Interactive text annotations and shape drawing
 - Image export
+- Automated cell/particle counting and quantification
 """
 
 try:
     from .czi_reader import CZIFileReader, CZIChannelInfo, CZIMetadata, CZIImageData
     from .image_processor import (
         CZIImageProcessor, ChannelDisplaySettings, TextAnnotation, ShapeAnnotation
+    )
+    from .quantification import (
+        ImageQuantifier, QuantificationResult, QuantificationConfig, ParticleResult,
+        MultiChannelConfig, MultiChannelResult, ColocalizationResult,
+        ROIDefinition, ROIDensityResult, ROIChannelMetrics,
     )
 
     __all__ = [
@@ -26,6 +32,16 @@ try:
         'ChannelDisplaySettings',
         'TextAnnotation',
         'ShapeAnnotation',
+        'ImageQuantifier',
+        'QuantificationResult',
+        'QuantificationConfig',
+        'ParticleResult',
+        'MultiChannelConfig',
+        'MultiChannelResult',
+        'ColocalizationResult',
+        'ROIDefinition',
+        'ROIDensityResult',
+        'ROIChannelMetrics',
     ]
 except ImportError:
     # Dependencies not installed

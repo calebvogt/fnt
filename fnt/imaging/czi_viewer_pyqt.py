@@ -68,9 +68,6 @@ class ImagePreviewWidget(QWidget):
     shape_selected = pyqtSignal(int)  # shape index
     shape_modified = pyqtSignal()  # shape was moved/resized
 
-    # ROI drawing signal
-    roi_drawn = pyqtSignal(int, int, int, int)  # x, y, w, h in image coords
-
     # Drawing mode exited signal (Escape pressed)
     drawing_mode_exited = pyqtSignal()
 
@@ -124,11 +121,6 @@ class ImagePreviewWidget(QWidget):
         self.selected_shape_idx: int = -1
         self.active_shape_handle: int = self.HANDLE_NONE
         self.drag_start_shape_data: Optional[dict] = None
-
-        # ROI drawing state
-        self.roi_mode: bool = False
-        self.roi_rect: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h in image coords
-        self.roi_start_pos: Optional[Tuple[float, float]] = None
 
         # Scale bar state
         self.show_scale_bar: bool = True
@@ -391,10 +383,6 @@ class ImagePreviewWidget(QWidget):
         if self.current_draw_shape is not None:
             self._draw_single_shape(painter, self.current_draw_shape, is_preview=True)
 
-        # Draw ROI rectangle overlay
-        if self.roi_rect is not None:
-            self._draw_roi_overlay(painter)
-
         # Draw scale bar
         if self.show_scale_bar and self.pixel_size_um > 0:
             self._draw_scale_bar(painter)
@@ -418,12 +406,6 @@ class ImagePreviewWidget(QWidget):
             painter.setPen(QColor(255, 255, 0))
             painter.setFont(QFont("Arial", 10, QFont.Bold))
             painter.drawText(10, 38, "Press Escape to stop drawing")
-        elif self.roi_mode:
-            painter.setPen(QPen(QColor(255, 100, 0), 2))
-            painter.drawRect(2, 2, self.width() - 4, self.height() - 4)
-            painter.setPen(QColor(255, 100, 0))
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(10, 20, "Draw ROI: click and drag a rectangle")
 
     def _draw_annotations(self, painter: QPainter):
         """Draw all annotations with their text and selection handles."""
@@ -621,20 +603,6 @@ class ImagePreviewWidget(QWidget):
         painter.setPen(QPen(QColor(0, 120, 215), 1))
         painter.drawRect(QRectF(pos.x() - hs/2, pos.y() - hs/2, hs, hs))
 
-    def _draw_roi_overlay(self, painter: QPainter):
-        """Draw the ROI rectangle overlay."""
-        if self.roi_rect is None:
-            return
-        x, y, w, h = self.roi_rect
-        tl = self._image_to_widget_coords(x, y)
-        br = self._image_to_widget_coords(x + w, y + h)
-        pen = QPen(QColor(255, 100, 0), 2, Qt.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(QBrush(QColor(255, 100, 0, 40)))
-        painter.drawRect(QRectF(tl, br))
-        painter.setPen(QColor(255, 100, 0))
-        painter.setFont(QFont("Arial", 9))
-        painter.drawText(int(tl.x()) + 4, int(tl.y()) - 4, "ROI")
 
     def _draw_scale_bar(self, painter: QPainter):
         """Draw a scale bar (draggable). Default position: bottom-right corner."""
@@ -848,13 +816,6 @@ class ImagePreviewWidget(QWidget):
                 self.update()
                 return
 
-            # ROI drawing mode
-            if self.roi_mode and img_coords:
-                self.roi_start_pos = img_coords
-                self.roi_rect = (int(img_coords[0]), int(img_coords[1]), 0, 0)
-                self.update()
-                return
-
             # Shape drawing mode
             if self.drawing_mode and img_coords:
                 self.is_drawing = True
@@ -941,20 +902,6 @@ class ImagePreviewWidget(QWidget):
             y_frac = (new_top_left.y() + 4) / self.height()
             self.scale_bar_pos = (max(0.0, min(1.0, x_frac)), max(0.0, min(1.0, y_frac)))
             self.update()
-            return
-
-        # ROI dragging
-        if self.roi_mode and self.roi_start_pos is not None:
-            img_coords = self._widget_to_image_coords(event.pos())
-            if img_coords:
-                x0, y0 = self.roi_start_pos
-                x1, y1 = img_coords
-                rx = int(min(x0, x1))
-                ry = int(min(y0, y1))
-                rw = int(abs(x1 - x0))
-                rh = int(abs(y1 - y0))
-                self.roi_rect = (rx, ry, rw, rh)
-                self.update()
             return
 
         # Shape drawing in progress
@@ -1111,16 +1058,6 @@ class ImagePreviewWidget(QWidget):
                 self.update()
                 return
 
-            # Finish ROI drawing
-            if self.roi_mode and self.roi_start_pos is not None:
-                self.roi_start_pos = None
-                if self.roi_rect and self.roi_rect[2] > 2 and self.roi_rect[3] > 2:
-                    x, y, w, h = self.roi_rect
-                    self.roi_drawn.emit(x, y, w, h)
-                self.roi_mode = False
-                self.update()
-                return
-
             # Finish shape drawing
             if self.is_drawing and self.current_draw_shape is not None:
                 shape = self.current_draw_shape
@@ -1177,11 +1114,6 @@ class ImagePreviewWidget(QWidget):
                 exited = True
             if self.drawing_mode:
                 self.drawing_mode = ""
-                self.update()
-                exited = True
-            if self.roi_mode:
-                self.roi_mode = False
-                self.roi_start_pos = None
                 self.update()
                 exited = True
             if self.annotation_mode:
@@ -1264,7 +1196,7 @@ class DualHandleSlider(QWidget):
         self._high = 1000
         self._handle_radius = 6
         self._dragging = None  # "low", "high", or None
-        self._enabled = False
+        self._enabled = True
         self.setMouseTracking(True)
 
     @property
@@ -1480,14 +1412,12 @@ class ChannelControlWidget(QWidget):
         row5.addWidget(self.sharpness_val)
         main_layout.addLayout(row5)
 
-        # Row 6: Threshold — dual-handle range slider with enable checkbox
+        # Row 6: Threshold — dual-handle range slider (always active)
         row6 = QHBoxLayout()
         row6.setSpacing(4)
-        self.thresh_cb = CheckmarkCheckBox("Threshold:")
-        self.thresh_cb.setChecked(False)
-        self.thresh_cb.setStyleSheet("font-size: 10px;")
-        self.thresh_cb.stateChanged.connect(self._on_thresh_toggle)
-        row6.addWidget(self.thresh_cb)
+        thresh_label = QLabel("Threshold:")
+        thresh_label.setStyleSheet(label_style)
+        row6.addWidget(thresh_label)
         self.thresh_slider = DualHandleSlider()
         self.thresh_slider.range_changed.connect(self._on_thresh_changed)
         row6.addWidget(self.thresh_slider)
@@ -1568,11 +1498,6 @@ class ChannelControlWidget(QWidget):
         """Called after debounce timer — trigger actual recompute."""
         self.settings_changed.emit()
 
-    def _on_thresh_toggle(self, state):
-        enabled = bool(state)
-        self.thresh_slider.set_slider_enabled(enabled)
-        self._on_change()
-
     def _on_thresh_changed(self, low: float, high: float):
         self.thresh_range_label.setText(f"{low:.2f}–{high:.2f}")
         self.settings_changed.emit()
@@ -1596,7 +1521,7 @@ class ChannelControlWidget(QWidget):
             contrast=self.contrast_slider.value() / 100.0,
             sharpness=self.sharpness_slider.value() / 100.0,
             gamma=self.gamma_slider.value() / 100.0,
-            threshold_enabled=self.thresh_cb.isChecked(),
+            threshold_enabled=True,
             threshold_low=self.thresh_slider.low_value,
             threshold_high=self.thresh_slider.high_value,
             bg_subtract_method=method_map.get(self.bg_method_combo.currentText(), "none"),
@@ -1609,7 +1534,6 @@ class ChannelControlWidget(QWidget):
         self.contrast_slider.setValue(100)
         self.sharpness_slider.setValue(0)
         self.gamma_slider.setValue(100)
-        self.thresh_cb.setChecked(False)
         self.thresh_slider.set_range(0.0, 1.0)
         self.thresh_range_label.setText("0.00–1.00")
         self.bg_method_combo.setCurrentText("None")
@@ -1631,7 +1555,6 @@ class ChannelControlWidget(QWidget):
         self.contrast_slider.setValue(int(settings.contrast * 100))
         self.gamma_slider.setValue(int(settings.gamma * 100))
         self.sharpness_slider.setValue(int(settings.sharpness * 100))
-        self.thresh_cb.setChecked(settings.threshold_enabled)
         self.thresh_slider.set_range(settings.threshold_low, settings.threshold_high)
         self.thresh_range_label.setText(f"{settings.threshold_low:.2f}–{settings.threshold_high:.2f}")
 
@@ -1717,7 +1640,6 @@ class CZIViewerWindow(QMainWindow):
         self.preview.shape_drawn.connect(self._on_shape_drawn)
         self.preview.shape_selected.connect(self._on_shape_selected)
         self.preview.shape_modified.connect(self._on_shape_modified)
-        self.preview.roi_drawn.connect(self._on_roi_drawn)
         self.preview.drawing_mode_exited.connect(self._on_drawing_mode_exited)
         right_layout.addWidget(self.preview, 1)
 

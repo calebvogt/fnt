@@ -593,6 +593,7 @@ class FNTMainWindow(QMainWindow):
 
         buttons = [
             ("CZI Viewer", "View and process Zeiss CZI microscopy images with false coloring", self.run_czi_viewer),
+            ("Image Quantification", "Cell counting and analysis for CZI microscopy images", self.run_image_quantification),
         ]
 
         self.create_button_grid(group_layout, buttons)
@@ -600,19 +601,24 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(group)
 
         # Info panel
-        info_group = QGroupBox("About CZI Viewer")
+        info_group = QGroupBox("About Imaging Tools")
         info_layout = QVBoxLayout()
 
         info_label = QLabel(
-            "<b>Features:</b><br>"
+            "<b>CZI Viewer:</b><br>"
             "• Load and view multi-channel Zeiss CZI microscopy files<br>"
             "• False color channels (GFP green, Cy3 magenta, etc.)<br>"
-            "• Adjust brightness, contrast, and gamma<br>"
-            "• Toggle channels on/off and view merged composite<br>"
-            "• Add text annotations to images<br>"
+            "• Adjust brightness, contrast, gamma, and sharpness<br>"
+            "• Background subtraction (Rolling Ball, Gaussian)<br>"
+            "• Add text and shape annotations to images<br>"
             "• Export processed images to PNG or TIFF<br><br>"
+            "<b>Image Quantification:</b><br>"
+            "• Multi-channel cell/particle counting with watershed separation<br>"
+            "• Colocalization analysis (centroid overlap, Dice coefficient)<br>"
+            "• ROI-based density measurement (cells/mm\u00b2)<br>"
+            "• Export results to CSV<br><br>"
             "<b>Requirements:</b><br>"
-            "pip install aicspylibczi fsspec Pillow"
+            "pip install aicspylibczi fsspec Pillow scikit-image"
         )
         info_label.setTextFormat(Qt.RichText)
         info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
@@ -904,6 +910,26 @@ class FNTMainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+
+    def run_image_quantification(self):
+        """Launch Image Quantification tool for CZI microscopy images"""
+        try:
+            from fnt.imaging.quantification_pyqt import QuantificationToolWindow
+
+            self.image_quant_window = QuantificationToolWindow()
+            self.image_quant_window.show()
+        except ImportError as e:
+            if "aicspylibczi" in str(e) or "No module named" in str(e):
+                QMessageBox.warning(
+                    self, "Missing Dependencies",
+                    "Image Quantification requires additional packages.\n\n"
+                    "Install with:\n"
+                    "pip install aicspylibczi fsspec Pillow scikit-image"
+                )
+            else:
+                QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
 
     # Video Tracking Methods
     def run_mask_pose_tracker(self):

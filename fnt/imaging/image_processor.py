@@ -32,7 +32,7 @@ class ChannelDisplaySettings:
     # Sharpness (beta) - unsharp mask amount, 0 = off
     sharpness: float = 0.0
     # Brightness thresholding
-    threshold_enabled: bool = False
+    threshold_enabled: bool = True
     threshold_low: float = 0.0
     threshold_high: float = 1.0
     # Background subtraction

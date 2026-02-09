@@ -68,27 +68,28 @@
 - [x] Export settings JSON for traceability
 - [x] Per-file settings preservation during navigation
 
-## Cell Counting / Quantification Module (Roadmap)
+## Cell Counting / Quantification Module (Standalone Tool)
 
 ### Overview
-Add a "Quantification" section below Export in the left panel for automated cell/fiber counting on fluorescence microscopy images.
+Standalone "Image Quantification" tool in the Imaging tab for automated cell/fiber counting on fluorescence microscopy images.
 
-### Phase 1: Basic Cell Counting
-- [ ] Intensity thresholding with adjustable threshold levels
-- [ ] Binary mask preview overlay on the image
-- [ ] Particle analysis with size filtering (min/max area in µm²)
-- [ ] Watershed separation for touching cells
-- [ ] Results table: count, mean area, total area, mean intensity
+### Phase 1: Basic Cell Counting ✅
+- [x] Intensity thresholding with adjustable threshold levels (Otsu/Triangle/Li/Manual)
+- [x] Binary mask preview overlay (filled + contour outline modes)
+- [x] Particle analysis with size filtering (min/max area in µm²)
+- [x] Watershed separation for touching cells
+- [x] Results table: count, mean area, total area, mean intensity, circularity
 
-### Phase 2: Multi-Channel Analysis
-- [ ] Count cells per channel independently
-- [ ] Colocalization analysis (% overlap between channels)
-- [ ] Cell-by-cell intensity measurements per channel
+### Phase 2: Multi-Channel Analysis ✅
+- [x] Count cells per channel independently
+- [x] Colocalization analysis (% overlap between channels, Dice coefficient)
+- [x] Cell-by-cell intensity measurements per channel
+- [x] False-color composite preview with per-channel colors
 
-### Phase 3: ROI-Based Counting
-- [ ] Draw ROI regions for localized counting
-- [ ] Compare counts across ROIs
-- [ ] Density calculations (cells per mm²)
+### Phase 3: ROI-Based Counting ✅
+- [x] Draw ROI regions for localized counting
+- [x] Compare counts across ROIs
+- [x] Density calculations (cells per mm²)
 
 ### Phase 4: Fiber Quantification
 - [ ] Skeletonization for fiber/neurite tracing
@@ -96,15 +97,21 @@ Add a "Quantification" section below Export in the left panel for automated cell
 - [ ] Branch point detection and counting
 - [ ] Fiber density per area
 
-### Phase 5: Export & Reporting
-- [ ] "Export Analysis" button
-- [ ] CSV export with all measurements
-- [ ] Overlay export showing detected objects
-- [ ] Batch processing across all loaded files
+### Phase 5: Export & Reporting ✅
+- [x] CSV export with all measurements (per-channel + colocalization + ROI density)
+- [x] Overlay image export (PNG/TIFF) with masks, centroids, ROI rectangles
+- [x] Batch processing across all loaded files (combined CSV output)
+- [x] Analysis settings persistence (Save/Load JSON for reproducibility)
+
+### UX Features ✅
+- [x] Zoom-to-particle on table row selection (auto-pan/zoom to centroid)
+- [x] Contour outline mode for mask preview (vs filled overlay)
+- [x] Keyboard shortcuts (Ctrl+R, Ctrl+E, Ctrl+O, F, M, Left/Right, Ctrl+±)
+- [x] Per-channel color composite preview with additive blending
 
 ### Technical Considerations
-- Use scikit-image for segmentation (threshold_otsu, watershed, label)
-- Consider deep learning option (Cellpose, StarDist) for advanced segmentation
-- Results should be linked to the current display settings for reproducibility
-- All measurements should use calibrated units (µm, µm²) when pixel size is available
+- [x] Uses scikit-image for segmentation (threshold_otsu, watershed, label)
+- [ ] Consider deep learning option (Cellpose, StarDist) for advanced segmentation
+- [x] Results linked to current display settings for reproducibility (auto-saved config JSON)
+- [x] All measurements use calibrated units (µm, µm²) when pixel size is available
 
