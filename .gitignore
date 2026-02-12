@@ -15,7 +15,13 @@ SAM_models/
 *.egg-info/
 dist/
 build/
-*.pyc
-.DS_Store
+
+# Audio files
 *.wav
+<<<<<<< Updated upstream
 *.pyc
+=======
+
+# Claude Code instructions (keep private)
+CLAUDE.md
+>>>>>>> Stashed changes
