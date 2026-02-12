@@ -1135,7 +1135,10 @@ class UWBQuickVisualizationWindow(QWidget):
             
             summary_data['Parameter'].append('CSV Exported')
             summary_data['Value'].append('Yes' if self.chk_export_csv.isChecked() else 'No')
-            
+
+            summary_data['Parameter'].append('Raw CSV Exported')
+            summary_data['Value'].append('Yes' if self.chk_export_raw_csv.isChecked() else 'No')
+
             summary_data['Parameter'].append('Plots Generated')
             summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
             
@@ -1438,6 +1441,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_csv.setChecked(True)
         self.chk_export_csv.setToolTip("Export processed data as CSV with current settings applied")
         export_layout.addWidget(self.chk_export_csv)
+
+        # Export Raw CSV checkbox
+        self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
+        self.chk_export_raw_csv.setChecked(False)
+        self.chk_export_raw_csv.setToolTip("Export raw database contents as CSV (no processing) next to the input SQL file")
+        export_layout.addWidget(self.chk_export_raw_csv)
         
         # Detect Behaviors checkbox
         self.chk_detect_behaviors = QCheckBox("Detect Behaviors")
@@ -2458,6 +2467,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'show_trail': self.chk_show_trail.isChecked(),
             'trail_length': self.spin_trail_length.value(),
             'export_csv': self.chk_export_csv.isChecked(),
+            'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'detect_behaviors': self.chk_detect_behaviors.isChecked(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
@@ -2562,7 +2572,10 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'export_csv' in config:
                 self.chk_export_csv.setChecked(config['export_csv'])
-            
+
+            if 'export_raw_csv' in config:
+                self.chk_export_raw_csv.setChecked(config['export_raw_csv'])
+
             if 'detect_behaviors' in config:
                 self.chk_detect_behaviors.setChecked(config['detect_behaviors'])
             
@@ -3196,10 +3209,11 @@ class UWBQuickVisualizationWindow(QWidget):
         os.makedirs(output_dir, exist_ok=True)
         
         export_csv = self.chk_export_csv.isChecked()
+        export_raw_csv = self.chk_export_raw_csv.isChecked()
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
-        
-        if not export_csv and not save_plots and not save_animation:
+
+        if not export_csv and not export_raw_csv and not save_plots and not save_animation:
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
         
@@ -3209,15 +3223,41 @@ class UWBQuickVisualizationWindow(QWidget):
             
             # Calculate total steps for progress
             total_steps = 0
+            if export_raw_csv:
+                total_steps += 1
             if export_csv:
                 total_steps += 1
             if save_plots:
                 total_steps += 1
             if save_animation:
                 total_steps += 1  # Animation progress handled separately
-            
+
             current_step = 0
-            
+
+            # Export raw CSV (unprocessed database dump) next to the input SQL file
+            if export_raw_csv:
+                if self.export_cancelled:
+                    self.stop_export()
+                    return
+
+                current_step += 1
+                self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting raw CSV...")
+                self.progress_bar.setValue(int(current_step / total_steps * 100))
+                QApplication.processEvents()
+
+                raw_csv_filename = f'{db_name}_{self.table_name}_raw.csv'
+                raw_csv_path = os.path.join(db_dir, raw_csv_filename)
+
+                if not os.path.exists(raw_csv_path) or self.chk_overwrite.isChecked():
+                    self.log_message("Exporting raw database to CSV...")
+                    conn = sqlite3.connect(self.db_path)
+                    raw_data = pd.read_sql_query(f"SELECT * FROM {self.table_name}", conn)
+                    conn.close()
+                    raw_data.to_csv(raw_csv_path, index=False)
+                    self.log_message(f"✓ Raw CSV exported: {raw_csv_path}")
+                else:
+                    self.log_message(f"Skipped raw CSV (already exists): {raw_csv_filename}")
+
             # Handle overwrite setting
             if self.chk_overwrite.isChecked():
                 # Delete all files in analysis folder EXCEPT the config file
@@ -3501,10 +3541,14 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 self.generate_animation(output_dir, total_steps, current_step, csv_path)
             
-            # If only CSV was exported (no plots or animation), show success message
-            if export_csv and not save_plots and not save_animation:
+            # If only CSV(s) exported (no plots or animation), show success message
+            if (export_csv or export_raw_csv) and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
-                msg = f"Export completed:\n- CSV: {csv_path}\n"
+                msg = "Export completed:\n"
+                if export_csv:
+                    msg += f"- Processed CSV: {csv_path}\n"
+                if export_raw_csv:
+                    msg += f"- Raw CSV: {os.path.join(db_dir, f'{db_name}_{self.table_name}_raw.csv')}\n"
                 QMessageBox.information(self, "Success", msg)
                 
         except Exception as e:
