@@ -11,6 +11,7 @@ import sys
 import subprocess
 import glob
 import re
+import shutil
 from pathlib import Path
 
 try:
@@ -36,8 +37,9 @@ class VideoProcessorWorker(QThread):
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
-    def __init__(self, input_dirs, input_videos, frame_rate, grayscale, apply_clahe, 
-                 remove_audio, output_format, crf_quality, resolution, codec, preset, instance_id=1):
+    def __init__(self, input_dirs, input_videos, frame_rate, grayscale, apply_clahe,
+                 remove_audio, output_format, crf_quality, resolution, codec, preset,
+                 instance_id=1, skip_already_processed=False):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -51,104 +53,173 @@ class VideoProcessorWorker(QThread):
         self.codec = codec
         self.preset = preset
         self.instance_id = instance_id
+        self.skip_already_processed = skip_already_processed
         self.should_stop = False
     
     def stop(self):
         """Stop the processing"""
         self.should_stop = True
-    
+
+    def _get_output_filename(self, video_file):
+        """Get the expected output filename for a given input video."""
+        video_filename = os.path.basename(video_file)
+        video_filename_no_ext = re.sub(
+            r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
+            video_filename, flags=re.IGNORECASE
+        )
+        return f"{video_filename_no_ext}_processed.{self.output_format}"
+
+    def _is_already_processed(self, video_file, out_dir):
+        """Check if a video already has a corresponding processed file in out_dir."""
+        output_filename = self._get_output_filename(video_file)
+        output_path = os.path.join(out_dir, output_filename)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+    def _move_to_failed(self, video_file, parent_dir):
+        """Move a failed video file to proc_failed/ directory."""
+        failed_dir = os.path.join(parent_dir, "proc_failed")
+        os.makedirs(failed_dir, exist_ok=True)
+
+        dest_path = os.path.join(failed_dir, os.path.basename(video_file))
+
+        # If already exists in proc_failed/ from a previous run, remove the old copy
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+
+        try:
+            shutil.move(video_file, dest_path)
+            self.progress_update.emit(
+                f"⚠️ Moved failed video to proc_failed/: {os.path.basename(video_file)}"
+            )
+        except Exception as e:
+            self.progress_update.emit(
+                f"⚠️ Could not move {os.path.basename(video_file)} to proc_failed/: {str(e)}"
+            )
+
     def run(self):
         """Main processing function"""
         try:
             total_files = 0
-            processed_files = 0
-            
+            processed_count = 0
+            skipped_count = 0
+            failed_count = 0
+            file_index = 0
+
             # Count total files first
             video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
-            
+
             # Count files from directories
             for input_dir in self.input_dirs:
                 for ext in video_extensions:
                     total_files += len(glob.glob(os.path.join(input_dir, ext)))
-            
+
             # Add count of individual videos
             total_files += len(self.input_videos)
-            
+
             if total_files == 0:
                 self.finished.emit(False, "No video files found in selected directories or video list.")
                 return
-            
+
             self.progress_update.emit(f"Found {total_files} video files to process...")
-            
+
             # Process each directory
             for input_dir in self.input_dirs:
                 if self.should_stop:
                     break
-                    
+
                 # Create output directory
                 out_dir = os.path.join(input_dir, "proc")
                 os.makedirs(out_dir, exist_ok=True)
-                
+
                 self.progress_update.emit(f"Processing directory: {input_dir}")
-                
+
                 # Process each video type
                 for video_extension in video_extensions:
                     if self.should_stop:
                         break
-                        
+
                     video_files = glob.glob(os.path.join(input_dir, video_extension))
-                    
+
                     for video_file in video_files:
                         if self.should_stop:
                             break
-                            
-                        processed_files += 1
-                        self.file_progress.emit(processed_files, total_files)
-                        
+
+                        file_index += 1
+                        self.file_progress.emit(file_index, total_files)
+
+                        # Skip check
+                        if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
+                            self.progress_update.emit(
+                                f"⏭️ Skipping (already processed): {os.path.basename(video_file)}"
+                            )
+                            skipped_count += 1
+                            continue
+
                         # Process individual file
-                        success = self.process_single_file(video_file, out_dir, processed_files)
-                        if not success and not self.should_stop:
-                            self.finished.emit(False, f"Failed to process: {os.path.basename(video_file)}")
-                            return
-            
+                        success = self.process_single_file(video_file, out_dir, file_index)
+                        if success:
+                            processed_count += 1
+                        elif not self.should_stop:
+                            failed_count += 1
+                            self._move_to_failed(video_file, input_dir)
+
             # Process individual video files
             for video_file in self.input_videos:
                 if self.should_stop:
                     break
-                
-                processed_files += 1
-                self.file_progress.emit(processed_files, total_files)
-                
+
+                file_index += 1
+                self.file_progress.emit(file_index, total_files)
+
                 # Create output directory next to the video file
                 video_dir = os.path.dirname(video_file)
                 out_dir = os.path.join(video_dir, "proc")
                 os.makedirs(out_dir, exist_ok=True)
-                
+
                 self.progress_update.emit(f"Processing video: {os.path.basename(video_file)}")
-                
+
+                # Skip check
+                if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
+                    self.progress_update.emit(
+                        f"⏭️ Skipping (already processed): {os.path.basename(video_file)}"
+                    )
+                    skipped_count += 1
+                    continue
+
                 # Process individual file
-                success = self.process_single_file(video_file, out_dir, processed_files)
-                if not success and not self.should_stop:
-                    self.finished.emit(False, f"Failed to process: {os.path.basename(video_file)}")
-                    return
-            
-            if not self.should_stop:
-                self.finished.emit(True, f"Successfully processed {processed_files} video files!")
-            else:
+                success = self.process_single_file(video_file, out_dir, file_index)
+                if success:
+                    processed_count += 1
+                elif not self.should_stop:
+                    failed_count += 1
+                    self._move_to_failed(video_file, video_dir)
+
+            # Build summary
+            if self.should_stop:
                 self.finished.emit(False, "Processing stopped by user.")
-                
+            elif failed_count > 0:
+                summary = (
+                    f"Processed {processed_count} of {total_files} videos. "
+                    f"{failed_count} failed (moved to proc_failed/)."
+                )
+                if skipped_count > 0:
+                    summary += f" {skipped_count} skipped."
+                self.finished.emit(processed_count > 0, summary)
+            else:
+                summary = f"Successfully processed {processed_count} video files!"
+                if skipped_count > 0:
+                    summary += f" ({skipped_count} skipped, already processed.)"
+                self.finished.emit(True, summary)
+
         except Exception as e:
             self.finished.emit(False, f"Error during processing: {str(e)}")
     
     def process_single_file(self, video_file, out_dir, file_index):
         """Process a single video file"""
         try:
-            # Get filename without extension
+            # Get filename and build output path
             video_filename = os.path.basename(video_file)
-            video_filename_no_ext = re.sub(r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '', video_filename, flags=re.IGNORECASE)
-            
-            # Output file path with selected format
-            output_file = os.path.join(out_dir, f"{video_filename_no_ext}_processed.{self.output_format}")
+            output_file = os.path.join(out_dir, self._get_output_filename(video_file))
             
             self.progress_update.emit(f"Processing: {video_filename}")
             
@@ -749,7 +820,69 @@ class VideoProcessingGUI(QMainWindow):
         # Get resolution (extract value from selection)
         resolution_text = self.resolution_combo.currentText()
         resolution = resolution_text.split()[0]  # Extract "1080p" or "720p"
-        
+
+        # --- Detect already-processed videos ---
+        skip_already_processed = False
+        video_extensions_check = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
+
+        already_processed_count = 0
+        total_video_count = 0
+
+        for input_dir in self.selected_dirs:
+            proc_dir = os.path.join(input_dir, "proc")
+            for ext in video_extensions_check:
+                video_files = glob.glob(os.path.join(input_dir, ext))
+                for vf in video_files:
+                    total_video_count += 1
+                    vf_basename = os.path.basename(vf)
+                    vf_no_ext = re.sub(
+                        r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
+                        vf_basename, flags=re.IGNORECASE
+                    )
+                    expected_output = os.path.join(
+                        proc_dir, f"{vf_no_ext}_processed.{output_format}"
+                    )
+                    if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
+                        already_processed_count += 1
+
+        for video_file in self.selected_videos:
+            total_video_count += 1
+            video_dir = os.path.dirname(video_file)
+            proc_dir = os.path.join(video_dir, "proc")
+            vf_basename = os.path.basename(video_file)
+            vf_no_ext = re.sub(
+                r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
+                vf_basename, flags=re.IGNORECASE
+            )
+            expected_output = os.path.join(
+                proc_dir, f"{vf_no_ext}_processed.{output_format}"
+            )
+            if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
+                already_processed_count += 1
+
+        if already_processed_count > 0:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Already Processed Videos Detected")
+            msg_box.setText(
+                f"{already_processed_count} of {total_video_count} videos have already "
+                f"been processed (output files found in proc/)."
+            )
+            msg_box.setInformativeText(
+                "Would you like to skip these videos or reprocess all?"
+            )
+            skip_btn = msg_box.addButton("Skip Already Processed", QMessageBox.AcceptRole)
+            reprocess_btn = msg_box.addButton("Reprocess All", QMessageBox.RejectRole)
+            cancel_btn = msg_box.addButton("Cancel", QMessageBox.DestructiveRole)
+            msg_box.setDefaultButton(skip_btn)
+            msg_box.exec_()
+
+            clicked = msg_box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            elif clicked == skip_btn:
+                skip_already_processed = True
+            # else: reprocess_btn clicked, skip_already_processed stays False
+
         # Disable controls
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -772,7 +905,7 @@ class VideoProcessingGUI(QMainWindow):
         self.worker = VideoProcessorWorker(
             self.selected_dirs,
             self.selected_videos,
-            frame_rate, 
+            frame_rate,
             grayscale,
             apply_clahe,
             remove_audio,
@@ -781,7 +914,8 @@ class VideoProcessingGUI(QMainWindow):
             resolution,
             codec,
             preset,
-            self.instance_id
+            self.instance_id,
+            skip_already_processed=skip_already_processed
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
@@ -834,8 +968,10 @@ class VideoProcessingGUI(QMainWindow):
         self.log_message(f"\\n{'✅' if success else '❌'} {message}")
         
         # Show completion dialog
-        if success:
-            QMessageBox.information(self, "Success", message)
+        if success and "failed" not in message.lower():
+            QMessageBox.information(self, "Complete", message)
+        elif success and "failed" in message.lower():
+            QMessageBox.warning(self, "Completed with Failures", message)
         else:
             QMessageBox.critical(self, "Error", message)
         
