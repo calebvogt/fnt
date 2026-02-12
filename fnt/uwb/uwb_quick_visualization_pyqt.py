@@ -1038,6 +1038,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.playback_timer = QTimer()
         self.playback_timer.timeout.connect(self.advance_playback)
 
+        # Zoom state tracking — used to preserve user zoom across redraws
+        self._default_xlim = None
+        self._default_ylim = None
+
         self.initUI()
         
     def log_message(self, message):
@@ -1483,6 +1487,14 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.lbl_background_status.setWordWrap(True)
         options_layout.addWidget(self.lbl_background_status)
+
+        # Show anchors toggle
+        self.chk_show_anchors = QCheckBox("Show anchor positions")
+        self.chk_show_anchors.setChecked(True)
+        self.chk_show_anchors.setEnabled(False)  # Enabled when anchors are parsed from XML
+        self.chk_show_anchors.setToolTip("Toggle visibility of UWB anchor/antenna positions (triangles)")
+        self.chk_show_anchors.stateChanged.connect(self.on_show_anchors_toggled)
+        options_layout.addWidget(self.chk_show_anchors)
 
         # Refresh Tracking Preview button
         self.btn_refresh_preview = QPushButton("Refresh Tracking Preview")
@@ -2015,6 +2027,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if self.anchor_positions:
                 self.log_message(f"Parsed {len(self.anchor_positions)} anchor positions from XML")
+                self.chk_show_anchors.setEnabled(True)
             else:
                 self.log_message("No anchor positions found in XML")
 
@@ -2496,8 +2509,13 @@ class UWBQuickVisualizationWindow(QWidget):
         # Refresh preview if loaded (trail is a visual-only setting, no reload needed)
         if self.preview_loaded:
             self.update_visualization(self.time_slider.value())
-    
-    
+
+    def on_show_anchors_toggled(self):
+        """Handle show anchors checkbox toggle"""
+        # Visual-only setting, no data reload needed
+        if self.preview_loaded:
+            self.update_visualization(self.time_slider.value())
+
     def apply_smoothing(self):
         """Apply smoothing to self.data"""
         self.data = self.apply_smoothing_to_data(self.data, self.combo_smoothing.currentText())
@@ -2767,6 +2785,10 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.preview_data is None or len(self.preview_data) == 0 or not self.unique_timestamps:
             return
 
+        # Save current axis limits before clearing (to preserve user zoom)
+        old_xlim = self.ax.get_xlim()
+        old_ylim = self.ax.get_ylim()
+
         self.ax.clear()
 
         x_col = 'smoothed_x' if 'smoothed_x' in self.preview_data.columns else 'location_x'
@@ -2806,8 +2828,8 @@ class UWBQuickVisualizationWindow(QWidget):
             except Exception as e:
                 self.log_message(f"Error drawing zones: {str(e)}")
 
-        # Plot anchor positions if available
-        if self.anchor_positions:
+        # Plot anchor positions if available and toggled on
+        if self.anchor_positions and self.chk_show_anchors.isChecked():
             try:
                 for anchor in self.anchor_positions:
                     self.ax.scatter(anchor['x'], anchor['y'],
@@ -2861,7 +2883,7 @@ class UWBQuickVisualizationWindow(QWidget):
                         fontsize=10, fontweight='bold', color=color,
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=color))
 
-        # Set limits based on all data
+        # Compute default (full-extent) limits
         x_min, x_max = self.preview_data[x_col].min(), self.preview_data[x_col].max()
         y_min, y_max = self.preview_data[y_col].min(), self.preview_data[y_col].max()
 
@@ -2877,8 +2899,21 @@ class UWBQuickVisualizationWindow(QWidget):
         x_pad = x_range * 0.05 if x_range > 0 else 1
         y_pad = y_range * 0.05 if y_range > 0 else 1
 
-        self.ax.set_xlim(x_min - x_pad, x_max + x_pad)
-        self.ax.set_ylim(y_min - y_pad, y_max + y_pad)
+        default_xlim = (x_min - x_pad, x_max + x_pad)
+        default_ylim = (y_min - y_pad, y_max + y_pad)
+
+        # Preserve user zoom: if old limits differ from stored defaults, user had zoomed
+        if (self._default_xlim is not None
+                and (old_xlim != self._default_xlim or old_ylim != self._default_ylim)):
+            self.ax.set_xlim(old_xlim)
+            self.ax.set_ylim(old_ylim)
+        else:
+            self.ax.set_xlim(default_xlim)
+            self.ax.set_ylim(default_ylim)
+
+        # Store current defaults so we can detect user zoom on next redraw
+        self._default_xlim = default_xlim
+        self._default_ylim = default_ylim
 
         self.ax.set_xlabel('X Position (m)', fontsize=10)
         self.ax.set_ylabel('Y Position (m)', fontsize=10)
