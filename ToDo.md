@@ -18,7 +18,6 @@
 	- simba, supervised, didnt want to label; alpha tracker is unsupervised; simba features are overly complicated; spectral clustering or hierarchical clustering, she tried both; 
 - Show USV rate for each resource zone to the right of the animation. 
 - Show the UWB tracking alongside the actual footage; 
-- 
 
 # Doric WiFP
 - RIP my old matlab code from changwoo and get it to work with the WiFP data. 

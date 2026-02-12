@@ -1,10 +1,9 @@
-[build-system]
-requires = ["setuptools>=64", "wheel"]
+tracking  # GUIes = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
 license = {text = "MIT"}
@@ -61,7 +60,7 @@ tracking = [
     #   pip install git+https://github.com/facebookresearch/sam2.git
 ]
 all = [
-    "fnt[imaging,usv,rfid,tracking]",
+    "fnt[imaging,usv,tracking]",
 ]
 
 [project.scripts]
