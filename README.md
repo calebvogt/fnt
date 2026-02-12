@@ -60,5 +60,23 @@ conda activate fnt
 fnt-gui
 ```
 
+## Updating
+
+Because the package is installed in editable mode, updating is simple:
+
+```bash
+cd path/to/fnt
+git pull
+```
+
+That's it — the updated code is immediately available the next time you run `fnt-gui`.
+
+**Note:** If the update includes changes to `pyproject.toml` (e.g., new dependencies), you will need to re-run the install:
+
+```bash
+conda activate fnt
+pip install -e .
+```
+
 ## Notes
 - Package dependencies are listed in pyproject.toml
