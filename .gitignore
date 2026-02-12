@@ -18,10 +18,10 @@ build/
 
 # Audio files
 *.wav
-<<<<<<< Updated upstream
-*.pyc
-=======
+
+# Editor/tool settings (local only)
+.vscode/
+.claude/
 
 # Claude Code instructions (keep private)
 CLAUDE.md
->>>>>>> Stashed changes
