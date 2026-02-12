@@ -374,12 +374,12 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # UWB Quick Review group
-        quick_group = QGroupBox("UWB Quick Review")
+        # UWB PreProcessing group
+        quick_group = QGroupBox("UWB PreProcessing")
         quick_layout = QGridLayout()
-        
+
         quick_buttons = [
-            ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
+            ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_quick_visualization),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -866,15 +866,15 @@ class FNTMainWindow(QMainWindow):
     
     # UWB Processing Methods
     def run_uwb_quick_visualization(self):
-        """Launch UWB Quick Visualization tool"""
+        """Launch UWB PreProcessing Tool"""
         try:
             from fnt.uwb.uwb_quick_visualization_pyqt import UWBQuickVisualizationWindow
-            
-            # Create and show the UWB quick visualization window
+
+            # Create and show the UWB PreProcessing Tool window
             self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
             self.uwb_quick_viz_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB Quick Visualization failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
     
     def run_uwb_behavioral(self):
         """Launch UWB behavioral analysis"""
