@@ -1465,7 +1465,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.lbl_background_status.setWordWrap(True)
         options_layout.addWidget(self.lbl_background_status)
-        
+
+        # Refresh Tracking Preview button
+        self.btn_refresh_preview = QPushButton("Refresh Tracking Preview")
+        self.btn_refresh_preview.clicked.connect(self.load_preview)
+        self.btn_refresh_preview.setEnabled(False)
+        self.btn_refresh_preview.setToolTip("Reload preview with current options (tag selection, smoothing, filtering, identities)")
+        self.btn_refresh_preview.setStyleSheet("padding: 8px; font-size: 11px;")
+        options_layout.addWidget(self.btn_refresh_preview)
+
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
         
@@ -1684,14 +1692,6 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Export buttons layout
         export_buttons_layout = QHBoxLayout()
-
-        # Load Preview button
-        self.btn_load_preview = QPushButton("Load Preview")
-        self.btn_load_preview.clicked.connect(self.load_preview)
-        self.btn_load_preview.setEnabled(False)
-        self.btn_load_preview.setToolTip("Load interactive preview (always downsampled to 1Hz for performance)")
-        self.btn_load_preview.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
-        export_buttons_layout.addWidget(self.btn_load_preview)
 
         # Export button
         self.btn_export = QPushButton("Export")
@@ -2291,10 +2291,9 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_export_progress.setText("")
     
     def mark_options_changed(self):
-        """Mark that options have changed - prompt user to reload preview"""
+        """Mark that options have changed - prompt user to refresh preview"""
         if self.preview_loaded:
-            self.btn_load_preview.setText("Reload Preview")
-            self.btn_load_preview.setEnabled(True)
+            self.btn_refresh_preview.setEnabled(True)
     
     def load_tags_from_table(self):
         """Load tags from selected table"""
@@ -2311,12 +2310,15 @@ class UWBQuickVisualizationWindow(QWidget):
             self.update_tag_selection()
 
             # Enable buttons
-            self.btn_load_preview.setEnabled(True)
+            self.btn_refresh_preview.setEnabled(True)
             self.btn_export.setEnabled(True)
-            
+
             # Load unique days for daily animation options
             self.load_unique_days_from_database()
-            
+
+            # Auto-load preview with default settings
+            self.load_preview()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load tags: {str(e)}")
     
@@ -2607,8 +2609,8 @@ class UWBQuickVisualizationWindow(QWidget):
             return
 
         try:
-            self.btn_load_preview.setText("Loading...")
-            self.btn_load_preview.setEnabled(False)
+            self.btn_refresh_preview.setText("Refreshing...")
+            self.btn_refresh_preview.setEnabled(False)
             QApplication.processEvents()
 
             self.log_message("Loading data from database for preview...")
@@ -2681,8 +2683,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # Mark preview as loaded
             self.preview_loaded = True
-            self.btn_load_preview.setText("Reload Preview")
-            self.btn_load_preview.setEnabled(True)
+            self.btn_refresh_preview.setText("Refresh Tracking Preview")
+            self.btn_refresh_preview.setEnabled(True)
             self.btn_export.setEnabled(True)
 
             # Populate animation days and update frame estimate
@@ -2694,8 +2696,8 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load preview: {str(e)}")
             self.log_message(f"\u2717 Error loading data: {str(e)}")
-            self.btn_load_preview.setText("Load Preview")
-            self.btn_load_preview.setEnabled(True)
+            self.btn_refresh_preview.setText("Refresh Tracking Preview")
+            self.btn_refresh_preview.setEnabled(True)
 
     def update_visualization(self, slider_value):
         """Update visualization based on slider position"""
