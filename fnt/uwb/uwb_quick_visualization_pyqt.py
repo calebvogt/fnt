@@ -14,11 +14,13 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from scipy.signal import savgol_filter
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QFileDialog, QMessageBox, 
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QFileDialog, QMessageBox,
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
-                             QSpinBox, QDoubleSpinBox, QFrame, QLineEdit,
+                             QSpinBox, QDoubleSpinBox, QSplitter, QFrame, QSlider, QLineEdit,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -1018,7 +1020,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
         self.arena_zones = None  # DataFrame with zone coordinates from XML
-        
+
+        # Preview state (separate from export data)
+        self.preview_data = None
+        self.unique_timestamps = []
+        self.preview_loaded = False
+        self.is_playing = False
+        self.playback_speed = 1
+        self.playback_timer = QTimer()
+        self.playback_timer.timeout.connect(self.advance_playback)
+
         self.initUI()
         
     def log_message(self, message):
@@ -1158,7 +1169,7 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def initUI(self):
         self.setWindowTitle("UWB PreProcessing Tool")
-        self.setGeometry(50, 50, 900, 700)
+        self.setGeometry(50, 50, 1400, 900)
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -1218,12 +1229,38 @@ class UWBQuickVisualizationWindow(QWidget):
                 padding: 4px 8px;
                 min-width: 100px;
             }
+            QSlider::groove:horizontal {
+                border: 1px solid #3f3f3f;
+                height: 6px;
+                background: #1e1e1e;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #e08030;
+                border: 1px solid #3f3f3f;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #f09040;
+            }
         """)
-        
-        # Main layout - single column (no preview panel)
-        main_layout = QVBoxLayout()
-        settings_panel = self.create_settings_panel()
-        main_layout.addWidget(settings_panel)
+
+        # Main layout - splitter with settings (left) and preview (right)
+        main_layout = QHBoxLayout()
+        splitter = QSplitter(Qt.Horizontal)
+
+        left_panel = self.create_settings_panel()
+        left_panel.setMinimumWidth(350)
+        splitter.addWidget(left_panel)
+
+        right_panel = self.create_visualization_panel()
+        splitter.addWidget(right_panel)
+
+        splitter.setSizes([400, 1000])
+
+        main_layout.addWidget(splitter)
         self.setLayout(main_layout)
         
     def create_settings_panel(self):
@@ -1647,21 +1684,29 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Export buttons layout
         export_buttons_layout = QHBoxLayout()
-        
+
+        # Load Preview button
+        self.btn_load_preview = QPushButton("Load Preview")
+        self.btn_load_preview.clicked.connect(self.load_preview)
+        self.btn_load_preview.setEnabled(False)
+        self.btn_load_preview.setToolTip("Load interactive preview (always downsampled to 1Hz for performance)")
+        self.btn_load_preview.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
+        export_buttons_layout.addWidget(self.btn_load_preview)
+
         # Export button
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_data)
         self.btn_export.setEnabled(False)
         self.btn_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
         export_buttons_layout.addWidget(self.btn_export)
-        
+
         # Stop export button (hidden by default)
         self.btn_stop_export = QPushButton("Stop Export")
         self.btn_stop_export.clicked.connect(self.stop_export)
         self.btn_stop_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold; background-color: #d41100;")
         self.btn_stop_export.setVisible(False)
         export_buttons_layout.addWidget(self.btn_stop_export)
-        
+
         layout.addLayout(export_buttons_layout)
         
         # Messages window
@@ -1700,8 +1745,96 @@ class UWBQuickVisualizationWindow(QWidget):
         scroll.setWidgetResizable(True)
         
         return scroll
-        
-    
+
+    def create_visualization_panel(self):
+        """Create the right visualization/preview panel"""
+        panel = QWidget()
+        layout = QVBoxLayout()
+
+        # Title
+        title = QLabel("Tracking Preview")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        layout.addWidget(title)
+
+        # Matplotlib canvas
+        self.figure = Figure(figsize=(10, 8))
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+
+        # Initial empty plot
+        self.ax.set_xlabel('X Position (m)', fontsize=10)
+        self.ax.set_ylabel('Y Position (m)', fontsize=10)
+        self.ax.set_title('Load data to visualize tracking', fontsize=12)
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_aspect('equal')
+
+        layout.addWidget(self.canvas)
+
+        # Navigation toolbar
+        self.toolbar = NavigationToolbar(self.canvas, panel)
+        layout.addWidget(self.toolbar)
+
+        # Playback controls
+        playback_layout = QHBoxLayout()
+
+        self.btn_rewind = QPushButton("\u23ee Rewind")
+        self.btn_rewind.clicked.connect(self.rewind_playback)
+        self.btn_rewind.setEnabled(False)
+        self.btn_rewind.setMaximumWidth(100)
+        playback_layout.addWidget(self.btn_rewind)
+
+        self.btn_play_pause = QPushButton("\u25b6 Play")
+        self.btn_play_pause.clicked.connect(self.toggle_play_pause)
+        self.btn_play_pause.setEnabled(False)
+        self.btn_play_pause.setMaximumWidth(100)
+        playback_layout.addWidget(self.btn_play_pause)
+
+        self.btn_fast_forward = QPushButton("Fast Forward \u23ed")
+        self.btn_fast_forward.clicked.connect(self.fast_forward_playback)
+        self.btn_fast_forward.setEnabled(False)
+        self.btn_fast_forward.setMaximumWidth(120)
+        playback_layout.addWidget(self.btn_fast_forward)
+
+        playback_layout.addSpacing(20)
+
+        playback_layout.addWidget(QLabel("Speed:"))
+        self.combo_playback_speed = QComboBox()
+        self.combo_playback_speed.addItems(["1x", "2x", "4x", "8x"])
+        self.combo_playback_speed.setCurrentText("1x")
+        self.combo_playback_speed.currentTextChanged.connect(self.on_speed_changed)
+        self.combo_playback_speed.setMaximumWidth(80)
+        playback_layout.addWidget(self.combo_playback_speed)
+
+        playback_layout.addStretch()
+
+        # Save Preview Image button
+        self.btn_save_preview = QPushButton("Save Preview Image")
+        self.btn_save_preview.clicked.connect(self.save_preview_image)
+        self.btn_save_preview.setEnabled(False)
+        self.btn_save_preview.setToolTip("Save the current preview view as PNG or SVG")
+        playback_layout.addWidget(self.btn_save_preview)
+
+        layout.addLayout(playback_layout)
+
+        # Time slider
+        slider_layout = QHBoxLayout()
+        self.lbl_time = QLabel("--:--:--")
+        self.lbl_time.setMinimumWidth(160)
+        slider_layout.addWidget(self.lbl_time)
+
+        self.time_slider = QSlider(Qt.Horizontal)
+        self.time_slider.setMinimum(0)
+        self.time_slider.setMaximum(100)
+        self.time_slider.setValue(0)
+        self.time_slider.setEnabled(False)
+        self.time_slider.valueChanged.connect(self.update_visualization)
+        slider_layout.addWidget(self.time_slider)
+
+        layout.addLayout(slider_layout)
+
+        panel.setLayout(layout)
+        return panel
+
     def select_database(self):
         """Select SQLite database"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1914,9 +2047,13 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message("No XML scale found, using pixel dimensions")
                 
                 # Update status label
-                self.lbl_background_status.setText(f"✓ Background: {os.path.basename(file_path)}")
+                self.lbl_background_status.setText(f"\u2713 Background: {os.path.basename(file_path)}")
                 self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
-                
+
+                # Refresh preview if loaded
+                if self.preview_loaded:
+                    self.update_visualization(self.time_slider.value())
+
             except Exception as e:
                 self.log_message(f"Error loading background image: {str(e)}")
                 self.background_image = None
@@ -2024,21 +2161,22 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def update_frame_estimate(self):
         """Update estimated frame count based on animation settings and loaded data"""
-        if self.data is None or 'Timestamp' not in self.data.columns:
+        source_data = self.preview_data if self.preview_data is not None else self.data
+        if source_data is None or 'Timestamp' not in source_data.columns:
             self.lbl_estimated_frames.setText("Estimated frames: -- (load data first)")
             return
-        
+
         try:
             # Get animation parameters
             fps = int(self.combo_animation_fps.currentText())
             speed_text = self.combo_animation_speed.currentText()
             speed_multiplier = int(speed_text.replace('x', ''))
-            
+
             # Calculate frame interval (real seconds per frame)
             frame_interval = speed_multiplier / fps
-            
+
             # Get total time span of data
-            time_span = (self.data['Timestamp'].max() - self.data['Timestamp'].min()).total_seconds()
+            time_span = (source_data['Timestamp'].max() - source_data['Timestamp'].min()).total_seconds()
             
             # Estimate number of frames
             estimated_frames = int(time_span / frame_interval)
@@ -2088,12 +2226,13 @@ class UWBQuickVisualizationWindow(QWidget):
         for cb in self.daily_animation_day_checkboxes.values():
             cb.deleteLater()
         self.daily_animation_day_checkboxes.clear()
-        
-        if self.data is None or 'Timestamp' not in self.data.columns:
+
+        source_data = self.preview_data if self.preview_data is not None else self.data
+        if source_data is None or 'Timestamp' not in source_data.columns:
             return
-        
+
         # Get unique dates
-        dates = pd.to_datetime(self.data['Timestamp']).dt.date.unique()
+        dates = pd.to_datetime(source_data['Timestamp']).dt.date.unique()
         dates = sorted(dates)
         date_strings = [date.strftime('%Y-%m-%d') for date in dates]
         
@@ -2152,8 +2291,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_export_progress.setText("")
     
     def mark_options_changed(self):
-        """Mark that options have changed"""
-        pass
+        """Mark that options have changed - prompt user to reload preview"""
+        if self.preview_loaded:
+            self.btn_load_preview.setText("Reload Preview")
+            self.btn_load_preview.setEnabled(True)
     
     def load_tags_from_table(self):
         """Load tags from selected table"""
@@ -2168,8 +2309,9 @@ class UWBQuickVisualizationWindow(QWidget):
             
             self.available_tags = df['shortid'].tolist()
             self.update_tag_selection()
-            
-            # Enable export
+
+            # Enable buttons
+            self.btn_load_preview.setEnabled(True)
             self.btn_export.setEnabled(True)
             
             # Load unique days for daily animation options
@@ -2297,6 +2439,9 @@ class UWBQuickVisualizationWindow(QWidget):
         """Handle trail checkbox toggle"""
         enabled = self.chk_show_trail.isChecked()
         self.spin_trail_length.setEnabled(enabled)
+        # Refresh preview if loaded (trail is a visual-only setting, no reload needed)
+        if self.preview_loaded:
+            self.update_visualization(self.time_slider.value())
     
     
     def apply_smoothing(self):
@@ -2448,8 +2593,300 @@ class UWBQuickVisualizationWindow(QWidget):
         }
         
         return data
-    
-    
+
+    # ---- Preview / Playback Methods ----
+
+    def load_preview(self):
+        """Load data and setup interactive preview (always downsampled to 1Hz)"""
+        if not self.db_path or not self.table_name:
+            return
+
+        selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+        if not selected_tags:
+            QMessageBox.warning(self, "No Tags", "Please select at least one tag")
+            return
+
+        try:
+            self.btn_load_preview.setText("Loading...")
+            self.btn_load_preview.setEnabled(False)
+            QApplication.processEvents()
+
+            self.log_message("Loading data from database for preview...")
+
+            # Load data
+            conn = sqlite3.connect(self.db_path)
+            query = f"SELECT * FROM {self.table_name}"
+            preview_data = pd.read_sql_query(query, conn)
+            conn.close()
+
+            self.log_message(f"Loaded {len(preview_data)} records from database")
+
+            # Process data
+            self.log_message("Processing timestamps and converting units...")
+            preview_data['Timestamp'] = pd.to_datetime(preview_data['timestamp'], unit='ms', origin='unix', utc=True)
+            tz = pytz.timezone(self.combo_timezone.currentText())
+            preview_data['Timestamp'] = preview_data['Timestamp'].dt.tz_convert(tz)
+
+            preview_data['location_x'] *= 0.0254
+            preview_data['location_y'] *= 0.0254
+
+            preview_data = preview_data.sort_values(by=['shortid', 'Timestamp'])
+
+            # Filter tags
+            preview_data = preview_data[preview_data['shortid'].isin(selected_tags)]
+
+            # Apply custom sex and identities
+            if self.tag_identities:
+                self.log_message("Applying custom identities...")
+                preview_data['sex'] = preview_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
+                preview_data['identity'] = preview_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('identity', f'Tag{x}'))
+            else:
+                preview_data['sex'] = 'M'
+                preview_data['identity'] = preview_data['shortid'].apply(lambda x: f'Tag{x}')
+
+            # Apply filtering if enabled
+            if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
+                self.log_message("Applying velocity/jump filtering...")
+                preview_data = self.apply_filters_to_data(preview_data)
+
+            # Apply smoothing if enabled (on full resolution data BEFORE downsampling)
+            if self.combo_smoothing.currentText() != "None":
+                self.log_message("Applying smoothing to full resolution data...")
+                preview_data = self.apply_smoothing_to_data(preview_data, self.combo_smoothing.currentText())
+
+            # ALWAYS downsample to 1Hz for preview performance
+            self.log_message("Downsampling preview to 1Hz...")
+            preview_data['time_sec'] = (preview_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
+            preview_data = preview_data.groupby(['shortid', 'time_sec']).first().reset_index()
+
+            # Store preview data
+            self.preview_data = preview_data
+
+            # Setup slider based on unique timestamps
+            self.log_message("Setting up visualization controls...")
+            unique_times = sorted(self.preview_data['Timestamp'].unique())
+            self.unique_timestamps = unique_times
+            self.time_slider.setMaximum(len(unique_times) - 1)
+            self.time_slider.setValue(0)
+            self.time_slider.setEnabled(True)
+
+            # Initial visualization
+            self.update_visualization(0)
+
+            # Enable playback controls
+            self.btn_rewind.setEnabled(True)
+            self.btn_play_pause.setEnabled(True)
+            self.btn_fast_forward.setEnabled(True)
+            self.btn_save_preview.setEnabled(True)
+
+            # Mark preview as loaded
+            self.preview_loaded = True
+            self.btn_load_preview.setText("Reload Preview")
+            self.btn_load_preview.setEnabled(True)
+            self.btn_export.setEnabled(True)
+
+            # Populate animation days and update frame estimate
+            self.populate_animation_days()
+            self.update_frame_estimate()
+
+            self.log_message(f"\u2713 Preview loaded: {len(self.preview_data)} data points across {len(unique_times)} unique timestamps")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load preview: {str(e)}")
+            self.log_message(f"\u2717 Error loading data: {str(e)}")
+            self.btn_load_preview.setText("Load Preview")
+            self.btn_load_preview.setEnabled(True)
+
+    def update_visualization(self, slider_value):
+        """Update visualization based on slider position"""
+        if self.preview_data is None or len(self.preview_data) == 0 or not self.unique_timestamps:
+            return
+
+        self.ax.clear()
+
+        x_col = 'smoothed_x' if 'smoothed_x' in self.preview_data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in self.preview_data.columns else 'location_y'
+
+        # Get current timestamp from slider
+        current_timestamp = self.unique_timestamps[slider_value]
+        self.lbl_time.setText(current_timestamp.strftime('%Y-%m-%d %H:%M:%S'))
+
+        # Display background image if available
+        if self.background_image is not None and self.bg_width_meters is not None:
+            try:
+                self.ax.imshow(self.background_image,
+                              extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+                              origin='lower',
+                              aspect='auto',
+                              alpha=0.6,
+                              zorder=0)
+            except Exception as e:
+                self.log_message(f"Error drawing background: {str(e)}")
+
+        # Draw arena zones if available
+        if self.arena_zones is not None and not self.arena_zones.empty:
+            try:
+                from matplotlib.patches import Polygon
+                for zone_name in self.arena_zones['zone'].unique():
+                    zone_points = self.arena_zones[self.arena_zones['zone'] == zone_name]
+                    coords = zone_points[['x', 'y']].values
+                    if len(coords) >= 3:
+                        poly = Polygon(coords, fill=False, edgecolor='black', linewidth=1.5, linestyle='--', zorder=1)
+                        self.ax.add_patch(poly)
+                        centroid_x = coords[:, 0].mean()
+                        centroid_y = coords[:, 1].mean()
+                        self.ax.text(centroid_x, centroid_y, zone_name,
+                                   fontsize=8, ha='center', va='center',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5))
+            except Exception as e:
+                self.log_message(f"Error drawing zones: {str(e)}")
+
+        # Get all data up to and including current timestamp
+        current_data = self.preview_data[self.preview_data['Timestamp'] <= current_timestamp]
+
+        # Plot each tag
+        for tag in sorted(self.preview_data['shortid'].unique()):
+            tag_all_data = current_data[current_data['shortid'] == tag]
+
+            if len(tag_all_data) == 0:
+                continue
+
+            # Get the most recent position for this tag
+            current_pos = tag_all_data.iloc[-1]
+
+            # Determine label and color
+            if tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                sex = info.get('sex', 'M')
+                identity = info.get('identity', str(tag))
+                label = f"{sex}-{identity}"
+                color = 'blue' if sex == 'M' else 'red'
+            else:
+                hex_id = hex(tag).upper().replace('0X', '')
+                label = f"HexID {hex_id}"
+                color = 'blue'
+
+            # Plot trail if enabled
+            if self.chk_show_trail.isChecked() and len(tag_all_data) > 1:
+                trail_seconds = self.spin_trail_length.value()
+                trail_start_time = current_timestamp - pd.Timedelta(seconds=trail_seconds)
+                trail_data = tag_all_data[tag_all_data['Timestamp'] >= trail_start_time]
+
+                if len(trail_data) > 1:
+                    self.ax.plot(trail_data[x_col], trail_data[y_col],
+                               color=color, linewidth=2, alpha=0.6)
+
+            # Plot current position with label
+            self.ax.scatter(current_pos[x_col], current_pos[y_col],
+                          c=color, s=100, marker='o', edgecolors='black', linewidths=2, zorder=5)
+            self.ax.text(current_pos[x_col], current_pos[y_col], f'  {label}',
+                        fontsize=10, fontweight='bold', color=color,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=color))
+
+        # Set limits based on all data
+        x_min, x_max = self.preview_data[x_col].min(), self.preview_data[x_col].max()
+        y_min, y_max = self.preview_data[y_col].min(), self.preview_data[y_col].max()
+
+        # Include background image bounds
+        if self.background_image is not None and self.bg_width_meters is not None:
+            x_min = min(x_min, 0)
+            x_max = max(x_max, self.bg_width_meters)
+            y_min = min(y_min, 0)
+            y_max = max(y_max, self.bg_height_meters)
+
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_pad = x_range * 0.05 if x_range > 0 else 1
+        y_pad = y_range * 0.05 if y_range > 0 else 1
+
+        self.ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        self.ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+        self.ax.set_xlabel('X Position (m)', fontsize=10)
+        self.ax.set_ylabel('Y Position (m)', fontsize=10)
+        self.ax.set_title('UWB Tracking Preview', fontsize=12, fontweight='bold')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_aspect('equal')
+
+        self.canvas.draw_idle()
+
+    def rewind_playback(self):
+        """Rewind to the beginning"""
+        self.time_slider.setValue(0)
+        if self.is_playing:
+            self.toggle_play_pause()
+
+    def toggle_play_pause(self):
+        """Toggle between play and pause"""
+        if self.is_playing:
+            self.is_playing = False
+            self.playback_timer.stop()
+            self.btn_play_pause.setText("\u25b6 Play")
+        else:
+            self.is_playing = True
+            base_interval = 1000
+            interval = int(base_interval / self.playback_speed)
+            self.playback_timer.start(interval)
+            self.btn_play_pause.setText("\u23f8 Pause")
+
+    def fast_forward_playback(self):
+        """Fast forward to the end"""
+        self.time_slider.setValue(self.time_slider.maximum())
+        if self.is_playing:
+            self.toggle_play_pause()
+
+    def on_speed_changed(self, speed_text):
+        """Handle playback speed change"""
+        self.playback_speed = int(speed_text.replace('x', ''))
+        if self.is_playing:
+            base_interval = 1000
+            interval = int(base_interval / self.playback_speed)
+            self.playback_timer.start(interval)
+
+    def advance_playback(self):
+        """Advance playback by one frame"""
+        current_value = self.time_slider.value()
+        max_value = self.time_slider.maximum()
+        if current_value < max_value:
+            self.time_slider.setValue(current_value + 1)
+        else:
+            self.toggle_play_pause()
+
+    def save_preview_image(self):
+        """Save the current preview view as PNG or SVG"""
+        if self.preview_data is None:
+            QMessageBox.warning(self, "No Preview", "Please load a preview first")
+            return
+
+        # Default filename based on current timestamp
+        current_idx = self.time_slider.value()
+        if current_idx < len(self.unique_timestamps):
+            ts = self.unique_timestamps[current_idx]
+            default_name = f"preview_{ts.strftime('%Y%m%d_%H%M%S')}"
+        else:
+            default_name = "preview_image"
+
+        # Determine default directory (same as database file)
+        default_dir = os.path.dirname(self.db_path) if self.db_path else ""
+        default_path = os.path.join(default_dir, default_name)
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save Preview Image", default_path,
+            "PNG Image (*.png);;SVG Image (*.svg);;All Files (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # Determine format from extension
+            fmt = 'svg' if file_path.lower().endswith('.svg') else 'png'
+            self.figure.savefig(file_path, dpi=300, bbox_inches='tight', format=fmt)
+            self.log_message(f"\u2713 Preview image saved: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save image: {str(e)}")
+            self.log_message(f"\u2717 Error saving preview image: {str(e)}")
+
     def get_config_dict(self):
         """Get current configuration as dictionary"""
         config = {
@@ -3590,7 +4027,9 @@ class UWBQuickVisualizationWindow(QWidget):
         QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
     
     def closeEvent(self, event):
-        """Handle window close event - stop any ongoing exports"""
+        """Handle window close event - stop any ongoing exports and playback"""
+        if self.is_playing:
+            self.playback_timer.stop()
         if self.exporting:
             reply = QMessageBox.question(self, 'Export in Progress', 
                                         'An export is in progress. Do you want to cancel it and close?',

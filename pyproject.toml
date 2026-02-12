@@ -64,11 +64,11 @@ all = [
 ]
 
 [project.scripts]
-fnt = "fnt.gui_pyqt:main"
+fnt-gui = "fnt.gui_pyqt:main"
 
 [project.urls]
-Homepage = "https://github.com/calebweinreb/fnt"
-Issues = "https://github.com/calebweinreb/fnt/issues"
+Homepage = "https://github.com/calebvogt/fnt"
+Issues = "https://github.com/calebvogt/fnt/issues"
 
 [tool.setuptools.packages.find]
 include = ["fnt*"]
