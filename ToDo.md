@@ -51,5 +51,67 @@
 
 # Sleap EthoScope / Behavioral Catagorizer
 - create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
-- 
+-
+
+
+# Imaging Tool (CZI Viewer)
+
+## Completed
+- [x] CZI file loading with channel detection
+- [x] Per-channel brightness, contrast, gamma, sharpness adjustments
+- [x] Brightness thresholding with dual-handle slider
+- [x] Rolling ball and Gaussian background subtraction with downsampling
+- [x] False coloring with customizable palette
+- [x] Scale bar from metadata (draggable position)
+- [x] Text and shape annotations (arrow, line, circle, rectangle, freehand)
+- [x] Export to PNG/TIFF with annotations and scale bar
+- [x] Export settings JSON for traceability
+- [x] Per-file settings preservation during navigation
+
+## Cell Counting / Quantification Module (Standalone Tool)
+
+### Overview
+Standalone "Image Quantification" tool in the Imaging tab for automated cell/fiber counting on fluorescence microscopy images.
+
+### Phase 1: Basic Cell Counting ✅
+- [x] Intensity thresholding with adjustable threshold levels (Otsu/Triangle/Li/Manual)
+- [x] Binary mask preview overlay (filled + contour outline modes)
+- [x] Particle analysis with size filtering (min/max area in µm²)
+- [x] Watershed separation for touching cells
+- [x] Results table: count, mean area, total area, mean intensity, circularity
+
+### Phase 2: Multi-Channel Analysis ✅
+- [x] Count cells per channel independently
+- [x] Colocalization analysis (% overlap between channels, Dice coefficient)
+- [x] Cell-by-cell intensity measurements per channel
+- [x] False-color composite preview with per-channel colors
+
+### Phase 3: ROI-Based Counting ✅
+- [x] Draw ROI regions for localized counting
+- [x] Compare counts across ROIs
+- [x] Density calculations (cells per mm²)
+
+### Phase 4: Fiber Quantification
+- [ ] Skeletonization for fiber/neurite tracing
+- [ ] Total fiber length measurement
+- [ ] Branch point detection and counting
+- [ ] Fiber density per area
+
+### Phase 5: Export & Reporting ✅
+- [x] CSV export with all measurements (per-channel + colocalization + ROI density)
+- [x] Overlay image export (PNG/TIFF) with masks, centroids, ROI rectangles
+- [x] Batch processing across all loaded files (combined CSV output)
+- [x] Analysis settings persistence (Save/Load JSON for reproducibility)
+
+### UX Features ✅
+- [x] Zoom-to-particle on table row selection (auto-pan/zoom to centroid)
+- [x] Contour outline mode for mask preview (vs filled overlay)
+- [x] Keyboard shortcuts (Ctrl+R, Ctrl+E, Ctrl+O, F, M, Left/Right, Ctrl+±)
+- [x] Per-channel color composite preview with additive blending
+
+### Technical Considerations
+- [x] Uses scikit-image for segmentation (threshold_otsu, watershed, label)
+- [ ] Consider deep learning option (Cellpose, StarDist) for advanced segmentation
+- [x] Results linked to current display settings for reproducibility (auto-saved config JSON)
+- [x] All measurements use calibrated units (µm, µm²) when pixel size is available
 

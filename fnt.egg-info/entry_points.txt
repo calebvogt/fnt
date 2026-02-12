@@ -1,2 +1,0 @@
-[console_scripts]
-fnt-gui = fnt.gui_pyqt:main

@@ -1,6 +1,8 @@
 # CLAUDE.md - Instructions for Claude Code Sessions
 
-This file provides context and patterns for Claude sessions working on the FieldNeuroToolbox (FNT) codebase.
+**Agents working on this project should read this CLAUDE.md file first before making any changes.**
+
+This file provides context, patterns, and rules for Claude sessions working on the FieldNeuroToolbox (FNT) codebase.
 
 ## Project Overview
 
@@ -34,7 +36,12 @@ fnt/
 ├── sleapProcessing/     # SLEAP pipeline tools
 ├── uwb/                 # UWB tracking tools
 ├── rfid/                # RFID processing tools
-└── DoricFP/             # Fiber photometry tools
+├── DoricFP/             # Fiber photometry tools
+└── imaging/             # Zeiss CZI microscopy viewer
+    ├── __init__.py              # Module init with try/except imports
+    ├── czi_reader.py            # CZI file reader (aicspylibczi)
+    ├── image_processor.py       # Processing pipeline (normalize, BG sub, colorize, merge)
+    └── czi_viewer_pyqt.py       # PyQt5 GUI (ImagePreviewWidget, ChannelControlWidget, CZIViewerWindow)
 ```
 
 ## PyQt5 Styling Patterns
@@ -335,3 +342,67 @@ if __name__ == "__main__":
 ```
 
 Run with: `python -m fnt.usv.my_tool_pyqt`
+
+## General UI Rules
+
+These rules apply to all FNT GUIs. Follow them when creating or modifying any tool:
+
+1. **Dark theme is mandatory** — All GUIs must use the FNT dark theme (#2b2b2b background, #0078d4 accent blue). See stylesheet above.
+2. **Use `CheckmarkCheckBox`** — Custom checkbox class that draws a visible ✓ inside the indicator. Never use plain `QCheckBox` for visible checkboxes. Defined in `fnt/imaging/czi_viewer_pyqt.py`.
+3. **Color order convention** — When offering color choices (annotation colors, shape colors, etc.), use this order: `['white', 'green', 'magenta', 'cyan', 'red', 'blue', 'yellow', 'gray']` — white first, then matching the fluorescence channel color order.
+4. **No tool pre-selected by default** — Drawing/annotation toolbars should start with no tool selected. Options panels should be hidden until the user clicks a tool.
+5. **Drawing tools: click-and-drag, no immediate placement** — When a user selects a drawing tool (text, arrow, line, etc.), do NOT immediately place an item on the image. The user should click and drag on the image to create items.
+6. **Live property editing** — When a user selects an existing drawing (text or shape), populate the options panel with its properties. Changes to options should update the selected item live.
+7. **Debounce expensive slider computations** — For sliders that trigger expensive computations (e.g., background subtraction radius), use a 400ms QTimer debounce. Update the value label immediately but delay the recompute.
+8. **Preserve per-file settings in memory** — When users navigate between files (← → arrows), save their channel settings to an in-memory cache and restore when they return. Settings do not need to persist across app restarts.
+9. **Compact buttons** — Use `padding: 4px 10px`, `font-size: 11px`, `min-height: 16px` for buttons in dense UIs like the imaging viewer.
+10. **Use QThread for long operations** — Never do heavy processing in the main thread. Always use QThread with signals for progress reporting.
+
+## Imaging Module Conventions
+
+These conventions are specific to the CZI viewer (`fnt/imaging/`):
+
+### Channel Control Layout
+
+Each channel's control widget follows this order (top to bottom):
+1. **Channel name** — Bold label on its own row (above the checkbox)
+2. **Enable checkbox + Color combo** — `[✓] ........... [green ▾]`
+3. **Brightness** — Slider (0–3.0, default 1.0)
+4. **Contrast** — Slider (0–3.0, default 1.0)
+5. **Gamma** — Slider (0.1–3.0, default 1.0) — **above** Sharpness
+6. **Sharpness** — Slider (0–5.0, default 0.0)
+7. **Threshold** — Checkbox + DualHandleSlider (0.0–1.0)
+8. **BG Sub** — Method combo (None, Rolling Ball, Gaussian, ROI) + conditional radius/ROI rows
+9. **Separator line**
+
+### Zoom Behavior
+
+- **100% = fit to window** — The zoom percentage is relative to the "fit" level, not to raw pixel mapping.
+- Users can zoom beyond 100% (zoomed in) or below 100% (zoomed out beyond fit).
+- The `_fit_zoom_level` reference is recalculated on window resize.
+
+### Scale Bar
+
+- Scale bar is **draggable** — users can click and drag it to reposition.
+- Position is stored in image coordinates so it stays consistent across zoom/pan.
+- Default position: bottom-right corner.
+
+### Background Subtraction Performance
+
+- Radius slider range is constrained to **1–200** (not 500).
+- Radius slider uses **400ms debounce** — label updates instantly, recompute is delayed.
+- Rolling ball and Gaussian methods use **downsampling** (up to 4x) for images larger than 512px, then upscale the result. This provides ~16x speedup on large images.
+- Results are cached per-channel to avoid redundant recomputation.
+
+### ROI Background Subtraction Flow
+
+1. User clicks "Draw ROI" on a specific channel
+2. User draws rectangle on the image
+3. On mouse release: ROI median is calculated, rectangle overlay is cleared, status message shows: "BG subtracted: ROI median = X.XXXX applied to channel NAME"
+
+## Stylistic Preferences
+
+- **Slider labels**: Use full names (Brightness, Contrast, Gamma, Sharpness), one per row, with value display on the right
+- **Font sizes**: Labels use `font-size: 10px`, value labels use `font-size: 10px`, channel names use `font-size: 11px; font-weight: bold`
+- **QComboBox dropdown fix**: Always include `QComboBox QAbstractItemView { min-width: 140px; }` in stylesheets to prevent truncated dropdowns on macOS
+- **Separator lines**: Use a 1px-high QWidget with `background-color: #3f3f3f` between channel controls

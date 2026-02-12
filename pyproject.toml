@@ -4,34 +4,75 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnt"
-version = "1.0"
+version = "0.1.0"
+description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Caleb Vogt", email = "vogtneuroscience@gmail.com"},
+]
+keywords = ["neuroscience", "behavior", "RFID", "USV", "imaging", "field-research"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
 dependencies = [
-    "opencv-python",
-    "numpy>=2.3",
-    "ffmpeg-python",
-    "tk",
+    # Core scientific stack
+    "numpy>=1.24",
     "pandas",
-    "matplotlib",
-    "tqdm",
-    "seaborn",
     "scipy",
-    "shapely",
-    "openpyxl",
-    "soundfile",
-    "moviepy",
+    "matplotlib",
+    # GUI
     "PyQt5",
-    "requests>=2.31.0",
-    "h5py",  # For reading Doric .doric (HDF5) files
-    "networkx>=3.0",  # For RFID social network analysis
-    # Video tracking dependencies (SAM 2)
+    # I/O
+    "h5py",
+    "Pillow",
+    "soundfile",
+    "opencv-python",
+]
+
+[project.optional-dependencies]
+imaging = [
+    "aicspylibczi>=3.1.1",
+    "aicsimageio",
+    "fsspec",
+    "scikit-image",
+]
+usv = [
+    "sounddevice",
+    "scikit-learn",
+    "joblib",
+]
+rfid = [
+    "networkx>=3.0",
+]
+tracking = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
-    "SAM-2 @ git+https://github.com/facebookresearch/sam2.git"
+    # segment-anything and SAM-2 must be installed separately:
+    #   pip install git+https://github.com/facebookresearch/sam2.git
 ]
-requires-python = ">=3.8"
+all = [
+    "fnt[imaging,usv,rfid,tracking]",
+]
 
 [project.scripts]
-fnt-gui = "fnt.gui_pyqt:main"
+fnt = "fnt.gui_pyqt:main"
+
+[project.urls]
+Homepage = "https://github.com/calebweinreb/fnt"
+Issues = "https://github.com/calebweinreb/fnt/issues"
 
 [tool.setuptools.packages.find]
-include = ["fnt"]
+include = ["fnt*"]
+
+[tool.setuptools.package-data]
+fnt = ["../icons/*.ico", "../icons/*.png"]

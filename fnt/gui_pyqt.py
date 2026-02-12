@@ -177,6 +177,7 @@ class FNTMainWindow(QMainWindow):
         self.create_rfid_tab()
         self.create_fed_tab()
         self.create_wifp_tab()
+        self.create_imaging_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -373,12 +374,12 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # UWB Quick Review group
-        quick_group = QGroupBox("UWB Quick Review")
+        # UWB PreProcessing group
+        quick_group = QGroupBox("UWB PreProcessing")
         quick_layout = QGridLayout()
-        
+
         quick_buttons = [
-            ("UWB Quick Visualization", "Interactive tracking visualization with time slider", self.run_uwb_quick_visualization),
+            ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_quick_visualization),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -574,7 +575,63 @@ class FNTMainWindow(QMainWindow):
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "WiFP")
-    
+
+    def create_imaging_tab(self):
+        """Create the Imaging tab for microscopy analysis"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        # Description
+        desc = QLabel("Microscopy image viewing and processing tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        # Imaging tools group
+        group = QGroupBox("Imaging Tools")
+        group_layout = QGridLayout()
+
+        buttons = [
+            ("CZI Viewer", "View and process Zeiss CZI microscopy images with false coloring", self.run_czi_viewer),
+            ("Image Quantification", "Cell counting and analysis for CZI microscopy images", self.run_image_quantification),
+        ]
+
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+
+        # Info panel
+        info_group = QGroupBox("About Imaging Tools")
+        info_layout = QVBoxLayout()
+
+        info_label = QLabel(
+            "<b>CZI Viewer:</b><br>"
+            "• Load and view multi-channel Zeiss CZI microscopy files<br>"
+            "• False color channels (GFP green, Cy3 magenta, etc.)<br>"
+            "• Adjust brightness, contrast, gamma, and sharpness<br>"
+            "• Background subtraction (Rolling Ball, Gaussian)<br>"
+            "• Add text and shape annotations to images<br>"
+            "• Export processed images to PNG or TIFF<br><br>"
+            "<b>Image Quantification:</b><br>"
+            "• Multi-channel cell/particle counting with watershed separation<br>"
+            "• Colocalization analysis (centroid overlap, Dice coefficient)<br>"
+            "• ROI-based density measurement (cells/mm\u00b2)<br>"
+            "• Export results to CSV<br><br>"
+            "<b>Requirements:</b><br>"
+            "pip install aicspylibczi fsspec Pillow scikit-image"
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Imaging")
+
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab = QWidget()
@@ -809,15 +866,15 @@ class FNTMainWindow(QMainWindow):
     
     # UWB Processing Methods
     def run_uwb_quick_visualization(self):
-        """Launch UWB Quick Visualization tool"""
+        """Launch UWB PreProcessing Tool"""
         try:
             from fnt.uwb.uwb_quick_visualization_pyqt import UWBQuickVisualizationWindow
-            
-            # Create and show the UWB quick visualization window
+
+            # Create and show the UWB PreProcessing Tool window
             self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
             self.uwb_quick_viz_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB Quick Visualization failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
     
     def run_uwb_behavioral(self):
         """Launch UWB behavioral analysis"""
@@ -833,6 +890,47 @@ class FNTMainWindow(QMainWindow):
             plot_uwb_path()
         self.run_function_safely(func, "UWB Path Plotting")
     
+    # Imaging Methods
+    def run_czi_viewer(self):
+        """Launch CZI Viewer for microscopy images"""
+        try:
+            from fnt.imaging.czi_viewer_pyqt import CZIViewerWindow
+
+            self.czi_viewer_window = CZIViewerWindow()
+            self.czi_viewer_window.show()
+        except ImportError as e:
+            if "aicspylibczi" in str(e) or "No module named" in str(e):
+                QMessageBox.warning(
+                    self, "Missing Dependencies",
+                    "CZI file support requires additional packages.\n\n"
+                    "Install with:\n"
+                    "pip install aicspylibczi fsspec Pillow"
+                )
+            else:
+                QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+
+    def run_image_quantification(self):
+        """Launch Image Quantification tool for CZI microscopy images"""
+        try:
+            from fnt.imaging.quantification_pyqt import QuantificationToolWindow
+
+            self.image_quant_window = QuantificationToolWindow()
+            self.image_quant_window.show()
+        except ImportError as e:
+            if "aicspylibczi" in str(e) or "No module named" in str(e):
+                QMessageBox.warning(
+                    self, "Missing Dependencies",
+                    "Image Quantification requires additional packages.\n\n"
+                    "Install with:\n"
+                    "pip install aicspylibczi fsspec Pillow scikit-image"
+                )
+            else:
+                QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
+
     # Video Tracking Methods
     def run_mask_pose_tracker(self):
         """Launch Mask Pose Tracker with SAM"""
