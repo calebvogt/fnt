@@ -1,6 +1,7 @@
 import os
 import sys
 import sqlite3
+import struct
 import numpy as np
 import pandas as pd
 import pytz
@@ -314,7 +315,13 @@ class PlotSaverWorker(QThread):
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-        
+        elif method == "Rolling Median":
+            window_size = max(3, self.rolling_window)
+            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
+                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
+                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+
         return data
     
     def save_daily_paths_per_tag(self, data, output_dir, db_name):
@@ -1020,6 +1027,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
         self.arena_zones = None  # DataFrame with zone coordinates from XML
+        self.anchor_positions = []  # List of dicts: {'shortid': int, 'x': float, 'y': float, 'z': float}
 
         # Preview state (separate from export data)
         self.preview_data = None
@@ -1335,10 +1343,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.tag_group.setLayout(self.tag_layout)
         layout.addWidget(self.tag_group)
         
-        # Options
+        # Options (ordered to match processing pipeline: Filter -> Smooth -> Downsample)
         options_group = QGroupBox("Options")
         options_layout = QVBoxLayout()
-        
+
         # Timezone
         tz_layout = QHBoxLayout()
         tz_layout.addWidget(QLabel("Timezone:"))
@@ -1352,49 +1360,17 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_timezone.currentTextChanged.connect(self.mark_options_changed)
         tz_layout.addWidget(self.combo_timezone)
         options_layout.addLayout(tz_layout)
-        
-        # Smoothing (moved up, before downsample)
-        options_layout.addWidget(QLabel("Smoothing method:"))
-        self.combo_smoothing = QComboBox()
-        self.combo_smoothing.addItems(["None", "Savitzky-Golay", "Rolling Average"])
-        self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
-        options_layout.addWidget(self.combo_smoothing)
-        
-        # Rolling average window (only shown when Rolling Average is selected)
-        self.rolling_window_layout = QHBoxLayout()
-        self.rolling_window_layout.addWidget(QLabel("Window (seconds):"))
-        self.spin_rolling_window = QSpinBox()
-        self.spin_rolling_window.setRange(1, 60)
-        self.spin_rolling_window.setValue(30)  # Changed default to 30s
-        self.spin_rolling_window.setEnabled(False)
-        self.rolling_window_layout.addWidget(self.spin_rolling_window)
-        options_layout.addLayout(self.rolling_window_layout)
-        self.spin_rolling_window.hide()
-        self.rolling_window_layout.itemAt(0).widget().hide()  # Hide label too
-        
-        # Trail options
-        self.chk_show_trail = QCheckBox("Show trail")
-        self.chk_show_trail.setChecked(False)
-        self.chk_show_trail.stateChanged.connect(self.on_trail_toggled)
-        options_layout.addWidget(self.chk_show_trail)
-        
-        trail_length_layout = QHBoxLayout()
-        trail_length_layout.addWidget(QLabel("Trail length (seconds):"))  # Changed to seconds
-        self.spin_trail_length = QSpinBox()
-        self.spin_trail_length.setRange(1, 300)  # 1-300 seconds
-        self.spin_trail_length.setValue(30)  # Changed default to 30s
-        self.spin_trail_length.setEnabled(False)
-        trail_length_layout.addWidget(self.spin_trail_length)
-        options_layout.addLayout(trail_length_layout)
-        
+
+        # --- Step 1: Filtering ---
+
         # Velocity Filtering
         velocity_filter_layout = QHBoxLayout()
         self.chk_velocity_filter = QCheckBox("Apply velocity filtering (remove points >")
         self.chk_velocity_filter.setChecked(True)
-        self.chk_velocity_filter.setToolTip("Remove data points with unrealistic velocities before smoothing")
+        self.chk_velocity_filter.setToolTip("Remove data points with unrealistic velocities")
         self.chk_velocity_filter.stateChanged.connect(self.mark_options_changed)
         velocity_filter_layout.addWidget(self.chk_velocity_filter)
-        
+
         self.spin_velocity_threshold = QDoubleSpinBox()
         self.spin_velocity_threshold.setRange(0.1, 10.0)
         self.spin_velocity_threshold.setValue(2.0)
@@ -1406,15 +1382,15 @@ class UWBQuickVisualizationWindow(QWidget):
         velocity_filter_layout.addWidget(self.spin_velocity_threshold)
         velocity_filter_layout.addStretch()
         options_layout.addLayout(velocity_filter_layout)
-        
+
         # Jump Filtering (distance threshold)
         jump_filter_layout = QHBoxLayout()
         self.chk_jump_filter = QCheckBox("Apply jump filtering (remove jumps >")
         self.chk_jump_filter.setChecked(True)
-        self.chk_jump_filter.setToolTip("Remove data points with unrealistic spatial jumps before smoothing")
+        self.chk_jump_filter.setToolTip("Remove data points with unrealistic spatial jumps")
         self.chk_jump_filter.stateChanged.connect(self.mark_options_changed)
         jump_filter_layout.addWidget(self.chk_jump_filter)
-        
+
         self.spin_jump_threshold = QDoubleSpinBox()
         self.spin_jump_threshold.setRange(0.1, 10.0)
         self.spin_jump_threshold.setValue(2.0)
@@ -1426,7 +1402,7 @@ class UWBQuickVisualizationWindow(QWidget):
         jump_filter_layout.addWidget(self.spin_jump_threshold)
         jump_filter_layout.addStretch()
         options_layout.addLayout(jump_filter_layout)
-        
+
         # Time Window Grouping
         time_window_layout = QHBoxLayout()
         time_window_layout.addWidget(QLabel("Time gap grouping:"))
@@ -1439,28 +1415,70 @@ class UWBQuickVisualizationWindow(QWidget):
         time_window_layout.addWidget(self.spin_time_gap)
         time_window_layout.addStretch()
         options_layout.addLayout(time_window_layout)
-        
-        # Downsample (moved to below trail options)
+
+        # Trail options (visual setting, placed after filtering options)
+        self.chk_show_trail = QCheckBox("Show trail")
+        self.chk_show_trail.setChecked(False)
+        self.chk_show_trail.stateChanged.connect(self.on_trail_toggled)
+        options_layout.addWidget(self.chk_show_trail)
+
+        trail_length_layout = QHBoxLayout()
+        trail_length_layout.addWidget(QLabel("Trail length (seconds):"))
+        self.spin_trail_length = QSpinBox()
+        self.spin_trail_length.setRange(1, 300)
+        self.spin_trail_length.setValue(30)
+        self.spin_trail_length.setEnabled(False)
+        trail_length_layout.addWidget(self.spin_trail_length)
+        options_layout.addLayout(trail_length_layout)
+
+        # --- Step 2: Smoothing ---
+
+        options_layout.addWidget(QLabel("Smoothing method:"))
+        self.combo_smoothing = QComboBox()
+        self.combo_smoothing.addItems(["None", "Savitzky-Golay", "Rolling Average", "Rolling Median"])
+        self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
+        options_layout.addWidget(self.combo_smoothing)
+
+        # Rolling window (shown for Rolling Average and Rolling Median)
+        self.rolling_window_layout = QHBoxLayout()
+        self.rolling_window_layout.addWidget(QLabel("Window (seconds):"))
+        self.spin_rolling_window = QSpinBox()
+        self.spin_rolling_window.setRange(1, 60)
+        self.spin_rolling_window.setValue(30)
+        self.spin_rolling_window.setEnabled(False)
+        self.rolling_window_layout.addWidget(self.spin_rolling_window)
+        options_layout.addLayout(self.rolling_window_layout)
+        self.spin_rolling_window.hide()
+        self.rolling_window_layout.itemAt(0).widget().hide()
+
+        # --- Step 3: Downsample ---
+
         self.chk_downsample = QCheckBox("Downsample to 1Hz")
         self.chk_downsample.setChecked(True)
         self.chk_downsample.setToolTip("Downsample output to 1Hz (smoothing is applied to full resolution data first)")
         self.chk_downsample.stateChanged.connect(self.mark_options_changed)
         options_layout.addWidget(self.chk_downsample)
-        
-        # Load Background and Load Preview buttons in horizontal layout
-        load_buttons_layout = QHBoxLayout()
-        
-        # Load Background Image button
+
+        # --- Background Image ---
+
+        bg_buttons_layout = QHBoxLayout()
+
         self.btn_load_background = QPushButton("Load Background")
         self.btn_load_background.clicked.connect(self.select_background_image)
         self.btn_load_background.setEnabled(False)
         self.btn_load_background.setToolTip("Load a background map/floorplan image to overlay on visualizations")
         self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
-        load_buttons_layout.addWidget(self.btn_load_background)
-        
-        options_layout.addLayout(load_buttons_layout)
-        
-        # Label to show background image status
+        bg_buttons_layout.addWidget(self.btn_load_background)
+
+        self.btn_remove_background = QPushButton("Remove Background")
+        self.btn_remove_background.clicked.connect(self.remove_background)
+        self.btn_remove_background.setEnabled(False)
+        self.btn_remove_background.setToolTip("Remove the background image from visualizations")
+        self.btn_remove_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        bg_buttons_layout.addWidget(self.btn_remove_background)
+
+        options_layout.addLayout(bg_buttons_layout)
+
         self.lbl_background_status = QLabel("No background image loaded")
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.lbl_background_status.setWordWrap(True)
@@ -1889,6 +1907,11 @@ class UWBQuickVisualizationWindow(QWidget):
         
         if not xml_files:
             self.log_message("No XML configuration file found in database directory")
+            QMessageBox.warning(
+                self, "XML Configuration Not Found",
+                "No XML configuration file found in the database folder.\n\n"
+                "Anchor positions and floorplan scale will not be available."
+            )
             return
         
         # If multiple XML files, use the first one or one matching config/Config pattern
@@ -1965,51 +1988,58 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message("No valid zone coordinates found in XML")
             else:
                 self.log_message("No Zones section found in XML")
-            
-            # Look for background image reference
-            # XML structure might vary, check common patterns
-            bg_image_element = None
-            
-            # Check for various possible XML paths
-            possible_paths = [
-                './/BackgroundImage',
-                './/backgroundImage',
-                './/background_image',
-                './/MapImage',
-                './/mapImage',
-                './/map_image',
-                './/Image',
-            ]
-            
-            for path in possible_paths:
-                bg_image_element = root.find(path)
-                if bg_image_element is not None:
-                    break
-            
-            # Also check for attributes that might contain image filename
-            if bg_image_element is None:
-                for elem in root.iter():
-                    if elem.text and any(ext in elem.text.lower() for ext in ['.png', '.jpg', '.jpeg', '.bmp']):
-                        bg_image_element = elem
+
+            # Parse anchor positions
+            self.anchor_positions = []
+            for anchor in root.iter('Anchor'):
+                try:
+                    shortid = int(anchor.get('shortid', '0'))
+                    x_hex = anchor.get('x', '0x0')
+                    y_hex = anchor.get('y', '0x0')
+                    z_hex = anchor.get('z', '0x0')
+
+                    # Decode IEEE 754 hex-encoded doubles
+                    x_inches = struct.unpack('d', struct.pack('Q', int(x_hex, 16)))[0]
+                    y_inches = struct.unpack('d', struct.pack('Q', int(y_hex, 16)))[0]
+                    z_inches = struct.unpack('d', struct.pack('Q', int(z_hex, 16)))[0]
+
+                    # Convert inches to meters
+                    self.anchor_positions.append({
+                        'shortid': shortid,
+                        'x': x_inches * 0.0254,
+                        'y': y_inches * 0.0254,
+                        'z': z_inches * 0.0254
+                    })
+                except (ValueError, struct.error):
+                    continue
+
+            if self.anchor_positions:
+                self.log_message(f"Parsed {len(self.anchor_positions)} anchor positions from XML")
+            else:
+                self.log_message("No anchor positions found in XML")
+
+            # Check if XML contains an embedded background image (base64)
+            has_embedded_image = False
+            for elem in root.iter():
+                if elem.tag in ('Map', 'BackgroundImage', 'Image'):
+                    # Check for base64 image data in text content
+                    if elem.text and len(elem.text.strip()) > 200:
+                        has_embedded_image = True
                         break
-            
-            if bg_image_element is not None and bg_image_element.text:
-                image_filename = bg_image_element.text.strip()
-                self.log_message(f"XML references background image: {image_filename}")
-                
-                # Prompt user to select the background image
+
+            if has_embedded_image:
+                self.log_message("XML contains an embedded background image")
                 reply = QMessageBox.question(
-                    self, 
-                    "Background Image Found",
-                    f"XML config references a background image: {image_filename}\\n\\n"
-                    "Would you like to select the background image file?",
+                    self,
+                    "Background Image Detected",
+                    "The XML config contains an embedded background image.\n\n"
+                    "Would you like to select the corresponding PNG file to use as background?",
                     QMessageBox.Yes | QMessageBox.No
                 )
-                
                 if reply == QMessageBox.Yes:
                     self.select_background_image()
             else:
-                self.log_message("XML config does not reference a background image")
+                self.log_message("No embedded background image found in XML")
                 
         except Exception as e:
             self.log_message(f"Error parsing XML: {str(e)}")
@@ -2041,14 +2071,21 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
                     self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m")
                 else:
-                    # Fallback: use pixel dimensions (no scaling)
-                    self.bg_width_meters = img_width_px
-                    self.bg_height_meters = img_height_px
-                    self.log_message("No XML scale found, using pixel dimensions")
+                    # No XML scale — warn user that dimensions will be incorrect
+                    self.bg_width_meters = img_width_px * 0.0254  # Assume 1 inch/pixel as rough fallback
+                    self.bg_height_meters = img_height_px * 0.0254
+                    self.log_message("WARNING: No XML scale found — background dimensions may be incorrect. Load an XML configuration for accurate scaling.")
+                    QMessageBox.warning(
+                        self, "No Scale Available",
+                        "No XML scale has been loaded. The background image dimensions "
+                        "may be incorrect.\n\nLoad an XML configuration file first for "
+                        "accurate floorplan scaling."
+                    )
                 
-                # Update status label
+                # Update status label and enable remove button
                 self.lbl_background_status.setText(f"\u2713 Background: {os.path.basename(file_path)}")
                 self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                self.btn_remove_background.setEnabled(True)
 
                 # Refresh preview if loaded
                 if self.preview_loaded:
@@ -2062,7 +2099,22 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.bg_height_meters = None
                 self.lbl_background_status.setText("Error loading background image")
                 self.lbl_background_status.setStyleSheet("color: #aa0000; font-style: italic; font-size: 9px;")
-    
+
+    def remove_background(self):
+        """Remove the background image from visualizations"""
+        self.background_image = None
+        self.background_image_path = None
+        self.bg_width_meters = None
+        self.bg_height_meters = None
+        self.lbl_background_status.setText("No background image loaded")
+        self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
+        self.btn_remove_background.setEnabled(False)
+        self.log_message("Background image removed")
+
+        # Refresh preview if loaded
+        if self.preview_loaded:
+            self.update_visualization(self.time_slider.value())
+
     def on_table_selected(self, table_name):
         """Handle table selection"""
         if table_name:
@@ -2142,7 +2194,7 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def on_smoothing_changed(self, method):
         """Handle smoothing method change"""
-        is_rolling = method == "Rolling Average"
+        is_rolling = method in ("Rolling Average", "Rolling Median")
         self.spin_rolling_window.setEnabled(is_rolling)
         self.spin_rolling_window.setVisible(is_rolling)
         self.rolling_window_layout.itemAt(0).widget().setVisible(is_rolling)
@@ -2467,15 +2519,23 @@ class UWBQuickVisualizationWindow(QWidget):
         elif method == "Rolling Average":
             # Get window size in seconds from spinbox
             window_seconds = self.spin_rolling_window.value()
-            
+
             # Calculate window size in number of samples (assuming 1Hz after downsampling)
             window_size = max(3, window_seconds)  # Minimum window of 3
-            
+
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
                 lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-        
+        elif method == "Rolling Median":
+            window_seconds = self.spin_rolling_window.value()
+            window_size = max(3, window_seconds)
+
+            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
+                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
+                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+
         return data
     
     def apply_filters(self, data):
@@ -2656,10 +2716,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message("Applying smoothing to full resolution data...")
                 preview_data = self.apply_smoothing_to_data(preview_data, self.combo_smoothing.currentText())
 
-            # ALWAYS downsample to 1Hz for preview performance
-            self.log_message("Downsampling preview to 1Hz...")
-            preview_data['time_sec'] = (preview_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
-            preview_data = preview_data.groupby(['shortid', 'time_sec']).first().reset_index()
+            # Downsample to 1Hz if checkbox is checked
+            if self.chk_downsample.isChecked():
+                self.log_message("Downsampling preview to 1Hz...")
+                preview_data['time_sec'] = (preview_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
+                preview_data = preview_data.groupby(['shortid', 'time_sec']).first().reset_index()
+            else:
+                self.log_message("Using full-resolution data (downsample unchecked)")
 
             # Store preview data
             self.preview_data = preview_data
@@ -2742,6 +2805,19 @@ class UWBQuickVisualizationWindow(QWidget):
                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5))
             except Exception as e:
                 self.log_message(f"Error drawing zones: {str(e)}")
+
+        # Plot anchor positions if available
+        if self.anchor_positions:
+            try:
+                for anchor in self.anchor_positions:
+                    self.ax.scatter(anchor['x'], anchor['y'],
+                                  marker='^', s=80, c='black', edgecolors='white',
+                                  linewidths=1, zorder=4)
+                    self.ax.text(anchor['x'], anchor['y'] + 0.05,
+                               str(anchor['shortid']),
+                               fontsize=7, ha='center', va='bottom', color='black')
+            except Exception as e:
+                self.log_message(f"Error drawing anchors: {str(e)}")
 
         # Get all data up to and including current timestamp
         current_data = self.preview_data[self.preview_data['Timestamp'] <= current_timestamp]
@@ -3083,19 +3159,19 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.background_image_path = bg_path
                     try:
                         self.background_image = plt.imread(bg_path)
-                        # Calculate dimensions in meters
                         img_height_px, img_width_px = self.background_image.shape[:2]
                         if self.xml_scale:
                             self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
                             self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
                             self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
                         else:
-                            self.bg_width_meters = img_width_px
-                            self.bg_height_meters = img_height_px
-                            self.log_message(f"Background dimensions: {self.bg_width_meters}px x {self.bg_height_meters}px (no scale)")
+                            self.bg_width_meters = img_width_px * 0.0254
+                            self.bg_height_meters = img_height_px * 0.0254
+                            self.log_message(f"WARNING: No XML scale — background dimensions may be incorrect")
                         self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                        self.btn_remove_background.setEnabled(True)
                     except Exception as e:
                         self.log_message(f"Warning: Could not load background image: {str(e)}")
                 # Try relative to database directory
@@ -3104,19 +3180,19 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.background_image_path = bg_path
                     try:
                         self.background_image = plt.imread(bg_path)
-                        # Calculate dimensions in meters
                         img_height_px, img_width_px = self.background_image.shape[:2]
                         if self.xml_scale:
                             self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
                             self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
                             self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
                         else:
-                            self.bg_width_meters = img_width_px
-                            self.bg_height_meters = img_height_px
-                            self.log_message(f"Background dimensions: {self.bg_width_meters}px x {self.bg_height_meters}px (no scale)")
+                            self.bg_width_meters = img_width_px * 0.0254
+                            self.bg_height_meters = img_height_px * 0.0254
+                            self.log_message(f"WARNING: No XML scale — background dimensions may be incorrect")
                         self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+                        self.btn_remove_background.setEnabled(True)
                     except Exception as e:
                         self.log_message(f"Warning: Could not load background image: {str(e)}")
                 else:
