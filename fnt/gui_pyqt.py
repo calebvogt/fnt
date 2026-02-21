@@ -333,18 +333,6 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
 
-        # USV Analysis Tools group
-        analysis_group = QGroupBox("USV Analysis Tools")
-        analysis_layout = QGridLayout()
-
-        analysis_buttons = [
-            ("USV Studio", "Unified detection, labeling, and ML classification", self.run_usv_studio),
-        ]
-
-        self.create_button_grid(analysis_layout, analysis_buttons)
-        analysis_group.setLayout(analysis_layout)
-        layout.addWidget(analysis_group)
-
         # Audio Processing Tools group
         audio_group = QGroupBox("Audio Processing Tools")
         audio_layout = QGridLayout()
@@ -358,6 +346,18 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(audio_layout, audio_buttons)
         audio_group.setLayout(audio_layout)
         layout.addWidget(audio_group)
+
+        # USV Analysis Tools group
+        analysis_group = QGroupBox("USV Analysis Tools")
+        analysis_layout = QGridLayout()
+
+        analysis_buttons = [
+            ("USV Studio", "Unified detection, labeling, and ML classification", self.run_usv_studio),
+        ]
+
+        self.create_button_grid(analysis_layout, analysis_buttons)
+        analysis_group.setLayout(analysis_layout)
+        layout.addWidget(analysis_group)
 
         layout.addStretch()
         tab.setLayout(layout)
