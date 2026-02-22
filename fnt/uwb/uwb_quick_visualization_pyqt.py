@@ -23,87 +23,140 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
                              QSpinBox, QDoubleSpinBox, QSplitter, QFrame, QSlider, QLineEdit,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+                             QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
+                             QDateTimeEdit)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QFont
 
 
 class IdentityAssignmentDialog(QDialog):
-    """Dialog for assigning sex and custom identities to tags"""
-    def __init__(self, available_tags, existing_identities=None, parent=None):
+    """Dialog for assigning sex, custom identities, and active time windows to tags"""
+    def __init__(self, available_tags, existing_identities=None, tag_time_ranges=None, parent=None):
         super().__init__(parent)
         self.available_tags = available_tags
         self.identities = existing_identities if existing_identities else {}
+        self.tag_time_ranges = tag_time_ranges if tag_time_ranges else {}
         self.initUI()
-    
+
     def initUI(self):
         self.setWindowTitle("Assign Tag Identities")
-        self.setMinimumWidth(400)
-        
+        self.setMinimumWidth(700)
+
         layout = QVBoxLayout()
-        
+
         # Instructions
-        instructions = QLabel("Assign sex (M/F) and custom alphanumeric IDs to each tag:")
+        instructions = QLabel(
+            "Assign sex (M/F), IDs, and active time windows. "
+            "To merge tags (e.g., lost tag replaced), assign the same ID to both tags."
+        )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
-        
+
         # Form for each tag
         form_layout = QFormLayout()
         self.sex_combos = {}
         self.identity_edits = {}
-        
+        self.start_edits = {}
+        self.stop_edits = {}
+
         for tag in sorted(self.available_tags):
             # Sex selection
             sex_combo = QComboBox()
             sex_combo.addItems(["M", "F"])
-            
+
             # Identity text input
             identity_edit = QLineEdit()
             identity_edit.setPlaceholderText(f"e.g., {tag}")
-            
-            # Load existing values if available
+
+            # Start/Stop time pickers
+            start_edit = QDateTimeEdit()
+            start_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+            start_edit.setCalendarPopup(True)
+            stop_edit = QDateTimeEdit()
+            stop_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+            stop_edit.setCalendarPopup(True)
+
+            # Set defaults from tag time ranges
+            if tag in self.tag_time_ranges:
+                tr = self.tag_time_ranges[tag]
+                start_edit.setDateTime(QDateTime.fromString(tr['start'], "yyyy-MM-dd HH:mm:ss"))
+                stop_edit.setDateTime(QDateTime.fromString(tr['end'], "yyyy-MM-dd HH:mm:ss"))
+                # Set min/max to observed range
+                start_edit.setMinimumDateTime(QDateTime.fromString(tr['start'], "yyyy-MM-dd HH:mm:ss"))
+                stop_edit.setMaximumDateTime(QDateTime.fromString(tr['end'], "yyyy-MM-dd HH:mm:ss"))
+
+            # Load existing identity values if available
             if tag in self.identities:
                 sex_idx = 0 if self.identities[tag].get('sex', 'M') == 'M' else 1
                 sex_combo.setCurrentIndex(sex_idx)
                 identity_edit.setText(self.identities[tag].get('identity', ''))
+                # Restore saved start/stop times
+                if 'start_time' in self.identities[tag]:
+                    dt = QDateTime.fromString(self.identities[tag]['start_time'], "yyyy-MM-dd HH:mm:ss")
+                    if dt.isValid():
+                        start_edit.setDateTime(dt)
+                if 'stop_time' in self.identities[tag]:
+                    dt = QDateTime.fromString(self.identities[tag]['stop_time'], "yyyy-MM-dd HH:mm:ss")
+                    if dt.isValid():
+                        stop_edit.setDateTime(dt)
             else:
-                # Default values
-                sex_combo.setCurrentIndex(0)  # Default to M
-                identity_edit.setText(f"{tag}")
-            
-            # Horizontal layout for sex and identity
-            tag_layout = QHBoxLayout()
-            tag_layout.addWidget(QLabel("Sex:"))
-            tag_layout.addWidget(sex_combo)
-            tag_layout.addWidget(QLabel("ID:"))
-            tag_layout.addWidget(identity_edit)
-            
+                sex_combo.setCurrentIndex(-1)  # No default selection
+                identity_edit.setText("")  # Blank until user configures
+
+            # Layout: Sex + ID on first row, Start/Stop on second row
+            tag_widget = QWidget()
+            tag_vlayout = QVBoxLayout()
+            tag_vlayout.setContentsMargins(0, 0, 0, 0)
+
+            row1 = QHBoxLayout()
+            row1.addWidget(QLabel("Sex:"))
+            row1.addWidget(sex_combo)
+            row1.addWidget(QLabel("ID:"))
+            row1.addWidget(identity_edit)
+            tag_vlayout.addLayout(row1)
+
+            row2 = QHBoxLayout()
+            row2.addWidget(QLabel("Start:"))
+            row2.addWidget(start_edit)
+            row2.addWidget(QLabel("Stop:"))
+            row2.addWidget(stop_edit)
+            tag_vlayout.addLayout(row2)
+
+            tag_widget.setLayout(tag_vlayout)
+
             # Convert DEC to HEX for display
             hex_id = hex(tag).upper().replace('0X', '')
-            form_layout.addRow(f"HexID {hex_id}:", tag_layout)
-            
+            form_layout.addRow(f"HexID {hex_id}:", tag_widget)
+
             self.sex_combos[tag] = sex_combo
             self.identity_edits[tag] = identity_edit
-        
+            self.start_edits[tag] = start_edit
+            self.stop_edits[tag] = stop_edit
+
         layout.addLayout(form_layout)
-        
+
         # Dialog buttons
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
-        
+
         self.setLayout(layout)
-    
+
     def get_identities(self):
-        """Return the configured identities"""
+        """Return the configured identities with start/stop times"""
         result = {}
         for tag in self.available_tags:
             sex = self.sex_combos[tag].currentText()
             identity = self.identity_edits[tag].text().strip()
             if not identity:
                 identity = str(tag)
-            result[tag] = {'sex': sex, 'identity': identity}
+            result[tag] = {
+                'sex': sex,
+                'identity': identity,
+                'start_time': self.start_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss"),
+                'stop_time': self.stop_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss"),
+            }
         return result
 
 
@@ -115,7 +168,8 @@ class PlotSaverWorker(QThread):
     def __init__(self, db_path, table_name, selected_tags, downsample, smoothing_method,
                  plot_types=None, overwrite=True, rolling_window=10, timezone='US/Mountain',
                  tag_identities=None, use_identities=False, background_image=None,
-                 bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False):
+                 bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False,
+                 output_dir=None):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -129,6 +183,7 @@ class PlotSaverWorker(QThread):
             'battery_levels': True
         }
         self.overwrite = overwrite
+        self.output_dir = output_dir
         self.rolling_window = rolling_window
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
@@ -203,13 +258,16 @@ class PlotSaverWorker(QThread):
                     self.progress.emit("Downsampling to 1Hz...")
                     data = self.apply_downsampling(data)
             
-            # Get output directory - use the analysis folder
-            db_dir = os.path.dirname(self.db_path)
-            db_filename = os.path.basename(self.db_path)
-            db_name = os.path.splitext(db_filename)[0]
-            output_dir = os.path.join(db_dir, f"{db_name}_fntUwbAnalysis")
-            
-            # Create output directory if it doesn't exist
+            # Get output directory
+            if self.output_dir:
+                output_dir = self.output_dir
+            else:
+                db_dir = os.path.dirname(self.db_path)
+                db_filename = os.path.basename(self.db_path)
+                db_name = os.path.splitext(db_filename)[0]
+                output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
             os.makedirs(output_dir, exist_ok=True)
             
             # Generate and save plots based on selection
@@ -1123,8 +1181,8 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Value'].append(self.combo_smoothing.currentText())
             
             # Downsampling
-            summary_data['Parameter'].append('Downsampled to 1Hz')
-            summary_data['Value'].append('Yes' if self.chk_downsample.isChecked() else 'No')
+            summary_data['Parameter'].append('Downsample Hz')
+            summary_data['Value'].append(f"{self.spin_downsample_hz.value()} Hz" if self.chk_export_downsampled_csv.isChecked() else 'N/A')
             
             # Filtering statistics (if available)
             if hasattr(self, 'filter_stats') and self.filter_stats:
@@ -1156,11 +1214,17 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('--- Export Options ---')
             summary_data['Value'].append('')
             
-            summary_data['Parameter'].append('CSV Exported')
-            summary_data['Value'].append('Yes' if self.chk_export_csv.isChecked() else 'No')
-
             summary_data['Parameter'].append('Raw CSV Exported')
             summary_data['Value'].append('Yes' if self.chk_export_raw_csv.isChecked() else 'No')
+
+            summary_data['Parameter'].append('Smoothed CSV Exported')
+            summary_data['Value'].append('Yes' if self.chk_export_smoothed_csv.isChecked() else 'No')
+
+            summary_data['Parameter'].append('Downsampled CSV Exported')
+            if self.chk_export_downsampled_csv.isChecked():
+                summary_data['Value'].append(f'Yes ({self.spin_downsample_hz.value()} Hz)')
+            else:
+                summary_data['Value'].append('No')
 
             summary_data['Parameter'].append('Plots Generated')
             summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
@@ -1331,7 +1395,25 @@ class UWBQuickVisualizationWindow(QWidget):
         
         db_group.setLayout(db_layout)
         layout.addWidget(db_group)
-        
+
+        # Timezone
+        tz_group = QGroupBox("Timezone")
+        tz_group_layout = QVBoxLayout()
+        tz_layout = QHBoxLayout()
+        tz_layout.addWidget(QLabel("Timezone:"))
+        self.combo_timezone = QComboBox()
+        common_timezones = [
+            "US/Mountain", "US/Pacific", "US/Central", "US/Eastern",
+            "UTC", "Europe/London", "Europe/Paris", "Asia/Tokyo"
+        ]
+        self.combo_timezone.addItems(common_timezones)
+        self.combo_timezone.setCurrentText("US/Mountain")
+        self.combo_timezone.currentTextChanged.connect(self.mark_options_changed)
+        tz_layout.addWidget(self.combo_timezone)
+        tz_group_layout.addLayout(tz_layout)
+        tz_group.setLayout(tz_group_layout)
+        layout.addWidget(tz_group)
+
         # Tag selection
         self.tag_group = QGroupBox("Tag Selection")
         self.tag_layout = QVBoxLayout()
@@ -1346,24 +1428,10 @@ class UWBQuickVisualizationWindow(QWidget):
         
         self.tag_group.setLayout(self.tag_layout)
         layout.addWidget(self.tag_group)
-        
-        # Options (ordered to match processing pipeline: Filter -> Smooth -> Downsample)
-        options_group = QGroupBox("Options")
-        options_layout = QVBoxLayout()
 
-        # Timezone
-        tz_layout = QHBoxLayout()
-        tz_layout.addWidget(QLabel("Timezone:"))
-        self.combo_timezone = QComboBox()
-        common_timezones = [
-            "US/Mountain", "US/Pacific", "US/Central", "US/Eastern",
-            "UTC", "Europe/London", "Europe/Paris", "Asia/Tokyo"
-        ]
-        self.combo_timezone.addItems(common_timezones)
-        self.combo_timezone.setCurrentText("US/Mountain")
-        self.combo_timezone.currentTextChanged.connect(self.mark_options_changed)
-        tz_layout.addWidget(self.combo_timezone)
-        options_layout.addLayout(tz_layout)
+        # Smoothing & Filtering Options
+        options_group = QGroupBox("Smoothing & Filtering Options")
+        options_layout = QVBoxLayout()
 
         # --- Step 1: Filtering ---
 
@@ -1439,7 +1507,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
         options_layout.addWidget(QLabel("Smoothing method:"))
         self.combo_smoothing = QComboBox()
-        self.combo_smoothing.addItems(["None", "Savitzky-Golay", "Rolling Average", "Rolling Median"])
+        self.combo_smoothing.addItems(["None", "Rolling Average (default)", "Rolling Median", "Savitzky-Golay"])
+        self.combo_smoothing.setCurrentIndex(1)  # Default to Rolling Average
         self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
         options_layout.addWidget(self.combo_smoothing)
 
@@ -1455,13 +1524,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_rolling_window.hide()
         self.rolling_window_layout.itemAt(0).widget().hide()
 
-        # --- Step 3: Downsample ---
-
-        self.chk_downsample = QCheckBox("Downsample to 1Hz")
-        self.chk_downsample.setChecked(True)
-        self.chk_downsample.setToolTip("Downsample output to 1Hz (smoothing is applied to full resolution data first)")
-        self.chk_downsample.stateChanged.connect(self.mark_options_changed)
-        options_layout.addWidget(self.chk_downsample)
+        # --- Preview Color By ---
+        preview_color_layout = QHBoxLayout()
+        preview_color_layout.addWidget(QLabel("Color by:"))
+        self.combo_preview_color_by = QComboBox()
+        self.combo_preview_color_by.addItems(["ID", "Sex"])
+        self.combo_preview_color_by.setToolTip("Color trajectories in preview by unique ID or by sex (M=blue, F=red)")
+        self.combo_preview_color_by.currentTextChanged.connect(self.on_preview_color_changed)
+        preview_color_layout.addWidget(self.combo_preview_color_by)
+        options_layout.addLayout(preview_color_layout)
 
         # --- Background Image ---
 
@@ -1511,24 +1582,37 @@ class UWBQuickVisualizationWindow(QWidget):
         export_group = QGroupBox("Export Options")
         export_layout = QVBoxLayout()
         
-        # Export CSV checkbox
-        self.chk_export_csv = QCheckBox("Export CSV")
-        self.chk_export_csv.setChecked(True)
-        self.chk_export_csv.setToolTip("Export processed data as CSV with current settings applied")
-        export_layout.addWidget(self.chk_export_csv)
-
         # Export Raw CSV checkbox
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
-        self.chk_export_raw_csv.setChecked(False)
-        self.chk_export_raw_csv.setToolTip("Export raw database contents as CSV (no processing) next to the input SQL file")
+        self.chk_export_raw_csv.setChecked(True)
+        self.chk_export_raw_csv.setToolTip("Export raw database contents as CSV (no processing)")
         export_layout.addWidget(self.chk_export_raw_csv)
-        
-        # Detect Behaviors checkbox
-        self.chk_detect_behaviors = QCheckBox("Detect Behaviors")
-        self.chk_detect_behaviors.setChecked(False)
-        self.chk_detect_behaviors.setToolTip("Analyze and export behavioral patterns and social interactions")
-        export_layout.addWidget(self.chk_detect_behaviors)
-        
+
+        # Export Smoothed CSV checkbox
+        self.chk_export_smoothed_csv = QCheckBox("Export Smoothed CSV")
+        self.chk_export_smoothed_csv.setChecked(True)
+        self.chk_export_smoothed_csv.setToolTip("Export filtered + smoothed data at full resolution (no downsampling)")
+        export_layout.addWidget(self.chk_export_smoothed_csv)
+
+        # Export Smoothed Downsampled CSV checkbox + Hz spinner
+        downsample_row = QWidget()
+        downsample_layout = QHBoxLayout()
+        downsample_layout.setContentsMargins(0, 0, 0, 0)
+        self.chk_export_downsampled_csv = QCheckBox("Export Smoothed Downsampled CSV")
+        self.chk_export_downsampled_csv.setChecked(True)
+        self.chk_export_downsampled_csv.setToolTip("Export filtered + smoothed + downsampled data at specified sample rate")
+        downsample_layout.addWidget(self.chk_export_downsampled_csv)
+        self.spin_downsample_hz = QSpinBox()
+        self.spin_downsample_hz.setRange(1, 5)
+        self.spin_downsample_hz.setValue(1)
+        self.spin_downsample_hz.setSuffix(" Hz")
+        self.spin_downsample_hz.setToolTip("Target sample rate for downsampled CSV (1-5 Hz)")
+        self.spin_downsample_hz.setFixedWidth(70)
+        downsample_layout.addWidget(self.spin_downsample_hz)
+        downsample_layout.addStretch()
+        downsample_row.setLayout(downsample_layout)
+        export_layout.addWidget(downsample_row)
+
         # Save Plots checkbox (master)
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(True)  # Default checked
@@ -1536,24 +1620,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_save_plots.setToolTip("Generate and save visualization plots (PNG always included)")
         export_layout.addWidget(self.chk_save_plots)
 
-        # SVG option (indented under Save Plots)
-        self.svg_option_widget = QWidget()
-        svg_option_layout = QHBoxLayout()
-        svg_option_layout.setContentsMargins(30, 0, 0, 0)  # Indent
-        self.chk_save_svg = QCheckBox("Also save as SVG")
-        self.chk_save_svg.setChecked(False)
-        self.chk_save_svg.setToolTip("Additionally save plots in SVG format (vector graphics)")
-        svg_option_layout.addWidget(self.chk_save_svg)
-        svg_option_layout.addStretch()
-        self.svg_option_widget.setLayout(svg_option_layout)
-        self.svg_option_widget.setVisible(True)  # Visible by default since Save Plots is checked
-        export_layout.addWidget(self.svg_option_widget)
-
         # Indented plot type options
         self.plot_types_widget = QWidget()
         plot_types_layout = QVBoxLayout()
         plot_types_layout.setContentsMargins(30, 0, 0, 0)  # Indent
-        
+
         self.plot_type_checkboxes = {}
         plot_types = [
             ("daily_paths", "Daily Paths per Tag", "One PNG per tag with all days"),
@@ -1567,18 +1638,37 @@ class UWBQuickVisualizationWindow(QWidget):
             ("actogram", "Circadian Actogram", "24-hour activity patterns across days"),
             ("data_quality", "Data Quality Metrics", "Table showing data gaps and quality statistics")
         ]
-        
+
         for key, plot_name, plot_desc in plot_types:
             cb = QCheckBox(plot_name)
             cb.setChecked(True)
             cb.setToolTip(plot_desc)
             self.plot_type_checkboxes[key] = cb
             plot_types_layout.addWidget(cb)
-        
+
         self.plot_types_widget.setLayout(plot_types_layout)
         self.plot_types_widget.setVisible(True)  # Visible by default since Save Plots is checked
         export_layout.addWidget(self.plot_types_widget)
-        
+
+        # SVG option (indented under Save Plots, after plot types)
+        self.svg_option_widget = QWidget()
+        svg_option_layout = QHBoxLayout()
+        svg_option_layout.setContentsMargins(30, 0, 0, 0)  # Indent
+        self.chk_save_svg = QCheckBox("Also save as SVG")
+        self.chk_save_svg.setChecked(True)
+        self.chk_save_svg.setToolTip("Additionally save plots in SVG format (vector graphics)")
+        svg_option_layout.addWidget(self.chk_save_svg)
+        svg_option_layout.addStretch()
+        self.svg_option_widget.setLayout(svg_option_layout)
+        self.svg_option_widget.setVisible(True)  # Visible by default since Save Plots is checked
+        export_layout.addWidget(self.svg_option_widget)
+
+        # Detect Behaviors checkbox
+        self.chk_detect_behaviors = QCheckBox("Detect Behaviors (beta)")
+        self.chk_detect_behaviors.setChecked(False)
+        self.chk_detect_behaviors.setToolTip("Analyze and export behavioral patterns and social interactions")
+        export_layout.addWidget(self.chk_detect_behaviors)
+
         # Save Animation checkbox (master)
         self.chk_save_animation = QCheckBox("Save Animation")
         self.chk_save_animation.setChecked(True)  # Default checked
@@ -1606,7 +1696,7 @@ class UWBQuickVisualizationWindow(QWidget):
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
         self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "100x", "120x", "150x", "160x", "200x", "400x", "500x", "1000x"])
-        self.combo_animation_speed.setCurrentText("40x")
+        self.combo_animation_speed.setCurrentText("80x")
         self.combo_animation_speed.setToolTip("Playback speed multiplier (e.g., 10x = 10 seconds of real time per second of video)")
         speed_layout.addWidget(self.combo_animation_speed)
         animation_options_layout.addLayout(speed_layout)
@@ -1645,7 +1735,7 @@ class UWBQuickVisualizationWindow(QWidget):
         quality_layout.addWidget(QLabel("Video Quality:"))
         self.combo_video_quality = QComboBox()
         self.combo_video_quality.addItems(["Draft (Fast)", "Standard", "High Quality"])
-        self.combo_video_quality.setCurrentText("Standard")
+        self.combo_video_quality.setCurrentText("High Quality")
         self.combo_video_quality.setToolTip("Draft=75dpi (4x faster), Standard=100dpi, High=150dpi")
         quality_layout.addWidget(self.combo_video_quality)
         animation_options_layout.addLayout(quality_layout)
@@ -1682,9 +1772,9 @@ class UWBQuickVisualizationWindow(QWidget):
         export_layout.addWidget(self.animation_options_widget)
         
         # Overwrite checkbox (moved to bottom, applies to all exports)
-        self.chk_overwrite = QCheckBox("Overwrite existing files")
-        self.chk_overwrite.setChecked(False)
-        self.chk_overwrite.setToolTip("If unchecked, will skip files that already exist (applies to all export types)")
+        self.chk_overwrite = QCheckBox("Overwrite existing export")
+        self.chk_overwrite.setChecked(True)
+        self.chk_overwrite.setToolTip("If checked, overwrites the base _FNT_analysis folder. If unchecked, creates a new timestamped folder.")
         export_layout.addWidget(self.chk_overwrite)
         
         export_group.setLayout(export_layout)
@@ -1903,7 +1993,10 @@ class UWBQuickVisualizationWindow(QWidget):
             
             # Check for XML configuration file in the database directory
             self.load_xml_config()
-            
+
+            # Auto-load background image if PNG exists alongside database
+            self.auto_load_background()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
     
@@ -2057,6 +2150,71 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"Error parsing XML: {str(e)}")
     
+    def auto_load_background(self):
+        """Auto-load background image if a PNG exists in the database directory"""
+        if not self.db_path or self.background_image is not None:
+            return  # Already loaded (e.g., from config) or no database
+
+        db_dir = os.path.dirname(self.db_path)
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+
+        # Find PNG files in the database directory
+        png_files = [f for f in os.listdir(db_dir) if f.lower().endswith('.png')]
+
+        if not png_files:
+            return
+
+        # Pick the best match: prefer one matching db name or xml config name, else use only if exactly one
+        selected_png = None
+        for f in png_files:
+            fname = os.path.splitext(f)[0].lower()
+            if db_name.lower() in fname or fname in db_name.lower():
+                selected_png = f
+                break
+        if not selected_png and hasattr(self, 'xml_config_path') and self.xml_config_path:
+            xml_name = os.path.splitext(os.path.basename(self.xml_config_path))[0].lower()
+            for f in png_files:
+                fname = os.path.splitext(f)[0].lower()
+                if xml_name in fname or fname in xml_name:
+                    selected_png = f
+                    break
+        if not selected_png and len(png_files) == 1:
+            selected_png = png_files[0]
+
+        if not selected_png:
+            self.log_message(f"Multiple PNG files found in directory — skipping auto-load (use Load Background to select)")
+            return
+
+        file_path = os.path.join(db_dir, selected_png)
+        try:
+            self.background_image = plt.imread(file_path)
+            self.background_image_path = file_path
+            img_height_px, img_width_px = self.background_image.shape[:2]
+
+            if self.xml_scale:
+                self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
+                self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
+                self.log_message(f"✓ Background auto-loaded: {selected_png} ({self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m)")
+            else:
+                self.bg_width_meters = img_width_px * 0.0254
+                self.bg_height_meters = img_height_px * 0.0254
+                self.log_message(f"✓ Background auto-loaded: {selected_png} (no XML scale — dimensions may be inaccurate)")
+
+            self.lbl_background_status.setText(f"\u2713 Background: {selected_png}")
+            self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+            self.btn_remove_background.setEnabled(True)
+
+            # Reset stored axis defaults so preview recomputes limits to include background
+            self._default_xlim = None
+            self._default_ylim = None
+
+            # Refresh preview if already loaded
+            if self.preview_loaded:
+                self.update_visualization(self.time_slider.value())
+
+        except Exception as e:
+            self.log_message(f"Warning: Could not auto-load background {selected_png}: {str(e)}")
+
     def select_background_image(self):
         """Allow user to select a background image"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2100,6 +2258,10 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
                 self.btn_remove_background.setEnabled(True)
 
+                # Reset stored axis defaults so preview recomputes limits to include background
+                self._default_xlim = None
+                self._default_ylim = None
+
                 # Refresh preview if loaded
                 if self.preview_loaded:
                     self.update_visualization(self.time_slider.value())
@@ -2123,6 +2285,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.btn_remove_background.setEnabled(False)
         self.log_message("Background image removed")
+
+        # Reset stored axis defaults so preview recomputes limits without background
+        self._default_xlim = None
+        self._default_ylim = None
 
         # Refresh preview if loaded
         if self.preview_loaded:
@@ -2207,12 +2373,18 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def on_smoothing_changed(self, method):
         """Handle smoothing method change"""
-        is_rolling = method in ("Rolling Average", "Rolling Median")
+        clean_method = method.replace(" (default)", "")
+        is_rolling = clean_method in ("Rolling Average", "Rolling Median")
         self.spin_rolling_window.setEnabled(is_rolling)
         self.spin_rolling_window.setVisible(is_rolling)
         self.rolling_window_layout.itemAt(0).widget().setVisible(is_rolling)
         self.mark_options_changed()
     
+    def on_preview_color_changed(self):
+        """Handle preview color-by dropdown change - refresh preview if loaded"""
+        if self.preview_loaded:
+            self.update_visualization(self.time_slider.value())
+
     def on_save_plots_toggled(self):
         """Handle save plots checkbox toggle"""
         enabled = self.chk_save_plots.isChecked()
@@ -2311,14 +2483,35 @@ class UWBQuickVisualizationWindow(QWidget):
         if not self.available_tags:
             QMessageBox.warning(self, "No Tags", "Please load a database and table first")
             return
-        
+
         # Get only selected tags
         selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
         if not selected_tags:
             QMessageBox.warning(self, "No Tags Selected", "Please select at least one tag")
             return
-        
-        dialog = IdentityAssignmentDialog(selected_tags, self.tag_identities, self)
+
+        # Query per-tag time ranges from database
+        tag_time_ranges = {}
+        try:
+            tz = pytz.timezone(self.combo_timezone.currentText())
+            conn = sqlite3.connect(self.db_path)
+            placeholders = ','.join(['?'] * len(selected_tags))
+            query = f"SELECT shortid, MIN(timestamp) as first_ts, MAX(timestamp) as last_ts FROM {self.table_name} WHERE shortid IN ({placeholders}) GROUP BY shortid"
+            cursor = conn.execute(query, selected_tags)
+            for row in cursor:
+                tag_id, first_ts, last_ts = row
+                # Convert ms timestamps to timezone-aware datetimes
+                first_dt = pd.Timestamp(first_ts, unit='ms', tz='UTC').tz_convert(tz)
+                last_dt = pd.Timestamp(last_ts, unit='ms', tz='UTC').tz_convert(tz)
+                tag_time_ranges[tag_id] = {
+                    'start': first_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    'end': last_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                }
+            conn.close()
+        except Exception as e:
+            self.log_message(f"Warning: Could not query tag time ranges: {str(e)}")
+
+        dialog = IdentityAssignmentDialog(selected_tags, self.tag_identities, tag_time_ranges, self)
         if dialog.exec_() == QDialog.Accepted:
             self.tag_identities = dialog.get_identities()
             self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
@@ -2331,7 +2524,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 db_dir = os.path.dirname(self.db_path)
                 db_filename = os.path.basename(self.db_path)
                 db_name = os.path.splitext(db_filename)[0]
-                output_dir = os.path.join(db_dir, f"{db_name}_fntUwbAnalysis")
+                output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
                 os.makedirs(output_dir, exist_ok=True)
                 self.save_config(output_dir)
                 self.log_message("✓ Configuration auto-saved to JSON")
@@ -2433,14 +2626,17 @@ class UWBQuickVisualizationWindow(QWidget):
         
         for tag in self.available_tags:
             hex_id = hex(tag).upper().replace('0X', '')
-            # Show HexID with default identity if configured, otherwise just HexID with default sex and numeric ID
+            # Show HexID with identity info only if user has configured it
             if tag in self.tag_identities:
                 info = self.tag_identities[tag]
-                sex = info.get('sex', 'M')
-                identity = info.get('identity', str(tag))
-                cb = QCheckBox(f"HexID {hex_id} ({sex}, {identity})")
+                sex = info.get('sex', '')
+                identity = info.get('identity', '')
+                if sex and identity:
+                    cb = QCheckBox(f"HexID {hex_id} ({sex}, {identity})")
+                else:
+                    cb = QCheckBox(f"HexID {hex_id}")
             else:
-                cb = QCheckBox(f"HexID {hex_id} (M, {tag})")
+                cb = QCheckBox(f"HexID {hex_id}")
             cb.setChecked(True)
             cb.stateChanged.connect(self.mark_options_changed)  # Track changes
             cb.stateChanged.connect(self.update_identity_button_state)  # Enable/disable identity button
@@ -2484,11 +2680,14 @@ class UWBQuickVisualizationWindow(QWidget):
             hex_id = hex(tag).upper().replace('0X', '')
             if tag in self.tag_identities:
                 info = self.tag_identities[tag]
-                sex = info.get('sex', 'M')
-                identity = info.get('identity', str(tag))
-                cb.setText(f"HexID {hex_id} ({sex}, {identity})")
+                sex = info.get('sex', '')
+                identity = info.get('identity', '')
+                if sex and identity:
+                    cb.setText(f"HexID {hex_id} ({sex}, {identity})")
+                else:
+                    cb.setText(f"HexID {hex_id}")
             else:
-                cb.setText(f"HexID {hex_id} (M, {tag})")
+                cb.setText(f"HexID {hex_id}")
     
     def select_all_tags(self):
         """Select all tags"""
@@ -2516,9 +2715,14 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.preview_loaded:
             self.update_visualization(self.time_slider.value())
 
+    def get_smoothing_method(self):
+        """Get the current smoothing method name (stripped of UI hints like '(default)')"""
+        text = self.combo_smoothing.currentText()
+        return text.replace(" (default)", "")
+
     def apply_smoothing(self):
         """Apply smoothing to self.data"""
-        self.data = self.apply_smoothing_to_data(self.data, self.combo_smoothing.currentText())
+        self.data = self.apply_smoothing_to_data(self.data, self.get_smoothing_method())
     
     def apply_smoothing_to_data(self, data, method):
         """Apply smoothing to a dataframe (works on any dataframe, not just self.data)"""
@@ -2724,23 +2928,34 @@ class UWBQuickVisualizationWindow(QWidget):
                 preview_data['sex'] = 'M'
                 preview_data['identity'] = preview_data['shortid'].apply(lambda x: f'Tag{x}')
 
+            # Apply per-tag time trimming (before filtering/smoothing)
+            if self.tag_identities:
+                tz = pytz.timezone(self.combo_timezone.currentText())
+                for tag, info in self.tag_identities.items():
+                    if 'start_time' in info and 'stop_time' in info:
+                        start = pd.Timestamp(info['start_time']).tz_localize(tz)
+                        stop = pd.Timestamp(info['stop_time']).tz_localize(tz)
+                        mask = (preview_data['shortid'] == tag) & (
+                            (preview_data['Timestamp'] < start) | (preview_data['Timestamp'] > stop))
+                        trimmed = mask.sum()
+                        if trimmed > 0:
+                            preview_data = preview_data[~mask]
+                            self.log_message(f"  Trimmed {trimmed} points outside time window for tag {tag}")
+
             # Apply filtering if enabled
             if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
                 self.log_message("Applying velocity/jump filtering...")
                 preview_data = self.apply_filters_to_data(preview_data)
 
             # Apply smoothing if enabled (on full resolution data BEFORE downsampling)
-            if self.combo_smoothing.currentText() != "None":
+            if self.get_smoothing_method() != "None":
                 self.log_message("Applying smoothing to full resolution data...")
-                preview_data = self.apply_smoothing_to_data(preview_data, self.combo_smoothing.currentText())
+                preview_data = self.apply_smoothing_to_data(preview_data, self.get_smoothing_method())
 
-            # Downsample to 1Hz if checkbox is checked
-            if self.chk_downsample.isChecked():
-                self.log_message("Downsampling preview to 1Hz...")
-                preview_data['time_sec'] = (preview_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
-                preview_data = preview_data.groupby(['shortid', 'time_sec']).first().reset_index()
-            else:
-                self.log_message("Using full-resolution data (downsample unchecked)")
+            # Always downsample preview to 1Hz for performance
+            self.log_message("Downsampling preview to 1Hz...")
+            preview_data['time_sec'] = (preview_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
+            preview_data = preview_data.groupby(['shortid', 'time_sec']).first().reset_index()
 
             # Store preview data
             self.preview_data = preview_data
@@ -2844,8 +3059,19 @@ class UWBQuickVisualizationWindow(QWidget):
         # Get all data up to and including current timestamp
         current_data = self.preview_data[self.preview_data['Timestamp'] <= current_timestamp]
 
+        # Determine color mode from preview dropdown
+        preview_color_mode = self.combo_preview_color_by.currentText()  # "ID" or "Sex"
+
+        # Build a color palette for ID-based coloring
+        sorted_tags = sorted(self.preview_data['shortid'].unique())
+        id_color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                            '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+        tag_id_colors = {}
+        for i, t in enumerate(sorted_tags):
+            tag_id_colors[t] = id_color_palette[i % len(id_color_palette)]
+
         # Plot each tag
-        for tag in sorted(self.preview_data['shortid'].unique()):
+        for tag in sorted_tags:
             tag_all_data = current_data[current_data['shortid'] == tag]
 
             if len(tag_all_data) == 0:
@@ -2854,17 +3080,20 @@ class UWBQuickVisualizationWindow(QWidget):
             # Get the most recent position for this tag
             current_pos = tag_all_data.iloc[-1]
 
-            # Determine label and color
+            # Determine label and color based on preview color mode
             if tag in self.tag_identities:
                 info = self.tag_identities[tag]
                 sex = info.get('sex', 'M')
                 identity = info.get('identity', str(tag))
                 label = f"{sex}-{identity}"
-                color = 'blue' if sex == 'M' else 'red'
+                if preview_color_mode == "Sex":
+                    color = 'blue' if sex == 'M' else 'red'
+                else:
+                    color = tag_id_colors[tag]
             else:
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
-                color = 'blue'
+                color = tag_id_colors[tag]
 
             # Plot trail if enabled
             if self.chk_show_trail.isChecked() and len(tag_all_data) > 1:
@@ -3006,7 +3235,6 @@ class UWBQuickVisualizationWindow(QWidget):
             'table_name': self.table_name,
             'selected_tags': [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()],
             'timezone': self.combo_timezone.currentText(),
-            'downsample': self.chk_downsample.isChecked(),
             'smoothing_method': self.combo_smoothing.currentText(),
             'rolling_window': self.spin_rolling_window.value(),
             'velocity_filter': self.chk_velocity_filter.isChecked(),
@@ -3016,8 +3244,10 @@ class UWBQuickVisualizationWindow(QWidget):
             'time_gap': self.spin_time_gap.value(),
             'show_trail': self.chk_show_trail.isChecked(),
             'trail_length': self.spin_trail_length.value(),
-            'export_csv': self.chk_export_csv.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
+            'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
+            'export_downsampled_csv': self.chk_export_downsampled_csv.isChecked(),
+            'downsample_hz': self.spin_downsample_hz.value(),
             'detect_behaviors': self.chk_detect_behaviors.isChecked(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
@@ -3039,6 +3269,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'animation_fps': self.combo_animation_fps.currentText(),
             'time_window': self.spin_time_window.value(),
             'color_by': self.combo_color_by.currentText(),
+            'preview_color_by': self.combo_preview_color_by.currentText(),
             'tag_identities': self.tag_identities,
             'overwrite': self.chk_overwrite.isChecked(),
             'background_image_path': self.background_image_path,  # Save background image path
@@ -3066,7 +3297,7 @@ class UWBQuickVisualizationWindow(QWidget):
         db_dir = os.path.dirname(self.db_path)
         db_filename = os.path.basename(self.db_path)
         db_name = os.path.splitext(db_filename)[0]
-        analysis_dir = os.path.join(db_dir, f"{db_name}_fntUwbAnalysis")
+        analysis_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
         config_path = os.path.join(analysis_dir, 'fnt_config.json')
         
         if not os.path.exists(config_path):
@@ -3087,9 +3318,6 @@ class UWBQuickVisualizationWindow(QWidget):
                 index = self.combo_timezone.findText(config['timezone'])
                 if index >= 0:
                     self.combo_timezone.setCurrentIndex(index)
-            
-            if 'downsample' in config:
-                self.chk_downsample.setChecked(config['downsample'])
             
             if 'smoothing_method' in config:
                 index = self.combo_smoothing.findText(config['smoothing_method'])
@@ -3120,11 +3348,17 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'trail_length' in config:
                 self.spin_trail_length.setValue(config['trail_length'])
             
-            if 'export_csv' in config:
-                self.chk_export_csv.setChecked(config['export_csv'])
-
             if 'export_raw_csv' in config:
                 self.chk_export_raw_csv.setChecked(config['export_raw_csv'])
+
+            if 'export_smoothed_csv' in config:
+                self.chk_export_smoothed_csv.setChecked(config['export_smoothed_csv'])
+
+            if 'export_downsampled_csv' in config:
+                self.chk_export_downsampled_csv.setChecked(config['export_downsampled_csv'])
+
+            if 'downsample_hz' in config:
+                self.spin_downsample_hz.setValue(config['downsample_hz'])
 
             if 'detect_behaviors' in config:
                 self.chk_detect_behaviors.setChecked(config['detect_behaviors'])
@@ -3163,7 +3397,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 index = self.combo_color_by.findText(config['color_by'])
                 if index >= 0:
                     self.combo_color_by.setCurrentIndex(index)
-            
+
+            if 'preview_color_by' in config:
+                index = self.combo_preview_color_by.findText(config['preview_color_by'])
+                if index >= 0:
+                    self.combo_preview_color_by.setCurrentIndex(index)
+
             if 'tag_identities' in config:
                 # Convert string keys back to integers if needed
                 self.tag_identities = {}
@@ -3207,6 +3446,8 @@ class UWBQuickVisualizationWindow(QWidget):
                         self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
                         self.btn_remove_background.setEnabled(True)
+                        self._default_xlim = None
+                        self._default_ylim = None
                     except Exception as e:
                         self.log_message(f"Warning: Could not load background image: {str(e)}")
                 # Try relative to database directory
@@ -3228,6 +3469,8 @@ class UWBQuickVisualizationWindow(QWidget):
                         self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
                         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
                         self.btn_remove_background.setEnabled(True)
+                        self._default_xlim = None
+                        self._default_ylim = None
                     except Exception as e:
                         self.log_message(f"Warning: Could not load background image: {str(e)}")
                 else:
@@ -3749,42 +3992,74 @@ class UWBQuickVisualizationWindow(QWidget):
         self.progress_widget.setVisible(True)
         self.progress_bar.setValue(0)
         
-        # Create output directory with naming convention: <db_name>_fntUwbAnalysis
+        # Create output directory
         db_dir = os.path.dirname(self.db_path)
         db_filename = os.path.basename(self.db_path)
         db_name = os.path.splitext(db_filename)[0]  # Remove extension
-        output_dir = os.path.join(db_dir, f"{db_name}_fntUwbAnalysis")
-        
-        # Create the output directory if it doesn't exist
+
+        if self.chk_overwrite.isChecked():
+            # Overwrite mode: use base _FNT_analysis folder
+            output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+        else:
+            # No-overwrite mode: create timestamped folder
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis_{timestamp}")
+
         os.makedirs(output_dir, exist_ok=True)
         
-        export_csv = self.chk_export_csv.isChecked()
         export_raw_csv = self.chk_export_raw_csv.isChecked()
+        export_smoothed_csv = self.chk_export_smoothed_csv.isChecked()
+        export_downsampled_csv = self.chk_export_downsampled_csv.isChecked()
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
+        downsample_hz = self.spin_downsample_hz.value()
 
-        if not export_csv and not export_raw_csv and not save_plots and not save_animation:
+        detect_behaviors = self.chk_detect_behaviors.isChecked()
+
+        if not export_raw_csv and not export_smoothed_csv and not export_downsampled_csv and not save_plots and not save_animation and not detect_behaviors:
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
-        
+
         try:
             self.log_message(f"Starting export to {output_dir}")
             self.lbl_export_progress.setText("Initializing export...")
-            
+
             # Calculate total steps for progress
             total_steps = 0
             if export_raw_csv:
                 total_steps += 1
-            if export_csv:
+            if export_smoothed_csv:
+                total_steps += 1
+            if export_downsampled_csv:
                 total_steps += 1
             if save_plots:
                 total_steps += 1
             if save_animation:
-                total_steps += 1  # Animation progress handled separately
+                total_steps += 1
 
             current_step = 0
 
-            # Export raw CSV (unprocessed database dump) next to the input SQL file
+            # Handle overwrite: clear existing files in base folder (preserving config)
+            if self.chk_overwrite.isChecked():
+                if os.path.exists(output_dir) and os.listdir(output_dir):
+                    self.log_message("Clearing existing files (preserving config)...")
+                    for filename in os.listdir(output_dir):
+                        file_path = os.path.join(output_dir, filename)
+                        if filename == 'fnt_config.json':
+                            continue
+                        if os.path.isfile(file_path):
+                            try:
+                                os.remove(file_path)
+                            except Exception as e:
+                                print(f"Warning: Could not delete {filename}: {str(e)}")
+                        elif os.path.isdir(file_path):
+                            try:
+                                shutil.rmtree(file_path, ignore_errors=True)
+                            except Exception as e:
+                                print(f"Warning: Could not delete directory {filename}: {str(e)}")
+
+            # Export raw CSV (unprocessed database dump)
             if export_raw_csv:
                 if self.export_cancelled:
                     self.stop_export()
@@ -3795,133 +4070,130 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.progress_bar.setValue(int(current_step / total_steps * 100))
                 QApplication.processEvents()
 
-                raw_csv_filename = f'{db_name}_{self.table_name}_raw.csv'
-                raw_csv_path = os.path.join(db_dir, raw_csv_filename)
+                raw_csv_filename = f'{db_name}_raw.csv'
+                raw_csv_path = os.path.join(output_dir, raw_csv_filename)
+                self.log_message("Exporting raw database to CSV...")
+                conn = sqlite3.connect(self.db_path)
+                raw_data = pd.read_sql_query(f"SELECT * FROM {self.table_name}", conn)
+                conn.close()
+                raw_data.to_csv(raw_csv_path, index=False)
+                self.log_message(f"✓ Raw CSV exported: {raw_csv_filename}")
 
-                if not os.path.exists(raw_csv_path) or self.chk_overwrite.isChecked():
-                    self.log_message("Exporting raw database to CSV...")
+            # Prepare processed data (needed for smoothed CSV, downsampled CSV, plots, animation, behaviors)
+            needs_processed_data = export_smoothed_csv or export_downsampled_csv or save_plots or save_animation or detect_behaviors
+            smoothed_data = None
+            csv_path = None  # Path to the CSV that plots/animation will use
+
+            if needs_processed_data:
+                if self.export_cancelled:
+                    self.stop_export()
+                    return
+
+                self.log_message("Preparing processed data...")
+
+                # Load data if not already in memory
+                if self.data is None:
+                    self.log_message("Loading data from database...")
                     conn = sqlite3.connect(self.db_path)
-                    raw_data = pd.read_sql_query(f"SELECT * FROM {self.table_name}", conn)
+                    query = f"SELECT * FROM {self.table_name}"
+                    csv_data = pd.read_sql_query(query, conn)
                     conn.close()
-                    raw_data.to_csv(raw_csv_path, index=False)
-                    self.log_message(f"✓ Raw CSV exported: {raw_csv_path}")
-                else:
-                    self.log_message(f"Skipped raw CSV (already exists): {raw_csv_filename}")
 
-            # Handle overwrite setting
-            if self.chk_overwrite.isChecked():
-                # Delete all files in analysis folder EXCEPT the config file
-                self.log_message("Clearing existing files (preserving config)...")
-                config_path = os.path.join(output_dir, 'fnt_config.json')
-                
-                for filename in os.listdir(output_dir):
-                    file_path = os.path.join(output_dir, filename)
-                    # Skip the config file and skip directories (we'll handle them separately)
-                    if filename == 'fnt_config.json':
-                        continue
-                    
-                    if os.path.isfile(file_path):
-                        try:
-                            os.remove(file_path)
-                        except Exception as e:
-                            print(f"Warning: Could not delete {filename}: {str(e)}")
-                    elif os.path.isdir(file_path):
-                        # Remove directories like animation_frames
-                        try:
-                            shutil.rmtree(file_path, ignore_errors=True)
-                        except Exception as e:
-                            print(f"Warning: Could not delete directory {filename}: {str(e)}")
-            
-            # ALWAYS create/ensure CSV exists (for plots and animation to reuse)
-            csv_filename = f'{db_name}_{self.table_name}_processed.csv'
-            csv_path = os.path.join(output_dir, csv_filename)
-            csv_needs_creation = not os.path.exists(csv_path) or self.chk_overwrite.isChecked()
-            
-            # Export CSV if requested OR if plots/animation need it
-            if export_csv or (save_plots or save_animation):
-                if csv_needs_creation:
-                    if self.export_cancelled:
-                        self.stop_export()
-                        return
-                    
-                    # Show progress only if user explicitly requested CSV export
-                    if export_csv:
-                        current_step += 1
-                        self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting CSV...")
-                        self.progress_bar.setValue(int(current_step / total_steps * 100))
-                        QApplication.processEvents()
+                    csv_data['Timestamp'] = pd.to_datetime(csv_data['timestamp'], unit='ms', origin='unix', utc=True)
+                    tz = pytz.timezone(self.combo_timezone.currentText())
+                    csv_data['Timestamp'] = csv_data['Timestamp'].dt.tz_convert(tz)
+                    csv_data['location_x'] *= 0.0254
+                    csv_data['location_y'] *= 0.0254
+                    csv_data = csv_data.sort_values(by=['shortid', 'Timestamp'])
+
+                    selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+                    if selected_tags:
+                        csv_data = csv_data[csv_data['shortid'].isin(selected_tags)]
+
+                    # Apply per-tag time trimming (before filtering/smoothing)
+                    if self.tag_identities:
+                        for tag, info in self.tag_identities.items():
+                            if 'start_time' in info and 'stop_time' in info:
+                                start = pd.Timestamp(info['start_time']).tz_localize(tz)
+                                stop = pd.Timestamp(info['stop_time']).tz_localize(tz)
+                                mask = (csv_data['shortid'] == tag) & (
+                                    (csv_data['Timestamp'] < start) | (csv_data['Timestamp'] > stop))
+                                trimmed = mask.sum()
+                                if trimmed > 0:
+                                    csv_data = csv_data[~mask]
+                                    self.log_message(f"  Trimmed {trimmed} points outside time window for tag {tag}")
+
+                    # Apply filtering (before smoothing)
+                    if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
+                        self.log_message("Applying velocity/jump filtering...")
+                        csv_data = self.apply_filters_to_data(csv_data)
+
+                    # Apply smoothing (after filtering)
+                    if self.get_smoothing_method() != "None":
+                        self.log_message("Applying smoothing...")
+                        csv_data = self.apply_smoothing_to_data(csv_data, self.get_smoothing_method())
+                else:
+                    csv_data = self.data.copy()
+
+                # Ensure sex and identity columns
+                if 'sex' not in csv_data.columns or 'identity' not in csv_data.columns:
+                    if self.tag_identities:
+                        csv_data['sex'] = csv_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
+                        csv_data['identity'] = csv_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('identity', f'Tag{x}'))
                     else:
-                        self.log_message("Creating temporary CSV for plots/animation...")
-                    
-                    self.log_message("Exporting CSV...")
-                    
-                    # Load data if not already in memory
-                    if self.data is None:
-                        self.log_message("Loading data from database...")
-                        conn = sqlite3.connect(self.db_path)
-                        query = f"SELECT * FROM {self.table_name}"
-                        csv_data = pd.read_sql_query(query, conn)
-                        conn.close()
-                        
-                        # Process data
-                        csv_data['Timestamp'] = pd.to_datetime(csv_data['timestamp'], unit='ms', origin='unix', utc=True)
-                        tz = pytz.timezone(self.combo_timezone.currentText())
-                        csv_data['Timestamp'] = csv_data['Timestamp'].dt.tz_convert(tz)
-                        csv_data['location_x'] *= 0.0254
-                        csv_data['location_y'] *= 0.0254
-                        csv_data = csv_data.sort_values(by=['shortid', 'Timestamp'])
-                        
-                        # Filter to selected tags
-                        selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
-                        if selected_tags:
-                            csv_data = csv_data[csv_data['shortid'].isin(selected_tags)]
-                        
-                        # Apply filtering if requested (before smoothing)
-                        if self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked():
-                            self.log_message("Applying velocity/jump filtering...")
-                            # Need to temporarily set the data for apply_filters to work
-                            temp_data = csv_data
-                            csv_data = self.apply_filters_to_data(csv_data)
-                        
-                        # Apply smoothing if requested (after filtering)
-                        if self.combo_smoothing.currentText() != "None":
-                            self.log_message("Applying smoothing...")
-                            csv_data = self.apply_smoothing_to_data(csv_data, self.combo_smoothing.currentText())
-                        
-                        # Downsample if requested
-                        if self.chk_downsample.isChecked():
-                            self.log_message("Downsampling to 1Hz...")
-                            csv_data['time_sec'] = (csv_data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
-                            csv_data = csv_data.groupby(['shortid', 'time_sec']).first().reset_index()
-                    else:
-                        # Use already loaded data
-                        csv_data = self.data.copy()
-                    
-                    # Ensure sex and identity columns are in the data
-                    if 'sex' not in csv_data.columns or 'identity' not in csv_data.columns:
-                        if self.tag_identities:
-                            csv_data['sex'] = csv_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('sex', 'M'))
-                            csv_data['identity'] = csv_data['shortid'].map(lambda x: self.tag_identities.get(x, {}).get('identity', f'Tag{x}'))
-                        else:
-                            csv_data['sex'] = 'M'
-                            csv_data['identity'] = csv_data['shortid'].apply(lambda x: f'Tag{x}')
-                    
-                    csv_data.to_csv(csv_path, index=False)
-                    
-                    if export_csv:
-                        self.log_message(f"✓ CSV exported: {csv_filename}")
-                    else:
-                        self.log_message(f"✓ Temporary CSV created for processing")
-                elif export_csv:
-                    # CSV already exists and overwrite is disabled
+                        csv_data['sex'] = 'M'
+                        csv_data['identity'] = csv_data['shortid'].apply(lambda x: f'Tag{x}')
+
+                # This is the smoothed (full resolution) data
+                smoothed_data = csv_data
+
+                # Export smoothed CSV
+                if export_smoothed_csv:
                     current_step += 1
-                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: CSV already exists...")
+                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting smoothed CSV...")
                     self.progress_bar.setValue(int(current_step / total_steps * 100))
                     QApplication.processEvents()
-                    self.log_message(f"Skipped CSV (already exists): {csv_filename}")
-                else:
-                    # CSV exists and will be reused
-                    self.log_message(f"Using existing CSV for plots/animation: {csv_filename}")
+
+                    smoothed_csv_filename = f'{db_name}_smoothed.csv'
+                    smoothed_csv_path = os.path.join(output_dir, smoothed_csv_filename)
+                    smoothed_data.to_csv(smoothed_csv_path, index=False)
+                    self.log_message(f"✓ Smoothed CSV exported: {smoothed_csv_filename}")
+                    csv_path = smoothed_csv_path  # Use smoothed for plots/animation
+
+                # Export downsampled CSV
+                if export_downsampled_csv:
+                    current_step += 1
+                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting downsampled CSV ({downsample_hz}Hz)...")
+                    self.progress_bar.setValue(int(current_step / total_steps * 100))
+                    QApplication.processEvents()
+
+                    downsampled_data = smoothed_data.copy()
+                    # Downsample by grouping into time bins of 1/Hz seconds
+                    bin_ns = int(1_000_000_000 / downsample_hz)
+                    downsampled_data['time_bin'] = (downsampled_data['Timestamp'].astype(np.int64) // bin_ns).astype(int)
+                    downsampled_data = downsampled_data.groupby(['shortid', 'time_bin']).first().reset_index()
+                    if 'time_bin' in downsampled_data.columns:
+                        downsampled_data = downsampled_data.drop(columns=['time_bin'])
+
+                    ds_csv_filename = f'{db_name}_smoothed_{downsample_hz}Hz.csv'
+                    ds_csv_path = os.path.join(output_dir, ds_csv_filename)
+                    downsampled_data.to_csv(ds_csv_path, index=False)
+                    self.log_message(f"✓ Downsampled CSV exported: {ds_csv_filename}")
+                    csv_path = ds_csv_path  # Prefer downsampled for plots/animation
+
+                # If neither CSV was exported but plots/animation need data, create a temp CSV
+                if csv_path is None and (save_plots or save_animation):
+                    csv_filename = f'{db_name}_smoothed_{downsample_hz}Hz.csv'
+                    csv_path = os.path.join(output_dir, csv_filename)
+                    # Downsample for plots/animation
+                    temp_data = smoothed_data.copy()
+                    bin_ns = int(1_000_000_000 / downsample_hz)
+                    temp_data['time_bin'] = (temp_data['Timestamp'].astype(np.int64) // bin_ns).astype(int)
+                    temp_data = temp_data.groupby(['shortid', 'time_bin']).first().reset_index()
+                    if 'time_bin' in temp_data.columns:
+                        temp_data = temp_data.drop(columns=['time_bin'])
+                    temp_data.to_csv(csv_path, index=False)
+                    self.log_message(f"✓ Temporary CSV created for plots/animation")
             
             # Save configuration file
             self.save_config(output_dir)
@@ -3931,7 +4203,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.save_run_summary(output_dir)
             
             # Detect behaviors if requested
-            detect_behaviors = self.chk_detect_behaviors.isChecked()
             if detect_behaviors:
                 if self.export_cancelled:
                     self.stop_export()
@@ -4059,8 +4330,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.db_path,
                     self.table_name,
                     selected_tags,
-                    self.chk_downsample.isChecked(),
-                    self.combo_smoothing.currentText(),
+                    False,  # downsample handled in CSV creation
+                    self.get_smoothing_method(),
                     plot_types,
                     overwrite,
                     rolling_window,
@@ -4071,7 +4342,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height
                     csv_path,  # Pass CSV path for reuse
-                    self.chk_save_svg.isChecked()  # Save SVG copies
+                    self.chk_save_svg.isChecked(),  # Save SVG copies
+                    output_dir  # Pass output directory
                 )
                 self.worker.progress.connect(self.update_status)
                 self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, csv_path))
@@ -4091,14 +4363,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 self.generate_animation(output_dir, total_steps, current_step, csv_path)
             
-            # If only CSV(s) exported (no plots or animation), show success message
-            if (export_csv or export_raw_csv) and not save_plots and not save_animation:
+            # If no plots or animation, show success message now
+            any_csv = export_raw_csv or export_smoothed_csv or export_downsampled_csv
+            if (any_csv or detect_behaviors) and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
-                msg = "Export completed:\n"
-                if export_csv:
-                    msg += f"- Processed CSV: {csv_path}\n"
-                if export_raw_csv:
-                    msg += f"- Raw CSV: {os.path.join(db_dir, f'{db_name}_{self.table_name}_raw.csv')}\n"
+                msg = f"Export completed to:\n{output_dir}"
                 QMessageBox.information(self, "Success", msg)
                 
         except Exception as e:

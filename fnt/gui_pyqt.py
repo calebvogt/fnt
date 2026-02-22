@@ -386,19 +386,6 @@ class FNTMainWindow(QMainWindow):
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
         
-        # UWB processing group
-        group = QGroupBox("UWB Tracking & Analysis")
-        group_layout = QGridLayout()
-        
-        buttons = [
-            ("Behavioral Analysis", "Analyze behavioral patterns from tracking", self.run_uwb_behavioral),
-            ("Plot UWB Paths", "Generate static plots of tracking data", self.run_plot_uwb_path),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "UWB")
@@ -875,20 +862,6 @@ class FNTMainWindow(QMainWindow):
             self.uwb_quick_viz_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
-    
-    def run_uwb_behavioral(self):
-        """Launch UWB behavioral analysis"""
-        def func():
-            from fnt.uwb.uwb_behavioral_analysis import uwb_behavioral_analysis
-            uwb_behavioral_analysis()
-        self.run_function_safely(func, "UWB Behavioral Analysis")
-    
-    def run_plot_uwb_path(self):
-        """Launch UWB path plotting"""
-        def func():
-            from fnt.uwb.plot_uwb_path import plot_uwb_path
-            plot_uwb_path()
-        self.run_function_safely(func, "UWB Path Plotting")
     
     # Imaging Methods
     def run_czi_viewer(self):

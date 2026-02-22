@@ -23,5 +23,8 @@ build/
 .vscode/
 .claude/
 
+# Local test data (not for distribution)
+LocalTestData/
+
 # Claude Code instructions (keep private)
 CLAUDE.md
