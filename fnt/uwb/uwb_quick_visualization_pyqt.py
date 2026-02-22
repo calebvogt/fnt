@@ -1671,7 +1671,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Save Animation checkbox (master)
         self.chk_save_animation = QCheckBox("Save Animation")
-        self.chk_save_animation.setChecked(True)  # Default checked
+        self.chk_save_animation.setChecked(False)  # Default unchecked
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
         self.chk_save_animation.setToolTip("Generate animated video of tracking data")
         export_layout.addWidget(self.chk_save_animation)
