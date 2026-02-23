@@ -170,8 +170,8 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs - Original order
         self.create_video_tab()
-        self.create_sleap_tab()
         self.create_video_tracking_tab()
+        self.create_sleap_tab()
         self.create_uwb_tab()
         self.create_usv_tab()
         self.create_rfid_tab()
@@ -379,7 +379,7 @@ class FNTMainWindow(QMainWindow):
         quick_layout = QGridLayout()
 
         quick_buttons = [
-            ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_quick_visualization),
+            ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_preprocessing),
         ]
         
         self.create_button_grid(quick_layout, quick_buttons)
@@ -401,13 +401,13 @@ class FNTMainWindow(QMainWindow):
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # SAM-based tracking group
-        group = QGroupBox("SAM-Based Tracking Tools")
+        # Tracking tools group
+        group = QGroupBox("Tracking Tools")
         group_layout = QGridLayout()
-        
+
         buttons = [
-            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
             ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
         ]
         
         self.create_button_grid(group_layout, buttons)
@@ -852,10 +852,10 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"WAV compression failed: {str(e)}")
     
     # UWB Processing Methods
-    def run_uwb_quick_visualization(self):
+    def run_uwb_preprocessing(self):
         """Launch UWB PreProcessing Tool"""
         try:
-            from fnt.uwb.uwb_quick_visualization_pyqt import UWBQuickVisualizationWindow
+            from fnt.uwb.uwb_preprocessing_pyqt import UWBQuickVisualizationWindow
 
             # Create and show the UWB PreProcessing Tool window
             self.uwb_quick_viz_window = UWBQuickVisualizationWindow()

@@ -276,9 +276,12 @@ class VideoProcessorWorker(QThread):
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(video_file, output_file)
 
-            # Run FFmpeg and capture output for GUI display
+            # Run FFmpeg and capture output for GUI display.
+            # stdin=subprocess.DEVNULL prevents FFmpeg from hanging on
+            # interactive prompts (e.g. "Enter command:" from corrupt files).
             process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -286,22 +289,83 @@ class VideoProcessorWorker(QThread):
                 bufsize=1
             )
 
-            # Monitor process output and stream to GUI
-            for line in process.stdout:
+            # Use a background thread to read lines from stdout so we can
+            # detect stalls without blocking (works cross-platform, inc. Windows).
+            import time
+            import threading
+            import queue
+
+            line_queue = queue.Queue()
+
+            def _reader():
+                """Read lines from process stdout and put them in the queue."""
+                try:
+                    for ln in process.stdout:
+                        line_queue.put(ln)
+                except Exception:
+                    pass
+                finally:
+                    line_queue.put(None)  # sentinel — EOF
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            last_progress_time = time.time()
+            stall_timeout = 120  # seconds — kill if no output for 2 minutes
+
+            while True:
                 if self.should_stop:
                     process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                     return False
 
-                # Send FFmpeg output to GUI
+                try:
+                    line = line_queue.get(timeout=1.0)
+                except queue.Empty:
+                    # No output in the last second — check for stall
+                    if process.poll() is not None:
+                        break  # Process exited
+                    if time.time() - last_progress_time > stall_timeout:
+                        self.progress_update.emit(
+                            f"⚠️ FFmpeg stalled for {stall_timeout}s on "
+                            f"{video_filename} — killing process")
+                        process.kill()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        # Clean up partial output
+                        try:
+                            if os.path.exists(output_file):
+                                os.remove(output_file)
+                        except Exception:
+                            pass
+                        return False
+                    continue
+
+                if line is None:
+                    break  # EOF — process finished
+
                 line = line.strip()
-                if line:  # Only send non-empty lines
+                if line:
                     self.ffmpeg_output.emit(line)
+                    last_progress_time = time.time()
 
             process.wait()
             success = process.returncode == 0
 
             if not success:
-                self.progress_update.emit(f"❌ Failed: {video_filename}")
+                self.progress_update.emit(
+                    f"❌ Failed (exit code {process.returncode}): {video_filename}")
+                # Clean up partial output file
+                try:
+                    if os.path.exists(output_file):
+                        os.remove(output_file)
+                except Exception:
+                    pass
                 return False
 
             # --- Post-processing verification: confirm output resolution ---
@@ -342,7 +406,7 @@ class VideoProcessorWorker(QThread):
         
         # Build FFmpeg command with SLEAP-compatible settings
         cmd = [
-            "ffmpeg", "-y",                      # Overwrite output files
+            "ffmpeg", "-y", "-nostdin",           # Overwrite output, disable interactive input
             "-i", input_file,
             "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
             "-preset", self.preset,              # User-selected speed preset

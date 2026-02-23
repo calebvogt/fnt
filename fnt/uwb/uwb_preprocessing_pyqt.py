@@ -1417,8 +1417,11 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('Animation Generated')
             summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
             
-            summary_data['Parameter'].append('Behaviors Detected')
-            summary_data['Value'].append('Yes' if self.chk_detect_behaviors.isChecked() else 'No')
+            summary_data['Parameter'].append('Proximity Detection')
+            if self.chk_proximity_detection.isChecked():
+                summary_data['Value'].append(f'Yes (threshold: {self.spin_proximity_threshold.value()} m)')
+            else:
+                summary_data['Value'].append('No')
             
             # Create DataFrame and save
             summary_df = pd.DataFrame(summary_data)
@@ -1823,6 +1826,32 @@ class UWBQuickVisualizationWindow(QWidget):
         downsample_row.setLayout(downsample_layout)
         export_layout.addWidget(downsample_row)
 
+        # Proximity Detection checkbox
+        self.chk_proximity_detection = QCheckBox("Detect Proximity Bouts")
+        self.chk_proximity_detection.setChecked(True)
+        self.chk_proximity_detection.setToolTip("Detect pairwise proximity events and bouts from smoothed data")
+        self.chk_proximity_detection.stateChanged.connect(self.on_proximity_detection_toggled)
+        export_layout.addWidget(self.chk_proximity_detection)
+
+        # Proximity threshold spinner (indented, visible when checkbox is checked)
+        self.proximity_threshold_widget = QWidget()
+        prox_layout = QHBoxLayout()
+        prox_layout.setContentsMargins(30, 0, 0, 0)
+        prox_layout.addWidget(QLabel("Proximity threshold:"))
+        self.spin_proximity_threshold = QDoubleSpinBox()
+        self.spin_proximity_threshold.setRange(0.01, 10.0)
+        self.spin_proximity_threshold.setValue(0.5)
+        self.spin_proximity_threshold.setSingleStep(0.05)
+        self.spin_proximity_threshold.setDecimals(2)
+        self.spin_proximity_threshold.setSuffix(" m")
+        self.spin_proximity_threshold.setToolTip("Tags within this distance are detected as in sociospatial proximity")
+        self.spin_proximity_threshold.setFixedWidth(100)
+        prox_layout.addWidget(self.spin_proximity_threshold)
+        prox_layout.addStretch()
+        self.proximity_threshold_widget.setLayout(prox_layout)
+        self.proximity_threshold_widget.setVisible(True)  # Visible by default since checkbox is checked
+        export_layout.addWidget(self.proximity_threshold_widget)
+
         # Save Plots checkbox (master)
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(True)  # Default checked
@@ -1872,12 +1901,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.svg_option_widget.setLayout(svg_option_layout)
         self.svg_option_widget.setVisible(True)  # Visible by default since Save Plots is checked
         export_layout.addWidget(self.svg_option_widget)
-
-        # Detect Behaviors checkbox
-        self.chk_detect_behaviors = QCheckBox("Detect Behaviors (beta)")
-        self.chk_detect_behaviors.setChecked(False)
-        self.chk_detect_behaviors.setToolTip("Analyze and export behavioral patterns and social interactions")
-        export_layout.addWidget(self.chk_detect_behaviors)
 
         # Save Animation checkbox (master)
         self.chk_save_animation = QCheckBox("Save Animation")
@@ -2607,6 +2630,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.plot_types_widget.setVisible(enabled)
         self.svg_option_widget.setVisible(enabled)
     
+    def on_proximity_detection_toggled(self):
+        """Handle proximity detection checkbox toggle"""
+        enabled = self.chk_proximity_detection.isChecked()
+        self.proximity_threshold_widget.setVisible(enabled)
+
     def on_save_animation_toggled(self):
         """Handle save animation checkbox toggle"""
         enabled = self.chk_save_animation.isChecked()
@@ -3464,7 +3492,8 @@ class UWBQuickVisualizationWindow(QWidget):
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'export_downsampled_csv': self.chk_export_downsampled_csv.isChecked(),
             'downsample_hz': self.spin_downsample_hz.value(),
-            'detect_behaviors': self.chk_detect_behaviors.isChecked(),
+            'proximity_detection': self.chk_proximity_detection.isChecked(),
+            'proximity_threshold': self.spin_proximity_threshold.value(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {
@@ -3578,8 +3607,11 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'downsample_hz' in config:
                 self.spin_downsample_hz.setValue(config['downsample_hz'])
 
-            if 'detect_behaviors' in config:
-                self.chk_detect_behaviors.setChecked(config['detect_behaviors'])
+            if 'proximity_detection' in config:
+                self.chk_proximity_detection.setChecked(config['proximity_detection'])
+
+            if 'proximity_threshold' in config:
+                self.spin_proximity_threshold.setValue(config['proximity_threshold'])
             
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
@@ -4317,9 +4349,10 @@ class UWBQuickVisualizationWindow(QWidget):
         save_animation = self.chk_save_animation.isChecked()
         downsample_hz = self.spin_downsample_hz.value()
 
-        detect_behaviors = self.chk_detect_behaviors.isChecked()
+        detect_proximity = self.chk_proximity_detection.isChecked()
+        proximity_threshold = self.spin_proximity_threshold.value()
 
-        if not export_raw_csv and not export_smoothed_csv and not export_downsampled_csv and not save_plots and not save_animation and not detect_behaviors:
+        if not export_raw_csv and not export_smoothed_csv and not export_downsampled_csv and not save_plots and not save_animation and not detect_proximity:
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
 
@@ -4355,11 +4388,9 @@ class UWBQuickVisualizationWindow(QWidget):
             predicted_files.append(f'{db_name}_smoothed.csv')
         if export_downsampled_csv:
             predicted_files.append(f'{db_name}_smoothed_{downsample_hz}Hz.csv')
-        if detect_behaviors:
-            predicted_files.append(f'{db_name}_behavior_timeline.csv')
-            predicted_files.append(f'{db_name}_behavior_summary.csv')
-            predicted_files.append(f'{db_name}_social_interactions.csv')
-            predicted_files.append(f'{db_name}_social_summary.csv')
+        if detect_proximity:
+            predicted_files.append(f'{db_name}_proximity_events.csv')
+            predicted_files.append(f'{db_name}_proximity_bouts.csv')
 
         # Predict animation files (in animations/ subfolder)
         predicted_animation_files = []
@@ -4515,7 +4546,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"✓ Raw CSV exported: {raw_csv_filename}")
 
             # Prepare processed data (needed for smoothed CSV, downsampled CSV, plots, animation, behaviors)
-            needs_processed_data = export_smoothed_csv or export_downsampled_csv or save_plots or save_animation or detect_behaviors
+            needs_processed_data = export_smoothed_csv or export_downsampled_csv or save_plots or save_animation or detect_proximity
             smoothed_data = None
             csv_path = None  # Path to the CSV that plots/animation will use
 
@@ -4645,104 +4676,70 @@ class UWBQuickVisualizationWindow(QWidget):
             self.save_message_log(output_dir)
             self.save_run_summary(output_dir)
             
-            # Detect behaviors if requested
-            if detect_behaviors:
+            # Detect proximity bouts if requested
+            if detect_proximity:
                 if self.export_cancelled:
                     self.stop_export()
                     return
-                
+
                 self.log_message("=" * 50)
-                self.log_message("Starting behavioral analysis...")
-                self.lbl_export_progress.setText("Analyzing behaviors and social interactions...")
+                self.log_message("Starting proximity detection...")
+                self.lbl_export_progress.setText("Detecting proximity events and bouts...")
                 QApplication.processEvents()
-                
+
                 try:
-                    from fnt.uwb.behavior_detection import BehaviorDetector
-                    
-                    # Load CSV data if not already loaded
-                    if not os.path.exists(csv_path):
-                        self.log_message("Error: CSV file not found for behavior analysis")
+                    from fnt.uwb.proximity_detection import detect_proximity_bouts
+
+                    # Warn if tag identities not configured
+                    if not self.tag_identities:
+                        self.log_message("Warning: Tag identities not configured. "
+                                         "Proximity output will use raw shortid values. "
+                                         "Configure identities in Tag Configuration for sex-ID labels.")
+
+                    # Use the smoothed full-resolution data (not downsampled)
+                    if smoothed_data is not None:
+                        prox_data = smoothed_data.copy()
+                    elif csv_path and os.path.exists(csv_path):
+                        prox_data = pd.read_csv(csv_path, low_memory=False)
+                        prox_data['Timestamp'] = pd.to_datetime(prox_data['Timestamp'], format='ISO8601')
                     else:
-                        behavior_data = pd.read_csv(csv_path, low_memory=False)
-                        behavior_data['Timestamp'] = pd.to_datetime(behavior_data['Timestamp'], format='ISO8601')
-                        
-                        # Initialize behavior detector with default thresholds
-                        detector = BehaviorDetector(
-                            speed_threshold_rest=0.05,      # m/s
-                            speed_threshold_active=0.3,     # m/s
-                            distance_threshold_social=0.5,  # m
-                            window_seconds=10.0,
-                            overlap_seconds=5.0
-                        )
-                        
-                        # Run behavior detection
-                        behavior_timeline, social_interactions = detector.analyze_behaviors(
-                            behavior_data, 
+                        self.log_message("Error: No smoothed data available for proximity detection")
+                        prox_data = None
+
+                    if prox_data is not None:
+                        proximity_events, proximity_bouts = detect_proximity_bouts(
+                            prox_data,
+                            threshold=proximity_threshold,
+                            gap_s=5,
+                            tag_identities=self.tag_identities,
                             log_callback=self.log_message
                         )
-                        
-                        # Generate summary reports
-                        if not behavior_timeline.empty:
-                            # Behavior summary per animal
-                            behavior_summary = detector.generate_behavior_summary(
-                                behavior_timeline, 
-                                social_interactions,
-                                tag_identities=self.tag_identities
-                            )
-                            
-                            # Social interaction summary
-                            social_summary = detector.generate_social_interaction_summary(
-                                social_interactions,
-                                tag_identities=self.tag_identities
-                            )
-                            
-                            # Export behavior timeline (detailed)
-                            behavior_timeline_path = os.path.join(output_dir, f'{db_name}_behavior_timeline.csv')
-                            if skip_existing and os.path.exists(behavior_timeline_path):
-                                self.log_message(f"Skipped (exists): {os.path.basename(behavior_timeline_path)}")
-                            else:
-                                behavior_timeline.to_csv(behavior_timeline_path, index=False)
-                                self.log_message(f"✓ Exported behavior timeline: {os.path.basename(behavior_timeline_path)}")
 
-                            # Export behavior summary
-                            behavior_summary_path = os.path.join(output_dir, f'{db_name}_behavior_summary.csv')
-                            if skip_existing and os.path.exists(behavior_summary_path):
-                                self.log_message(f"Skipped (exists): {os.path.basename(behavior_summary_path)}")
-                            else:
-                                behavior_summary.to_csv(behavior_summary_path, index=False)
-                                self.log_message(f"✓ Exported behavior summary: {os.path.basename(behavior_summary_path)}")
-
-                            # Export social interactions (detailed)
-                            if not social_interactions.empty:
-                                social_interactions_path = os.path.join(output_dir, f'{db_name}_social_interactions.csv')
-                                if skip_existing and os.path.exists(social_interactions_path):
-                                    self.log_message(f"Skipped (exists): {os.path.basename(social_interactions_path)}")
-                                else:
-                                    social_interactions.to_csv(social_interactions_path, index=False)
-                                    self.log_message(f"✓ Exported social interactions: {os.path.basename(social_interactions_path)}")
-
-                            # Export social interaction summary
-                            if not social_summary.empty:
-                                social_summary_path = os.path.join(output_dir, f'{db_name}_social_summary.csv')
-                                if skip_existing and os.path.exists(social_summary_path):
-                                    self.log_message(f"Skipped (exists): {os.path.basename(social_summary_path)}")
-                                else:
-                                    social_summary.to_csv(social_summary_path, index=False)
-                                    self.log_message(f"✓ Exported social interaction summary: {os.path.basename(social_summary_path)}")
-                            else:
-                                self.log_message("No social interactions detected")
-                            
-                            self.log_message("✓ Behavioral analysis complete!")
+                        # Export proximity events
+                        events_path = os.path.join(output_dir, f'{db_name}_proximity_events.csv')
+                        if skip_existing and os.path.exists(events_path):
+                            self.log_message(f"Skipped (exists): {os.path.basename(events_path)}")
                         else:
-                            self.log_message("Warning: No behaviors detected in data")
-                        
-                except ImportError as e:
-                    self.log_message(f"Error: Could not import behavior detection module: {e}")
+                            proximity_events.to_csv(events_path, index=False)
+                            self.log_message(f"✓ Exported proximity events ({len(proximity_events)} rows): "
+                                             f"{os.path.basename(events_path)}")
+
+                        # Export proximity bouts
+                        bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
+                        if skip_existing and os.path.exists(bouts_path):
+                            self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
+                        else:
+                            proximity_bouts.to_csv(bouts_path, index=False)
+                            self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
+                                             f"{os.path.basename(bouts_path)}")
+
+                        self.log_message("✓ Proximity detection complete!")
+
                 except Exception as e:
-                    self.log_message(f"Error during behavioral analysis: {e}")
+                    self.log_message(f"Error during proximity detection: {e}")
                     import traceback
                     traceback.print_exc()
-                
+
                 self.log_message("=" * 50)
             
             # Export plots if requested (BEFORE animation, which takes longer)
@@ -4818,7 +4815,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # If no plots or animation, show success message now
             any_csv = export_raw_csv or export_smoothed_csv or export_downsampled_csv
-            if (any_csv or detect_behaviors) and not save_plots and not save_animation:
+            if (any_csv or detect_proximity) and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
                 msg = f"Export completed to:\n{output_dir}"
                 QMessageBox.information(self, "Success", msg)
