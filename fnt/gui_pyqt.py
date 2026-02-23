@@ -937,15 +937,15 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
     
     def run_github_csv_transfer(self):
-        """Launch GitHub CSV Transfer tool for copying data files to a GitHub repo"""
+        """Launch GitHub Data Transfer tool for copying data files to a GitHub repo"""
         try:
             from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
-            
+
             # Store as instance variable to prevent garbage collection
             self.github_csv_transfer_window = GitHubCSVTransferWindow()
             self.github_csv_transfer_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"GitHub CSV Transfer failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"GitHub Data Transfer failed: {str(e)}")
     
     # Doric WiFP Processing Methods
     def run_doric_processor(self):

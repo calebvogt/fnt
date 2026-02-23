@@ -1,11 +1,11 @@
 """
-GitHub CSV Transfer Tool
-Transfer CSV/TXT/JSON files to a GitHub repository with automatic splitting for large files.
+GitHub Data Transfer Tool
+Transfer CSV/TXT/JSON files to a GitHub repository with optional automatic splitting for large files.
 
 This tool:
 - Recursively copies selected file types from source to destination
 - Preserves folder structure
-- Automatically splits files larger than the configured threshold
+- Optionally splits files larger than the configured threshold
 - Uses CSV-aware splitting to preserve headers in each chunk
 - Optional file curation via tree-view explorer with checkboxes
 """
@@ -604,7 +604,7 @@ class TransferWorker(QThread):
                 file_size = os.path.getsize(source_path)
                 stats['total_size'] += file_size
 
-                if file_size >= self.max_size_bytes:
+                if self.max_size_bytes > 0 and file_size >= self.max_size_bytes:
                     # Need to split
                     self.log.emit(f"✂️ Splitting: {rel_path} ({file_size / 1024 / 1024:.1f}MB)")
                     chunks = self.split_and_copy_file(source_path, dest_path)
@@ -763,7 +763,7 @@ class TransferWorker(QThread):
 
 
 class GitHubCSVTransferWindow(QWidget):
-    """Main window for GitHub CSV Transfer tool."""
+    """Main window for GitHub Data Transfer tool."""
 
     def __init__(self):
         super().__init__()
@@ -771,7 +771,7 @@ class GitHubCSVTransferWindow(QWidget):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("GitHub CSV Transfer - FNT")
+        self.setWindowTitle("GitHub Data Transfer Tool - FNT")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 500)
 
@@ -841,13 +841,13 @@ class GitHubCSVTransferWindow(QWidget):
         layout = QVBoxLayout()
 
         # Title
-        title = QLabel("GitHub CSV Transfer")
+        title = QLabel("GitHub Data Transfer Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setStyleSheet("color: #0078d4;")
         layout.addWidget(title)
 
         # Description
-        desc = QLabel("Transfer CSV, TXT, and JSON files to a GitHub repository with automatic splitting for large files.")
+        desc = QLabel("Transfer CSV, TXT, and JSON files to a GitHub repository with optional automatic splitting for large files.")
         desc.setFont(QFont("Arial", 10))
         desc.setStyleSheet("color: #999999; font-style: italic; margin-bottom: 10px;")
         desc.setWordWrap(True)
@@ -887,11 +887,19 @@ class GitHubCSVTransferWindow(QWidget):
         folder_group.setLayout(folder_layout)
         layout.addWidget(folder_group)
 
-        # Configuration Group (split threshold only — file types are in curation dialog)
+        # Configuration Group (split toggle + threshold — file types are in curation dialog)
         config_group = QGroupBox("Transfer Configuration")
         config_layout = QHBoxLayout()
 
-        config_layout.addWidget(QLabel("Split files larger than:"))
+        self.split_checkbox = QCheckBox("Split large files")
+        self.split_checkbox.setChecked(True)
+        self.split_checkbox.setToolTip("Automatically split files exceeding the size threshold (recommended for GitHub's 100MB limit)")
+        self.split_checkbox.stateChanged.connect(self._on_split_toggle)
+        config_layout.addWidget(self.split_checkbox)
+
+        self.split_label = QLabel("Threshold:")
+        config_layout.addWidget(self.split_label)
+
         self.size_spinbox = QSpinBox()
         self.size_spinbox.setRange(1, 100)
         self.size_spinbox.setValue(45)
@@ -953,6 +961,12 @@ class GitHubCSVTransferWindow(QWidget):
         self.dest_folder = None
         self.curated_paths = None  # None = transfer everything, list = only these relative paths
         self.curated_file_types = None  # File types selected in curation dialog
+
+    def _on_split_toggle(self, state):
+        """Enable/disable the split threshold spinbox based on checkbox."""
+        enabled = state == Qt.Checked
+        self.size_spinbox.setEnabled(enabled)
+        self.split_label.setEnabled(enabled)
 
     def select_source_folder(self):
         """Select source folder for transfer."""
@@ -1038,10 +1052,16 @@ class GitHubCSVTransferWindow(QWidget):
 
         file_types = self._get_file_types_for_transfer()
 
+        # Determine split threshold
+        split_enabled = self.split_checkbox.isChecked()
+        max_size_mb = self.size_spinbox.value() if split_enabled else 0
+
         # Build confirmation message
         curation_note = ""
         if self.curated_paths is not None:
             curation_note = f"\nCurated: {len(self.curated_paths)} file(s) selected\n"
+
+        split_note = f"Split threshold: {max_size_mb} MB" if split_enabled else "File splitting: Disabled"
 
         # Confirm transfer
         reply = QMessageBox.question(
@@ -1049,7 +1069,7 @@ class GitHubCSVTransferWindow(QWidget):
             "Confirm Transfer",
             f"Transfer files from:\n{self.source_folder}\n\nTo:\n{self.dest_folder}\n\n"
             f"File types: {', '.join(file_types)}\n"
-            f"Split threshold: {self.size_spinbox.value()} MB\n"
+            f"{split_note}\n"
             f"{curation_note}\n"
             "Continue?",
             QMessageBox.Yes | QMessageBox.No
@@ -1074,7 +1094,7 @@ class GitHubCSVTransferWindow(QWidget):
             self.source_folder,
             self.dest_folder,
             file_types,
-            self.size_spinbox.value(),
+            max_size_mb,
             self.curated_paths
         )
         self.worker.progress.connect(self.update_progress)
