@@ -29,6 +29,54 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QFont
 
 
+class ExportConflictDialog(QDialog):
+    """Dialog shown when export would overwrite existing files."""
+
+    SKIP = 0
+    OVERWRITE = 1
+    NEW_FOLDER = 2
+
+    def __init__(self, total_new, num_conflicts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Conflict")
+        self.setModal(True)
+        self.setMinimumWidth(450)
+
+        layout = QVBoxLayout()
+
+        message = QLabel(
+            f"{total_new} file(s) will be produced, but {num_conflicts} existing "
+            f"file(s) have the same name and would be overwritten.\n\n"
+            "What would you like to do?"
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        btn_layout = QHBoxLayout()
+
+        skip_btn = QPushButton("Skip Existing")
+        skip_btn.setToolTip("Only write files that don't already exist")
+        skip_btn.clicked.connect(lambda: self.done(self.SKIP))
+        btn_layout.addWidget(skip_btn)
+
+        overwrite_btn = QPushButton("Overwrite")
+        overwrite_btn.setToolTip("Replace all conflicting files")
+        overwrite_btn.clicked.connect(lambda: self.done(self.OVERWRITE))
+        btn_layout.addWidget(overwrite_btn)
+
+        new_folder_btn = QPushButton("New Folder")
+        new_folder_btn.setToolTip("Create a new timestamped analysis folder instead")
+        new_folder_btn.clicked.connect(lambda: self.done(self.NEW_FOLDER))
+        btn_layout.addWidget(new_folder_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+
 class IdentityAssignmentDialog(QDialog):
     """Dialog for assigning sex, custom identities, and active time windows to tags"""
     def __init__(self, available_tags, existing_identities=None, tag_time_ranges=None, parent=None):
@@ -166,10 +214,10 @@ class PlotSaverWorker(QThread):
     finished = pyqtSignal(bool, str)
     
     def __init__(self, db_path, table_name, selected_tags, downsample, smoothing_method,
-                 plot_types=None, overwrite=True, rolling_window=10, timezone='US/Mountain',
+                 plot_types=None, skip_existing=False, rolling_window=10, timezone='US/Mountain',
                  tag_identities=None, use_identities=False, background_image=None,
                  bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False,
-                 output_dir=None):
+                 output_dir=None, plots_dir=None):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -182,8 +230,9 @@ class PlotSaverWorker(QThread):
             'trajectory_overview': True,
             'battery_levels': True
         }
-        self.overwrite = overwrite
+        self.skip_existing = skip_existing
         self.output_dir = output_dir
+        self.plots_dir = plots_dir  # Subfolder for plot output (PNGs/SVGs)
         self.rolling_window = rolling_window
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
@@ -267,70 +316,74 @@ class PlotSaverWorker(QThread):
                 db_name = os.path.splitext(db_filename)[0]
                 output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
 
+            # Use plots subfolder for all plot output
+            plots_dir = self.plots_dir if self.plots_dir else os.path.join(output_dir, 'plots')
+
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(plots_dir, exist_ok=True)
             
             # Generate and save plots based on selection
             generated_count = 0
             skipped_count = 0
             
             if self.plot_types.get('daily_paths', False):
-                result = self.save_daily_paths_per_tag(data, output_dir, db_name)
+                result = self.save_daily_paths_per_tag(data, plots_dir, db_name)
                 if result:
                     generated_count += result
-            
+
             if self.plot_types.get('trajectory_overview', False):
-                result = self.save_trajectory_overview(data, output_dir, db_name)
+                result = self.save_trajectory_overview(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
                     skipped_count += 1
-            
+
             if self.plot_types.get('battery_levels', False):
-                result = self.save_battery_levels(data, output_dir, db_name)
+                result = self.save_battery_levels(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
                     skipped_count += 1
-            
+
             if self.plot_types.get('3d_occupancy', False):
-                result = self.save_3d_occupancy(data, output_dir, db_name)
+                result = self.save_3d_occupancy(data, plots_dir, db_name)
                 if result:
                     generated_count += result
-            
+
             if self.plot_types.get('activity_timeline', False):
-                result = self.save_activity_timeline(data, output_dir, db_name)
+                result = self.save_activity_timeline(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
                     skipped_count += 1
-            
+
             if self.plot_types.get('velocity_distribution', False):
-                result = self.save_velocity_distribution(data, output_dir, db_name)
+                result = self.save_velocity_distribution(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
                     skipped_count += 1
             
             if self.plot_types.get('cumulative_distance', False):
-                result = self.save_cumulative_distance(data, output_dir, db_name)
+                result = self.save_cumulative_distance(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
                     skipped_count += 1
-            
+
             if self.plot_types.get('velocity_timeline', False):
-                result = self.save_velocity_timeline(data, output_dir, db_name)
+                result = self.save_velocity_timeline(data, plots_dir, db_name)
                 if result:
                     generated_count += result
-            
+
             if self.plot_types.get('actogram', False):
-                result = self.save_actogram(data, output_dir, db_name)
+                result = self.save_actogram(data, plots_dir, db_name)
                 if result:
                     generated_count += result
-            
+
             if self.plot_types.get('data_quality', False):
-                result = self.save_data_quality(data, output_dir, db_name)
+                result = self.save_data_quality(data, plots_dir, db_name)
                 if result:
                     generated_count += 1
                 else:
@@ -436,7 +489,7 @@ class PlotSaverWorker(QThread):
             output_path = os.path.join(output_dir, f'{db_name}_DailyPaths_{file_suffix}.png')
             
             # Check if file exists and overwrite is False
-            if not self.overwrite and os.path.exists(output_path):
+            if self.skip_existing and os.path.exists(output_path):
                 self.progress.emit(f"Skipped (exists): {db_name}_DailyPaths_{file_suffix}.png")
                 continue
             
@@ -487,7 +540,7 @@ class PlotSaverWorker(QThread):
         output_path = os.path.join(output_dir, f'{db_name}_TrajectoryOverview.png')
         
         # Check if file exists and overwrite is False
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_TrajectoryOverview.png")
             return False
         
@@ -558,7 +611,7 @@ class PlotSaverWorker(QThread):
         output_path = os.path.join(output_dir, f'{db_name}_BatteryLevels.png')
         
         # Check if file exists and overwrite is False
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_BatteryLevels.png")
             return False
         
@@ -632,7 +685,7 @@ class PlotSaverWorker(QThread):
             
             output_path = os.path.join(output_dir, f'{db_name}_3D_Occupancy_{file_suffix}.png')
             
-            if not self.overwrite and os.path.exists(output_path):
+            if self.skip_existing and os.path.exists(output_path):
                 self.progress.emit(f"Skipped (exists): {db_name}_3D_Occupancy_{file_suffix}.png")
                 continue
             
@@ -691,7 +744,7 @@ class PlotSaverWorker(QThread):
         
         output_path = os.path.join(output_dir, f'{db_name}_ActivityTimeline.png')
         
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_ActivityTimeline.png")
             return False
         
@@ -723,7 +776,7 @@ class PlotSaverWorker(QThread):
         
         output_path = os.path.join(output_dir, f'{db_name}_VelocityDistribution.png')
         
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_VelocityDistribution.png")
             return False
         
@@ -779,7 +832,7 @@ class PlotSaverWorker(QThread):
         
         output_path = os.path.join(output_dir, f'{db_name}_CumulativeDistance.png')
         
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_CumulativeDistance.png")
             return False
         
@@ -877,7 +930,7 @@ class PlotSaverWorker(QThread):
             
             output_path = os.path.join(output_dir, filename)
             
-            if not self.overwrite and os.path.exists(output_path):
+            if self.skip_existing and os.path.exists(output_path):
                 self.progress.emit(f"Skipped (exists): {filename}")
                 continue
             
@@ -955,7 +1008,7 @@ class PlotSaverWorker(QThread):
             
             output_path = os.path.join(output_dir, filename)
             
-            if not self.overwrite and os.path.exists(output_path):
+            if self.skip_existing and os.path.exists(output_path):
                 self.progress.emit(f"Skipped (exists): {filename}")
                 continue
             
@@ -1001,7 +1054,7 @@ class PlotSaverWorker(QThread):
         
         output_path = os.path.join(output_dir, f'{db_name}_DataQuality.png')
         
-        if not self.overwrite and os.path.exists(output_path):
+        if self.skip_existing and os.path.exists(output_path):
             self.progress.emit(f"Skipped (exists): {db_name}_DataQuality.png")
             return False
         
@@ -1686,7 +1739,7 @@ class UWBQuickVisualizationWindow(QWidget):
         trail_layout.addWidget(QLabel("Trail length (seconds):"))
         self.spin_animation_trail = QSpinBox()
         self.spin_animation_trail.setRange(1, 1000)
-        self.spin_animation_trail.setValue(1000)
+        self.spin_animation_trail.setValue(500)
         self.spin_animation_trail.setToolTip("How much trailing data to show in animation")
         trail_layout.addWidget(self.spin_animation_trail)
         animation_options_layout.addLayout(trail_layout)
@@ -1770,12 +1823,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.animation_options_widget.setLayout(animation_options_layout)
         self.animation_options_widget.setVisible(True)  # Visible by default
         export_layout.addWidget(self.animation_options_widget)
-        
-        # Overwrite checkbox (moved to bottom, applies to all exports)
-        self.chk_overwrite = QCheckBox("Overwrite existing export")
-        self.chk_overwrite.setChecked(True)
-        self.chk_overwrite.setToolTip("If checked, overwrites the base _FNT_analysis folder. If unchecked, creates a new timestamped folder.")
-        export_layout.addWidget(self.chk_overwrite)
         
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
@@ -1978,19 +2025,26 @@ class UWBQuickVisualizationWindow(QWidget):
             
             self.db_path = file_path
             self.lbl_db.setText(f"Selected: {os.path.basename(file_path)}")
-            
+
+            # Load config BEFORE populating combo_table, so that pending_tag_selection
+            # is set before on_table_selected() triggers tag checkbox creation
+            self.load_config_if_exists()
+
             self.combo_table.clear()
             self.combo_table.addItems(tables)
             self.combo_table.setEnabled(True)
             self.btn_preview_table.setEnabled(True)
             self.btn_load_background.setEnabled(True)  # Enable background image loading
-            
-            if len(tables) == 1:
+
+            # Apply saved table name from config (if any), otherwise default to first
+            if hasattr(self, 'pending_table_name') and self.pending_table_name:
+                index = self.combo_table.findText(self.pending_table_name)
+                if index >= 0:
+                    self.combo_table.setCurrentIndex(index)
+                delattr(self, 'pending_table_name')
+            elif len(tables) == 1:
                 self.combo_table.setCurrentIndex(0)
-            
-            # Check for existing config file and load it
-            self.load_config_if_exists()
-            
+
             # Check for XML configuration file in the database directory
             self.load_xml_config()
 
@@ -3271,7 +3325,6 @@ class UWBQuickVisualizationWindow(QWidget):
             'color_by': self.combo_color_by.currentText(),
             'preview_color_by': self.combo_preview_color_by.currentText(),
             'tag_identities': self.tag_identities,
-            'overwrite': self.chk_overwrite.isChecked(),
             'background_image_path': self.background_image_path,  # Save background image path
             'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None  # Save zone data
         }
@@ -3309,7 +3362,9 @@ class UWBQuickVisualizationWindow(QWidget):
             
             # Load configuration into GUI
             if 'table_name' in config and config['table_name']:
-                # Set table if it exists in combo
+                # Store for deferred application after combo_table is populated
+                self.pending_table_name = config['table_name']
+                # Also try to set directly if combo is already populated
                 index = self.combo_table.findText(config['table_name'])
                 if index >= 0:
                     self.combo_table.setCurrentIndex(index)
@@ -3410,9 +3465,6 @@ class UWBQuickVisualizationWindow(QWidget):
                     tag_key = int(key) if isinstance(key, str) and key.isdigit() else key
                     self.tag_identities[tag_key] = value
             
-            if 'overwrite' in config:
-                self.chk_overwrite.setChecked(config['overwrite'])
-            
             # Load background image if path is saved and file exists
             if 'background_image_path' in config and config['background_image_path']:
                 bg_path = config['background_image_path']
@@ -3489,12 +3541,67 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"Loaded {num_zones} zones with {num_points} coordinate points from config")
             
             self.log_message(f"Loaded previous configuration from {config_path}")
-            
+
             # Update tag labels if identities were loaded
             if self.tag_identities and self.tag_checkboxes:
                 self.update_tag_labels()
-            
-            
+
+            # --- Migration prompt: move loose files into subfolders ---
+            plots_subdir = os.path.join(analysis_dir, 'plots')
+            animations_subdir = os.path.join(analysis_dir, 'animations')
+
+            loose_plots = []
+            loose_animations = []
+
+            if not os.path.exists(plots_subdir):
+                loose_plots = [f for f in os.listdir(analysis_dir)
+                               if os.path.isfile(os.path.join(analysis_dir, f))
+                               and f.lower().endswith(('.png', '.svg'))]
+
+            if not os.path.exists(animations_subdir):
+                loose_animations = [f for f in os.listdir(analysis_dir)
+                                    if os.path.isfile(os.path.join(analysis_dir, f))
+                                    and f.lower().endswith('.mp4')]
+
+            if loose_plots or loose_animations:
+                parts = []
+                if loose_plots:
+                    parts.append(f"{len(loose_plots)} plot file(s)")
+                if loose_animations:
+                    parts.append(f"{len(loose_animations)} animation file(s)")
+                file_desc = " and ".join(parts)
+
+                reply = QMessageBox.question(
+                    self, "Update Folder Structure",
+                    f"Your analysis folder has {file_desc} in the root directory. "
+                    f"Would you like to organize them into subfolders (plots/ and animations/) "
+                    f"for better organization?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    moved = 0
+                    if loose_plots:
+                        os.makedirs(plots_subdir, exist_ok=True)
+                        for plot_file in loose_plots:
+                            src = os.path.join(analysis_dir, plot_file)
+                            dst = os.path.join(plots_subdir, plot_file)
+                            try:
+                                shutil.move(src, dst)
+                                moved += 1
+                            except Exception as move_err:
+                                self.log_message(f"Warning: Could not move {plot_file}: {move_err}")
+                    if loose_animations:
+                        os.makedirs(animations_subdir, exist_ok=True)
+                        for anim_file in loose_animations:
+                            src = os.path.join(analysis_dir, anim_file)
+                            dst = os.path.join(animations_subdir, anim_file)
+                            try:
+                                shutil.move(src, dst)
+                                moved += 1
+                            except Exception as move_err:
+                                self.log_message(f"Warning: Could not move {anim_file}: {move_err}")
+                    self.log_message(f"Migrated {moved} file(s) into subfolders")
+
         except Exception as e:
             print(f"Warning: Could not load config: {str(e)}")
     
@@ -3505,14 +3612,19 @@ class UWBQuickVisualizationWindow(QWidget):
                 cb.setChecked(tag in self.pending_tag_selection)
             delattr(self, 'pending_tag_selection')
     
-    def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None):
+    def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None, animations_dir=None):
         """Generate animation video from tracking data"""
         try:
             if self.export_cancelled:
                 return
             
             self.log_message("Preparing animation data...")
-            
+
+            # Resolve animations output directory
+            if animations_dir is None:
+                animations_dir = os.path.join(output_dir, 'animations')
+            os.makedirs(animations_dir, exist_ok=True)
+
             # Use temp folder on C: drive (SSD) for faster frame writing
             desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
             temp_frames_dir = os.path.join(desktop_path, "temp_animation_frames")
@@ -3652,7 +3764,7 @@ class UWBQuickVisualizationWindow(QWidget):
                         db_filename = os.path.basename(self.db_path)
                         db_name = os.path.splitext(db_filename)[0]
                         speed_text = self.combo_animation_speed.currentText()
-                        final_video_path = os.path.join(output_dir, f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
+                        final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
                         
                         # Check if file exists and skip if not overwriting
                         if os.path.exists(final_video_path):
@@ -3689,7 +3801,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     db_filename = os.path.basename(self.db_path)
                     db_name = os.path.splitext(db_filename)[0]
                     speed_text = self.combo_animation_speed.currentText()
-                    final_video_path = os.path.join(output_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
+                    final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
                     
                     # Check if file exists and skip if not overwriting
                     if os.path.exists(final_video_path):
@@ -3992,22 +4104,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.progress_widget.setVisible(True)
         self.progress_bar.setValue(0)
         
-        # Create output directory
+        # Gather export settings
         db_dir = os.path.dirname(self.db_path)
         db_filename = os.path.basename(self.db_path)
         db_name = os.path.splitext(db_filename)[0]  # Remove extension
 
-        if self.chk_overwrite.isChecked():
-            # Overwrite mode: use base _FNT_analysis folder
-            output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
-        else:
-            # No-overwrite mode: create timestamped folder
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis_{timestamp}")
-
-        os.makedirs(output_dir, exist_ok=True)
-        
         export_raw_csv = self.chk_export_raw_csv.isChecked()
         export_smoothed_csv = self.chk_export_smoothed_csv.isChecked()
         export_downsampled_csv = self.chk_export_downsampled_csv.isChecked()
@@ -4020,6 +4121,146 @@ class UWBQuickVisualizationWindow(QWidget):
         if not export_raw_csv and not export_smoothed_csv and not export_downsampled_csv and not save_plots and not save_animation and not detect_behaviors:
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
+
+        # --- Conflict detection ---
+        base_output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+        plots_subdir = os.path.join(base_output_dir, 'plots')
+        animations_subdir = os.path.join(base_output_dir, 'animations')
+
+        # Predict which files will be produced (root-level CSVs and behavior files)
+        predicted_files = []
+        if export_raw_csv:
+            predicted_files.append(f'{db_name}_raw.csv')
+        if export_smoothed_csv:
+            predicted_files.append(f'{db_name}_smoothed.csv')
+        if export_downsampled_csv:
+            predicted_files.append(f'{db_name}_downsampled_{downsample_hz}Hz.csv')
+        if detect_behaviors:
+            predicted_files.append(f'{db_name}_behavior_timeline.csv')
+            predicted_files.append(f'{db_name}_behavior_summary.csv')
+            predicted_files.append(f'{db_name}_social_interactions.csv')
+            predicted_files.append(f'{db_name}_social_summary.csv')
+
+        # Predict animation files (in animations/ subfolder)
+        predicted_animation_files = []
+        if save_animation:
+            fps = int(self.combo_animation_fps.currentText())
+            speed_text = self.combo_animation_speed.currentText()
+            if self.chk_daily_animations.isChecked():
+                selected_days = [d for d, cb in self.daily_animation_day_checkboxes.items() if cb.isChecked()]
+                for day_idx, date_str in enumerate(selected_days):
+                    predicted_animation_files.append(f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
+            else:
+                predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
+
+        # Predict plot files (in plots/ subfolder)
+        predicted_plot_files = []
+        if save_plots:
+            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+            plot_types = {k: self.plot_type_checkboxes[k].isChecked() for k in self.plot_type_checkboxes}
+
+            if plot_types.get('daily_paths', False):
+                for tag in selected_tags:
+                    hex_id = hex(tag).upper().replace('0X', '')
+                    predicted_plot_files.append(f'{db_name}_daily_paths_HexID_{hex_id}.png')
+                    if self.chk_save_svg.isChecked():
+                        predicted_plot_files.append(f'{db_name}_daily_paths_HexID_{hex_id}.svg')
+            if plot_types.get('trajectory_overview', False):
+                predicted_plot_files.append(f'{db_name}_trajectory_overview.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_trajectory_overview.svg')
+            if plot_types.get('battery_levels', False):
+                predicted_plot_files.append(f'{db_name}_battery_levels.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_battery_levels.svg')
+            if plot_types.get('3d_occupancy', False):
+                for tag in selected_tags:
+                    hex_id = hex(tag).upper().replace('0X', '')
+                    predicted_plot_files.append(f'{db_name}_3d_occupancy_HexID_{hex_id}.png')
+                    if self.chk_save_svg.isChecked():
+                        predicted_plot_files.append(f'{db_name}_3d_occupancy_HexID_{hex_id}.svg')
+            if plot_types.get('activity_timeline', False):
+                predicted_plot_files.append(f'{db_name}_activity_timeline.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_activity_timeline.svg')
+            if plot_types.get('velocity_distribution', False):
+                predicted_plot_files.append(f'{db_name}_velocity_distribution.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_velocity_distribution.svg')
+            if plot_types.get('cumulative_distance', False):
+                predicted_plot_files.append(f'{db_name}_cumulative_distance.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_cumulative_distance.svg')
+            if plot_types.get('velocity_timeline', False):
+                predicted_plot_files.append(f'{db_name}_velocity_timeline.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_velocity_timeline.svg')
+            if plot_types.get('actogram', False):
+                for tag in selected_tags:
+                    hex_id = hex(tag).upper().replace('0X', '')
+                    predicted_plot_files.append(f'{db_name}_actogram_HexID_{hex_id}.png')
+                    if self.chk_save_svg.isChecked():
+                        predicted_plot_files.append(f'{db_name}_actogram_HexID_{hex_id}.svg')
+            if plot_types.get('data_quality', False):
+                predicted_plot_files.append(f'{db_name}_data_quality.png')
+                if self.chk_save_svg.isChecked():
+                    predicted_plot_files.append(f'{db_name}_data_quality.svg')
+
+        # Check for conflicts against existing files
+        conflicting_root = [f for f in predicted_files if os.path.exists(os.path.join(base_output_dir, f))]
+        conflicting_plots = [f for f in predicted_plot_files if os.path.exists(os.path.join(plots_subdir, f))]
+        conflicting_animations = [f for f in predicted_animation_files if os.path.exists(os.path.join(animations_subdir, f))]
+        num_conflicts = len(conflicting_root) + len(conflicting_plots) + len(conflicting_animations)
+        total_new = len(predicted_files) + len(predicted_plot_files) + len(predicted_animation_files)
+
+        skip_existing = False
+        output_dir = base_output_dir
+
+        if num_conflicts > 0:
+            dialog = ExportConflictDialog(total_new, num_conflicts, parent=self)
+            result = dialog.exec_()
+
+            if result == ExportConflictDialog.SKIP:
+                skip_existing = True
+                output_dir = base_output_dir
+            elif result == ExportConflictDialog.OVERWRITE:
+                skip_existing = False
+                output_dir = base_output_dir
+                # Delete conflicting files so they get cleanly rewritten
+                for f in conflicting_root:
+                    try:
+                        os.remove(os.path.join(base_output_dir, f))
+                    except Exception:
+                        pass
+                for f in conflicting_plots:
+                    try:
+                        os.remove(os.path.join(plots_subdir, f))
+                    except Exception:
+                        pass
+                for f in conflicting_animations:
+                    try:
+                        os.remove(os.path.join(animations_subdir, f))
+                    except Exception:
+                        pass
+            elif result == ExportConflictDialog.NEW_FOLDER:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis_{timestamp}")
+                skip_existing = False
+            else:
+                # User cancelled
+                self.exporting = False
+                self.btn_export.setEnabled(True)
+                self.btn_stop_export.setVisible(False)
+                self.progress_widget.setVisible(False)
+                return
+
+        # Create output directory and subfolders
+        os.makedirs(output_dir, exist_ok=True)
+        plots_dir = os.path.join(output_dir, 'plots')
+        os.makedirs(plots_dir, exist_ok=True)
+        animations_dir = os.path.join(output_dir, 'animations')
+        os.makedirs(animations_dir, exist_ok=True)
 
         try:
             self.log_message(f"Starting export to {output_dir}")
@@ -4040,24 +4281,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             current_step = 0
 
-            # Handle overwrite: clear existing files in base folder (preserving config)
-            if self.chk_overwrite.isChecked():
-                if os.path.exists(output_dir) and os.listdir(output_dir):
-                    self.log_message("Clearing existing files (preserving config)...")
-                    for filename in os.listdir(output_dir):
-                        file_path = os.path.join(output_dir, filename)
-                        if filename == 'fnt_config.json':
-                            continue
-                        if os.path.isfile(file_path):
-                            try:
-                                os.remove(file_path)
-                            except Exception as e:
-                                print(f"Warning: Could not delete {filename}: {str(e)}")
-                        elif os.path.isdir(file_path):
-                            try:
-                                shutil.rmtree(file_path, ignore_errors=True)
-                            except Exception as e:
-                                print(f"Warning: Could not delete directory {filename}: {str(e)}")
+            # Note: Conflict resolution (skip/overwrite/new folder) was handled above
 
             # Export raw CSV (unprocessed database dump)
             if export_raw_csv:
@@ -4302,7 +4526,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 QApplication.processEvents()
                 
                 selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
-                
+
                 # Get selected plot types - include ALL plot types
                 plot_types = {
                     'daily_paths': self.plot_type_checkboxes['daily_paths'].isChecked(),
@@ -4316,16 +4540,13 @@ class UWBQuickVisualizationWindow(QWidget):
                     'actogram': self.plot_type_checkboxes['actogram'].isChecked(),
                     'data_quality': self.plot_type_checkboxes['data_quality'].isChecked()
                 }
-                
-                # Get overwrite setting
-                overwrite = self.chk_overwrite.isChecked()
-                
+
                 # Get rolling window value
                 rolling_window = self.spin_rolling_window.value()
-                
+
                 self.btn_export.setEnabled(False)
                 self.log_message("Starting plot generation in background...")
-                
+
                 self.worker = PlotSaverWorker(
                     self.db_path,
                     self.table_name,
@@ -4333,7 +4554,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     False,  # downsample handled in CSV creation
                     self.get_smoothing_method(),
                     plot_types,
-                    overwrite,
+                    skip_existing,
                     rolling_window,
                     self.combo_timezone.currentText(),
                     self.tag_identities,
@@ -4343,10 +4564,11 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.bg_height_meters,  # Pass scaled height
                     csv_path,  # Pass CSV path for reuse
                     self.chk_save_svg.isChecked(),  # Save SVG copies
-                    output_dir  # Pass output directory
+                    output_dir,  # Pass output directory
+                    plots_dir  # Pass plots subfolder
                 )
                 self.worker.progress.connect(self.update_status)
-                self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, csv_path))
+                self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, csv_path, animations_dir))
                 self.worker.start()
             
             # Animation will be started from export_finished() after plots complete
@@ -4361,8 +4583,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.progress_bar.setValue(int((current_step - 1) / total_steps * 100))
                 QApplication.processEvents()
                 
-                self.generate_animation(output_dir, total_steps, current_step, csv_path)
-            
+                self.generate_animation(output_dir, total_steps, current_step, csv_path, animations_dir)
+
             # If no plots or animation, show success message now
             any_csv = export_raw_csv or export_smoothed_csv or export_downsampled_csv
             if (any_csv or detect_behaviors) and not save_plots and not save_animation:
@@ -4378,19 +4600,19 @@ class UWBQuickVisualizationWindow(QWidget):
         """Update status label and messages window"""
         self.log_message(message)
     
-    def export_finished(self, success, message, start_animation=False, output_dir=None, total_steps=1, current_step=1, csv_path=None):
+    def export_finished(self, success, message, start_animation=False, output_dir=None, total_steps=1, current_step=1, csv_path=None, animations_dir=None):
         """Handle export completion"""
         if not self.export_cancelled:
             if success:
                 self.log_message("✓ Plot export completed successfully")
-                
+
                 # Start animation if requested (plots are now complete)
                 if start_animation and output_dir:
                     self.log_message("Starting animation generation...")
                     self.lbl_export_progress.setText(f"Step {current_step + 1}/{total_steps}: Generating animation...")
                     self.progress_bar.setValue(int(current_step / total_steps * 100))
                     QApplication.processEvents()
-                    self.generate_animation(output_dir, total_steps, current_step + 1, csv_path)
+                    self.generate_animation(output_dir, total_steps, current_step + 1, csv_path, animations_dir)
                     return  # Don't reset UI yet, animation will do that
                 else:
                     self.progress_bar.setValue(100)
