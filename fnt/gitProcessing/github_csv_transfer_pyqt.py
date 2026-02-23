@@ -889,26 +889,38 @@ class GitHubCSVTransferWindow(QWidget):
 
         # Configuration Group (split toggle + threshold — file types are in curation dialog)
         config_group = QGroupBox("Transfer Configuration")
-        config_layout = QHBoxLayout()
+        config_outer_layout = QVBoxLayout()
+
+        config_row = QHBoxLayout()
 
         self.split_checkbox = QCheckBox("Split large files")
         self.split_checkbox.setChecked(True)
         self.split_checkbox.setToolTip("Automatically split files exceeding the size threshold (recommended for GitHub's 100MB limit)")
         self.split_checkbox.stateChanged.connect(self._on_split_toggle)
-        config_layout.addWidget(self.split_checkbox)
+        config_row.addWidget(self.split_checkbox)
 
         self.split_label = QLabel("Threshold:")
-        config_layout.addWidget(self.split_label)
+        config_row.addWidget(self.split_label)
 
         self.size_spinbox = QSpinBox()
         self.size_spinbox.setRange(1, 100)
         self.size_spinbox.setValue(45)
         self.size_spinbox.setSuffix(" MB")
         self.size_spinbox.setToolTip("Files larger than this will be automatically split (GitHub limit is 100MB, recommended 45MB)")
-        config_layout.addWidget(self.size_spinbox)
-        config_layout.addStretch()
+        config_row.addWidget(self.size_spinbox)
+        config_row.addStretch()
 
-        config_group.setLayout(config_layout)
+        config_outer_layout.addLayout(config_row)
+
+        github_note = QLabel(
+            "ℹ️  GitHub limits: 100 MB per file, ~2 GB per push. "
+            "Keep individual files under 50 MB and push in small batches for best reliability."
+        )
+        github_note.setWordWrap(True)
+        github_note.setStyleSheet("color: #999999; font-size: 9pt; font-style: italic; margin-top: 2px;")
+        config_outer_layout.addWidget(github_note)
+
+        config_group.setLayout(config_outer_layout)
         layout.addWidget(config_group)
 
         # Progress Group
