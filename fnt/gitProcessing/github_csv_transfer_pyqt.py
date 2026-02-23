@@ -913,8 +913,8 @@ class GitHubCSVTransferWindow(QWidget):
         config_outer_layout.addLayout(config_row)
 
         github_note = QLabel(
-            "ℹ️  GitHub limits: 100 MB per file, ~2 GB per push. "
-            "Keep individual files under 50 MB and push in small batches for best reliability."
+            "ℹ️  GitHub limits: 50 MB per file (warning), 100 MB per file (hard block), ~2 GB per push. "
+            "Push in small batches for best reliability."
         )
         github_note.setWordWrap(True)
         github_note.setStyleSheet("color: #999999; font-size: 9pt; font-style: italic; margin-top: 2px;")
