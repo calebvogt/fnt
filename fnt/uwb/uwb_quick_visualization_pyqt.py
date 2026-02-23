@@ -1655,7 +1655,7 @@ class UWBQuickVisualizationWindow(QWidget):
         svg_option_layout = QHBoxLayout()
         svg_option_layout.setContentsMargins(30, 0, 0, 0)  # Indent
         self.chk_save_svg = QCheckBox("Also save as SVG")
-        self.chk_save_svg.setChecked(True)
+        self.chk_save_svg.setChecked(False)
         self.chk_save_svg.setToolTip("Additionally save plots in SVG format (vector graphics)")
         svg_option_layout.addWidget(self.chk_save_svg)
         svg_option_layout.addStretch()
