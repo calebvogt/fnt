@@ -34,9 +34,10 @@ class ConcatenationWorker(QThread):
     folder_progress = pyqtSignal(int, int)  # current folder, total folders
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
-    # Signal to ask user whether to skip corrupt file(s) or cancel.
-    # Emits (message, file_list) — GUI must call worker.respond_to_prompt(True/False)
-    user_decision_needed = pyqtSignal(str, list)  # message, list of filenames
+    # Signal to ask user whether to skip/move corrupt file(s) or cancel.
+    # Emits (message, file_paths) — full paths so GUI can move files if needed.
+    # GUI must call worker.respond_to_prompt("skip", "move", or "cancel").
+    user_decision_needed = pyqtSignal(str, list)  # message, list of full file paths
 
     def __init__(self, input_dirs, output_filename, sort_order="default", instance_id=1):
         super().__init__()
@@ -48,38 +49,37 @@ class ConcatenationWorker(QThread):
         # Mutex/condition for blocking the worker until the user responds
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
-        self._decision_result = None  # True = skip & continue, False = cancel
+        self._decision_result = None  # "skip", "move", or "cancel"
 
     def stop(self):
         """Stop the processing"""
         self.should_stop = True
         # Wake up the worker if it's waiting on a user decision so it can exit
         self._decision_mutex.lock()
-        self._decision_result = False  # treat as cancel
+        self._decision_result = "cancel"
         self._decision_cond.wakeAll()
         self._decision_mutex.unlock()
 
     # ------------------------------------------------------------------
     # Cross-thread user decision helpers
     # ------------------------------------------------------------------
-    def respond_to_prompt(self, skip: bool):
-        """Called from the GUI thread after the user clicks Skip or Cancel.
-        *skip=True* means skip the bad file(s) and continue;
-        *skip=False* means cancel the entire concatenation."""
+    def respond_to_prompt(self, action: str):
+        """Called from the GUI thread after the user clicks a dialog button.
+        *action* must be one of: "skip", "move", or "cancel"."""
         self._decision_mutex.lock()
-        self._decision_result = skip
+        self._decision_result = action
         self._decision_cond.wakeAll()
         self._decision_mutex.unlock()
 
-    def _ask_user_skip_or_cancel(self, message: str, file_list: list) -> bool:
+    def _ask_user_decision(self, message: str, file_paths: list) -> str:
         """Emit a signal so the GUI can show a dialog, then block until the
-        user responds.  Returns True (skip & continue) or False (cancel)."""
+        user responds.  Returns "skip", "move", or "cancel"."""
         self._decision_mutex.lock()
         self._decision_result = None
         self._decision_mutex.unlock()
 
         # Tell the GUI to show the dialog (runs on the main thread)
-        self.user_decision_needed.emit(message, file_list)
+        self.user_decision_needed.emit(message, file_paths)
 
         # Block until respond_to_prompt() is called
         self._decision_mutex.lock()
@@ -137,6 +137,25 @@ class ConcatenationWorker(QThread):
             return False, "ffprobe timed out (file may be corrupt)"
         except Exception as e:
             return False, str(e)
+
+    def _get_video_resolution(self, filepath):
+        """Get video resolution (width, height) via ffprobe. Returns (w, h) or None."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0",
+                filepath
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split("x")
+                if len(parts) == 2:
+                    return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None
 
     def _try_repair_video(self, filepath, folder_path):
         """Attempt to repair a corrupt video by re-muxing it with ffmpeg.
@@ -277,37 +296,233 @@ class ConcatenationWorker(QThread):
 
         return process.returncode == 0, last_lines
 
-    def _find_bad_video_bisect(self, video_files, folder_path):
-        """Use binary search to find the first video that causes concat failure.
-        Returns the index of the problematic file, or -1 if not found."""
-        self.progress_update.emit("🔍 Searching for the problematic video file...")
+    # ------------------------------------------------------------------
+    # Fast per-file decode test
+    # ------------------------------------------------------------------
+    def _decode_test_video(self, filepath):
+        """Quick-test a single video by decoding it to null output.
+        This catches issues that ffprobe misses (corrupt frames, bad
+        timestamps, codec errors).
+        Returns (ok: bool, error_summary: str)."""
+        try:
+            cmd = [
+                "ffmpeg", "-v", "error",
+                "-i", filepath,
+                "-f", "null",
+                "-"
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=120  # generous per-file timeout
+            )
+            stderr = proc.stderr.strip()
+            if proc.returncode != 0 or stderr:
+                # Grab last few error lines
+                err_lines = stderr.splitlines()[-5:] if stderr else ["non-zero exit code"]
+                return False, "; ".join(err_lines)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "decode test timed out"
+        except Exception as e:
+            return False, str(e)
 
-        # Try progressively larger slices from the start
-        # Binary search: find the smallest N where concat of files[0:N] fails
-        lo, hi = 1, len(video_files)
-        bad_idx = -1
-        temp_out = os.path.join(folder_path, "_bisect_test.mp4")
+    def _find_bad_videos_fast(self, video_files, folder_path, last_ffmpeg_lines):
+        """Quickly identify problematic video(s) after a concat failure.
 
-        while lo <= hi:
-            if self.should_stop:
+        Strategy:
+        1.  Parse the last ffmpeg output for frame= and time= values to
+            know exactly where in the concatenated output the failure occurred.
+        2.  Get each source file's frame count via ffprobe and compute the
+            cumulative frame total to map the failure frame to a file index.
+            Falls back to duration-based mapping if frame counts unavailable.
+        3.  Decode-test a small window of files around the estimated failure.
+        4.  If no estimate is possible, decode-test ALL files (still much
+            faster than binary-search concatenation).
+
+        Returns a list of (index, filepath, error) tuples for bad files.
+        """
+        import re
+
+        total = len(video_files)
+        bad_files = []
+
+        # ------ Step 1: Parse last ffmpeg output for frame/time ------
+        failure_frame = None
+        failure_time_sec = None
+        for line in reversed(last_ffmpeg_lines):
+            # Extract frame= number (most precise)
+            if failure_frame is None:
+                fm = re.search(r'frame=\s*(\d+)', line)
+                if fm:
+                    failure_frame = int(fm.group(1))
+            # Extract time= as fallback
+            if failure_time_sec is None:
+                tm = re.search(r'time=(\d+):(\d+):(\d+(?:\.\d+)?)', line)
+                if tm:
+                    h, mi, s = float(tm.group(1)), float(tm.group(2)), float(tm.group(3))
+                    failure_time_sec = h * 3600 + mi * 60 + s
+                else:
+                    tm2 = re.search(r'time=(\d+(?:\.\d+)?)\s', line)
+                    if tm2:
+                        failure_time_sec = float(tm2.group(1))
+            if failure_frame is not None and failure_time_sec is not None:
                 break
-            mid = (lo + hi) // 2
-            self.progress_update.emit(f"  Testing first {mid} of {len(video_files)} files...")
-            ok, _ = self._run_ffmpeg_concat(video_files[:mid], folder_path, temp_out)
 
-            # Clean up test output
-            try:
-                os.remove(temp_out)
-            except Exception:
-                pass
+        # ------ Step 2: Map to file index via frame counts (preferred) ------
+        estimated_idx = None
 
-            if ok:
-                lo = mid + 1
-            else:
-                bad_idx = mid - 1  # 0-indexed: the last file in the failing slice
-                hi = mid - 1
+        if failure_frame is not None:
+            self.progress_update.emit(
+                f"📍 Failure occurred at output frame {failure_frame:,}"
+                + (f" (~{failure_time_sec:.1f}s)" if failure_time_sec else "")
+                + ". Mapping to source file...")
 
-        return bad_idx
+            cumulative_frames = 0
+            for i, vf in enumerate(video_files):
+                if self.should_stop:
+                    return bad_files
+                fc = self._get_frame_count(vf)
+                if fc is None:
+                    fc = 0
+                cumulative_frames += fc
+                if cumulative_frames >= failure_frame:
+                    estimated_idx = i
+                    local_frame = failure_frame - (cumulative_frames - fc)
+                    self.progress_update.emit(
+                        f"   ➜ File #{i+1}/{total}: {os.path.basename(vf)}")
+                    self.progress_update.emit(
+                        f"     Failure at approximately frame {local_frame:,} "
+                        f"within this file (file has {fc:,} frames)")
+                    break
+
+            if estimated_idx is None:
+                self.progress_update.emit(
+                    f"   ⚠️ Frame {failure_frame:,} exceeds cumulative count "
+                    f"({cumulative_frames:,}). Failure likely in the last file.")
+                estimated_idx = total - 1
+
+        elif failure_time_sec is not None:
+            # Fallback: use duration-based mapping
+            self.progress_update.emit(
+                f"📍 Failure occurred at ~{failure_time_sec:.1f}s in the output. "
+                "Mapping to source file via duration...")
+            cumulative = 0.0
+            for i, vf in enumerate(video_files):
+                dur = self._get_duration(vf)
+                if dur is None:
+                    dur = 0.0
+                cumulative += dur
+                if cumulative >= failure_time_sec:
+                    estimated_idx = i
+                    self.progress_update.emit(
+                        f"   ➜ Estimated failure around file #{i+1}/{total}: "
+                        f"{os.path.basename(vf)}")
+                    break
+
+        # ------ Step 3: Decode-test files around the estimated point ------
+        if estimated_idx is not None:
+            # Test a window: 3 files before through 3 files after the estimate
+            window_start = max(0, estimated_idx - 3)
+            window_end = min(total, estimated_idx + 4)
+            test_indices = set(range(window_start, window_end))
+            self.progress_update.emit(
+                f"🔍 Decode-testing files #{window_start+1}–#{window_end} "
+                f"(window around estimated failure point)...")
+        else:
+            # No estimate — test all files
+            test_indices = set(range(total))
+            self.progress_update.emit(
+                f"🔍 No frame/time estimate available. "
+                f"Decode-testing all {total} files...")
+
+        for i in sorted(test_indices):
+            if self.should_stop:
+                return bad_files
+            vf = video_files[i]
+            self.progress_update.emit(
+                f"  Testing [{i+1}/{total}]: {os.path.basename(vf)}...")
+            ok, err = self._decode_test_video(vf)
+            if not ok:
+                bad_files.append((i, vf, err))
+                self.progress_update.emit(
+                    f"  ❌ FAILED: {os.path.basename(vf)}")
+                self.progress_update.emit(f"     Error: {err}")
+            # Progress for long scans
+            elif len(test_indices) > 30 and i % 20 == 0:
+                self.progress_update.emit(
+                    f"  ✓ {i+1}/{total} passed...")
+
+        # If windowed scan found nothing, expand to full scan
+        if not bad_files and estimated_idx is not None:
+            self.progress_update.emit(
+                "⚠️ Windowed scan found no issues. "
+                "Expanding to full decode test of all files...")
+            for i in range(total):
+                if self.should_stop:
+                    return bad_files
+                if i in test_indices:
+                    continue  # Already tested
+                vf = video_files[i]
+                self.progress_update.emit(
+                    f"  Testing [{i+1}/{total}]: {os.path.basename(vf)}...")
+                ok, err = self._decode_test_video(vf)
+                if not ok:
+                    bad_files.append((i, vf, err))
+                    self.progress_update.emit(
+                        f"  ❌ FAILED: {os.path.basename(vf)}")
+                    self.progress_update.emit(f"     Error: {err}")
+
+        return bad_files
+
+    def _get_frame_count(self, filepath):
+        """Get video frame count via ffprobe. Returns int or None."""
+        try:
+            # Try nb_frames from stream (fastest — reads header only)
+            cmd = [
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                val = result.stdout.strip()
+                if val and val != "N/A":
+                    return int(val)
+            # Fallback: count packets (slower but reliable)
+            cmd2 = [
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "v:0",
+                "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ]
+            result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=30)
+            if result2.returncode == 0:
+                val2 = result2.stdout.strip()
+                if val2 and val2 != "N/A":
+                    return int(val2)
+        except Exception:
+            pass
+        return None
+
+    def _get_duration(self, filepath):
+        """Get video duration in seconds via ffprobe. Returns float or None."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                return float(result.stdout.strip())
+        except Exception:
+            pass
+        return None
 
     def concatenate_folder(self, folder_path):
         """Concatenate all videos in a single folder with validation and auto-repair."""
@@ -368,18 +583,18 @@ class ConcatenationWorker(QThread):
                 # Any files that couldn't be repaired — ask user what to do
                 unrepairable = [vf for _, vf, _ in bad_files if vf not in repaired_map]
                 if unrepairable:
-                    names = [os.path.basename(uf) for uf in unrepairable]
-                    skip = self._ask_user_skip_or_cancel(
+                    action = self._ask_user_decision(
                         f"{len(unrepairable)} file(s) could not be repaired.",
-                        names
+                        unrepairable  # full paths — GUI shows basenames, can move files
                     )
-                    if not skip or self.should_stop:
+                    if action == "cancel" or self.should_stop:
                         self.progress_update.emit("❌ Concatenation cancelled by user.")
                         self._cleanup_repaired(repaired_map)
                         return False
-                    # User chose to skip — remove unrepairable files
+                    # User chose skip or move (move already handled by GUI)
                     for uf in unrepairable:
-                        self.progress_update.emit(f"   Skipping: {os.path.basename(uf)}")
+                        verb = "Moved" if action == "move" else "Skipping"
+                        self.progress_update.emit(f"   {verb}: {os.path.basename(uf)}")
                     video_files = [vf for vf in video_files if vf not in unrepairable]
 
                 if not video_files:
@@ -388,6 +603,80 @@ class ConcatenationWorker(QThread):
                     return False
             else:
                 self.progress_update.emit(f"✅ All {len(video_files)} files passed validation.")
+
+            # --- Resolution consistency check ---
+            self.progress_update.emit("Checking resolution consistency across files...")
+            resolution_map = {}  # (width, height) -> [filepath, ...]
+            for vf in video_files:
+                if self.should_stop:
+                    self._cleanup_repaired(repaired_map)
+                    return False
+                res = self._get_video_resolution(vf)
+                if res is not None:
+                    resolution_map.setdefault(res, []).append(vf)
+
+            if len(resolution_map) > 1:
+                # Mixed resolutions detected — report clearly
+                self.progress_update.emit("=" * 50)
+                self.progress_update.emit(
+                    f"⚠️ MIXED RESOLUTIONS DETECTED — {len(resolution_map)} "
+                    f"different resolutions found:")
+                for (w, h), files in sorted(resolution_map.items(),
+                                            key=lambda x: len(x[1]), reverse=True):
+                    self.progress_update.emit(
+                        f"   {w}x{h}: {len(files)} file(s)")
+                    # Show up to 5 example filenames for each resolution
+                    for f in files[:5]:
+                        self.progress_update.emit(
+                            f"      • {os.path.basename(f)}")
+                    if len(files) > 5:
+                        self.progress_update.emit(
+                            f"      ... and {len(files) - 5} more")
+
+                self.progress_update.emit("")
+                self.progress_update.emit(
+                    "FFmpeg's concat demuxer requires all files to have the same "
+                    "resolution. Please re-run the FNT Video PreProcessing Tool "
+                    "on these files with a consistent resolution setting.")
+                self.progress_update.emit("=" * 50)
+
+                # Find the minority resolution files (fewer files = likely the outliers)
+                sorted_res = sorted(resolution_map.items(),
+                                    key=lambda x: len(x[1]), reverse=True)
+                majority_res = sorted_res[0][0]
+                mismatched_files = []
+                for (w, h), files in sorted_res[1:]:
+                    mismatched_files.extend(files)
+
+                mismatch_msg = (
+                    f"{len(mismatched_files)} file(s) have a different resolution "
+                    f"than the majority ({majority_res[0]}x{majority_res[1]}). "
+                    f"These files need to be re-preprocessed."
+                )
+                action = self._ask_user_decision(mismatch_msg, mismatched_files)
+                if action == "cancel" or self.should_stop:
+                    self.progress_update.emit("❌ Concatenation cancelled — resolve resolution mismatch first.")
+                    self._cleanup_repaired(repaired_map)
+                    return False
+                # User chose skip or move — remove mismatched files
+                for mf in mismatched_files:
+                    verb = "Moved" if action == "move" else "Skipping"
+                    self.progress_update.emit(
+                        f"   {verb}: {os.path.basename(mf)}")
+                video_files = [vf for vf in video_files if vf not in set(mismatched_files)]
+
+                if not video_files:
+                    self.progress_update.emit("❌ No files remain after removing mismatched resolutions.")
+                    self._cleanup_repaired(repaired_map)
+                    return False
+
+                self.progress_update.emit(
+                    f"Continuing with {len(video_files)} file(s) at {majority_res[0]}x{majority_res[1]}")
+            elif len(resolution_map) == 1:
+                res = list(resolution_map.keys())[0]
+                self.progress_update.emit(
+                    f"✅ All files have consistent resolution: {res[0]}x{res[1]}")
+            # else: couldn't determine resolution — proceed anyway
 
             # --- Phase 2: Attempt full concatenation ---
             output_file = os.path.join(folder_path, self.output_filename)
@@ -407,8 +696,11 @@ class ConcatenationWorker(QThread):
                 self._cleanup_repaired(repaired_map)
                 return True
 
-            # --- Phase 3: Concat failed — find the culprit via binary search ---
-            self.progress_update.emit("❌ Full concatenation failed. Identifying problematic file...")
+            # --- Phase 3: Concat failed — fast identification of problematic file(s) ---
+            self.progress_update.emit(
+                "=" * 50)
+            self.progress_update.emit(
+                "❌ Full concatenation failed. Identifying problematic file(s)...")
 
             # Show last few lines of FFmpeg output for context
             if last_lines:
@@ -416,57 +708,98 @@ class ConcatenationWorker(QThread):
                 for ln in last_lines[-5:]:
                     self.progress_update.emit(f"  {ln}")
 
-            bad_idx = self._find_bad_video_bisect(video_files, folder_path)
+            # Use fast detection: parse failure timestamp → decode-test
+            detected_bad = self._find_bad_videos_fast(video_files, folder_path, last_lines)
 
-            if bad_idx >= 0 and bad_idx < len(video_files):
-                bad_file = video_files[bad_idx]
+            if detected_bad:
+                # Report all bad files clearly
                 self.progress_update.emit(
-                    f"🔴 IDENTIFIED problematic file #{bad_idx + 1}: {os.path.basename(bad_file)}")
+                    f"{'=' * 50}")
                 self.progress_update.emit(
-                    f"   Full path: {bad_file}")
+                    f"🔴 IDENTIFIED {len(detected_bad)} problematic file(s):")
+                for idx, filepath, err in detected_bad:
+                    self.progress_update.emit(
+                        f"   #{idx + 1}: {os.path.basename(filepath)}")
+                    self.progress_update.emit(
+                        f"         Error: {err}")
+                    self.progress_update.emit(
+                        f"         Path:  {filepath}")
 
-                # Try to repair this file too
-                repaired = self._try_repair_video(bad_file, folder_path)
-                if repaired:
-                    video_files[bad_idx] = repaired
-                    repaired_map[bad_file] = repaired
-                    self.progress_update.emit("Retrying concatenation with repaired file...")
+                # Try to repair each bad file
+                repair_succeeded = []
+                repair_failed = []
+                for idx, filepath, err in detected_bad:
+                    if self.should_stop:
+                        self._cleanup_repaired(repaired_map)
+                        return False
+                    repaired = self._try_repair_video(filepath, folder_path)
+                    if repaired:
+                        repaired_map[filepath] = repaired
+                        video_files[idx] = repaired
+                        repair_succeeded.append((idx, filepath))
+                    else:
+                        repair_failed.append((idx, filepath))
+
+                if repair_succeeded and not repair_failed:
+                    # All bad files were repaired — retry full concat
+                    self.progress_update.emit(
+                        f"✅ All {len(repair_succeeded)} problematic file(s) repaired. "
+                        "Retrying concatenation...")
                     ok2, _ = self._run_ffmpeg_concat(video_files, folder_path, output_file)
                     if ok2:
                         self.progress_update.emit(
-                            f"✅ Successfully created (after repair): {os.path.basename(output_file)}")
+                            f"✅ Successfully created (after repair): "
+                            f"{os.path.basename(output_file)}")
                         self._cleanup_repaired(repaired_map)
                         return True
-                    else:
-                        self.progress_update.emit(
-                            "❌ Concatenation still failed after repair. "
-                            "Trying without the problematic file...")
+                    self.progress_update.emit(
+                        "❌ Concatenation still failed after repairing files.")
 
-                # Last resort: ask user whether to skip the problematic file
-                skipped_name = os.path.basename(bad_file)
-                skip = self._ask_user_skip_or_cancel(
-                    "A problematic video file was identified that could not be repaired.",
-                    [skipped_name]
+                # Some or all files couldn't be repaired — ask user
+                unrepairable_paths = [fp for _, fp in repair_failed]
+                if not unrepairable_paths:
+                    # Repairs happened but concat still failed — list all bad files
+                    unrepairable_paths = [fp for _, fp, _ in detected_bad]
+
+                action = self._ask_user_decision(
+                    f"{len(unrepairable_paths)} problematic file(s) identified.",
+                    unrepairable_paths  # full paths — GUI shows basenames, can move files
                 )
-                if not skip or self.should_stop:
+                if action == "cancel" or self.should_stop:
                     self.progress_update.emit("❌ Concatenation cancelled by user.")
                     self._cleanup_repaired(repaired_map)
                     return False
 
-                # User chose to skip — retry without the bad file
-                video_files_without = [vf for vf in video_files if vf != bad_file and vf != repaired]
-                if video_files_without:
+                # User chose skip or move (move already handled by GUI)
+                bad_paths = set()
+                for idx, filepath, err in detected_bad:
+                    bad_paths.add(filepath)
+                    if filepath in repaired_map:
+                        bad_paths.add(repaired_map[filepath])
+                video_files_clean = [vf for vf in video_files if vf not in bad_paths]
+
+                unrepairable_names = [os.path.basename(fp) for fp in unrepairable_paths]
+                if video_files_clean:
+                    verb = "moving" if action == "move" else "skipping"
+                    skipped_names = ", ".join(unrepairable_names)
                     self.progress_update.emit(
-                        f"Retrying concatenation without: {skipped_name} "
-                        f"({len(video_files_without)} files remaining)...")
-                    ok3, _ = self._run_ffmpeg_concat(video_files_without, folder_path, output_file)
+                        f"Retrying concatenation after {verb} {len(detected_bad)} file(s) "
+                        f"({len(video_files_clean)} remaining)...")
+                    ok3, _ = self._run_ffmpeg_concat(
+                        video_files_clean, folder_path, output_file)
                     if ok3:
                         self.progress_update.emit(
-                            f"✅ Created (skipped {skipped_name}): {os.path.basename(output_file)}")
+                            f"✅ Created: {os.path.basename(output_file)}")
                         self.progress_update.emit(
-                            f"⚠️ NOTE: The output is missing footage from: {skipped_name}")
+                            f"⚠️ NOTE: Output is missing footage from: {skipped_names}")
                         self._cleanup_repaired(repaired_map)
                         return True
+            else:
+                self.progress_update.emit(
+                    "⚠️ Decode test passed for all files individually. "
+                    "The failure may be caused by incompatible formats between files "
+                    "(resolution, codec, framerate mismatch).")
+                # TODO: future enhancement — compare codec/resolution across files
 
             self.progress_update.emit(
                 f"❌ Failed to concatenate videos in {os.path.basename(folder_path)}")
@@ -877,27 +1210,52 @@ class VideoConcatenationGUI(QMainWindow):
         cursor.movePosition(cursor.End)
         self.ffmpeg_log.setTextCursor(cursor)
     
-    def _handle_user_decision(self, message, file_list):
-        """Show a dialog asking the user whether to skip corrupt file(s) or cancel.
-        Called on the GUI thread via the worker's user_decision_needed signal."""
-        file_names = "\n".join([f"  • {f}" for f in file_list])
+    def _handle_user_decision(self, message, file_paths):
+        """Show a dialog asking the user whether to skip, move, or cancel.
+        Called on the GUI thread via the worker's user_decision_needed signal.
+        *file_paths* contains full paths so we can move files if requested."""
+        import shutil
+
+        file_names = "\n".join([f"  • {os.path.basename(f)}" for f in file_paths])
         full_message = (
             f"{message}\n\n"
             f"Affected file(s):\n{file_names}\n\n"
-            "Would you like to skip these file(s) and continue concatenation, "
-            "or cancel the process?"
+            "Choose an action:\n"
+            "• Move && Continue — move file(s) to a 'corrupted_video' subfolder "
+            "and continue concatenation\n"
+            "• Skip && Continue — skip these file(s) and continue\n"
+            "• Cancel — stop the concatenation process"
         )
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Corrupt Video File")
         msg_box.setIcon(QMessageBox.Warning)
         msg_box.setText(full_message)
+        move_btn = msg_box.addButton("Move && Continue", QMessageBox.AcceptRole)
         skip_btn = msg_box.addButton("Skip && Continue", QMessageBox.AcceptRole)
         cancel_btn = msg_box.addButton("Cancel", QMessageBox.RejectRole)
-        msg_box.setDefaultButton(cancel_btn)
+        msg_box.setDefaultButton(move_btn)
         msg_box.exec_()
 
-        skip = msg_box.clickedButton() == skip_btn
-        self.worker.respond_to_prompt(skip)
+        clicked = msg_box.clickedButton()
+        if clicked == move_btn:
+            # Move corrupt files to corrupted_video/ subfolder
+            for fp in file_paths:
+                try:
+                    parent_dir = os.path.dirname(fp)
+                    corrupt_dir = os.path.join(parent_dir, "corrupted_video")
+                    os.makedirs(corrupt_dir, exist_ok=True)
+                    dest = os.path.join(corrupt_dir, os.path.basename(fp))
+                    shutil.move(fp, dest)
+                    self.log_message(
+                        f"  📁 Moved to corrupted_video/: {os.path.basename(fp)}")
+                except Exception as e:
+                    self.log_message(
+                        f"  ⚠️ Failed to move {os.path.basename(fp)}: {e}")
+            self.worker.respond_to_prompt("move")
+        elif clicked == skip_btn:
+            self.worker.respond_to_prompt("skip")
+        else:
+            self.worker.respond_to_prompt("cancel")
 
     def concatenation_finished(self, success, message):
         """Handle concatenation completion"""

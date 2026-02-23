@@ -69,11 +69,61 @@ class VideoProcessorWorker(QThread):
         )
         return f"{video_filename_no_ext}_processed.{self.output_format}"
 
+    def _get_video_resolution(self, filepath):
+        """Get video resolution (width, height) via ffprobe. Returns (w, h) or None."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0",
+                filepath
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split("x")
+                if len(parts) == 2:
+                    return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None
+
     def _is_already_processed(self, video_file, out_dir):
-        """Check if a video already has a corresponding processed file in out_dir."""
+        """Check if a video already has a correctly processed file in out_dir.
+        Verifies the output exists, has size > 0, AND matches the target resolution.
+        If the output exists but has the wrong resolution, it is deleted so the
+        file gets reprocessed."""
         output_filename = self._get_output_filename(video_file)
         output_path = os.path.join(out_dir, output_filename)
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            return False
+
+        # Verify resolution matches the current target
+        if self.resolution == "1080p":
+            target_w, target_h = 1920, 1080
+        else:
+            target_w, target_h = 1280, 720
+
+        res = self._get_video_resolution(output_path)
+        if res is None:
+            # Can't verify — assume it needs reprocessing
+            return False
+
+        actual_w, actual_h = res
+        if actual_w == target_w and actual_h == target_h:
+            return True
+
+        # Wrong resolution — delete the stale output so it gets reprocessed
+        self.progress_update.emit(
+            f"  🔄 Existing output has wrong resolution ({actual_w}x{actual_h}, "
+            f"target {target_w}x{target_h}): {output_filename} — will reprocess"
+        )
+        try:
+            os.remove(output_path)
+        except Exception:
+            pass
+        return False
 
     def _move_to_failed(self, video_file, parent_dir):
         """Move a failed video file to proc_failed/ directory."""
@@ -220,43 +270,63 @@ class VideoProcessorWorker(QThread):
             # Get filename and build output path
             video_filename = os.path.basename(video_file)
             output_file = os.path.join(out_dir, self._get_output_filename(video_file))
-            
+
             self.progress_update.emit(f"Processing: {video_filename}")
-            
+
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(video_file, output_file)
-            
+
             # Run FFmpeg and capture output for GUI display
             process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 universal_newlines=True,
                 bufsize=1
             )
-            
+
             # Monitor process output and stream to GUI
             for line in process.stdout:
                 if self.should_stop:
                     process.terminate()
                     return False
-                
+
                 # Send FFmpeg output to GUI
                 line = line.strip()
                 if line:  # Only send non-empty lines
                     self.ffmpeg_output.emit(line)
-            
+
             process.wait()
             success = process.returncode == 0
-            
-            if success:
-                self.progress_update.emit(f"✅ Completed: {video_filename}")
-                return True
-            else:
+
+            if not success:
                 self.progress_update.emit(f"❌ Failed: {video_filename}")
                 return False
-                
+
+            # --- Post-processing verification: confirm output resolution ---
+            if self.resolution == "1080p":
+                target_w, target_h = 1920, 1080
+            else:
+                target_w, target_h = 1280, 720
+
+            res = self._get_video_resolution(output_file)
+            if res is not None:
+                actual_w, actual_h = res
+                if actual_w != target_w or actual_h != target_h:
+                    self.progress_update.emit(
+                        f"⚠️ Resolution mismatch after processing {video_filename}: "
+                        f"got {actual_w}x{actual_h}, expected {target_w}x{target_h}")
+                    # Remove the bad output so it doesn't pollute future skip checks
+                    try:
+                        os.remove(output_file)
+                    except Exception:
+                        pass
+                    return False
+
+            self.progress_update.emit(f"✅ Completed: {video_filename}")
+            return True
+
         except Exception as e:
             self.progress_update.emit(f"❌ Error processing {video_filename}: {str(e)}")
             return False
