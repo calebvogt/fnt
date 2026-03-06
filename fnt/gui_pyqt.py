@@ -275,11 +275,23 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(group_layout, buttons)
         group.setLayout(group_layout)
         layout.addWidget(group)
-        
+
+        # Behavioral scoring group
+        scoring_group = QGroupBox("Behavioral Scoring")
+        scoring_group_layout = QGridLayout()
+
+        scoring_buttons = [
+            ("Behavior Scoring Studio", "Manual behavioral annotation with ethogram, timeline, and video playback", self.run_behavior_scoring_studio),
+        ]
+
+        self.create_button_grid(scoring_group_layout, scoring_buttons)
+        scoring_group.setLayout(scoring_group_layout)
+        layout.addWidget(scoring_group)
+
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Video")
-    
+
     def create_sleap_tab(self):
         """Create the SLEAP processing tab"""
         tab = QWidget()
@@ -759,7 +771,16 @@ class FNTMainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video processing tool: {str(e)}")
-    
+
+    def run_behavior_scoring_studio(self):
+        """Launch Behavior Scoring Studio"""
+        try:
+            from fnt.videoProcessing.behavior_scoring_studio_pyqt import BehaviorScoringStudioWindow
+            self.behavior_scoring_window = BehaviorScoringStudioWindow()
+            self.behavior_scoring_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Behavior Scoring Studio failed: {str(e)}")
+
     # SLEAP Processing Methods
     def run_sleap_inference_only(self):
         """Launch SLEAP inference tool with PyQt interface"""
