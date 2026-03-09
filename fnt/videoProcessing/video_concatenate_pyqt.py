@@ -326,36 +326,25 @@ class ConcatenationWorker(QThread):
         except Exception as e:
             return False, str(e)
 
-    def _find_bad_videos_fast(self, video_files, folder_path, last_ffmpeg_lines):
-        """Quickly identify problematic video(s) after a concat failure.
+    def _get_failure_file_index(self, video_files, last_ffmpeg_lines):
+        """Parse ffmpeg output to estimate which source file caused failure.
 
-        Strategy:
-        1.  Parse the last ffmpeg output for frame= and time= values to
-            know exactly where in the concatenated output the failure occurred.
-        2.  Get each source file's frame count via ffprobe and compute the
-            cumulative frame total to map the failure frame to a file index.
-            Falls back to duration-based mapping if frame counts unavailable.
-        3.  Decode-test a small window of files around the estimated failure.
-        4.  If no estimate is possible, decode-test ALL files (still much
-            faster than binary-search concatenation).
-
-        Returns a list of (index, filepath, error) tuples for bad files.
+        Parses the last ffmpeg stderr lines for frame= and time= values,
+        then maps them to a file index via cumulative frame counts or durations.
+        Returns the 0-based index into video_files, or None if indeterminate.
         """
         import re
 
         total = len(video_files)
-        bad_files = []
 
-        # ------ Step 1: Parse last ffmpeg output for frame/time ------
+        # ------ Parse last ffmpeg output for frame/time ------
         failure_frame = None
         failure_time_sec = None
         for line in reversed(last_ffmpeg_lines):
-            # Extract frame= number (most precise)
             if failure_frame is None:
                 fm = re.search(r'frame=\s*(\d+)', line)
                 if fm:
                     failure_frame = int(fm.group(1))
-            # Extract time= as fallback
             if failure_time_sec is None:
                 tm = re.search(r'time=(\d+):(\d+):(\d+(?:\.\d+)?)', line)
                 if tm:
@@ -368,7 +357,7 @@ class ConcatenationWorker(QThread):
             if failure_frame is not None and failure_time_sec is not None:
                 break
 
-        # ------ Step 2: Map to file index via frame counts (preferred) ------
+        # ------ Map to file index via frame counts (preferred) ------
         estimated_idx = None
 
         if failure_frame is not None:
@@ -380,7 +369,7 @@ class ConcatenationWorker(QThread):
             cumulative_frames = 0
             for i, vf in enumerate(video_files):
                 if self.should_stop:
-                    return bad_files
+                    return None
                 fc = self._get_frame_count(vf)
                 if fc is None:
                     fc = 0
@@ -402,7 +391,6 @@ class ConcatenationWorker(QThread):
                 estimated_idx = total - 1
 
         elif failure_time_sec is not None:
-            # Fallback: use duration-based mapping
             self.progress_update.emit(
                 f"📍 Failure occurred at ~{failure_time_sec:.1f}s in the output. "
                 "Mapping to source file via duration...")
@@ -419,7 +407,24 @@ class ConcatenationWorker(QThread):
                         f"{os.path.basename(vf)}")
                     break
 
-        # ------ Step 3: Decode-test files around the estimated point ------
+        return estimated_idx
+
+    def _find_bad_videos_fast(self, video_files, folder_path, last_ffmpeg_lines):
+        """Quickly identify problematic video(s) after a concat failure.
+
+        Strategy:
+        1.  Parse the last ffmpeg output to map failure to a file index.
+        2.  Decode-test a small window of files around the estimated failure.
+        3.  If no estimate is possible, decode-test ALL files.
+
+        Returns a list of (index, filepath, error) tuples for bad files.
+        """
+        total = len(video_files)
+        bad_files = []
+
+        estimated_idx = self._get_failure_file_index(video_files, last_ffmpeg_lines)
+
+        # ------ Decode-test files around the estimated point ------
         if estimated_idx is not None:
             # Test a window: 3 files before through 3 files after the estimate
             window_start = max(0, estimated_idx - 3)
@@ -696,115 +701,22 @@ class ConcatenationWorker(QThread):
                 self._cleanup_repaired(repaired_map)
                 return True
 
-            # --- Phase 3: Concat failed — fast identification of problematic file(s) ---
+            # --- Phase 3: Incremental failure recovery ---
+            self.progress_update.emit("=" * 50)
             self.progress_update.emit(
-                "=" * 50)
-            self.progress_update.emit(
-                "❌ Full concatenation failed. Identifying problematic file(s)...")
+                "❌ Full concatenation failed. "
+                "Starting incremental recovery...")
 
-            # Show last few lines of FFmpeg output for context
             if last_lines:
                 self.progress_update.emit("Last FFmpeg output before failure:")
                 for ln in last_lines[-5:]:
                     self.progress_update.emit(f"  {ln}")
 
-            # Use fast detection: parse failure timestamp → decode-test
-            detected_bad = self._find_bad_videos_fast(video_files, folder_path, last_lines)
-
-            if detected_bad:
-                # Report all bad files clearly
-                self.progress_update.emit(
-                    f"{'=' * 50}")
-                self.progress_update.emit(
-                    f"🔴 IDENTIFIED {len(detected_bad)} problematic file(s):")
-                for idx, filepath, err in detected_bad:
-                    self.progress_update.emit(
-                        f"   #{idx + 1}: {os.path.basename(filepath)}")
-                    self.progress_update.emit(
-                        f"         Error: {err}")
-                    self.progress_update.emit(
-                        f"         Path:  {filepath}")
-
-                # Try to repair each bad file
-                repair_succeeded = []
-                repair_failed = []
-                for idx, filepath, err in detected_bad:
-                    if self.should_stop:
-                        self._cleanup_repaired(repaired_map)
-                        return False
-                    repaired = self._try_repair_video(filepath, folder_path)
-                    if repaired:
-                        repaired_map[filepath] = repaired
-                        video_files[idx] = repaired
-                        repair_succeeded.append((idx, filepath))
-                    else:
-                        repair_failed.append((idx, filepath))
-
-                if repair_succeeded and not repair_failed:
-                    # All bad files were repaired — retry full concat
-                    self.progress_update.emit(
-                        f"✅ All {len(repair_succeeded)} problematic file(s) repaired. "
-                        "Retrying concatenation...")
-                    ok2, _ = self._run_ffmpeg_concat(video_files, folder_path, output_file)
-                    if ok2:
-                        self.progress_update.emit(
-                            f"✅ Successfully created (after repair): "
-                            f"{os.path.basename(output_file)}")
-                        self._cleanup_repaired(repaired_map)
-                        return True
-                    self.progress_update.emit(
-                        "❌ Concatenation still failed after repairing files.")
-
-                # Some or all files couldn't be repaired — ask user
-                unrepairable_paths = [fp for _, fp in repair_failed]
-                if not unrepairable_paths:
-                    # Repairs happened but concat still failed — list all bad files
-                    unrepairable_paths = [fp for _, fp, _ in detected_bad]
-
-                action = self._ask_user_decision(
-                    f"{len(unrepairable_paths)} problematic file(s) identified.",
-                    unrepairable_paths  # full paths — GUI shows basenames, can move files
-                )
-                if action == "cancel" or self.should_stop:
-                    self.progress_update.emit("❌ Concatenation cancelled by user.")
-                    self._cleanup_repaired(repaired_map)
-                    return False
-
-                # User chose skip or move (move already handled by GUI)
-                bad_paths = set()
-                for idx, filepath, err in detected_bad:
-                    bad_paths.add(filepath)
-                    if filepath in repaired_map:
-                        bad_paths.add(repaired_map[filepath])
-                video_files_clean = [vf for vf in video_files if vf not in bad_paths]
-
-                unrepairable_names = [os.path.basename(fp) for fp in unrepairable_paths]
-                if video_files_clean:
-                    verb = "moving" if action == "move" else "skipping"
-                    skipped_names = ", ".join(unrepairable_names)
-                    self.progress_update.emit(
-                        f"Retrying concatenation after {verb} {len(detected_bad)} file(s) "
-                        f"({len(video_files_clean)} remaining)...")
-                    ok3, _ = self._run_ffmpeg_concat(
-                        video_files_clean, folder_path, output_file)
-                    if ok3:
-                        self.progress_update.emit(
-                            f"✅ Created: {os.path.basename(output_file)}")
-                        self.progress_update.emit(
-                            f"⚠️ NOTE: Output is missing footage from: {skipped_names}")
-                        self._cleanup_repaired(repaired_map)
-                        return True
-            else:
-                self.progress_update.emit(
-                    "⚠️ Decode test passed for all files individually. "
-                    "The failure may be caused by incompatible formats between files "
-                    "(resolution, codec, framerate mismatch).")
-                # TODO: future enhancement — compare codec/resolution across files
-
-            self.progress_update.emit(
-                f"❌ Failed to concatenate videos in {os.path.basename(folder_path)}")
+            success = self._incremental_concat_with_recovery(
+                video_files, folder_path, output_file, repaired_map,
+                initial_last_lines=last_lines)
             self._cleanup_repaired(repaired_map)
-            return False
+            return success
 
         except Exception as e:
             self.progress_update.emit(f"❌ Error processing {folder_path}: {str(e)}")
@@ -820,6 +732,394 @@ class ConcatenationWorker(QThread):
                     os.remove(repaired)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Incremental failure recovery helpers
+    # ------------------------------------------------------------------
+    def _salvage_partial_output(self, partial_path, salvaged_path, prefix_files):
+        """Salvage a partial/crashed ffmpeg output by re-muxing and trimming.
+
+        When ffmpeg crashes at file N, the partial .mp4 contains files [0..N-1]
+        plus some frames from file N. This method re-muxes the partial file to
+        fix its container, then trims it to the total duration of prefix_files
+        (files [0..N-1]) so that no content from the crash file leaks through.
+
+        Returns True if salvaged_path was created and is valid.
+        """
+        if not os.path.exists(partial_path) or os.path.getsize(partial_path) < 1024:
+            return False
+
+        temp_dir = os.path.dirname(salvaged_path)
+        remuxed_path = os.path.join(temp_dir, "_salvage_remux.mp4")
+
+        try:
+            # Step A: Re-mux partial file to fix container structure
+            size_gb = os.path.getsize(partial_path) / (1024 ** 3)
+            self.progress_update.emit(
+                f"💾 Salvaging partial output ({size_gb:.2f} GB)...")
+            cmd = [
+                "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
+                "-i", partial_path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                remuxed_path
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if proc.returncode != 0 or not os.path.exists(remuxed_path) \
+                    or os.path.getsize(remuxed_path) == 0:
+                self.progress_update.emit("   Salvage re-mux failed.")
+                return False
+
+            # Step B: Calculate clean trim boundary
+            prefix_duration = 0.0
+            for f in prefix_files:
+                dur = self._get_duration(f)
+                if dur:
+                    prefix_duration += dur
+            if prefix_duration <= 0:
+                self.progress_update.emit(
+                    "   Cannot determine prefix duration — skipping trim.")
+                # Use remuxed file as-is (may have slight overlap)
+                os.rename(remuxed_path, salvaged_path)
+                return True
+
+            # Subtract 0.1s safety margin to guarantee no leaked crash-file content
+            trim_duration = max(0.1, prefix_duration - 0.1)
+
+            # Step C: Trim to clean boundary
+            cmd_trim = [
+                "ffmpeg", "-y",
+                "-i", remuxed_path,
+                "-t", f"{trim_duration:.3f}",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                salvaged_path
+            ]
+            proc2 = subprocess.run(cmd_trim, capture_output=True, text=True, timeout=600)
+            try:
+                os.remove(remuxed_path)
+            except Exception:
+                pass
+
+            if proc2.returncode != 0 or not os.path.exists(salvaged_path) \
+                    or os.path.getsize(salvaged_path) == 0:
+                self.progress_update.emit("   Salvage trim failed.")
+                return False
+
+            # Step D: Validate
+            ok, _ = self._probe_video(salvaged_path)
+            if not ok:
+                self.progress_update.emit("   Salvaged file failed validation.")
+                try:
+                    os.remove(salvaged_path)
+                except Exception:
+                    pass
+                return False
+
+            salvaged_gb = os.path.getsize(salvaged_path) / (1024 ** 3)
+            self.progress_update.emit(
+                f"   ✅ Salvaged {salvaged_gb:.2f} GB (trimmed to {trim_duration:.1f}s)")
+            return True
+
+        except Exception as e:
+            self.progress_update.emit(f"   Salvage error: {e}")
+            for tmp in (remuxed_path, salvaged_path):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            return False
+
+    def _join_segments_streamcopy(self, segment_paths, output_file):
+        """Join pre-encoded segments using stream copy (no re-encoding).
+
+        All segments share identical encoding parameters (libx264 crf 18 medium
+        yuv420p), so stream copy produces a lossless join near-instantly.
+        Returns True on success.
+        """
+        if len(segment_paths) == 1:
+            # Single segment — just move it to the output path
+            try:
+                if os.path.abspath(segment_paths[0]) != os.path.abspath(output_file):
+                    import shutil
+                    shutil.move(segment_paths[0], output_file)
+                return True
+            except Exception as e:
+                self.progress_update.emit(f"   Failed to move segment: {e}")
+                return False
+
+        # Create concat list with absolute paths
+        list_file = output_file + ".segments_list.txt"
+        try:
+            with open(list_file, "w") as fp:
+                for seg in segment_paths:
+                    abs_path = os.path.abspath(seg)
+                    fp.write(f"file '{abs_path}'\n")
+
+            command = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_file
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            for line in process.stdout:
+                if self.should_stop:
+                    process.terminate()
+                    return False
+                line = line.strip()
+                if line:
+                    self.ffmpeg_output.emit(line)
+            process.wait()
+            return process.returncode == 0
+        except Exception as e:
+            self.progress_update.emit(f"   Segment join error: {e}")
+            return False
+        finally:
+            try:
+                os.remove(list_file)
+            except Exception:
+                pass
+
+    def _cleanup_temp_dir(self, temp_dir):
+        """Remove the temporary segment directory and all its contents."""
+        try:
+            if os.path.isdir(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _incremental_concat_with_recovery(self, video_files, folder_path,
+                                          output_file, repaired_map,
+                                          initial_last_lines):
+        """Incrementally concatenate videos with failure recovery.
+
+        Instead of restarting from scratch on failure, this method:
+        1. Salvages the partial output (already-encoded content) as a segment
+        2. Identifies and repairs the problematic file(s)
+        3. Continues concatenating only the remaining files
+        4. Repeats on subsequent failures
+        5. Joins all segments with stream copy at the end
+
+        Parameters:
+            video_files: Full list of video files to concatenate
+            folder_path: Directory containing the videos
+            output_file: Final output file path
+            repaired_map: Dict tracking original→repaired file mappings
+            initial_last_lines: Last ffmpeg output from the Phase 2 failure
+        """
+        MAX_RETRIES = 10
+        temp_dir = os.path.join(folder_path, "_fnt_concat_temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        segments = []        # Completed segment file paths
+        remaining = list(video_files)
+        skipped_files = []   # Basenames of files that were skipped
+        attempt = 0
+        first_iteration = True
+
+        try:
+            while remaining and attempt < MAX_RETRIES:
+                if self.should_stop:
+                    return False
+
+                attempt += 1
+
+                # ------ Run concat or use initial failure data ------
+                if first_iteration:
+                    # Use the Phase 2 partial output + failure data
+                    first_iteration = False
+                    ok = False
+                    last_lines = initial_last_lines
+                    segment_output = output_file  # the Phase 2 partial file
+                else:
+                    segment_output = os.path.join(
+                        temp_dir, f"segment_{len(segments):03d}.mp4")
+                    self.progress_update.emit(
+                        f"{'=' * 50}\n"
+                        f"Recovery attempt #{attempt - 1}: "
+                        f"{len(remaining)} files remaining, "
+                        f"{len(segments)} segment(s) completed")
+                    ok, last_lines = self._run_ffmpeg_concat(
+                        remaining, folder_path, segment_output)
+
+                if ok:
+                    segments.append(segment_output)
+                    remaining = []
+                    break
+
+                # ------ Failure: salvage → identify → repair → continue ------
+
+                # Step A: Determine failure file index within 'remaining'
+                failure_idx = self._get_failure_file_index(
+                    remaining, last_lines)
+
+                if failure_idx is None:
+                    # Can't parse failure point — run full decode scan
+                    self.progress_update.emit(
+                        "Could not determine failure point from ffmpeg output.")
+                    detected_bad = self._find_bad_videos_fast(
+                        remaining, folder_path, last_lines)
+                    if not detected_bad:
+                        self.progress_update.emit(
+                            "⚠️ No bad files found. Cannot recover incrementally.")
+                        break
+                    failure_idx = detected_bad[0][0]
+                else:
+                    detected_bad = None  # will run decode test below
+
+                # Step B: Salvage partial output (files before failure_idx)
+                if failure_idx > 0:
+                    partial_exists = (os.path.exists(segment_output)
+                                     and os.path.getsize(segment_output) > 1024)
+                    if partial_exists:
+                        salvaged_path = os.path.join(
+                            temp_dir, f"salvaged_{len(segments):03d}.mp4")
+                        prefix_files = remaining[:failure_idx]
+                        if self._salvage_partial_output(
+                                segment_output, salvaged_path, prefix_files):
+                            segments.append(salvaged_path)
+                            self.progress_update.emit(
+                                f"   Saved progress: {failure_idx} file(s) "
+                                f"→ segment {len(segments)}")
+                        else:
+                            # Fallback: re-encode the known-good prefix
+                            self.progress_update.emit(
+                                "   Salvage failed. Re-encoding prefix...")
+                            prefix_out = os.path.join(
+                                temp_dir, f"prefix_{len(segments):03d}.mp4")
+                            ok_p, _ = self._run_ffmpeg_concat(
+                                prefix_files, folder_path, prefix_out)
+                            if ok_p:
+                                segments.append(prefix_out)
+                                self.progress_update.emit(
+                                    f"   Re-encoded {failure_idx} file(s) "
+                                    f"→ segment {len(segments)}")
+                            else:
+                                self.progress_update.emit(
+                                    "   ⚠️ Could not save progress for "
+                                    "files before the failure point.")
+
+                # Clean up the failed partial output
+                if segment_output == output_file:
+                    # Phase 2 partial — clean up from the main output path
+                    try:
+                        if os.path.exists(output_file):
+                            os.remove(output_file)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        if os.path.exists(segment_output):
+                            os.remove(segment_output)
+                    except Exception:
+                        pass
+
+                # Step C: Find and repair bad files around failure point
+                if detected_bad is None:
+                    detected_bad = self._find_bad_videos_fast(
+                        remaining, folder_path, last_lines)
+
+                bad_indices = set()
+                if detected_bad:
+                    self.progress_update.emit(
+                        f"🔴 IDENTIFIED {len(detected_bad)} "
+                        f"problematic file(s):")
+                    for idx, filepath, err in detected_bad:
+                        self.progress_update.emit(
+                            f"   #{idx + 1}: {os.path.basename(filepath)}")
+                        self.progress_update.emit(
+                            f"         Error: {err}")
+
+                    for idx, filepath, err in detected_bad:
+                        if self.should_stop:
+                            return False
+                        repaired = self._try_repair_video(
+                            filepath, folder_path)
+                        if repaired:
+                            repaired_map[filepath] = repaired
+                            remaining[idx] = repaired
+                        else:
+                            bad_indices.add(idx)
+
+                # Handle unrepairable files
+                if bad_indices:
+                    unrepairable = [remaining[i]
+                                    for i in sorted(bad_indices)]
+                    action = self._ask_user_decision(
+                        f"{len(unrepairable)} file(s) could not be "
+                        f"repaired during recovery.",
+                        unrepairable)
+                    if action == "cancel" or self.should_stop:
+                        self.progress_update.emit(
+                            "❌ Cancelled by user during recovery.")
+                        return False
+                    for uf in unrepairable:
+                        skipped_files.append(os.path.basename(uf))
+                    # Remove unrepairable from remaining
+                    remaining = [f for i, f in enumerate(remaining)
+                                 if i not in bad_indices]
+                    # Adjust failure_idx for removed files before it
+                    bad_before = len(
+                        [i for i in bad_indices if i < failure_idx])
+                    failure_idx -= bad_before
+
+                # Step D: Advance past the salvaged/encoded prefix
+                if failure_idx > 0:
+                    remaining = remaining[failure_idx:]
+
+            # ------ All iterations done — produce final output ------
+            if not segments:
+                self.progress_update.emit(
+                    "❌ No segments could be produced.")
+                return False
+
+            if remaining:
+                self.progress_update.emit(
+                    f"⚠️ Reached maximum recovery attempts ({MAX_RETRIES}). "
+                    f"{len(remaining)} file(s) could not be processed.")
+
+            # Join segments
+            if len(segments) == 1 and not remaining:
+                # Single segment is the complete output
+                import shutil
+                if os.path.abspath(segments[0]) != os.path.abspath(output_file):
+                    shutil.move(segments[0], output_file)
+                self.progress_update.emit(
+                    f"✅ Successfully created: "
+                    f"{os.path.basename(output_file)}")
+            else:
+                self.progress_update.emit(
+                    f"🔗 Joining {len(segments)} segment(s) with "
+                    f"stream copy (no re-encoding)...")
+                if not self._join_segments_streamcopy(
+                        segments, output_file):
+                    self.progress_update.emit(
+                        "❌ Failed to join segments.")
+                    return False
+                self.progress_update.emit(
+                    f"✅ Successfully created (after recovery): "
+                    f"{os.path.basename(output_file)}")
+
+            if skipped_files:
+                self.progress_update.emit(
+                    f"⚠️ NOTE: Output is missing footage from: "
+                    f"{', '.join(skipped_files)}")
+
+            return True
+
+        finally:
+            self._cleanup_temp_dir(temp_dir)
 
 
 class VideoConcatenationGUI(QMainWindow):
@@ -1093,7 +1393,13 @@ class VideoConcatenationGUI(QMainWindow):
         self.status_log.setReadOnly(True)
         self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
         group_layout.addWidget(self.status_log)
-        
+
+        self.copy_status_btn = QPushButton("Copy Status Log Output")
+        self.copy_status_btn.setStyleSheet(
+            "background-color: #3f3f3f; color: #cccccc; padding: 4px 12px; border: 1px solid #555555;")
+        self.copy_status_btn.clicked.connect(self.copy_status_log)
+        group_layout.addWidget(self.copy_status_btn)
+
         # FFmpeg output log
         ffmpeg_label = QLabel("FFmpeg Output:")
         ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
@@ -1194,6 +1500,14 @@ class VideoConcatenationGUI(QMainWindow):
         self.progress_bar.setValue(current)
         self.folder_progress_label.setText(f"Processing folder {current} of {total}")
     
+    def copy_status_log(self):
+        """Copy the status log contents to the clipboard"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.status_log.toPlainText())
+        self.copy_status_btn.setText("Copied!")
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(2000, lambda: self.copy_status_btn.setText("Copy Status Log Output"))
+
     def log_message(self, message):
         """Add message to status log"""
         self.status_log.append(message)
