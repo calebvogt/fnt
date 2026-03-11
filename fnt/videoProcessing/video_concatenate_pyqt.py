@@ -755,8 +755,10 @@ class ConcatenationWorker(QThread):
         try:
             # Step A: Re-mux partial file to fix container structure
             size_gb = os.path.getsize(partial_path) / (1024 ** 3)
+            # Scale timeout: 120s base + 60s per GB (network drives can be slow)
+            salvage_timeout = max(600, int(120 + size_gb * 60))
             self.progress_update.emit(
-                f"💾 Salvaging partial output ({size_gb:.2f} GB)...")
+                f"💾 Salvaging partial output ({size_gb:.2f} GB, timeout {salvage_timeout}s)...")
             cmd = [
                 "ffmpeg", "-y",
                 "-err_detect", "ignore_err",
@@ -765,7 +767,7 @@ class ConcatenationWorker(QThread):
                 "-movflags", "+faststart",
                 remuxed_path
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=salvage_timeout)
             if proc.returncode != 0 or not os.path.exists(remuxed_path) \
                     or os.path.getsize(remuxed_path) == 0:
                 self.progress_update.emit("   Salvage re-mux failed.")
@@ -796,7 +798,7 @@ class ConcatenationWorker(QThread):
                 "-movflags", "+faststart",
                 salvaged_path
             ]
-            proc2 = subprocess.run(cmd_trim, capture_output=True, text=True, timeout=600)
+            proc2 = subprocess.run(cmd_trim, capture_output=True, text=True, timeout=salvage_timeout)
             try:
                 os.remove(remuxed_path)
             except Exception:
