@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QBrush, QColor
 
 
 class VideoTrimConfig:
@@ -33,6 +33,7 @@ class VideoTrimConfig:
     def __init__(self, video_path: str):
         self.video_path = video_path
         self.start_time = 0.0  # seconds
+        self.stop_time = None  # seconds (None = use duration preset; float = manual mode)
         self.duration = 300  # seconds (5 minutes default)
         self.crop_polygon = []  # List of (x, y) points
         self.output_filename = ""
@@ -253,9 +254,166 @@ class BatchTrimWorker(QThread):
         self.cancelled = True
 
 
+class TimeRangeSlider(QWidget):
+    """Custom dual-handle range slider for selecting start/stop times.
+
+    Adapted from the RangeSlider in simple_tracker_gui_v2.py.
+    Operates in seconds (float) externally; uses *10 integer precision internally.
+    Green handle = start, orange handle = stop.
+    """
+
+    rangeChanged = pyqtSignal(float, float)   # (start_seconds, stop_seconds)
+    handleActivated = pyqtSignal(str)         # 'start' or 'stop'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._min = 0        # internal integer (seconds * 10)
+        self._max = 1000
+        self._low = 0        # start handle (seconds * 10)
+        self._high = 1000    # stop handle (seconds * 10)
+        self._pressed = None  # 'low', 'high', or None
+        self._handle_w = 16
+        self._bar_h = 8
+        self.setMinimumHeight(36)
+        self.setMinimumWidth(200)
+        self.setCursor(Qt.PointingHandCursor)
+
+    # --- Public API (seconds as float) ---
+
+    def setRange(self, min_sec, max_sec):
+        """Set the total range in seconds."""
+        self._min = int(min_sec * 10)
+        self._max = max(self._min + 1, int(max_sec * 10))
+        self._low = max(self._low, self._min)
+        self._high = min(self._high, self._max)
+        self.update()
+
+    def setLow(self, seconds):
+        """Set the start handle position in seconds."""
+        val = int(seconds * 10)
+        self._low = max(self._min, min(val, self._high))
+        self.update()
+        self.rangeChanged.emit(self._low / 10.0, self._high / 10.0)
+
+    def setHigh(self, seconds):
+        """Set the stop handle position in seconds."""
+        val = int(seconds * 10)
+        self._high = min(self._max, max(val, self._low))
+        self.update()
+        self.rangeChanged.emit(self._low / 10.0, self._high / 10.0)
+
+    def low(self):
+        """Return start position in seconds."""
+        return self._low / 10.0
+
+    def high(self):
+        """Return stop position in seconds."""
+        return self._high / 10.0
+
+    # --- Internal coordinate mapping ---
+
+    def _val_to_x(self, val):
+        w = self.width() - self._handle_w
+        if self._max == self._min:
+            return self._handle_w // 2
+        return int(self._handle_w // 2 + (val - self._min) / (self._max - self._min) * w)
+
+    def _x_to_val(self, x):
+        w = self.width() - self._handle_w
+        if w <= 0:
+            return self._min
+        ratio = max(0.0, min(1.0, (x - self._handle_w // 2) / w))
+        return int(self._min + ratio * (self._max - self._min))
+
+    # --- Painting ---
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        h = self.height()
+        bar_y = h // 2 - self._bar_h // 2
+
+        # Track background
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(63, 63, 63)))
+        p.drawRoundedRect(self._handle_w // 2, bar_y,
+                          self.width() - self._handle_w, self._bar_h, 3, 3)
+
+        # Active range (blue bar between handles)
+        x_low = self._val_to_x(self._low)
+        x_high = self._val_to_x(self._high)
+        p.setBrush(QBrush(QColor(0, 120, 212)))
+        p.drawRoundedRect(x_low, bar_y, max(1, x_high - x_low), self._bar_h, 3, 3)
+
+        # Start handle (green)
+        r = self._handle_w // 2
+        if self._pressed == 'low':
+            color_start = QColor(30, 160, 50)
+        else:
+            color_start = QColor(50, 200, 80)
+        p.setBrush(QBrush(color_start))
+        p.setPen(QPen(QColor(200, 200, 200), 1))
+        p.drawEllipse(x_low - r, h // 2 - r, self._handle_w, self._handle_w)
+
+        # Stop handle (orange)
+        if self._pressed == 'high':
+            color_stop = QColor(200, 120, 20)
+        else:
+            color_stop = QColor(240, 160, 40)
+        p.setBrush(QBrush(color_stop))
+        p.setPen(QPen(QColor(200, 200, 200), 1))
+        p.drawEllipse(x_high - r, h // 2 - r, self._handle_w, self._handle_w)
+
+        p.end()
+
+    # --- Mouse interaction ---
+
+    def mousePressEvent(self, event):
+        x = event.pos().x()
+        x_low = self._val_to_x(self._low)
+        x_high = self._val_to_x(self._high)
+
+        dist_low = abs(x - x_low)
+        dist_high = abs(x - x_high)
+
+        if dist_low <= dist_high:
+            self._pressed = 'low'
+            self.handleActivated.emit('start')
+        else:
+            self._pressed = 'high'
+            self.handleActivated.emit('stop')
+        self._move_handle(x)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._pressed:
+            self._move_handle(event.pos().x())
+
+    def mouseReleaseEvent(self, event):
+        if self._pressed:
+            self._pressed = None
+            self.update()
+
+    def _move_handle(self, x):
+        val = self._x_to_val(x)
+        if self._pressed == 'low':
+            val = min(val, self._high)
+            if val != self._low:
+                self._low = val
+                self.rangeChanged.emit(self._low / 10.0, self._high / 10.0)
+                self.update()
+        elif self._pressed == 'high':
+            val = max(val, self._low)
+            if val != self._high:
+                self._high = val
+                self.rangeChanged.emit(self._low / 10.0, self._high / 10.0)
+                self.update()
+
+
 class VideoTrimTool(QMainWindow):
     """Main window for batch video trimming and cropping"""
-    
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Trim and Crop - FieldNeuroToolbox")
@@ -270,6 +428,9 @@ class VideoTrimTool(QMainWindow):
         # Drawing state
         self.drawing_crop = False
         
+        # Range slider state
+        self.active_range_handle = 'start'  # 'start' or 'stop'
+
         # Processing queue
         self.processing_queue = []
         
@@ -470,8 +631,8 @@ class VideoTrimTool(QMainWindow):
         duration_layout = QHBoxLayout()
         
         self.duration_combo = QComboBox()
-        self.duration_combo.addItems(["Original Video Duration", "1 minute", "5 minutes", "10 minutes", "20 minutes", "30 minutes", "1 hour", "Custom"])
-        self.duration_combo.setCurrentText("Original Video Duration")
+        self.duration_combo.addItems(["Manual", "Original Video Duration", "1 minute", "5 minutes", "10 minutes", "20 minutes", "30 minutes", "1 hour", "Custom"])
+        self.duration_combo.setCurrentText("Manual")
         self.duration_combo.setEnabled(False)
         self.duration_combo.currentTextChanged.connect(self.on_duration_changed)
         duration_layout.addWidget(self.duration_combo)
@@ -680,20 +841,37 @@ class VideoTrimTool(QMainWindow):
         position_controls = QVBoxLayout()
         position_controls.setSpacing(5)
         
-        # Time display
+        # Time display (single slider mode)
         self.time_label = QLabel("Start Time: 00:00:00")
         self.time_label.setFont(QFont("Arial", 12, QFont.Bold))
         self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setVisible(False)  # Hidden by default (Manual mode is default)
         position_controls.addWidget(self.time_label)
-        
-        # Slider
+
+        # Time display (Manual/range slider mode)
+        self.manual_time_label = QLabel("Start: 00:00:00  |  Stop: 00:00:00  |  Duration: 00:00:00")
+        self.manual_time_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.manual_time_label.setAlignment(Qt.AlignCenter)
+        self.manual_time_label.setVisible(True)  # Visible by default (Manual mode)
+        position_controls.addWidget(self.manual_time_label)
+
+        # Single slider (non-Manual modes)
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setMinimum(0)
         self.position_slider.setMaximum(100)
         self.position_slider.setValue(0)
         self.position_slider.setEnabled(False)
+        self.position_slider.setVisible(False)  # Hidden by default (Manual mode)
         self.position_slider.valueChanged.connect(self.on_slider_changed)
         position_controls.addWidget(self.position_slider)
+
+        # Range slider (Manual mode — dual handles for start/stop)
+        self.time_range_slider = TimeRangeSlider()
+        self.time_range_slider.setEnabled(False)
+        self.time_range_slider.setVisible(True)  # Visible by default (Manual mode)
+        self.time_range_slider.rangeChanged.connect(self.on_range_slider_changed)
+        self.time_range_slider.handleActivated.connect(self.on_range_handle_activated)
+        position_controls.addWidget(self.time_range_slider)
         
         # Adjustment buttons
         button_layout = QHBoxLayout()
@@ -838,15 +1016,25 @@ class VideoTrimTool(QMainWindow):
         self.position_slider.setEnabled(True)
         self.position_slider.setMaximum(int(config.total_duration * 10))
         self.position_slider.setValue(int(config.start_time * 10))
-        
+
+        # Initialize range slider
+        self.time_range_slider.setEnabled(True)
+        self.time_range_slider.setRange(0, config.total_duration)
+        self.time_range_slider.setLow(config.start_time)
+        self.time_range_slider.setHigh(
+            config.stop_time if config.stop_time is not None else config.total_duration)
+
         for btn in self.adjustment_buttons:
             btn.setEnabled(True)
-        
+
         self.duration_combo.setEnabled(True)
         self.btn_draw_crop.setEnabled(True)
         self.start_time_input.setEnabled(True)
         self.btn_add_to_queue.setEnabled(True)
-        
+
+        # Trigger UI mode update (show correct slider for current duration mode)
+        self.on_duration_changed(self.duration_combo.currentText())
+
         # Restore settings if configured
         self.restore_video_settings(config)
         
@@ -858,7 +1046,15 @@ class VideoTrimTool(QMainWindow):
         # Update start time display
         self.start_time_input.setText(self.format_time(config.start_time))
         self.time_label.setText(f"Start Time: {self.format_time(config.start_time)}")
-        
+
+        # Update manual time label if stop_time is set
+        if config.stop_time is not None:
+            self.manual_time_label.setText(
+                f"Start: {self.format_time(config.start_time)}  |  "
+                f"Stop: {self.format_time(config.stop_time)}  |  "
+                f"Duration: {self.format_time(config.stop_time - config.start_time)}"
+            )
+
         # Update crop status
         if len(config.crop_polygon) >= 3:
             self.crop_status_label.setText(f"✓ Crop region set with {len(config.crop_polygon)} points")
@@ -881,30 +1077,101 @@ class VideoTrimTool(QMainWindow):
         self.time_label.setText(f"Start Time: {self.format_time(config.start_time)}")
         self.update_preview()
     
-    def adjust_position(self, seconds):
-        """Adjust position by seconds"""
+    def on_range_slider_changed(self, start_sec, stop_sec):
+        """Handle range slider value changes (Manual mode)."""
         if self.current_config_idx >= len(self.video_configs):
             return
-        
+
         config = self.video_configs[self.current_config_idx]
-        new_position = max(0, min(config.total_duration, config.start_time + seconds))
-        self.position_slider.setValue(int(new_position * 10))
-    
+        config.start_time = start_sec
+        config.stop_time = stop_sec
+        config.duration = stop_sec - start_sec
+
+        # Update text inputs
+        self.start_time_input.setText(self.format_time(config.start_time))
+        self.manual_time_label.setText(
+            f"Start: {self.format_time(config.start_time)}  |  "
+            f"Stop: {self.format_time(config.stop_time)}  |  "
+            f"Duration: {self.format_time(config.duration)}"
+        )
+
+        # Preview the frame for whichever handle is active
+        self.update_preview()
+
+    def on_range_handle_activated(self, handle_name):
+        """Track which range slider handle is being dragged."""
+        self.active_range_handle = handle_name
+
+    def adjust_position(self, seconds):
+        """Adjust position by seconds (works with both single slider and range slider)."""
+        if self.current_config_idx >= len(self.video_configs):
+            return
+
+        config = self.video_configs[self.current_config_idx]
+
+        if self.duration_combo.currentText() == "Manual":
+            # In Manual mode, adjust whichever handle was last touched
+            if self.active_range_handle == 'stop' and config.stop_time is not None:
+                new_stop = max(config.start_time + 0.1,
+                               min(config.total_duration, config.stop_time + seconds))
+                self.time_range_slider.setHigh(new_stop)
+            else:
+                stop_limit = config.stop_time if config.stop_time is not None else config.total_duration
+                new_start = max(0, min(stop_limit - 0.1, config.start_time + seconds))
+                self.time_range_slider.setLow(new_start)
+        else:
+            new_position = max(0, min(config.total_duration, config.start_time + seconds))
+            self.position_slider.setValue(int(new_position * 10))
+
     def on_duration_changed(self, text):
-        """Handle duration selection change"""
+        """Handle duration selection change."""
         is_custom = text == "Custom"
+        is_manual = text == "Manual"
+
+        # Toggle custom duration inputs
         self.custom_duration_input.setVisible(is_custom)
         self.custom_duration_unit.setVisible(is_custom)
-        
+
+        # Toggle between single slider and range slider
+        self.position_slider.setVisible(not is_manual)
+        self.time_label.setVisible(not is_manual)
+        self.time_range_slider.setVisible(is_manual)
+        self.manual_time_label.setVisible(is_manual)
+
         # Update config
         if self.current_config_idx < len(self.video_configs):
             config = self.video_configs[self.current_config_idx]
-            config.duration = self.get_duration_from_ui()
+            if is_manual:
+                # Initialize stop_time if not set
+                if config.stop_time is None:
+                    config.stop_time = config.total_duration if config.total_duration > 0 else 300.0
+                config.duration = config.stop_time - config.start_time
+                # Sync range slider
+                if config.total_duration > 0:
+                    self.time_range_slider.setRange(0, config.total_duration)
+                    self.time_range_slider.setLow(config.start_time)
+                    self.time_range_slider.setHigh(config.stop_time)
+                self.manual_time_label.setText(
+                    f"Start: {self.format_time(config.start_time)}  |  "
+                    f"Stop: {self.format_time(config.stop_time)}  |  "
+                    f"Duration: {self.format_time(config.duration)}"
+                )
+            else:
+                config.stop_time = None
+                config.duration = self.get_duration_from_ui()
     
     def get_duration_from_ui(self) -> float:
         """Get duration in seconds from UI"""
         selected = self.duration_combo.currentText()
-        
+
+        # Manual mode: duration = stop_time - start_time
+        if selected == "Manual":
+            if self.current_config_idx < len(self.video_configs):
+                config = self.video_configs[self.current_config_idx]
+                if config.stop_time is not None:
+                    return max(0.1, config.stop_time - config.start_time)
+            return 300  # Fallback
+
         # Handle original video duration
         if selected == "Original Video Duration":
             if self.current_config_idx < len(self.video_configs):
@@ -1036,9 +1303,17 @@ class VideoTrimTool(QMainWindow):
             return
         
         config = self.video_configs[self.current_config_idx]
-        
+
+        # Determine which time to preview: stop frame when stop handle is active
+        if (self.duration_combo.currentText() == "Manual"
+                and self.active_range_handle == 'stop'
+                and config.stop_time is not None):
+            preview_time = config.stop_time
+        else:
+            preview_time = config.start_time
+
         # Seek to position
-        frame_number = int(config.start_time * config.fps)
+        frame_number = int(preview_time * config.fps)
         self.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ret, frame = self.preview_cap.read()
         
@@ -1103,6 +1378,7 @@ class VideoTrimTool(QMainWindow):
         clip_config = VideoTrimConfig(config.video_path)
         clip_config.video_path = config.video_path
         clip_config.start_time = config.start_time
+        clip_config.stop_time = config.stop_time
         clip_config.duration = self.get_duration_from_ui()
         clip_config.crop_polygon = config.crop_polygon.copy()  # Keep the crop
         clip_config.output_filename = output_filename
