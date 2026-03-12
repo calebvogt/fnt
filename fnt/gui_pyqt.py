@@ -276,7 +276,7 @@ class FNTMainWindow(QMainWindow):
         import time as _time
         _this_file = os.path.abspath(__file__)
         _mtime = os.path.getmtime(_this_file)
-        _ts = _time.strftime("%y%m%d %H%M%S %Z", _time.localtime(_mtime))
+        _ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(_mtime))
         subtitle = QLabel(f"Updated: {_ts}  |  Donaldson Lab, U. Colorado Boulder")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))

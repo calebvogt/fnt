@@ -11,22 +11,24 @@ A comprehensive PyQt5 application for:
 Author: FNT Project
 """
 
+import math
 import os
 import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QTimer, QEvent
-from PyQt5.QtGui import QFont, QColor, QPainter, QImage, QPen, QBrush
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QPointF, QTimer, QSettings, QUrl
+from PyQt5.QtGui import QFont, QColor, QPainter, QImage, QPen, QBrush, QPolygonF, QKeySequence, QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QProgressBar, QGroupBox,
     QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QListWidgetItem,
     QScrollArea, QSplitter, QStatusBar, QMessageBox, QScrollBar,
-    QSizePolicy, QFrame, QCheckBox
+    QSizePolicy, QFrame, QCheckBox, QShortcut
 )
 from scipy import signal
 
@@ -54,6 +56,7 @@ class SpectrogramWidget(QWidget):
     detection_selected = pyqtSignal(int)
     box_adjusted = pyqtSignal(int, float, float, float, float)
     drag_complete = pyqtSignal()  # Emitted when box drag is finished
+    zoom_requested = pyqtSignal(float, float)  # factor, center_time
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,15 +96,47 @@ class SpectrogramWidget(QWidget):
         self.draw_current = None
 
         # Colormap
-        self.colormap_lut = self._create_colormap_lut()
+        self.colormap_name = 'viridis'
+        self.colormap_lut = self._create_colormap_lut(self.colormap_name)
 
-    def _create_colormap_lut(self):
-        """Create viridis-like colormap lookup table."""
-        colors = np.array([
-            [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
-            [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89],
-            [180, 222, 44], [253, 231, 37],
-        ], dtype=np.float32)
+    def set_colormap(self, name):
+        """Set colormap by name and recompute spectrogram."""
+        self.colormap_name = name
+        self.colormap_lut = self._create_colormap_lut(name)
+        # Force recompute
+        self.cached_view_start = None
+        self.cached_view_end = None
+        self.spec_image = None
+        if self.total_duration > 0:
+            self._compute_view_spectrogram()
+        self.update()
+
+    @staticmethod
+    def _create_colormap_lut(name='viridis'):
+        """Create colormap lookup table by name."""
+        colormaps = {
+            'viridis': [
+                [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
+                [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89],
+                [180, 222, 44], [253, 231, 37],
+            ],
+            'magma': [
+                [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129],
+                [181, 54, 122], [229, 89, 100], [251, 135, 97], [254, 194, 140],
+                [254, 237, 176], [252, 253, 191],
+            ],
+            'inferno': [
+                [0, 0, 4], [22, 11, 57], [66, 10, 104], [106, 23, 110],
+                [147, 38, 103], [188, 55, 84], [221, 81, 58], [243, 120, 25],
+                [249, 173, 10], [252, 255, 164],
+            ],
+            'grayscale': [
+                [0, 0, 0], [28, 28, 28], [57, 57, 57], [85, 85, 85],
+                [113, 113, 113], [142, 142, 142], [170, 170, 170], [198, 198, 198],
+                [227, 227, 227], [255, 255, 255],
+            ],
+        }
+        colors = np.array(colormaps.get(name, colormaps['viridis']), dtype=np.float32)
 
         n_colors = len(colors)
         indices = np.linspace(0, n_colors - 1, 256)
@@ -141,7 +176,13 @@ class SpectrogramWidget(QWidget):
         self.update()
 
     def set_detections(self, detections, current_idx=-1):
-        """Set detection boxes."""
+        """Set detection boxes. Clears any active drag to prevent stale references."""
+        # Cancel any active drag — the detection list is being replaced
+        if self.drag_mode is not None:
+            self.drag_mode = None
+            self.drag_detection_idx = None
+            self.drag_start = None
+            self.drag_start_box = None
         self.detections = detections
         self.current_detection_idx = current_idx
         self.update()
@@ -328,12 +369,14 @@ class SpectrogramWidget(QWidget):
         status = det.get('status', 'pending')
 
         # Handle NaN values
-        import math
-        if math.isnan(start_s) or math.isnan(stop_s):
+        try:
+            if math.isnan(start_s) or math.isnan(stop_s):
+                return
+        except TypeError:
             return
-        if math.isnan(min_freq):
+        if isinstance(min_freq, float) and math.isnan(min_freq):
             min_freq = self.min_freq
-        if math.isnan(max_freq):
+        if isinstance(max_freq, float) and math.isnan(max_freq):
             max_freq = self.max_freq
 
         x1 = self._time_to_x(start_s, spec_rect)
@@ -343,7 +386,7 @@ class SpectrogramWidget(QWidget):
 
         is_selected = idx == self.current_detection_idx
 
-        # Color based on status - yellow for pending, green/red for labeled
+        # Color based on status - yellow for pending, green for accepted, red for rejected
         if status == 'accepted':
             color = QColor(0, 200, 0, 220)  # Bright green
             label = "A"
@@ -352,7 +395,7 @@ class SpectrogramWidget(QWidget):
             label = "R"
         else:
             color = QColor(255, 255, 0, 200)  # Yellow for pending
-            label = None
+            label = "P"
 
         # Selected = white border; non-selected = yellow outline
         if is_selected:
@@ -366,17 +409,17 @@ class SpectrogramWidget(QWidget):
         painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 30)))
         painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
 
-        # Draw status label above the box (for accepted/rejected)
+        # Draw status label above the box
         if label:
             center_x = (x1 + x2) / 2
             label_y = y1 - 4
             font = QFont("Arial", 14, QFont.Bold)
             painter.setFont(font)
-            # White label for selected box, yellow for others
             if is_selected:
                 painter.setPen(QColor(255, 255, 255))
             else:
-                painter.setPen(QColor(255, 255, 0))  # Yellow
+                # Label color matches status
+                painter.setPen(color)
             painter.drawText(int(center_x - 10), int(label_y - 16), 20, 18, Qt.AlignCenter, label)
 
         # Draw frequency contour dots+lines for accepted detections
@@ -385,7 +428,6 @@ class SpectrogramWidget(QWidget):
 
     def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
         """Draw peak frequency sample dots and connecting lines."""
-        import math
         # Collect peak_freq_N values
         points = []
         i = 1
@@ -483,9 +525,8 @@ class SpectrogramWidget(QWidget):
             fmt = "{:.1f}"
 
         # Draw minor ticks (subdivisions between major ticks)
-        import math as _math
         minor_interval = tick_interval / 10.0
-        first_minor = _math.ceil(self.view_start / minor_interval) * minor_interval
+        first_minor = math.ceil(self.view_start / minor_interval) * minor_interval
         t = first_minor
         painter.setPen(QColor(120, 120, 120))
         while t <= self.view_end:
@@ -497,7 +538,7 @@ class SpectrogramWidget(QWidget):
 
         # Draw major ticks with labels
         painter.setPen(QColor(200, 200, 200))
-        first_tick = _math.ceil(self.view_start / tick_interval) * tick_interval
+        first_tick = math.ceil(self.view_start / tick_interval) * tick_interval
         t = first_tick
         while t <= self.view_end:
             x = self._time_to_x(t, spec_rect)
@@ -611,9 +652,25 @@ class SpectrogramWidget(QWidget):
         if was_dragging:
             self.drag_complete.emit()
 
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zoom. Zoom centered on mouse position."""
+        if self.total_duration <= 0:
+            return
+        spec_rect = self._get_spec_rect()
+        if not spec_rect.contains(event.pos()):
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        # Zoom factor: scroll up = zoom in, scroll down = zoom out
+        factor = 1.3 if delta > 0 else 1 / 1.3
+        center_time = self._x_to_time(event.pos().x(), spec_rect)
+        self.zoom_requested.emit(factor, center_time)
+        event.accept()
+
     def _find_edge_at_pos(self, pos, spec_rect, threshold=8):
-        """Find if position is near a detection edge."""
-        for i, det in enumerate(self.detections):
+        """Find if position is near a detection edge. Prioritizes selected detection."""
+        def _check_det(i, det):
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
             min_freq = det.get('min_freq_hz', self.min_freq)
@@ -624,9 +681,11 @@ class SpectrogramWidget(QWidget):
             y1 = self._freq_to_y(max_freq, spec_rect)
             y2 = self._freq_to_y(min_freq, spec_rect)
 
-            if abs(pos.x() - x1) < threshold and y1 <= pos.y() <= y2:
+            # Expand y-range slightly for edge detection
+            y_pad = threshold
+            if abs(pos.x() - x1) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
                 return 'resize_left', i
-            if abs(pos.x() - x2) < threshold and y1 <= pos.y() <= y2:
+            if abs(pos.x() - x2) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
                 return 'resize_right', i
             if abs(pos.y() - y1) < threshold and x1 <= pos.x() <= x2:
                 return 'resize_top', i
@@ -637,29 +696,54 @@ class SpectrogramWidget(QWidget):
                 if x1 < pos.x() < x2 and y1 < pos.y() < y2:
                     return 'move', i
 
+            return None, None
+
+        # Check currently selected detection first (gives it priority)
+        if 0 <= self.current_detection_idx < len(self.detections):
+            result = _check_det(self.current_detection_idx, self.detections[self.current_detection_idx])
+            if result[0] is not None:
+                return result
+
+        # Then check all others
+        for i, det in enumerate(self.detections):
+            if i == self.current_detection_idx:
+                continue
+            result = _check_det(i, det)
+            if result[0] is not None:
+                return result
+
         return None, None
 
     def _find_detection_at_pos(self, pos, spec_rect):
-        """Find detection at position."""
+        """Find detection at position (checks both x and y axes)."""
         for i, det in enumerate(self.detections):
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
+            min_freq = det.get('min_freq_hz', self.min_freq)
+            max_freq = det.get('max_freq_hz', self.max_freq)
 
             x1 = self._time_to_x(start_s, spec_rect)
             x2 = self._time_to_x(stop_s, spec_rect)
+            y1 = self._freq_to_y(max_freq, spec_rect)  # top
+            y2 = self._freq_to_y(min_freq, spec_rect)  # bottom
 
-            if x1 <= pos.x() <= x2:
+            if x1 <= pos.x() <= x2 and y1 <= pos.y() <= y2:
                 return i
         return -1
 
     def _handle_drag(self, pos, spec_rect):
-        """Handle drag for resize or move."""
+        """Handle drag for resize or move with clamped coordinates."""
         if self.drag_detection_idx is None or self.drag_detection_idx >= len(self.detections):
+            self.drag_mode = None
             return
 
         det = self.detections[self.drag_detection_idx]
         time_s = self._x_to_time(pos.x(), spec_rect)
         freq_hz = self._y_to_freq(pos.y(), spec_rect)
+
+        # Clamp to valid ranges
+        time_s = max(0, min(time_s, self.total_duration))
+        freq_hz = max(0, min(freq_hz, self.max_freq))
 
         start_s = det.get('start_seconds', 0)
         stop_s = det.get('stop_seconds', 0)
@@ -667,13 +751,13 @@ class SpectrogramWidget(QWidget):
         max_freq = det.get('max_freq_hz', self.max_freq)
 
         if self.drag_mode == 'resize_left':
-            start_s = min(time_s, stop_s - 0.001)
+            start_s = max(0, min(time_s, stop_s - 0.001))
         elif self.drag_mode == 'resize_right':
-            stop_s = max(time_s, start_s + 0.001)
+            stop_s = min(self.total_duration, max(time_s, start_s + 0.001))
         elif self.drag_mode == 'resize_top':
-            max_freq = max(freq_hz, min_freq + 100)
+            max_freq = min(self.max_freq, max(freq_hz, min_freq + 100))
         elif self.drag_mode == 'resize_bottom':
-            min_freq = min(freq_hz, max_freq - 100)
+            min_freq = max(0, min(freq_hz, max_freq - 100))
         elif self.drag_mode == 'move' and self.drag_start and self.drag_start_box:
             delta_t = time_s - self.drag_start[0]
             delta_f = freq_hz - self.drag_start[1]
@@ -695,6 +779,113 @@ class SpectrogramWidget(QWidget):
                 min_freq = max_freq - box_freq_range
 
         self.box_adjusted.emit(self.drag_detection_idx, start_s, stop_s, min_freq, max_freq)
+
+
+# =============================================================================
+# Waveform Overview Widget
+# =============================================================================
+
+class WaveformOverviewWidget(QWidget):
+    """Thin waveform strip showing full file with viewport highlight."""
+
+    view_changed = pyqtSignal(float)  # center time clicked
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+
+        self.envelope = None  # Downsampled envelope
+        self.total_duration = 0.0
+        self.view_start = 0.0
+        self.view_end = 1.0
+        self._dragging = False
+        self.detection_times = []  # List of (start_s, stop_s) for tick marks
+
+    def set_audio_data(self, audio_data, sample_rate):
+        """Compute downsampled envelope for display."""
+        if audio_data is None or sample_rate is None or len(audio_data) == 0:
+            self.envelope = None
+            self.total_duration = 0.0
+            self.update()
+            return
+
+        self.total_duration = len(audio_data) / sample_rate
+        # Downsample to ~1000 points for the overview
+        n_bins = min(1000, len(audio_data))
+        bin_size = max(1, len(audio_data) // n_bins)
+        trimmed = audio_data[:bin_size * n_bins]
+        reshaped = trimmed.reshape(n_bins, bin_size)
+        self.envelope = np.max(np.abs(reshaped), axis=1)
+        # Normalize
+        peak = np.max(self.envelope)
+        if peak > 0:
+            self.envelope = self.envelope / peak
+        self.update()
+
+    def set_detections(self, detection_times):
+        """Set detection positions for tick marks.
+
+        Args:
+            detection_times: List of (start_seconds, stop_seconds) tuples
+        """
+        self.detection_times = detection_times or []
+        self.update()
+
+    def set_view_range(self, start, end):
+        """Update viewport highlight."""
+        self.view_start = start
+        self.view_end = end
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(20, 20, 20))
+
+        if self.envelope is None or self.total_duration <= 0:
+            return
+
+        w = self.width()
+        h = self.height()
+
+        # Draw waveform envelope
+        painter.setPen(QPen(QColor(0, 120, 212, 180), 1))
+        n = len(self.envelope)
+        mid_y = h / 2
+        for i in range(n):
+            x = int(i / n * w)
+            amp = self.envelope[i] * mid_y * 0.9
+            painter.drawLine(x, int(mid_y - amp), x, int(mid_y + amp))
+
+        # Draw detection tick marks
+        if self.detection_times and self.total_duration > 0:
+            painter.setPen(QPen(QColor(255, 200, 50, 180), 1))
+            for start_s, stop_s in self.detection_times:
+                cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
+                painter.drawLine(cx, 0, cx, h)
+
+        # Draw viewport highlight
+        x1 = int(self.view_start / self.total_duration * w)
+        x2 = int(self.view_end / self.total_duration * w)
+        painter.setBrush(QBrush(QColor(0, 120, 212, 50)))
+        painter.setPen(QPen(QColor(0, 120, 212, 200), 1))
+        painter.drawRect(x1, 0, max(2, x2 - x1), h)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.total_duration > 0:
+            self._dragging = True
+            center = event.pos().x() / self.width() * self.total_duration
+            self.view_changed.emit(center)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self.total_duration > 0:
+            center = event.pos().x() / self.width() * self.total_duration
+            center = max(0, min(center, self.total_duration))
+            self.view_changed.emit(center)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
 
 
 # =============================================================================
@@ -910,6 +1101,7 @@ class USVStudioWindow(QMainWindow):
         self.detections_df = None  # Current file's detections
         self.current_detection_idx = 0
         self.all_detections = {}  # filepath -> DataFrame
+        self.detection_sources = {}  # filepath -> 'dsp' | 'rf' | 'detections' (tracks CSV origin)
         self.dsp_queue = []  # Files queued for DSP detection
         self.current_model_dir = None
 
@@ -918,29 +1110,21 @@ class USVStudioWindow(QMainWindow):
         self.playback_speed = 0.1
         self.use_heterodyne = False
 
+        # Undo stack (stores (action, data) tuples)
+        self.undo_stack = deque(maxlen=50)
+
+        # Filter state
+        self.filter_status = 'all'  # 'all', 'pending', 'accepted', 'rejected'
+
         # Workers
         self.dsp_worker = None
         self.rf_worker = None
 
         self._setup_ui()
         self._apply_styles()
-
-        # Install event filter to capture arrow keys before child widgets consume them
-        QApplication.instance().installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        """Intercept key presses globally to handle arrow key shortcuts."""
-        if event.type() == QEvent.KeyPress:
-            key = event.key()
-            if key == Qt.Key_Right and self.btn_next_det.isEnabled():
-                self._flash_button(self.btn_next_det)
-                self.next_detection()
-                return True
-            elif key == Qt.Key_Left and self.btn_prev_det.isEnabled():
-                self._flash_button(self.btn_prev_det)
-                self.prev_detection()
-                return True
-        return super().eventFilter(obj, event)
+        self._setup_shortcuts()
+        self._setup_pan_timers()
+        self._restore_settings()
 
     def _setup_ui(self):
         """Setup the main UI."""
@@ -956,7 +1140,7 @@ class USVStudioWindow(QMainWindow):
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setFixedWidth(340)  # Fixed width to prevent horizontal scroll
+        left_scroll.setFixedWidth(380)  # Fixed width to prevent horizontal scroll
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -968,7 +1152,6 @@ class USVStudioWindow(QMainWindow):
         self._create_dsp_section(left_layout)
         self._create_detection_section(left_layout)
         self._create_labeling_section(left_layout)
-        self._create_playback_section(left_layout)
         self._create_ml_section(left_layout)
 
         left_layout.addStretch()
@@ -985,54 +1168,162 @@ class USVStudioWindow(QMainWindow):
         self.spectrogram.detection_selected.connect(self.on_detection_selected)
         self.spectrogram.box_adjusted.connect(self.on_box_adjusted)
         self.spectrogram.drag_complete.connect(self.on_drag_complete)
+        self.spectrogram.zoom_requested.connect(self.on_wheel_zoom)
         right_layout.addWidget(self.spectrogram, 1)
 
-        # Navigation bar
-        nav_bar = QWidget()
-        nav_layout = QHBoxLayout(nav_bar)
-        nav_layout.setContentsMargins(5, 2, 5, 2)
+        # Waveform overview strip
+        self.waveform_overview = WaveformOverviewWidget()
+        self.waveform_overview.view_changed.connect(self.on_overview_clicked)
+        right_layout.addWidget(self.waveform_overview)
+
+        # Scrollbar row (full width, matching spectrogram)
+        scroll_bar_row = QWidget()
+        scroll_layout = QHBoxLayout(scroll_bar_row)
+        scroll_layout.setContentsMargins(5, 2, 5, 2)
+        scroll_layout.setSpacing(2)
 
         self.btn_pan_left = QPushButton("<")
         self.btn_pan_left.setObjectName("small_btn")
         self.btn_pan_left.setFixedWidth(24)
+        self.btn_pan_left.setToolTip("Pan the spectrogram view left in time")
         self.btn_pan_left.clicked.connect(self.pan_left)
-        nav_layout.addWidget(self.btn_pan_left)
+        scroll_layout.addWidget(self.btn_pan_left)
 
         self.time_scrollbar = QScrollBar(Qt.Horizontal)
         self.time_scrollbar.setMinimum(0)
         self.time_scrollbar.setMaximum(1000)
+        self.time_scrollbar.setToolTip("Scroll through the recording timeline")
         self.time_scrollbar.valueChanged.connect(self.on_scrollbar_changed)
-        nav_layout.addWidget(self.time_scrollbar, 1)
+        scroll_layout.addWidget(self.time_scrollbar, 1)
 
         self.btn_pan_right = QPushButton(">")
         self.btn_pan_right.setObjectName("small_btn")
         self.btn_pan_right.setFixedWidth(24)
+        self.btn_pan_right.setToolTip("Pan the spectrogram view right in time")
         self.btn_pan_right.clicked.connect(self.pan_right)
-        nav_layout.addWidget(self.btn_pan_right)
+        scroll_layout.addWidget(self.btn_pan_right)
 
-        nav_layout.addWidget(QLabel("Window:"))
+        right_layout.addWidget(scroll_bar_row)
+
+        # Controls row (window/zoom, freq, colormap, playback)
+        controls_bar = QWidget()
+        controls_layout = QHBoxLayout(controls_bar)
+        controls_layout.setContentsMargins(5, 2, 5, 2)
+        controls_layout.setSpacing(4)
+
+        # Window / Zoom
+        controls_layout.addWidget(QLabel("Window:"))
 
         self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setObjectName("small_btn")
         self.btn_zoom_out.setFixedWidth(24)
+        self.btn_zoom_out.setToolTip("Zoom out (show more time)")
         self.btn_zoom_out.clicked.connect(self.zoom_out)
-        nav_layout.addWidget(self.btn_zoom_out)
+        controls_layout.addWidget(self.btn_zoom_out)
 
         self.spin_view_window = QDoubleSpinBox()
         self.spin_view_window.setRange(0.1, 600.0)
         self.spin_view_window.setValue(2.0)
         self.spin_view_window.setSuffix(" s")
         self.spin_view_window.setFixedWidth(80)
+        self.spin_view_window.setToolTip("Time window duration (seconds).\nControls how much of the recording is visible.\nSmaller = zoomed in, larger = zoomed out.\nAlso adjustable with mouse wheel on spectrogram.")
         self.spin_view_window.valueChanged.connect(self.on_view_window_changed)
-        nav_layout.addWidget(self.spin_view_window)
+        controls_layout.addWidget(self.spin_view_window)
 
         self.btn_zoom_in = QPushButton("+")
         self.btn_zoom_in.setObjectName("small_btn")
         self.btn_zoom_in.setFixedWidth(24)
+        self.btn_zoom_in.setToolTip("Zoom in (show less time)")
         self.btn_zoom_in.clicked.connect(self.zoom_in)
-        nav_layout.addWidget(self.btn_zoom_in)
+        controls_layout.addWidget(self.btn_zoom_in)
 
-        right_layout.addWidget(nav_bar)
+        # Separator
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.VLine)
+        sep1.setStyleSheet("color: #3f3f3f;")
+        controls_layout.addWidget(sep1)
+
+        # Frequency display range
+        controls_layout.addWidget(QLabel("Freq:"))
+        self.spin_display_min_freq = QSpinBox()
+        self.spin_display_min_freq.setRange(0, 200000)
+        self.spin_display_min_freq.setSingleStep(5000)
+        self.spin_display_min_freq.setValue(0)
+        self.spin_display_min_freq.setSuffix(" Hz")
+        self.spin_display_min_freq.setFixedWidth(90)
+        self.spin_display_min_freq.setToolTip("Minimum frequency displayed on the spectrogram (Hz).\nAdjust to zoom into the frequency range of interest.")
+        self.spin_display_min_freq.valueChanged.connect(self.on_display_freq_changed)
+        controls_layout.addWidget(self.spin_display_min_freq)
+
+        controls_layout.addWidget(QLabel("-"))
+        self.spin_display_max_freq = QSpinBox()
+        self.spin_display_max_freq.setRange(1000, 250000)
+        self.spin_display_max_freq.setSingleStep(5000)
+        self.spin_display_max_freq.setValue(125000)
+        self.spin_display_max_freq.setSuffix(" Hz")
+        self.spin_display_max_freq.setFixedWidth(90)
+        self.spin_display_max_freq.setToolTip("Maximum frequency displayed on the spectrogram (Hz).\nPrairie vole USVs are typically 30-110 kHz.")
+        self.spin_display_max_freq.valueChanged.connect(self.on_display_freq_changed)
+        controls_layout.addWidget(self.spin_display_max_freq)
+
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setStyleSheet("color: #3f3f3f;")
+        controls_layout.addWidget(sep2)
+
+        # Colormap selector
+        controls_layout.addWidget(QLabel("Color Map:"))
+        self.combo_colormap = QComboBox()
+        self.combo_colormap.addItems(['viridis', 'magma', 'inferno', 'grayscale'])
+        self.combo_colormap.setFixedWidth(85)
+        self.combo_colormap.setToolTip("Spectrogram color scheme.\nViridis (default) and magma work well for USV visualization.\nGrayscale can be helpful for publications.")
+        self.combo_colormap.currentTextChanged.connect(self.on_colormap_changed)
+        controls_layout.addWidget(self.combo_colormap)
+
+        # Separator
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.VLine)
+        sep3.setStyleSheet("color: #3f3f3f;")
+        controls_layout.addWidget(sep3)
+
+        # Playback controls (moved from left panel)
+        self.btn_play = QPushButton("Play")
+        self.btn_play.setToolTip("Play the current detection audio (Space key).\nAudio is slowed down according to the speed setting\nso ultrasonic calls become audible.")
+        self.btn_play.clicked.connect(self.toggle_playback)
+        self.btn_play.setEnabled(False)
+        controls_layout.addWidget(self.btn_play)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_stop.setToolTip("Stop audio playback immediately.")
+        self.btn_stop.clicked.connect(self.stop_playback)
+        self.btn_stop.setEnabled(False)
+        controls_layout.addWidget(self.btn_stop)
+
+        controls_layout.addWidget(QLabel("Speed:"))
+        self.combo_speed = QComboBox()
+        self.combo_speed.addItem("0.01x", 0.01)
+        self.combo_speed.addItem("0.05x", 0.05)
+        self.combo_speed.addItem("0.1x", 0.1)
+        self.combo_speed.addItem("0.2x", 0.2)
+        self.combo_speed.addItem("0.5x", 0.5)
+        self.combo_speed.addItem("1x", 1.0)
+        self.combo_speed.addItem("Heterodyne", "heterodyne")
+        self.combo_speed.setCurrentIndex(2)
+        self.combo_speed.setFixedWidth(90)
+        self.combo_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.\n0.1x is a good default for ~50 kHz USV calls.\nHeterodyne mixes the signal to bring USVs down.")
+        self.combo_speed.currentIndexChanged.connect(self.on_speed_changed)
+        controls_layout.addWidget(self.combo_speed)
+
+        if not HAS_SOUNDDEVICE:
+            lbl_warn = QLabel("No audio")
+            lbl_warn.setStyleSheet("color: #d13438; font-size: 9px;")
+            controls_layout.addWidget(lbl_warn)
+
+        controls_layout.addStretch()
+
+        right_layout.addWidget(controls_bar)
 
         # Add to main layout
         main_layout.addWidget(left_scroll)
@@ -1054,15 +1345,18 @@ class USVStudioWindow(QMainWindow):
         btn_row.setSpacing(2)
 
         self.btn_add_folder = QPushButton("Add Folder")
+        self.btn_add_folder.setToolTip("Add all WAV files from a folder")
         self.btn_add_folder.clicked.connect(self.add_folder)
         btn_row.addWidget(self.btn_add_folder)
 
         self.btn_add_files = QPushButton("Add Files")
+        self.btn_add_files.setToolTip("Select individual WAV files to add")
         self.btn_add_files.clicked.connect(self.add_files)
         btn_row.addWidget(self.btn_add_files)
 
         self.btn_clear_files = QPushButton("Clear")
         self.btn_clear_files.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_clear_files.setToolTip("Remove all loaded files")
         self.btn_clear_files.clicked.connect(self.clear_files)
         btn_row.addWidget(self.btn_clear_files)
 
@@ -1080,6 +1374,7 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_prev_file = QPushButton("< Prev")
         self.btn_prev_file.setObjectName("small_btn")
+        self.btn_prev_file.setToolTip("Load the previous file in the list")
         self.btn_prev_file.clicked.connect(self.prev_file)
         self.btn_prev_file.setEnabled(False)
         nav_row.addWidget(self.btn_prev_file)
@@ -1090,6 +1385,7 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_next_file = QPushButton("Next >")
         self.btn_next_file.setObjectName("small_btn")
+        self.btn_next_file.setToolTip("Load the next file in the list")
         self.btn_next_file.clicked.connect(self.next_file)
         self.btn_next_file.setEnabled(False)
         nav_row.addWidget(self.btn_next_file)
@@ -1099,6 +1395,7 @@ class USVStudioWindow(QMainWindow):
         # Open Folder button
         self.btn_open_folder = QPushButton("Open Folder")
         self.btn_open_folder.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_open_folder.setToolTip("Open the folder containing the current file\nin the system file browser.")
         self.btn_open_folder.clicked.connect(self.open_output_folder)
         self.btn_open_folder.setEnabled(False)
         group_layout.addWidget(self.btn_open_folder)
@@ -1106,23 +1403,38 @@ class USVStudioWindow(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
 
+    def _make_label(self, text, tooltip=None, min_width=0):
+        """Helper to create a label with optional tooltip and minimum width."""
+        lbl = QLabel(text)
+        if tooltip:
+            lbl.setToolTip(tooltip)
+        if min_width > 0:
+            lbl.setMinimumWidth(min_width)
+        return lbl
+
     def _create_dsp_section(self, layout):
         """Create DSP detection section."""
         group = QGroupBox("2. DSP Detection")
+        group.setToolTip("Configure and run the DSP-based ultrasonic vocalization detector")
         group_layout = QVBoxLayout()
         group_layout.setSpacing(4)
 
         # Frequency range
+        freq_tip = ("Bandpass filter range for detection.\n"
+                     "Only energy within this band is analyzed.\n"
+                     "Prairie voles: typically 25-65 kHz.\n"
+                     "Mice: typically 30-110 kHz.")
         freq_row = QHBoxLayout()
-        freq_row.setSpacing(2)
-        freq_row.addWidget(QLabel("Freq:"))
+        freq_row.setSpacing(4)
+        freq_row.addWidget(self._make_label("Freq:", freq_tip, min_width=62))
 
         self.spin_min_freq = QSpinBox()
         self.spin_min_freq.setRange(1000, 150000)
         self.spin_min_freq.setSingleStep(1000)
         self.spin_min_freq.setValue(25000)
         self.spin_min_freq.setSuffix(" Hz")
-        freq_row.addWidget(self.spin_min_freq)
+        self.spin_min_freq.setToolTip("Minimum frequency of the detection bandpass filter (Hz)")
+        freq_row.addWidget(self.spin_min_freq, 1)
 
         freq_row.addWidget(QLabel("-"))
 
@@ -1131,35 +1443,45 @@ class USVStudioWindow(QMainWindow):
         self.spin_max_freq.setSingleStep(1000)
         self.spin_max_freq.setValue(65000)
         self.spin_max_freq.setSuffix(" Hz")
-        freq_row.addWidget(self.spin_max_freq)
+        self.spin_max_freq.setToolTip("Maximum frequency of the detection bandpass filter (Hz)")
+        freq_row.addWidget(self.spin_max_freq, 1)
 
         group_layout.addLayout(freq_row)
 
         # Threshold
+        thresh_tip = ("Energy threshold above the noise floor (dB).\n"
+                      "Lower = more sensitive (more detections, more noise).\n"
+                      "Higher = more conservative (fewer false positives).\n"
+                      "Typical range: 6-15 dB.")
         thresh_row = QHBoxLayout()
-        thresh_row.setSpacing(2)
-        thresh_row.addWidget(QLabel("Threshold:"))
+        thresh_row.setSpacing(4)
+        thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=62))
 
         self.spin_threshold = QDoubleSpinBox()
         self.spin_threshold.setRange(1.0, 30.0)
         self.spin_threshold.setSingleStep(0.5)
         self.spin_threshold.setValue(10.0)
         self.spin_threshold.setSuffix(" dB")
+        self.spin_threshold.setToolTip(thresh_tip)
         thresh_row.addWidget(self.spin_threshold)
         thresh_row.addStretch()
 
         group_layout.addLayout(thresh_row)
 
         # Duration
+        dur_tip = ("Min/max call duration filter.\n"
+                   "Detections outside this range are discarded.\n"
+                   "Most USV calls are 5-200 ms.")
         dur_row = QHBoxLayout()
-        dur_row.setSpacing(2)
-        dur_row.addWidget(QLabel("Duration:"))
+        dur_row.setSpacing(4)
+        dur_row.addWidget(self._make_label("Duration:", dur_tip, min_width=62))
 
         self.spin_min_dur = QDoubleSpinBox()
         self.spin_min_dur.setRange(1.0, 100.0)
         self.spin_min_dur.setValue(5.0)
         self.spin_min_dur.setSuffix(" ms")
-        dur_row.addWidget(self.spin_min_dur)
+        self.spin_min_dur.setToolTip("Minimum call duration — shorter events are discarded (ms)")
+        dur_row.addWidget(self.spin_min_dur, 1)
 
         dur_row.addWidget(QLabel("-"))
 
@@ -1167,68 +1489,96 @@ class USVStudioWindow(QMainWindow):
         self.spin_max_dur.setRange(10.0, 5000.0)
         self.spin_max_dur.setValue(300.0)
         self.spin_max_dur.setSuffix(" ms")
-        dur_row.addWidget(self.spin_max_dur)
+        self.spin_max_dur.setToolTip("Maximum call duration — longer events are discarded (ms)")
+        dur_row.addWidget(self.spin_max_dur, 1)
 
         group_layout.addLayout(dur_row)
 
         # Advanced options (collapsible)
         self.chk_advanced = QCheckBox("Advanced Options")
+        self.chk_advanced.setToolTip("Show additional DSP detection parameters")
         self.chk_advanced.toggled.connect(self._toggle_advanced_options)
         group_layout.addWidget(self.chk_advanced)
 
         self.advanced_widget = QWidget()
         adv_layout = QVBoxLayout(self.advanced_widget)
         adv_layout.setContentsMargins(10, 0, 0, 0)
-        adv_layout.setSpacing(2)
+        adv_layout.setSpacing(4)
 
         # Min gap
+        gap_tip = ("Minimum silent gap between calls (ms).\n"
+                   "Calls closer together than this are merged\n"
+                   "into a single detection.")
         gap_row = QHBoxLayout()
-        gap_row.addWidget(QLabel("Min Gap:"))
+        gap_row.setSpacing(4)
+        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=72))
         self.spin_min_gap = QDoubleSpinBox()
         self.spin_min_gap.setRange(0.0, 100.0)
         self.spin_min_gap.setValue(5.0)
         self.spin_min_gap.setSuffix(" ms")
+        self.spin_min_gap.setToolTip(gap_tip)
         gap_row.addWidget(self.spin_min_gap)
         gap_row.addStretch()
         adv_layout.addLayout(gap_row)
 
         # Noise percentile
+        noise_tip = ("Percentile of spectrogram power used to\n"
+                     "estimate the background noise floor.\n"
+                     "Lower = assumes quieter background.\n"
+                     "Typical: 20-30.")
         noise_row = QHBoxLayout()
-        noise_row.addWidget(QLabel("Noise %ile:"))
+        noise_row.setSpacing(4)
+        noise_row.addWidget(self._make_label("Noise %ile:", noise_tip, min_width=72))
         self.spin_noise_pct = QDoubleSpinBox()
         self.spin_noise_pct.setRange(1.0, 50.0)
         self.spin_noise_pct.setValue(25.0)
+        self.spin_noise_pct.setToolTip(noise_tip)
         noise_row.addWidget(self.spin_noise_pct)
         noise_row.addStretch()
         adv_layout.addLayout(noise_row)
 
         # FFT params
+        fft_tip = ("FFT window size (samples). Larger = better\n"
+                   "frequency resolution but worse time resolution.")
+        overlap_tip = ("FFT overlap (samples). Higher overlap gives\n"
+                       "smoother spectrograms but costs more compute.\n"
+                       "Typical: 75% of FFT size.")
         fft_row = QHBoxLayout()
-        fft_row.addWidget(QLabel("FFT:"))
+        fft_row.setSpacing(4)
+        fft_row.addWidget(self._make_label("FFT:", fft_tip, min_width=34))
         self.spin_nperseg = QSpinBox()
         self.spin_nperseg.setRange(64, 2048)
         self.spin_nperseg.setSingleStep(64)
         self.spin_nperseg.setValue(512)
-        fft_row.addWidget(self.spin_nperseg)
-        fft_row.addWidget(QLabel("Overlap:"))
+        self.spin_nperseg.setToolTip(fft_tip)
+        fft_row.addWidget(self.spin_nperseg, 1)
+        fft_row.addWidget(self._make_label("Ovlp:", overlap_tip, min_width=34))
         self.spin_noverlap = QSpinBox()
         self.spin_noverlap.setRange(0, 1024)
         self.spin_noverlap.setSingleStep(64)
         self.spin_noverlap.setValue(384)
-        fft_row.addWidget(self.spin_noverlap)
+        self.spin_noverlap.setToolTip(overlap_tip)
+        fft_row.addWidget(self.spin_noverlap, 1)
         adv_layout.addLayout(fft_row)
 
         # Frequency samples (optional)
+        freq_samp_tip = ("Sample peak frequency at N evenly-spaced\n"
+                         "time points across each call. Enables\n"
+                         "frequency contour visualization on accepted\n"
+                         "detections (cyan line overlay).")
         freq_samp_row = QHBoxLayout()
-        self.chk_freq_samples = QCheckBox("Freq Samples:")
+        freq_samp_row.setSpacing(4)
+        self.chk_freq_samples = QCheckBox("Freq Samp:")
         self.chk_freq_samples.setChecked(False)
+        self.chk_freq_samples.setToolTip(freq_samp_tip)
         self.chk_freq_samples.toggled.connect(lambda checked: self.spin_freq_samples.setEnabled(checked))
         freq_samp_row.addWidget(self.chk_freq_samples)
         self.spin_freq_samples = QSpinBox()
         self.spin_freq_samples.setRange(3, 10)
         self.spin_freq_samples.setValue(5)
         self.spin_freq_samples.setEnabled(False)
-        self.spin_freq_samples.setToolTip("Number of evenly-spaced peak frequency samples per call")
+        self.spin_freq_samples.setToolTip(freq_samp_tip)
+        self.spin_freq_samples.setFixedWidth(60)
         freq_samp_row.addWidget(self.spin_freq_samples)
         freq_samp_row.addStretch()
         adv_layout.addLayout(freq_samp_row)
@@ -1246,12 +1596,14 @@ class USVStudioWindow(QMainWindow):
         queue_row.setSpacing(2)
 
         self.btn_add_to_queue = QPushButton("Add to Queue")
+        self.btn_add_to_queue.setToolTip("Add the currently selected file to the detection queue")
         self.btn_add_to_queue.clicked.connect(self.add_to_queue)
         self.btn_add_to_queue.setEnabled(False)
         queue_row.addWidget(self.btn_add_to_queue)
 
         self.btn_clear_queue = QPushButton("Clear")
         self.btn_clear_queue.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_clear_queue.setToolTip("Remove all files from the detection queue")
         self.btn_clear_queue.clicked.connect(self.clear_queue)
         queue_row.addWidget(self.btn_clear_queue)
 
@@ -1260,6 +1612,7 @@ class USVStudioWindow(QMainWindow):
         # Run button
         self.btn_run_dsp = QPushButton("Run DSP Detection")
         self.btn_run_dsp.setStyleSheet("background-color: #0078d4;")
+        self.btn_run_dsp.setToolTip("Run DSP-based detection on all queued files")
         self.btn_run_dsp.clicked.connect(self.run_dsp_detection)
         self.btn_run_dsp.setEnabled(False)
         group_layout.addWidget(self.btn_run_dsp)
@@ -1283,12 +1636,36 @@ class USVStudioWindow(QMainWindow):
         group_layout = QVBoxLayout()
         group_layout.setSpacing(4)
 
+        # Filter row
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(2)
+        filter_row.addWidget(QLabel("Show:"))
+        self.combo_filter = QComboBox()
+        self.combo_filter.addItem("All", "all")
+        self.combo_filter.addItem("Pending", "pending")
+        self.combo_filter.addItem("Accepted", "accepted")
+        self.combo_filter.addItem("Rejected", "rejected")
+        self.combo_filter.setToolTip("Filter which detections to navigate through")
+        self.combo_filter.currentIndexChanged.connect(self.on_filter_changed)
+        filter_row.addWidget(self.combo_filter, 1)
+
+        # Jump-to spinner
+        filter_row.addWidget(QLabel("Go:"))
+        self.spin_jump = QSpinBox()
+        self.spin_jump.setRange(1, 1)
+        self.spin_jump.setFixedWidth(60)
+        self.spin_jump.setToolTip("Jump directly to a detection by number.\nType a number and press Enter.")
+        self.spin_jump.editingFinished.connect(self.on_jump_to_detection)
+        filter_row.addWidget(self.spin_jump)
+        group_layout.addLayout(filter_row)
+
         # Navigation
         nav_row = QHBoxLayout()
         nav_row.setSpacing(2)
 
         self.btn_prev_det = QPushButton("<")
         self.btn_prev_det.setObjectName("small_btn")
+        self.btn_prev_det.setToolTip("Go to previous detection (Left arrow key)")
         self.btn_prev_det.clicked.connect(self.prev_detection)
         self.btn_prev_det.setEnabled(False)
         nav_row.addWidget(self.btn_prev_det)
@@ -1299,6 +1676,7 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_next_det = QPushButton(">")
         self.btn_next_det.setObjectName("small_btn")
+        self.btn_next_det.setToolTip("Go to next detection (Right arrow key)")
         self.btn_next_det.clicked.connect(self.next_detection)
         self.btn_next_det.setEnabled(False)
         nav_row.addWidget(self.btn_next_det)
@@ -1313,6 +1691,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_start.setDecimals(4)
         self.spin_start.setRange(0, 9999)
         self.spin_start.setSuffix(" s")
+        self.spin_start.setToolTip("Start time of the selected detection (seconds).\nEdit to adjust the left boundary of the detection box.")
         self.spin_start.valueChanged.connect(self.on_time_changed)
         time_row.addWidget(self.spin_start, 1)
 
@@ -1321,6 +1700,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_stop.setDecimals(4)
         self.spin_stop.setRange(0, 9999)
         self.spin_stop.setSuffix(" s")
+        self.spin_stop.setToolTip("End time of the selected detection (seconds).\nEdit to adjust the right boundary of the detection box.")
         self.spin_stop.valueChanged.connect(self.on_time_changed)
         time_row.addWidget(self.spin_stop, 1)
 
@@ -1334,6 +1714,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_det_min_freq.setRange(0, 200000)
         self.spin_det_min_freq.setSingleStep(1000)
         self.spin_det_min_freq.setSuffix(" Hz")
+        self.spin_det_min_freq.setToolTip("Minimum frequency of the selected detection (Hz).\nEdit to adjust the bottom boundary of the detection box.")
         self.spin_det_min_freq.valueChanged.connect(self.on_freq_changed)
         freq_row.addWidget(self.spin_det_min_freq, 1)
 
@@ -1342,6 +1723,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_det_max_freq.setRange(0, 200000)
         self.spin_det_max_freq.setSingleStep(1000)
         self.spin_det_max_freq.setSuffix(" Hz")
+        self.spin_det_max_freq.setToolTip("Maximum frequency of the selected detection (Hz).\nEdit to adjust the top boundary of the detection box.")
         self.spin_det_max_freq.valueChanged.connect(self.on_freq_changed)
         freq_row.addWidget(self.spin_det_max_freq, 1)
 
@@ -1381,17 +1763,46 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_accept = QPushButton("Accept")
         self.btn_accept.setObjectName("accept_btn")
+        self.btn_accept.setToolTip("Mark current detection as a valid USV call (A key).\nAccepted calls are saved and used for ML training.")
         self.btn_accept.clicked.connect(self.accept_detection)
         self.btn_accept.setEnabled(False)
         btn_row1.addWidget(self.btn_accept)
 
         self.btn_reject = QPushButton("Reject")
         self.btn_reject.setObjectName("reject_btn")
+        self.btn_reject.setToolTip("Mark current detection as a false positive (R key).\nRejected calls are excluded from analysis but kept for ML training.")
         self.btn_reject.clicked.connect(self.reject_detection)
         self.btn_reject.setEnabled(False)
         btn_row1.addWidget(self.btn_reject)
 
+        self.btn_undo = QPushButton("Undo")
+        self.btn_undo.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_undo.clicked.connect(self.undo_action)
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setToolTip("Undo last labeling action (Ctrl+Z).\nSupports undoing single and batch operations.")
+        btn_row1.addWidget(self.btn_undo)
+
         group_layout.addLayout(btn_row1)
+
+        # Batch labeling
+        batch_row = QHBoxLayout()
+        batch_row.setSpacing(2)
+
+        self.btn_accept_all_pending = QPushButton("Accept All Pending")
+        self.btn_accept_all_pending.setObjectName("accept_btn")
+        self.btn_accept_all_pending.setToolTip("Accept all unreviewed detections at once.\nUseful after reviewing and only rejecting false positives.")
+        self.btn_accept_all_pending.clicked.connect(self.accept_all_pending)
+        self.btn_accept_all_pending.setEnabled(False)
+        batch_row.addWidget(self.btn_accept_all_pending)
+
+        self.btn_reject_all_pending = QPushButton("Reject All Pending")
+        self.btn_reject_all_pending.setObjectName("reject_btn")
+        self.btn_reject_all_pending.setToolTip("Reject all unreviewed detections at once.\nUseful to clear remaining detections after accepting valid calls.")
+        self.btn_reject_all_pending.clicked.connect(self.reject_all_pending)
+        self.btn_reject_all_pending.setEnabled(False)
+        batch_row.addWidget(self.btn_reject_all_pending)
+
+        group_layout.addLayout(batch_row)
 
         # Add/Delete
         btn_row2 = QHBoxLayout()
@@ -1399,78 +1810,51 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_add_usv = QPushButton("+ Add USV")
         self.btn_add_usv.setStyleSheet("background-color: #6b4c9a;")
+        self.btn_add_usv.setToolTip("Manually draw a new USV detection box on the spectrogram.\nClick and drag on the spectrogram to define the region.")
         self.btn_add_usv.clicked.connect(self.add_new_usv)
         self.btn_add_usv.setEnabled(False)
         btn_row2.addWidget(self.btn_add_usv)
 
         self.btn_delete = QPushButton("Delete")
         self.btn_delete.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_delete.setToolTip("Permanently delete the currently selected detection (D key).\nThis cannot be undone.")
         self.btn_delete.clicked.connect(self.delete_current)
         self.btn_delete.setEnabled(False)
         btn_row2.addWidget(self.btn_delete)
 
         group_layout.addLayout(btn_row2)
 
-        # Delete pending
-        self.btn_delete_pending = QPushButton("Delete All Pending")
+        # Delete pending / Delete all labels
+        delete_row = QHBoxLayout()
+        delete_row.setSpacing(2)
+
+        self.btn_delete_pending = QPushButton("Delete Pending")
         self.btn_delete_pending.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_delete_pending.setToolTip("Permanently delete all unreviewed detections.\nUseful for clearing noise after accepting valid calls.")
         self.btn_delete_pending.clicked.connect(self.delete_all_pending)
         self.btn_delete_pending.setEnabled(False)
-        group_layout.addWidget(self.btn_delete_pending)
+        delete_row.addWidget(self.btn_delete_pending)
+
+        self.btn_delete_all_labels = QPushButton("Delete All Labels")
+        self.btn_delete_all_labels.setStyleSheet("background-color: #8b0000;")
+        self.btn_delete_all_labels.setToolTip("Delete ALL detections (pending + accepted + rejected)\nfor the current file. This cannot be undone.")
+        self.btn_delete_all_labels.clicked.connect(self.delete_all_labels)
+        self.btn_delete_all_labels.setEnabled(False)
+        delete_row.addWidget(self.btn_delete_all_labels)
+
+        group_layout.addLayout(delete_row)
+
+        # Statistics label
+        self.lbl_stats = QLabel("")
+        self.lbl_stats.setStyleSheet("color: #888888; font-size: 9px;")
+        self.lbl_stats.setWordWrap(True)
+        group_layout.addWidget(self.lbl_stats)
 
         # Instructions
-        lbl_hint = QLabel("Drag edges to resize, center to move")
+        lbl_hint = QLabel("Keys: A=Accept R=Reject D=Delete Space=Play Ctrl+Z=Undo")
         lbl_hint.setStyleSheet("color: #666666; font-size: 9px; font-style: italic;")
+        lbl_hint.setWordWrap(True)
         group_layout.addWidget(lbl_hint)
-
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-
-    def _create_playback_section(self, layout):
-        """Create playback section."""
-        group = QGroupBox("5. Playback")
-        group_layout = QVBoxLayout()
-        group_layout.setSpacing(4)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(2)
-
-        self.btn_play = QPushButton("Play")
-        self.btn_play.clicked.connect(self.toggle_playback)
-        self.btn_play.setEnabled(False)
-        btn_row.addWidget(self.btn_play)
-
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setStyleSheet("background-color: #5c5c5c;")
-        self.btn_stop.clicked.connect(self.stop_playback)
-        self.btn_stop.setEnabled(False)
-        btn_row.addWidget(self.btn_stop)
-
-        group_layout.addLayout(btn_row)
-
-        # Speed
-        speed_row = QHBoxLayout()
-        speed_row.setSpacing(2)
-        speed_row.addWidget(QLabel("Speed:"))
-
-        self.combo_speed = QComboBox()
-        self.combo_speed.addItem("0.01x", 0.01)
-        self.combo_speed.addItem("0.05x", 0.05)
-        self.combo_speed.addItem("0.1x", 0.1)
-        self.combo_speed.addItem("0.2x", 0.2)
-        self.combo_speed.addItem("0.5x", 0.5)
-        self.combo_speed.addItem("1x", 1.0)
-        self.combo_speed.addItem("Heterodyne", "heterodyne")
-        self.combo_speed.setCurrentIndex(2)
-        self.combo_speed.currentIndexChanged.connect(self.on_speed_changed)
-        speed_row.addWidget(self.combo_speed, 1)
-
-        group_layout.addLayout(speed_row)
-
-        if not HAS_SOUNDDEVICE:
-            lbl_warn = QLabel("sounddevice not installed")
-            lbl_warn.setStyleSheet("color: #d13438; font-size: 9px;")
-            group_layout.addWidget(lbl_warn)
 
         group.setLayout(group_layout)
         layout.addWidget(group)
@@ -1478,7 +1862,7 @@ class USVStudioWindow(QMainWindow):
     def _create_ml_section(self, layout):
         """Create machine learning train and predict sections."""
         # --- Train section ---
-        train_group = QGroupBox("7. Train ML Model")
+        train_group = QGroupBox("5. Train ML Model")
         train_layout = QVBoxLayout()
         train_layout.setSpacing(4)
 
@@ -1488,6 +1872,7 @@ class USVStudioWindow(QMainWindow):
 
         self.btn_train = QPushButton("Train Model")
         self.btn_train.setStyleSheet("background-color: #2d7d46;")
+        self.btn_train.setToolTip("Train a Random Forest classifier using\naccepted and rejected detections as training data.\nRequires labeled detections from the current session.")
         self.btn_train.clicked.connect(self.train_model)
         self.btn_train.setEnabled(False)
         train_layout.addWidget(self.btn_train)
@@ -1496,13 +1881,14 @@ class USVStudioWindow(QMainWindow):
         layout.addWidget(train_group)
 
         # --- Predict section ---
-        predict_group = QGroupBox("8. Predict with ML Model")
+        predict_group = QGroupBox("6. Predict with ML Model")
         predict_layout = QVBoxLayout()
         predict_layout.setSpacing(4)
 
         model_row = QHBoxLayout()
         model_row.setSpacing(2)
         self.btn_browse_model = QPushButton("Browse Model...")
+        self.btn_browse_model.setToolTip("Select a previously trained Random Forest model file (.joblib).\nThe model will be used to predict USV vs noise on new files.")
         self.btn_browse_model.clicked.connect(self.browse_model)
         model_row.addWidget(self.btn_browse_model)
         predict_layout.addLayout(model_row)
@@ -1516,11 +1902,13 @@ class USVStudioWindow(QMainWindow):
         apply_row.setSpacing(2)
 
         self.btn_apply_current = QPushButton("Apply Current")
+        self.btn_apply_current.setToolTip("Apply the loaded ML model to the current file.\nPredicts USV/noise labels for all pending detections.")
         self.btn_apply_current.clicked.connect(self.apply_model_current)
         self.btn_apply_current.setEnabled(False)
         apply_row.addWidget(self.btn_apply_current)
 
         self.btn_apply_all = QPushButton("Apply All")
+        self.btn_apply_all.setToolTip("Apply the loaded ML model to all files in the file list.\nBatch-processes pending detections across all files.")
         self.btn_apply_all.clicked.connect(self.apply_model_all)
         self.btn_apply_all.setEnabled(False)
         apply_row.addWidget(self.btn_apply_all)
@@ -1543,8 +1931,103 @@ class USVStudioWindow(QMainWindow):
         """Toggle advanced options visibility."""
         self.advanced_widget.setVisible(checked)
 
+    def _setup_shortcuts(self):
+        """Set up global keyboard shortcuts using QShortcut."""
+        # Navigation - QShortcut works regardless of which widget has focus
+        sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
+        sc_right.setContext(Qt.ApplicationShortcut)
+        sc_right.activated.connect(self._shortcut_next_detection)
+
+        sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
+        sc_left.setContext(Qt.ApplicationShortcut)
+        sc_left.activated.connect(self._shortcut_prev_detection)
+
+    def _shortcut_next_detection(self):
+        """Handle Right arrow shortcut."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_next_det.isEnabled():
+            self._flash_button(self.btn_next_det)
+            self.next_detection()
+
+    def _shortcut_prev_detection(self):
+        """Handle Left arrow shortcut."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_prev_det.isEnabled():
+            self._flash_button(self.btn_prev_det)
+            self.prev_detection()
+
+    def _setup_pan_timers(self):
+        """Set up press-and-hold repeat timers for pan buttons."""
+        self._pan_left_timer = QTimer(self)
+        self._pan_left_timer.setInterval(100)  # Repeat every 100ms while held
+        self._pan_left_timer.timeout.connect(self.pan_left)
+
+        self._pan_right_timer = QTimer(self)
+        self._pan_right_timer.setInterval(100)
+        self._pan_right_timer.timeout.connect(self.pan_right)
+
+        # Connect press/release events
+        self.btn_pan_left.pressed.connect(self._on_pan_left_pressed)
+        self.btn_pan_left.released.connect(self._pan_left_timer.stop)
+        self.btn_pan_right.pressed.connect(self._on_pan_right_pressed)
+        self.btn_pan_right.released.connect(self._pan_right_timer.stop)
+
+        # Disconnect the old clicked signals to avoid double-firing
+        self.btn_pan_left.clicked.disconnect(self.pan_left)
+        self.btn_pan_right.clicked.disconnect(self.pan_right)
+
+    def _on_pan_left_pressed(self):
+        """Handle pan left button press - immediate pan + start repeat timer."""
+        self.pan_left()
+        self._pan_left_timer.start()
+
+    def _on_pan_right_pressed(self):
+        """Handle pan right button press - immediate pan + start repeat timer."""
+        self.pan_right()
+        self._pan_right_timer.start()
+
+    def _create_arrow_images(self):
+        """Create small arrow PNG images for spinbox/combobox buttons."""
+        import tempfile
+        self._arrow_dir = tempfile.mkdtemp(prefix='usv_arrows_')
+
+        # Up arrow (white triangle on transparent bg)
+        up_img = QImage(9, 6, QImage.Format_ARGB32)
+        up_img.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(up_img)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor('#cccccc'))
+        painter.drawPolygon(QPolygonF([
+            QPointF(4.5, 0.5), QPointF(8.5, 5.5), QPointF(0.5, 5.5)
+        ]))
+        painter.end()
+        self._up_arrow_path = os.path.join(self._arrow_dir, 'up.png')
+        up_img.save(self._up_arrow_path)
+
+        # Down arrow
+        down_img = QImage(9, 6, QImage.Format_ARGB32)
+        down_img.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(down_img)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor('#cccccc'))
+        painter.drawPolygon(QPolygonF([
+            QPointF(4.5, 5.5), QPointF(0.5, 0.5), QPointF(8.5, 0.5)
+        ]))
+        painter.end()
+        self._down_arrow_path = os.path.join(self._arrow_dir, 'down.png')
+        down_img.save(self._down_arrow_path)
+
     def _apply_styles(self):
         """Apply dark theme styles."""
+        self._create_arrow_images()
+        up = self._up_arrow_path.replace('\\', '/')
+        down = self._down_arrow_path.replace('\\', '/')
         self.setStyleSheet("""
             QWidget {
                 background-color: #2b2b2b;
@@ -1610,6 +2093,69 @@ class USVStudioWindow(QMainWindow):
                 background-color: #1e1e1e;
                 color: #cccccc;
             }
+            QSpinBox::up-button, QDoubleSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 16px;
+                border-left: 1px solid #555555;
+                border-bottom: 1px solid #555555;
+                border-top-right-radius: 3px;
+                background-color: #404040;
+            }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover {
+                background-color: #505050;
+            }
+            QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed {
+                background-color: #606060;
+            }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: url(UP_ARROW_PATH);
+                width: 9px;
+                height: 6px;
+            }
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 16px;
+                border-left: 1px solid #555555;
+                border-top: 1px solid #555555;
+                border-bottom-right-radius: 3px;
+                background-color: #404040;
+            }
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+                background-color: #505050;
+            }
+            QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+                background-color: #606060;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: url(DOWN_ARROW_PATH);
+                width: 9px;
+                height: 6px;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 18px;
+                border-left: 1px solid #555555;
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+                background-color: #404040;
+            }
+            QComboBox::drop-down:hover {
+                background-color: #505050;
+            }
+            QComboBox::down-arrow {
+                image: url(DOWN_ARROW_PATH);
+                width: 9px;
+                height: 6px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                selection-background-color: #0078d4;
+                border: 1px solid #3f3f3f;
+            }
             QListWidget {
                 background-color: #1e1e1e;
                 border: 1px solid #3f3f3f;
@@ -1635,14 +2181,16 @@ class USVStudioWindow(QMainWindow):
                 border: none;
             }
             QScrollBar:vertical {
-                background-color: #2b2b2b;
+                background-color: #1e1e1e;
                 width: 12px;
-                border-radius: 6px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
             }
             QScrollBar::handle:vertical {
                 background-color: #0078d4;
-                border-radius: 4px;
+                border-radius: 2px;
                 min-height: 20px;
+                margin: 1px;
             }
             QScrollBar::handle:vertical:hover {
                 background-color: #106ebe;
@@ -1651,17 +2199,19 @@ class USVStudioWindow(QMainWindow):
                 height: 0px;
             }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
+                background-color: #1e1e1e;
             }
             QScrollBar:horizontal {
-                background-color: #2b2b2b;
-                height: 12px;
-                border-radius: 6px;
+                background-color: #1e1e1e;
+                height: 14px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
             }
             QScrollBar::handle:horizontal {
                 background-color: #0078d4;
-                border-radius: 4px;
+                border-radius: 2px;
                 min-width: 20px;
+                margin: 1px;
             }
             QScrollBar::handle:horizontal:hover {
                 background-color: #106ebe;
@@ -1670,7 +2220,7 @@ class USVStudioWindow(QMainWindow):
                 width: 0px;
             }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-                background: none;
+                background-color: #1e1e1e;
             }
             QCheckBox {
                 spacing: 5px;
@@ -1679,7 +2229,7 @@ class USVStudioWindow(QMainWindow):
                 width: 14px;
                 height: 14px;
             }
-        """)
+        """.replace('UP_ARROW_PATH', up).replace('DOWN_ARROW_PATH', down))
 
     # =========================================================================
     # File Management
@@ -1733,7 +2283,9 @@ class USVStudioWindow(QMainWindow):
                         df = pd.read_csv(csv_path)
                         if 'status' not in df.columns:
                             df['status'] = 'pending'
+                        self._ensure_freq_bounds(df)
                         self.all_detections[filepath] = df
+                        self.detection_sources[filepath] = suffix.lstrip('_')
                         break
                     except Exception:
                         pass
@@ -1745,10 +2297,13 @@ class USVStudioWindow(QMainWindow):
         self.audio_data = None
         self.detections_df = None
         self.all_detections = {}
+        self.detection_sources = {}
         self.dsp_queue = []
+        self.undo_stack.clear()
         self._update_file_list()
         self.spectrogram.set_audio_data(None, None)
         self.spectrogram.set_detections([], -1)
+        self.waveform_overview.set_audio_data(None, None)
         self._update_ui_state()
 
     def _update_file_list(self):
@@ -1835,12 +2390,14 @@ class USVStudioWindow(QMainWindow):
             self.file_list.setCurrentRow(current_row)
 
     def _load_current_file(self):
-        """Load the current audio file."""
+        """Load the current audio file with progress indication."""
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
             return
 
         filepath = self.audio_files[self.current_file_idx]
         self.status_bar.showMessage(f"Loading {os.path.basename(filepath)}...")
+        # Show a busy cursor during load
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
 
         try:
@@ -1848,7 +2405,7 @@ class USVStudioWindow(QMainWindow):
             if HAS_SOUNDFILE:
                 try:
                     self.audio_data, self.sample_rate = sf.read(filepath, dtype='float32')
-                except:
+                except Exception:
                     self.audio_data, self.sample_rate = self._load_with_ffmpeg(filepath)
             else:
                 self.audio_data, self.sample_rate = self._load_with_ffmpeg(filepath)
@@ -1857,14 +2414,27 @@ class USVStudioWindow(QMainWindow):
                 self.audio_data = np.mean(self.audio_data, axis=1)
 
             self.spectrogram.set_audio_data(self.audio_data, self.sample_rate)
+            self.waveform_overview.set_audio_data(self.audio_data, self.sample_rate)
+
+            # Update display frequency range to match Nyquist
+            nyq = min(125000, self.sample_rate // 2) if self.sample_rate else 125000
+            self.spin_display_max_freq.blockSignals(True)
+            self.spin_display_max_freq.setValue(nyq)
+            self.spin_display_max_freq.blockSignals(False)
 
             # Load detections if available
             if filepath in self.all_detections:
                 self.detections_df = self.all_detections[filepath].copy()
+                # Ensure legacy data has freq bounds
+                self._ensure_freq_bounds(self.detections_df)
                 self.current_detection_idx = 0
             else:
                 # Try to load from CSV
                 self._try_load_detections(filepath)
+
+            # Clear undo stack on file switch
+            self.undo_stack.clear()
+            self.btn_undo.setEnabled(False)
 
             self._update_display()
             self.status_bar.showMessage(f"Loaded: {os.path.basename(filepath)}")
@@ -1872,6 +2442,8 @@ class USVStudioWindow(QMainWindow):
         except Exception as e:
             self.status_bar.showMessage(f"Error loading file: {e}")
             self.audio_data = None
+        finally:
+            QApplication.restoreOverrideCursor()
 
         self._update_ui_state()
 
@@ -1917,14 +2489,37 @@ class USVStudioWindow(QMainWindow):
                     self.detections_df = pd.read_csv(csv_path)
                     if 'status' not in self.detections_df.columns:
                         self.detections_df['status'] = 'pending'
+                    # Handle legacy CSVs missing min_freq_hz/max_freq_hz
+                    self._ensure_freq_bounds(self.detections_df)
                     self.all_detections[filepath] = self.detections_df.copy()
+                    # Track source suffix for correct auto-save naming
+                    self.detection_sources[filepath] = suffix.lstrip('_')
                     self.current_detection_idx = 0
                     return
-                except:
+                except Exception:
                     pass
 
         self.detections_df = None
         self.current_detection_idx = 0
+
+    @staticmethod
+    def _ensure_freq_bounds(df):
+        """Ensure min_freq_hz and max_freq_hz columns exist. Compute from
+        mean_freq_hz and freq_bandwidth_hz if available, else use defaults."""
+        if 'min_freq_hz' not in df.columns or df['min_freq_hz'].isna().all():
+            if 'mean_freq_hz' in df.columns and 'freq_bandwidth_hz' in df.columns:
+                df['min_freq_hz'] = df['mean_freq_hz'] - df['freq_bandwidth_hz'] / 2
+                df['min_freq_hz'] = df['min_freq_hz'].clip(lower=0)
+            else:
+                df['min_freq_hz'] = 25000
+        if 'max_freq_hz' not in df.columns or df['max_freq_hz'].isna().all():
+            if 'mean_freq_hz' in df.columns and 'freq_bandwidth_hz' in df.columns:
+                df['max_freq_hz'] = df['mean_freq_hz'] + df['freq_bandwidth_hz'] / 2
+            else:
+                df['max_freq_hz'] = 65000
+        # Fill any remaining NaNs
+        df['min_freq_hz'] = df['min_freq_hz'].fillna(25000)
+        df['max_freq_hz'] = df['max_freq_hz'].fillna(65000)
 
     # =========================================================================
     # DSP Detection
@@ -1962,6 +2557,10 @@ class USVStudioWindow(QMainWindow):
         n = len(self.dsp_queue)
         self.lbl_queue.setText(f"Queue: {n} file{'s' if n != 1 else ''}")
         self.btn_run_dsp.setEnabled(n > 0)
+        if n > 0:
+            self.btn_run_dsp.setText(f"Run DSP Detection ({n} file{'s' if n != 1 else ''})")
+        else:
+            self.btn_run_dsp.setText("Run DSP Detection")
         # Update file list to show/hide checkmarks
         self._refresh_file_list_items()
 
@@ -2021,6 +2620,7 @@ class USVStudioWindow(QMainWindow):
                 df['source'] = 'dsp'
 
             self.all_detections[filepath] = df
+            self.detection_sources[filepath] = 'usv_dsp'
 
             # Save CSV
             base = Path(filepath).stem
@@ -2059,6 +2659,7 @@ class USVStudioWindow(QMainWindow):
             self.lbl_det_info.setText("Peak: -- Hz | Dur: -- ms")
             self.lbl_det_status.setText("Status: --")
             self.spectrogram.set_detections([], -1)
+            self.waveform_overview.set_detections([])
             self._update_progress()
             return
 
@@ -2113,11 +2714,25 @@ class USVStudioWindow(QMainWindow):
         else:
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #999999;")
 
+        # Update jump spinner
+        self.spin_jump.blockSignals(True)
+        self.spin_jump.setRange(1, max(1, n_det))
+        self.spin_jump.setValue(self.current_detection_idx + 1)
+        self.spin_jump.blockSignals(False)
+
+        # Update waveform overview detection ticks
+        det_times = list(zip(
+            self.detections_df['start_seconds'].tolist(),
+            self.detections_df['stop_seconds'].tolist()
+        ))
+        self.waveform_overview.set_detections(det_times)
+
         # Update spectrogram view
         self._update_spectrogram_view()
         self._update_progress()
         self._update_training_data_label()
         self._update_button_counts()
+        self._update_statistics()
 
     def _update_spectrogram_view(self):
         """Update spectrogram to show current detection."""
@@ -2138,19 +2753,10 @@ class USVStudioWindow(QMainWindow):
 
         self.spectrogram.set_view_range(view_start, view_end)
         self._update_scrollbar()
+        self.waveform_overview.set_view_range(view_start, view_end)
 
-        # Update detection boxes
-        detections = []
-        for _, row in self.detections_df.iterrows():
-            detections.append({
-                'start_seconds': row['start_seconds'],
-                'stop_seconds': row['stop_seconds'],
-                'min_freq_hz': row.get('min_freq_hz', 20000),
-                'max_freq_hz': row.get('max_freq_hz', 80000),
-                'status': row.get('status', 'pending')
-            })
-
-        self.spectrogram.set_detections(detections, self.current_detection_idx)
+        # Update detection boxes (reuses shared method to include contour data)
+        self._update_detection_boxes()
 
     def _update_scrollbar(self):
         """Update scrollbar position."""
@@ -2192,15 +2798,29 @@ class USVStudioWindow(QMainWindow):
         self.btn_train.setEnabled(n_usv >= 3 and n_noise >= 3)
 
     def prev_detection(self):
-        """Go to previous detection."""
-        if self.current_detection_idx > 0:
-            self.current_detection_idx -= 1
+        """Go to previous detection (respects filter)."""
+        if self.detections_df is None:
+            return
+        filtered = self._get_filtered_indices()
+        if not filtered:
+            return
+        # Find previous index in filtered list that's before current
+        prev_indices = [i for i in filtered if i < self.current_detection_idx]
+        if prev_indices:
+            self.current_detection_idx = prev_indices[-1]
             self._update_display()
 
     def next_detection(self):
-        """Go to next detection."""
-        if self.detections_df is not None and self.current_detection_idx < len(self.detections_df) - 1:
-            self.current_detection_idx += 1
+        """Go to next detection (respects filter)."""
+        if self.detections_df is None:
+            return
+        filtered = self._get_filtered_indices()
+        if not filtered:
+            return
+        # Find next index in filtered list that's after current
+        next_indices = [i for i in filtered if i > self.current_detection_idx]
+        if next_indices:
+            self.current_detection_idx = next_indices[0]
             self._update_display()
 
     def on_detection_selected(self, idx):
@@ -2271,25 +2891,31 @@ class USVStudioWindow(QMainWindow):
         self.lbl_det_info.setText(f"Peak: {peak:.0f} Hz | Dur: {dur:.1f} ms")
 
     def _update_detection_boxes(self):
-        """Update detection boxes on spectrogram."""
+        """Update detection boxes on spectrogram (includes peak_freq contour data)."""
         if self.detections_df is None or len(self.detections_df) == 0:
             self.spectrogram.set_detections([], -1)
             return
 
         detections = []
         for _, row in self.detections_df.iterrows():
-            # Use direct column access with safe defaults
             min_freq = row['min_freq_hz'] if 'min_freq_hz' in row and not pd.isna(row['min_freq_hz']) else 20000
             max_freq = row['max_freq_hz'] if 'max_freq_hz' in row and not pd.isna(row['max_freq_hz']) else 80000
             status = row['status'] if 'status' in row and not pd.isna(row['status']) else 'pending'
 
-            detections.append({
+            det = {
                 'start_seconds': row['start_seconds'],
                 'stop_seconds': row['stop_seconds'],
                 'min_freq_hz': min_freq,
                 'max_freq_hz': max_freq,
-                'status': status
-            })
+                'status': status,
+            }
+            # Pass through peak_freq_N contour columns
+            for col in row.index:
+                if col.startswith('peak_freq_') and col != 'peak_freq_hz':
+                    val = row[col]
+                    if not pd.isna(val):
+                        det[col] = val
+            detections.append(det)
 
         self.spectrogram.set_detections(detections, self.current_detection_idx)
 
@@ -2311,6 +2937,7 @@ class USVStudioWindow(QMainWindow):
 
         self.spectrogram.set_view_range(view_start, view_end)
         self._update_detection_boxes()
+        self.waveform_overview.set_view_range(view_start, view_end)
 
     def pan_left(self):
         """Pan view left."""
@@ -2324,6 +2951,7 @@ class USVStudioWindow(QMainWindow):
         self.spectrogram.set_view_range(new_start, new_end)
         self._update_scrollbar()
         self._update_detection_boxes()
+        self.waveform_overview.set_view_range(new_start, new_end)
 
     def pan_right(self):
         """Pan view right."""
@@ -2338,6 +2966,7 @@ class USVStudioWindow(QMainWindow):
         self.spectrogram.set_view_range(new_start, new_end)
         self._update_scrollbar()
         self._update_detection_boxes()
+        self.waveform_overview.set_view_range(new_start, new_end)
 
     def zoom_in(self):
         """Zoom in maintaining center."""
@@ -2355,6 +2984,7 @@ class USVStudioWindow(QMainWindow):
         self.spectrogram.set_view_range(new_start, new_end)
         self._update_scrollbar()
         self._update_detection_boxes()
+        self.waveform_overview.set_view_range(new_start, new_end)
 
     def zoom_out(self):
         """Zoom out maintaining center."""
@@ -2372,6 +3002,7 @@ class USVStudioWindow(QMainWindow):
         self.spectrogram.set_view_range(new_start, new_end)
         self._update_scrollbar()
         self._update_detection_boxes()
+        self.waveform_overview.set_view_range(new_start, new_end)
 
     def on_view_window_changed(self):
         """Handle view window spinbox change."""
@@ -2412,6 +3043,9 @@ class USVStudioWindow(QMainWindow):
         """Mark current detection as accepted (USV)."""
         if self.detections_df is None:
             return
+        old_status = self.detections_df.at[self.current_detection_idx, 'status']
+        self.undo_stack.append(('label', self.current_detection_idx, old_status))
+        self.btn_undo.setEnabled(True)
         self.detections_df.at[self.current_detection_idx, 'status'] = 'accepted'
         self._store_current_detections()
         self._update_display()
@@ -2422,6 +3056,9 @@ class USVStudioWindow(QMainWindow):
         """Mark current detection as rejected."""
         if self.detections_df is None:
             return
+        old_status = self.detections_df.at[self.current_detection_idx, 'status']
+        self.undo_stack.append(('label', self.current_detection_idx, old_status))
+        self.btn_undo.setEnabled(True)
         self.detections_df.at[self.current_detection_idx, 'status'] = 'rejected'
         self._store_current_detections()
         self._update_display()
@@ -2533,6 +3170,39 @@ class USVStudioWindow(QMainWindow):
         n_remaining = len(self.detections_df) if self.detections_df is not None else 0
         self.status_bar.showMessage(f"Deleted {n_pending} pending | {n_remaining} labeled remain")
 
+    def delete_all_labels(self):
+        """Delete ALL detections (pending + accepted + rejected) for the current file."""
+        if self.detections_df is None or len(self.detections_df) == 0:
+            return
+
+        n_total = len(self.detections_df)
+        reply = QMessageBox.warning(
+            self, "Warning",
+            f"This action will delete all {n_total} pending and approved labels "
+            "in this file.\n\nAre you sure you want to continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # Remove the CSV file on disk so labels don't reload
+        if self.audio_files and self.current_file_idx < len(self.audio_files):
+            filepath = self.audio_files[self.current_file_idx]
+            base = Path(filepath).stem
+            parent = Path(filepath).parent
+            source = self.detection_sources.get(filepath, 'usv_dsp')
+            csv_path = parent / f"{base}_{source}.csv"
+            if csv_path.exists():
+                csv_path.unlink()
+
+        self.detections_df = None
+        self.current_detection_idx = 0
+        self._store_current_detections()
+        self._update_display()
+        self._update_ui_state()
+        self.status_bar.showMessage(f"Deleted all {n_total} detections")
+
     def _auto_advance(self):
         """Auto-advance to next detection."""
         if self.detections_df is not None and self.current_detection_idx < len(self.detections_df) - 1:
@@ -2551,13 +3221,15 @@ class USVStudioWindow(QMainWindow):
                 del self.all_detections[filepath]
 
     def _save_detections_csv(self, filepath):
-        """Save current detections to CSV file (updates _usv_dsp.csv in place)."""
+        """Save current detections to CSV file, preserving original naming."""
         if self.detections_df is None or len(self.detections_df) == 0:
             return
 
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        csv_path = parent / f"{base}_usv_dsp.csv"
+        # Use the tracked source suffix, default to _usv_dsp
+        source = self.detection_sources.get(filepath, 'usv_dsp')
+        csv_path = parent / f"{base}_{source}.csv"
 
         try:
             self.detections_df.to_csv(csv_path, index=False)
@@ -2646,11 +3318,10 @@ class USVStudioWindow(QMainWindow):
     # =========================================================================
 
     def open_output_folder(self):
-        """Open folder containing current file."""
+        """Open folder containing current file (cross-platform)."""
         if self.audio_files and self.current_file_idx < len(self.audio_files):
-            folder = str(Path(self.audio_files[self.current_file_idx]).parent)
-            import subprocess
-            subprocess.run(['open', folder])
+            folder = Path(self.audio_files[self.current_file_idx]).parent
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     # =========================================================================
     # Machine Learning
@@ -2848,6 +3519,7 @@ class USVStudioWindow(QMainWindow):
         for filepath, detections in results.items():
             if isinstance(detections, pd.DataFrame) and len(detections) > 0:
                 self.all_detections[filepath] = detections
+                self.detection_sources[filepath] = 'usv_rf'
 
                 # Save CSV
                 base = Path(filepath).stem
@@ -2897,6 +3569,9 @@ class USVStudioWindow(QMainWindow):
 
         has_pending = has_det and (self.detections_df['status'] == 'pending').any()
         self.btn_delete_pending.setEnabled(has_pending)
+        self.btn_delete_all_labels.setEnabled(has_det)
+        self.btn_accept_all_pending.setEnabled(has_pending)
+        self.btn_reject_all_pending.setEnabled(has_pending)
 
         # Playback
         self.btn_play.setEnabled(has_audio and HAS_SOUNDDEVICE)
@@ -2910,8 +3585,21 @@ class USVStudioWindow(QMainWindow):
         self.btn_apply_all.setEnabled(has_model and has_files)
 
     def keyPressEvent(self, event):
-        """Handle keyboard shortcuts for accept/reject."""
+        """Handle keyboard shortcuts. Skips when text-input widgets have focus."""
+        # Don't intercept if a text-input widget has focus
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            super().keyPressEvent(event)
+            return
+
         key = event.key()
+        modifiers = event.modifiers()
+
+        # Ctrl+Z = Undo
+        if key == Qt.Key_Z and (modifiers & Qt.ControlModifier):
+            self.undo_action()
+            return
+
         if key == Qt.Key_A and self.btn_accept.isEnabled():
             self._flash_button(self.btn_accept)
             self.accept_detection()
@@ -2932,6 +3620,236 @@ class USVStudioWindow(QMainWindow):
         original_style = button.styleSheet()
         button.setStyleSheet("background-color: #ffffff; color: #000000;")
         QTimer.singleShot(120, lambda: button.setStyleSheet(original_style))
+
+    # =========================================================================
+    # Undo
+    # =========================================================================
+
+    def undo_action(self):
+        """Undo the last labeling action."""
+        if not self.undo_stack or self.detections_df is None:
+            return
+
+        action = self.undo_stack.pop()
+        if action[0] == 'label':
+            _, idx, old_status = action
+            if 0 <= idx < len(self.detections_df):
+                self.detections_df.at[idx, 'status'] = old_status
+                self.current_detection_idx = idx
+                self._store_current_detections()
+                self._update_display()
+                self._update_button_counts()
+                self.status_bar.showMessage(f"Undid label change on detection {idx + 1}")
+        elif action[0] == 'batch_label':
+            _, indices, old_status = action
+            for idx in indices:
+                if 0 <= idx < len(self.detections_df):
+                    self.detections_df.at[idx, 'status'] = old_status
+            self._store_current_detections()
+            self._update_display()
+            self._update_button_counts()
+            self.status_bar.showMessage(f"Undid batch label change on {len(indices)} detections")
+
+        self.btn_undo.setEnabled(len(self.undo_stack) > 0)
+
+    # =========================================================================
+    # Batch Labeling
+    # =========================================================================
+
+    def accept_all_pending(self):
+        """Accept all pending detections."""
+        if self.detections_df is None:
+            return
+        mask = self.detections_df['status'] == 'pending'
+        n = mask.sum()
+        if n == 0:
+            self.status_bar.showMessage("No pending detections")
+            return
+        reply = QMessageBox.question(
+            self, "Accept All Pending",
+            f"Accept all {n} pending detections?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        # Push batch undo
+        self.undo_stack.append(('batch_label', list(self.detections_df[mask].index), 'pending'))
+        self.btn_undo.setEnabled(True)
+        self.detections_df.loc[mask, 'status'] = 'accepted'
+        self._store_current_detections()
+        self._update_display()
+        self._update_button_counts()
+        self.status_bar.showMessage(f"Accepted {n} detections")
+
+    def reject_all_pending(self):
+        """Reject all pending detections."""
+        if self.detections_df is None:
+            return
+        mask = self.detections_df['status'] == 'pending'
+        n = mask.sum()
+        if n == 0:
+            self.status_bar.showMessage("No pending detections")
+            return
+        reply = QMessageBox.question(
+            self, "Reject All Pending",
+            f"Reject all {n} pending detections?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.undo_stack.append(('batch_label', list(self.detections_df[mask].index), 'pending'))
+        self.btn_undo.setEnabled(True)
+        self.detections_df.loc[mask, 'status'] = 'rejected'
+        self._store_current_detections()
+        self._update_display()
+        self._update_button_counts()
+        self.status_bar.showMessage(f"Rejected {n} detections")
+
+    # =========================================================================
+    # Filter / Jump
+    # =========================================================================
+
+    def on_filter_changed(self):
+        """Handle filter combo change."""
+        self.filter_status = self.combo_filter.currentData()
+        self._update_display()
+
+    def on_jump_to_detection(self):
+        """Jump to a specific detection number."""
+        idx = self.spin_jump.value() - 1
+        if self.detections_df is not None and 0 <= idx < len(self.detections_df):
+            self.current_detection_idx = idx
+            self._update_display()
+
+    def _get_filtered_indices(self):
+        """Get detection indices matching current filter."""
+        if self.detections_df is None or len(self.detections_df) == 0:
+            return []
+        if self.filter_status == 'all':
+            return list(range(len(self.detections_df)))
+        return list(self.detections_df.index[self.detections_df['status'] == self.filter_status])
+
+    # =========================================================================
+    # Wheel Zoom / Overview Navigation / Display Frequency
+    # =========================================================================
+
+    def on_wheel_zoom(self, factor, center_time):
+        """Handle mouse wheel zoom on spectrogram."""
+        current_start, current_end = self.spectrogram.get_view_range()
+        current_window = current_end - current_start
+        new_window = current_window / factor
+        total_dur = self.spectrogram.get_total_duration()
+        new_window = max(0.05, min(total_dur if total_dur > 0 else 600, new_window))
+
+        # Maintain zoom center at mouse position
+        ratio = (center_time - current_start) / current_window if current_window > 0 else 0.5
+        new_start = center_time - ratio * new_window
+        new_end = new_start + new_window
+
+        new_start = max(0, new_start)
+        new_end = min(total_dur, new_end)
+
+        self.spin_view_window.blockSignals(True)
+        self.spin_view_window.setValue(new_end - new_start)
+        self.spin_view_window.blockSignals(False)
+
+        self.spectrogram.set_view_range(new_start, new_end)
+        self._update_scrollbar()
+        self._update_detection_boxes()
+        self.waveform_overview.set_view_range(new_start, new_end)
+
+    def on_overview_clicked(self, center_time):
+        """Handle click on waveform overview to navigate."""
+        window = self.spin_view_window.value()
+        total_dur = self.spectrogram.get_total_duration()
+
+        view_start = max(0, center_time - window / 2)
+        view_end = min(total_dur, center_time + window / 2)
+
+        self.spectrogram.set_view_range(view_start, view_end)
+        self._update_scrollbar()
+        self._update_detection_boxes()
+        self.waveform_overview.set_view_range(view_start, view_end)
+
+    def on_display_freq_changed(self):
+        """Handle display frequency range change."""
+        min_f = self.spin_display_min_freq.value()
+        max_f = self.spin_display_max_freq.value()
+        if max_f <= min_f:
+            return
+        self.spectrogram.min_freq = min_f
+        self.spectrogram.max_freq = max_f
+        # Force spectrogram recompute
+        self.spectrogram.cached_view_start = None
+        self.spectrogram.cached_view_end = None
+        self.spectrogram.spec_image = None
+        if self.spectrogram.total_duration > 0:
+            self.spectrogram._compute_view_spectrogram()
+        self.spectrogram.update()
+
+    def on_colormap_changed(self, name):
+        """Handle colormap selection change."""
+        self.spectrogram.set_colormap(name)
+
+    # =========================================================================
+    # Export
+    # =========================================================================
+
+    # =========================================================================
+    # Detection Statistics
+    # =========================================================================
+
+    def _update_statistics(self):
+        """Update detection statistics label."""
+        if self.detections_df is None or len(self.detections_df) == 0:
+            self.lbl_stats.setText("")
+            return
+
+        n = len(self.detections_df)
+        durations = self.detections_df['stop_seconds'] - self.detections_df['start_seconds']
+        dur_ms = durations * 1000
+        total_dur = self.spectrogram.get_total_duration()
+        cpm = n / (total_dur / 60) if total_dur > 0 else 0
+
+        parts = [f"{n} calls | {cpm:.1f}/min"]
+        parts.append(f"Dur: {dur_ms.mean():.1f}ms (SD {dur_ms.std():.1f})")
+
+        if 'peak_freq_hz' in self.detections_df.columns:
+            pf = self.detections_df['peak_freq_hz'].dropna()
+            if len(pf) > 0:
+                parts.append(f"Peak F: {pf.mean()/1000:.1f}kHz")
+
+        self.lbl_stats.setText(" | ".join(parts))
+
+    # =========================================================================
+    # Settings Persistence
+    # =========================================================================
+
+    def _restore_settings(self):
+        """Restore window geometry and preferences from QSettings."""
+        settings = QSettings("FNT", "USVStudio")
+        geometry = settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        state = settings.value("windowState")
+        if state:
+            self.restoreState(state)
+        # Restore view preferences
+        view_window = settings.value("view_window", 2.0, type=float)
+        self.spin_view_window.setValue(view_window)
+        colormap = settings.value("colormap", "viridis", type=str)
+        idx = self.combo_colormap.findText(colormap)
+        if idx >= 0:
+            self.combo_colormap.setCurrentIndex(idx)
+
+    def closeEvent(self, event):
+        """Save settings on close."""
+        settings = QSettings("FNT", "USVStudio")
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        settings.setValue("view_window", self.spin_view_window.value())
+        settings.setValue("colormap", self.combo_colormap.currentText())
+        super().closeEvent(event)
 
 
 # =============================================================================
