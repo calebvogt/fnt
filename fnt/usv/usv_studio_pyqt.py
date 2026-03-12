@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QProgressBar, QGroupBox,
     QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QListWidgetItem,
     QScrollArea, QSplitter, QStatusBar, QMessageBox, QScrollBar,
-    QSizePolicy, QFrame, QCheckBox, QShortcut
+    QSizePolicy, QFrame, QCheckBox, QShortcut, QSlider
 )
 from scipy import signal
 
@@ -73,6 +73,8 @@ class SpectrogramWidget(QWidget):
         self.spec_image = None
         self.cached_view_start = None
         self.cached_view_end = None
+        self.cached_min_freq = None
+        self.cached_max_freq = None
 
         # View state
         self.view_start = 0.0
@@ -152,16 +154,31 @@ class SpectrogramWidget(QWidget):
 
         return lut
 
-    def set_audio_data(self, audio_data, sample_rate):
-        """Set audio data for spectrogram computation."""
+    def set_audio_data(self, audio_data, sample_rate, preserve_view=False):
+        """Set audio data for spectrogram computation.
+
+        Args:
+            preserve_view: If True, keep current view_start/view_end/freq settings.
+        """
         self.audio_data = audio_data
         self.sample_rate = sample_rate
 
         if audio_data is not None and sample_rate is not None and len(audio_data) > 0:
             self.total_duration = len(audio_data) / sample_rate
-            self.view_start = 0
-            self.view_end = min(2.0, self.total_duration)
-            self.max_freq = min(125000, sample_rate / 2)
+            nyquist = min(125000, sample_rate / 2)
+            if not preserve_view:
+                self.view_start = 0
+                self.view_end = min(2.0, self.total_duration)
+                self.max_freq = nyquist
+            else:
+                # Clamp view to new file duration
+                if self.view_start >= self.total_duration:
+                    self.view_start = 0
+                self.view_end = min(self.view_end, self.total_duration)
+                if self.view_end <= self.view_start:
+                    self.view_end = min(self.view_start + 2.0, self.total_duration)
+                # Clamp max_freq to Nyquist
+                self.max_freq = min(self.max_freq, nyquist)
         else:
             self.total_duration = 0
             self.view_start = 0
@@ -169,6 +186,8 @@ class SpectrogramWidget(QWidget):
 
         self.cached_view_start = None
         self.cached_view_end = None
+        self.cached_min_freq = None
+        self.cached_max_freq = None
         self.spec_image = None
 
         if self.total_duration > 0:
@@ -218,7 +237,7 @@ class SpectrogramWidget(QWidget):
             self.spec_image = None
             return
 
-        # Check cache - only use if position is nearly identical
+        # Check cache - only use if position and freq range are nearly identical
         current_window = self.view_end - self.view_start
         if (self.cached_view_start is not None and
             self.cached_view_end is not None and
@@ -228,7 +247,9 @@ class SpectrogramWidget(QWidget):
             position_tolerance = current_window * 0.01
             same_position = (abs(self.view_start - self.cached_view_start) < position_tolerance and
                             abs(self.view_end - self.cached_view_end) < position_tolerance)
-            if zoom_similar and same_position:
+            same_freq = (self.cached_min_freq == self.min_freq and
+                        self.cached_max_freq == self.max_freq)
+            if zoom_similar and same_position and same_freq:
                 return
 
         # Extract segment with padding
@@ -265,13 +286,20 @@ class SpectrogramWidget(QWidget):
         times = times + start_time
         spec_db = 10 * np.log10(Sxx + 1e-10)
 
-        # Filter to view range
+        # Filter to view range (time)
         time_mask = (times >= self.view_start) & (times <= self.view_end)
         if not np.any(time_mask):
             self.spec_image = None
             return
 
         view_spec = spec_db[:, time_mask]
+
+        # Filter to frequency display range
+        freq_mask = (frequencies >= self.min_freq) & (frequencies <= self.max_freq)
+        if not np.any(freq_mask):
+            self.spec_image = None
+            return
+        view_spec = view_spec[freq_mask, :]
 
         # Normalize and apply colormap
         vmin = np.percentile(view_spec, 5)
@@ -290,6 +318,8 @@ class SpectrogramWidget(QWidget):
 
         self.cached_view_start = self.view_start
         self.cached_view_end = self.view_end
+        self.cached_min_freq = self.min_freq
+        self.cached_max_freq = self.max_freq
 
     def paintEvent(self, event):
         """Paint spectrogram and detection boxes."""
@@ -937,9 +967,14 @@ class DSPDetectionWorker(QThread):
 
             try:
                 detections = detector.detect_file(filepath)
+                # If stop was requested during processing, discard this file's results
+                if self._stop_requested:
+                    break
                 self.results[filepath] = detections
                 self.file_complete.emit(filename, len(detections))
             except Exception as e:
+                if self._stop_requested:
+                    break
                 self.error.emit(filename, str(e))
                 self.results[filepath] = []
 
@@ -1302,19 +1337,18 @@ class USVStudioWindow(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
 
         controls_layout.addWidget(QLabel("Speed:"))
-        self.combo_speed = QComboBox()
-        self.combo_speed.addItem("0.01x", 0.01)
-        self.combo_speed.addItem("0.05x", 0.05)
-        self.combo_speed.addItem("0.1x", 0.1)
-        self.combo_speed.addItem("0.2x", 0.2)
-        self.combo_speed.addItem("0.5x", 0.5)
-        self.combo_speed.addItem("1x", 1.0)
-        self.combo_speed.addItem("Heterodyne", "heterodyne")
-        self.combo_speed.setCurrentIndex(2)
-        self.combo_speed.setFixedWidth(90)
-        self.combo_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.\n0.1x is a good default for ~50 kHz USV calls.\nHeterodyne mixes the signal to bring USVs down.")
-        self.combo_speed.currentIndexChanged.connect(self.on_speed_changed)
-        controls_layout.addWidget(self.combo_speed)
+        # Speed slider: positions map to [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+        self._speed_values = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed.setRange(0, len(self._speed_values) - 1)
+        self.slider_speed.setValue(2)  # Default 0.1x
+        self.slider_speed.setFixedWidth(100)
+        self.slider_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.\n0.1x is a good default for ~50 kHz USV calls.")
+        self.slider_speed.valueChanged.connect(self.on_speed_changed)
+        controls_layout.addWidget(self.slider_speed)
+        self.lbl_speed = QLabel("0.1x")
+        self.lbl_speed.setFixedWidth(35)
+        controls_layout.addWidget(self.lbl_speed)
 
         if not HAS_SOUNDDEVICE:
             lbl_warn = QLabel("No audio")
@@ -1591,15 +1625,21 @@ class USVStudioWindow(QMainWindow):
         self.lbl_queue.setStyleSheet("color: #999999;")
         group_layout.addWidget(self.lbl_queue)
 
-        # Queue buttons
+        # Queue buttons - row 1
         queue_row = QHBoxLayout()
         queue_row.setSpacing(2)
 
-        self.btn_add_to_queue = QPushButton("Add to Queue")
+        self.btn_add_to_queue = QPushButton("Add Current")
         self.btn_add_to_queue.setToolTip("Add the currently selected file to the detection queue")
         self.btn_add_to_queue.clicked.connect(self.add_to_queue)
         self.btn_add_to_queue.setEnabled(False)
         queue_row.addWidget(self.btn_add_to_queue)
+
+        self.btn_add_all_to_queue = QPushButton("Add All")
+        self.btn_add_all_to_queue.setToolTip("Add all imported files to the detection queue")
+        self.btn_add_all_to_queue.clicked.connect(self.add_all_to_queue)
+        self.btn_add_all_to_queue.setEnabled(False)
+        queue_row.addWidget(self.btn_add_all_to_queue)
 
         self.btn_clear_queue = QPushButton("Clear")
         self.btn_clear_queue.setStyleSheet("background-color: #5c5c5c;")
@@ -1622,6 +1662,13 @@ class USVStudioWindow(QMainWindow):
         self.dsp_progress.setValue(0)
         self.dsp_progress.setVisible(False)
         group_layout.addWidget(self.dsp_progress)
+
+        self.btn_stop_dsp = QPushButton("Stop Detection")
+        self.btn_stop_dsp.setStyleSheet("background-color: #d13438;")
+        self.btn_stop_dsp.setToolTip("Stop DSP detection after the current file finishes.\nResults for the file being processed will be discarded.")
+        self.btn_stop_dsp.clicked.connect(self.stop_dsp_detection)
+        self.btn_stop_dsp.setVisible(False)
+        group_layout.addWidget(self.btn_stop_dsp)
 
         self.lbl_dsp_status = QLabel("")
         self.lbl_dsp_status.setStyleSheet("color: #999999; font-size: 9px;")
@@ -2330,6 +2377,7 @@ class USVStudioWindow(QMainWindow):
         self.btn_prev_file.setEnabled(self.current_file_idx > 0)
         self.btn_next_file.setEnabled(self.current_file_idx < n - 1)
         self.btn_add_to_queue.setEnabled(n > 0)
+        self.btn_add_all_to_queue.setEnabled(n > 0)
 
         if n > 0 and self.current_file_idx < n:
             self.file_list.setCurrentRow(self.current_file_idx)
@@ -2413,14 +2461,26 @@ class USVStudioWindow(QMainWindow):
             if self.audio_data.ndim > 1:
                 self.audio_data = np.mean(self.audio_data, axis=1)
 
-            self.spectrogram.set_audio_data(self.audio_data, self.sample_rate)
+            # Preserve view settings if we already had a file loaded
+            has_previous = self.spectrogram.total_duration > 0
+            self.spectrogram.set_audio_data(self.audio_data, self.sample_rate,
+                                            preserve_view=has_previous)
             self.waveform_overview.set_audio_data(self.audio_data, self.sample_rate)
 
-            # Update display frequency range to match Nyquist
-            nyq = min(125000, self.sample_rate // 2) if self.sample_rate else 125000
+            # Sync freq spinners with spectrogram's (possibly preserved) values
+            self.spin_display_min_freq.blockSignals(True)
             self.spin_display_max_freq.blockSignals(True)
-            self.spin_display_max_freq.setValue(nyq)
+            self.spin_display_min_freq.setValue(self.spectrogram.min_freq)
+            self.spin_display_max_freq.setValue(self.spectrogram.max_freq)
+            self.spin_display_min_freq.blockSignals(False)
             self.spin_display_max_freq.blockSignals(False)
+
+            # Sync the window spinner with the preserved view
+            if has_previous:
+                view_start, view_end = self.spectrogram.get_view_range()
+                self.spin_view_window.blockSignals(True)
+                self.spin_view_window.setValue(view_end - view_start)
+                self.spin_view_window.blockSignals(False)
 
             # Load detections if available
             if filepath in self.all_detections:
@@ -2547,6 +2607,20 @@ class USVStudioWindow(QMainWindow):
             self.dsp_queue.append(filepath)
             self._update_queue_display()
 
+    def add_all_to_queue(self):
+        """Add all imported files to DSP queue."""
+        if not self.audio_files:
+            return
+
+        added = 0
+        for filepath in self.audio_files:
+            if filepath not in self.dsp_queue:
+                self.dsp_queue.append(filepath)
+                added += 1
+
+        self._update_queue_display()
+        self.status_bar.showMessage(f"Added {added} file{'s' if added != 1 else ''} to queue")
+
     def clear_queue(self):
         """Clear DSP queue."""
         self.dsp_queue = []
@@ -2594,8 +2668,16 @@ class USVStudioWindow(QMainWindow):
         self.dsp_progress.setValue(0)
         self.btn_run_dsp.setEnabled(False)
         self.btn_run_dsp.setText("Running...")
+        self.btn_stop_dsp.setVisible(True)
 
         self.dsp_worker.start()
+
+    def stop_dsp_detection(self):
+        """Stop DSP detection. The file currently being processed is discarded."""
+        if hasattr(self, 'dsp_worker') and self.dsp_worker is not None:
+            self.dsp_worker.stop()
+            self.lbl_dsp_status.setText("Stopping after current file...")
+            self.btn_stop_dsp.setEnabled(False)
 
     def _on_dsp_progress(self, filename, current, total):
         """Handle DSP progress update."""
@@ -2608,7 +2690,9 @@ class USVStudioWindow(QMainWindow):
 
     def _on_dsp_complete(self, results):
         """Handle DSP detection completion."""
-        # Store results
+        was_stopped = hasattr(self, 'dsp_worker') and self.dsp_worker._stop_requested
+
+        # Store results (only files that completed before stop)
         for filepath, detections in results.items():
             if isinstance(detections, pd.DataFrame):
                 df = detections.copy()
@@ -2631,12 +2715,18 @@ class USVStudioWindow(QMainWindow):
         # Update UI
         self.dsp_progress.setValue(100)
         self.dsp_progress.setVisible(False)
+        self.btn_stop_dsp.setVisible(False)
+        self.btn_stop_dsp.setEnabled(True)
         self.btn_run_dsp.setEnabled(True)
         self.btn_run_dsp.setText("Run DSP Detection")
 
         total_det = sum(len(d) for d in results.values())
-        self.lbl_dsp_status.setText(f"Complete: {total_det} total detections")
-        self.status_bar.showMessage(f"DSP detection complete: {total_det} detections in {len(results)} files")
+        if was_stopped:
+            self.lbl_dsp_status.setText(f"Stopped. {len(results)} file{'s' if len(results) != 1 else ''} completed, {total_det} detections")
+            self.status_bar.showMessage(f"DSP detection stopped. {len(results)} files completed.")
+        else:
+            self.lbl_dsp_status.setText(f"Complete: {total_det} total detections")
+            self.status_bar.showMessage(f"DSP detection complete: {total_det} detections in {len(results)} files")
 
         # Clear queue and reload current file
         self.dsp_queue = []
@@ -3241,14 +3331,12 @@ class USVStudioWindow(QMainWindow):
     # =========================================================================
 
     def on_speed_changed(self):
-        """Handle playback speed change."""
-        mode = self.combo_speed.currentData()
-        if mode == "heterodyne":
-            self.use_heterodyne = True
-            self.playback_speed = 1.0
-        else:
-            self.use_heterodyne = False
-            self.playback_speed = mode
+        """Handle playback speed slider change."""
+        idx = self.slider_speed.value()
+        speed = self._speed_values[idx]
+        self.use_heterodyne = False
+        self.playback_speed = speed
+        self.lbl_speed.setText(f"{speed}x")
 
     def toggle_playback(self):
         """Toggle playback."""
@@ -3556,6 +3644,7 @@ class USVStudioWindow(QMainWindow):
 
         # Input
         self.btn_add_to_queue.setEnabled(has_files)
+        self.btn_add_all_to_queue.setEnabled(has_files)
 
         # Detection navigation
         self.btn_prev_det.setEnabled(has_det and self.current_detection_idx > 0)
