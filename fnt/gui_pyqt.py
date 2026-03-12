@@ -64,8 +64,8 @@ class FNTMainWindow(QMainWindow):
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("FieldNeuroToolbox (FNT) v1.0")
-        self.setGeometry(100, 100, 1000, 700)
-        self.setMinimumSize(800, 600)
+        self.setGeometry(100, 100, 1100, 780)
+        self.setMinimumSize(850, 650)
         
         # Set window icon (check multiple possible locations)
         icon_paths = [
@@ -111,9 +111,10 @@ class FNTMainWindow(QMainWindow):
                 background-color: #0078d4;
                 color: white;
                 border: none;
-                padding: 8px 16px;
+                padding: 6px 14px;
                 border-radius: 4px;
                 font-weight: bold;
+                font-size: 10pt;
             }
             QPushButton:hover {
                 background-color: #106ebe;
@@ -150,6 +151,44 @@ class FNTMainWindow(QMainWindow):
             QFrame {
                 background-color: #2b2b2b;
                 border-color: #3f3f3f;
+            }
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #0078d4;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #106ebe;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #0078d4;
+                border-radius: 4px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #106ebe;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
             }
         """)
         
@@ -250,10 +289,31 @@ class FNTMainWindow(QMainWindow):
         
         layout.addWidget(header_frame)
     
+    def _make_scrollable_tab(self, name):
+        """Create a scrollable tab and return (scroll_widget, layout) for adding content.
+
+        Usage in create_*_tab:
+            tab, layout = self._make_scrollable_tab("TabName")
+            # ... add widgets to layout ...
+            layout.addStretch()
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        content.setLayout(layout)
+        scroll.setWidget(content)
+
+        self.tabs.addTab(scroll, name)
+        return scroll, layout
+
     def create_video_tab(self):
         """Create the video processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("Video")
         
         # Description
         desc = QLabel("Tools for video file processing and manipulation")
@@ -289,13 +349,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(scoring_group)
 
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "Video")
 
     def create_sleap_tab(self):
         """Create the SLEAP processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("SLEAP")
         
         # Description
         desc = QLabel("SLEAP pose estimation pipeline tools")
@@ -331,13 +388,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(post_group)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "SLEAP")
-    
+
     def create_usv_tab(self):
         """Create the USV processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("USV")
 
         # Description
         desc = QLabel("Ultrasonic vocalization analysis tools")
@@ -372,13 +426,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(analysis_group)
 
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "USV")
-    
+
     def create_uwb_tab(self):
         """Create the UWB processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("UWB")
         
         # Description
         desc = QLabel("Ultra-wideband tracking and behavioral analysis")
@@ -399,13 +450,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(quick_group)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "UWB")
-    
+
     def create_video_tracking_tab(self):
         """Create the video tracking tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("Video Tracking")
         
         # Description
         desc = QLabel("Interactive tracking using SAM (Segment Anything Model) for behavioral tests")
@@ -440,13 +488,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(info_label)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "Video Tracking")
 
     def create_rfid_tab(self):
         """Create the RFID processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("RFID")
 
         # Description
         desc = QLabel("RFID tracking and social behavior analysis tools")
@@ -469,8 +514,6 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(group)
 
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "RFID")
 
     def run_rfid_preprocessing(self):
         """Launch RFID Preprocessing Tool"""
@@ -489,8 +532,7 @@ class FNTMainWindow(QMainWindow):
     
     def create_fed_tab(self):
         """Create the FED processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("FED")
         
         # Description
         desc = QLabel("Feeding Experimentation Device (FED) data analysis")
@@ -521,13 +563,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(group)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "FED")
-    
+
     def create_wifp_tab(self):
         """Create the WiFP (Wireless Fiber Photometry) processing tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("WiFP")
         
         # Description
         desc = QLabel("Doric Wireless Fiber Photometry (WiFP) analysis tools")
@@ -572,13 +611,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(info_group)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "WiFP")
 
     def create_imaging_tab(self):
         """Create the Imaging tab for microscopy analysis"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("Imaging")
 
         # Description
         desc = QLabel("Microscopy image viewing and processing tools")
@@ -628,13 +664,10 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(info_group)
 
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "Imaging")
 
     def create_utilities_tab(self):
         """Create the utilities tab"""
-        tab = QWidget()
-        layout = QVBoxLayout()
+        tab, layout = self._make_scrollable_tab("Utilities")
         
         # Description
         desc = QLabel("General utilities and information")
@@ -671,37 +704,39 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(group)
         
         layout.addStretch()
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "Utilities")
-    
+
     def create_button_grid(self, layout, buttons):
         """Create a grid of buttons with descriptions"""
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
         row, col = 0, 0
-        
+
         for title, description, callback in buttons:
             # Create button container
             button_widget = QWidget()
             button_layout = QVBoxLayout()
+            button_layout.setSpacing(2)
+            button_layout.setContentsMargins(4, 4, 4, 4)
             button_widget.setLayout(button_layout)
-            
+
             # Main button
             btn = QPushButton(title)
             btn.clicked.connect(callback)
-            btn.setMinimumHeight(40)
+            btn.setMinimumHeight(32)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button_layout.addWidget(btn)
-            
+
             # Description label
             desc_label = QLabel(description)
-            desc_label.setFont(QFont("Arial", 9))
-            desc_label.setStyleSheet("color: #cccccc; margin: 5px;")
+            desc_label.setFont(QFont("Arial", 8))
+            desc_label.setStyleSheet("color: #aaaaaa; margin: 2px 4px;")
             desc_label.setWordWrap(True)
             desc_label.setAlignment(Qt.AlignCenter)
             button_layout.addWidget(desc_label)
-            
+
             # Add to grid
             layout.addWidget(button_widget, row, col)
-            
+
             col += 1
             if col > 1:  # 2 columns
                 col = 0

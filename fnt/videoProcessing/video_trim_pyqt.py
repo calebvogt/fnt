@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QFileDialog, QMessageBox, QGroupBox, QComboBox,
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QApplication,
-    QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
+    QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget,
+    QTableWidgetItem, QHeaderView, QSplitter, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QBrush, QColor
@@ -505,26 +506,77 @@ class VideoTrimTool(QMainWindow):
             QProgressBar::chunk {
                 background-color: #0078d4;
             }
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #0078d4;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #106ebe;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #0078d4;
+                border-radius: 4px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #106ebe;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
+            }
         """)
         
-        # Main container
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout()
-        main_widget.setLayout(main_layout)
-        
+        # Main container with resizable splitter
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(5)
+        splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #3f3f3f;
+            }
+            QSplitter::handle:hover {
+                background-color: #0078d4;
+            }
+        """)
+
         # Left panel (video list and settings)
         left_panel = self.create_left_panel()
-        main_layout.addWidget(left_panel, 1)
-        
+        left_panel.setMinimumWidth(380)
+        splitter.addWidget(left_panel)
+
         # Right panel (preview)
         right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel, 2)
+        splitter.addWidget(right_panel)
+
+        # Set initial sizes (roughly 1:2 ratio)
+        splitter.setSizes([450, 1100])
+        splitter.setStretchFactor(0, 0)  # Left panel doesn't auto-stretch
+        splitter.setStretchFactor(1, 1)  # Right panel takes extra space
+
+        self.setCentralWidget(splitter)
     
     def create_left_panel(self):
         """Create the left panel with video list and settings"""
         panel = QWidget()
-        panel.setMaximumWidth(450)  # Constrain the width
         layout = QVBoxLayout()
         panel.setLayout(layout)
         
@@ -570,15 +622,15 @@ class VideoTrimTool(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
         
-        btn_add_folder = QPushButton("📁 Add Folder")
+        btn_add_folder = QPushButton("Add Folder")
         btn_add_folder.clicked.connect(self.add_folder)
         button_layout.addWidget(btn_add_folder)
         
-        btn_add_videos = QPushButton("🎬 Add Video(s)")
+        btn_add_videos = QPushButton("Add Video(s)")
         btn_add_videos.clicked.connect(self.add_videos)
         button_layout.addWidget(btn_add_videos)
         
-        btn_clear = QPushButton("🗑️ Clear All")
+        btn_clear = QPushButton("Clear All")
         btn_clear.clicked.connect(self.clear_videos)
         button_layout.addWidget(btn_clear)
         
@@ -593,12 +645,12 @@ class VideoTrimTool(QMainWindow):
         # Navigation buttons
         nav_layout = QHBoxLayout()
         
-        self.btn_previous = QPushButton("⬅️ Previous")
+        self.btn_previous = QPushButton("Previous")
         self.btn_previous.clicked.connect(self.previous_video)
         self.btn_previous.setEnabled(False)
         nav_layout.addWidget(self.btn_previous)
         
-        self.btn_next = QPushButton("Next ➡️")
+        self.btn_next = QPushButton("Next")
         self.btn_next.clicked.connect(self.next_video)
         self.btn_next.setEnabled(False)
         nav_layout.addWidget(self.btn_next)
@@ -661,12 +713,12 @@ class VideoTrimTool(QMainWindow):
         
         crop_button_layout = QHBoxLayout()
         
-        self.btn_draw_crop = QPushButton("✏️ Select Crop ROI")
+        self.btn_draw_crop = QPushButton("Select Crop ROI")
         self.btn_draw_crop.clicked.connect(self.start_drawing_crop)
         self.btn_draw_crop.setEnabled(False)
         crop_button_layout.addWidget(self.btn_draw_crop)
         
-        self.btn_clear_crop = QPushButton("🗑️ Clear Crop")
+        self.btn_clear_crop = QPushButton("Clear Crop")
         self.btn_clear_crop.clicked.connect(self.clear_crop)
         self.btn_clear_crop.setEnabled(False)
         crop_button_layout.addWidget(self.btn_clear_crop)
@@ -689,20 +741,23 @@ class VideoTrimTool(QMainWindow):
         
         # Add to queue button
         layout.addSpacing(10)
-        self.btn_add_to_queue = QPushButton("➕ Add Video to Processing Queue")
+        self.btn_add_to_queue = QPushButton("+ Add Video to Processing Queue")
         self.btn_add_to_queue.clicked.connect(self.add_to_queue)
         self.btn_add_to_queue.setEnabled(False)
         self.btn_add_to_queue.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
+                color: white;
                 padding: 10px;
                 font-size: 12px;
+                font-weight: bold;
             }
             QPushButton:hover {
                 background-color: #218838;
             }
             QPushButton:disabled {
                 background-color: #3f3f3f;
+                color: #888888;
             }
         """)
         layout.addWidget(self.btn_add_to_queue)
@@ -775,24 +830,27 @@ class VideoTrimTool(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
         
-        self.btn_start_batch = QPushButton("▶️ Start Batch Processing")
+        self.btn_start_batch = QPushButton("Start Batch Processing")
         self.btn_start_batch.clicked.connect(self.start_batch_processing)
         self.btn_start_batch.setEnabled(False)
         self.btn_start_batch.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
+                color: white;
                 padding: 10px;
+                font-weight: bold;
             }
             QPushButton:hover {
                 background-color: #218838;
             }
             QPushButton:disabled {
                 background-color: #3f3f3f;
+                color: #888888;
             }
         """)
         button_layout.addWidget(self.btn_start_batch)
         
-        self.btn_cancel_batch = QPushButton("⏹️ Cancel")
+        self.btn_cancel_batch = QPushButton("Cancel")
         self.btn_cancel_batch.clicked.connect(self.cancel_batch_processing)
         self.btn_cancel_batch.setEnabled(False)
         button_layout.addWidget(self.btn_cancel_batch)
@@ -1399,7 +1457,7 @@ class VideoTrimTool(QMainWindow):
         self.queue_table.blockSignals(True)
         
         # Remove button (red minus sign)
-        remove_btn = QPushButton("🗑")
+        remove_btn = QPushButton("X")
         remove_btn.setStyleSheet("""
             QPushButton {
                 background-color: #dc3545;
