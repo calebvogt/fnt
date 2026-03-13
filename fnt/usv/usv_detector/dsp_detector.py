@@ -43,12 +43,13 @@ class DSPDetector:
             config = get_prairie_vole_config()
         self.config = config
 
-    def detect_file(self, filepath: str) -> List[Dict]:
+    def detect_file(self, filepath: str, progress_callback=None) -> List[Dict]:
         """
         Detect USV calls in an audio file.
 
         Args:
             filepath: Path to audio file
+            progress_callback: Optional callable(fraction) where fraction is 0.0-1.0
 
         Returns:
             List of detected calls, each as a dictionary with:
@@ -66,15 +67,16 @@ class DSPDetector:
         audio, sr = load_audio(filepath)
 
         # Detect calls
-        return self.detect(audio, sr)
+        return self.detect(audio, sr, progress_callback=progress_callback)
 
-    def detect(self, audio: np.ndarray, sr: int) -> List[Dict]:
+    def detect(self, audio: np.ndarray, sr: int, progress_callback=None) -> List[Dict]:
         """
         Detect USV calls in audio data.
 
         Args:
             audio: Audio signal array (1D, float)
             sr: Sample rate in Hz
+            progress_callback: Optional callable(fraction) where fraction is 0.0-1.0
 
         Returns:
             List of detected calls as dictionaries
@@ -87,7 +89,11 @@ class DSPDetector:
         # Process in chunks for long files
         duration = len(audio) / sr
         if duration > self.config.chunk_duration_s * 2:
-            return self._detect_chunked(audio, sr)
+            return self._detect_chunked(audio, sr, progress_callback=progress_callback)
+
+        # For short files, report complete immediately
+        if progress_callback:
+            progress_callback(1.0)
 
         # Apply bandpass filter
         filtered = bandpass_filter(
@@ -116,6 +122,12 @@ class DSPDetector:
         # Merge close calls
         calls = self._merge_close_calls(calls)
 
+        # Noise rejection filters
+        calls = self._filter_by_bandwidth(calls)
+        calls = self._filter_by_tonality(calls, frequencies, times, Sxx_db)
+        calls = self._filter_by_min_freq(calls)
+        calls = self._filter_harmonics(calls)
+
         # Sample peak frequencies across each call (optional)
         n_samples = getattr(self.config, 'freq_samples', 5)
         if n_samples and n_samples > 0:
@@ -128,28 +140,30 @@ class DSPDetector:
 
         return calls
 
-    def _detect_chunked(self, audio: np.ndarray, sr: int) -> List[Dict]:
+    def _detect_chunked(self, audio: np.ndarray, sr: int, progress_callback=None) -> List[Dict]:
         """
         Process long audio files in chunks.
 
         Args:
             audio: Audio signal
             sr: Sample rate
+            progress_callback: Optional callable(fraction) where fraction is 0.0-1.0
 
         Returns:
             List of all detected calls
         """
         chunk_samples = int(self.config.chunk_duration_s * sr)
         overlap_samples = int(self.config.chunk_overlap_s * sr)
+        total_samples = len(audio)
 
         all_calls = []
         offset = 0
 
-        while offset < len(audio):
-            chunk_end = min(offset + chunk_samples, len(audio))
+        while offset < total_samples:
+            chunk_end = min(offset + chunk_samples, total_samples)
             chunk = audio[offset:chunk_end]
 
-            # Detect in this chunk
+            # Detect in this chunk (no recursive progress callback)
             calls = self.detect(chunk, sr)
 
             # Adjust times for offset
@@ -160,6 +174,10 @@ class DSPDetector:
 
             all_calls.extend(calls)
             offset += chunk_samples - overlap_samples
+
+            # Report per-chunk progress
+            if progress_callback:
+                progress_callback(min(1.0, offset / total_samples))
 
         # Remove duplicates from overlap regions
         all_calls = self._deduplicate_calls(all_calls)
@@ -328,6 +346,149 @@ class DSPDetector:
                 deduplicated.append(call)
 
         return deduplicated
+
+    def _filter_by_bandwidth(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections whose frequency bandwidth exceeds max_bandwidth_hz.
+
+        Broadband noise events (cage bumps, movement artifacts) typically span
+        a much wider frequency range than real USV calls. This filter removes
+        detections that are too wide spectrally.
+        """
+        max_bw = getattr(self.config, 'max_bandwidth_hz', 0)
+        if max_bw <= 0:
+            return calls  # Filter disabled
+        return [c for c in calls if c.get('freq_bandwidth_hz', 0) <= max_bw]
+
+    def _filter_by_tonality(
+        self,
+        calls: List[Dict],
+        frequencies: np.ndarray,
+        times: np.ndarray,
+        Sxx_db: np.ndarray
+    ) -> List[Dict]:
+        """Filter detections by spectral purity (tonality score).
+
+        Tonality measures how concentrated the energy is vs. spread across
+        frequencies. A pure tone has tonality ~1.0; broadband noise has ~0.0.
+
+        For each detection, at each time step we find the peak frequency bin
+        and measure what fraction of the total column energy is within ±2 bins
+        of that peak. The mean of this ratio across all time steps is the
+        tonality score. Real USV calls are tonal (energy concentrated in a
+        narrow band); noise events are diffuse.
+        """
+        min_tonality = getattr(self.config, 'min_tonality', 0)
+        if min_tonality <= 0:
+            return calls  # Filter disabled
+
+        filtered = []
+        for call in calls:
+            start_idx = call.get('_start_idx')
+            end_idx = call.get('_end_idx')
+            if start_idx is None or end_idx is None:
+                # No indices available — keep the call
+                filtered.append(call)
+                continue
+
+            # Extract the detection's spectrogram columns
+            region = Sxx_db[:, start_idx:end_idx + 1]
+            # Convert to linear power for ratio computation
+            power = 10 ** (region / 10)
+
+            n_cols = region.shape[1]
+            if n_cols == 0:
+                filtered.append(call)
+                continue
+
+            ratios = np.zeros(n_cols)
+            half_width = 2  # ±2 bins around peak
+            for t in range(n_cols):
+                col = power[:, t]
+                total = col.sum()
+                if total <= 0:
+                    continue
+                peak_bin = np.argmax(col)
+                lo = max(0, peak_bin - half_width)
+                hi = min(len(col), peak_bin + half_width + 1)
+                ratios[t] = col[lo:hi].sum() / total
+
+            tonality = float(np.mean(ratios))
+            call['tonality'] = tonality
+
+            if tonality >= min_tonality:
+                filtered.append(call)
+
+        return filtered
+
+    def _filter_by_min_freq(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections whose actual minimum frequency is too low.
+
+        Broadband noise events often have strong energy extending down to very
+        low frequencies (near the detection bandpass floor). Real USV calls
+        typically start well above the lower bound. Setting min_call_freq_hz
+        higher than min_freq_hz discards detections that reach too low.
+        """
+        min_f = getattr(self.config, 'min_call_freq_hz', 0)
+        if min_f <= 0:
+            return calls  # Filter disabled
+        return [c for c in calls if c.get('min_freq_hz', min_f) >= min_f]
+
+    def _filter_harmonics(self, calls: List[Dict]) -> List[Dict]:
+        """Remove harmonic duplicates by merging temporally overlapping detections.
+
+        When a USV call produces harmonics, the detector may find separate
+        detections at the fundamental and at 2x, 3x, etc. These overlap
+        heavily in time but sit at different frequency bands.
+
+        For each group of detections that overlap by >=80% in time, only the
+        detection with the lowest min_freq_hz (the fundamental) is kept.
+        """
+        if not getattr(self.config, 'harmonic_filter', False):
+            return calls
+        if len(calls) < 2:
+            return calls
+
+        calls = sorted(calls, key=lambda c: c['start_seconds'])
+        kept = []
+        used = set()
+
+        for i, call_a in enumerate(calls):
+            if i in used:
+                continue
+
+            # Collect all calls that overlap >=80% with call_a
+            group = [i]
+            dur_a = call_a['stop_seconds'] - call_a['start_seconds']
+            if dur_a <= 0:
+                kept.append(call_a)
+                used.add(i)
+                continue
+
+            for j in range(i + 1, len(calls)):
+                if j in used:
+                    continue
+                call_b = calls[j]
+                # If call_b starts well after call_a ends, no more overlaps
+                if call_b['start_seconds'] > call_a['stop_seconds']:
+                    break
+
+                overlap_start = max(call_a['start_seconds'], call_b['start_seconds'])
+                overlap_end = min(call_a['stop_seconds'], call_b['stop_seconds'])
+                overlap = max(0, overlap_end - overlap_start)
+
+                dur_b = call_b['stop_seconds'] - call_b['start_seconds']
+                min_dur = min(dur_a, dur_b) if dur_b > 0 else dur_a
+
+                if overlap / min_dur >= 0.80:
+                    group.append(j)
+
+            # Keep only the lowest-frequency detection (the fundamental)
+            best_idx = min(group, key=lambda k: calls[k].get('min_freq_hz', 0))
+            kept.append(calls[best_idx])
+            for idx in group:
+                used.add(idx)
+
+        return kept
 
     def _sample_peak_frequencies(
         self,

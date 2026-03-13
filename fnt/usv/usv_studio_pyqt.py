@@ -97,6 +97,9 @@ class SpectrogramWidget(QWidget):
         self.draw_start = None
         self.draw_current = None
 
+        # Playback position indicator (None = not playing)
+        self.playback_position = None
+
         # Colormap
         self.colormap_name = 'viridis'
         self.colormap_lut = self._create_colormap_lut(self.colormap_name)
@@ -265,17 +268,27 @@ class SpectrogramWidget(QWidget):
             self.spec_image = None
             return
 
-        # Downsample if needed
+        # Downsample if needed, but ensure Nyquist stays above max display freq
         effective_sr = self.sample_rate
         if len(segment) > 2_000_000:
             downsample_factor = int(np.ceil(len(segment) / 2_000_000))
-            segment = segment[::downsample_factor]
-            effective_sr = self.sample_rate / downsample_factor
+            # Limit downsample so Nyquist (effective_sr/2) >= max_freq
+            if self.max_freq > 0:
+                max_allowed = max(1, int(self.sample_rate / (2 * self.max_freq)))
+                downsample_factor = min(downsample_factor, max_allowed)
+            if downsample_factor > 1:
+                segment = segment[::downsample_factor]
+                effective_sr = self.sample_rate / downsample_factor
 
-        # Compute spectrogram
+        # For very large segments, reduce time resolution instead of frequency
+        # Target ~2000 time columns max for the spectrogram image
+        target_time_cols = 2000
         nperseg = min(512, len(segment) // 10)
         nperseg = max(128, nperseg)
-        noverlap = int(nperseg * 0.75)
+        # Adjust overlap to limit output columns for wide windows
+        min_hop = max(1, len(segment) // target_time_cols)
+        noverlap = max(0, nperseg - min_hop)
+        noverlap = min(noverlap, int(nperseg * 0.75))  # Cap at 75% overlap
         nfft = max(nperseg, 512)
 
         frequencies, times, Sxx = signal.spectrogram(
@@ -347,6 +360,14 @@ class SpectrogramWidget(QWidget):
         # Draw temp box if drawing
         if self.is_drawing and self.draw_start and self.draw_current:
             self._draw_temp_box(painter, spec_rect)
+
+        # Draw playback position line
+        if self.playback_position is not None:
+            x = self._time_to_x(self.playback_position, spec_rect)
+            if spec_rect.left() <= x <= spec_rect.right():
+                painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
+                painter.drawLine(int(x), int(spec_rect.top()),
+                                 int(x), int(spec_rect.bottom()))
 
         self._draw_axes(painter, spec_rect)
 
@@ -527,22 +548,16 @@ class SpectrogramWidget(QWidget):
             return
 
         # Choose nice tick intervals based on view duration
-        if view_duration < 0.05:
-            tick_interval = 0.005
-        elif view_duration < 0.1:
-            tick_interval = 0.01
-        elif view_duration < 0.5:
-            tick_interval = 0.05
-        elif view_duration < 1.0:
-            tick_interval = 0.1
-        elif view_duration < 5.0:
-            tick_interval = 0.5
-        elif view_duration < 20.0:
-            tick_interval = 1.0
-        elif view_duration < 60.0:
-            tick_interval = 5.0
-        else:
-            tick_interval = 10.0
+        # Aim for roughly 8-12 major ticks across the view
+        nice_intervals = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+                          1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
+        target_ticks = 10
+        ideal_interval = view_duration / target_ticks
+        tick_interval = nice_intervals[-1]
+        for ni in nice_intervals:
+            if ni >= ideal_interval:
+                tick_interval = ni
+                break
 
         # Determine decimal places for label
         if tick_interval < 0.01:
@@ -586,12 +601,44 @@ class SpectrogramWidget(QWidget):
             60, 15, Qt.AlignCenter, "Time (s)"
         )
 
-        # Frequency axis
-        n_freq_ticks = 5
-        for i in range(n_freq_ticks + 1):
-            freq = self.min_freq + (self.max_freq - self.min_freq) * i / n_freq_ticks
+        # Frequency axis — adaptive tick intervals like time axis
+        freq_range_khz = (self.max_freq - self.min_freq) / 1000.0
+        nice_freq_intervals = [0.5, 1, 2, 5, 10, 25, 50]  # kHz
+        target_freq_ticks = 8
+        ideal_freq_interval = freq_range_khz / target_freq_ticks
+        freq_tick_khz = nice_freq_intervals[-1]
+        for ni in nice_freq_intervals:
+            if ni >= ideal_freq_interval:
+                freq_tick_khz = ni
+                break
+
+        # Draw minor frequency ticks (subdivisions)
+        minor_freq_khz = freq_tick_khz / 5.0
+        painter.setPen(QColor(120, 120, 120))
+        first_minor_f = math.ceil(self.min_freq / 1000.0 / minor_freq_khz) * minor_freq_khz
+        f_khz = first_minor_f
+        while f_khz * 1000.0 <= self.max_freq:
+            freq = f_khz * 1000.0
             y = self._freq_to_y(freq, spec_rect)
-            painter.drawText(0, int(y - 7), 45, 14, Qt.AlignRight, f"{freq/1000:.0f}")
+            if spec_rect.top() <= y <= spec_rect.bottom():
+                painter.drawLine(int(spec_rect.left() - 4), int(y),
+                                 int(spec_rect.left()), int(y))
+            f_khz += minor_freq_khz
+
+        # Draw major frequency ticks with labels (centered vertically on tick)
+        painter.setPen(QColor(200, 200, 200))
+        first_major_f = math.ceil(self.min_freq / 1000.0 / freq_tick_khz) * freq_tick_khz
+        f_khz = first_major_f
+        label_h = 16
+        while f_khz * 1000.0 <= self.max_freq:
+            freq = f_khz * 1000.0
+            y = self._freq_to_y(freq, spec_rect)
+            if spec_rect.top() <= y <= spec_rect.bottom():
+                painter.drawLine(int(spec_rect.left() - 8), int(y),
+                                 int(spec_rect.left()), int(y))
+                painter.drawText(0, int(y - label_h // 2), 42, label_h,
+                                 Qt.AlignRight | Qt.AlignVCenter, f"{f_khz:.0f}")
+            f_khz += freq_tick_khz
 
         painter.drawText(5, int(spec_rect.center().y() - 20), "kHz")
 
@@ -609,6 +656,15 @@ class SpectrogramWidget(QWidget):
         time_s = self._x_to_time(pos.x(), spec_rect)
         freq_hz = self._y_to_freq(pos.y(), spec_rect)
 
+        # First: check if clicking inside ANY detection box (for selection)
+        clicked_det = self._find_detection_at_pos(pos, spec_rect)
+
+        if clicked_det >= 0 and clicked_det != self.current_detection_idx:
+            # Clicked a non-selected detection — select it (don't drag)
+            self.detection_selected.emit(clicked_det)
+            return
+
+        # Now check edges/move on the SELECTED detection only
         edge, det_idx = self._find_edge_at_pos(pos, spec_rect)
 
         if edge:
@@ -625,13 +681,10 @@ class SpectrogramWidget(QWidget):
                     det.get('max_freq_hz', self.max_freq)
                 )
         else:
-            det_idx = self._find_detection_at_pos(pos, spec_rect)
-            if det_idx >= 0:
-                self.detection_selected.emit(det_idx)
-            else:
-                self.is_drawing = True
-                self.draw_start = (time_s, freq_hz)
-                self.draw_current = (time_s, freq_hz)
+            # Not on any detection — start drawing a new box
+            self.is_drawing = True
+            self.draw_start = (time_s, freq_hz)
+            self.draw_current = (time_s, freq_hz)
 
     def mouseMoveEvent(self, event):
         """Handle mouse move."""
@@ -745,7 +798,12 @@ class SpectrogramWidget(QWidget):
         return None, None
 
     def _find_detection_at_pos(self, pos, spec_rect):
-        """Find detection at position (checks both x and y axes)."""
+        """Find detection at position (checks both x and y axes).
+
+        Uses a generous click target — the box itself plus a 6px padding zone,
+        so small boxes are easier to click on.
+        """
+        pad = 6  # pixels of padding around each box
         for i, det in enumerate(self.detections):
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
@@ -757,7 +815,7 @@ class SpectrogramWidget(QWidget):
             y1 = self._freq_to_y(max_freq, spec_rect)  # top
             y2 = self._freq_to_y(min_freq, spec_rect)  # bottom
 
-            if x1 <= pos.x() <= x2 and y1 <= pos.y() <= y2:
+            if (x1 - pad) <= pos.x() <= (x2 + pad) and (y1 - pad) <= pos.y() <= (y2 + pad):
                 return i
         return -1
 
@@ -925,6 +983,7 @@ class WaveformOverviewWidget(QWidget):
 class DSPDetectionWorker(QThread):
     """Worker thread for DSP detection."""
     progress = pyqtSignal(str, int, int)  # filename, current, total
+    file_progress = pyqtSignal(float)  # fraction 0.0-1.0 within current file
     file_complete = pyqtSignal(str, int)  # filename, n_detections
     all_complete = pyqtSignal(dict)  # results dict
     error = pyqtSignal(str, str)  # filename, error message
@@ -944,11 +1003,15 @@ class DSPDetectionWorker(QThread):
         from fnt.usv.usv_detector.config import USVDetectorConfig
 
         config = USVDetectorConfig(
-            min_freq_hz=self.config.get('min_freq_hz', 25000),
+            min_freq_hz=self.config.get('min_freq_hz', 20000),
             max_freq_hz=self.config.get('max_freq_hz', 65000),
             energy_threshold_db=self.config.get('energy_threshold_db', 10.0),
-            min_duration_ms=self.config.get('min_duration_ms', 5.0),
-            max_duration_ms=self.config.get('max_duration_ms', 300.0),
+            min_duration_ms=self.config.get('min_duration_ms', 10.0),
+            max_duration_ms=self.config.get('max_duration_ms', 1000.0),
+            max_bandwidth_hz=self.config.get('max_bandwidth_hz', 20000.0),
+            min_tonality=self.config.get('min_tonality', 0.3),
+            min_call_freq_hz=self.config.get('min_call_freq_hz', 0.0),
+            harmonic_filter=self.config.get('harmonic_filter', True),
             min_gap_ms=self.config.get('min_gap_ms', 5.0),
             noise_percentile=self.config.get('noise_percentile', 25.0),
             nperseg=self.config.get('nperseg', 512),
@@ -964,9 +1027,13 @@ class DSPDetectionWorker(QThread):
 
             filename = os.path.basename(filepath)
             self.progress.emit(filename, i, total)
+            self.file_progress.emit(0.0)
 
             try:
-                detections = detector.detect_file(filepath)
+                def on_chunk_progress(fraction):
+                    self.file_progress.emit(fraction)
+
+                detections = detector.detect_file(filepath, progress_callback=on_chunk_progress)
                 # If stop was requested during processing, discard this file's results
                 if self._stop_requested:
                     break
@@ -1122,6 +1189,22 @@ class RFDetectionWorker(QThread):
 class USVStudioWindow(QMainWindow):
     """Main window for USV Studio."""
 
+    # Species-specific DSP detection presets.
+    # 'Manual' means user controls all parameters directly.
+    # Add new species by adding a key with a dict of DSP config values.
+    SPECIES_PROFILES = {
+        'Manual': None,
+        'Prairie Vole': {
+            'min_freq_hz': 20000, 'max_freq_hz': 65000,
+            'energy_threshold_db': 10.0,
+            'min_duration_ms': 10.0, 'max_duration_ms': 1000.0,
+            'max_bandwidth_hz': 20000, 'min_tonality': 0.30,
+            'min_call_freq_hz': 0, 'harmonic_filter': True,
+            'min_gap_ms': 5.0, 'noise_percentile': 25.0,
+            'nperseg': 512, 'noverlap': 384,
+        },
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FNT USV Studio")
@@ -1142,8 +1225,14 @@ class USVStudioWindow(QMainWindow):
 
         # Playback state
         self.is_playing = False
-        self.playback_speed = 0.1
+        self.playback_speed = 1.0
         self.use_heterodyne = False
+        self._playback_start_time = None  # Wall-clock time when playback started
+        self._playback_start_s = None     # Audio time (seconds) where playback begins
+        self._playback_end_s = None       # Audio time (seconds) where playback ends
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(30)  # ~33 fps update
+        self._playback_timer.timeout.connect(self._update_playback_position)
 
         # Undo stack (stores (action, data) tuples)
         self.undo_stack = deque(maxlen=50)
@@ -1341,12 +1430,12 @@ class USVStudioWindow(QMainWindow):
         self._speed_values = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
-        self.slider_speed.setValue(2)  # Default 0.1x
+        self.slider_speed.setValue(5)  # Default 1.0x
         self.slider_speed.setFixedWidth(100)
         self.slider_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.\n0.1x is a good default for ~50 kHz USV calls.")
         self.slider_speed.valueChanged.connect(self.on_speed_changed)
         controls_layout.addWidget(self.slider_speed)
-        self.lbl_speed = QLabel("0.1x")
+        self.lbl_speed = QLabel("1.0x")
         self.lbl_speed.setFixedWidth(35)
         controls_layout.addWidget(self.lbl_speed)
 
@@ -1453,6 +1542,19 @@ class USVStudioWindow(QMainWindow):
         group_layout = QVBoxLayout()
         group_layout.setSpacing(4)
 
+        # Species profile dropdown
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(4)
+        profile_row.addWidget(self._make_label("Profile:", "Select a species profile to auto-fill\nDSP parameters, or Manual to set them yourself.", min_width=62))
+        self.combo_species_profile = QComboBox()
+        for name in self.SPECIES_PROFILES.keys():
+            self.combo_species_profile.addItem(name)
+        self.combo_species_profile.setCurrentText("Manual")
+        self.combo_species_profile.setToolTip("Species profile presets.\nSelecting a profile auto-fills all DSP parameters\nand locks them. Choose Manual to customize.")
+        self.combo_species_profile.currentTextChanged.connect(self._on_species_profile_changed)
+        profile_row.addWidget(self.combo_species_profile, 1)
+        group_layout.addLayout(profile_row)
+
         # Frequency range
         freq_tip = ("Bandpass filter range for detection.\n"
                      "Only energy within this band is analyzed.\n"
@@ -1465,7 +1567,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_min_freq = QSpinBox()
         self.spin_min_freq.setRange(1000, 150000)
         self.spin_min_freq.setSingleStep(1000)
-        self.spin_min_freq.setValue(25000)
+        self.spin_min_freq.setValue(20000)
         self.spin_min_freq.setSuffix(" Hz")
         self.spin_min_freq.setToolTip("Minimum frequency of the detection bandpass filter (Hz)")
         freq_row.addWidget(self.spin_min_freq, 1)
@@ -1512,7 +1614,7 @@ class USVStudioWindow(QMainWindow):
 
         self.spin_min_dur = QDoubleSpinBox()
         self.spin_min_dur.setRange(1.0, 100.0)
-        self.spin_min_dur.setValue(5.0)
+        self.spin_min_dur.setValue(10.0)
         self.spin_min_dur.setSuffix(" ms")
         self.spin_min_dur.setToolTip("Minimum call duration — shorter events are discarded (ms)")
         dur_row.addWidget(self.spin_min_dur, 1)
@@ -1521,39 +1623,98 @@ class USVStudioWindow(QMainWindow):
 
         self.spin_max_dur = QDoubleSpinBox()
         self.spin_max_dur.setRange(10.0, 5000.0)
-        self.spin_max_dur.setValue(300.0)
+        self.spin_max_dur.setValue(1000.0)
         self.spin_max_dur.setSuffix(" ms")
         self.spin_max_dur.setToolTip("Maximum call duration — longer events are discarded (ms)")
         dur_row.addWidget(self.spin_max_dur, 1)
 
         group_layout.addLayout(dur_row)
 
-        # Advanced options (collapsible)
-        self.chk_advanced = QCheckBox("Advanced Options")
-        self.chk_advanced.setToolTip("Show additional DSP detection parameters")
-        self.chk_advanced.toggled.connect(self._toggle_advanced_options)
-        group_layout.addWidget(self.chk_advanced)
+        # --- Noise Rejection Filters ---
+        # Max bandwidth
+        bw_tip = ("Maximum frequency bandwidth for a detection (Hz).\n"
+                  "Detections spanning a wider frequency range are\n"
+                  "discarded as broadband noise (cage bumps, movement).\n"
+                  "Real USV calls are narrowband (typically <15 kHz).\n"
+                  "Set to 0 to disable this filter.")
+        bw_row = QHBoxLayout()
+        bw_row.setSpacing(4)
+        bw_row.addWidget(self._make_label("Max BW:", bw_tip, min_width=62))
+        self.spin_max_bw = QSpinBox()
+        self.spin_max_bw.setRange(0, 100000)
+        self.spin_max_bw.setSingleStep(1000)
+        self.spin_max_bw.setValue(20000)
+        self.spin_max_bw.setSuffix(" Hz")
+        self.spin_max_bw.setToolTip(bw_tip)
+        bw_row.addWidget(self.spin_max_bw, 1)
+        group_layout.addLayout(bw_row)
 
-        self.advanced_widget = QWidget()
-        adv_layout = QVBoxLayout(self.advanced_widget)
-        adv_layout.setContentsMargins(10, 0, 0, 0)
-        adv_layout.setSpacing(4)
+        # Tonality (spectral purity)
+        ton_tip = ("Minimum spectral purity score (0.0 - 1.0).\n"
+                   "Measures how tonal vs. noisy a detection is.\n"
+                   "1.0 = pure tone (energy at one frequency).\n"
+                   "0.0 = broadband noise (energy spread everywhere).\n"
+                   "Real USV calls are tonal (typically >0.3).\n"
+                   "Higher = stricter, fewer false positives.\n"
+                   "Set to 0 to disable this filter.")
+        ton_row = QHBoxLayout()
+        ton_row.setSpacing(4)
+        ton_row.addWidget(self._make_label("Tonality:", ton_tip, min_width=62))
+        self.spin_tonality = QDoubleSpinBox()
+        self.spin_tonality.setRange(0.0, 1.0)
+        self.spin_tonality.setSingleStep(0.05)
+        self.spin_tonality.setDecimals(2)
+        self.spin_tonality.setValue(0.30)
+        self.spin_tonality.setToolTip(ton_tip)
+        ton_row.addWidget(self.spin_tonality, 1)
+        group_layout.addLayout(ton_row)
 
+        # Min call frequency
+        mcf_tip = ("Minimum actual frequency of a detection (Hz).\n"
+                   "Detections whose lowest frequency falls below\n"
+                   "this are discarded as likely broadband noise.\n"
+                   "Broadband artifacts often extend down to the\n"
+                   "detection floor, while real USVs start higher.\n"
+                   "Set to 0 to disable this filter.")
+        mcf_row = QHBoxLayout()
+        mcf_row.setSpacing(4)
+        mcf_row.addWidget(self._make_label("Min Call F:", mcf_tip, min_width=62))
+        self.spin_min_call_freq = QSpinBox()
+        self.spin_min_call_freq.setRange(0, 100000)
+        self.spin_min_call_freq.setSingleStep(1000)
+        self.spin_min_call_freq.setValue(0)
+        self.spin_min_call_freq.setSuffix(" Hz")
+        self.spin_min_call_freq.setToolTip(mcf_tip)
+        mcf_row.addWidget(self.spin_min_call_freq, 1)
+        group_layout.addLayout(mcf_row)
+
+        # Harmonic filter checkbox
+        harmonic_tip = ("Merge temporally overlapping detections that are\n"
+                        "likely harmonics of the same call.\n"
+                        "When enabled, if two detections overlap by >=80%\n"
+                        "in time, only the lowest-frequency one (the\n"
+                        "fundamental) is kept and the harmonic is discarded.\n"
+                        "Recommended for species that produce strong harmonics.")
+        self.chk_harmonic_filter = QCheckBox("Harmonic Filter")
+        self.chk_harmonic_filter.setChecked(True)
+        self.chk_harmonic_filter.setToolTip(harmonic_tip)
+        group_layout.addWidget(self.chk_harmonic_filter)
+
+        # --- Additional Parameters ---
         # Min gap
         gap_tip = ("Minimum silent gap between calls (ms).\n"
                    "Calls closer together than this are merged\n"
                    "into a single detection.")
         gap_row = QHBoxLayout()
         gap_row.setSpacing(4)
-        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=72))
+        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=62))
         self.spin_min_gap = QDoubleSpinBox()
         self.spin_min_gap.setRange(0.0, 100.0)
         self.spin_min_gap.setValue(5.0)
         self.spin_min_gap.setSuffix(" ms")
         self.spin_min_gap.setToolTip(gap_tip)
-        gap_row.addWidget(self.spin_min_gap)
-        gap_row.addStretch()
-        adv_layout.addLayout(gap_row)
+        gap_row.addWidget(self.spin_min_gap, 1)
+        group_layout.addLayout(gap_row)
 
         # Noise percentile
         noise_tip = ("Percentile of spectrogram power used to\n"
@@ -1562,14 +1723,13 @@ class USVStudioWindow(QMainWindow):
                      "Typical: 20-30.")
         noise_row = QHBoxLayout()
         noise_row.setSpacing(4)
-        noise_row.addWidget(self._make_label("Noise %ile:", noise_tip, min_width=72))
+        noise_row.addWidget(self._make_label("Noise %ile:", noise_tip, min_width=62))
         self.spin_noise_pct = QDoubleSpinBox()
         self.spin_noise_pct.setRange(1.0, 50.0)
         self.spin_noise_pct.setValue(25.0)
         self.spin_noise_pct.setToolTip(noise_tip)
-        noise_row.addWidget(self.spin_noise_pct)
-        noise_row.addStretch()
-        adv_layout.addLayout(noise_row)
+        noise_row.addWidget(self.spin_noise_pct, 1)
+        group_layout.addLayout(noise_row)
 
         # FFT params
         fft_tip = ("FFT window size (samples). Larger = better\n"
@@ -1593,7 +1753,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_noverlap.setValue(384)
         self.spin_noverlap.setToolTip(overlap_tip)
         fft_row.addWidget(self.spin_noverlap, 1)
-        adv_layout.addLayout(fft_row)
+        group_layout.addLayout(fft_row)
 
         # Frequency samples (optional)
         freq_samp_tip = ("Sample peak frequency at N evenly-spaced\n"
@@ -1615,10 +1775,19 @@ class USVStudioWindow(QMainWindow):
         self.spin_freq_samples.setFixedWidth(60)
         freq_samp_row.addWidget(self.spin_freq_samples)
         freq_samp_row.addStretch()
-        adv_layout.addLayout(freq_samp_row)
+        group_layout.addLayout(freq_samp_row)
 
-        self.advanced_widget.setVisible(False)
-        group_layout.addWidget(self.advanced_widget)
+        # Collect all DSP parameter widgets for profile enable/disable
+        self._dsp_param_widgets = [
+            self.spin_min_freq, self.spin_max_freq,
+            self.spin_threshold,
+            self.spin_min_dur, self.spin_max_dur,
+            self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
+            self.chk_harmonic_filter,
+            self.spin_min_gap, self.spin_noise_pct,
+            self.spin_nperseg, self.spin_noverlap,
+            self.chk_freq_samples, self.spin_freq_samples,
+        ]
 
         # Queue display
         self.lbl_queue = QLabel("Queue: 0 files")
@@ -1657,11 +1826,20 @@ class USVStudioWindow(QMainWindow):
         self.btn_run_dsp.setEnabled(False)
         group_layout.addWidget(self.btn_run_dsp)
 
-        # Progress
+        # Batch progress (tracks files completed)
         self.dsp_progress = QProgressBar()
         self.dsp_progress.setValue(0)
         self.dsp_progress.setVisible(False)
+        self.dsp_progress.setFormat("Batch: %p%")
         group_layout.addWidget(self.dsp_progress)
+
+        # Per-file progress (tracks chunks within current file)
+        self.dsp_file_progress = QProgressBar()
+        self.dsp_file_progress.setValue(0)
+        self.dsp_file_progress.setVisible(False)
+        self.dsp_file_progress.setFormat("File: %p%")
+        self.dsp_file_progress.setMaximumHeight(12)
+        group_layout.addWidget(self.dsp_file_progress)
 
         self.btn_stop_dsp = QPushButton("Stop Detection")
         self.btn_stop_dsp.setStyleSheet("background-color: #d13438;")
@@ -1822,6 +2000,13 @@ class USVStudioWindow(QMainWindow):
         self.btn_reject.setEnabled(False)
         btn_row1.addWidget(self.btn_reject)
 
+        self.btn_skip = QPushButton("Skip")
+        self.btn_skip.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_skip.clicked.connect(self.skip_detection)
+        self.btn_skip.setEnabled(False)
+        self.btn_skip.setToolTip("Skip to the next detection without changing\nits current status (S key).\nUseful for reviewing without modifying labels.")
+        btn_row1.addWidget(self.btn_skip)
+
         self.btn_undo = QPushButton("Undo")
         self.btn_undo.setStyleSheet("background-color: #5c5c5c;")
         self.btn_undo.clicked.connect(self.undo_action)
@@ -1974,23 +2159,93 @@ class USVStudioWindow(QMainWindow):
         predict_group.setLayout(predict_layout)
         layout.addWidget(predict_group)
 
-    def _toggle_advanced_options(self, checked):
-        """Toggle advanced options visibility."""
-        self.advanced_widget.setVisible(checked)
+    def _on_species_profile_changed(self, profile_name):
+        """Handle species profile dropdown change."""
+        preset = self.SPECIES_PROFILES.get(profile_name)
+
+        if preset is None:
+            # Manual mode — re-enable all DSP parameter widgets
+            for w in self._dsp_param_widgets:
+                w.setEnabled(True)
+                w.setStyleSheet("")  # Clear locked styling
+            # Respect freq_samples checkbox state
+            self.spin_freq_samples.setEnabled(self.chk_freq_samples.isChecked())
+        else:
+            # Block signals on all spinboxes to avoid cascading updates
+            spinboxes = [
+                self.spin_min_freq, self.spin_max_freq, self.spin_threshold,
+                self.spin_min_dur, self.spin_max_dur,
+                self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
+                self.spin_min_gap, self.spin_noise_pct,
+                self.spin_nperseg, self.spin_noverlap,
+            ]
+            for s in spinboxes:
+                s.blockSignals(True)
+
+            self.spin_min_freq.setValue(preset['min_freq_hz'])
+            self.spin_max_freq.setValue(preset['max_freq_hz'])
+            self.spin_threshold.setValue(preset['energy_threshold_db'])
+            self.spin_min_dur.setValue(preset['min_duration_ms'])
+            self.spin_max_dur.setValue(preset['max_duration_ms'])
+            self.spin_max_bw.setValue(preset['max_bandwidth_hz'])
+            self.spin_tonality.setValue(preset['min_tonality'])
+            self.spin_min_call_freq.setValue(preset['min_call_freq_hz'])
+            self.spin_min_gap.setValue(preset['min_gap_ms'])
+            self.spin_noise_pct.setValue(preset['noise_percentile'])
+            self.spin_nperseg.setValue(preset['nperseg'])
+            self.spin_noverlap.setValue(preset['noverlap'])
+            self.chk_harmonic_filter.setChecked(preset.get('harmonic_filter', True))
+
+            for s in spinboxes:
+                s.blockSignals(False)
+
+            # Disable all DSP parameter widgets with strong visual indicator
+            locked_style = "background-color: #1a1a1a; color: #555555;"
+            for w in self._dsp_param_widgets:
+                w.setEnabled(False)
+                w.setStyleSheet(locked_style)
 
     def _setup_shortcuts(self):
         """Set up global keyboard shortcuts using QShortcut."""
-        # Navigation - QShortcut works regardless of which widget has focus
-        sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
-        sc_right.setContext(Qt.ApplicationShortcut)
-        sc_right.activated.connect(self._shortcut_next_detection)
+        # Detection navigation: B = back, N = next
+        sc_next = QShortcut(QKeySequence(Qt.Key_N), self)
+        sc_next.setContext(Qt.ApplicationShortcut)
+        sc_next.activated.connect(self._shortcut_next_detection)
 
-        sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
-        sc_left.setContext(Qt.ApplicationShortcut)
-        sc_left.activated.connect(self._shortcut_prev_detection)
+        sc_prev = QShortcut(QKeySequence(Qt.Key_B), self)
+        sc_prev.setContext(Qt.ApplicationShortcut)
+        sc_prev.activated.connect(self._shortcut_prev_detection)
+
+        # Spectrogram panning: Left/Right arrow keys
+        sc_pan_right = QShortcut(QKeySequence(Qt.Key_Right), self)
+        sc_pan_right.setContext(Qt.ApplicationShortcut)
+        sc_pan_right.activated.connect(self._shortcut_pan_right)
+
+        sc_pan_left = QShortcut(QKeySequence(Qt.Key_Left), self)
+        sc_pan_left.setContext(Qt.ApplicationShortcut)
+        sc_pan_left.activated.connect(self._shortcut_pan_left)
+
+        # Window size: Up = zoom in (smaller window), Down = zoom out (larger window)
+        sc_zoom_in = QShortcut(QKeySequence(Qt.Key_Up), self)
+        sc_zoom_in.setContext(Qt.ApplicationShortcut)
+        sc_zoom_in.activated.connect(self._shortcut_zoom_in)
+
+        sc_zoom_out = QShortcut(QKeySequence(Qt.Key_Down), self)
+        sc_zoom_out.setContext(Qt.ApplicationShortcut)
+        sc_zoom_out.activated.connect(self._shortcut_zoom_out)
+
+        # P = add new pending USV detection
+        sc_add_usv = QShortcut(QKeySequence(Qt.Key_P), self)
+        sc_add_usv.setContext(Qt.ApplicationShortcut)
+        sc_add_usv.activated.connect(self._shortcut_add_usv)
+
+        # S = skip detection (advance without changing status)
+        sc_skip = QShortcut(QKeySequence(Qt.Key_S), self)
+        sc_skip.setContext(Qt.ApplicationShortcut)
+        sc_skip.activated.connect(self._shortcut_skip)
 
     def _shortcut_next_detection(self):
-        """Handle Right arrow shortcut."""
+        """Handle N key shortcut — next detection."""
         focus = QApplication.focusWidget()
         if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
             return
@@ -1999,13 +2254,59 @@ class USVStudioWindow(QMainWindow):
             self.next_detection()
 
     def _shortcut_prev_detection(self):
-        """Handle Left arrow shortcut."""
+        """Handle B key shortcut — previous detection."""
         focus = QApplication.focusWidget()
         if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
             return
         if self.btn_prev_det.isEnabled():
             self._flash_button(self.btn_prev_det)
             self.prev_detection()
+
+    def _shortcut_pan_right(self):
+        """Handle Right arrow — pan spectrogram right."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.pan_right()
+
+    def _shortcut_pan_left(self):
+        """Handle Left arrow — pan spectrogram left."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.pan_left()
+
+    def _shortcut_zoom_out(self):
+        """Handle Up arrow — increase window size (zoom out)."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.zoom_out()
+
+    def _shortcut_zoom_in(self):
+        """Handle Down arrow — decrease window size (zoom in)."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.zoom_in()
+
+    def _shortcut_add_usv(self):
+        """Handle P key — add new pending USV detection."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_add_usv.isEnabled():
+            self._flash_button(self.btn_add_usv)
+            self.add_new_usv()
+
+    def _shortcut_skip(self):
+        """Handle S key — skip to next detection without changing status."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_skip.isEnabled():
+            self._flash_button(self.btn_skip)
+            self.skip_detection()
 
     def _setup_pan_timers(self):
         """Set up press-and-hold repeat timers for pan buttons."""
@@ -2288,18 +2589,12 @@ class USVStudioWindow(QMainWindow):
         if not folder:
             return
 
-        wav_files = list(Path(folder).glob("*.wav")) + list(Path(folder).glob("*.WAV"))
+        wav_files = sorted(list(Path(folder).glob("*.wav")) + list(Path(folder).glob("*.WAV")))
         if not wav_files:
             QMessageBox.warning(self, "No Files", "No WAV files found in folder.")
             return
 
-        for f in wav_files:
-            if str(f) not in self.audio_files:
-                self.audio_files.append(str(f))
-
-        # Pre-load detection counts from existing CSVs
-        self._scan_existing_csvs()
-        self._update_file_list()
+        self._add_audio_files([str(f) for f in wav_files])
 
     def add_files(self):
         """Add individual WAV files."""
@@ -2310,11 +2605,41 @@ class USVStudioWindow(QMainWindow):
         if not files:
             return
 
-        for f in files:
-            if f not in self.audio_files:
-                self.audio_files.append(f)
+        self._add_audio_files(files)
 
-        self._update_file_list()
+    def _add_audio_files(self, new_files):
+        """Add files to the import list, skipping duplicates with a warning."""
+        duplicates = [f for f in new_files if f in self.audio_files]
+        to_add = [f for f in new_files if f not in self.audio_files]
+
+        if duplicates and not to_add:
+            QMessageBox.information(
+                self, "Already Imported",
+                f"All {len(duplicates)} file{'s' if len(duplicates) != 1 else ''} "
+                "are already imported. No new files added.")
+            return
+
+        if duplicates:
+            self.status_bar.showMessage(
+                f"Added {len(to_add)} new file{'s' if len(to_add) != 1 else ''}, "
+                f"skipped {len(duplicates)} already imported")
+        else:
+            self.status_bar.showMessage(
+                f"Added {len(to_add)} file{'s' if len(to_add) != 1 else ''}")
+
+        had_files = len(self.audio_files) > 0
+        for f in to_add:
+            self.audio_files.append(f)
+
+        # Scan new files for existing CSV detections
+        self._scan_existing_csvs()
+
+        if had_files:
+            # Already have files loaded — just refresh the list display
+            self._refresh_file_list_items_full()
+        else:
+            # First files being added — do full list build + load first file
+            self._update_file_list()
 
     def _scan_existing_csvs(self):
         """Pre-scan for existing CSV detection files to show counts in file list."""
@@ -2354,7 +2679,9 @@ class USVStudioWindow(QMainWindow):
         self._update_ui_state()
 
     def _update_file_list(self):
-        """Update file list display."""
+        """Update file list display. Blocks signals to prevent
+        _store_current_detections from overwriting freshly loaded data."""
+        self.file_list.blockSignals(True)
         self.file_list.clear()
 
         for filepath in self.audio_files:
@@ -2381,9 +2708,46 @@ class USVStudioWindow(QMainWindow):
 
         if n > 0 and self.current_file_idx < n:
             self.file_list.setCurrentRow(self.current_file_idx)
+        self.file_list.blockSignals(False)
+
+        if n > 0 and self.current_file_idx < n:
             self._load_current_file()
 
         self._update_ui_state()
+
+    def _refresh_file_list_items_full(self):
+        """Rebuild file list widget without reloading the current file.
+
+        Used when adding more files to an already-populated list.
+        """
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+
+        for filepath in self.audio_files:
+            filename = os.path.basename(filepath)
+            parts = []
+            if filepath in self.dsp_queue:
+                parts.append("\u2713")
+            parts.append(filename)
+            if filepath in self.all_detections:
+                n_det = len(self.all_detections[filepath])
+                parts.append(f"({n_det})")
+            item = QListWidgetItem(" ".join(parts))
+            item.setData(Qt.UserRole, filepath)
+            self.file_list.addItem(item)
+
+        n = len(self.audio_files)
+        self.lbl_file_num.setText(f"File {self.current_file_idx + 1 if n > 0 else 0}/{n}")
+        self.btn_prev_file.setEnabled(self.current_file_idx > 0)
+        self.btn_next_file.setEnabled(self.current_file_idx < n - 1)
+        self.btn_add_to_queue.setEnabled(n > 0)
+        self.btn_add_all_to_queue.setEnabled(n > 0)
+
+        if n > 0 and self.current_file_idx < n:
+            self.file_list.setCurrentRow(self.current_file_idx)
+        self.file_list.blockSignals(False)
+
+        self._update_file_navigation()
 
     def on_file_selected(self, row):
         """Handle file selection from list."""
@@ -2397,14 +2761,16 @@ class USVStudioWindow(QMainWindow):
     def prev_file(self):
         """Go to previous file."""
         if self.current_file_idx > 0:
-            self.current_file_idx -= 1
-            self.file_list.setCurrentRow(self.current_file_idx)
+            # Only change list selection — on_file_selected will handle
+            # storing old detections and updating current_file_idx
+            self.file_list.setCurrentRow(self.current_file_idx - 1)
 
     def next_file(self):
         """Go to next file."""
         if self.current_file_idx < len(self.audio_files) - 1:
-            self.current_file_idx += 1
-            self.file_list.setCurrentRow(self.current_file_idx)
+            # Only change list selection — on_file_selected will handle
+            # storing old detections and updating current_file_idx
+            self.file_list.setCurrentRow(self.current_file_idx + 1)
 
     def _update_file_navigation(self):
         """Update file navigation buttons."""
@@ -2585,6 +2951,18 @@ class USVStudioWindow(QMainWindow):
     # DSP Detection
     # =========================================================================
 
+    def _file_has_detections(self, filepath):
+        """Check if a file has existing detections (in memory or on disk)."""
+        if filepath in self.all_detections and len(self.all_detections[filepath]) > 0:
+            return True
+        # Check for CSV on disk
+        base = Path(filepath).stem
+        parent = Path(filepath).parent
+        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+            if (parent / f"{base}{suffix}.csv").exists():
+                return True
+        return False
+
     def add_to_queue(self):
         """Add current file to DSP queue."""
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
@@ -2592,34 +2970,25 @@ class USVStudioWindow(QMainWindow):
 
         filepath = self.audio_files[self.current_file_idx]
         if filepath not in self.dsp_queue:
-            # Check if file already has detections
-            if filepath in self.all_detections and len(self.all_detections[filepath]) > 0:
-                reply = QMessageBox.question(
-                    self, "Existing Detections",
-                    f"This file already has {len(self.all_detections[filepath])} detections.\n"
-                    "Running DSP detection will overwrite them.\n\nAdd to queue anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                if reply != QMessageBox.Yes:
-                    return
-
             self.dsp_queue.append(filepath)
             self._update_queue_display()
+            self.status_bar.showMessage(f"Added 1 file to queue")
 
     def add_all_to_queue(self):
         """Add all imported files to DSP queue."""
         if not self.audio_files:
             return
 
-        added = 0
-        for filepath in self.audio_files:
-            if filepath not in self.dsp_queue:
-                self.dsp_queue.append(filepath)
-                added += 1
+        files_to_add = [f for f in self.audio_files if f not in self.dsp_queue]
+        if not files_to_add:
+            self.status_bar.showMessage("All files already in queue")
+            return
+
+        for filepath in files_to_add:
+            self.dsp_queue.append(filepath)
 
         self._update_queue_display()
-        self.status_bar.showMessage(f"Added {added} file{'s' if added != 1 else ''} to queue")
+        self.status_bar.showMessage(f"Added {len(files_to_add)} file{'s' if len(files_to_add) != 1 else ''} to queue")
 
     def clear_queue(self):
         """Clear DSP queue."""
@@ -2643,6 +3012,37 @@ class USVStudioWindow(QMainWindow):
         if not self.dsp_queue:
             return
 
+        # Check which queued files already have detections
+        files_with_dets = [f for f in self.dsp_queue if self._file_has_detections(f)]
+        files_without_dets = [f for f in self.dsp_queue if f not in files_with_dets]
+        n_with = len(files_with_dets)
+        n_without = len(files_without_dets)
+        n_total = len(self.dsp_queue)
+
+        if n_with > 0:
+            msg = (f"Queue: {n_total} file{'s' if n_total != 1 else ''}\n"
+                   f"  - {n_with} file{'s' if n_with != 1 else ''} with existing detections\n"
+                   f"  - {n_without} file{'s' if n_without != 1 else ''} without detections\n\n"
+                   "How would you like to proceed?")
+            box = QMessageBox(self)
+            box.setWindowTitle("Existing Detections Found")
+            box.setText(msg)
+            btn_overwrite = box.addButton("Overwrite All", QMessageBox.AcceptRole)
+            btn_skip = box.addButton("Skip Existing", QMessageBox.ActionRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec_()
+
+            clicked = box.clickedButton()
+            if clicked == btn_skip:
+                if not files_without_dets:
+                    self.status_bar.showMessage("All queued files already have detections — nothing to process")
+                    return
+                self.dsp_queue = files_without_dets
+            elif clicked == btn_overwrite:
+                pass  # Keep full queue
+            else:
+                return  # Cancel
+
         # Gather config
         config = {
             'min_freq_hz': self.spin_min_freq.value(),
@@ -2650,6 +3050,10 @@ class USVStudioWindow(QMainWindow):
             'energy_threshold_db': self.spin_threshold.value(),
             'min_duration_ms': self.spin_min_dur.value(),
             'max_duration_ms': self.spin_max_dur.value(),
+            'max_bandwidth_hz': self.spin_max_bw.value(),
+            'min_tonality': self.spin_tonality.value(),
+            'min_call_freq_hz': self.spin_min_call_freq.value(),
+            'harmonic_filter': self.chk_harmonic_filter.isChecked(),
             'min_gap_ms': self.spin_min_gap.value(),
             'noise_percentile': self.spin_noise_pct.value(),
             'nperseg': self.spin_nperseg.value(),
@@ -2660,12 +3064,15 @@ class USVStudioWindow(QMainWindow):
         # Start worker
         self.dsp_worker = DSPDetectionWorker(self.dsp_queue.copy(), config)
         self.dsp_worker.progress.connect(self._on_dsp_progress)
+        self.dsp_worker.file_progress.connect(self._on_dsp_file_progress)
         self.dsp_worker.file_complete.connect(self._on_dsp_file_complete)
         self.dsp_worker.all_complete.connect(self._on_dsp_complete)
         self.dsp_worker.error.connect(self._on_dsp_error)
 
         self.dsp_progress.setVisible(True)
         self.dsp_progress.setValue(0)
+        self.dsp_file_progress.setVisible(True)
+        self.dsp_file_progress.setValue(0)
         self.btn_run_dsp.setEnabled(False)
         self.btn_run_dsp.setText("Running...")
         self.btn_stop_dsp.setVisible(True)
@@ -2680,17 +3087,28 @@ class USVStudioWindow(QMainWindow):
             self.btn_stop_dsp.setEnabled(False)
 
     def _on_dsp_progress(self, filename, current, total):
-        """Handle DSP progress update."""
+        """Handle DSP batch progress update (file-level)."""
         self.dsp_progress.setValue(int(current / total * 100))
-        self.lbl_dsp_status.setText(f"Processing: {filename}")
+        self.lbl_dsp_status.setText(f"Processing ({current + 1}/{total}): {filename}")
+        self.dsp_file_progress.setValue(0)
+
+    def _on_dsp_file_progress(self, fraction):
+        """Handle per-file progress update (chunk-level within a file)."""
+        self.dsp_file_progress.setValue(int(fraction * 100))
 
     def _on_dsp_file_complete(self, filename, n_detections):
         """Handle DSP file completion."""
+        self.dsp_file_progress.setValue(100)
         self.lbl_dsp_status.setText(f"{filename}: {n_detections} detections")
 
     def _on_dsp_complete(self, results):
         """Handle DSP detection completion."""
         was_stopped = hasattr(self, 'dsp_worker') and self.dsp_worker._stop_requested
+
+        # Standard columns for detection CSVs
+        std_columns = ['call_number', 'start_seconds', 'stop_seconds', 'duration_ms',
+                        'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
+                        'max_power_db', 'mean_power_db', 'status', 'source']
 
         # Store results (only files that completed before stop)
         for filepath, detections in results.items():
@@ -2699,14 +3117,22 @@ class USVStudioWindow(QMainWindow):
             else:
                 df = pd.DataFrame(detections)
 
-            if len(df) > 0 and 'status' not in df.columns:
-                df['status'] = 'pending'
-                df['source'] = 'dsp'
+            if len(df) > 0:
+                if 'status' not in df.columns:
+                    df['status'] = 'pending'
+                if 'source' not in df.columns:
+                    df['source'] = 'dsp'
+                # Add call_number column (1-indexed)
+                if 'call_number' not in df.columns:
+                    df.insert(0, 'call_number', range(1, len(df) + 1))
+            else:
+                # Empty result — create DataFrame with proper headers
+                df = pd.DataFrame(columns=std_columns)
 
             self.all_detections[filepath] = df
             self.detection_sources[filepath] = 'usv_dsp'
 
-            # Save CSV
+            # Save CSV (always, even if empty — so it's recognized on reload)
             base = Path(filepath).stem
             parent = Path(filepath).parent
             csv_path = parent / f"{base}_usv_dsp.csv"
@@ -2715,6 +3141,7 @@ class USVStudioWindow(QMainWindow):
         # Update UI
         self.dsp_progress.setValue(100)
         self.dsp_progress.setVisible(False)
+        self.dsp_file_progress.setVisible(False)
         self.btn_stop_dsp.setVisible(False)
         self.btn_stop_dsp.setEnabled(True)
         self.btn_run_dsp.setEnabled(True)
@@ -2728,10 +3155,21 @@ class USVStudioWindow(QMainWindow):
             self.lbl_dsp_status.setText(f"Complete: {total_det} total detections")
             self.status_bar.showMessage(f"DSP detection complete: {total_det} detections in {len(results)} files")
 
-        # Clear queue and reload current file
+        # Clear queue and refresh display
         self.dsp_queue = []
         self._update_queue_display()
-        self._update_file_list()
+
+        # Update the current file's detections_df from the new DSP results
+        # BEFORE refreshing the file list (which could trigger on_file_selected
+        # and _store_current_detections, overwriting the new results).
+        if self.audio_files and self.current_file_idx < len(self.audio_files):
+            current_filepath = self.audio_files[self.current_file_idx]
+            if current_filepath in self.all_detections:
+                self.detections_df = self.all_detections[current_filepath].copy()
+                self._ensure_freq_bounds(self.detections_df)
+                self.current_detection_idx = 0
+
+        self._refresh_file_list_items()
         self._load_current_file()
 
     def _on_dsp_error(self, filename, error):
@@ -2888,30 +3326,58 @@ class USVStudioWindow(QMainWindow):
         self.btn_train.setEnabled(n_usv >= 3 and n_noise >= 3)
 
     def prev_detection(self):
-        """Go to previous detection (respects filter)."""
+        """Go to previous detection by time (respects filter)."""
         if self.detections_df is None:
             return
         filtered = self._get_filtered_indices()
         if not filtered:
             return
-        # Find previous index in filtered list that's before current
-        prev_indices = [i for i in filtered if i < self.current_detection_idx]
-        if prev_indices:
-            self.current_detection_idx = prev_indices[-1]
-            self._update_display()
+        # Get current detection's start time
+        current_time = self.detections_df.iloc[self.current_detection_idx]['start_seconds']
+        # Find all filtered detections that start before current, sorted by time
+        earlier = [(i, self.detections_df.iloc[i]['start_seconds']) for i in filtered
+                   if self.detections_df.iloc[i]['start_seconds'] < current_time]
+        if not earlier:
+            # Wrap: also check detections at same time but different index
+            earlier = [(i, self.detections_df.iloc[i]['start_seconds']) for i in filtered
+                       if i != self.current_detection_idx]
+            if not earlier:
+                return
+            # Go to the last one temporally (wrap around)
+            earlier.sort(key=lambda x: x[1])
+            self.current_detection_idx = earlier[-1][0]
+        else:
+            # Go to the nearest earlier detection (latest start time before current)
+            earlier.sort(key=lambda x: x[1])
+            self.current_detection_idx = earlier[-1][0]
+        self._update_display()
 
     def next_detection(self):
-        """Go to next detection (respects filter)."""
+        """Go to next detection by time (respects filter)."""
         if self.detections_df is None:
             return
         filtered = self._get_filtered_indices()
         if not filtered:
             return
-        # Find next index in filtered list that's after current
-        next_indices = [i for i in filtered if i > self.current_detection_idx]
-        if next_indices:
-            self.current_detection_idx = next_indices[0]
-            self._update_display()
+        # Get current detection's start time
+        current_time = self.detections_df.iloc[self.current_detection_idx]['start_seconds']
+        # Find all filtered detections that start after current, sorted by time
+        later = [(i, self.detections_df.iloc[i]['start_seconds']) for i in filtered
+                 if self.detections_df.iloc[i]['start_seconds'] > current_time]
+        if not later:
+            # Wrap: also check detections at same time but different index
+            later = [(i, self.detections_df.iloc[i]['start_seconds']) for i in filtered
+                     if i != self.current_detection_idx]
+            if not later:
+                return
+            # Go to the first one temporally (wrap around)
+            later.sort(key=lambda x: x[1])
+            self.current_detection_idx = later[0][0]
+        else:
+            # Go to the nearest later detection (earliest start time after current)
+            later.sort(key=lambda x: x[1])
+            self.current_detection_idx = later[0][0]
+        self._update_display()
 
     def on_detection_selected(self, idx):
         """Handle detection selection from spectrogram."""
@@ -2999,12 +3465,13 @@ class USVStudioWindow(QMainWindow):
                 'max_freq_hz': max_freq,
                 'status': status,
             }
-            # Pass through peak_freq_N contour columns
-            for col in row.index:
-                if col.startswith('peak_freq_') and col != 'peak_freq_hz':
-                    val = row[col]
-                    if not pd.isna(val):
-                        det[col] = val
+            # Pass through peak_freq_N contour columns only if freq sampling is enabled
+            if self.chk_freq_samples.isChecked():
+                for col in row.index:
+                    if col.startswith('peak_freq_') and col != 'peak_freq_hz':
+                        val = row[col]
+                        if not pd.isna(val):
+                            det[col] = val
             detections.append(det)
 
         self.spectrogram.set_detections(detections, self.current_detection_idx)
@@ -3155,6 +3622,31 @@ class USVStudioWindow(QMainWindow):
         self._update_button_counts()
         self._auto_advance()
 
+    def skip_detection(self):
+        """Skip to next detection by time without changing its status."""
+        if self.detections_df is None:
+            return
+        current_time = self.detections_df.iloc[self.current_detection_idx]['start_seconds']
+        # Find temporally next detection (any status)
+        all_dets = [(i, self.detections_df.iloc[i]['start_seconds'])
+                    for i in range(len(self.detections_df))]
+        all_dets.sort(key=lambda x: x[1])
+        for idx, t in all_dets:
+            if t > current_time:
+                self.current_detection_idx = idx
+                self._update_display()
+                return
+        # At the last detection temporally — about to wrap
+        # If fully curated, prompt to move to next file
+        n_pending = (self.detections_df['status'] == 'pending').sum()
+        if n_pending == 0:
+            self._update_display()
+            self._prompt_next_file()
+            return
+        # Wrap to earliest
+        self.current_detection_idx = all_dets[0][0]
+        self._update_display()
+
     def _update_button_counts(self):
         """Update Accept/Reject/Noise button labels with counts."""
         if self.detections_df is None or len(self.detections_df) == 0:
@@ -3178,17 +3670,20 @@ class USVStudioWindow(QMainWindow):
         view_center = (view_start + view_end) / 2
         view_duration = view_end - view_start
 
-        new_duration = min(0.05, view_duration * 0.1)
+        new_duration = min(0.03, view_duration * 0.05)
         new_start = view_center - new_duration / 2
         new_stop = view_center + new_duration / 2
 
+        # Small square box centered at 40 kHz (typical USV range)
+        freq_center = 40000
+        freq_half = 4000  # ±4 kHz = 8 kHz span
         new_row = {
             'start_seconds': new_start,
             'stop_seconds': new_stop,
             'duration_ms': new_duration * 1000,
-            'min_freq_hz': 30000,
-            'max_freq_hz': 60000,
-            'peak_freq_hz': 45000,
+            'min_freq_hz': freq_center - freq_half,
+            'max_freq_hz': freq_center + freq_half,
+            'peak_freq_hz': freq_center,
             'status': 'pending',
             'source': 'manual'
         }
@@ -3294,10 +3789,92 @@ class USVStudioWindow(QMainWindow):
         self.status_bar.showMessage(f"Deleted all {n_total} detections")
 
     def _auto_advance(self):
-        """Auto-advance to next detection."""
-        if self.detections_df is not None and self.current_detection_idx < len(self.detections_df) - 1:
-            self.current_detection_idx += 1
+        """Auto-advance to next pending detection by time, with wrap-around.
+
+        After accept/reject, finds the temporally next pending detection.
+        If none exist after the current position, wraps to the beginning.
+        If ALL detections have been curated, prompts to move to next file.
+        """
+        if self.detections_df is None:
+            return
+
+        current_time = self.detections_df.iloc[self.current_detection_idx]['start_seconds']
+
+        # Build list of all pending detections with their times
+        pending = []
+        for i in range(len(self.detections_df)):
+            if self.detections_df.iloc[i]['status'] == 'pending':
+                pending.append((i, self.detections_df.iloc[i]['start_seconds']))
+
+        if not pending:
+            # All detections have been curated — prompt for next file
             self._update_display()
+            self._prompt_next_file()
+            return
+
+        # Sort by start time
+        pending.sort(key=lambda x: x[1])
+
+        # Find next pending after current time
+        for idx, t in pending:
+            if t > current_time:
+                self.current_detection_idx = idx
+                self._update_display()
+                return
+
+        # Wrap around — take the earliest pending detection
+        self.current_detection_idx = pending[0][0]
+        self._update_display()
+
+    def _prompt_next_file(self):
+        """Show dialog when all detections are curated, asking to move to next file."""
+        box = QMessageBox(self)
+        box.setWindowTitle("File Complete")
+        box.setText("All detections in this file have been curated.\n\nMove to the next file?")
+        btn_yes = box.addButton("Yes (Press Enter)", QMessageBox.AcceptRole)
+        box.addButton("No", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_yes)
+        box.exec_()
+        if box.clickedButton() == btn_yes:
+            self._advance_to_next_file_with_detections()
+
+    def _advance_to_next_file_with_detections(self):
+        """Auto-switch to the next file that has detections."""
+        if not self.audio_files:
+            return
+
+        # Save current file's detections first
+        self._store_current_detections()
+
+        # Search forward through files for one with detections
+        for offset in range(1, len(self.audio_files)):
+            next_idx = (self.current_file_idx + offset) % len(self.audio_files)
+            filepath = self.audio_files[next_idx]
+
+            has_dets = filepath in self.all_detections and len(self.all_detections[filepath]) > 0
+            if not has_dets:
+                # Check disk
+                has_dets = self._file_has_detections(filepath)
+
+            if has_dets:
+                self.file_list.setCurrentRow(next_idx)
+                # Jump to first pending detection by time, or first detection if none pending
+                if self.detections_df is not None and len(self.detections_df) > 0:
+                    pending = [(i, self.detections_df.iloc[i]['start_seconds'])
+                               for i in range(len(self.detections_df))
+                               if self.detections_df.iloc[i]['status'] == 'pending']
+                    if pending:
+                        pending.sort(key=lambda x: x[1])
+                        self.current_detection_idx = pending[0][0]
+                    else:
+                        time_sorted = self.detections_df['start_seconds'].argsort()
+                        self.current_detection_idx = time_sorted.iloc[0]
+                    self._update_display()
+                self.status_bar.showMessage(
+                    f"Advanced to {os.path.basename(filepath)}")
+                return
+
+        self.status_bar.showMessage("No more files with detections")
 
     def _store_current_detections(self):
         """Store current detections in all_detections dict and save to CSV."""
@@ -3314,6 +3891,15 @@ class USVStudioWindow(QMainWindow):
         """Save current detections to CSV file, preserving original naming."""
         if self.detections_df is None or len(self.detections_df) == 0:
             return
+
+        # Refresh call_number column before saving
+        self.detections_df['call_number'] = range(1, len(self.detections_df) + 1)
+        # Ensure call_number is the first column
+        cols = self.detections_df.columns.tolist()
+        if 'call_number' in cols:
+            cols.remove('call_number')
+            cols.insert(0, 'call_number')
+            self.detections_df = self.detections_df[cols]
 
         base = Path(filepath).stem
         parent = Path(filepath).parent
@@ -3364,14 +3950,34 @@ class USVStudioWindow(QMainWindow):
                 segment = self._heterodyne(segment)
                 play_sr = 44100
             else:
-                # Resample for slow playback
-                target_sr = int(self.sample_rate * self.playback_speed)
-                target_sr = max(8000, min(target_sr, 192000))
-                play_sr = target_sr
+                # Resample to a standard output rate for smooth playback.
+                # Playing at speed S means the output should have
+                # (original_duration / S) seconds of audio at the output rate.
+                output_sr = 44100
+                # Number of output samples = original_duration / speed * output_sr
+                original_duration = len(segment) / self.sample_rate
+                output_duration = original_duration / self.playback_speed
+                n_output_samples = int(output_duration * output_sr)
+                if n_output_samples < 100:
+                    return
+                segment = signal.resample(segment, n_output_samples).astype(np.float32)
+                play_sr = output_sr
 
             sd.play(segment, play_sr)
             self.is_playing = True
             self.btn_play.setText("Playing...")
+
+            # Track playback position for the moving line.
+            # Use a small latency offset to account for audio output buffering.
+            import time as _time
+            self._playback_latency = 0.15  # seconds of estimated output latency
+            self._playback_start_time = _time.time()
+            self._playback_start_s = start_s
+            self._playback_end_s = stop_s
+            self._playback_timer.start()
+
+            # Disable pan/zoom/navigation controls during playback
+            self._set_playback_controls_enabled(False)
 
         except Exception as e:
             self.status_bar.showMessage(f"Playback error: {e}")
@@ -3382,6 +3988,48 @@ class USVStudioWindow(QMainWindow):
             sd.stop()
         self.is_playing = False
         self.btn_play.setText("Play")
+        self._playback_timer.stop()
+        self.spectrogram.playback_position = None
+        self.spectrogram.update()
+        # Re-enable controls
+        self._set_playback_controls_enabled(True)
+
+    def _update_playback_position(self):
+        """Timer callback to update the playback position line."""
+        import time as _time
+        if not self.is_playing or self._playback_start_time is None:
+            self.stop_playback()
+            return
+
+        # Subtract latency offset so the line matches when audio is heard
+        elapsed = _time.time() - self._playback_start_time - self._playback_latency
+        elapsed = max(0.0, elapsed)
+        # Convert wall-clock elapsed to audio time using playback speed
+        audio_elapsed = elapsed * self.playback_speed
+        current_pos = self._playback_start_s + audio_elapsed
+
+        if current_pos >= self._playback_end_s:
+            # Playback finished
+            self.stop_playback()
+            return
+
+        self.spectrogram.playback_position = current_pos
+        self.spectrogram.update()
+
+    def _set_playback_controls_enabled(self, enabled):
+        """Enable or disable pan/zoom/navigation controls during playback."""
+        self.btn_pan_left.setEnabled(enabled)
+        self.btn_pan_right.setEnabled(enabled)
+        self.btn_zoom_in.setEnabled(enabled)
+        self.btn_zoom_out.setEnabled(enabled)
+        self.spin_view_window.setEnabled(enabled)
+        self.time_scrollbar.setEnabled(enabled)
+        self.btn_prev_det.setEnabled(enabled)
+        self.btn_next_det.setEnabled(enabled)
+        self.btn_prev_file.setEnabled(enabled)
+        self.btn_next_file.setEnabled(enabled)
+        self.slider_speed.setEnabled(enabled)
+        self.file_list.setEnabled(enabled)
 
     def _heterodyne(self, segment, carrier_freq=40000):
         """Apply heterodyne transformation."""
@@ -3653,6 +4301,7 @@ class USVStudioWindow(QMainWindow):
         # Labeling
         self.btn_accept.setEnabled(has_det)
         self.btn_reject.setEnabled(has_det)
+        self.btn_skip.setEnabled(has_det)
         self.btn_add_usv.setEnabled(has_audio)
         self.btn_delete.setEnabled(has_det)
 

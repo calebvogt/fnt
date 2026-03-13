@@ -52,11 +52,17 @@ class USVDetectorConfig:
     max_duration_ms: float = 300.0      # Maximum call duration
     min_gap_ms: float = 5.0             # Minimum gap to consider separate calls
 
+    # Noise rejection filters
+    max_bandwidth_hz: float = 20000.0   # Max freq bandwidth; wider = broadband noise
+    min_tonality: float = 0.3           # Min spectral purity (0=noise, 1=pure tone)
+    min_call_freq_hz: float = 0.0       # Discard if actual min freq is below this (0=off)
+    harmonic_filter: bool = True        # Merge temporally overlapping detections (keep fundamental)
+
     # Adaptive threshold parameters
     noise_percentile: float = 25.0      # Percentile for background noise estimate
 
     # Batch processing
-    chunk_duration_s: float = 60.0      # Process in 60-second chunks
+    chunk_duration_s: float = 10.0      # Process in 10-second chunks (finer progress updates)
     chunk_overlap_s: float = 0.5        # Small overlap to avoid boundary issues
 
     # Frequency sampling
