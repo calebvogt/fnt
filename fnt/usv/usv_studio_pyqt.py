@@ -4318,7 +4318,7 @@ class USVStudioWindow(QMainWindow):
         self.btn_add_usv.setEnabled(has_audio)
         self.btn_delete.setEnabled(has_det)
 
-        has_pending = has_det and (self.detections_df['status'] == 'pending').any()
+        has_pending = bool(has_det and (self.detections_df['status'] == 'pending').any())
         self.btn_delete_pending.setEnabled(has_pending)
         self.btn_delete_all_labels.setEnabled(has_det)
         self.btn_accept_all_pending.setEnabled(has_pending)
