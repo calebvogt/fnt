@@ -1194,12 +1194,12 @@ class USVStudioWindow(QMainWindow):
     # Add new species by adding a key with a dict of DSP config values.
     SPECIES_PROFILES = {
         'Manual': None,
-        'Prairie Vole': {
+        'Prairie Vole USVs': {
             'min_freq_hz': 20000, 'max_freq_hz': 65000,
             'energy_threshold_db': 10.0,
-            'min_duration_ms': 10.0, 'max_duration_ms': 1000.0,
-            'max_bandwidth_hz': 20000, 'min_tonality': 0.30,
-            'min_call_freq_hz': 0, 'harmonic_filter': True,
+            'min_duration_ms': 20.0, 'max_duration_ms': 1000.0,
+            'max_bandwidth_hz': 25000, 'min_tonality': 0.50,
+            'min_call_freq_hz': 15000, 'harmonic_filter': True,
             'min_gap_ms': 5.0, 'noise_percentile': 25.0,
             'nperseg': 512, 'noverlap': 384,
         },
