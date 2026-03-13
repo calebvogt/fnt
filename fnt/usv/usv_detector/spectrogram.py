@@ -190,6 +190,71 @@ def compute_spectrogram(
     return frequencies, times, Sxx_db
 
 
+def compute_spectrogram_auto(
+    audio: np.ndarray,
+    sr: int,
+    nperseg: int = 512,
+    noverlap: int = 384,
+    nfft: int = 1024,
+    window: str = 'hann',
+    min_freq: Optional[float] = None,
+    max_freq: Optional[float] = None,
+    gpu_enabled: bool = False,
+    gpu_device: str = 'auto'
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute spectrogram with automatic GPU/CPU dispatch.
+
+    When gpu_enabled=True, attempts GPU-accelerated computation via
+    torch.stft(). Falls back to scipy on any failure (no GPU, OOM, etc.).
+
+    Args:
+        audio: Audio signal array
+        sr: Sample rate
+        nperseg: Length of each segment (FFT window size)
+        noverlap: Number of points to overlap between segments
+        nfft: Length of FFT (zero-padded)
+        window: Window function
+        min_freq: Minimum frequency to include (Hz)
+        max_freq: Maximum frequency to include (Hz)
+        gpu_enabled: Whether to attempt GPU acceleration
+        gpu_device: PyTorch device string ("auto", "cuda:0", "mps", "cpu")
+
+    Returns:
+        Tuple of (frequencies, times, Sxx_db)
+    """
+    if gpu_enabled:
+        try:
+            from .gpu_spectrogram import compute_spectrogram_gpu
+            from .gpu_utils import get_best_device
+
+            device = gpu_device if gpu_device != 'auto' else get_best_device()
+            if device != 'cpu':
+                return compute_spectrogram_gpu(
+                    audio, sr,
+                    nperseg=nperseg,
+                    noverlap=noverlap,
+                    nfft=nfft,
+                    window=window,
+                    min_freq=min_freq,
+                    max_freq=max_freq,
+                    device=device,
+                )
+        except Exception as e:
+            warnings.warn(f"GPU spectrogram failed, falling back to CPU: {e}")
+
+    # CPU fallback (default path)
+    return compute_spectrogram(
+        audio, sr,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        nfft=nfft,
+        window=window,
+        min_freq=min_freq,
+        max_freq=max_freq,
+    )
+
+
 def bandpass_filter(
     audio: np.ndarray,
     sr: int,

@@ -11,8 +11,8 @@ from scipy.ndimage import label, binary_dilation, binary_erosion
 from typing import List, Dict, Optional, Tuple
 from .config import USVDetectorConfig
 from .spectrogram import (
-    load_audio, compute_spectrogram, bandpass_filter,
-    estimate_noise_floor, get_audio_info
+    load_audio, compute_spectrogram, compute_spectrogram_auto,
+    bandpass_filter, estimate_noise_floor, get_audio_info
 )
 
 
@@ -102,15 +102,17 @@ class DSPDetector:
             self.config.max_freq_hz
         )
 
-        # Compute spectrogram
-        frequencies, times, Sxx_db = compute_spectrogram(
+        # Compute spectrogram (GPU-accelerated if enabled)
+        frequencies, times, Sxx_db = compute_spectrogram_auto(
             filtered, sr,
             nperseg=self.config.nperseg,
             noverlap=self.config.noverlap,
             nfft=self.config.nfft,
             window=self.config.window_type,
             min_freq=self.config.min_freq_hz,
-            max_freq=self.config.max_freq_hz
+            max_freq=self.config.max_freq_hz,
+            gpu_enabled=self.config.gpu_enabled,
+            gpu_device=self.config.gpu_device,
         )
 
         # Detect calls from spectrogram
@@ -217,6 +219,15 @@ class DSPDetector:
         # Find connected regions
         labeled, num_features = label(mask)
 
+        # Split connected regions that have vertical frequency gaps
+        min_freq_gap_hz = getattr(self.config, 'min_freq_gap_hz', 0)
+        if min_freq_gap_hz > 0 and len(frequencies) > 1:
+            freq_resolution = float(frequencies[1] - frequencies[0])
+            min_gap_bins = max(1, int(min_freq_gap_hz / freq_resolution))
+            labeled, num_features = self._split_by_freq_gap(
+                labeled, num_features, min_gap_bins
+            )
+
         calls = []
         for i in range(1, num_features + 1):
             # Get region mask
@@ -280,6 +291,73 @@ class DSPDetector:
             })
 
         return calls
+
+    def _split_by_freq_gap(
+        self,
+        labeled: np.ndarray,
+        num_features: int,
+        min_gap_bins: int
+    ) -> tuple:
+        """Split connected regions that have vertical frequency gaps.
+
+        When a fundamental and its harmonic are connected in the binary mask
+        (e.g. via a noise bridge), they form one region. This method detects
+        vertical gaps within each region and splits them into separate labels.
+
+        Args:
+            labeled: 2D label array from scipy.ndimage.label
+            num_features: Number of regions found
+            min_gap_bins: Minimum gap in frequency bins to trigger a split
+
+        Returns:
+            (new_labeled, new_num_features) with split regions relabeled
+        """
+        new_labeled = labeled.copy()
+        next_label = num_features + 1
+
+        for i in range(1, num_features + 1):
+            region_mask = labeled == i
+
+            # Get occupied frequency bins for this region
+            freq_occupied = np.any(region_mask, axis=1)  # shape: (n_freq,)
+            occupied_bins = np.where(freq_occupied)[0]
+
+            if len(occupied_bins) < 2:
+                continue
+
+            # Find gaps between occupied bins
+            diffs = np.diff(occupied_bins)
+            gap_positions = np.where(diffs >= min_gap_bins)[0]
+
+            if len(gap_positions) == 0:
+                continue  # No gaps to split on
+
+            # Split into sub-regions at each gap
+            # gap_positions[k] means there's a gap between
+            # occupied_bins[gap_positions[k]] and occupied_bins[gap_positions[k]+1]
+            split_boundaries = []
+            for gp in gap_positions:
+                # Midpoint of the gap (in frequency bin space)
+                split_at = (occupied_bins[gp] + occupied_bins[gp + 1]) // 2
+                split_boundaries.append(split_at)
+
+            # Relabel: first segment keeps original label, subsequent get new labels
+            # Sort boundaries ascending
+            split_boundaries.sort()
+
+            for sb in split_boundaries:
+                # Everything above this boundary in this region gets a new label
+                upper_mask = region_mask.copy()
+                upper_mask[:sb + 1, :] = False  # Zero out below boundary
+
+                if np.any(upper_mask):
+                    new_labeled[upper_mask] = next_label
+                    next_label += 1
+
+                    # Update region_mask to only contain the lower portion
+                    region_mask[sb + 1:, :] = False
+
+        return new_labeled, next_label - 1
 
     def _filter_by_duration(self, calls: List[Dict]) -> List[Dict]:
         """Filter calls by minimum and maximum duration."""
@@ -551,12 +629,14 @@ class DSPDetector:
             self.config.max_freq_hz
         )
 
-        return compute_spectrogram(
+        return compute_spectrogram_auto(
             filtered, sr,
             nperseg=self.config.nperseg,
             noverlap=self.config.noverlap,
             nfft=self.config.nfft,
             window=self.config.window_type,
             min_freq=self.config.min_freq_hz,
-            max_freq=self.config.max_freq_hz
+            max_freq=self.config.max_freq_hz,
+            gpu_enabled=self.config.gpu_enabled,
+            gpu_device=self.config.gpu_device,
         )

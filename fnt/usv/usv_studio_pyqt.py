@@ -28,7 +28,8 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QProgressBar, QGroupBox,
     QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QListWidgetItem,
     QScrollArea, QSplitter, QStatusBar, QMessageBox, QScrollBar,
-    QSizePolicy, QFrame, QCheckBox, QShortcut, QSlider
+    QSizePolicy, QFrame, QCheckBox, QShortcut, QSlider,
+    QDialog, QDialogButtonBox
 )
 from scipy import signal
 
@@ -1012,10 +1013,13 @@ class DSPDetectionWorker(QThread):
             min_tonality=self.config.get('min_tonality', 0.3),
             min_call_freq_hz=self.config.get('min_call_freq_hz', 0.0),
             harmonic_filter=self.config.get('harmonic_filter', True),
+            min_freq_gap_hz=self.config.get('min_freq_gap_hz', 5000.0),
             min_gap_ms=self.config.get('min_gap_ms', 5.0),
             noise_percentile=self.config.get('noise_percentile', 25.0),
             nperseg=self.config.get('nperseg', 512),
             noverlap=self.config.get('noverlap', 384),
+            gpu_enabled=self.config.get('gpu_enabled', False),
+            gpu_device=self.config.get('gpu_device', 'auto'),
         )
 
         detector = DSPDetector(config)
@@ -1200,6 +1204,7 @@ class USVStudioWindow(QMainWindow):
             'min_duration_ms': 20.0, 'max_duration_ms': 1000.0,
             'max_bandwidth_hz': 25000, 'min_tonality': 0.50,
             'min_call_freq_hz': 15000, 'harmonic_filter': True,
+            'min_freq_gap_hz': 5000,
             'min_gap_ms': 5.0, 'noise_percentile': 25.0,
             'nperseg': 512, 'noverlap': 384,
         },
@@ -1545,7 +1550,7 @@ class USVStudioWindow(QMainWindow):
         # Species profile dropdown
         profile_row = QHBoxLayout()
         profile_row.setSpacing(4)
-        profile_row.addWidget(self._make_label("Profile:", "Select a species profile to auto-fill\nDSP parameters, or Manual to set them yourself.", min_width=62))
+        profile_row.addWidget(self._make_label("Profile:", "Select a species profile to auto-fill\nDSP parameters, or Manual to set them yourself.", min_width=90))
         self.combo_species_profile = QComboBox()
         for name in self.SPECIES_PROFILES.keys():
             self.combo_species_profile.addItem(name)
@@ -1562,7 +1567,7 @@ class USVStudioWindow(QMainWindow):
                      "Mice: typically 30-110 kHz.")
         freq_row = QHBoxLayout()
         freq_row.setSpacing(4)
-        freq_row.addWidget(self._make_label("Freq:", freq_tip, min_width=62))
+        freq_row.addWidget(self._make_label("Freq Range:", freq_tip, min_width=90))
 
         self.spin_min_freq = QSpinBox()
         self.spin_min_freq.setRange(1000, 150000)
@@ -1591,7 +1596,7 @@ class USVStudioWindow(QMainWindow):
                       "Typical range: 6-15 dB.")
         thresh_row = QHBoxLayout()
         thresh_row.setSpacing(4)
-        thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=62))
+        thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=90))
 
         self.spin_threshold = QDoubleSpinBox()
         self.spin_threshold.setRange(1.0, 30.0)
@@ -1610,7 +1615,7 @@ class USVStudioWindow(QMainWindow):
                    "Most USV calls are 5-200 ms.")
         dur_row = QHBoxLayout()
         dur_row.setSpacing(4)
-        dur_row.addWidget(self._make_label("Duration:", dur_tip, min_width=62))
+        dur_row.addWidget(self._make_label("Duration:", dur_tip, min_width=90))
 
         self.spin_min_dur = QDoubleSpinBox()
         self.spin_min_dur.setRange(1.0, 100.0)
@@ -1639,7 +1644,7 @@ class USVStudioWindow(QMainWindow):
                   "Set to 0 to disable this filter.")
         bw_row = QHBoxLayout()
         bw_row.setSpacing(4)
-        bw_row.addWidget(self._make_label("Max BW:", bw_tip, min_width=62))
+        bw_row.addWidget(self._make_label("Max Bandwidth:", bw_tip, min_width=90))
         self.spin_max_bw = QSpinBox()
         self.spin_max_bw.setRange(0, 100000)
         self.spin_max_bw.setSingleStep(1000)
@@ -1648,6 +1653,19 @@ class USVStudioWindow(QMainWindow):
         self.spin_max_bw.setToolTip(bw_tip)
         bw_row.addWidget(self.spin_max_bw, 1)
         group_layout.addLayout(bw_row)
+
+        # --- Advanced Options (collapsible) ---
+        self.btn_advanced_toggle = QPushButton("▶ Advanced Options")
+        self.btn_advanced_toggle.setFlat(True)
+        self.btn_advanced_toggle.setStyleSheet("text-align: left; color: #aaaaaa; font-size: 11px; padding: 2px 0px;")
+        self.btn_advanced_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_advanced_toggle.clicked.connect(self._toggle_advanced_options)
+        group_layout.addWidget(self.btn_advanced_toggle)
+
+        self.advanced_options_widget = QWidget()
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(4)
 
         # Tonality (spectral purity)
         ton_tip = ("Minimum spectral purity score (0.0 - 1.0).\n"
@@ -1659,7 +1677,7 @@ class USVStudioWindow(QMainWindow):
                    "Set to 0 to disable this filter.")
         ton_row = QHBoxLayout()
         ton_row.setSpacing(4)
-        ton_row.addWidget(self._make_label("Tonality:", ton_tip, min_width=62))
+        ton_row.addWidget(self._make_label("Tonality:", ton_tip, min_width=90))
         self.spin_tonality = QDoubleSpinBox()
         self.spin_tonality.setRange(0.0, 1.0)
         self.spin_tonality.setSingleStep(0.05)
@@ -1667,7 +1685,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_tonality.setValue(0.30)
         self.spin_tonality.setToolTip(ton_tip)
         ton_row.addWidget(self.spin_tonality, 1)
-        group_layout.addLayout(ton_row)
+        advanced_layout.addLayout(ton_row)
 
         # Min call frequency
         mcf_tip = ("Minimum actual frequency of a detection (Hz).\n"
@@ -1678,7 +1696,7 @@ class USVStudioWindow(QMainWindow):
                    "Set to 0 to disable this filter.")
         mcf_row = QHBoxLayout()
         mcf_row.setSpacing(4)
-        mcf_row.addWidget(self._make_label("Min Call F:", mcf_tip, min_width=62))
+        mcf_row.addWidget(self._make_label("Min Call Freq:", mcf_tip, min_width=90))
         self.spin_min_call_freq = QSpinBox()
         self.spin_min_call_freq.setRange(0, 100000)
         self.spin_min_call_freq.setSingleStep(1000)
@@ -1686,7 +1704,7 @@ class USVStudioWindow(QMainWindow):
         self.spin_min_call_freq.setSuffix(" Hz")
         self.spin_min_call_freq.setToolTip(mcf_tip)
         mcf_row.addWidget(self.spin_min_call_freq, 1)
-        group_layout.addLayout(mcf_row)
+        advanced_layout.addLayout(mcf_row)
 
         # Harmonic filter checkbox
         harmonic_tip = ("Merge temporally overlapping detections that are\n"
@@ -1698,23 +1716,42 @@ class USVStudioWindow(QMainWindow):
         self.chk_harmonic_filter = QCheckBox("Harmonic Filter")
         self.chk_harmonic_filter.setChecked(True)
         self.chk_harmonic_filter.setToolTip(harmonic_tip)
-        group_layout.addWidget(self.chk_harmonic_filter)
+        advanced_layout.addWidget(self.chk_harmonic_filter)
 
-        # --- Additional Parameters ---
+        # Frequency gap splitting
+        freq_gap_tip = ("Minimum vertical frequency gap (Hz) to split\n"
+                        "a single connected detection into two.\n"
+                        "When a fundamental and harmonic are connected\n"
+                        "by noise, this splits them so the harmonic\n"
+                        "filter can remove the upper one.\n"
+                        "Set to 0 to disable. 5000 Hz works well for\n"
+                        "prairie vole USVs.")
+        freq_gap_row = QHBoxLayout()
+        freq_gap_row.setSpacing(4)
+        freq_gap_row.addWidget(self._make_label("Freq Gap:", freq_gap_tip, min_width=90))
+        self.spin_freq_gap = QSpinBox()
+        self.spin_freq_gap.setRange(0, 30000)
+        self.spin_freq_gap.setSingleStep(1000)
+        self.spin_freq_gap.setValue(5000)
+        self.spin_freq_gap.setSuffix(" Hz")
+        self.spin_freq_gap.setToolTip(freq_gap_tip)
+        freq_gap_row.addWidget(self.spin_freq_gap, 1)
+        advanced_layout.addLayout(freq_gap_row)
+
         # Min gap
         gap_tip = ("Minimum silent gap between calls (ms).\n"
                    "Calls closer together than this are merged\n"
                    "into a single detection.")
         gap_row = QHBoxLayout()
         gap_row.setSpacing(4)
-        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=62))
+        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=90))
         self.spin_min_gap = QDoubleSpinBox()
         self.spin_min_gap.setRange(0.0, 100.0)
         self.spin_min_gap.setValue(5.0)
         self.spin_min_gap.setSuffix(" ms")
         self.spin_min_gap.setToolTip(gap_tip)
         gap_row.addWidget(self.spin_min_gap, 1)
-        group_layout.addLayout(gap_row)
+        advanced_layout.addLayout(gap_row)
 
         # Noise percentile
         noise_tip = ("Percentile of spectrogram power used to\n"
@@ -1723,13 +1760,13 @@ class USVStudioWindow(QMainWindow):
                      "Typical: 20-30.")
         noise_row = QHBoxLayout()
         noise_row.setSpacing(4)
-        noise_row.addWidget(self._make_label("Noise %ile:", noise_tip, min_width=62))
+        noise_row.addWidget(self._make_label("Noise %tile:", noise_tip, min_width=90))
         self.spin_noise_pct = QDoubleSpinBox()
         self.spin_noise_pct.setRange(1.0, 50.0)
         self.spin_noise_pct.setValue(25.0)
         self.spin_noise_pct.setToolTip(noise_tip)
         noise_row.addWidget(self.spin_noise_pct, 1)
-        group_layout.addLayout(noise_row)
+        advanced_layout.addLayout(noise_row)
 
         # FFT params
         fft_tip = ("FFT window size (samples). Larger = better\n"
@@ -1746,14 +1783,14 @@ class USVStudioWindow(QMainWindow):
         self.spin_nperseg.setValue(512)
         self.spin_nperseg.setToolTip(fft_tip)
         fft_row.addWidget(self.spin_nperseg, 1)
-        fft_row.addWidget(self._make_label("Ovlp:", overlap_tip, min_width=34))
+        fft_row.addWidget(self._make_label("Overlap:", overlap_tip, min_width=50))
         self.spin_noverlap = QSpinBox()
         self.spin_noverlap.setRange(0, 1024)
         self.spin_noverlap.setSingleStep(64)
         self.spin_noverlap.setValue(384)
         self.spin_noverlap.setToolTip(overlap_tip)
         fft_row.addWidget(self.spin_noverlap, 1)
-        group_layout.addLayout(fft_row)
+        advanced_layout.addLayout(fft_row)
 
         # Frequency samples (optional)
         freq_samp_tip = ("Sample peak frequency at N evenly-spaced\n"
@@ -1762,7 +1799,7 @@ class USVStudioWindow(QMainWindow):
                          "detections (cyan line overlay).")
         freq_samp_row = QHBoxLayout()
         freq_samp_row.setSpacing(4)
-        self.chk_freq_samples = QCheckBox("Freq Samp:")
+        self.chk_freq_samples = QCheckBox("Freq Samples:")
         self.chk_freq_samples.setChecked(False)
         self.chk_freq_samples.setToolTip(freq_samp_tip)
         self.chk_freq_samples.toggled.connect(lambda checked: self.spin_freq_samples.setEnabled(checked))
@@ -1775,7 +1812,30 @@ class USVStudioWindow(QMainWindow):
         self.spin_freq_samples.setFixedWidth(60)
         freq_samp_row.addWidget(self.spin_freq_samples)
         freq_samp_row.addStretch()
-        group_layout.addLayout(freq_samp_row)
+        advanced_layout.addLayout(freq_samp_row)
+
+        self.advanced_options_widget.setLayout(advanced_layout)
+        self.advanced_options_widget.setVisible(False)
+        group_layout.addWidget(self.advanced_options_widget)
+
+        # GPU acceleration checkbox
+        gpu_row = QHBoxLayout()
+        gpu_row.setSpacing(4)
+        self.chk_gpu_accel = QCheckBox("Enable GPU Acceleration")
+        self.chk_gpu_accel.setChecked(False)
+        self.chk_gpu_accel.setToolTip(
+            "Use GPU for spectrogram computation (FFT).\n"
+            "Supports NVIDIA CUDA and Apple Silicon MPS.\n"
+            "Falls back to CPU if no compatible GPU found."
+        )
+        self.chk_gpu_accel.toggled.connect(self._on_gpu_toggle)
+        gpu_row.addWidget(self.chk_gpu_accel)
+        self.lbl_gpu_status = QLabel("")
+        self.lbl_gpu_status.setStyleSheet("color: #999999; font-size: 9px;")
+        gpu_row.addWidget(self.lbl_gpu_status)
+        gpu_row.addStretch()
+        group_layout.addLayout(gpu_row)
+        self._selected_gpu_device = "auto"
 
         # Collect all DSP parameter widgets for profile enable/disable
         self._dsp_param_widgets = [
@@ -1783,7 +1843,7 @@ class USVStudioWindow(QMainWindow):
             self.spin_threshold,
             self.spin_min_dur, self.spin_max_dur,
             self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
-            self.chk_harmonic_filter,
+            self.chk_harmonic_filter, self.spin_freq_gap,
             self.spin_min_gap, self.spin_noise_pct,
             self.spin_nperseg, self.spin_noverlap,
             self.chk_freq_samples, self.spin_freq_samples,
@@ -2159,6 +2219,110 @@ class USVStudioWindow(QMainWindow):
         predict_group.setLayout(predict_layout)
         layout.addWidget(predict_group)
 
+    def _on_gpu_toggle(self, checked):
+        """Handle GPU acceleration checkbox toggle."""
+        if checked:
+            self._show_gpu_detection_dialog()
+        else:
+            self.lbl_gpu_status.setText("")
+            self._selected_gpu_device = "auto"
+
+    def _show_gpu_detection_dialog(self):
+        """Show dialog listing detected GPU devices."""
+        try:
+            from fnt.usv.usv_detector.gpu_utils import detect_available_devices
+        except ImportError:
+            QMessageBox.warning(self, "PyTorch Not Available",
+                "PyTorch is required for GPU acceleration.\n\n"
+                "Install with: pip install torch")
+            self.chk_gpu_accel.blockSignals(True)
+            self.chk_gpu_accel.setChecked(False)
+            self.chk_gpu_accel.blockSignals(False)
+            return
+
+        devices = detect_available_devices()
+        gpu_devices = [d for d in devices if d['type'] != 'cpu']
+
+        if not gpu_devices:
+            QMessageBox.warning(self, "No GPU Found",
+                "No compatible GPU detected.\n\n"
+                "Requires:\n"
+                "  \u2022 NVIDIA GPU with CUDA support, or\n"
+                "  \u2022 Apple Silicon with MPS support\n\n"
+                "Processing will use CPU.")
+            self.chk_gpu_accel.blockSignals(True)
+            self.chk_gpu_accel.setChecked(False)
+            self.chk_gpu_accel.blockSignals(False)
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("GPU Acceleration")
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("Detected compute devices:"))
+        layout.addSpacing(4)
+
+        for dev in devices:
+            parts = []
+            if dev['type'] != 'cpu':
+                parts.append("\u2705")  # Green checkmark
+            else:
+                parts.append("   ")
+            parts.append(f"{dev['name']}  ({dev['type'].upper()})")
+            if dev.get('vram_mb'):
+                parts.append(f" \u2014 {dev['vram_mb']:,} MB VRAM")
+            lbl = QLabel("".join(parts))
+            if dev['type'] != 'cpu':
+                lbl.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            else:
+                lbl.setStyleSheet("color: #999999;")
+            layout.addWidget(lbl)
+
+        layout.addSpacing(8)
+
+        # Device selection
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("Use device:"))
+        combo = QComboBox()
+        combo.addItem("Auto (best available)", "auto")
+        for dev in gpu_devices:
+            label = f"{dev['name']} ({dev['type'].upper()})"
+            if dev.get('vram_mb'):
+                label += f" \u2014 {dev['vram_mb']:,} MB"
+            combo.addItem(label, dev['device'])
+        sel_row.addWidget(combo, 1)
+        layout.addLayout(sel_row)
+
+        layout.addSpacing(8)
+
+        # OK / Cancel
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            self._selected_gpu_device = combo.currentData()
+            dev_name = combo.currentText()
+            self.lbl_gpu_status.setText(f"\u26a1 {dev_name}")
+            self.lbl_gpu_status.setStyleSheet("color: #4CAF50; font-size: 9px;")
+        else:
+            # User cancelled — uncheck
+            self.chk_gpu_accel.blockSignals(True)
+            self.chk_gpu_accel.setChecked(False)
+            self.chk_gpu_accel.blockSignals(False)
+            self.lbl_gpu_status.setText("")
+
+    def _toggle_advanced_options(self):
+        """Toggle visibility of advanced DSP options."""
+        visible = not self.advanced_options_widget.isVisible()
+        self.advanced_options_widget.setVisible(visible)
+        arrow = "▼" if visible else "▶"
+        self.btn_advanced_toggle.setText(f"{arrow} Advanced Options")
+
     def _on_species_profile_changed(self, profile_name):
         """Handle species profile dropdown change."""
         preset = self.SPECIES_PROFILES.get(profile_name)
@@ -2176,6 +2340,7 @@ class USVStudioWindow(QMainWindow):
                 self.spin_min_freq, self.spin_max_freq, self.spin_threshold,
                 self.spin_min_dur, self.spin_max_dur,
                 self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
+                self.spin_freq_gap,
                 self.spin_min_gap, self.spin_noise_pct,
                 self.spin_nperseg, self.spin_noverlap,
             ]
@@ -2195,6 +2360,7 @@ class USVStudioWindow(QMainWindow):
             self.spin_nperseg.setValue(preset['nperseg'])
             self.spin_noverlap.setValue(preset['noverlap'])
             self.chk_harmonic_filter.setChecked(preset.get('harmonic_filter', True))
+            self.spin_freq_gap.setValue(preset.get('min_freq_gap_hz', 5000))
 
             for s in spinboxes:
                 s.blockSignals(False)
@@ -3054,11 +3220,14 @@ class USVStudioWindow(QMainWindow):
             'min_tonality': self.spin_tonality.value(),
             'min_call_freq_hz': self.spin_min_call_freq.value(),
             'harmonic_filter': self.chk_harmonic_filter.isChecked(),
+            'min_freq_gap_hz': self.spin_freq_gap.value(),
             'min_gap_ms': self.spin_min_gap.value(),
             'noise_percentile': self.spin_noise_pct.value(),
             'nperseg': self.spin_nperseg.value(),
             'noverlap': self.spin_noverlap.value(),
             'freq_samples': self.spin_freq_samples.value() if self.chk_freq_samples.isChecked() else 0,
+            'gpu_enabled': self.chk_gpu_accel.isChecked(),
+            'gpu_device': getattr(self, '_selected_gpu_device', 'auto'),
         }
 
         # Start worker
@@ -4308,32 +4477,32 @@ class USVStudioWindow(QMainWindow):
         self.btn_add_all_to_queue.setEnabled(has_files)
 
         # Detection navigation
-        self.btn_prev_det.setEnabled(has_det and self.current_detection_idx > 0)
-        self.btn_next_det.setEnabled(has_det and self.current_detection_idx < len(self.detections_df) - 1 if has_det else False)
+        self.btn_prev_det.setEnabled(bool(has_det and self.current_detection_idx > 0))
+        self.btn_next_det.setEnabled(bool(has_det and self.current_detection_idx < len(self.detections_df) - 1) if has_det else False)
 
         # Labeling
-        self.btn_accept.setEnabled(has_det)
-        self.btn_reject.setEnabled(has_det)
-        self.btn_skip.setEnabled(has_det)
-        self.btn_add_usv.setEnabled(has_audio)
-        self.btn_delete.setEnabled(has_det)
+        self.btn_accept.setEnabled(bool(has_det))
+        self.btn_reject.setEnabled(bool(has_det))
+        self.btn_skip.setEnabled(bool(has_det))
+        self.btn_add_usv.setEnabled(bool(has_audio))
+        self.btn_delete.setEnabled(bool(has_det))
 
         has_pending = bool(has_det and (self.detections_df['status'] == 'pending').any())
         self.btn_delete_pending.setEnabled(has_pending)
-        self.btn_delete_all_labels.setEnabled(has_det)
+        self.btn_delete_all_labels.setEnabled(bool(has_det))
         self.btn_accept_all_pending.setEnabled(has_pending)
         self.btn_reject_all_pending.setEnabled(has_pending)
 
         # Playback
-        self.btn_play.setEnabled(has_audio and HAS_SOUNDDEVICE)
-        self.btn_stop.setEnabled(has_audio and HAS_SOUNDDEVICE)
+        self.btn_play.setEnabled(bool(has_audio and HAS_SOUNDDEVICE))
+        self.btn_stop.setEnabled(bool(has_audio and HAS_SOUNDDEVICE))
 
         # Open folder
-        self.btn_open_folder.setEnabled(has_files)
+        self.btn_open_folder.setEnabled(bool(has_files))
 
         # ML
-        self.btn_apply_current.setEnabled(has_model and has_audio)
-        self.btn_apply_all.setEnabled(has_model and has_files)
+        self.btn_apply_current.setEnabled(bool(has_model and has_audio))
+        self.btn_apply_all.setEnabled(bool(has_model and has_files))
 
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts. Skips when text-input widgets have focus."""

@@ -57,6 +57,7 @@ class USVDetectorConfig:
     min_tonality: float = 0.3           # Min spectral purity (0=noise, 1=pure tone)
     min_call_freq_hz: float = 0.0       # Discard if actual min freq is below this (0=off)
     harmonic_filter: bool = True        # Merge temporally overlapping detections (keep fundamental)
+    min_freq_gap_hz: float = 5000.0     # Split connected regions with vertical freq gaps wider than this (0=off)
 
     # Adaptive threshold parameters
     noise_percentile: float = 25.0      # Percentile for background noise estimate
@@ -64,6 +65,10 @@ class USVDetectorConfig:
     # Batch processing
     chunk_duration_s: float = 10.0      # Process in 10-second chunks (finer progress updates)
     chunk_overlap_s: float = 0.5        # Small overlap to avoid boundary issues
+
+    # GPU acceleration
+    gpu_enabled: bool = False           # Use GPU for spectrogram computation (FFT)
+    gpu_device: str = "auto"            # "auto", "cuda:0", "mps", "cpu"
 
     # Frequency sampling
     freq_samples: int = 5                       # Number of peak-frequency sample points per call (3-10)
