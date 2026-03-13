@@ -984,7 +984,7 @@ class DSPDetectionWorker(QThread):
     """Worker thread for DSP detection."""
     progress = pyqtSignal(str, int, int)  # filename, current, total
     file_progress = pyqtSignal(float)  # fraction 0.0-1.0 within current file
-    file_complete = pyqtSignal(str, int)  # filename, n_detections
+    file_complete = pyqtSignal(str, str, list, int)  # filename, filepath, detections, n_detections
     all_complete = pyqtSignal(dict)  # results dict
     error = pyqtSignal(str, str)  # filename, error message
 
@@ -1038,7 +1038,7 @@ class DSPDetectionWorker(QThread):
                 if self._stop_requested:
                     break
                 self.results[filepath] = detections
-                self.file_complete.emit(filename, len(detections))
+                self.file_complete.emit(filename, filepath, detections, len(detections))
             except Exception as e:
                 if self._stop_requested:
                     break
@@ -3096,47 +3096,70 @@ class USVStudioWindow(QMainWindow):
         """Handle per-file progress update (chunk-level within a file)."""
         self.dsp_file_progress.setValue(int(fraction * 100))
 
-    def _on_dsp_file_complete(self, filename, n_detections):
-        """Handle DSP file completion."""
+    def _on_dsp_file_complete(self, filename, filepath, detections, n_detections):
+        """Handle DSP file completion — write CSV immediately."""
         self.dsp_file_progress.setValue(100)
         self.lbl_dsp_status.setText(f"{filename}: {n_detections} detections")
-
-    def _on_dsp_complete(self, results):
-        """Handle DSP detection completion."""
-        was_stopped = hasattr(self, 'dsp_worker') and self.dsp_worker._stop_requested
 
         # Standard columns for detection CSVs
         std_columns = ['call_number', 'start_seconds', 'stop_seconds', 'duration_ms',
                         'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
                         'max_power_db', 'mean_power_db', 'status', 'source']
 
-        # Store results (only files that completed before stop)
-        for filepath, detections in results.items():
-            if isinstance(detections, pd.DataFrame):
-                df = detections.copy()
-            else:
-                df = pd.DataFrame(detections)
+        # Build DataFrame from detection list
+        if isinstance(detections, pd.DataFrame):
+            df = detections.copy()
+        else:
+            df = pd.DataFrame(detections)
 
-            if len(df) > 0:
-                if 'status' not in df.columns:
-                    df['status'] = 'pending'
-                if 'source' not in df.columns:
-                    df['source'] = 'dsp'
-                # Add call_number column (1-indexed)
-                if 'call_number' not in df.columns:
-                    df.insert(0, 'call_number', range(1, len(df) + 1))
-            else:
-                # Empty result — create DataFrame with proper headers
-                df = pd.DataFrame(columns=std_columns)
+        if len(df) > 0:
+            if 'status' not in df.columns:
+                df['status'] = 'pending'
+            if 'source' not in df.columns:
+                df['source'] = 'dsp'
+            if 'call_number' not in df.columns:
+                df.insert(0, 'call_number', range(1, len(df) + 1))
+        else:
+            df = pd.DataFrame(columns=std_columns)
 
-            self.all_detections[filepath] = df
-            self.detection_sources[filepath] = 'usv_dsp'
+        # Store in memory
+        self.all_detections[filepath] = df
+        self.detection_sources[filepath] = 'usv_dsp'
 
-            # Save CSV (always, even if empty — so it's recognized on reload)
-            base = Path(filepath).stem
-            parent = Path(filepath).parent
-            csv_path = parent / f"{base}_usv_dsp.csv"
+        # Write CSV immediately (crash-safe — results are on disk per file)
+        base = Path(filepath).stem
+        parent = Path(filepath).parent
+        csv_path = parent / f"{base}_usv_dsp.csv"
+        try:
             df.to_csv(csv_path, index=False)
+        except Exception as e:
+            self.status_bar.showMessage(f"Error saving CSV for {filename}: {e}")
+
+        # Update file list item to show detection count
+        if filepath in self.audio_files:
+            idx = self.audio_files.index(filepath)
+            item = self.file_list.item(idx)
+            if item:
+                parts = []
+                if filepath in self.dsp_queue:
+                    parts.append("\u2713")
+                parts.append(filename)
+                parts.append(f"({len(df)})")
+                self.file_list.blockSignals(True)
+                item.setText(" ".join(parts))
+                self.file_list.blockSignals(False)
+
+        # If this is the currently displayed file, update the view
+        if (self.audio_files and self.current_file_idx < len(self.audio_files)
+                and self.audio_files[self.current_file_idx] == filepath):
+            self.detections_df = df.copy()
+            self._ensure_freq_bounds(self.detections_df)
+            self.current_detection_idx = 0
+            self._load_current_file()
+
+    def _on_dsp_complete(self, results):
+        """Handle DSP batch completion. CSVs already written per-file."""
+        was_stopped = hasattr(self, 'dsp_worker') and self.dsp_worker._stop_requested
 
         # Update UI
         self.dsp_progress.setValue(100)
@@ -3158,16 +3181,6 @@ class USVStudioWindow(QMainWindow):
         # Clear queue and refresh display
         self.dsp_queue = []
         self._update_queue_display()
-
-        # Update the current file's detections_df from the new DSP results
-        # BEFORE refreshing the file list (which could trigger on_file_selected
-        # and _store_current_detections, overwriting the new results).
-        if self.audio_files and self.current_file_idx < len(self.audio_files):
-            current_filepath = self.audio_files[self.current_file_idx]
-            if current_filepath in self.all_detections:
-                self.detections_df = self.all_detections[current_filepath].copy()
-                self._ensure_freq_bounds(self.detections_df)
-                self.current_detection_idx = 0
 
         self._refresh_file_list_items()
         self._load_current_file()
