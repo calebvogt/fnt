@@ -149,22 +149,29 @@ class VideoProcessorWorker(QThread):
     def run(self):
         """Main processing function"""
         try:
-            total_files = 0
             processed_count = 0
             skipped_count = 0
             failed_count = 0
-            file_index = 0
+            missing_files = []
 
-            # Count total files first
+            # --- Single-pass file discovery: build the complete list up front ---
             video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
 
-            # Count files from directories
-            for input_dir in self.input_dirs:
-                for ext in video_extensions:
-                    total_files += len(glob.glob(os.path.join(input_dir, ext)))
+            # Each entry: (video_path, output_dir)
+            file_list = []
 
-            # Add count of individual videos
-            total_files += len(self.input_videos)
+            for input_dir in self.input_dirs:
+                out_dir = os.path.join(input_dir, "proc")
+                for ext in video_extensions:
+                    for f in sorted(glob.glob(os.path.join(input_dir, ext))):
+                        file_list.append((f, out_dir))
+
+            for video_file in self.input_videos:
+                video_dir = os.path.dirname(video_file)
+                out_dir = os.path.join(video_dir, "proc")
+                file_list.append((video_file, out_dir))
+
+            total_files = len(file_list)
 
             if total_files == 0:
                 self.finished.emit(False, "No video files found in selected directories or video list.")
@@ -172,94 +179,73 @@ class VideoProcessorWorker(QThread):
 
             self.progress_update.emit(f"Found {total_files} video files to process...")
 
-            # Process each directory
-            for input_dir in self.input_dirs:
+            # --- Process the pre-collected file list ---
+            for file_index, (video_file, out_dir) in enumerate(file_list, start=1):
                 if self.should_stop:
                     break
 
-                # Create output directory
-                out_dir = os.path.join(input_dir, "proc")
-                os.makedirs(out_dir, exist_ok=True)
-
-                self.progress_update.emit(f"Processing directory: {input_dir}")
-
-                # Process each video type
-                for video_extension in video_extensions:
-                    if self.should_stop:
-                        break
-
-                    video_files = glob.glob(os.path.join(input_dir, video_extension))
-
-                    for video_file in video_files:
-                        if self.should_stop:
-                            break
-
-                        file_index += 1
-                        self.file_progress.emit(file_index, total_files)
-
-                        # Skip check
-                        if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
-                            self.progress_update.emit(
-                                f"⏭️ Skipping (already processed): {os.path.basename(video_file)}"
-                            )
-                            skipped_count += 1
-                            continue
-
-                        # Process individual file
-                        success = self.process_single_file(video_file, out_dir, file_index)
-                        if success:
-                            processed_count += 1
-                        elif not self.should_stop:
-                            failed_count += 1
-                            self._move_to_failed(video_file, input_dir)
-
-            # Process individual video files
-            for video_file in self.input_videos:
-                if self.should_stop:
-                    break
-
-                file_index += 1
                 self.file_progress.emit(file_index, total_files)
 
-                # Create output directory next to the video file
-                video_dir = os.path.dirname(video_file)
-                out_dir = os.path.join(video_dir, "proc")
-                os.makedirs(out_dir, exist_ok=True)
+                # Check that the file still exists (user may have moved/deleted it)
+                if not os.path.exists(video_file):
+                    self.progress_update.emit(
+                        f"File not found (moved or deleted?): {video_file}"
+                    )
+                    missing_files.append(video_file)
+                    continue
 
-                self.progress_update.emit(f"Processing video: {os.path.basename(video_file)}")
+                os.makedirs(out_dir, exist_ok=True)
 
                 # Skip check
                 if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
                     self.progress_update.emit(
-                        f"⏭️ Skipping (already processed): {os.path.basename(video_file)}"
+                        f"Skipping (already processed): {os.path.basename(video_file)}"
                     )
                     skipped_count += 1
                     continue
 
+                self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
+
                 # Process individual file
+                parent_dir = os.path.dirname(video_file)
                 success = self.process_single_file(video_file, out_dir, file_index)
                 if success:
                     processed_count += 1
                 elif not self.should_stop:
                     failed_count += 1
-                    self._move_to_failed(video_file, video_dir)
+                    self._move_to_failed(video_file, parent_dir)
 
             # Build summary
             if self.should_stop:
                 self.finished.emit(False, "Processing stopped by user.")
-            elif failed_count > 0:
-                summary = (
-                    f"Processed {processed_count} of {total_files} videos. "
-                    f"{failed_count} failed (moved to proc_failed/)."
-                )
-                if skipped_count > 0:
-                    summary += f" {skipped_count} skipped."
-                self.finished.emit(processed_count > 0, summary)
-            else:
-                summary = f"Successfully processed {processed_count} video files!"
-                if skipped_count > 0:
-                    summary += f" ({skipped_count} skipped, already processed.)"
-                self.finished.emit(True, summary)
+                return
+
+            parts = []
+            success = True
+
+            if missing_files:
+                parts.append(f"{len(missing_files)} file(s) not found (moved or deleted since start)")
+                success = False
+
+            if failed_count > 0:
+                parts.append(f"{failed_count} failed (moved to proc_failed/)")
+                success = False
+
+            if skipped_count > 0:
+                parts.append(f"{skipped_count} skipped (already processed)")
+
+            summary = f"Processed {processed_count} of {total_files} videos."
+            if parts:
+                summary += " " + ". ".join(parts) + "."
+
+            if missing_files:
+                summary += "\n\nMissing files:\n"
+                for mf in missing_files[:20]:  # Show up to 20
+                    summary += f"  - {mf}\n"
+                if len(missing_files) > 20:
+                    summary += f"  ... and {len(missing_files) - 20} more.\n"
+
+            self.finished.emit(success and processed_count > 0, summary)
 
         except Exception as e:
             self.finished.emit(False, f"Error during processing: {str(e)}")
