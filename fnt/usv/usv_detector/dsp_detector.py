@@ -126,9 +126,20 @@ class DSPDetector:
 
         # Noise rejection filters
         calls = self._filter_by_bandwidth(calls)
-        calls = self._filter_by_tonality(calls, frequencies, times, Sxx_db)
+        calls = self._filter_by_min_bandwidth(calls)
+        calls = self._filter_by_snr(calls)
+
+        # Compute spectral features (tonality + spectral entropy)
+        calls = self._compute_spectral_features(calls, frequencies, times, Sxx_db)
+        calls = self._filter_by_tonality(calls)
+        calls = self._filter_by_spectral_entropy(calls)
+
         calls = self._filter_by_min_freq(calls)
+        calls = self._filter_by_power(calls)
         calls = self._filter_harmonics(calls)
+
+        # Label harmonics (post-detection: marks but does not remove)
+        calls = self._label_harmonics(calls)
 
         # Sample peak frequencies across each call (optional)
         n_samples = getattr(self.config, 'freq_samples', 5)
@@ -139,6 +150,12 @@ class DSPDetector:
             for call in calls:
                 call.pop('_start_idx', None)
                 call.pop('_end_idx', None)
+
+        # Contour-based features and filters (require peak_freq samples)
+        calls = self._compute_contour_features(calls)
+        calls = self._filter_by_sweep_rate(calls)
+        calls = self._filter_by_contour_smoothness(calls)
+        calls = self._filter_by_ici(calls)
 
         return calls
 
@@ -275,6 +292,10 @@ class DSPDetector:
             mean_power_db = np.mean(region_spec[region_spec > -99])
             max_power_db = np.max(region_spec)
 
+            # SNR: max power minus mean noise floor over detection's freq range
+            det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1]
+            snr_db = float(max_power_db - np.mean(det_noise_floor)) if len(det_noise_floor) > 0 else 0.0
+
             calls.append({
                 'start_seconds': float(start_s),
                 'stop_seconds': float(stop_s),
@@ -286,6 +307,7 @@ class DSPDetector:
                 'duration_ms': float(duration_ms),
                 'mean_power_db': float(mean_power_db),
                 'max_power_db': float(max_power_db),
+                'snr_db': snr_db,
                 '_start_idx': start_idx,
                 '_end_idx': end_idx,
             })
@@ -437,35 +459,28 @@ class DSPDetector:
             return calls  # Filter disabled
         return [c for c in calls if c.get('freq_bandwidth_hz', 0) <= max_bw]
 
-    def _filter_by_tonality(
+    def _compute_spectral_features(
         self,
         calls: List[Dict],
         frequencies: np.ndarray,
         times: np.ndarray,
         Sxx_db: np.ndarray
     ) -> List[Dict]:
-        """Filter detections by spectral purity (tonality score).
+        """Compute tonality and spectral entropy for each detection.
 
         Tonality measures how concentrated the energy is vs. spread across
         frequencies. A pure tone has tonality ~1.0; broadband noise has ~0.0.
 
-        For each detection, at each time step we find the peak frequency bin
-        and measure what fraction of the total column energy is within ±2 bins
-        of that peak. The mean of this ratio across all time steps is the
-        tonality score. Real USV calls are tonal (energy concentrated in a
-        narrow band); noise events are diffuse.
+        Spectral entropy (Shannon entropy of the normalized power spectrum)
+        provides a more robust measure: low entropy = tonal, high entropy = noisy.
+        Range is 0.0 (pure tone) to 1.0 (uniform noise).
         """
-        min_tonality = getattr(self.config, 'min_tonality', 0)
-        if min_tonality <= 0:
-            return calls  # Filter disabled
-
-        filtered = []
         for call in calls:
             start_idx = call.get('_start_idx')
             end_idx = call.get('_end_idx')
             if start_idx is None or end_idx is None:
-                # No indices available — keep the call
-                filtered.append(call)
+                call['tonality'] = 0.0
+                call['spectral_entropy'] = 1.0
                 continue
 
             # Extract the detection's spectrogram columns
@@ -474,11 +489,14 @@ class DSPDetector:
             power = 10 ** (region / 10)
 
             n_cols = region.shape[1]
+            n_freq = region.shape[0]
             if n_cols == 0:
-                filtered.append(call)
+                call['tonality'] = 0.0
+                call['spectral_entropy'] = 1.0
                 continue
 
-            ratios = np.zeros(n_cols)
+            # Tonality: fraction of energy within ±2 bins of peak
+            tonality_ratios = np.zeros(n_cols)
             half_width = 2  # ±2 bins around peak
             for t in range(n_cols):
                 col = power[:, t]
@@ -488,14 +506,54 @@ class DSPDetector:
                 peak_bin = np.argmax(col)
                 lo = max(0, peak_bin - half_width)
                 hi = min(len(col), peak_bin + half_width + 1)
-                ratios[t] = col[lo:hi].sum() / total
+                tonality_ratios[t] = col[lo:hi].sum() / total
 
-            tonality = float(np.mean(ratios))
-            call['tonality'] = tonality
+            call['tonality'] = float(np.mean(tonality_ratios))
 
-            if tonality >= min_tonality:
-                filtered.append(call)
+            # Spectral entropy: Shannon entropy of normalized power spectrum
+            # Normalized to [0, 1] where 0 = pure tone, 1 = uniform noise
+            entropy_vals = np.zeros(n_cols)
+            max_entropy = np.log2(n_freq) if n_freq > 1 else 1.0
+            for t in range(n_cols):
+                col = power[:, t]
+                total = col.sum()
+                if total <= 0:
+                    entropy_vals[t] = 1.0
+                    continue
+                p = col / total  # Normalize to probability distribution
+                p = p[p > 0]     # Remove zeros for log
+                entropy_vals[t] = -np.sum(p * np.log2(p)) / max_entropy
 
+            call['spectral_entropy'] = float(np.mean(entropy_vals))
+
+        return calls
+
+    def _filter_by_tonality(self, calls: List[Dict]) -> List[Dict]:
+        """Filter detections by tonality score (must be computed first)."""
+        min_tonality = getattr(self.config, 'min_tonality', 0)
+        if min_tonality <= 0:
+            return calls
+        return [c for c in calls if c.get('tonality', 0) >= min_tonality]
+
+    def _filter_by_spectral_entropy(self, calls: List[Dict]) -> List[Dict]:
+        """Filter detections by spectral entropy range.
+
+        Low entropy = tonal (real calls), high entropy = broadband noise.
+        min_spectral_entropy filters out too-pure artifacts (e.g., electrical tones).
+        max_spectral_entropy filters out broadband noise.
+        """
+        min_ent = getattr(self.config, 'min_spectral_entropy', 0)
+        max_ent = getattr(self.config, 'max_spectral_entropy', 0)
+        if min_ent <= 0 and max_ent <= 0:
+            return calls
+        filtered = []
+        for c in calls:
+            ent = c.get('spectral_entropy', 0.5)
+            if min_ent > 0 and ent < min_ent:
+                continue
+            if max_ent > 0 and ent > max_ent:
+                continue
+            filtered.append(c)
         return filtered
 
     def _filter_by_min_freq(self, calls: List[Dict]) -> List[Dict]:
@@ -567,6 +625,233 @@ class DSPDetector:
                 used.add(idx)
 
         return kept
+
+    def _label_harmonics(self, calls: List[Dict]) -> List[Dict]:
+        """Label harmonic detections without removing them.
+
+        For each pair of detections with >=50% temporal overlap, check if
+        one detection's peak frequency is approximately an integer multiple
+        (2x, 3x) of the other's. If so, mark the higher-frequency detection
+        with ``is_harmonic=True`` and ``harmonic_of=<index>``.
+
+        This is a post-processing step that preserves all detections but
+        annotates harmonics so downstream code can filter or count them.
+        """
+        if not getattr(self.config, 'harmonic_label', False):
+            return calls
+        if len(calls) < 2:
+            for c in calls:
+                c['is_harmonic'] = False
+            return calls
+
+        # Initialize all as non-harmonic
+        for c in calls:
+            c['is_harmonic'] = False
+            c['harmonic_of'] = None
+
+        calls_sorted = sorted(calls, key=lambda c: c['start_seconds'])
+
+        # Tolerance for harmonic ratio matching (±15%)
+        ratio_tol = 0.15
+
+        for i, call_a in enumerate(calls_sorted):
+            if call_a['is_harmonic']:
+                continue  # Already labelled as a harmonic
+
+            peak_a = call_a.get('peak_freq_hz', 0)
+            if peak_a <= 0:
+                # Use midpoint of freq range as fallback
+                peak_a = (call_a.get('min_freq_hz', 0) + call_a.get('max_freq_hz', 0)) / 2
+            if peak_a <= 0:
+                continue
+
+            dur_a = call_a['stop_seconds'] - call_a['start_seconds']
+            if dur_a <= 0:
+                continue
+
+            for j in range(i + 1, len(calls_sorted)):
+                call_b = calls_sorted[j]
+                if call_b['is_harmonic']:
+                    continue
+
+                # Stop scanning once we're past temporal overlap range
+                if call_b['start_seconds'] > call_a['stop_seconds']:
+                    break
+
+                # Compute temporal overlap
+                overlap_start = max(call_a['start_seconds'], call_b['start_seconds'])
+                overlap_end = min(call_a['stop_seconds'], call_b['stop_seconds'])
+                overlap = max(0, overlap_end - overlap_start)
+                dur_b = call_b['stop_seconds'] - call_b['start_seconds']
+                if dur_b <= 0:
+                    continue
+                min_dur = min(dur_a, dur_b)
+                if overlap / min_dur < 0.50:
+                    continue
+
+                peak_b = call_b.get('peak_freq_hz', 0)
+                if peak_b <= 0:
+                    peak_b = (call_b.get('min_freq_hz', 0) + call_b.get('max_freq_hz', 0)) / 2
+                if peak_b <= 0:
+                    continue
+
+                # Determine which is lower (fundamental) and higher (potential harmonic)
+                if peak_a <= peak_b:
+                    fund_peak, harm_peak = peak_a, peak_b
+                    fund_call, harm_call = call_a, call_b
+                else:
+                    fund_peak, harm_peak = peak_b, peak_a
+                    fund_call, harm_call = call_b, call_a
+
+                # Check integer harmonic ratios: 2x, 3x
+                ratio = harm_peak / fund_peak
+                for n in (2, 3):
+                    if abs(ratio - n) <= ratio_tol * n:
+                        harm_call['is_harmonic'] = True
+                        harm_call['harmonic_of'] = id(fund_call)
+                        # Store the fundamental's start time for easier matching
+                        harm_call['harmonic_of_start'] = fund_call['start_seconds']
+                        harm_call['harmonic_ratio'] = round(ratio, 2)
+                        break
+
+        return calls_sorted
+
+    def _filter_by_min_bandwidth(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections narrower than min_bandwidth_hz.
+
+        Very narrow-band detections (< 500 Hz) are often electrical noise
+        spikes or single-frequency artifacts, not real USV calls.
+        """
+        min_bw = getattr(self.config, 'min_bandwidth_hz', 0)
+        if min_bw <= 0:
+            return calls
+        return [c for c in calls if c.get('freq_bandwidth_hz', 0) >= min_bw]
+
+    def _filter_by_snr(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections with SNR below threshold."""
+        min_snr = getattr(self.config, 'min_snr_db', 0)
+        if min_snr <= 0:
+            return calls
+        return [c for c in calls if c.get('snr_db', 0) >= min_snr]
+
+    def _filter_by_power(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections outside power range.
+
+        min_power_db: reject weak/quiet detections (low mean power).
+        max_power_db: reject clipping artifacts (extremely high max power).
+        """
+        min_pwr = getattr(self.config, 'min_power_db', 0)
+        max_pwr = getattr(self.config, 'max_power_db', 0)
+        if min_pwr == 0 and max_pwr == 0:
+            return calls
+        filtered = []
+        for c in calls:
+            if min_pwr != 0 and c.get('mean_power_db', 0) < min_pwr:
+                continue
+            if max_pwr != 0 and c.get('max_power_db', 0) > max_pwr:
+                continue
+            filtered.append(c)
+        return filtered
+
+    def _compute_contour_features(self, calls: List[Dict]) -> List[Dict]:
+        """Compute frequency sweep rate and contour smoothness from peak_freq samples.
+
+        For each call that has peak_freq_1..N:
+        - mean_sweep_rate_khz_ms: mean |Δfreq| / Δtime between consecutive samples
+        - max_sweep_rate_khz_ms: max instantaneous |Δfreq| / Δtime
+        - contour_smoothness: mean absolute second derivative (jitter)
+          Low jitter = smooth trajectory (real call), high jitter = erratic (noise)
+        """
+        for call in calls:
+            # Collect peak_freq samples
+            freqs = []
+            i = 1
+            while True:
+                key = f'peak_freq_{i}'
+                val = call.get(key)
+                if val is None:
+                    break
+                if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                    freqs.append(val)
+                i += 1
+
+            duration_ms = call.get('duration_ms', 0)
+            n = len(freqs)
+
+            if n < 2 or duration_ms <= 0:
+                call['mean_sweep_rate_khz_ms'] = 0.0
+                call['max_sweep_rate_khz_ms'] = 0.0
+                call['contour_smoothness'] = 0.0
+                continue
+
+            # Time step between consecutive samples
+            dt_ms = duration_ms / (n - 1)
+            if dt_ms <= 0:
+                call['mean_sweep_rate_khz_ms'] = 0.0
+                call['max_sweep_rate_khz_ms'] = 0.0
+                call['contour_smoothness'] = 0.0
+                continue
+
+            # First derivative: |Δfreq| / Δtime in kHz/ms
+            diffs = [abs(freqs[j+1] - freqs[j]) / 1000.0 / dt_ms for j in range(n - 1)]
+            call['mean_sweep_rate_khz_ms'] = float(np.mean(diffs))
+            call['max_sweep_rate_khz_ms'] = float(np.max(diffs))
+
+            # Second derivative (jitter): mean |Δ²freq| in kHz
+            if n >= 3:
+                second_diffs = [abs(freqs[j+2] - 2*freqs[j+1] + freqs[j]) / 1000.0
+                                for j in range(n - 2)]
+                call['contour_smoothness'] = float(np.mean(second_diffs))
+            else:
+                call['contour_smoothness'] = 0.0
+
+        return calls
+
+    def _filter_by_sweep_rate(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections with mean sweep rate above threshold.
+
+        Very high sweep rates may indicate noise artifacts rather than real calls.
+        """
+        max_rate = getattr(self.config, 'max_mean_sweep_rate', 0)
+        if max_rate <= 0:
+            return calls
+        return [c for c in calls if c.get('mean_sweep_rate_khz_ms', 0) <= max_rate]
+
+    def _filter_by_contour_smoothness(self, calls: List[Dict]) -> List[Dict]:
+        """Discard detections with high contour jitter.
+
+        Real USV calls have smooth frequency trajectories. Noisy detections
+        have erratic frequency contours with high jitter values.
+        """
+        max_jitter = getattr(self.config, 'max_contour_jitter', 0)
+        if max_jitter <= 0:
+            return calls
+        return [c for c in calls if c.get('contour_smoothness', 0) <= max_jitter]
+
+    def _filter_by_ici(self, calls: List[Dict]) -> List[Dict]:
+        """Filter out calls in suspiciously regular trains (short ICI).
+
+        Some noise sources produce detections at regular intervals (e.g.,
+        60 Hz harmonics → every 16.7ms). This filter removes calls whose
+        inter-call interval to the previous call is below the threshold.
+        """
+        min_ici = getattr(self.config, 'min_ici_ms', 0)
+        if min_ici <= 0:
+            return calls
+        if len(calls) < 2:
+            return calls
+
+        # Sort by time
+        calls = sorted(calls, key=lambda c: c['start_seconds'])
+
+        # First call is always kept; subsequent calls checked against predecessor
+        filtered = [calls[0]]
+        for i in range(1, len(calls)):
+            ici_ms = (calls[i]['start_seconds'] - calls[i-1]['stop_seconds']) * 1000
+            if ici_ms >= min_ici:
+                filtered.append(calls[i])
+
+        return filtered
 
     def _sample_peak_frequencies(
         self,

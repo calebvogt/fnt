@@ -57,7 +57,19 @@ class USVDetectorConfig:
     min_tonality: float = 0.3           # Min spectral purity (0=noise, 1=pure tone)
     min_call_freq_hz: float = 0.0       # Discard if actual min freq is below this (0=off)
     harmonic_filter: bool = True        # Merge temporally overlapping detections (keep fundamental)
+    harmonic_label: bool = False        # Label (not remove) harmonics; adds is_harmonic + harmonic_of fields
     min_freq_gap_hz: float = 5000.0     # Split connected regions with vertical freq gaps wider than this (0=off)
+
+    # Advanced noise rejection filters
+    min_bandwidth_hz: float = 0.0       # Min freq bandwidth; narrower = electrical noise (0=off)
+    min_snr_db: float = 0.0             # Min signal-to-noise ratio in dB (0=off)
+    min_spectral_entropy: float = 0.0   # Min spectral entropy; too-pure tones may be artifacts (0=off)
+    max_spectral_entropy: float = 0.0   # Max spectral entropy; high = broadband noise (0=off)
+    max_mean_sweep_rate: float = 0.0    # Max mean freq sweep rate kHz/ms (0=off)
+    max_contour_jitter: float = 0.0     # Max mean abs freq jitter between samples kHz (0=off)
+    min_power_db: float = 0.0           # Min mean_power_db threshold (0=off)
+    max_power_db: float = 0.0           # Max max_power_db threshold (0=off)
+    min_ici_ms: float = 0.0             # Min inter-call interval ms; reject regular noise trains (0=off)
 
     # Adaptive threshold parameters
     noise_percentile: float = 25.0      # Percentile for background noise estimate

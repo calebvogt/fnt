@@ -1,21 +1,20 @@
 """
-USV Studio - Unified tool for USV detection, inspection, and classification.
+Classic Audio Detector - DSP-based detection and labeling tool.
 
 A comprehensive PyQt5 application for:
 1. Loading and browsing audio files
 2. Running DSP-based USV detection
 3. Manual labeling and ground-truthing
 4. Training Random Forest classifiers
-5. Applying ML models for automated detection
 
 Author: FNT Project
 """
 
+import json
 import math
 import os
 import sys
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -29,9 +28,11 @@ from PyQt5.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QListWidgetItem,
     QScrollArea, QSplitter, QStatusBar, QMessageBox, QScrollBar,
     QSizePolicy, QFrame, QCheckBox, QShortcut, QSlider,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QInputDialog, QLineEdit
 )
 from scipy import signal
+
+from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
 
 # Optional imports
 try:
@@ -45,940 +46,6 @@ try:
     HAS_SOUNDFILE = True
 except ImportError:
     HAS_SOUNDFILE = False
-
-
-# =============================================================================
-# Spectrogram Widget (from Inspector, with improvements)
-# =============================================================================
-
-class SpectrogramWidget(QWidget):
-    """Custom widget for displaying spectrogram with detection boxes."""
-
-    detection_selected = pyqtSignal(int)
-    box_adjusted = pyqtSignal(int, float, float, float, float)
-    drag_complete = pyqtSignal()  # Emitted when box drag is finished
-    zoom_requested = pyqtSignal(float, float)  # factor, center_time
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(400, 300)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMouseTracking(True)
-
-        # Audio data
-        self.audio_data = None
-        self.sample_rate = None
-        self.total_duration = 0.0
-
-        # Cached spectrogram
-        self.spec_image = None
-        self.cached_view_start = None
-        self.cached_view_end = None
-        self.cached_min_freq = None
-        self.cached_max_freq = None
-
-        # View state
-        self.view_start = 0.0
-        self.view_end = 10.0
-        self.min_freq = 0
-        self.max_freq = 125000
-
-        # Detections
-        self.detections = []
-        self.current_detection_idx = -1
-
-        # Interaction state
-        self.drag_mode = None
-        self.drag_start = None
-        self.drag_start_box = None
-        self.drag_detection_idx = None
-
-        # Drawing new box
-        self.is_drawing = False
-        self.draw_start = None
-        self.draw_current = None
-
-        # Playback position indicator (None = not playing)
-        self.playback_position = None
-
-        # Colormap
-        self.colormap_name = 'viridis'
-        self.colormap_lut = self._create_colormap_lut(self.colormap_name)
-
-    def set_colormap(self, name):
-        """Set colormap by name and recompute spectrogram."""
-        self.colormap_name = name
-        self.colormap_lut = self._create_colormap_lut(name)
-        # Force recompute
-        self.cached_view_start = None
-        self.cached_view_end = None
-        self.spec_image = None
-        if self.total_duration > 0:
-            self._compute_view_spectrogram()
-        self.update()
-
-    @staticmethod
-    def _create_colormap_lut(name='viridis'):
-        """Create colormap lookup table by name."""
-        colormaps = {
-            'viridis': [
-                [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
-                [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89],
-                [180, 222, 44], [253, 231, 37],
-            ],
-            'magma': [
-                [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129],
-                [181, 54, 122], [229, 89, 100], [251, 135, 97], [254, 194, 140],
-                [254, 237, 176], [252, 253, 191],
-            ],
-            'inferno': [
-                [0, 0, 4], [22, 11, 57], [66, 10, 104], [106, 23, 110],
-                [147, 38, 103], [188, 55, 84], [221, 81, 58], [243, 120, 25],
-                [249, 173, 10], [252, 255, 164],
-            ],
-            'grayscale': [
-                [0, 0, 0], [28, 28, 28], [57, 57, 57], [85, 85, 85],
-                [113, 113, 113], [142, 142, 142], [170, 170, 170], [198, 198, 198],
-                [227, 227, 227], [255, 255, 255],
-            ],
-        }
-        colors = np.array(colormaps.get(name, colormaps['viridis']), dtype=np.float32)
-
-        n_colors = len(colors)
-        indices = np.linspace(0, n_colors - 1, 256)
-        lut = np.zeros((256, 3), dtype=np.uint8)
-
-        for i, t in enumerate(indices):
-            idx = int(t)
-            frac = t - idx
-            if idx >= n_colors - 1:
-                lut[i] = colors[-1]
-            else:
-                lut[i] = (colors[idx] * (1 - frac) + colors[idx + 1] * frac).astype(np.uint8)
-
-        return lut
-
-    def set_audio_data(self, audio_data, sample_rate, preserve_view=False):
-        """Set audio data for spectrogram computation.
-
-        Args:
-            preserve_view: If True, keep current view_start/view_end/freq settings.
-        """
-        self.audio_data = audio_data
-        self.sample_rate = sample_rate
-
-        if audio_data is not None and sample_rate is not None and len(audio_data) > 0:
-            self.total_duration = len(audio_data) / sample_rate
-            nyquist = min(125000, sample_rate / 2)
-            if not preserve_view:
-                self.view_start = 0
-                self.view_end = min(2.0, self.total_duration)
-                self.max_freq = nyquist
-            else:
-                # Clamp view to new file duration
-                if self.view_start >= self.total_duration:
-                    self.view_start = 0
-                self.view_end = min(self.view_end, self.total_duration)
-                if self.view_end <= self.view_start:
-                    self.view_end = min(self.view_start + 2.0, self.total_duration)
-                # Clamp max_freq to Nyquist
-                self.max_freq = min(self.max_freq, nyquist)
-        else:
-            self.total_duration = 0
-            self.view_start = 0
-            self.view_end = 10.0
-
-        self.cached_view_start = None
-        self.cached_view_end = None
-        self.cached_min_freq = None
-        self.cached_max_freq = None
-        self.spec_image = None
-
-        if self.total_duration > 0:
-            self._compute_view_spectrogram()
-        self.update()
-
-    def set_detections(self, detections, current_idx=-1):
-        """Set detection boxes. Clears any active drag to prevent stale references."""
-        # Cancel any active drag — the detection list is being replaced
-        if self.drag_mode is not None:
-            self.drag_mode = None
-            self.drag_detection_idx = None
-            self.drag_start = None
-            self.drag_start_box = None
-        self.detections = detections
-        self.current_detection_idx = current_idx
-        self.update()
-
-    def update_detection(self, idx, start_s, stop_s, min_freq, max_freq):
-        """Update a single detection in place (used during drag)."""
-        if 0 <= idx < len(self.detections):
-            self.detections[idx]['start_seconds'] = start_s
-            self.detections[idx]['stop_seconds'] = stop_s
-            self.detections[idx]['min_freq_hz'] = min_freq
-            self.detections[idx]['max_freq_hz'] = max_freq
-            self.update()
-
-    def set_view_range(self, start_s, end_s):
-        """Set visible time range."""
-        if self.total_duration > 0:
-            self.view_start = max(0, start_s)
-            self.view_end = min(self.total_duration, end_s)
-            self._compute_view_spectrogram()
-            self.update()
-
-    def get_view_range(self):
-        """Get current view range."""
-        return self.view_start, self.view_end
-
-    def get_total_duration(self):
-        """Get total audio duration."""
-        return self.total_duration
-
-    def _compute_view_spectrogram(self):
-        """Compute spectrogram for current view window."""
-        if self.audio_data is None or self.sample_rate is None:
-            self.spec_image = None
-            return
-
-        # Check cache - only use if position and freq range are nearly identical
-        current_window = self.view_end - self.view_start
-        if (self.cached_view_start is not None and
-            self.cached_view_end is not None and
-            self.spec_image is not None):
-            cached_window = self.cached_view_end - self.cached_view_start
-            zoom_similar = abs(current_window - cached_window) / (cached_window + 1e-10) < 0.05
-            position_tolerance = current_window * 0.01
-            same_position = (abs(self.view_start - self.cached_view_start) < position_tolerance and
-                            abs(self.view_end - self.cached_view_end) < position_tolerance)
-            same_freq = (self.cached_min_freq == self.min_freq and
-                        self.cached_max_freq == self.max_freq)
-            if zoom_similar and same_position and same_freq:
-                return
-
-        # Extract segment with padding
-        pad_time = 0.1
-        start_time = max(0, self.view_start - pad_time)
-        end_time = min(self.total_duration, self.view_end + pad_time)
-
-        start_sample = int(start_time * self.sample_rate)
-        end_sample = int(end_time * self.sample_rate)
-        segment = self.audio_data[start_sample:end_sample]
-
-        if len(segment) < 512:
-            self.spec_image = None
-            return
-
-        # Downsample if needed, but ensure Nyquist stays above max display freq
-        effective_sr = self.sample_rate
-        if len(segment) > 2_000_000:
-            downsample_factor = int(np.ceil(len(segment) / 2_000_000))
-            # Limit downsample so Nyquist (effective_sr/2) >= max_freq
-            if self.max_freq > 0:
-                max_allowed = max(1, int(self.sample_rate / (2 * self.max_freq)))
-                downsample_factor = min(downsample_factor, max_allowed)
-            if downsample_factor > 1:
-                segment = segment[::downsample_factor]
-                effective_sr = self.sample_rate / downsample_factor
-
-        # For very large segments, reduce time resolution instead of frequency
-        # Target ~2000 time columns max for the spectrogram image
-        target_time_cols = 2000
-        nperseg = min(512, len(segment) // 10)
-        nperseg = max(128, nperseg)
-        # Adjust overlap to limit output columns for wide windows
-        min_hop = max(1, len(segment) // target_time_cols)
-        noverlap = max(0, nperseg - min_hop)
-        noverlap = min(noverlap, int(nperseg * 0.75))  # Cap at 75% overlap
-        nfft = max(nperseg, 512)
-
-        frequencies, times, Sxx = signal.spectrogram(
-            segment, fs=effective_sr,
-            nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann'
-        )
-
-        times = times + start_time
-        spec_db = 10 * np.log10(Sxx + 1e-10)
-
-        # Filter to view range (time)
-        time_mask = (times >= self.view_start) & (times <= self.view_end)
-        if not np.any(time_mask):
-            self.spec_image = None
-            return
-
-        view_spec = spec_db[:, time_mask]
-
-        # Filter to frequency display range
-        freq_mask = (frequencies >= self.min_freq) & (frequencies <= self.max_freq)
-        if not np.any(freq_mask):
-            self.spec_image = None
-            return
-        view_spec = view_spec[freq_mask, :]
-
-        # Normalize and apply colormap
-        vmin = np.percentile(view_spec, 5)
-        vmax = np.percentile(view_spec, 99)
-        normalized = np.clip((view_spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
-        indices = (normalized * 255).astype(np.uint8)
-        indices = np.flipud(indices)
-
-        rgb_data = self.colormap_lut[indices]
-
-        height, width = indices.shape
-        self.spec_image = QImage(
-            rgb_data.data, width, height, width * 3,
-            QImage.Format_RGB888
-        ).copy()
-
-        self.cached_view_start = self.view_start
-        self.cached_view_end = self.view_end
-        self.cached_min_freq = self.min_freq
-        self.cached_max_freq = self.max_freq
-
-    def paintEvent(self, event):
-        """Paint spectrogram and detection boxes."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        painter.fillRect(self.rect(), QColor(30, 30, 30))
-
-        if self.spec_image is None:
-            painter.setPen(QColor(150, 150, 150))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No spectrogram data\nLoad audio files to begin")
-            return
-
-        spec_rect = self._get_spec_rect()
-        scaled_image = self.spec_image.scaled(
-            int(spec_rect.width()), int(spec_rect.height()),
-            Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-        )
-        painter.drawImage(spec_rect.topLeft(), scaled_image)
-
-        # Draw detection boxes
-        for i, det in enumerate(self.detections):
-            self._draw_detection_box(painter, det, i, spec_rect)
-
-        # Draw temp box if drawing
-        if self.is_drawing and self.draw_start and self.draw_current:
-            self._draw_temp_box(painter, spec_rect)
-
-        # Draw playback position line
-        if self.playback_position is not None:
-            x = self._time_to_x(self.playback_position, spec_rect)
-            if spec_rect.left() <= x <= spec_rect.right():
-                painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
-                painter.drawLine(int(x), int(spec_rect.top()),
-                                 int(x), int(spec_rect.bottom()))
-
-        self._draw_axes(painter, spec_rect)
-
-    def _get_spec_rect(self):
-        """Get spectrogram drawing area."""
-        margin_left = 50
-        margin_right = 10
-        margin_top = 10
-        margin_bottom = 40
-        return QRectF(
-            margin_left, margin_top,
-            self.width() - margin_left - margin_right,
-            self.height() - margin_top - margin_bottom
-        )
-
-    def _time_to_x(self, time_s, spec_rect):
-        """Convert time to x coordinate."""
-        if self.view_end <= self.view_start:
-            return spec_rect.left()
-        t = (time_s - self.view_start) / (self.view_end - self.view_start)
-        return spec_rect.left() + t * spec_rect.width()
-
-    def _x_to_time(self, x, spec_rect):
-        """Convert x coordinate to time."""
-        if spec_rect.width() <= 0:
-            return self.view_start
-        t = (x - spec_rect.left()) / spec_rect.width()
-        return self.view_start + t * (self.view_end - self.view_start)
-
-    def _freq_to_y(self, freq_hz, spec_rect):
-        """Convert frequency to y coordinate."""
-        if self.max_freq <= self.min_freq:
-            return spec_rect.top()
-        f = (freq_hz - self.min_freq) / (self.max_freq - self.min_freq)
-        return spec_rect.bottom() - f * spec_rect.height()
-
-    def _y_to_freq(self, y, spec_rect):
-        """Convert y coordinate to frequency."""
-        if spec_rect.height() <= 0:
-            return self.min_freq
-        f = (spec_rect.bottom() - y) / spec_rect.height()
-        return self.min_freq + f * (self.max_freq - self.min_freq)
-
-    def _draw_detection_box(self, painter, det, idx, spec_rect):
-        """Draw a detection bounding box."""
-        start_s = det.get('start_seconds', 0)
-        stop_s = det.get('stop_seconds', 0)
-        min_freq = det.get('min_freq_hz', self.min_freq)
-        max_freq = det.get('max_freq_hz', self.max_freq)
-        status = det.get('status', 'pending')
-
-        # Handle NaN values
-        try:
-            if math.isnan(start_s) or math.isnan(stop_s):
-                return
-        except TypeError:
-            return
-        if isinstance(min_freq, float) and math.isnan(min_freq):
-            min_freq = self.min_freq
-        if isinstance(max_freq, float) and math.isnan(max_freq):
-            max_freq = self.max_freq
-
-        x1 = self._time_to_x(start_s, spec_rect)
-        x2 = self._time_to_x(stop_s, spec_rect)
-        y1 = self._freq_to_y(max_freq, spec_rect)
-        y2 = self._freq_to_y(min_freq, spec_rect)
-
-        is_selected = idx == self.current_detection_idx
-
-        # Color based on status - yellow for pending, green for accepted, red for rejected
-        if status == 'accepted':
-            color = QColor(0, 200, 0, 220)  # Bright green
-            label = "A"
-        elif status == 'rejected':
-            color = QColor(255, 80, 80, 220)  # Bright red
-            label = "R"
-        elif status == 'negative':
-            color = QColor(255, 50, 50, 180)  # Dark red for negative/background
-            label = "N"
-        else:
-            color = QColor(255, 255, 0, 200)  # Yellow for pending
-            label = "P"
-
-        # Selected = white border; non-selected = yellow outline
-        if is_selected:
-            pen = QPen(QColor(255, 255, 255))
-            pen.setWidth(4)
-        else:
-            pen = QPen(color)
-            pen.setWidth(2)
-
-        painter.setPen(pen)
-        fill_alpha = 50 if status == 'negative' else 30
-        painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), fill_alpha)))
-        painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
-
-        # Draw status label above the box
-        if label:
-            center_x = (x1 + x2) / 2
-            label_y = y1 - 4
-            font = QFont("Arial", 14, QFont.Bold)
-            painter.setFont(font)
-            if is_selected:
-                painter.setPen(QColor(255, 255, 255))
-            else:
-                # Label color matches status
-                painter.setPen(color)
-            painter.drawText(int(center_x - 10), int(label_y - 16), 20, 18, Qt.AlignCenter, label)
-
-        # Draw frequency contour dots+lines for accepted detections
-        if status == 'accepted':
-            self._draw_freq_contour(painter, det, x1, x2, spec_rect)
-
-    def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
-        """Draw peak frequency sample dots and connecting lines."""
-        # Collect peak_freq_N values
-        points = []
-        i = 1
-        while True:
-            key = f'peak_freq_{i}'
-            val = det.get(key)
-            if val is None:
-                break
-            if not (isinstance(val, (int, float)) and not math.isnan(val)):
-                i += 1
-                continue
-            points.append(val)
-            i += 1
-
-        if len(points) < 2:
-            return
-
-        n = len(points)
-        # Evenly space dots horizontally across the box
-        dot_coords = []
-        for j, freq in enumerate(points):
-            t = j / (n - 1) if n > 1 else 0.5
-            px = x1 + t * (x2 - x1)
-            py = self._freq_to_y(freq, spec_rect)
-            dot_coords.append((px, py))
-
-        # Draw connecting lines (cyan)
-        pen = QPen(QColor(0, 220, 255, 200))
-        pen.setWidth(2)
-        painter.setPen(pen)
-        for j in range(len(dot_coords) - 1):
-            painter.drawLine(
-                int(dot_coords[j][0]), int(dot_coords[j][1]),
-                int(dot_coords[j+1][0]), int(dot_coords[j+1][1])
-            )
-
-        # Draw dots
-        painter.setBrush(QBrush(QColor(0, 220, 255, 230)))
-        painter.setPen(QPen(QColor(255, 255, 255), 1))
-        radius = 4
-        for px, py in dot_coords:
-            painter.drawEllipse(int(px - radius), int(py - radius), radius * 2, radius * 2)
-
-    def _draw_temp_box(self, painter, spec_rect):
-        """Draw temporary box while drawing."""
-        x1 = self._time_to_x(self.draw_start[0], spec_rect)
-        x2 = self._time_to_x(self.draw_current[0], spec_rect)
-        y1 = self._freq_to_y(self.draw_start[1], spec_rect)
-        y2 = self._freq_to_y(self.draw_current[1], spec_rect)
-
-        pen = QPen(QColor(0, 120, 212))
-        pen.setWidth(2)
-        pen.setStyle(Qt.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(QBrush(QColor(0, 120, 212, 40)))
-        painter.drawRect(QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)))
-
-    def _draw_axes(self, painter, spec_rect):
-        """Draw axis labels with adaptive tick density."""
-        painter.setPen(QColor(200, 200, 200))
-        font = QFont("Arial", 8)
-        painter.setFont(font)
-
-        # Time axis - adaptive tick spacing based on view window
-        view_duration = self.view_end - self.view_start
-        if view_duration <= 0:
-            return
-
-        # Choose nice tick intervals based on view duration
-        # Aim for roughly 8-12 major ticks across the view
-        nice_intervals = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
-                          1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
-        target_ticks = 10
-        ideal_interval = view_duration / target_ticks
-        tick_interval = nice_intervals[-1]
-        for ni in nice_intervals:
-            if ni >= ideal_interval:
-                tick_interval = ni
-                break
-
-        # Determine decimal places for label
-        if tick_interval < 0.01:
-            fmt = "{:.3f}"
-        elif tick_interval < 0.1:
-            fmt = "{:.2f}"
-        elif tick_interval < 1.0:
-            fmt = "{:.1f}"
-        else:
-            fmt = "{:.1f}"
-
-        # Draw minor ticks (subdivisions between major ticks)
-        minor_interval = tick_interval / 10.0
-        first_minor = math.ceil(self.view_start / minor_interval) * minor_interval
-        t = first_minor
-        painter.setPen(QColor(120, 120, 120))
-        while t <= self.view_end:
-            x = self._time_to_x(t, spec_rect)
-            if spec_rect.left() <= x <= spec_rect.right():
-                # Short tick mark at bottom of spectrogram
-                painter.drawLine(int(x), int(spec_rect.bottom()), int(x), int(spec_rect.bottom() + 4))
-            t += minor_interval
-
-        # Draw major ticks with labels
-        painter.setPen(QColor(200, 200, 200))
-        first_tick = math.ceil(self.view_start / tick_interval) * tick_interval
-        t = first_tick
-        while t <= self.view_end:
-            x = self._time_to_x(t, spec_rect)
-            if spec_rect.left() <= x <= spec_rect.right():
-                # Taller tick mark for major ticks
-                painter.drawLine(int(x), int(spec_rect.bottom()), int(x), int(spec_rect.bottom() + 8))
-                painter.drawText(
-                    int(x - 25), int(spec_rect.bottom() + 10),
-                    50, 15, Qt.AlignCenter, fmt.format(t)
-                )
-            t += tick_interval
-
-        painter.drawText(
-            int(spec_rect.center().x() - 30), int(spec_rect.bottom() + 25),
-            60, 15, Qt.AlignCenter, "Time (s)"
-        )
-
-        # Frequency axis — adaptive tick intervals like time axis
-        freq_range_khz = (self.max_freq - self.min_freq) / 1000.0
-        nice_freq_intervals = [0.5, 1, 2, 5, 10, 25, 50]  # kHz
-        target_freq_ticks = 8
-        ideal_freq_interval = freq_range_khz / target_freq_ticks
-        freq_tick_khz = nice_freq_intervals[-1]
-        for ni in nice_freq_intervals:
-            if ni >= ideal_freq_interval:
-                freq_tick_khz = ni
-                break
-
-        # Draw minor frequency ticks (subdivisions)
-        minor_freq_khz = freq_tick_khz / 5.0
-        painter.setPen(QColor(120, 120, 120))
-        first_minor_f = math.ceil(self.min_freq / 1000.0 / minor_freq_khz) * minor_freq_khz
-        f_khz = first_minor_f
-        while f_khz * 1000.0 <= self.max_freq:
-            freq = f_khz * 1000.0
-            y = self._freq_to_y(freq, spec_rect)
-            if spec_rect.top() <= y <= spec_rect.bottom():
-                painter.drawLine(int(spec_rect.left() - 4), int(y),
-                                 int(spec_rect.left()), int(y))
-            f_khz += minor_freq_khz
-
-        # Draw major frequency ticks with labels (centered vertically on tick)
-        painter.setPen(QColor(200, 200, 200))
-        first_major_f = math.ceil(self.min_freq / 1000.0 / freq_tick_khz) * freq_tick_khz
-        f_khz = first_major_f
-        label_h = 16
-        while f_khz * 1000.0 <= self.max_freq:
-            freq = f_khz * 1000.0
-            y = self._freq_to_y(freq, spec_rect)
-            if spec_rect.top() <= y <= spec_rect.bottom():
-                painter.drawLine(int(spec_rect.left() - 8), int(y),
-                                 int(spec_rect.left()), int(y))
-                painter.drawText(0, int(y - label_h // 2), 42, label_h,
-                                 Qt.AlignRight | Qt.AlignVCenter, f"{f_khz:.0f}")
-            f_khz += freq_tick_khz
-
-        painter.drawText(5, int(spec_rect.center().y() - 20), "kHz")
-
-    def mousePressEvent(self, event):
-        """Handle mouse press."""
-        if event.button() != Qt.LeftButton:
-            return
-
-        spec_rect = self._get_spec_rect()
-        pos = event.pos()
-
-        if not spec_rect.contains(pos):
-            return
-
-        time_s = self._x_to_time(pos.x(), spec_rect)
-        freq_hz = self._y_to_freq(pos.y(), spec_rect)
-
-        # First: check if clicking inside ANY detection box (for selection)
-        clicked_det = self._find_detection_at_pos(pos, spec_rect)
-
-        if clicked_det >= 0 and clicked_det != self.current_detection_idx:
-            # Clicked a non-selected detection — select it (don't drag)
-            self.detection_selected.emit(clicked_det)
-            return
-
-        # Now check edges/move on the SELECTED detection only
-        edge, det_idx = self._find_edge_at_pos(pos, spec_rect)
-
-        if edge:
-            self.drag_mode = edge
-            self.drag_detection_idx = det_idx
-            self.drag_start = (time_s, freq_hz)
-
-            if edge == 'move' and det_idx is not None and det_idx < len(self.detections):
-                det = self.detections[det_idx]
-                self.drag_start_box = (
-                    det.get('start_seconds', 0),
-                    det.get('stop_seconds', 0),
-                    det.get('min_freq_hz', self.min_freq),
-                    det.get('max_freq_hz', self.max_freq)
-                )
-        else:
-            # Not on any detection — start drawing a new box
-            self.is_drawing = True
-            self.draw_start = (time_s, freq_hz)
-            self.draw_current = (time_s, freq_hz)
-
-    def mouseMoveEvent(self, event):
-        """Handle mouse move."""
-        spec_rect = self._get_spec_rect()
-        pos = event.pos()
-
-        if self.is_drawing and self.draw_start:
-            time_s = self._x_to_time(pos.x(), spec_rect)
-            freq_hz = self._y_to_freq(pos.y(), spec_rect)
-            self.draw_current = (time_s, freq_hz)
-            self.update()
-        elif self.drag_mode:
-            self._handle_drag(pos, spec_rect)
-        else:
-            edge, _ = self._find_edge_at_pos(pos, spec_rect)
-            if edge in ('resize_left', 'resize_right'):
-                self.setCursor(Qt.SizeHorCursor)
-            elif edge in ('resize_top', 'resize_bottom'):
-                self.setCursor(Qt.SizeVerCursor)
-            elif edge == 'move':
-                self.setCursor(Qt.SizeAllCursor)
-            else:
-                self.setCursor(Qt.ArrowCursor)
-
-    def mouseReleaseEvent(self, event):
-        """Handle mouse release."""
-        if event.button() != Qt.LeftButton:
-            return
-
-        was_dragging = self.drag_mode is not None
-
-        if self.is_drawing and self.draw_start and self.draw_current:
-            t1, f1 = self.draw_start
-            t2, f2 = self.draw_current
-            if abs(t2 - t1) > 0.001 and abs(f2 - f1) > 100:
-                # Emit signal for new box (parent will handle creation)
-                pass
-
-        self.is_drawing = False
-        self.draw_start = None
-        self.draw_current = None
-        self.drag_mode = None
-        self.drag_detection_idx = None
-        self.drag_start_box = None
-        self.update()
-
-        # Notify parent that drag is complete (for saving)
-        if was_dragging:
-            self.drag_complete.emit()
-
-    def wheelEvent(self, event):
-        """Handle mouse wheel for zoom. Zoom centered on mouse position."""
-        if self.total_duration <= 0:
-            return
-        spec_rect = self._get_spec_rect()
-        if not spec_rect.contains(event.pos()):
-            return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        # Zoom factor: scroll up = zoom in, scroll down = zoom out
-        factor = 1.3 if delta > 0 else 1 / 1.3
-        center_time = self._x_to_time(event.pos().x(), spec_rect)
-        self.zoom_requested.emit(factor, center_time)
-        event.accept()
-
-    def _find_edge_at_pos(self, pos, spec_rect, threshold=8):
-        """Find if position is near a detection edge. Prioritizes selected detection."""
-        def _check_det(i, det):
-            start_s = det.get('start_seconds', 0)
-            stop_s = det.get('stop_seconds', 0)
-            min_freq = det.get('min_freq_hz', self.min_freq)
-            max_freq = det.get('max_freq_hz', self.max_freq)
-
-            x1 = self._time_to_x(start_s, spec_rect)
-            x2 = self._time_to_x(stop_s, spec_rect)
-            y1 = self._freq_to_y(max_freq, spec_rect)
-            y2 = self._freq_to_y(min_freq, spec_rect)
-
-            # Expand y-range slightly for edge detection
-            y_pad = threshold
-            if abs(pos.x() - x1) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
-                return 'resize_left', i
-            if abs(pos.x() - x2) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
-                return 'resize_right', i
-            if abs(pos.y() - y1) < threshold and x1 <= pos.x() <= x2:
-                return 'resize_top', i
-            if abs(pos.y() - y2) < threshold and x1 <= pos.x() <= x2:
-                return 'resize_bottom', i
-
-            if i == self.current_detection_idx:
-                if x1 < pos.x() < x2 and y1 < pos.y() < y2:
-                    return 'move', i
-
-            return None, None
-
-        # Check currently selected detection first (gives it priority)
-        if 0 <= self.current_detection_idx < len(self.detections):
-            result = _check_det(self.current_detection_idx, self.detections[self.current_detection_idx])
-            if result[0] is not None:
-                return result
-
-        # Then check all others
-        for i, det in enumerate(self.detections):
-            if i == self.current_detection_idx:
-                continue
-            result = _check_det(i, det)
-            if result[0] is not None:
-                return result
-
-        return None, None
-
-    def _find_detection_at_pos(self, pos, spec_rect):
-        """Find detection at position (checks both x and y axes).
-
-        Uses a generous click target — the box itself plus a 6px padding zone,
-        so small boxes are easier to click on.
-        """
-        pad = 6  # pixels of padding around each box
-        for i, det in enumerate(self.detections):
-            start_s = det.get('start_seconds', 0)
-            stop_s = det.get('stop_seconds', 0)
-            min_freq = det.get('min_freq_hz', self.min_freq)
-            max_freq = det.get('max_freq_hz', self.max_freq)
-
-            x1 = self._time_to_x(start_s, spec_rect)
-            x2 = self._time_to_x(stop_s, spec_rect)
-            y1 = self._freq_to_y(max_freq, spec_rect)  # top
-            y2 = self._freq_to_y(min_freq, spec_rect)  # bottom
-
-            if (x1 - pad) <= pos.x() <= (x2 + pad) and (y1 - pad) <= pos.y() <= (y2 + pad):
-                return i
-        return -1
-
-    def _handle_drag(self, pos, spec_rect):
-        """Handle drag for resize or move with clamped coordinates."""
-        if self.drag_detection_idx is None or self.drag_detection_idx >= len(self.detections):
-            self.drag_mode = None
-            return
-
-        det = self.detections[self.drag_detection_idx]
-        time_s = self._x_to_time(pos.x(), spec_rect)
-        freq_hz = self._y_to_freq(pos.y(), spec_rect)
-
-        # Clamp to valid ranges
-        time_s = max(0, min(time_s, self.total_duration))
-        freq_hz = max(0, min(freq_hz, self.max_freq))
-
-        start_s = det.get('start_seconds', 0)
-        stop_s = det.get('stop_seconds', 0)
-        min_freq = det.get('min_freq_hz', self.min_freq)
-        max_freq = det.get('max_freq_hz', self.max_freq)
-
-        if self.drag_mode == 'resize_left':
-            start_s = max(0, min(time_s, stop_s - 0.001))
-        elif self.drag_mode == 'resize_right':
-            stop_s = min(self.total_duration, max(time_s, start_s + 0.001))
-        elif self.drag_mode == 'resize_top':
-            max_freq = min(self.max_freq, max(freq_hz, min_freq + 100))
-        elif self.drag_mode == 'resize_bottom':
-            min_freq = max(0, min(freq_hz, max_freq - 100))
-        elif self.drag_mode == 'move' and self.drag_start and self.drag_start_box:
-            delta_t = time_s - self.drag_start[0]
-            delta_f = freq_hz - self.drag_start[1]
-
-            orig_start, orig_stop, orig_min_f, orig_max_f = self.drag_start_box
-            box_duration = orig_stop - orig_start
-            box_freq_range = orig_max_f - orig_min_f
-
-            start_s = max(0, orig_start + delta_t)
-            stop_s = start_s + box_duration
-            if stop_s > self.total_duration:
-                stop_s = self.total_duration
-                start_s = stop_s - box_duration
-
-            min_freq = max(0, orig_min_f + delta_f)
-            max_freq = min_freq + box_freq_range
-            if max_freq > self.max_freq:
-                max_freq = self.max_freq
-                min_freq = max_freq - box_freq_range
-
-        self.box_adjusted.emit(self.drag_detection_idx, start_s, stop_s, min_freq, max_freq)
-
-
-# =============================================================================
-# Waveform Overview Widget
-# =============================================================================
-
-class WaveformOverviewWidget(QWidget):
-    """Thin waveform strip showing full file with viewport highlight."""
-
-    view_changed = pyqtSignal(float)  # center time clicked
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(40)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setMouseTracking(True)
-
-        self.envelope = None  # Downsampled envelope
-        self.total_duration = 0.0
-        self.view_start = 0.0
-        self.view_end = 1.0
-        self._dragging = False
-        self.detection_times = []  # List of (start_s, stop_s) for tick marks
-
-    def set_audio_data(self, audio_data, sample_rate):
-        """Compute downsampled envelope for display."""
-        if audio_data is None or sample_rate is None or len(audio_data) == 0:
-            self.envelope = None
-            self.total_duration = 0.0
-            self.update()
-            return
-
-        self.total_duration = len(audio_data) / sample_rate
-        # Downsample to ~1000 points for the overview
-        n_bins = min(1000, len(audio_data))
-        bin_size = max(1, len(audio_data) // n_bins)
-        trimmed = audio_data[:bin_size * n_bins]
-        reshaped = trimmed.reshape(n_bins, bin_size)
-        self.envelope = np.max(np.abs(reshaped), axis=1)
-        # Normalize
-        peak = np.max(self.envelope)
-        if peak > 0:
-            self.envelope = self.envelope / peak
-        self.update()
-
-    def set_detections(self, detection_times):
-        """Set detection positions for tick marks.
-
-        Args:
-            detection_times: List of (start_seconds, stop_seconds) tuples
-        """
-        self.detection_times = detection_times or []
-        self.update()
-
-    def set_view_range(self, start, end):
-        """Update viewport highlight."""
-        self.view_start = start
-        self.view_end = end
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(20, 20, 20))
-
-        if self.envelope is None or self.total_duration <= 0:
-            return
-
-        w = self.width()
-        h = self.height()
-
-        # Draw waveform envelope
-        painter.setPen(QPen(QColor(0, 120, 212, 180), 1))
-        n = len(self.envelope)
-        mid_y = h / 2
-        for i in range(n):
-            x = int(i / n * w)
-            amp = self.envelope[i] * mid_y * 0.9
-            painter.drawLine(x, int(mid_y - amp), x, int(mid_y + amp))
-
-        # Draw detection tick marks
-        if self.detection_times and self.total_duration > 0:
-            painter.setPen(QPen(QColor(255, 200, 50, 180), 1))
-            for start_s, stop_s in self.detection_times:
-                cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
-                painter.drawLine(cx, 0, cx, h)
-
-        # Draw viewport highlight
-        x1 = int(self.view_start / self.total_duration * w)
-        x2 = int(self.view_end / self.total_duration * w)
-        painter.setBrush(QBrush(QColor(0, 120, 212, 50)))
-        painter.setPen(QPen(QColor(0, 120, 212, 200), 1))
-        painter.drawRect(x1, 0, max(2, x2 - x1), h)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.total_duration > 0:
-            self._dragging = True
-            center = event.pos().x() / self.width() * self.total_duration
-            self.view_changed.emit(center)
-
-    def mouseMoveEvent(self, event):
-        if self._dragging and self.total_duration > 0:
-            center = event.pos().x() / self.width() * self.total_duration
-            center = max(0, min(center, self.total_duration))
-            self.view_changed.emit(center)
-
-    def mouseReleaseEvent(self, event):
-        self._dragging = False
 
 
 # =============================================================================
@@ -1017,6 +84,7 @@ class DSPDetectionWorker(QThread):
             min_tonality=self.config.get('min_tonality', 0.3),
             min_call_freq_hz=self.config.get('min_call_freq_hz', 0.0),
             harmonic_filter=self.config.get('harmonic_filter', True),
+            harmonic_label=self.config.get('harmonic_label', False),
             min_freq_gap_hz=self.config.get('min_freq_gap_hz', 5000.0),
             min_gap_ms=self.config.get('min_gap_ms', 5.0),
             noise_percentile=self.config.get('noise_percentile', 25.0),
@@ -1024,6 +92,16 @@ class DSPDetectionWorker(QThread):
             noverlap=self.config.get('noverlap', 384),
             gpu_enabled=self.config.get('gpu_enabled', False),
             gpu_device=self.config.get('gpu_device', 'auto'),
+            # Advanced noise rejection
+            min_bandwidth_hz=self.config.get('min_bandwidth_hz', 0.0),
+            min_snr_db=self.config.get('min_snr_db', 0.0),
+            min_spectral_entropy=self.config.get('min_spectral_entropy', 0.0),
+            max_spectral_entropy=self.config.get('max_spectral_entropy', 0.0),
+            min_power_db=self.config.get('min_power_db', 0.0),
+            max_power_db=self.config.get('max_power_db', 0.0),
+            max_mean_sweep_rate=self.config.get('max_mean_sweep_rate', 0.0),
+            max_contour_jitter=self.config.get('max_contour_jitter', 0.0),
+            min_ici_ms=self.config.get('min_ici_ms', 0.0),
         )
 
         detector = DSPDetector(config)
@@ -1056,102 +134,83 @@ class DSPDetectionWorker(QThread):
         self.all_complete.emit(self.results)
 
 
-class YOLOTrainingWorker(QThread):
-    """Worker thread for YOLO model training."""
-    progress = pyqtSignal(str)       # status message
-    complete = pyqtSignal(str)       # model_path
-    error = pyqtSignal(str)          # error message
-
-    def __init__(self, dataset_yaml, output_dir, model_name,
-                 pretrained_weights=None):
-        super().__init__()
-        self.dataset_yaml = dataset_yaml
-        self.output_dir = output_dir
-        self.model_name = model_name
-        self.pretrained_weights = pretrained_weights
-
-    def run(self):
-        try:
-            from fnt.usv.usv_detector.yolo_detector import train_yolo_model
-
-            self.progress.emit(f"Training {self.model_name} (auto early stopping)...")
-            model_path = train_yolo_model(
-                self.dataset_yaml, self.output_dir, self.model_name,
-                pretrained_weights=self.pretrained_weights,
-            )
-            self.complete.emit(model_path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class YOLOInferenceWorker(QThread):
-    """Worker thread for YOLO inference on audio files."""
-    progress = pyqtSignal(str, int, int)       # filename, current, total
-    file_complete = pyqtSignal(str, str, list, int)  # filename, filepath, detections, count
-    all_complete = pyqtSignal(dict)             # filepath -> detections
-    error = pyqtSignal(str, str)               # filename, error
-
-    def __init__(self, files, model_path, config, confidence_threshold=0.25):
-        super().__init__()
-        self.files = files
-        self.model_path = model_path
-        self.config = config
-        self.confidence_threshold = confidence_threshold
-        self.results = {}
-
-    def run(self):
-        from fnt.usv.usv_detector.yolo_detector import run_yolo_inference
-
-        total = len(self.files)
-        for i, filepath in enumerate(self.files):
-            filename = os.path.basename(filepath)
-            self.progress.emit(filename, i, total)
-
-            try:
-                detections = run_yolo_inference(
-                    self.model_path, filepath, self.config,
-                    confidence_threshold=self.confidence_threshold,
-                )
-                self.results[filepath] = detections
-                self.file_complete.emit(filename, filepath, detections, len(detections))
-            except Exception as e:
-                self.error.emit(filename, str(e))
-                self.results[filepath] = []
-
-        self.all_complete.emit(self.results)
-
 
 # =============================================================================
-# Main USV Studio Window
+# Main Classic Audio Detector Window
 # =============================================================================
 
-class USVStudioWindow(QMainWindow):
-    """Main window for USV Studio."""
+class ClassicAudioDetectorWindow(QMainWindow):
+    """Main window for Classic Audio Detector."""
 
     # Species-specific DSP detection presets.
     # 'Manual' means user controls all parameters directly.
     # Add new species by adding a key with a dict of DSP config values.
     SPECIES_PROFILES = {
         'Manual': None,
-        'Prairie Vole USVs': {
-            'min_freq_hz': 20000, 'max_freq_hz': 65000,
-            'energy_threshold_db': 10.0,
-            'min_duration_ms': 20.0, 'max_duration_ms': 1000.0,
-            'max_bandwidth_hz': 25000, 'min_tonality': 0.50,
+        'Rodent USVs': {
+            'min_freq_hz': 18000, 'max_freq_hz': 120000,
+            'energy_threshold_db': 8.0,
+            'min_duration_ms': 3.0, 'max_duration_ms': 3000.0,
+            'max_bandwidth_hz': 25000, 'min_tonality': 0.05,
             'min_call_freq_hz': 15000, 'harmonic_filter': True,
             'min_freq_gap_hz': 5000,
             'min_gap_ms': 5.0, 'noise_percentile': 25.0,
             'nperseg': 512, 'noverlap': 384,
+            # Advanced noise rejection
+            'min_bandwidth_hz': 500, 'min_snr_db': 6.0,
+            'min_spectral_entropy': 0.0, 'max_spectral_entropy': 0.0,
+            'min_power_db': 0.0, 'max_power_db': 0.0,
+            'max_mean_sweep_rate': 0.0, 'max_contour_jitter': 0.0,
+            'min_ici_ms': 0.0,
+        },
+        'Prairie Vole USVs': {
+            # Freq range: adults 20-45 kHz fundamental (Stewart 2015).
+            # Cap at 60 kHz to capture full FM sweeps and near-harmonics
+            # while keeping broadband noise manageable.
+            'min_freq_hz': 20000, 'max_freq_hz': 60000,
+            # Threshold: 10 dB — real calls are bright and well above noise.
+            'energy_threshold_db': 10.0,
+            # Duration: 8 ms min — noise fragments are 3-5 ms; real prairie
+            # vole syllables are typically 10-40 ms (Stewart 2015).
+            'min_duration_ms': 8.0, 'max_duration_ms': 500.0,
+            # Bandwidth: 30 kHz max — real swept calls span 15-25 kHz;
+            # 20 kHz was too tight and rejected legitimate FM sweeps.
+            'max_bandwidth_hz': 30000,
+            # Tonality: 0.20 — empirically tuned. Real calls measure
+            # 0.14-0.62 tonality; 0.20 balances sensitivity vs noise.
+            'min_tonality': 0.20,
+            # Min call freq: 15 kHz — provides margin below the 20 kHz
+            # fundamental floor without admitting low-frequency noise.
+            'min_call_freq_hz': 15000,
+            # Harmonic filter + labeling with 2 kHz gap for tight splitting.
+            'harmonic_filter': True, 'harmonic_label': True,
+            'min_freq_gap_hz': 2000,
+            # Min gap: 2 ms — preserves rapid syllable sequences.
+            'min_gap_ms': 2.0,
+            'noise_percentile': 25.0,
+            'nperseg': 512, 'noverlap': 384,
+            # Advanced noise rejection — empirically tuned
+            # Min bandwidth 500 Hz: rejects pure-tone electrical noise.
+            'min_bandwidth_hz': 500,
+            # Min SNR 8 dB: real calls are clearly above noise floor.
+            'min_snr_db': 8.0,
+            # Spectral entropy: disabled — not reliable at our FFT resolution.
+            'min_spectral_entropy': 0.0, 'max_spectral_entropy': 0.0,
+            # Power: disabled.
+            'min_power_db': 0.0, 'max_power_db': 0.0,
+            # Sweep/contour/ICI: disabled.
+            'max_mean_sweep_rate': 0.0,
+            'max_contour_jitter': 0.0,
+            'min_ici_ms': 0.0,
         },
     }
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FNT USV Studio")
+        self.setWindowTitle("FNT Classic Audio Detector")
         self.setMinimumSize(1000, 700)
         self.resize(1400, 900)  # Initial size, but resizable
 
-        # State
         self.audio_files = []  # List of audio file paths
         self.current_file_idx = 0
         self.audio_data = None
@@ -1160,6 +219,7 @@ class USVStudioWindow(QMainWindow):
         self.current_detection_idx = 0
         self.all_detections = {}  # filepath -> DataFrame
         self.detection_sources = {}  # filepath -> 'dsp' | 'ml' | 'detections' (tracks CSV origin)
+        self.dsp_queue = []  # Files queued for DSP detection
         self.dsp_queue = []  # Files queued for DSP detection
 
         # Playback state
@@ -1214,7 +274,6 @@ class USVStudioWindow(QMainWindow):
         self._create_dsp_section(left_layout)
         self._create_detection_section(left_layout)
         self._create_labeling_section(left_layout)
-        self._create_ml_section(left_layout)
 
         left_layout.addStretch()
         left_scroll.setWidget(left_widget)
@@ -1393,7 +452,7 @@ class USVStudioWindow(QMainWindow):
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Welcome to USV Studio - Load audio files to begin")
+        self.status_bar.showMessage("Welcome to Classic Audio Detector - Load audio files to begin")
 
     def _create_input_section(self, layout):
         """Create input/file selection section."""
@@ -1487,10 +546,28 @@ class USVStudioWindow(QMainWindow):
         self.combo_species_profile = QComboBox()
         for name in self.SPECIES_PROFILES.keys():
             self.combo_species_profile.addItem(name)
+        # Load custom profiles from disk
+        self._custom_profiles = self._load_custom_profiles()
+        for name in sorted(self._custom_profiles.keys()):
+            self.combo_species_profile.addItem(name)
         self.combo_species_profile.setCurrentText("Manual")
         self.combo_species_profile.setToolTip("Species profile presets.\nSelecting a profile auto-fills all DSP parameters\nand locks them. Choose Manual to customize.")
         self.combo_species_profile.currentTextChanged.connect(self._on_species_profile_changed)
         profile_row.addWidget(self.combo_species_profile, 1)
+
+        self.btn_save_profile = QPushButton("Save")
+        self.btn_save_profile.setMaximumWidth(50)
+        self.btn_save_profile.setToolTip("Save current settings as a custom profile")
+        self.btn_save_profile.clicked.connect(self._save_custom_profile)
+        profile_row.addWidget(self.btn_save_profile)
+
+        self.btn_delete_profile = QPushButton("✕")
+        self.btn_delete_profile.setMaximumWidth(26)
+        self.btn_delete_profile.setToolTip("Delete the currently selected custom profile")
+        self.btn_delete_profile.clicked.connect(self._delete_custom_profile)
+        self.btn_delete_profile.setEnabled(False)
+        profile_row.addWidget(self.btn_delete_profile)
+
         group_layout.addLayout(profile_row)
 
         # Frequency range
@@ -1651,6 +728,20 @@ class USVStudioWindow(QMainWindow):
         self.chk_harmonic_filter.setToolTip(harmonic_tip)
         advanced_layout.addWidget(self.chk_harmonic_filter)
 
+        # Harmonic labeling checkbox
+        harmonic_label_tip = ("Label harmonics instead of removing them.\n"
+                              "When enabled, detections whose peak frequency\n"
+                              "is ~2x or 3x another overlapping detection are\n"
+                              "marked as 'harmonic' (yellow boxes) rather than\n"
+                              "discarded. They are excluded from call counts\n"
+                              "but preserved in the output CSV.\n\n"
+                              "This runs after the Harmonic Filter above,\n"
+                              "so both can be used together or independently.")
+        self.chk_harmonic_label = QCheckBox("Label Harmonics")
+        self.chk_harmonic_label.setChecked(False)
+        self.chk_harmonic_label.setToolTip(harmonic_label_tip)
+        advanced_layout.addWidget(self.chk_harmonic_label)
+
         # Frequency gap splitting
         freq_gap_tip = ("Minimum vertical frequency gap (Hz) to split\n"
                         "a single connected detection into two.\n"
@@ -1685,6 +776,149 @@ class USVStudioWindow(QMainWindow):
         self.spin_min_gap.setToolTip(gap_tip)
         gap_row.addWidget(self.spin_min_gap, 1)
         advanced_layout.addLayout(gap_row)
+
+        # --- Advanced Noise Rejection ---
+        # Min bandwidth
+        min_bw_tip = ("Minimum frequency bandwidth for a detection (Hz).\n"
+                      "Very narrow detections (< 500 Hz) are often\n"
+                      "electrical noise spikes or single-freq artifacts.\n"
+                      "Set to 0 to disable this filter.")
+        min_bw_row = QHBoxLayout()
+        min_bw_row.setSpacing(4)
+        min_bw_row.addWidget(self._make_label("Min Bandwidth:", min_bw_tip, min_width=90))
+        self.spin_min_bw = QSpinBox()
+        self.spin_min_bw.setRange(0, 50000)
+        self.spin_min_bw.setSingleStep(100)
+        self.spin_min_bw.setValue(0)
+        self.spin_min_bw.setSuffix(" Hz")
+        self.spin_min_bw.setToolTip(min_bw_tip)
+        min_bw_row.addWidget(self.spin_min_bw, 1)
+        advanced_layout.addLayout(min_bw_row)
+
+        # Min SNR
+        snr_tip = ("Minimum signal-to-noise ratio (dB).\n"
+                   "SNR = peak power minus local noise floor.\n"
+                   "Higher = keep only strong, clear calls.\n"
+                   "Set to 0 to disable this filter.")
+        snr_row = QHBoxLayout()
+        snr_row.setSpacing(4)
+        snr_row.addWidget(self._make_label("Min SNR:", snr_tip, min_width=90))
+        self.spin_min_snr = QDoubleSpinBox()
+        self.spin_min_snr.setRange(0.0, 50.0)
+        self.spin_min_snr.setSingleStep(1.0)
+        self.spin_min_snr.setValue(0.0)
+        self.spin_min_snr.setSuffix(" dB")
+        self.spin_min_snr.setToolTip(snr_tip)
+        snr_row.addWidget(self.spin_min_snr, 1)
+        advanced_layout.addLayout(snr_row)
+
+        # Spectral entropy range
+        ent_tip = ("Spectral entropy range (0.0 = pure tone, 1.0 = noise).\n"
+                   "Min: reject too-pure artifacts (electrical tones).\n"
+                   "Max: reject broadband noise events.\n"
+                   "Real USV calls typically 0.1 - 0.6.\n"
+                   "Set either to 0 to disable that bound.")
+        ent_row = QHBoxLayout()
+        ent_row.setSpacing(4)
+        ent_row.addWidget(self._make_label("Entropy:", ent_tip, min_width=90))
+        self.spin_min_entropy = QDoubleSpinBox()
+        self.spin_min_entropy.setRange(0.0, 1.0)
+        self.spin_min_entropy.setSingleStep(0.05)
+        self.spin_min_entropy.setDecimals(2)
+        self.spin_min_entropy.setValue(0.0)
+        self.spin_min_entropy.setToolTip("Min spectral entropy (0=off)")
+        ent_row.addWidget(self.spin_min_entropy, 1)
+        ent_row.addWidget(QLabel("-"))
+        self.spin_max_entropy = QDoubleSpinBox()
+        self.spin_max_entropy.setRange(0.0, 1.0)
+        self.spin_max_entropy.setSingleStep(0.05)
+        self.spin_max_entropy.setDecimals(2)
+        self.spin_max_entropy.setValue(0.0)
+        self.spin_max_entropy.setToolTip("Max spectral entropy (0=off)")
+        ent_row.addWidget(self.spin_max_entropy, 1)
+        advanced_layout.addLayout(ent_row)
+
+        # Power range
+        pwr_tip = ("Power thresholds (dB).\n"
+                   "Min: reject weak/quiet detections.\n"
+                   "Max: reject clipping artifacts.\n"
+                   "Set to 0 to disable.")
+        pwr_row = QHBoxLayout()
+        pwr_row.setSpacing(4)
+        pwr_row.addWidget(self._make_label("Power:", pwr_tip, min_width=90))
+        self.spin_min_power = QDoubleSpinBox()
+        self.spin_min_power.setRange(-120.0, 0.0)
+        self.spin_min_power.setSingleStep(1.0)
+        self.spin_min_power.setValue(0.0)
+        self.spin_min_power.setSuffix(" dB")
+        self.spin_min_power.setToolTip("Min mean power (0=off)")
+        pwr_row.addWidget(self.spin_min_power, 1)
+        pwr_row.addWidget(QLabel("-"))
+        self.spin_max_power = QDoubleSpinBox()
+        self.spin_max_power.setRange(-120.0, 0.0)
+        self.spin_max_power.setSingleStep(1.0)
+        self.spin_max_power.setValue(0.0)
+        self.spin_max_power.setSuffix(" dB")
+        self.spin_max_power.setToolTip("Max peak power (0=off)")
+        pwr_row.addWidget(self.spin_max_power, 1)
+        advanced_layout.addLayout(pwr_row)
+
+        # Max sweep rate
+        sweep_tip = ("Maximum mean frequency sweep rate (kHz/ms).\n"
+                     "Computed from peak frequency trajectory.\n"
+                     "Very high rates may indicate noise artifacts.\n"
+                     "Requires Freq Samples to be enabled.\n"
+                     "Set to 0 to disable.")
+        sweep_row = QHBoxLayout()
+        sweep_row.setSpacing(4)
+        sweep_row.addWidget(self._make_label("Max Sweep:", sweep_tip, min_width=90))
+        self.spin_max_sweep = QDoubleSpinBox()
+        self.spin_max_sweep.setRange(0.0, 100.0)
+        self.spin_max_sweep.setSingleStep(0.5)
+        self.spin_max_sweep.setDecimals(2)
+        self.spin_max_sweep.setValue(0.0)
+        self.spin_max_sweep.setSuffix(" kHz/ms")
+        self.spin_max_sweep.setToolTip(sweep_tip)
+        sweep_row.addWidget(self.spin_max_sweep, 1)
+        advanced_layout.addLayout(sweep_row)
+
+        # Max contour jitter
+        jitter_tip = ("Maximum frequency contour jitter (kHz).\n"
+                      "Measures how erratic the peak frequency trajectory is.\n"
+                      "Real USV calls have smooth contours (low jitter).\n"
+                      "Noise artifacts have erratic contours (high jitter).\n"
+                      "Requires Freq Samples to be enabled.\n"
+                      "Set to 0 to disable.")
+        jitter_row = QHBoxLayout()
+        jitter_row.setSpacing(4)
+        jitter_row.addWidget(self._make_label("Max Jitter:", jitter_tip, min_width=90))
+        self.spin_max_jitter = QDoubleSpinBox()
+        self.spin_max_jitter.setRange(0.0, 50.0)
+        self.spin_max_jitter.setSingleStep(0.5)
+        self.spin_max_jitter.setDecimals(2)
+        self.spin_max_jitter.setValue(0.0)
+        self.spin_max_jitter.setSuffix(" kHz")
+        self.spin_max_jitter.setToolTip(jitter_tip)
+        jitter_row.addWidget(self.spin_max_jitter, 1)
+        advanced_layout.addLayout(jitter_row)
+
+        # Min ICI
+        ici_tip = ("Minimum inter-call interval (ms).\n"
+                   "Reject calls in suspiciously regular trains.\n"
+                   "Some noise sources (e.g. 60Hz harmonics) produce\n"
+                   "detections at regular short intervals.\n"
+                   "Set to 0 to disable.")
+        ici_row = QHBoxLayout()
+        ici_row.setSpacing(4)
+        ici_row.addWidget(self._make_label("Min ICI:", ici_tip, min_width=90))
+        self.spin_min_ici = QDoubleSpinBox()
+        self.spin_min_ici.setRange(0.0, 100.0)
+        self.spin_min_ici.setSingleStep(1.0)
+        self.spin_min_ici.setValue(0.0)
+        self.spin_min_ici.setSuffix(" ms")
+        self.spin_min_ici.setToolTip(ici_tip)
+        ici_row.addWidget(self.spin_min_ici, 1)
+        advanced_layout.addLayout(ici_row)
 
         # Noise percentile
         noise_tip = ("Percentile of spectrogram power used to\n"
@@ -1776,10 +1010,16 @@ class USVStudioWindow(QMainWindow):
             self.spin_threshold,
             self.spin_min_dur, self.spin_max_dur,
             self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
-            self.chk_harmonic_filter, self.spin_freq_gap,
+            self.chk_harmonic_filter, self.chk_harmonic_label,
+            self.spin_freq_gap,
             self.spin_min_gap, self.spin_noise_pct,
             self.spin_nperseg, self.spin_noverlap,
             self.chk_freq_samples, self.spin_freq_samples,
+            # Advanced noise rejection
+            self.spin_min_bw, self.spin_min_snr,
+            self.spin_min_entropy, self.spin_max_entropy,
+            self.spin_min_power, self.spin_max_power,
+            self.spin_max_sweep, self.spin_max_jitter, self.spin_min_ici,
         ]
 
         # Queue display
@@ -1818,6 +1058,18 @@ class USVStudioWindow(QMainWindow):
         self.btn_run_dsp.clicked.connect(self.run_dsp_detection)
         self.btn_run_dsp.setEnabled(False)
         group_layout.addWidget(self.btn_run_dsp)
+
+        # Process Preview Snapshot button
+        self.btn_preview_snapshot = QPushButton("Process Preview Snapshot")
+        self.btn_preview_snapshot.setStyleSheet("background-color: #2d7d46;")
+        self.btn_preview_snapshot.setToolTip(
+            "Run DSP detection on only the currently visible time range.\n"
+            "Uses the current parameter settings. Results replace any\n"
+            "existing detections for this file."
+        )
+        self.btn_preview_snapshot.clicked.connect(self.run_preview_snapshot)
+        self.btn_preview_snapshot.setEnabled(False)
+        group_layout.addWidget(self.btn_preview_snapshot)
 
         # Batch progress (tracks files completed)
         self.dsp_progress = QProgressBar()
@@ -1863,7 +1115,6 @@ class USVStudioWindow(QMainWindow):
         self.combo_filter.addItem("Pending", "pending")
         self.combo_filter.addItem("Accepted", "accepted")
         self.combo_filter.addItem("Rejected", "rejected")
-        self.combo_filter.addItem("Negative", "negative")
         self.combo_filter.setToolTip("Filter which detections to navigate through")
         self.combo_filter.currentIndexChanged.connect(self.on_filter_changed)
         filter_row.addWidget(self.combo_filter, 1)
@@ -2077,105 +1328,13 @@ class USVStudioWindow(QMainWindow):
         group_layout.addWidget(self.lbl_stats)
 
         # Instructions
-        lbl_hint = QLabel("Keys: A=Accept R=Reject X=Negative D=Delete Space=Play Ctrl+Z=Undo")
+        lbl_hint = QLabel("Keys: A=Accept R=Reject D=Delete Space=Play Ctrl+Z=Undo")
         lbl_hint.setStyleSheet("color: #666666; font-size: 9px; font-style: italic;")
         lbl_hint.setWordWrap(True)
         group_layout.addWidget(lbl_hint)
 
         group.setLayout(group_layout)
         layout.addWidget(group)
-
-    def _create_ml_section(self, layout):
-        """Create YOLO-based ML detection section."""
-        group = QGroupBox("5. ML Detection (YOLO)")
-        group.setToolTip(
-            "Train and run a YOLO neural network for USV detection.\n"
-            "Label examples with Accept (A) and Negative (X),\n"
-            "then train a model to detect calls automatically."
-        )
-        group_layout = QVBoxLayout()
-        group_layout.setSpacing(4)
-
-        # Project row
-        project_row = QHBoxLayout()
-        project_row.setSpacing(2)
-        self.btn_ml_project = QPushButton("Open/Create Project")
-        self.btn_ml_project.setToolTip(
-            "Open an existing YOLO project or create a new one.\n"
-            "Projects store training data, models, and config."
-        )
-        self.btn_ml_project.clicked.connect(self._ml_open_project)
-        project_row.addWidget(self.btn_ml_project)
-        group_layout.addLayout(project_row)
-
-        self.lbl_ml_project = QLabel("No project")
-        self.lbl_ml_project.setStyleSheet("color: #999999; font-size: 9px;")
-        self.lbl_ml_project.setWordWrap(True)
-        group_layout.addWidget(self.lbl_ml_project)
-
-        # Training data stats
-        self.lbl_ml_data = QLabel("Labels: 0 positive, 0 negative")
-        self.lbl_ml_data.setStyleSheet("color: #999999;")
-        group_layout.addWidget(self.lbl_ml_data)
-
-        # Train button
-        self.btn_ml_train = QPushButton("Export && Train")
-        self.btn_ml_train.setStyleSheet("background-color: #2d7d46;")
-        self.btn_ml_train.setToolTip(
-            "Export labeled data as spectrogram tiles and train\n"
-            "a YOLOv8-nano model. Requires accepted + negative labels.\n"
-            "Training stops automatically when loss plateaus."
-        )
-        self.btn_ml_train.clicked.connect(self._ml_train)
-        self.btn_ml_train.setEnabled(False)
-        group_layout.addWidget(self.btn_ml_train)
-
-        # Progress
-        self.ml_progress = QProgressBar()
-        self.ml_progress.setValue(0)
-        self.ml_progress.setVisible(False)
-        group_layout.addWidget(self.ml_progress)
-
-        self.lbl_ml_status = QLabel("")
-        self.lbl_ml_status.setStyleSheet("color: #999999; font-size: 9px;")
-        group_layout.addWidget(self.lbl_ml_status)
-
-        # Current model info
-        self.lbl_ml_model = QLabel("No trained model")
-        self.lbl_ml_model.setStyleSheet("color: #aaaaaa; font-size: 9px;")
-        self.lbl_ml_model.setWordWrap(True)
-        group_layout.addWidget(self.lbl_ml_model)
-
-        # Run ML Detection buttons
-        run_row = QHBoxLayout()
-        run_row.setSpacing(2)
-
-        self.btn_ml_detect_current = QPushButton("Detect Current")
-        self.btn_ml_detect_current.setToolTip(
-            "Run YOLO detection on the current file.\n"
-            "Results appear as pending detections."
-        )
-        self.btn_ml_detect_current.clicked.connect(self._ml_detect_current)
-        self.btn_ml_detect_current.setEnabled(False)
-        run_row.addWidget(self.btn_ml_detect_current)
-
-        self.btn_ml_detect_all = QPushButton("Detect All")
-        self.btn_ml_detect_all.setToolTip(
-            "Run YOLO detection on all files in the file list.\n"
-            "Batch processes with progress reporting."
-        )
-        self.btn_ml_detect_all.clicked.connect(self._ml_detect_all)
-        self.btn_ml_detect_all.setEnabled(False)
-        run_row.addWidget(self.btn_ml_detect_all)
-
-        group_layout.addLayout(run_row)
-
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-
-        # Initialize YOLO project state
-        self._yolo_project_config = None
-        self._yolo_model_path = None
 
     def _on_gpu_toggle(self, checked):
         """Handle GPU acceleration checkbox toggle."""
@@ -2283,7 +1442,14 @@ class USVStudioWindow(QMainWindow):
 
     def _on_species_profile_changed(self, profile_name):
         """Handle species profile dropdown change."""
+        # Look up in built-in profiles first, then custom
         preset = self.SPECIES_PROFILES.get(profile_name)
+        if preset is None:
+            preset = self._custom_profiles.get(profile_name)
+
+        # Enable delete button only for custom profiles
+        is_custom = profile_name in self._custom_profiles
+        self.btn_delete_profile.setEnabled(is_custom)
 
         if preset is None:
             # Manual mode — re-enable all DSP parameter widgets
@@ -2301,6 +1467,11 @@ class USVStudioWindow(QMainWindow):
                 self.spin_freq_gap,
                 self.spin_min_gap, self.spin_noise_pct,
                 self.spin_nperseg, self.spin_noverlap,
+                # Advanced noise rejection
+                self.spin_min_bw, self.spin_min_snr,
+                self.spin_min_entropy, self.spin_max_entropy,
+                self.spin_min_power, self.spin_max_power,
+                self.spin_max_sweep, self.spin_max_jitter, self.spin_min_ici,
             ]
             for s in spinboxes:
                 s.blockSignals(True)
@@ -2318,7 +1489,18 @@ class USVStudioWindow(QMainWindow):
             self.spin_nperseg.setValue(preset['nperseg'])
             self.spin_noverlap.setValue(preset['noverlap'])
             self.chk_harmonic_filter.setChecked(preset.get('harmonic_filter', True))
+            self.chk_harmonic_label.setChecked(preset.get('harmonic_label', False))
             self.spin_freq_gap.setValue(preset.get('min_freq_gap_hz', 5000))
+            # Advanced noise rejection
+            self.spin_min_bw.setValue(preset.get('min_bandwidth_hz', 0))
+            self.spin_min_snr.setValue(preset.get('min_snr_db', 0.0))
+            self.spin_min_entropy.setValue(preset.get('min_spectral_entropy', 0.0))
+            self.spin_max_entropy.setValue(preset.get('max_spectral_entropy', 0.0))
+            self.spin_min_power.setValue(preset.get('min_power_db', 0.0))
+            self.spin_max_power.setValue(preset.get('max_power_db', 0.0))
+            self.spin_max_sweep.setValue(preset.get('max_mean_sweep_rate', 0.0))
+            self.spin_max_jitter.setValue(preset.get('max_contour_jitter', 0.0))
+            self.spin_min_ici.setValue(preset.get('min_ici_ms', 0.0))
 
             for s in spinboxes:
                 s.blockSignals(False)
@@ -2328,6 +1510,123 @@ class USVStudioWindow(QMainWindow):
             for w in self._dsp_param_widgets:
                 w.setEnabled(False)
                 w.setStyleSheet(locked_style)
+
+
+    # -------------------------------------------------------------------------
+    # Custom profile management
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _profiles_dir():
+        """Return the directory for custom detection profiles."""
+        d = os.path.join(os.path.expanduser("~"), ".fnt", "detection_profiles")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _load_custom_profiles(self) -> dict:
+        """Load all custom profiles from ~/.fnt/detection_profiles/."""
+        profiles = {}
+        profiles_dir = self._profiles_dir()
+        if not os.path.isdir(profiles_dir):
+            return profiles
+        for fname in os.listdir(profiles_dir):
+            if fname.endswith('.json'):
+                try:
+                    with open(os.path.join(profiles_dir, fname)) as f:
+                        data = json.load(f)
+                    name = data.pop('_profile_name', fname.replace('.json', ''))
+                    profiles[name] = data
+                except Exception:
+                    continue
+        return profiles
+
+    def _save_custom_profile(self):
+        """Save the current DSP settings as a custom profile."""
+        # Count existing custom profiles for default name
+        n = len(self._custom_profiles) + 1
+        default_name = f"Custom Profile {n}"
+
+        name, ok = QInputDialog.getText(
+            self, "Save Detection Profile",
+            "Profile name:",
+            QLineEdit.Normal,
+            default_name
+        )
+        if not ok or not name.strip():
+            return
+
+        name = name.strip()
+
+        # Prevent overwriting built-in profiles
+        if name in self.SPECIES_PROFILES:
+            QMessageBox.warning(
+                self, "Invalid Name",
+                f"'{name}' is a built-in profile and cannot be overwritten.\n"
+                "Please choose a different name."
+            )
+            return
+
+        # Confirm overwrite if profile already exists
+        if name in self._custom_profiles:
+            reply = QMessageBox.question(
+                self, "Overwrite Profile",
+                f"Profile '{name}' already exists. Overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        # Gather current settings
+        profile_data = self._gather_dsp_config()
+        profile_data['_profile_name'] = name
+
+        # Save to disk
+        safe_fname = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in name)
+        filepath = os.path.join(self._profiles_dir(), f"{safe_fname}.json")
+        with open(filepath, 'w') as f:
+            json.dump(profile_data, f, indent=2)
+
+        # Remove the _profile_name key from the in-memory dict
+        profile_data_clean = {k: v for k, v in profile_data.items() if k != '_profile_name'}
+        self._custom_profiles[name] = profile_data_clean
+
+        # Add to dropdown if not already there
+        if self.combo_species_profile.findText(name) == -1:
+            self.combo_species_profile.addItem(name)
+
+        # Select the newly saved profile
+        self.combo_species_profile.setCurrentText(name)
+        self.status_bar.showMessage(f"Profile '{name}' saved")
+
+    def _delete_custom_profile(self):
+        """Delete the currently selected custom profile."""
+        name = self.combo_species_profile.currentText()
+        if name not in self._custom_profiles:
+            return
+
+        reply = QMessageBox.question(
+            self, "Delete Profile",
+            f"Delete custom profile '{name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Remove from disk
+        safe_fname = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in name)
+        filepath = os.path.join(self._profiles_dir(), f"{safe_fname}.json")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+        # Remove from memory
+        del self._custom_profiles[name]
+
+        # Remove from dropdown and switch to Manual
+        idx = self.combo_species_profile.findText(name)
+        if idx >= 0:
+            self.combo_species_profile.removeItem(idx)
+        self.combo_species_profile.setCurrentText("Manual")
+        self.status_bar.showMessage(f"Profile '{name}' deleted")
 
     def _setup_shortcuts(self):
         """Set up global keyboard shortcuts using QShortcut."""
@@ -2772,7 +2071,7 @@ class USVStudioWindow(QMainWindow):
                 continue
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+            for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
                 csv_path = parent / f"{base}{suffix}.csv"
                 if csv_path.exists():
                     try:
@@ -3032,7 +2331,7 @@ class USVStudioWindow(QMainWindow):
         parent = Path(filepath).parent
 
         # Try different suffixes
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
             csv_path = parent / f"{base}{suffix}.csv"
             if csv_path.exists():
                 try:
@@ -3051,7 +2350,6 @@ class USVStudioWindow(QMainWindow):
 
         self.detections_df = None
         self.current_detection_idx = 0
-
     @staticmethod
     def _ensure_freq_bounds(df):
         """Ensure min_freq_hz and max_freq_hz columns exist. Compute from
@@ -3082,7 +2380,7 @@ class USVStudioWindow(QMainWindow):
         # Check for CSV on disk
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
             if (parent / f"{base}{suffix}.csv").exists():
                 return True
         return False
@@ -3131,6 +2429,275 @@ class USVStudioWindow(QMainWindow):
         # Update file list to show/hide checkmarks
         self._refresh_file_list_items()
 
+    def _gather_dsp_config(self):
+        """Gather current DSP parameter values from the UI into a config dict."""
+        return {
+            'min_freq_hz': self.spin_min_freq.value(),
+            'max_freq_hz': self.spin_max_freq.value(),
+            'energy_threshold_db': self.spin_threshold.value(),
+            'min_duration_ms': self.spin_min_dur.value(),
+            'max_duration_ms': self.spin_max_dur.value(),
+            'max_bandwidth_hz': self.spin_max_bw.value(),
+            'min_tonality': self.spin_tonality.value(),
+            'min_call_freq_hz': self.spin_min_call_freq.value(),
+            'harmonic_filter': self.chk_harmonic_filter.isChecked(),
+            'harmonic_label': self.chk_harmonic_label.isChecked(),
+            'min_freq_gap_hz': self.spin_freq_gap.value(),
+            'min_gap_ms': self.spin_min_gap.value(),
+            'noise_percentile': self.spin_noise_pct.value(),
+            'nperseg': self.spin_nperseg.value(),
+            'noverlap': self.spin_noverlap.value(),
+            'freq_samples': self.spin_freq_samples.value() if self.chk_freq_samples.isChecked() else 0,
+            'gpu_enabled': self.chk_gpu_accel.isChecked(),
+            'gpu_device': getattr(self, '_selected_gpu_device', 'auto'),
+            # Advanced noise rejection
+            'min_bandwidth_hz': self.spin_min_bw.value(),
+            'min_snr_db': self.spin_min_snr.value(),
+            'min_spectral_entropy': self.spin_min_entropy.value(),
+            'max_spectral_entropy': self.spin_max_entropy.value(),
+            'min_power_db': self.spin_min_power.value(),
+            'max_power_db': self.spin_max_power.value(),
+            'max_mean_sweep_rate': self.spin_max_sweep.value(),
+            'max_contour_jitter': self.spin_max_jitter.value(),
+            'min_ici_ms': self.spin_min_ici.value(),
+        }
+
+    def run_preview_snapshot(self):
+        """Run DSP detection on only the currently visible preview window."""
+        if self.audio_data is None or self.sample_rate is None:
+            self.status_bar.showMessage("No audio loaded")
+            return
+
+        filepath = self.audio_files[self.current_file_idx]
+        view_start, view_end = self.spectrogram.get_view_range()
+
+        # Extract the audio segment for the visible window
+        start_sample = int(view_start * self.sample_rate)
+        end_sample = int(view_end * self.sample_rate)
+        start_sample = max(0, start_sample)
+        end_sample = min(len(self.audio_data), end_sample)
+        audio_segment = self.audio_data[start_sample:end_sample]
+
+        if len(audio_segment) == 0:
+            self.status_bar.showMessage("Preview window is empty")
+            return
+
+        self.btn_preview_snapshot.setEnabled(False)
+        self.btn_preview_snapshot.setText("Processing...")
+        QApplication.processEvents()
+
+        try:
+            from fnt.usv.usv_detector.dsp_detector import DSPDetector
+            from fnt.usv.usv_detector.config import USVDetectorConfig
+
+            cfg = self._gather_dsp_config()
+            detector_config = USVDetectorConfig(
+                min_freq_hz=cfg.get('min_freq_hz', 20000),
+                max_freq_hz=cfg.get('max_freq_hz', 65000),
+                energy_threshold_db=cfg.get('energy_threshold_db', 10.0),
+                min_duration_ms=cfg.get('min_duration_ms', 10.0),
+                max_duration_ms=cfg.get('max_duration_ms', 1000.0),
+                max_bandwidth_hz=cfg.get('max_bandwidth_hz', 20000.0),
+                min_tonality=cfg.get('min_tonality', 0.3),
+                min_call_freq_hz=cfg.get('min_call_freq_hz', 0.0),
+                harmonic_filter=cfg.get('harmonic_filter', True),
+                harmonic_label=cfg.get('harmonic_label', False),
+                min_freq_gap_hz=cfg.get('min_freq_gap_hz', 5000.0),
+                min_gap_ms=cfg.get('min_gap_ms', 5.0),
+                noise_percentile=cfg.get('noise_percentile', 25.0),
+                nperseg=cfg.get('nperseg', 512),
+                noverlap=cfg.get('noverlap', 384),
+                gpu_enabled=cfg.get('gpu_enabled', False),
+                gpu_device=cfg.get('gpu_device', 'auto'),
+                min_bandwidth_hz=cfg.get('min_bandwidth_hz', 0.0),
+                min_snr_db=cfg.get('min_snr_db', 0.0),
+                min_spectral_entropy=cfg.get('min_spectral_entropy', 0.0),
+                max_spectral_entropy=cfg.get('max_spectral_entropy', 0.0),
+                min_power_db=cfg.get('min_power_db', 0.0),
+                max_power_db=cfg.get('max_power_db', 0.0),
+                max_mean_sweep_rate=cfg.get('max_mean_sweep_rate', 0.0),
+                max_contour_jitter=cfg.get('max_contour_jitter', 0.0),
+                min_ici_ms=cfg.get('min_ici_ms', 0.0),
+            )
+
+            detector = DSPDetector(detector_config)
+
+            seg_dur = len(audio_segment) / self.sample_rate
+            print(f"[Preview Snapshot] view={view_start:.3f}-{view_end:.3f}s, "
+                  f"samples={len(audio_segment)}, sr={self.sample_rate}, "
+                  f"dur={seg_dur:.3f}s")
+            print(f"[Preview Snapshot] Config: freq={detector_config.min_freq_hz}-"
+                  f"{detector_config.max_freq_hz}Hz, thresh={detector_config.energy_threshold_db}dB, "
+                  f"dur={detector_config.min_duration_ms}-{detector_config.max_duration_ms}ms, "
+                  f"tonality={detector_config.min_tonality}, "
+                  f"snr={detector_config.min_snr_db}dB, "
+                  f"entropy={detector_config.min_spectral_entropy}-{detector_config.max_spectral_entropy}, "
+                  f"min_bw={detector_config.min_bandwidth_hz}Hz")
+
+            # Run detection with per-stage diagnostic logging
+            from fnt.usv.usv_detector.spectrogram import bandpass_filter, compute_spectrogram_auto
+            filtered = bandpass_filter(
+                audio_segment, self.sample_rate,
+                detector_config.min_freq_hz,
+                detector_config.max_freq_hz
+            )
+            frequencies, times, Sxx_db = compute_spectrogram_auto(
+                filtered, self.sample_rate,
+                nperseg=detector_config.nperseg,
+                noverlap=detector_config.noverlap,
+                nfft=detector_config.nfft,
+                window=detector_config.window_type,
+                min_freq=detector_config.min_freq_hz,
+                max_freq=detector_config.max_freq_hz,
+                gpu_enabled=detector_config.gpu_enabled,
+                gpu_device=detector_config.gpu_device,
+            )
+            print(f"[Preview Snapshot] Spectrogram: {Sxx_db.shape}, "
+                  f"freq range {frequencies[0]:.0f}-{frequencies[-1]:.0f}Hz, "
+                  f"time range {times[0]:.4f}-{times[-1]:.4f}s, "
+                  f"dB range {Sxx_db.min():.1f} to {Sxx_db.max():.1f}")
+
+            calls = detector._detect_from_spectrogram(frequencies, times, Sxx_db)
+            print(f"[Preview Snapshot] After threshold+connected components: {len(calls)}")
+
+            calls = detector._filter_by_duration(calls)
+            print(f"[Preview Snapshot] After duration filter: {len(calls)}")
+
+            calls = detector._merge_close_calls(calls)
+            print(f"[Preview Snapshot] After merge close: {len(calls)}")
+
+            calls = detector._filter_by_bandwidth(calls)
+            print(f"[Preview Snapshot] After max bandwidth: {len(calls)}")
+
+            calls = detector._filter_by_min_bandwidth(calls)
+            print(f"[Preview Snapshot] After min bandwidth: {len(calls)}")
+
+            calls = detector._filter_by_snr(calls)
+            print(f"[Preview Snapshot] After SNR filter: {len(calls)}")
+
+            calls = detector._compute_spectral_features(calls, frequencies, times, Sxx_db)
+
+            # Diagnostic: show tonality and entropy distribution before filtering
+            if calls:
+                tonalities = [c.get('tonality', 0) for c in calls]
+                entropies = [c.get('spectral_entropy', 0) for c in calls]
+                print(f"[Preview Snapshot] Tonality stats: min={min(tonalities):.4f}, "
+                      f"max={max(tonalities):.4f}, mean={sum(tonalities)/len(tonalities):.4f}, "
+                      f"median={sorted(tonalities)[len(tonalities)//2]:.4f}")
+                print(f"[Preview Snapshot] Entropy stats: min={min(entropies):.4f}, "
+                      f"max={max(entropies):.4f}, mean={sum(entropies)/len(entropies):.4f}")
+                # Show a few examples
+                for i, c in enumerate(calls[:5]):
+                    print(f"[Preview Snapshot]   call[{i}]: tonality={c.get('tonality',0):.4f}, "
+                          f"entropy={c.get('spectral_entropy',0):.4f}, "
+                          f"freq={c.get('min_freq_hz',0):.0f}-{c.get('max_freq_hz',0):.0f}Hz, "
+                          f"dur={c.get('duration_ms',0):.1f}ms")
+
+            calls = detector._filter_by_tonality(calls)
+            print(f"[Preview Snapshot] After tonality filter (threshold={detector_config.min_tonality}): {len(calls)}")
+
+            calls = detector._filter_by_spectral_entropy(calls)
+            print(f"[Preview Snapshot] After spectral entropy ({detector_config.min_spectral_entropy}-{detector_config.max_spectral_entropy}): {len(calls)}")
+
+            calls = detector._filter_by_min_freq(calls)
+            print(f"[Preview Snapshot] After min freq filter: {len(calls)}")
+
+            calls = detector._filter_by_power(calls)
+            print(f"[Preview Snapshot] After power filter: {len(calls)}")
+
+            calls = detector._filter_harmonics(calls)
+            print(f"[Preview Snapshot] After harmonic filter: {len(calls)}")
+
+            # Peak freq sampling
+            n_samples = getattr(detector_config, 'freq_samples', 5)
+            if n_samples and n_samples > 0:
+                calls = detector._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
+
+            calls = detector._compute_contour_features(calls)
+            calls = detector._filter_by_sweep_rate(calls)
+            calls = detector._filter_by_contour_smoothness(calls)
+            calls = detector._filter_by_ici(calls)
+            print(f"[Preview Snapshot] Final detections: {len(calls)}")
+
+            detections = calls
+
+            # Offset all detection times by the view start
+            for det in detections:
+                det['start_seconds'] += view_start
+                det['stop_seconds'] += view_start
+
+            n_det = len(detections)
+            import pandas as pd
+
+            # Always clear existing detections within the preview window first
+            if self.detections_df is not None and len(self.detections_df) > 0:
+                mask_outside = (
+                    (self.detections_df['stop_seconds'] <= view_start) |
+                    (self.detections_df['start_seconds'] >= view_end)
+                )
+                self.detections_df = self.detections_df[mask_outside].copy()
+            else:
+                self.detections_df = None
+
+            if n_det > 0:
+                new_df = pd.DataFrame(detections)
+                # Mark harmonics with special status, others as pending
+                if 'is_harmonic' in new_df.columns:
+                    new_df['status'] = new_df['is_harmonic'].apply(
+                        lambda h: 'harmonic' if h else 'pending'
+                    )
+                else:
+                    new_df['status'] = 'pending'
+                self._ensure_freq_bounds(new_df)
+
+                if self.detections_df is not None and len(self.detections_df) > 0:
+                    self.detections_df = pd.concat([self.detections_df, new_df], ignore_index=True)
+                    self.detections_df.sort_values('start_seconds', inplace=True)
+                    self.detections_df.reset_index(drop=True, inplace=True)
+                else:
+                    self.detections_df = new_df
+
+            # Handle empty result — set to None if nothing left
+            if self.detections_df is not None and len(self.detections_df) == 0:
+                self.detections_df = None
+
+            # Update stored detections
+            self.all_detections[filepath] = self.detections_df.copy() if self.detections_df is not None else pd.DataFrame()
+            self.detection_sources[filepath] = 'usv_dsp'
+
+            # Keep current_detection_idx valid without jumping the view
+            if self.detections_df is not None and len(self.detections_df) > 0:
+                self.current_detection_idx = min(self.current_detection_idx, len(self.detections_df) - 1)
+                self.current_detection_idx = max(0, self.current_detection_idx)
+            else:
+                self.current_detection_idx = 0
+
+            # Refresh display WITHOUT moving the spectrogram view
+            self._update_display_no_scroll()
+            if n_det > 0:
+                n_harmonics = sum(1 for d in detections if d.get('is_harmonic', False))
+                n_calls = n_det - n_harmonics
+                harm_str = f" ({n_harmonics} harmonic)" if n_harmonics else ""
+                self.status_bar.showMessage(
+                    f"Preview snapshot: {n_calls} call{'s' if n_calls != 1 else ''}"
+                    f"{harm_str} in {view_end - view_start:.1f}s window"
+                )
+            else:
+                n_remaining = len(self.detections_df) if self.detections_df is not None else 0
+                self.status_bar.showMessage(
+                    f"Preview snapshot: no new detections in {view_end - view_start:.1f}s window "
+                    f"(cleared window; {n_remaining} detections remain outside)"
+                )
+
+        except Exception as e:
+            self.status_bar.showMessage(f"Preview snapshot error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.btn_preview_snapshot.setEnabled(True)
+            self.btn_preview_snapshot.setText("Process Preview Snapshot")
+            self._update_ui_state()
+
     def run_dsp_detection(self):
         """Run DSP detection on queued files."""
         if not self.dsp_queue:
@@ -3167,26 +2734,7 @@ class USVStudioWindow(QMainWindow):
             else:
                 return  # Cancel
 
-        # Gather config
-        config = {
-            'min_freq_hz': self.spin_min_freq.value(),
-            'max_freq_hz': self.spin_max_freq.value(),
-            'energy_threshold_db': self.spin_threshold.value(),
-            'min_duration_ms': self.spin_min_dur.value(),
-            'max_duration_ms': self.spin_max_dur.value(),
-            'max_bandwidth_hz': self.spin_max_bw.value(),
-            'min_tonality': self.spin_tonality.value(),
-            'min_call_freq_hz': self.spin_min_call_freq.value(),
-            'harmonic_filter': self.chk_harmonic_filter.isChecked(),
-            'min_freq_gap_hz': self.spin_freq_gap.value(),
-            'min_gap_ms': self.spin_min_gap.value(),
-            'noise_percentile': self.spin_noise_pct.value(),
-            'nperseg': self.spin_nperseg.value(),
-            'noverlap': self.spin_noverlap.value(),
-            'freq_samples': self.spin_freq_samples.value() if self.chk_freq_samples.isChecked() else 0,
-            'gpu_enabled': self.chk_gpu_accel.isChecked(),
-            'gpu_device': getattr(self, '_selected_gpu_device', 'auto'),
-        }
+        config = self._gather_dsp_config()
 
         # Start worker
         self.dsp_worker = DSPDetectionWorker(self.dsp_queue.copy(), config)
@@ -3241,7 +2789,13 @@ class USVStudioWindow(QMainWindow):
 
         if len(df) > 0:
             if 'status' not in df.columns:
-                df['status'] = 'pending'
+                # Mark harmonics with special status if labeling is enabled
+                if 'is_harmonic' in df.columns:
+                    df['status'] = df['is_harmonic'].apply(
+                        lambda h: 'harmonic' if h else 'pending'
+                    )
+                else:
+                    df['status'] = 'pending'
             if 'source' not in df.columns:
                 df['source'] = 'dsp'
             if 'call_number' not in df.columns:
@@ -3399,11 +2953,85 @@ class USVStudioWindow(QMainWindow):
         self._update_spectrogram_view()
         self._update_progress()
         self._update_button_counts()
+        self._update_button_counts()
         self._update_statistics()
 
-        # Refresh ML label counts (enables train button when enough labels exist)
-        if self._yolo_project_config is not None:
-            self._update_ml_state()
+
+    def _update_display_no_scroll(self):
+        """Update display elements without moving the spectrogram view.
+
+        Used by preview snapshot so the user's view stays in place.
+        """
+        if self.detections_df is None or len(self.detections_df) == 0:
+            self.lbl_det_num.setText("Det 0/0")
+            self.lbl_det_info.setText("Peak: -- Hz | Dur: -- ms")
+            self.lbl_det_status.setText("Status: --")
+            self.spectrogram.set_detections([], -1)
+            self.waveform_overview.set_detections([])
+            self._update_progress()
+            return
+
+        n_det = len(self.detections_df)
+        self.current_detection_idx = min(self.current_detection_idx, n_det - 1)
+        self.current_detection_idx = max(0, self.current_detection_idx)
+
+        det = self.detections_df.iloc[self.current_detection_idx]
+
+        self.lbl_det_num.setText(f"Det {self.current_detection_idx + 1}/{n_det}")
+        self.btn_prev_det.setEnabled(self.current_detection_idx > 0)
+        self.btn_next_det.setEnabled(self.current_detection_idx < n_det - 1)
+
+        self.spin_start.blockSignals(True)
+        self.spin_stop.blockSignals(True)
+        self.spin_start.setValue(det['start_seconds'])
+        self.spin_stop.setValue(det['stop_seconds'])
+        self.spin_start.blockSignals(False)
+        self.spin_stop.blockSignals(False)
+
+        self.spin_det_min_freq.blockSignals(True)
+        self.spin_det_max_freq.blockSignals(True)
+        min_f = det.get('min_freq_hz', 20000)
+        max_f = det.get('max_freq_hz', 80000)
+        min_f = 20000 if pd.isna(min_f) else int(min_f)
+        max_f = 80000 if pd.isna(max_f) else int(max_f)
+        self.spin_det_min_freq.setValue(min_f)
+        self.spin_det_max_freq.setValue(max_f)
+        self.spin_det_min_freq.blockSignals(False)
+        self.spin_det_max_freq.blockSignals(False)
+
+        peak = det.get('peak_freq_hz', 0)
+        dur = det.get('duration_ms', 0)
+        peak = 0 if pd.isna(peak) else peak
+        dur = 0 if pd.isna(dur) else dur
+        self.lbl_det_info.setText(f"Peak: {peak:.0f} Hz | Dur: {dur:.1f} ms")
+
+        status = det.get('status', 'pending')
+        self.lbl_det_status.setText(f"Status: {status.capitalize()}")
+        if status == 'accepted':
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #107c10;")
+        elif status == 'rejected':
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #d13438;")
+        elif status == 'noise':
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #8b4513;")
+        else:
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #999999;")
+
+        self.spin_jump.blockSignals(True)
+        self.spin_jump.setRange(1, max(1, n_det))
+        self.spin_jump.setValue(self.current_detection_idx + 1)
+        self.spin_jump.blockSignals(False)
+
+        det_times = list(zip(
+            self.detections_df['start_seconds'].tolist(),
+            self.detections_df['stop_seconds'].tolist()
+        ))
+        self.waveform_overview.set_detections(det_times)
+
+        # Refresh detection boxes on the spectrogram WITHOUT moving the view
+        self._update_detection_boxes()
+        self._update_progress()
+        self._update_button_counts()
+        self._update_statistics()
 
     def _update_spectrogram_view(self):
         """Update spectrogram to show current detection."""
@@ -3752,30 +3380,6 @@ class USVStudioWindow(QMainWindow):
         self._update_button_counts()
         self._auto_advance()
 
-    def mark_negative(self):
-        """Mark current detection as negative (background) training data.
-
-        Expands the box to full frequency range (0 to Nyquist) so the
-        entire time span is labeled as 'no USV here'.
-        """
-        if self.detections_df is None or len(self.detections_df) == 0:
-            return
-        if self.current_detection_idx >= len(self.detections_df):
-            return
-        old_status = self.detections_df.at[self.current_detection_idx, 'status']
-        self.undo_stack.append(('label', self.current_detection_idx, old_status))
-        self.btn_undo.setEnabled(True)
-        self.detections_df.at[self.current_detection_idx, 'status'] = 'negative'
-        # Expand to full frequency range
-        nyquist = self.sample_rate / 2 if self.sample_rate else 125000
-        self.detections_df.at[self.current_detection_idx, 'min_freq_hz'] = 0
-        self.detections_df.at[self.current_detection_idx, 'max_freq_hz'] = nyquist
-        self.detections_df.at[self.current_detection_idx, 'freq_bandwidth_hz'] = nyquist
-        self._store_current_detections()
-        self._update_display()
-        self._update_button_counts()
-        self._auto_advance()
-
     def skip_detection(self):
         """Skip to next detection by time without changing its status."""
         if self.detections_df is None:
@@ -3811,16 +3415,9 @@ class USVStudioWindow(QMainWindow):
         counts = self.detections_df['status'].value_counts()
         n_accepted = counts.get('accepted', 0)
         n_rejected = counts.get('rejected', 0)
-        n_negative = counts.get('negative', 0)
 
         self.btn_accept.setText(f"Accept ({n_accepted})")
         self.btn_reject.setText(f"Reject ({n_rejected})")
-        # Show negative count in status bar if any exist
-        if n_negative > 0:
-            self.status_bar.showMessage(
-                f"Detections: {n_accepted} accepted, {n_rejected} rejected, "
-                f"{n_negative} negative, {len(self.detections_df) - n_accepted - n_rejected - n_negative} pending"
-            )
 
     def add_new_usv(self):
         """Add a new USV detection at view center."""
@@ -4115,23 +3712,55 @@ class USVStudioWindow(QMainWindow):
                 # Playing at speed S means the output should have
                 # (original_duration / S) seconds of audio at the output rate.
                 output_sr = 44100
-                # Number of output samples = original_duration / speed * output_sr
                 original_duration = len(segment) / self.sample_rate
                 output_duration = original_duration / self.playback_speed
+
+                # Cap output duration to prevent enormous buffers
+                max_play_duration = 120.0  # seconds
+                if output_duration > max_play_duration:
+                    self.status_bar.showMessage(
+                        f"Playback too long ({output_duration:.0f}s at {self.playback_speed}x). "
+                        f"Increase speed or reduce window size."
+                    )
+                    return
+
                 n_output_samples = int(output_duration * output_sr)
                 if n_output_samples < 100:
                     return
                 segment = signal.resample(segment, n_output_samples).astype(np.float32)
                 play_sr = output_sr
 
-            sd.play(segment, play_sr)
+            # Normalize to prevent clipping
+            peak = np.max(np.abs(segment))
+            if peak > 0:
+                segment = segment / peak * 0.9
+
+            # Try playback, falling back to different sample rates if needed
+            played = False
+            for try_sr in [play_sr, 48000, 96000]:
+                try:
+                    if try_sr != play_sr:
+                        # Resample to fallback rate
+                        n_resamp = int(len(segment) * try_sr / play_sr)
+                        play_segment = signal.resample(segment, n_resamp).astype(np.float32)
+                    else:
+                        play_segment = segment
+                    sd.play(play_segment, try_sr)
+                    played = True
+                    break
+                except sd.PortAudioError:
+                    continue
+
+            if not played:
+                self.status_bar.showMessage("Playback error: no compatible audio output found")
+                return
+
             self.is_playing = True
             self.btn_play.setText("Playing...")
 
             # Track playback position for the moving line.
-            # Use a small latency offset to account for audio output buffering.
             import time as _time
-            self._playback_latency = 0.15  # seconds of estimated output latency
+            self._playback_latency = 0.15
             self._playback_start_time = _time.time()
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
@@ -4220,322 +3849,6 @@ class USVStudioWindow(QMainWindow):
             folder = Path(self.audio_files[self.current_file_idx]).parent
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
-    # =========================================================================
-    # Machine Learning
-    # =========================================================================
-
-    # =========================================================================
-    # ML Detection (YOLO)
-    # =========================================================================
-
-    def _ml_open_project(self):
-        """Open or create a YOLO ML detection project."""
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select or Create YOLO Project Directory"
-        )
-        if not folder:
-            return
-
-        try:
-            from fnt.usv.usv_detector.yolo_detector import (
-                YOLOProjectConfig, create_project
-            )
-        except ImportError as e:
-            QMessageBox.warning(self, "Import Error", f"Failed to import YOLO module:\n{e}")
-            return
-
-        config_path = os.path.join(folder, 'project_config.json')
-        if os.path.exists(config_path):
-            # Load existing project
-            self._yolo_project_config = YOLOProjectConfig.load(config_path)
-            self.lbl_ml_project.setText(os.path.basename(folder))
-            # Check for latest model
-            if self._yolo_project_config.models:
-                latest = self._yolo_project_config.models[-1]
-                model_path = latest.get('path', '')
-                if os.path.exists(model_path):
-                    self._yolo_model_path = model_path
-                    self.lbl_ml_model.setText(f"Model: {latest.get('name', 'unknown')}")
-            self.status_bar.showMessage(f"Opened YOLO project: {folder}")
-        else:
-            # Create new project
-            self._yolo_project_config = create_project(folder)
-            self.lbl_ml_project.setText(os.path.basename(folder))
-            self.status_bar.showMessage(f"Created new YOLO project: {folder}")
-
-        self._update_ml_state()
-
-    def _update_ml_state(self):
-        """Update ML section UI based on current state."""
-        from fnt.usv.usv_detector.yolo_detector import get_training_data_counts
-
-        # Count labeled data
-        counts = get_training_data_counts(self.all_detections)
-        n_pos = counts['n_positive']
-        n_neg = counts['n_negative']
-        self.lbl_ml_data.setText(f"Labels: {n_pos} positive, {n_neg} negative")
-
-        has_project = self._yolo_project_config is not None
-        has_labels = n_pos >= 1 and n_neg >= 1
-        has_model = self._yolo_model_path is not None and os.path.exists(str(self._yolo_model_path or ''))
-        has_files = len(self.audio_files) > 0
-
-        # Train button: needs project + at least 1 positive + 1 negative
-        self.btn_ml_train.setEnabled(has_project and has_labels)
-        if has_project and not has_labels:
-            if n_neg == 0:
-                self.lbl_ml_status.setText("Add negative examples (X key) to enable training")
-            elif n_pos == 0:
-                self.lbl_ml_status.setText("Add accepted labels (A key) to enable training")
-
-        # Detect buttons: needs project + trained model + files
-        self.btn_ml_detect_current.setEnabled(has_model and has_files)
-        self.btn_ml_detect_all.setEnabled(has_model and has_files)
-
-    def _ml_train(self):
-        """Export training data and train YOLO model."""
-        if self._yolo_project_config is None:
-            return
-
-        try:
-            from fnt.usv.usv_detector.yolo_detector import (
-                export_training_data, write_yolo_dataset_yaml,
-                train_yolo_model, get_training_data_counts
-            )
-        except ImportError as e:
-            QMessageBox.warning(self, "Import Error", str(e))
-            return
-
-        config = self._yolo_project_config
-        counts = get_training_data_counts(self.all_detections)
-        n_pos = counts['n_positive']
-        n_neg = counts['n_negative']
-
-        if n_pos < 1 or n_neg < 1:
-            QMessageBox.warning(
-                self, "Insufficient Labels",
-                f"Need at least 1 positive and 1 negative label.\n"
-                f"Currently: {n_pos} positive, {n_neg} negative.\n\n"
-                f"Use A key to accept USV calls, X key to mark background."
-            )
-            return
-
-        # Confirm
-        reply = QMessageBox.question(
-            self, "Train YOLO Model",
-            f"Training data: {n_pos} positive, {n_neg} negative from {counts['n_files_with_labels']} files.\n\n"
-            f"This will export spectrogram tiles and train a YOLOv8 model.\n"
-            f"Training stops automatically when loss plateaus.\n"
-            f"Continue?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self.btn_ml_train.setEnabled(False)
-        self.ml_progress.setVisible(True)
-        self.ml_progress.setValue(0)
-        self.lbl_ml_status.setText("Exporting training data...")
-        QApplication.processEvents()
-
-        # Export training data
-        dataset_dir = os.path.join(config.project_dir, 'datasets', 'train')
-        try:
-            export_stats = export_training_data(
-                self.audio_files, self.all_detections, dataset_dir, config,
-                progress_callback=lambda msg, cur, tot: (
-                    self.lbl_ml_status.setText(msg),
-                    self.ml_progress.setValue(int(cur / max(tot, 1) * 30)),
-                    QApplication.processEvents(),
-                )
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export training data:\n{e}")
-            self.btn_ml_train.setEnabled(True)
-            self.ml_progress.setVisible(False)
-            return
-
-        self.lbl_ml_status.setText(
-            f"Exported {export_stats['n_tiles']} tiles "
-            f"({export_stats['n_positive']} positive, {export_stats['n_negative']} negative)"
-        )
-        self.ml_progress.setValue(30)
-        QApplication.processEvents()
-
-        # Write dataset YAML
-        yaml_path = write_yolo_dataset_yaml(config.project_dir, dataset_dir)
-
-        # Determine model output dir
-        model_name = f"fntUSVStudioModel_n={n_pos}"
-        model_dir = os.path.join(config.project_dir, 'models', model_name)
-
-        # Get previous model for fine-tuning
-        prev_weights = None
-        if config.models:
-            prev_path = config.models[-1].get('path', '')
-            if os.path.exists(prev_path):
-                prev_weights = prev_path
-
-        self.lbl_ml_status.setText("Training YOLO model...")
-        self.ml_progress.setValue(35)
-        QApplication.processEvents()
-
-        # Train in a worker thread
-        self._yolo_train_worker = YOLOTrainingWorker(
-            yaml_path, model_dir, model_name,
-            pretrained_weights=prev_weights,
-        )
-        self._yolo_train_worker.progress.connect(self._on_ml_train_progress)
-        self._yolo_train_worker.complete.connect(
-            lambda path: self._on_ml_train_complete(path, model_name, n_pos, n_neg)
-        )
-        self._yolo_train_worker.error.connect(self._on_ml_train_error)
-        self._yolo_train_worker.start()
-
-    def _on_ml_train_progress(self, message):
-        """Handle YOLO training progress."""
-        self.lbl_ml_status.setText(message)
-        # Estimate progress in 35-95% range
-        current = self.ml_progress.value()
-        if current < 95:
-            self.ml_progress.setValue(current + 1)
-
-    def _on_ml_train_complete(self, model_path, model_name, n_pos, n_neg):
-        """Handle YOLO training completion."""
-        self.ml_progress.setValue(100)
-        self.ml_progress.setVisible(False)
-        self.btn_ml_train.setEnabled(True)
-
-        self._yolo_model_path = model_path
-        self.lbl_ml_model.setText(f"Model: {model_name}")
-        self.lbl_ml_status.setText(f"Training complete! Model: {model_name}")
-        self.status_bar.showMessage(f"YOLO model trained: {model_path}")
-
-        # Update project config with new model
-        if self._yolo_project_config is not None:
-            self._yolo_project_config.models.append({
-                'name': model_name,
-                'n_positive': n_pos,
-                'n_negative': n_neg,
-                'path': model_path,
-                'date': datetime.now().isoformat(),
-            })
-            self._yolo_project_config.save()
-
-        self._update_ml_state()
-
-    def _on_ml_train_error(self, error_msg):
-        """Handle YOLO training error."""
-        self.ml_progress.setVisible(False)
-        self.btn_ml_train.setEnabled(True)
-        self.lbl_ml_status.setText(f"Training failed")
-        QMessageBox.critical(self, "Training Error", f"YOLO training failed:\n{error_msg}")
-
-    def _ml_detect_current(self):
-        """Run YOLO detection on current file."""
-        if not self._yolo_model_path or not self.audio_files:
-            return
-        filepath = self.audio_files[self.current_file_idx]
-        self._ml_detect_files([filepath])
-
-    def _ml_detect_all(self):
-        """Run YOLO detection on all files."""
-        if not self._yolo_model_path or not self.audio_files:
-            return
-        self._ml_detect_files(list(self.audio_files))
-
-    def _ml_detect_files(self, files):
-        """Run YOLO inference on a list of files."""
-        if not self._yolo_model_path or not self._yolo_project_config:
-            return
-
-        self.btn_ml_detect_current.setEnabled(False)
-        self.btn_ml_detect_all.setEnabled(False)
-        self.ml_progress.setVisible(True)
-        self.ml_progress.setValue(0)
-        self.lbl_ml_status.setText("Running ML detection...")
-
-        self._yolo_infer_worker = YOLOInferenceWorker(
-            files, self._yolo_model_path, self._yolo_project_config,
-        )
-        self._yolo_infer_worker.progress.connect(self._on_ml_infer_progress)
-        self._yolo_infer_worker.file_complete.connect(self._on_ml_file_complete)
-        self._yolo_infer_worker.all_complete.connect(self._on_ml_infer_complete)
-        self._yolo_infer_worker.error.connect(self._on_ml_infer_error)
-        self._yolo_infer_worker.start()
-
-    def _on_ml_infer_progress(self, filename, current, total):
-        """Handle ML inference progress."""
-        self.ml_progress.setValue(int(current / total * 100))
-        self.lbl_ml_status.setText(f"Detecting: {filename}")
-
-    def _on_ml_file_complete(self, filename, filepath, detections, n_detections):
-        """Handle ML file completion — store results and write CSV."""
-        std_columns = ['call_number', 'start_seconds', 'stop_seconds', 'duration_ms',
-                        'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
-                        'max_power_db', 'mean_power_db', 'status', 'source']
-
-        if isinstance(detections, pd.DataFrame):
-            df = detections.copy()
-        else:
-            df = pd.DataFrame(detections)
-
-        if len(df) > 0:
-            if 'status' not in df.columns:
-                df['status'] = 'pending'
-            if 'source' not in df.columns:
-                df['source'] = 'ml'
-            if 'call_number' not in df.columns:
-                df.insert(0, 'call_number', range(1, len(df) + 1))
-        else:
-            df = pd.DataFrame(columns=std_columns)
-
-        self.all_detections[filepath] = df
-        self.detection_sources[filepath] = 'usv_yolo'
-
-        # Write CSV immediately
-        base = Path(filepath).stem
-        parent = Path(filepath).parent
-        csv_path = parent / f"{base}_usv_yolo.csv"
-        try:
-            df.to_csv(csv_path, index=False)
-        except Exception as e:
-            self.status_bar.showMessage(f"Error saving CSV for {filename}: {e}")
-
-        # Update file list
-        if filepath in self.audio_files:
-            idx = self.audio_files.index(filepath)
-            item = self.file_list.item(idx)
-            if item:
-                self.file_list.blockSignals(True)
-                item.setText(f"{filename} ({len(df)})")
-                self.file_list.blockSignals(False)
-
-        # Update current view if this is the displayed file
-        if (self.audio_files and self.current_file_idx < len(self.audio_files)
-                and self.audio_files[self.current_file_idx] == filepath):
-            self.detections_df = df.copy()
-            self._ensure_freq_bounds(self.detections_df)
-            self.current_detection_idx = 0
-            self._load_current_file()
-
-    def _on_ml_infer_complete(self, results):
-        """Handle ML inference batch completion."""
-        self.ml_progress.setValue(100)
-        self.ml_progress.setVisible(False)
-        self.btn_ml_detect_current.setEnabled(True)
-        self.btn_ml_detect_all.setEnabled(True)
-
-        total_det = sum(len(d) for d in results.values() if isinstance(d, (list, pd.DataFrame)))
-        self.lbl_ml_status.setText(f"Complete: {total_det} detections in {len(results)} files")
-        self.status_bar.showMessage(f"ML detection complete: {total_det} detections")
-
-        self._refresh_file_list_items()
-        self._load_current_file()
-
-    def _on_ml_infer_error(self, filename, error):
-        """Handle ML inference error."""
-        self.lbl_ml_status.setText(f"Error: {filename} - {error}")
 
     # =========================================================================
     # UI State Management
@@ -4567,6 +3880,9 @@ class USVStudioWindow(QMainWindow):
         self.btn_accept_all_pending.setEnabled(has_pending)
         self.btn_reject_all_pending.setEnabled(has_pending)
 
+        # Preview snapshot — available whenever audio is loaded
+        self.btn_preview_snapshot.setEnabled(bool(has_audio))
+
         # Playback
         self.btn_play.setEnabled(bool(has_audio and HAS_SOUNDDEVICE))
         self.btn_stop.setEnabled(bool(has_audio and HAS_SOUNDDEVICE))
@@ -4574,12 +3890,6 @@ class USVStudioWindow(QMainWindow):
         # Open folder
         self.btn_open_folder.setEnabled(bool(has_files))
 
-        # ML — update training data counts if project is open
-        if self._yolo_project_config is not None:
-            try:
-                self._update_ml_state()
-            except Exception:
-                pass
 
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts. Skips when text-input widgets have focus."""
@@ -4603,8 +3913,6 @@ class USVStudioWindow(QMainWindow):
         elif key == Qt.Key_R and self.btn_reject.isEnabled():
             self._flash_button(self.btn_reject)
             self.reject_detection()
-        elif key == Qt.Key_X:
-            self.mark_negative()
         elif key == Qt.Key_D and self.btn_delete.isEnabled():
             self._flash_button(self.btn_delete)
             self.delete_current()
@@ -4851,13 +4159,14 @@ class USVStudioWindow(QMainWindow):
         super().closeEvent(event)
 
 
+
 # =============================================================================
 # Main Entry Point
 # =============================================================================
 
 def main():
     app = QApplication(sys.argv)
-    window = USVStudioWindow()
+    window = ClassicAudioDetectorWindow()
     window.show()
     sys.exit(app.exec_())
 

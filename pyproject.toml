@@ -49,6 +49,7 @@ usv = [
     "sounddevice",
     "scikit-learn",
     "joblib",
+    "ultralytics>=8.0",
 ]
 rfid = [
     "networkx>=3.0",

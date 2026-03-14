@@ -418,7 +418,8 @@ class FNTMainWindow(QMainWindow):
         analysis_layout = QGridLayout()
 
         analysis_buttons = [
-            ("USV Studio", "Unified detection, labeling, and ML classification", self.run_usv_studio),
+            ("Classic Audio Detector", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
+            ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
         ]
 
         self.create_button_grid(analysis_layout, analysis_buttons)
@@ -868,8 +869,28 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
     
     # USV Processing Methods
+    def run_classic_audio_detector(self):
+        """Launch Classic Audio Detector - DSP-based detection and labeling"""
+        try:
+            from fnt.usv.classic_audio_detector import ClassicAudioDetectorWindow
+
+            self.cad_window = ClassicAudioDetectorWindow()
+            self.cad_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Classic Audio Detector failed: {str(e)}")
+
+    def run_deep_audio_detector(self):
+        """Launch Deep Audio Detector - ML model training and inference"""
+        try:
+            from fnt.usv.deep_audio_detector import DeepAudioDetectorWindow
+
+            self.dad_window = DeepAudioDetectorWindow()
+            self.dad_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Deep Audio Detector failed: {str(e)}")
+
     def run_usv_studio(self):
-        """Launch USV Studio - unified detection, labeling, and ML tool"""
+        """Launch USV Studio - DEPRECATED, use Classic/Deep Audio Detector instead"""
         try:
             from fnt.usv.usv_studio_pyqt import USVStudioWindow
 
