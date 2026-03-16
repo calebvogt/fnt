@@ -136,10 +136,10 @@ class DSPDetector:
 
         calls = self._filter_by_min_freq(calls)
         calls = self._filter_by_power(calls)
-        calls = self._filter_harmonics(calls)
 
-        # Label harmonics (post-detection: marks but does not remove)
-        calls = self._label_harmonics(calls)
+        # Post-hoc harmonic detection (label only, never remove)
+        if getattr(self.config, 'detect_harmonics', True):
+            calls = self._label_harmonics(calls)
 
         # Sample peak frequencies across each call (optional)
         n_samples = getattr(self.config, 'freq_samples', 5)
@@ -236,14 +236,26 @@ class DSPDetector:
         # Find connected regions
         labeled, num_features = label(mask)
 
-        # Split connected regions that have vertical frequency gaps
+        # Split connected regions that have vertical frequency gaps.
+        # Uses energy-based valley detection: even if faint pixels bridge
+        # a fundamental and its harmonic, a significant energy dip triggers
+        # a split.  Falls back to binary gap detection for true pixel gaps.
         min_freq_gap_hz = getattr(self.config, 'min_freq_gap_hz', 0)
         if min_freq_gap_hz > 0 and len(frequencies) > 1:
             freq_resolution = float(frequencies[1] - frequencies[0])
             min_gap_bins = max(1, int(min_freq_gap_hz / freq_resolution))
+            old_num = num_features
             labeled, num_features = self._split_by_freq_gap(
-                labeled, num_features, min_gap_bins
+                labeled, num_features, min_gap_bins, Sxx_db
             )
+            if num_features != old_num:
+                print(f"[DSP] Freq gap split: {old_num} -> {num_features} regions "
+                      f"(gap={min_freq_gap_hz}Hz={min_gap_bins}bins, "
+                      f"valley_ratio={getattr(self.config, 'valley_split_ratio', 0.30)})")
+            else:
+                print(f"[DSP] Freq gap split: no splits found in {old_num} regions "
+                      f"(gap={min_freq_gap_hz}Hz={min_gap_bins}bins, "
+                      f"valley_ratio={getattr(self.config, 'valley_split_ratio', 0.30)})")
 
         calls = []
         for i in range(1, num_features + 1):
@@ -318,18 +330,24 @@ class DSPDetector:
         self,
         labeled: np.ndarray,
         num_features: int,
-        min_gap_bins: int
+        min_gap_bins: int,
+        spec_db: np.ndarray = None
     ) -> tuple:
         """Split connected regions that have vertical frequency gaps.
 
-        When a fundamental and its harmonic are connected in the binary mask
-        (e.g. via a noise bridge), they form one region. This method detects
-        vertical gaps within each region and splits them into separate labels.
+        Uses a two-pass approach:
+        1. Binary gap detection: split where there are literally no pixels
+           across a frequency gap of min_gap_bins.
+        2. Energy valley detection: even when faint pixels bridge a fundamental
+           and its harmonic, detect valleys in the per-row energy profile and
+           split there.  A valley is a local minimum where energy drops to less
+           than 30% of the average of the two surrounding peaks.
 
         Args:
             labeled: 2D label array from scipy.ndimage.label
             num_features: Number of regions found
             min_gap_bins: Minimum gap in frequency bins to trigger a split
+            spec_db: Optional spectrogram in dB for energy-based splitting
 
         Returns:
             (new_labeled, new_num_features) with split regions relabeled
@@ -341,42 +359,104 @@ class DSPDetector:
             region_mask = labeled == i
 
             # Get occupied frequency bins for this region
-            freq_occupied = np.any(region_mask, axis=1)  # shape: (n_freq,)
+            freq_occupied = np.any(region_mask, axis=1)
             occupied_bins = np.where(freq_occupied)[0]
 
             if len(occupied_bins) < 2:
                 continue
 
-            # Find gaps between occupied bins
+            split_boundaries = []
+
+            # --- Pass 1: binary gap detection (original method) ---
             diffs = np.diff(occupied_bins)
             gap_positions = np.where(diffs >= min_gap_bins)[0]
-
-            if len(gap_positions) == 0:
-                continue  # No gaps to split on
-
-            # Split into sub-regions at each gap
-            # gap_positions[k] means there's a gap between
-            # occupied_bins[gap_positions[k]] and occupied_bins[gap_positions[k]+1]
-            split_boundaries = []
             for gp in gap_positions:
-                # Midpoint of the gap (in frequency bin space)
                 split_at = (occupied_bins[gp] + occupied_bins[gp + 1]) // 2
                 split_boundaries.append(split_at)
 
+            # --- Pass 2: energy valley detection ---
+            if spec_db is not None and len(split_boundaries) == 0:
+                freq_lo = occupied_bins[0]
+                freq_hi = occupied_bins[-1]
+                span = freq_hi - freq_lo + 1
+
+                # Only attempt energy splitting on regions spanning enough bins
+                if span >= min_gap_bins * 3:
+                    # Compute energy profile: mean dB per frequency row in the region
+                    energy_profile = np.full(span, -100.0)
+                    for local_idx, global_idx in enumerate(range(freq_lo, freq_hi + 1)):
+                        row_mask = region_mask[global_idx, :]
+                        if np.any(row_mask):
+                            energy_profile[local_idx] = np.mean(spec_db[global_idx, row_mask])
+
+                    # Smooth the profile to reduce noise (3-bin moving average)
+                    if span >= 3:
+                        kernel = np.ones(3) / 3.0
+                        smoothed = np.convolve(energy_profile, kernel, mode='same')
+                    else:
+                        smoothed = energy_profile
+
+                    from scipy.signal import argrelmin, argrelmax
+
+                    # Use smaller order to catch narrower valleys
+                    order = max(2, min(min_gap_bins // 2, 4))
+                    minima = argrelmin(smoothed, order=order)[0]
+                    maxima = argrelmax(smoothed, order=order)[0]
+
+                    print(f"[DSP]   Region {i}: span={span} bins, "
+                          f"order={order}, "
+                          f"minima={len(minima)}, maxima={len(maxima)}, "
+                          f"energy range={smoothed.min():.1f} to {smoothed.max():.1f} dB")
+
+                    if len(minima) > 0 and len(maxima) >= 2:
+                        valley_ratio = getattr(self.config, 'valley_split_ratio', 0.30)
+                        for m in minima:
+                            # Find nearest peaks on each side
+                            left_peaks = maxima[maxima < m]
+                            right_peaks = maxima[maxima > m]
+
+                            if len(left_peaks) == 0 or len(right_peaks) == 0:
+                                continue
+
+                            left_peak_val = smoothed[left_peaks[-1]]
+                            right_peak_val = smoothed[right_peaks[0]]
+                            valley_val = smoothed[m]
+
+                            # Convert dB to linear for ratio comparison
+                            avg_peak_lin = (10 ** (left_peak_val / 10) +
+                                            10 ** (right_peak_val / 10)) / 2.0
+                            valley_lin = 10 ** (valley_val / 10)
+                            ratio = valley_lin / avg_peak_lin if avg_peak_lin > 0 else 999
+
+                            print(f"[DSP]     valley@bin{freq_lo+m}: "
+                                  f"val={valley_val:.1f}dB, "
+                                  f"peaks={left_peak_val:.1f}/{right_peak_val:.1f}dB, "
+                                  f"ratio={ratio:.4f} (threshold={valley_ratio})")
+
+                            if avg_peak_lin > 0 and ratio < valley_ratio:
+                                split_at = freq_lo + m
+                                split_boundaries.append(split_at)
+                    elif len(minima) == 0:
+                        print(f"[DSP]   Region {i}: no local minima found")
+                    elif len(maxima) < 2:
+                        print(f"[DSP]   Region {i}: fewer than 2 maxima found")
+                else:
+                    print(f"[DSP]   Region {i}: span={span} bins too small "
+                          f"(need {min_gap_bins * 3} = 3 * {min_gap_bins})")
+
+            if len(split_boundaries) == 0:
+                continue
+
             # Relabel: first segment keeps original label, subsequent get new labels
-            # Sort boundaries ascending
             split_boundaries.sort()
 
             for sb in split_boundaries:
-                # Everything above this boundary in this region gets a new label
                 upper_mask = region_mask.copy()
-                upper_mask[:sb + 1, :] = False  # Zero out below boundary
+                upper_mask[:sb + 1, :] = False
 
                 if np.any(upper_mask):
                     new_labeled[upper_mask] = next_label
                     next_label += 1
-
-                    # Update region_mask to only contain the lower portion
                     region_mask[sb + 1:, :] = False
 
         return new_labeled, next_label - 1
@@ -389,7 +469,15 @@ class DSPDetector:
         ]
 
     def _merge_close_calls(self, calls: List[Dict]) -> List[Dict]:
-        """Merge calls that are closer than min_gap_ms."""
+        """Merge calls that are closer than min_gap_ms in time AND overlap in frequency.
+
+        Two calls are only merged if:
+        1. Their time gap is less than min_gap_ms, AND
+        2. Their frequency ranges overlap or are closer than min_freq_gap_hz.
+
+        This prevents the merge step from recombining a fundamental and
+        its harmonic that were previously split by the freq gap detector.
+        """
         if len(calls) < 2:
             return calls
 
@@ -397,28 +485,45 @@ class DSPDetector:
         calls = sorted(calls, key=lambda x: x['start_seconds'])
 
         min_gap_s = self.config.min_gap_ms / 1000
+        min_freq_gap_hz = getattr(self.config, 'min_freq_gap_hz', 0)
         merged = [calls[0]]
 
         for call in calls[1:]:
-            gap = call['start_seconds'] - merged[-1]['stop_seconds']
+            prev = merged[-1]
+            time_gap = call['start_seconds'] - prev['stop_seconds']
 
-            if gap < min_gap_s:
-                # Merge with previous call
-                prev = merged[-1]
-                prev['stop_seconds'] = call['stop_seconds']
-                prev['duration_ms'] = (prev['stop_seconds'] - prev['start_seconds']) * 1000
+            if time_gap < min_gap_s:
+                # Check frequency overlap/proximity before merging
+                prev_min_f = prev.get('min_freq_hz', 0)
+                prev_max_f = prev.get('max_freq_hz', 0)
+                call_min_f = call.get('min_freq_hz', 0)
+                call_max_f = call.get('max_freq_hz', 0)
 
-                # Update aggregate features - expand frequency bounds to encompass both calls
-                prev['peak_freq_hz'] = max(prev['peak_freq_hz'], call['peak_freq_hz'])
-                prev['max_power_db'] = max(prev['max_power_db'], call['max_power_db'])
-                prev['mean_power_db'] = (prev['mean_power_db'] + call['mean_power_db']) / 2
-                prev['min_freq_hz'] = min(prev.get('min_freq_hz', call['min_freq_hz']), call['min_freq_hz'])
-                prev['max_freq_hz'] = max(prev.get('max_freq_hz', call['max_freq_hz']), call['max_freq_hz'])
-                prev['freq_bandwidth_hz'] = prev['max_freq_hz'] - prev['min_freq_hz']
+                # Frequency gap between the two calls
+                freq_gap = max(0, max(call_min_f - prev_max_f,
+                                       prev_min_f - call_max_f))
 
-                # Update internal indices
-                if '_end_idx' in call:
-                    prev['_end_idx'] = call['_end_idx']
+                # Only merge if frequency ranges overlap or are close
+                # (closer than min_freq_gap_hz)
+                if freq_gap < min_freq_gap_hz:
+                    # Merge with previous call
+                    prev['stop_seconds'] = call['stop_seconds']
+                    prev['duration_ms'] = (prev['stop_seconds'] - prev['start_seconds']) * 1000
+
+                    # Update aggregate features
+                    prev['peak_freq_hz'] = max(prev['peak_freq_hz'], call['peak_freq_hz'])
+                    prev['max_power_db'] = max(prev['max_power_db'], call['max_power_db'])
+                    prev['mean_power_db'] = (prev['mean_power_db'] + call['mean_power_db']) / 2
+                    prev['min_freq_hz'] = min(prev_min_f, call_min_f)
+                    prev['max_freq_hz'] = max(prev_max_f, call_max_f)
+                    prev['freq_bandwidth_hz'] = prev['max_freq_hz'] - prev['min_freq_hz']
+
+                    # Update internal indices
+                    if '_end_idx' in call:
+                        prev['_end_idx'] = call['_end_idx']
+                else:
+                    # Time-close but frequency-separated: don't merge
+                    merged.append(call)
             else:
                 merged.append(call)
 
@@ -637,7 +742,7 @@ class DSPDetector:
         This is a post-processing step that preserves all detections but
         annotates harmonics so downstream code can filter or count them.
         """
-        if not getattr(self.config, 'harmonic_label', False):
+        if not getattr(self.config, 'detect_harmonics', True):
             return calls
         if len(calls) < 2:
             for c in calls:

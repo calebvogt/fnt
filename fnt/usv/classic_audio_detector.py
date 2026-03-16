@@ -83,9 +83,9 @@ class DSPDetectionWorker(QThread):
             max_bandwidth_hz=self.config.get('max_bandwidth_hz', 20000.0),
             min_tonality=self.config.get('min_tonality', 0.3),
             min_call_freq_hz=self.config.get('min_call_freq_hz', 0.0),
-            harmonic_filter=self.config.get('harmonic_filter', True),
-            harmonic_label=self.config.get('harmonic_label', False),
+            detect_harmonics=self.config.get('detect_harmonics', True),
             min_freq_gap_hz=self.config.get('min_freq_gap_hz', 5000.0),
+            valley_split_ratio=self.config.get('valley_split_ratio', 0.30),
             min_gap_ms=self.config.get('min_gap_ms', 5.0),
             noise_percentile=self.config.get('noise_percentile', 25.0),
             nperseg=self.config.get('nperseg', 512),
@@ -152,8 +152,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
             'energy_threshold_db': 8.0,
             'min_duration_ms': 3.0, 'max_duration_ms': 3000.0,
             'max_bandwidth_hz': 25000, 'min_tonality': 0.05,
-            'min_call_freq_hz': 15000, 'harmonic_filter': True,
-            'min_freq_gap_hz': 5000,
+            'min_call_freq_hz': 15000, 'detect_harmonics': True,
+            'min_freq_gap_hz': 5000, 'valley_split_ratio': 0.30,
             'min_gap_ms': 5.0, 'noise_percentile': 25.0,
             'nperseg': 512, 'noverlap': 384,
             # Advanced noise rejection
@@ -182,9 +182,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             # Min call freq: 15 kHz — provides margin below the 20 kHz
             # fundamental floor without admitting low-frequency noise.
             'min_call_freq_hz': 15000,
-            # Harmonic filter + labeling with 5 kHz gap.
-            'harmonic_filter': True, 'harmonic_label': True,
-            'min_freq_gap_hz': 5000,
+            # Harmonic detection with 5 kHz gap.
+            'detect_harmonics': True,
+            'min_freq_gap_hz': 5000, 'valley_split_ratio': 0.30,
             # Min gap: 4 ms — preserves rapid syllable sequences.
             'min_gap_ms': 4.0,
             'noise_percentile': 25.0,
@@ -262,7 +262,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setFixedWidth(380)  # Fixed width to prevent horizontal scroll
+        left_scroll.setMinimumWidth(340)
+        left_scroll.setMaximumWidth(500)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -446,8 +447,13 @@ class ClassicAudioDetectorWindow(QMainWindow):
         right_layout.addWidget(controls_bar)
 
         # Add to main layout
-        main_layout.addWidget(left_scroll)
-        main_layout.addWidget(right_panel, 1)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)  # Left panel: don't stretch
+        splitter.setStretchFactor(1, 1)  # Right panel: takes remaining space
+        splitter.setSizes([420, 800])    # Initial sizes
+        main_layout.addWidget(splitter)
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -542,7 +548,13 @@ class ClassicAudioDetectorWindow(QMainWindow):
         # Species profile dropdown
         profile_row = QHBoxLayout()
         profile_row.setSpacing(4)
-        profile_row.addWidget(self._make_label("Profile:", "Select a species profile to auto-fill\nDSP parameters, or Manual to set them yourself.", min_width=90))
+        profile_row.addWidget(self._make_label("Profile:",
+            "Species-specific preset that auto-fills all preprocessing\n"
+            "and detection parameters. Selecting a preset locks all\n"
+            "parameters; choose 'Manual' to unlock and customize.\n"
+            "Use 'Save' to store your current Manual settings as a\n"
+            "reusable custom profile (saved to ~/.fnt/detection_profiles/).",
+            min_width=80))
         self.combo_species_profile = QComboBox()
         for name in self.SPECIES_PROFILES.keys():
             self.combo_species_profile.addItem(name)
@@ -571,13 +583,20 @@ class ClassicAudioDetectorWindow(QMainWindow):
         group_layout.addLayout(profile_row)
 
         # Frequency range
-        freq_tip = ("Bandpass filter range for detection.\n"
-                     "Only energy within this band is analyzed.\n"
-                     "Prairie voles: typically 25-65 kHz.\n"
-                     "Mice: typically 30-110 kHz.")
+        freq_tip = ("PREPROCESSING: Bandpass frequency range (Hz).\n"
+                     "Only spectrogram rows within this range are analyzed;\n"
+                     "energy outside is ignored entirely. This is applied\n"
+                     "before thresholding and is visible in the Filter Overlay.\n\n"
+                     "Set to match your species' vocalization range:\n"
+                     "  Prairie voles: 20-55 kHz (fundamental)\n"
+                     "  Mice: 30-110 kHz\n"
+                     "  Rats (50 kHz): 35-80 kHz\n"
+                     "  Rats (22 kHz alarm): 18-32 kHz\n\n"
+                     "Each frequency row spans ~sample_rate/nfft Hz.\n"
+                     "At 250 kHz / 512 nfft = ~488 Hz per row.")
         freq_row = QHBoxLayout()
         freq_row.setSpacing(4)
-        freq_row.addWidget(self._make_label("Freq Range:", freq_tip, min_width=90))
+        freq_row.addWidget(self._make_label("Freq Range:", freq_tip, min_width=80))
 
         self.spin_min_freq = QSpinBox()
         self.spin_min_freq.setRange(1000, 150000)
@@ -600,13 +619,18 @@ class ClassicAudioDetectorWindow(QMainWindow):
         group_layout.addLayout(freq_row)
 
         # Threshold
-        thresh_tip = ("Energy threshold above the noise floor (dB).\n"
-                      "Lower = more sensitive (more detections, more noise).\n"
-                      "Higher = more conservative (fewer false positives).\n"
-                      "Typical range: 6-15 dB.")
+        thresh_tip = ("PREPROCESSING: Energy threshold above the noise floor (dB).\n"
+                      "A pixel in the spectrogram must exceed its frequency\n"
+                      "bin's noise floor by this many dB to be considered\n"
+                      "signal. The noise floor is estimated per-frequency-row\n"
+                      "using the Noise %tile parameter below.\n\n"
+                      "Pixel passes if: pixel_dB > noise_floor_dB + threshold\n\n"
+                      "Lower values (6-8 dB) = more sensitive, more noise.\n"
+                      "Higher values (12-15 dB) = fewer false positives.\n"
+                      "Typical: 8-12 dB. Visible in Filter Overlay (V key).")
         thresh_row = QHBoxLayout()
         thresh_row.setSpacing(4)
-        thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=90))
+        thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=80))
 
         self.spin_threshold = QDoubleSpinBox()
         self.spin_threshold.setRange(1.0, 30.0)
@@ -619,13 +643,125 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         group_layout.addLayout(thresh_row)
 
-        # Duration
-        dur_tip = ("Min/max call duration filter.\n"
-                   "Detections outside this range are discarded.\n"
-                   "Most USV calls are 5-200 ms.")
+        # Noise percentile (preprocessing — affects filter overlay)
+        noise_tip = ("PREPROCESSING: Percentile for noise floor estimation.\n"
+                     "For each frequency row, the noise floor is computed as\n"
+                     "the Nth percentile of power values across all time bins.\n"
+                     "This per-row estimate is subtracted before thresholding.\n\n"
+                     "Lower values (10-15) = estimates a quieter noise floor,\n"
+                     "making the detector more sensitive but more prone to\n"
+                     "false positives in noisy recordings.\n"
+                     "Higher values (30-40) = more aggressive noise removal,\n"
+                     "may suppress faint calls.\n\n"
+                     "Typical: 20-30. Visible in Filter Overlay (V key).")
+        noise_row = QHBoxLayout()
+        noise_row.setSpacing(4)
+        noise_row.addWidget(self._make_label("Noise %tile:", noise_tip, min_width=80))
+        self.spin_noise_pct = QDoubleSpinBox()
+        self.spin_noise_pct.setRange(1.0, 50.0)
+        self.spin_noise_pct.setValue(25.0)
+        self.spin_noise_pct.setToolTip(noise_tip)
+        noise_row.addWidget(self.spin_noise_pct, 1)
+        group_layout.addLayout(noise_row)
+
+        # Filter Overlay button (below Noise %tile)
+        overlay_tip = ("Toggle the DSP Filter Overlay (shortcut: V).\n"
+                       "Shows exactly what survives preprocessing:\n"
+                       "  1. Frequency band mask\n"
+                       "  2. Noise floor subtraction\n"
+                       "  3. Energy threshold\n"
+                       "Black pixels = removed by preprocessing.\n"
+                       "Colored pixels = signal the detector will analyze.")
+        self.btn_filter_overlay = QPushButton("Filter Overlay")
+        self.btn_filter_overlay.setCheckable(True)
+        self.btn_filter_overlay.setToolTip(overlay_tip)
+        self.btn_filter_overlay.toggled.connect(self._on_filter_overlay_toggled)
+        group_layout.addWidget(self.btn_filter_overlay)
+
+        # --- Detection Parameters (collapsible) ---
+        self.btn_advanced_toggle = QPushButton("▶ Detection Parameters")
+        self.btn_advanced_toggle.setFlat(True)
+        self.btn_advanced_toggle.setStyleSheet("text-align: left; color: #aaaaaa; font-size: 11px; padding: 2px 0px;")
+        self.btn_advanced_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_advanced_toggle.clicked.connect(self._toggle_advanced_options)
+        group_layout.addWidget(self.btn_advanced_toggle)
+
+        self.advanced_options_widget = QWidget()
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(4)
+
+        # === Widgets ordered to match detection pipeline execution order ===
+
+        # 1. Frequency gap splitting (during connected component analysis)
+        freq_gap_tip = ("DETECTION: Frequency gap for splitting merged blobs (Hz).\n"
+                        "When a fundamental and its harmonic are joined into one\n"
+                        "connected component (e.g. by a noise pixel bridge), this\n"
+                        "parameter attempts to split them into separate detections.\n\n"
+                        "Uses two methods:\n"
+                        "1. Binary gap: splits where there are literally no active\n"
+                        "   pixels across a gap of this many Hz.\n"
+                        "2. Energy valley: even when faint pixels bridge the gap,\n"
+                        "   analyzes the per-row energy profile and splits at\n"
+                        "   valleys (see Valley Split Ratio below).\n\n"
+                        "The gap is measured in frequency bins:\n"
+                        "  gap_bins = freq_gap_hz / (sample_rate / nfft)\n"
+                        "  e.g. 5000 Hz / 488 Hz = ~10 bins\n\n"
+                        "Higher values = only split large gaps (less aggressive).\n"
+                        "Lower values = split smaller gaps (more aggressive).\n"
+                        "Set to 0 to disable.")
+        freq_gap_row = QHBoxLayout()
+        freq_gap_row.setSpacing(4)
+        freq_gap_row.addWidget(self._make_label("Freq Gap:", freq_gap_tip, min_width=80))
+        self.spin_freq_gap = QSpinBox()
+        self.spin_freq_gap.setRange(0, 30000)
+        self.spin_freq_gap.setSingleStep(1000)
+        self.spin_freq_gap.setValue(5000)
+        self.spin_freq_gap.setSuffix(" Hz")
+        self.spin_freq_gap.setToolTip(freq_gap_tip)
+        freq_gap_row.addWidget(self.spin_freq_gap, 1)
+        advanced_layout.addLayout(freq_gap_row)
+
+        # Valley split ratio (energy valley depth threshold)
+        valley_tip = ("DETECTION: Energy valley depth ratio for splitting.\n"
+                      "Used by Freq Gap's energy valley detection (Pass 2).\n\n"
+                      "For each candidate split point, the algorithm computes:\n"
+                      "  ratio = valley_energy / avg_peak_energy\n"
+                      "in linear power (not dB). If ratio < this threshold,\n"
+                      "the valley is deep enough to split.\n\n"
+                      "Lower values = more conservative (only split deep valleys).\n"
+                      "Higher values = more aggressive (split shallower dips).\n\n"
+                      "  0.10 = valley must be 10 dB below peaks (very conservative)\n"
+                      "  0.30 = valley must be ~5 dB below peaks (default)\n"
+                      "  0.50 = valley must be ~3 dB below peaks (aggressive)\n\n"
+                      "Only active when Freq Gap > 0.")
+        valley_row = QHBoxLayout()
+        valley_row.setSpacing(4)
+        valley_row.addWidget(self._make_label("Valley Split:", valley_tip, min_width=80))
+        self.spin_valley_ratio = QDoubleSpinBox()
+        self.spin_valley_ratio.setRange(0.05, 0.95)
+        self.spin_valley_ratio.setSingleStep(0.05)
+        self.spin_valley_ratio.setDecimals(2)
+        self.spin_valley_ratio.setValue(0.30)
+        self.spin_valley_ratio.setToolTip(valley_tip)
+        valley_row.addWidget(self.spin_valley_ratio, 1)
+        advanced_layout.addLayout(valley_row)
+
+        # 2. Duration filter
+        dur_tip = ("DETECTION: Duration filter for connected components (ms).\n"
+                   "After thresholding, contiguous pixel blobs (connected\n"
+                   "components) are identified. Each blob's temporal extent\n"
+                   "is measured in milliseconds. Blobs shorter than Min or\n"
+                   "longer than Max are discarded.\n\n"
+                   "Short noise speckle is typically 1-5 ms.\n"
+                   "Prairie vole syllables: 8-100 ms.\n"
+                   "Mouse syllables: 5-200 ms.\n"
+                   "Rat 22 kHz alarm calls: 100-3000 ms.\n\n"
+                   "Set Min higher to reject noise fragments.\n"
+                   "Set Max lower to reject long broadband events.")
         dur_row = QHBoxLayout()
         dur_row.setSpacing(4)
-        dur_row.addWidget(self._make_label("Duration:", dur_tip, min_width=90))
+        dur_row.addWidget(self._make_label("Duration:", dur_tip, min_width=80))
 
         self.spin_min_dur = QDoubleSpinBox()
         self.spin_min_dur.setRange(1.0, 100.0)
@@ -643,132 +779,23 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.spin_max_dur.setToolTip("Maximum call duration — longer events are discarded (ms)")
         dur_row.addWidget(self.spin_max_dur, 1)
 
-        group_layout.addLayout(dur_row)
+        advanced_layout.addLayout(dur_row)
 
-        # --- Noise Rejection Filters ---
-        # Max bandwidth
-        bw_tip = ("Maximum frequency bandwidth for a detection (Hz).\n"
-                  "Detections spanning a wider frequency range are\n"
-                  "discarded as broadband noise (cage bumps, movement).\n"
-                  "Real USV calls are narrowband (typically <15 kHz).\n"
-                  "Set to 0 to disable this filter.")
-        bw_row = QHBoxLayout()
-        bw_row.setSpacing(4)
-        bw_row.addWidget(self._make_label("Max Bandwidth:", bw_tip, min_width=90))
-        self.spin_max_bw = QSpinBox()
-        self.spin_max_bw.setRange(0, 100000)
-        self.spin_max_bw.setSingleStep(1000)
-        self.spin_max_bw.setValue(20000)
-        self.spin_max_bw.setSuffix(" Hz")
-        self.spin_max_bw.setToolTip(bw_tip)
-        bw_row.addWidget(self.spin_max_bw, 1)
-        group_layout.addLayout(bw_row)
-
-        # --- Advanced Options (collapsible) ---
-        self.btn_advanced_toggle = QPushButton("▶ Advanced Options")
-        self.btn_advanced_toggle.setFlat(True)
-        self.btn_advanced_toggle.setStyleSheet("text-align: left; color: #aaaaaa; font-size: 11px; padding: 2px 0px;")
-        self.btn_advanced_toggle.setCursor(Qt.PointingHandCursor)
-        self.btn_advanced_toggle.clicked.connect(self._toggle_advanced_options)
-        group_layout.addWidget(self.btn_advanced_toggle)
-
-        self.advanced_options_widget = QWidget()
-        advanced_layout = QVBoxLayout()
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
-        advanced_layout.setSpacing(4)
-
-        # Tonality (spectral purity)
-        ton_tip = ("Minimum spectral purity score (0.0 - 1.0).\n"
-                   "Measures how tonal vs. noisy a detection is.\n"
-                   "1.0 = pure tone (energy at one frequency).\n"
-                   "0.0 = broadband noise (energy spread everywhere).\n"
-                   "Real USV calls are tonal (typically >0.3).\n"
-                   "Higher = stricter, fewer false positives.\n"
-                   "Set to 0 to disable this filter.")
-        ton_row = QHBoxLayout()
-        ton_row.setSpacing(4)
-        ton_row.addWidget(self._make_label("Tonality:", ton_tip, min_width=90))
-        self.spin_tonality = QDoubleSpinBox()
-        self.spin_tonality.setRange(0.0, 1.0)
-        self.spin_tonality.setSingleStep(0.05)
-        self.spin_tonality.setDecimals(2)
-        self.spin_tonality.setValue(0.30)
-        self.spin_tonality.setToolTip(ton_tip)
-        ton_row.addWidget(self.spin_tonality, 1)
-        advanced_layout.addLayout(ton_row)
-
-        # Min call frequency
-        mcf_tip = ("Minimum actual frequency of a detection (Hz).\n"
-                   "Detections whose lowest frequency falls below\n"
-                   "this are discarded as likely broadband noise.\n"
-                   "Broadband artifacts often extend down to the\n"
-                   "detection floor, while real USVs start higher.\n"
-                   "Set to 0 to disable this filter.")
-        mcf_row = QHBoxLayout()
-        mcf_row.setSpacing(4)
-        mcf_row.addWidget(self._make_label("Min Call Freq:", mcf_tip, min_width=90))
-        self.spin_min_call_freq = QSpinBox()
-        self.spin_min_call_freq.setRange(0, 100000)
-        self.spin_min_call_freq.setSingleStep(1000)
-        self.spin_min_call_freq.setValue(0)
-        self.spin_min_call_freq.setSuffix(" Hz")
-        self.spin_min_call_freq.setToolTip(mcf_tip)
-        mcf_row.addWidget(self.spin_min_call_freq, 1)
-        advanced_layout.addLayout(mcf_row)
-
-        # Harmonic filter checkbox
-        harmonic_tip = ("Merge temporally overlapping detections that are\n"
-                        "likely harmonics of the same call.\n"
-                        "When enabled, if two detections overlap by >=80%\n"
-                        "in time, only the lowest-frequency one (the\n"
-                        "fundamental) is kept and the harmonic is discarded.\n"
-                        "Recommended for species that produce strong harmonics.")
-        self.chk_harmonic_filter = QCheckBox("Harmonic Filter")
-        self.chk_harmonic_filter.setChecked(True)
-        self.chk_harmonic_filter.setToolTip(harmonic_tip)
-        advanced_layout.addWidget(self.chk_harmonic_filter)
-
-        # Harmonic labeling checkbox
-        harmonic_label_tip = ("Label harmonics instead of removing them.\n"
-                              "When enabled, detections whose peak frequency\n"
-                              "is ~2x or 3x another overlapping detection are\n"
-                              "marked as 'harmonic' (yellow boxes) rather than\n"
-                              "discarded. They are excluded from call counts\n"
-                              "but preserved in the output CSV.\n\n"
-                              "This runs after the Harmonic Filter above,\n"
-                              "so both can be used together or independently.")
-        self.chk_harmonic_label = QCheckBox("Label Harmonics")
-        self.chk_harmonic_label.setChecked(False)
-        self.chk_harmonic_label.setToolTip(harmonic_label_tip)
-        advanced_layout.addWidget(self.chk_harmonic_label)
-
-        # Frequency gap splitting
-        freq_gap_tip = ("Minimum vertical frequency gap (Hz) to split\n"
-                        "a single connected detection into two.\n"
-                        "When a fundamental and harmonic are connected\n"
-                        "by noise, this splits them so the harmonic\n"
-                        "filter can remove the upper one.\n"
-                        "Set to 0 to disable. 5000 Hz works well for\n"
-                        "prairie vole USVs.")
-        freq_gap_row = QHBoxLayout()
-        freq_gap_row.setSpacing(4)
-        freq_gap_row.addWidget(self._make_label("Freq Gap:", freq_gap_tip, min_width=90))
-        self.spin_freq_gap = QSpinBox()
-        self.spin_freq_gap.setRange(0, 30000)
-        self.spin_freq_gap.setSingleStep(1000)
-        self.spin_freq_gap.setValue(5000)
-        self.spin_freq_gap.setSuffix(" Hz")
-        self.spin_freq_gap.setToolTip(freq_gap_tip)
-        freq_gap_row.addWidget(self.spin_freq_gap, 1)
-        advanced_layout.addLayout(freq_gap_row)
-
-        # Min gap
-        gap_tip = ("Minimum silent gap between calls (ms).\n"
-                   "Calls closer together than this are merged\n"
-                   "into a single detection.")
+        # 3. Merge close calls
+        gap_tip = ("DETECTION: Minimum temporal gap between detections (ms).\n"
+                   "After connected components are found, any two detections\n"
+                   "separated by less than this gap are merged into one.\n"
+                   "This prevents a single call with a brief amplitude dip\n"
+                   "from being split into two detections.\n\n"
+                   "Lower values (2-4 ms) = preserve fine temporal structure,\n"
+                   "keep rapid syllable sequences as separate detections.\n"
+                   "Higher values (10-30 ms) = merge syllables into phrases.\n\n"
+                   "Within-sniff-cycle silences: typically < 20 ms.\n"
+                   "Between-sniff silences: typically > 60 ms.\n"
+                   "Set to 0 to disable merging.")
         gap_row = QHBoxLayout()
         gap_row.setSpacing(4)
-        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=90))
+        gap_row.addWidget(self._make_label("Min Gap:", gap_tip, min_width=80))
         self.spin_min_gap = QDoubleSpinBox()
         self.spin_min_gap.setRange(0.0, 100.0)
         self.spin_min_gap.setValue(5.0)
@@ -777,15 +804,45 @@ class ClassicAudioDetectorWindow(QMainWindow):
         gap_row.addWidget(self.spin_min_gap, 1)
         advanced_layout.addLayout(gap_row)
 
-        # --- Advanced Noise Rejection ---
-        # Min bandwidth
-        min_bw_tip = ("Minimum frequency bandwidth for a detection (Hz).\n"
-                      "Very narrow detections (< 500 Hz) are often\n"
-                      "electrical noise spikes or single-freq artifacts.\n"
-                      "Set to 0 to disable this filter.")
+        # 4. Max bandwidth
+        bw_tip = ("DETECTION: Maximum frequency bandwidth of a detection (Hz).\n"
+                  "Measured as max_freq - min_freq of the connected component.\n"
+                  "Blobs spanning wider than this are rejected as broadband\n"
+                  "noise (cage bumps, movement artifacts, handling noise).\n\n"
+                  "NOTE: If a fundamental and its harmonic are merged into\n"
+                  "one blob, the bandwidth includes both. Use Freq Gap to\n"
+                  "split them before this filter runs. Energy-based valley\n"
+                  "detection will also split at dips between harmonics.\n\n"
+                  "Typical USV bandwidth: 5-15 kHz (fundamental only).\n"
+                  "FM sweeps can span 15-25 kHz.\n"
+                  "Set to 0 to disable.")
+        bw_row = QHBoxLayout()
+        bw_row.setSpacing(4)
+        bw_row.addWidget(self._make_label("Max Bandwidth:", bw_tip, min_width=80))
+        self.spin_max_bw = QSpinBox()
+        self.spin_max_bw.setRange(0, 100000)
+        self.spin_max_bw.setSingleStep(1000)
+        self.spin_max_bw.setValue(20000)
+        self.spin_max_bw.setSuffix(" Hz")
+        self.spin_max_bw.setToolTip(bw_tip)
+        bw_row.addWidget(self.spin_max_bw, 1)
+        advanced_layout.addLayout(bw_row)
+
+        # 5. Min bandwidth
+        min_bw_tip = ("DETECTION: Minimum frequency bandwidth (Hz).\n"
+                      "Rejects detections whose frequency extent\n"
+                      "(max_freq - min_freq) is narrower than this value.\n\n"
+                      "Targets electrical noise artifacts: harmonics of\n"
+                      "60 Hz power lines, oscillator leakage, and other\n"
+                      "narrow-band interference appear as thin horizontal\n"
+                      "lines with near-zero bandwidth.\n\n"
+                      "Real USV calls, even constant-frequency rat 22 kHz\n"
+                      "alarm calls, have >= 1 kHz bandwidth due to onset/\n"
+                      "offset transients and slight FM.\n\n"
+                      "Typical: 500-1000 Hz. Set to 0 to disable.")
         min_bw_row = QHBoxLayout()
         min_bw_row.setSpacing(4)
-        min_bw_row.addWidget(self._make_label("Min Bandwidth:", min_bw_tip, min_width=90))
+        min_bw_row.addWidget(self._make_label("Min Bandwidth:", min_bw_tip, min_width=80))
         self.spin_min_bw = QSpinBox()
         self.spin_min_bw.setRange(0, 50000)
         self.spin_min_bw.setSingleStep(100)
@@ -795,14 +852,22 @@ class ClassicAudioDetectorWindow(QMainWindow):
         min_bw_row.addWidget(self.spin_min_bw, 1)
         advanced_layout.addLayout(min_bw_row)
 
-        # Min SNR
-        snr_tip = ("Minimum signal-to-noise ratio (dB).\n"
-                   "SNR = peak power minus local noise floor.\n"
-                   "Higher = keep only strong, clear calls.\n"
-                   "Set to 0 to disable this filter.")
+        # 6. Min SNR
+        snr_tip = ("DETECTION: Minimum signal-to-noise ratio (dB).\n"
+                   "For each detection, SNR is computed as:\n"
+                   "  snr_dB = max_power_dB - mean(noise_floor_dB)\n"
+                   "where noise_floor is the per-frequency-row estimate\n"
+                   "from the Noise %tile parameter, averaged across the\n"
+                   "detection's frequency range.\n\n"
+                   "This is different from the Threshold parameter:\n"
+                   "  Threshold = per-pixel test during preprocessing.\n"
+                   "  Min SNR = per-detection test on the blob's peak.\n\n"
+                   "A detection can survive thresholding (enough pixels\n"
+                   "above threshold) but still have low overall SNR.\n\n"
+                   "Typical: 6-10 dB. Set to 0 to disable.")
         snr_row = QHBoxLayout()
         snr_row.setSpacing(4)
-        snr_row.addWidget(self._make_label("Min SNR:", snr_tip, min_width=90))
+        snr_row.addWidget(self._make_label("Min SNR:", snr_tip, min_width=80))
         self.spin_min_snr = QDoubleSpinBox()
         self.spin_min_snr.setRange(0.0, 50.0)
         self.spin_min_snr.setSingleStep(1.0)
@@ -812,15 +877,54 @@ class ClassicAudioDetectorWindow(QMainWindow):
         snr_row.addWidget(self.spin_min_snr, 1)
         advanced_layout.addLayout(snr_row)
 
-        # Spectral entropy range
-        ent_tip = ("Spectral entropy range (0.0 = pure tone, 1.0 = noise).\n"
-                   "Min: reject too-pure artifacts (electrical tones).\n"
-                   "Max: reject broadband noise events.\n"
-                   "Real USV calls typically 0.1 - 0.6.\n"
-                   "Set either to 0 to disable that bound.")
+        # 7. Tonality (spectral purity)
+        ton_tip = ("DETECTION: Minimum spectral purity (tonality) score.\n"
+                   "Computed as: 1 - (geometric_mean / arithmetic_mean)\n"
+                   "of the power spectrum within the detection's bounding box.\n\n"
+                   "1.0 = pure tone (all energy at one frequency bin).\n"
+                   "0.0 = white noise (energy spread uniformly).\n\n"
+                   "IMPORTANT: Empirical tonality values depend on FFT\n"
+                   "resolution and call duration. Short calls (3-10 ms) with\n"
+                   "our default FFT (512 samples) typically measure 0.05-0.20\n"
+                   "because the bounding box includes noise around the call.\n"
+                   "Longer calls (20-50 ms) measure 0.15-0.60.\n\n"
+                   "Literature values (e.g. DeepSqueak's 0.3 default) assume\n"
+                   "different FFT parameters. Tune empirically using the\n"
+                   "diagnostic output from Process Preview Snapshot.\n"
+                   "Set to 0 to disable.")
+        ton_row = QHBoxLayout()
+        ton_row.setSpacing(4)
+        ton_row.addWidget(self._make_label("Tonality:", ton_tip, min_width=80))
+        self.spin_tonality = QDoubleSpinBox()
+        self.spin_tonality.setRange(0.0, 1.0)
+        self.spin_tonality.setSingleStep(0.05)
+        self.spin_tonality.setDecimals(2)
+        self.spin_tonality.setValue(0.30)
+        self.spin_tonality.setToolTip(ton_tip)
+        ton_row.addWidget(self.spin_tonality, 1)
+        advanced_layout.addLayout(ton_row)
+
+        # 8. Spectral entropy range
+        ent_tip = ("DETECTION: Spectral entropy range (Shannon entropy).\n"
+                   "Computed on the normalized power spectrum within the\n"
+                   "detection's bounding box:\n"
+                   "  H = -sum(p * log2(p)) / log2(N)\n"
+                   "where p is the normalized power per frequency bin\n"
+                   "and N is the number of bins. Normalized to [0, 1].\n\n"
+                   "0.0 = all energy in one bin (pure tone / electrical).\n"
+                   "1.0 = energy spread uniformly (white noise).\n\n"
+                   "Min entropy: rejects pure-tone electrical artifacts\n"
+                   "  (e.g. 60 Hz harmonics have entropy near 0).\n"
+                   "Max entropy: rejects broadband noise events\n"
+                   "  (cage bumps, handling noise have entropy > 0.85).\n\n"
+                   "IMPORTANT: Like tonality, empirical values depend on\n"
+                   "FFT resolution and call duration. With our default FFT,\n"
+                   "real USVs typically measure 0.5-0.9 (not the 0.1-0.6\n"
+                   "reported in literature with different parameters).\n"
+                   "Set either bound to 0 to disable it.")
         ent_row = QHBoxLayout()
         ent_row.setSpacing(4)
-        ent_row.addWidget(self._make_label("Entropy:", ent_tip, min_width=90))
+        ent_row.addWidget(self._make_label("Entropy:", ent_tip, min_width=80))
         self.spin_min_entropy = QDoubleSpinBox()
         self.spin_min_entropy.setRange(0.0, 1.0)
         self.spin_min_entropy.setSingleStep(0.05)
@@ -838,14 +942,49 @@ class ClassicAudioDetectorWindow(QMainWindow):
         ent_row.addWidget(self.spin_max_entropy, 1)
         advanced_layout.addLayout(ent_row)
 
-        # Power range
-        pwr_tip = ("Power thresholds (dB).\n"
-                   "Min: reject weak/quiet detections.\n"
-                   "Max: reject clipping artifacts.\n"
+        # 9. Min call frequency
+        mcf_tip = ("DETECTION: Minimum peak frequency of a detection (Hz).\n"
+                   "Each detection's peak frequency (the frequency bin with\n"
+                   "the highest power) is compared against this threshold.\n"
+                   "Detections whose peak frequency falls below this value\n"
+                   "are discarded.\n\n"
+                   "Useful for rejecting broadband noise artifacts that\n"
+                   "extend below the typical USV frequency range. Unlike\n"
+                   "the Freq Range (preprocessing), this operates on the\n"
+                   "detection's actual peak — not the bounding box edges.\n\n"
+                   "Set below your species' lowest expected fundamental:\n"
+                   "  Prairie voles: 15-20 kHz\n"
+                   "  Mice: 25-30 kHz\n"
                    "Set to 0 to disable.")
+        mcf_row = QHBoxLayout()
+        mcf_row.setSpacing(4)
+        mcf_row.addWidget(self._make_label("Min Call Freq:", mcf_tip, min_width=80))
+        self.spin_min_call_freq = QSpinBox()
+        self.spin_min_call_freq.setRange(0, 100000)
+        self.spin_min_call_freq.setSingleStep(1000)
+        self.spin_min_call_freq.setValue(0)
+        self.spin_min_call_freq.setSuffix(" Hz")
+        self.spin_min_call_freq.setToolTip(mcf_tip)
+        mcf_row.addWidget(self.spin_min_call_freq, 1)
+        advanced_layout.addLayout(mcf_row)
+
+        # 10. Power range
+        pwr_tip = ("DETECTION: Absolute power thresholds (dB).\n"
+                   "Unlike SNR (relative to noise floor), these filter on\n"
+                   "absolute power values from the spectrogram.\n\n"
+                   "Min power: mean_power_dB across the detection must\n"
+                   "  exceed this. Rejects faint/marginal detections.\n"
+                   "Max power: max_power_dB must be below this. Rejects\n"
+                   "  clipping artifacts and electrical saturation.\n\n"
+                   "NOTE: Absolute power depends heavily on microphone\n"
+                   "sensitivity, gain, and recording distance. These values\n"
+                   "are NOT comparable across recording setups. Prefer\n"
+                   "relative filters (SNR, Threshold) unless you have a\n"
+                   "calibrated recording pipeline.\n\n"
+                   "Set either to 0 to disable.")
         pwr_row = QHBoxLayout()
         pwr_row.setSpacing(4)
-        pwr_row.addWidget(self._make_label("Power:", pwr_tip, min_width=90))
+        pwr_row.addWidget(self._make_label("Power:", pwr_tip, min_width=80))
         self.spin_min_power = QDoubleSpinBox()
         self.spin_min_power.setRange(-120.0, 0.0)
         self.spin_min_power.setSingleStep(1.0)
@@ -863,15 +1002,21 @@ class ClassicAudioDetectorWindow(QMainWindow):
         pwr_row.addWidget(self.spin_max_power, 1)
         advanced_layout.addLayout(pwr_row)
 
-        # Max sweep rate
-        sweep_tip = ("Maximum mean frequency sweep rate (kHz/ms).\n"
-                     "Computed from peak frequency trajectory.\n"
-                     "Very high rates may indicate noise artifacts.\n"
-                     "Requires Freq Samples to be enabled.\n"
+        # 11. Max sweep rate
+        sweep_tip = ("DETECTION: Maximum mean frequency sweep rate (kHz/ms).\n"
+                     "Requires Freq Samples to be enabled (checkbox below).\n\n"
+                     "The detection's time span is divided into N equal\n"
+                     "segments, and the peak frequency in each segment is\n"
+                     "sampled. The mean sweep rate is:\n"
+                     "  mean(|delta_freq| / delta_time) across all segments\n\n"
+                     "Biological USV sweeps: typically 0.5-3.0 kHz/ms.\n"
+                     "Mouse upsweep: ~60→80 kHz in 20 ms = 1.0 kHz/ms.\n"
+                     "Rat flat calls: < 0.2 kHz/ms.\n"
+                     "Noise transients: can exceed 5 kHz/ms.\n\n"
                      "Set to 0 to disable.")
         sweep_row = QHBoxLayout()
         sweep_row.setSpacing(4)
-        sweep_row.addWidget(self._make_label("Max Sweep:", sweep_tip, min_width=90))
+        sweep_row.addWidget(self._make_label("Max Sweep:", sweep_tip, min_width=80))
         self.spin_max_sweep = QDoubleSpinBox()
         self.spin_max_sweep.setRange(0.0, 100.0)
         self.spin_max_sweep.setSingleStep(0.5)
@@ -882,16 +1027,23 @@ class ClassicAudioDetectorWindow(QMainWindow):
         sweep_row.addWidget(self.spin_max_sweep, 1)
         advanced_layout.addLayout(sweep_row)
 
-        # Max contour jitter
-        jitter_tip = ("Maximum frequency contour jitter (kHz).\n"
-                      "Measures how erratic the peak frequency trajectory is.\n"
-                      "Real USV calls have smooth contours (low jitter).\n"
-                      "Noise artifacts have erratic contours (high jitter).\n"
-                      "Requires Freq Samples to be enabled.\n"
+        # 12. Max contour jitter
+        jitter_tip = ("DETECTION: Maximum frequency contour jitter (kHz).\n"
+                      "Requires Freq Samples to be enabled (checkbox below).\n\n"
+                      "Measures smoothness of the peak frequency trajectory\n"
+                      "using mean absolute second derivative (acceleration):\n"
+                      "  jitter = mean(|f[i+1] - 2*f[i] + f[i-1]|)\n"
+                      "where f[i] are the sampled peak frequencies in kHz.\n\n"
+                      "Low jitter = smooth frequency contour (real USV).\n"
+                      "High jitter = erratic frequency jumps (noise).\n\n"
+                      "Biological calls have smooth FM sweeps or flat\n"
+                      "contours with jitter typically < 2-5 kHz.\n"
+                      "Noise artifacts show random frequency jumps between\n"
+                      "adjacent time samples.\n\n"
                       "Set to 0 to disable.")
         jitter_row = QHBoxLayout()
         jitter_row.setSpacing(4)
-        jitter_row.addWidget(self._make_label("Max Jitter:", jitter_tip, min_width=90))
+        jitter_row.addWidget(self._make_label("Max Jitter:", jitter_tip, min_width=80))
         self.spin_max_jitter = QDoubleSpinBox()
         self.spin_max_jitter.setRange(0.0, 50.0)
         self.spin_max_jitter.setSingleStep(0.5)
@@ -902,15 +1054,23 @@ class ClassicAudioDetectorWindow(QMainWindow):
         jitter_row.addWidget(self.spin_max_jitter, 1)
         advanced_layout.addLayout(jitter_row)
 
-        # Min ICI
-        ici_tip = ("Minimum inter-call interval (ms).\n"
-                   "Reject calls in suspiciously regular trains.\n"
-                   "Some noise sources (e.g. 60Hz harmonics) produce\n"
-                   "detections at regular short intervals.\n"
+        # 13. Min ICI
+        ici_tip = ("DETECTION: Minimum inter-call interval (ms).\n"
+                   "For each detection, the time gap to the previous\n"
+                   "detection is measured. If the gap is shorter than\n"
+                   "this threshold, the detection is discarded.\n\n"
+                   "Targets periodic electrical noise that produces\n"
+                   "detections at impossibly fast repetition rates\n"
+                   "(e.g. 60 Hz harmonics = 16.7 ms intervals).\n\n"
+                   "Natural USV inter-call intervals:\n"
+                   "  Within sniff cycle: 7-20 ms\n"
+                   "  Between sniff cycles: > 60 ms\n\n"
+                   "Use cautiously — real calls within rapid bouts\n"
+                   "can be very closely spaced (< 10 ms).\n"
                    "Set to 0 to disable.")
         ici_row = QHBoxLayout()
         ici_row.setSpacing(4)
-        ici_row.addWidget(self._make_label("Min ICI:", ici_tip, min_width=90))
+        ici_row.addWidget(self._make_label("Min ICI:", ici_tip, min_width=80))
         self.spin_min_ici = QDoubleSpinBox()
         self.spin_min_ici.setRange(0.0, 100.0)
         self.spin_min_ici.setSingleStep(1.0)
@@ -920,27 +1080,47 @@ class ClassicAudioDetectorWindow(QMainWindow):
         ici_row.addWidget(self.spin_min_ici, 1)
         advanced_layout.addLayout(ici_row)
 
-        # Noise percentile
-        noise_tip = ("Percentile of spectrogram power used to\n"
-                     "estimate the background noise floor.\n"
-                     "Lower = assumes quieter background.\n"
-                     "Typical: 20-30.")
-        noise_row = QHBoxLayout()
-        noise_row.setSpacing(4)
-        noise_row.addWidget(self._make_label("Noise %tile:", noise_tip, min_width=90))
-        self.spin_noise_pct = QDoubleSpinBox()
-        self.spin_noise_pct.setRange(1.0, 50.0)
-        self.spin_noise_pct.setValue(25.0)
-        self.spin_noise_pct.setToolTip(noise_tip)
-        noise_row.addWidget(self.spin_noise_pct, 1)
-        advanced_layout.addLayout(noise_row)
+        # 14. Detect Harmonics (post-hoc, last detection step)
+        detect_harm_tip = ("DETECTION: Post-hoc harmonic detection.\n"
+                           "After all filtering is complete, identifies detections\n"
+                           "whose peak frequency is approximately 2x or 3x another\n"
+                           "temporally overlapping detection (>= 50% overlap).\n\n"
+                           "Harmonics are labeled (purple 'H' boxes) and excluded\n"
+                           "from call counts, but preserved in the output CSV with\n"
+                           "is_harmonic=True for downstream analysis.\n\n"
+                           "Works best when Freq Gap splitting has already separated\n"
+                           "fundamentals from harmonics into distinct connected\n"
+                           "components. If they remain merged as one blob, there is\n"
+                           "nothing to compare against.\n\n"
+                           "Recommended ON for prairie voles (82% have harmonics)\n"
+                           "and mice. Less critical for rat 22 kHz alarm calls.")
+        self.chk_detect_harmonics = QCheckBox("Detect Harmonics")
+        self.chk_detect_harmonics.setChecked(True)
+        self.chk_detect_harmonics.setToolTip(detect_harm_tip)
+        advanced_layout.addWidget(self.chk_detect_harmonics)
+
+        # --- Infrastructure settings ---
 
         # FFT params
-        fft_tip = ("FFT window size (samples). Larger = better\n"
-                   "frequency resolution but worse time resolution.")
-        overlap_tip = ("FFT overlap (samples). Higher overlap gives\n"
-                       "smoother spectrograms but costs more compute.\n"
-                       "Typical: 75% of FFT size.")
+        fft_tip = ("FFT window size in samples (nperseg).\n"
+                   "Controls the time-frequency resolution tradeoff:\n\n"
+                   "  freq_resolution = sample_rate / nfft\n"
+                   "  time_resolution = nfft / sample_rate\n\n"
+                   "At 250 kHz sample rate:\n"
+                   "  512 → 488 Hz/bin, 2.0 ms/frame (default)\n"
+                   "  256 → 977 Hz/bin, 1.0 ms/frame\n"
+                   "  1024 → 244 Hz/bin, 4.1 ms/frame\n\n"
+                   "Larger = finer frequency detail but blurs short calls.\n"
+                   "Smaller = sharper timing but coarser frequency bins.")
+        overlap_tip = ("FFT overlap in samples (noverlap).\n"
+                       "Number of samples shared between consecutive FFT\n"
+                       "windows. Higher overlap = smoother time axis with\n"
+                       "more columns in the spectrogram, at compute cost.\n\n"
+                       "  hop_size = nperseg - noverlap\n"
+                       "  time_step = hop_size / sample_rate\n\n"
+                       "At 250 kHz with nperseg=512, noverlap=384:\n"
+                       "  hop = 128 → 0.51 ms time step.\n\n"
+                       "Typical: 75% of FFT size (384 for 512).")
         fft_row = QHBoxLayout()
         fft_row.setSpacing(4)
         fft_row.addWidget(self._make_label("FFT:", fft_tip, min_width=34))
@@ -960,10 +1140,18 @@ class ClassicAudioDetectorWindow(QMainWindow):
         advanced_layout.addLayout(fft_row)
 
         # Frequency samples (optional)
-        freq_samp_tip = ("Sample peak frequency at N evenly-spaced\n"
-                         "time points across each call. Enables\n"
-                         "frequency contour visualization on accepted\n"
-                         "detections (cyan line overlay).")
+        freq_samp_tip = ("Sample peak frequency at N evenly-spaced time points\n"
+                         "across each detection. For each time segment, the\n"
+                         "frequency bin with maximum power is recorded as\n"
+                         "peak_freq_1 through peak_freq_N in the output CSV.\n\n"
+                         "Enables:\n"
+                         "  - Frequency contour visualization (cyan line overlay)\n"
+                         "  - Sweep rate filtering (Max Sweep parameter)\n"
+                         "  - Contour jitter filtering (Max Jitter parameter)\n"
+                         "  - Call type classification (flat, up, down, chevron)\n\n"
+                         "More samples = finer contour resolution but diminishing\n"
+                         "returns above 5-7 for typical call durations.\n"
+                         "Uncheck to skip contour analysis (faster detection).")
         freq_samp_row = QHBoxLayout()
         freq_samp_row.setSpacing(4)
         self.chk_freq_samples = QCheckBox("Freq Samples:")
@@ -1010,8 +1198,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.spin_threshold,
             self.spin_min_dur, self.spin_max_dur,
             self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
-            self.chk_harmonic_filter, self.chk_harmonic_label,
-            self.spin_freq_gap,
+            self.chk_detect_harmonics,
+            self.spin_freq_gap, self.spin_valley_ratio,
             self.spin_min_gap, self.spin_noise_pct,
             self.spin_nperseg, self.spin_noverlap,
             self.chk_freq_samples, self.spin_freq_samples,
@@ -1021,6 +1209,12 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.spin_min_power, self.spin_max_power,
             self.spin_max_sweep, self.spin_max_jitter, self.spin_min_ici,
         ]
+
+        # Connect filter-overlay-relevant spinners for live updates
+        self.spin_min_freq.valueChanged.connect(self._push_filter_overlay_params)
+        self.spin_max_freq.valueChanged.connect(self._push_filter_overlay_params)
+        self.spin_threshold.valueChanged.connect(self._push_filter_overlay_params)
+        self.spin_noise_pct.valueChanged.connect(self._push_filter_overlay_params)
 
         # Queue display
         self.lbl_queue = QLabel("Queue: 0 files")
@@ -1063,9 +1257,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_preview_snapshot = QPushButton("Process Preview Snapshot")
         self.btn_preview_snapshot.setStyleSheet("background-color: #2d7d46;")
         self.btn_preview_snapshot.setToolTip(
-            "Run DSP detection on only the currently visible time range.\n"
-            "Uses the current parameter settings. Results replace any\n"
-            "existing detections for this file."
+            "Run the full DSP detection pipeline on only the currently\n"
+            "visible spectrogram window. Uses all current parameter\n"
+            "settings (both preprocessing and detection parameters).\n\n"
+            "Existing detections within the visible time range are\n"
+            "replaced; detections outside the window are preserved.\n\n"
+            "Prints per-stage diagnostic counts to the terminal:\n"
+            "  connected components → duration → merge → bandwidth\n"
+            "  → tonality → entropy → power → harmonic → final\n\n"
+            "Use this to rapidly iterate on parameter tuning without\n"
+            "processing the entire file."
         )
         self.btn_preview_snapshot.clicked.connect(self.run_preview_snapshot)
         self.btn_preview_snapshot.setEnabled(False)
@@ -1244,6 +1445,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_reject.clicked.connect(self.reject_detection)
         self.btn_reject.setEnabled(False)
         btn_row1.addWidget(self.btn_reject)
+
+        self.btn_harmonic = QPushButton("Harmonic")
+        self.btn_harmonic.setStyleSheet("background-color: #6b3fa0;")
+        self.btn_harmonic.clicked.connect(self.mark_harmonic)
+        self.btn_harmonic.setEnabled(False)
+        self.btn_harmonic.setToolTip("Mark current detection as a harmonic (H key).\n"
+                                     "Sets status to 'harmonic' (purple box).\n"
+                                     "Harmonics are excluded from call counts but\n"
+                                     "preserved in CSV with is_harmonic=True.")
+        btn_row1.addWidget(self.btn_harmonic)
 
         self.btn_skip = QPushButton("Skip")
         self.btn_skip.setStyleSheet("background-color: #5c5c5c;")
@@ -1438,7 +1649,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         visible = not self.advanced_options_widget.isVisible()
         self.advanced_options_widget.setVisible(visible)
         arrow = "▼" if visible else "▶"
-        self.btn_advanced_toggle.setText(f"{arrow} Advanced Options")
+        self.btn_advanced_toggle.setText(f"{arrow} Detection Parameters")
 
     def _on_species_profile_changed(self, profile_name):
         """Handle species profile dropdown change."""
@@ -1464,7 +1675,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 self.spin_min_freq, self.spin_max_freq, self.spin_threshold,
                 self.spin_min_dur, self.spin_max_dur,
                 self.spin_max_bw, self.spin_tonality, self.spin_min_call_freq,
-                self.spin_freq_gap,
+                self.spin_freq_gap, self.spin_valley_ratio,
                 self.spin_min_gap, self.spin_noise_pct,
                 self.spin_nperseg, self.spin_noverlap,
                 # Advanced noise rejection
@@ -1488,9 +1699,12 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.spin_noise_pct.setValue(preset['noise_percentile'])
             self.spin_nperseg.setValue(preset['nperseg'])
             self.spin_noverlap.setValue(preset['noverlap'])
-            self.chk_harmonic_filter.setChecked(preset.get('harmonic_filter', True))
-            self.chk_harmonic_label.setChecked(preset.get('harmonic_label', False))
+            # Backward compat: old profiles may have harmonic_filter/harmonic_label
+            detect_harm = preset.get('detect_harmonics',
+                                     preset.get('harmonic_filter', True) or preset.get('harmonic_label', False))
+            self.chk_detect_harmonics.setChecked(detect_harm)
             self.spin_freq_gap.setValue(preset.get('min_freq_gap_hz', 5000))
+            self.spin_valley_ratio.setValue(preset.get('valley_split_ratio', 0.30))
             # Advanced noise rejection
             self.spin_min_bw.setValue(preset.get('min_bandwidth_hz', 0))
             self.spin_min_snr.setValue(preset.get('min_snr_db', 0.0))
@@ -1511,6 +1725,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 w.setEnabled(False)
                 w.setStyleSheet(locked_style)
 
+            # Refresh filter overlay if active
+            self._push_filter_overlay_params()
 
     # -------------------------------------------------------------------------
     # Custom profile management
@@ -1667,6 +1883,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
         sc_skip.setContext(Qt.ApplicationShortcut)
         sc_skip.activated.connect(self._shortcut_skip)
 
+        # H = mark detection as harmonic
+        sc_harmonic = QShortcut(QKeySequence(Qt.Key_H), self)
+        sc_harmonic.setContext(Qt.ApplicationShortcut)
+        sc_harmonic.activated.connect(self._shortcut_mark_harmonic)
+
+        # V = toggle filter overlay
+        sc_overlay = QShortcut(QKeySequence(Qt.Key_V), self)
+        sc_overlay.setContext(Qt.ApplicationShortcut)
+        sc_overlay.activated.connect(self._shortcut_toggle_filter_overlay)
+
     def _shortcut_next_detection(self):
         """Handle N key shortcut — next detection."""
         focus = QApplication.focusWidget()
@@ -1722,6 +1948,15 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self._flash_button(self.btn_add_usv)
             self.add_new_usv()
 
+    def _shortcut_mark_harmonic(self):
+        """Handle H key — mark detection as harmonic."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_harmonic.isEnabled():
+            self._flash_button(self.btn_harmonic)
+            self.mark_harmonic()
+
     def _shortcut_skip(self):
         """Handle S key — skip to next detection without changing status."""
         focus = QApplication.focusWidget()
@@ -1730,6 +1965,33 @@ class ClassicAudioDetectorWindow(QMainWindow):
         if self.btn_skip.isEnabled():
             self._flash_button(self.btn_skip)
             self.skip_detection()
+
+    def _shortcut_toggle_filter_overlay(self):
+        """Handle V key — toggle filter overlay."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.btn_filter_overlay.toggle()
+
+    def _on_filter_overlay_toggled(self, checked):
+        """Handle filter overlay toggle."""
+        if checked:
+            self.btn_filter_overlay.setStyleSheet("background-color: #8b5cf6;")
+            self._push_filter_overlay_params()
+        else:
+            self.btn_filter_overlay.setStyleSheet("")
+            self.spectrogram.set_filter_overlay(False)
+
+    def _push_filter_overlay_params(self):
+        """Push current DSP filter params to the spectrogram overlay."""
+        if not self.btn_filter_overlay.isChecked():
+            return
+        self.spectrogram.set_filter_overlay(True, {
+            'min_freq_hz': self.spin_min_freq.value(),
+            'max_freq_hz': self.spin_max_freq.value(),
+            'noise_percentile': self.spin_noise_pct.value(),
+            'energy_threshold_db': self.spin_threshold.value(),
+        })
 
     def _setup_pan_timers(self):
         """Set up press-and-hold repeat timers for pan buttons."""
@@ -2447,9 +2709,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             'max_bandwidth_hz': self.spin_max_bw.value(),
             'min_tonality': self.spin_tonality.value(),
             'min_call_freq_hz': self.spin_min_call_freq.value(),
-            'harmonic_filter': self.chk_harmonic_filter.isChecked(),
-            'harmonic_label': self.chk_harmonic_label.isChecked(),
+            'detect_harmonics': self.chk_detect_harmonics.isChecked(),
             'min_freq_gap_hz': self.spin_freq_gap.value(),
+            'valley_split_ratio': self.spin_valley_ratio.value(),
             'min_gap_ms': self.spin_min_gap.value(),
             'noise_percentile': self.spin_noise_pct.value(),
             'nperseg': self.spin_nperseg.value(),
@@ -2507,9 +2769,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 max_bandwidth_hz=cfg.get('max_bandwidth_hz', 20000.0),
                 min_tonality=cfg.get('min_tonality', 0.3),
                 min_call_freq_hz=cfg.get('min_call_freq_hz', 0.0),
-                harmonic_filter=cfg.get('harmonic_filter', True),
-                harmonic_label=cfg.get('harmonic_label', False),
+                detect_harmonics=cfg.get('detect_harmonics', True),
                 min_freq_gap_hz=cfg.get('min_freq_gap_hz', 5000.0),
+                valley_split_ratio=cfg.get('valley_split_ratio', 0.30),
                 min_gap_ms=cfg.get('min_gap_ms', 5.0),
                 noise_percentile=cfg.get('noise_percentile', 25.0),
                 nperseg=cfg.get('nperseg', 512),
@@ -2530,6 +2792,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             detector = DSPDetector(detector_config)
 
             seg_dur = len(audio_segment) / self.sample_rate
+            print(f"\n{'='*60}", flush=True)
+            print(f"  NEW PREVIEW SNAPSHOT", flush=True)
+            print(f"{'='*60}", flush=True)
             print(f"[Preview Snapshot] view={view_start:.3f}-{view_end:.3f}s, "
                   f"samples={len(audio_segment)}, sr={self.sample_rate}, "
                   f"dur={seg_dur:.3f}s")
@@ -2539,7 +2804,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
                   f"tonality={detector_config.min_tonality}, "
                   f"snr={detector_config.min_snr_db}dB, "
                   f"entropy={detector_config.min_spectral_entropy}-{detector_config.max_spectral_entropy}, "
-                  f"min_bw={detector_config.min_bandwidth_hz}Hz")
+                  f"min_bw={detector_config.min_bandwidth_hz}Hz, "
+                  f"freq_gap={detector_config.min_freq_gap_hz}Hz, "
+                  f"valley_split={detector_config.valley_split_ratio}")
 
             # Run detection with per-stage diagnostic logging
             from fnt.usv.usv_detector.spectrogram import bandpass_filter, compute_spectrogram_auto
@@ -2570,8 +2837,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             calls = detector._filter_by_duration(calls)
             print(f"[Preview Snapshot] After duration filter: {len(calls)}")
 
+            pre_merge = len(calls)
             calls = detector._merge_close_calls(calls)
-            print(f"[Preview Snapshot] After merge close: {len(calls)}")
+            print(f"[Preview Snapshot] After merge close: {len(calls)} (merged {pre_merge - len(calls)})")
 
             calls = detector._filter_by_bandwidth(calls)
             print(f"[Preview Snapshot] After max bandwidth: {len(calls)}")
@@ -2612,8 +2880,10 @@ class ClassicAudioDetectorWindow(QMainWindow):
             calls = detector._filter_by_power(calls)
             print(f"[Preview Snapshot] After power filter: {len(calls)}")
 
-            calls = detector._filter_harmonics(calls)
-            print(f"[Preview Snapshot] After harmonic filter: {len(calls)}")
+            if detector_config.detect_harmonics:
+                calls = detector._label_harmonics(calls)
+            n_harmonics_labeled = sum(1 for c in calls if c.get('is_harmonic', False))
+            print(f"[Preview Snapshot] After harmonic labeling: {len(calls)} ({n_harmonics_labeled} labeled as harmonic)")
 
             # Peak freq sampling
             n_samples = getattr(detector_config, 'freq_samples', 5)
@@ -2938,6 +3208,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #107c10;")
         elif status == 'rejected':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #d13438;")
+        elif status == 'harmonic':
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
         elif status == 'noise':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #8b4513;")
         else:
@@ -3018,6 +3290,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #107c10;")
         elif status == 'rejected':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #d13438;")
+        elif status == 'harmonic':
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
         elif status == 'noise':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #8b4513;")
         else:
@@ -3382,6 +3656,21 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.undo_stack.append(('label', self.current_detection_idx, old_status))
         self.btn_undo.setEnabled(True)
         self.detections_df.at[self.current_detection_idx, 'status'] = 'rejected'
+        self._store_current_detections()
+        self._update_display()
+        self._update_button_counts()
+        self._auto_advance()
+
+    def mark_harmonic(self):
+        """Mark current detection as a harmonic."""
+        if self.detections_df is None:
+            return
+        old_status = self.detections_df.at[self.current_detection_idx, 'status']
+        self.undo_stack.append(('label', self.current_detection_idx, old_status))
+        self.btn_undo.setEnabled(True)
+        self.detections_df.at[self.current_detection_idx, 'status'] = 'harmonic'
+        if 'is_harmonic' in self.detections_df.columns:
+            self.detections_df.at[self.current_detection_idx, 'is_harmonic'] = True
         self._store_current_detections()
         self._update_display()
         self._update_button_counts()
@@ -3877,6 +4166,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         # Labeling
         self.btn_accept.setEnabled(bool(has_det))
         self.btn_reject.setEnabled(bool(has_det))
+        self.btn_harmonic.setEnabled(bool(has_det))
         self.btn_skip.setEnabled(bool(has_det))
         self.btn_add_usv.setEnabled(bool(has_audio))
         self.btn_delete.setEnabled(bool(has_det))

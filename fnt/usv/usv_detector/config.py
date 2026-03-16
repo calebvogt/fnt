@@ -56,9 +56,11 @@ class USVDetectorConfig:
     max_bandwidth_hz: float = 20000.0   # Max freq bandwidth; wider = broadband noise
     min_tonality: float = 0.3           # Min spectral purity (0=noise, 1=pure tone)
     min_call_freq_hz: float = 0.0       # Discard if actual min freq is below this (0=off)
-    harmonic_filter: bool = True        # Merge temporally overlapping detections (keep fundamental)
-    harmonic_label: bool = False        # Label (not remove) harmonics; adds is_harmonic + harmonic_of fields
+    harmonic_filter: bool = True        # Legacy: kept for backward compat with saved profiles
+    harmonic_label: bool = False        # Legacy: kept for backward compat with saved profiles
+    detect_harmonics: bool = True       # Post-hoc: label harmonics (is_harmonic field in CSV), never removes
     min_freq_gap_hz: float = 5000.0     # Split connected regions with vertical freq gaps wider than this (0=off)
+    valley_split_ratio: float = 0.30    # Energy valley depth ratio for splitting (0.0-1.0); lower = more aggressive
 
     # Advanced noise rejection filters
     min_bandwidth_hz: float = 0.0       # Min freq bandwidth; narrower = electrical noise (0=off)

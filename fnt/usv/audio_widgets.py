@@ -72,6 +72,13 @@ class SpectrogramWidget(QWidget):
         self.colormap_name = 'viridis'
         self.colormap_lut = self._create_colormap_lut(self.colormap_name)
 
+        # Filter overlay state
+        self._filter_overlay_active = False
+        self._filter_overlay_image = None
+        self._filter_params = None
+        self._raw_spec_db = None
+        self._raw_spec_freqs = None
+
     def set_colormap(self, name):
         """Set colormap by name and recompute spectrogram."""
         self.colormap_name = name
@@ -82,7 +89,92 @@ class SpectrogramWidget(QWidget):
         self.spec_image = None
         if self.total_duration > 0:
             self._compute_view_spectrogram()
+        if self._filter_overlay_active:
+            self._compute_filter_overlay()
         self.update()
+
+    def set_filter_overlay(self, active, params=None):
+        """Toggle the DSP filter overlay on/off.
+
+        Args:
+            active: Whether the overlay is visible.
+            params: Dict with keys: min_freq_hz, max_freq_hz,
+                    noise_percentile, energy_threshold_db.
+        """
+        self._filter_overlay_active = active
+        if params is not None:
+            self._filter_params = params
+        if active and self._raw_spec_db is not None:
+            self._compute_filter_overlay()
+        elif not active:
+            self._filter_overlay_image = None
+        self.update()
+
+    def _compute_filter_overlay(self):
+        """Compute the filtered spectrogram image showing what survives
+        frequency masking, noise floor subtraction, and energy thresholding.
+        """
+        if self._raw_spec_db is None or self._filter_params is None:
+            self._filter_overlay_image = None
+            return
+
+        spec = self._raw_spec_db.copy()  # (n_freq, n_time) in dB
+        freqs = self._raw_spec_freqs
+        p = self._filter_params
+
+        min_f = p.get('min_freq_hz', 0)
+        max_f = p.get('max_freq_hz', 200000)
+        noise_pct = p.get('noise_percentile', 25.0)
+        thresh_db = p.get('energy_threshold_db', 10.0)
+
+        # 1. Frequency band mask — mark out-of-band rows as dead
+        freq_in_band = (freqs >= min_f) & (freqs <= max_f)
+        dead = np.zeros(spec.shape, dtype=bool)
+        dead[~freq_in_band, :] = True
+
+        # 2. Noise floor subtraction for in-band rows
+        in_band_data = spec[freq_in_band, :]
+        if in_band_data.size > 0:
+            noise_floor = np.percentile(in_band_data, noise_pct,
+                                        axis=1, keepdims=True)
+            flattened = in_band_data - noise_floor
+
+            # 3. Energy threshold — mark sub-threshold pixels as dead
+            sub_threshold = flattened < thresh_db
+            # Map back to full array indices
+            in_band_indices = np.where(freq_in_band)[0]
+            for local_i, global_i in enumerate(in_band_indices):
+                dead[global_i, sub_threshold[local_i, :]] = True
+
+        # 4. Render: surviving pixels use original dB values, dead → black
+        # Normalize surviving pixels
+        surviving = spec[~dead]
+        if surviving.size == 0:
+            # Nothing survives — all black
+            h, w = spec.shape
+            black = np.ascontiguousarray(np.zeros((h, w, 3), dtype=np.uint8))
+            self._filter_overlay_image = QImage(
+                black.data, w, h, w * 3, QImage.Format_RGB888
+            ).copy()
+            return
+
+        vmin = np.percentile(surviving, 5)
+        vmax = np.percentile(surviving, 99)
+        normalized = np.clip((spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
+        indices = (normalized * 255).astype(np.uint8)
+
+        # Flip vertically (freq increases upward)
+        indices = np.flipud(indices)
+        dead_flipped = np.flipud(dead)
+
+        # Apply colormap, then black out dead pixels
+        rgb = np.ascontiguousarray(self.colormap_lut[indices])
+        rgb[dead_flipped] = [0, 0, 0]
+
+        h, w = indices.shape
+        self._filter_overlay_image = QImage(
+            rgb.data, w, h, w * 3, QImage.Format_RGB888
+        ).copy()
 
     @staticmethod
     def _create_colormap_lut(name='viridis'):
@@ -282,6 +374,10 @@ class SpectrogramWidget(QWidget):
             return
         view_spec = view_spec[freq_mask, :]
 
+        # Cache raw dB data for filter overlay (before normalization)
+        self._raw_spec_db = view_spec.copy()
+        self._raw_spec_freqs = frequencies[freq_mask].copy()
+
         # Normalize and apply colormap
         vmin = np.percentile(view_spec, 5)
         vmax = np.percentile(view_spec, 99)
@@ -289,7 +385,7 @@ class SpectrogramWidget(QWidget):
         indices = (normalized * 255).astype(np.uint8)
         indices = np.flipud(indices)
 
-        rgb_data = self.colormap_lut[indices]
+        rgb_data = np.ascontiguousarray(self.colormap_lut[indices])
 
         height, width = indices.shape
         self.spec_image = QImage(
@@ -301,6 +397,10 @@ class SpectrogramWidget(QWidget):
         self.cached_view_end = self.view_end
         self.cached_min_freq = self.min_freq
         self.cached_max_freq = self.max_freq
+
+        # Recompute filter overlay if active
+        if self._filter_overlay_active:
+            self._compute_filter_overlay()
 
     def paintEvent(self, event):
         """Paint spectrogram and detection boxes."""
@@ -315,7 +415,11 @@ class SpectrogramWidget(QWidget):
             return
 
         spec_rect = self._get_spec_rect()
-        scaled_image = self.spec_image.scaled(
+        display_image = (self._filter_overlay_image
+                         if self._filter_overlay_active
+                         and self._filter_overlay_image
+                         else self.spec_image)
+        scaled_image = display_image.scaled(
             int(spec_rect.width()), int(spec_rect.height()),
             Qt.IgnoreAspectRatio, Qt.SmoothTransformation
         )
