@@ -2012,7 +2012,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
         if not folder:
             return
 
-        wav_files = sorted(list(Path(folder).glob("*.wav")) + list(Path(folder).glob("*.WAV")))
+        # Use a dict to deduplicate (Windows glob is case-insensitive,
+        # so *.wav and *.WAV can return the same files)
+        seen = {}
+        for f in list(Path(folder).glob("*.wav")) + list(Path(folder).glob("*.WAV")):
+            key = str(f).lower()  # Normalize for case-insensitive FS
+            if key not in seen:
+                seen[key] = f
+        wav_files = sorted(seen.values())
         if not wav_files:
             QMessageBox.warning(self, "No Files", "No WAV files found in folder.")
             return
