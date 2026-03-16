@@ -165,9 +165,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
         },
         'Prairie Vole USVs': {
             # Freq range: adults 20-45 kHz fundamental (Stewart 2015).
-            # Cap at 60 kHz to capture full FM sweeps and near-harmonics
-            # while keeping broadband noise manageable.
-            'min_freq_hz': 20000, 'max_freq_hz': 60000,
+            # Cap at 55 kHz to capture full FM sweeps while excluding
+            # most harmonic energy and broadband noise.
+            'min_freq_hz': 20000, 'max_freq_hz': 55000,
             # Threshold: 10 dB — real calls are bright and well above noise.
             'energy_threshold_db': 10.0,
             # Duration: 8 ms min — noise fragments are 3-5 ms; real prairie
@@ -182,16 +182,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
             # Min call freq: 15 kHz — provides margin below the 20 kHz
             # fundamental floor without admitting low-frequency noise.
             'min_call_freq_hz': 15000,
-            # Harmonic filter + labeling with 2 kHz gap for tight splitting.
+            # Harmonic filter + labeling with 5 kHz gap.
             'harmonic_filter': True, 'harmonic_label': True,
-            'min_freq_gap_hz': 2000,
-            # Min gap: 2 ms — preserves rapid syllable sequences.
-            'min_gap_ms': 2.0,
+            'min_freq_gap_hz': 5000,
+            # Min gap: 4 ms — preserves rapid syllable sequences.
+            'min_gap_ms': 4.0,
             'noise_percentile': 25.0,
             'nperseg': 512, 'noverlap': 384,
             # Advanced noise rejection — empirically tuned
-            # Min bandwidth 500 Hz: rejects pure-tone electrical noise.
-            'min_bandwidth_hz': 500,
+            # Min bandwidth 1000 Hz: rejects pure-tone electrical noise.
+            'min_bandwidth_hz': 1000,
             # Min SNR 8 dB: real calls are clearly above noise floor.
             'min_snr_db': 8.0,
             # Spectral entropy: disabled — not reliable at our FFT resolution.
