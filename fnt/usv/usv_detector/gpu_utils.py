@@ -32,7 +32,7 @@ def detect_available_devices() -> List[Dict]:
                     'name': props.name,
                     'device': f'cuda:{i}',
                     'type': 'cuda',
-                    'vram_mb': props.total_mem // (1024 * 1024),
+                    'vram_mb': props.total_memory // (1024 * 1024),
                 })
 
         # Check MPS (Apple Silicon)
