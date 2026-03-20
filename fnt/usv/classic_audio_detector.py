@@ -2654,6 +2654,35 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 return True
         return False
 
+    def _file_has_curated_detections(self, filepath):
+        """Check if a file has any manually curated detections.
+
+        A file is considered 'curated' if it has at least one detection
+        with a status other than 'pending' (e.g. accepted, rejected,
+        harmonic, noise).  This indicates a user has invested manual
+        review time on this file.
+        """
+        df = self.all_detections.get(filepath)
+        if df is not None and len(df) > 0 and 'status' in df.columns:
+            non_pending = df[df['status'] != 'pending']
+            return len(non_pending) > 0
+
+        # Check on-disk CSV if not loaded in memory
+        base = Path(filepath).stem
+        parent = Path(filepath).parent
+        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+            csv_path = parent / f"{base}{suffix}.csv"
+            if csv_path.exists():
+                try:
+                    import pandas as pd
+                    disk_df = pd.read_csv(csv_path)
+                    if 'status' in disk_df.columns:
+                        non_pending = disk_df[disk_df['status'] != 'pending']
+                        return len(non_pending) > 0
+                except Exception:
+                    pass
+        return False
+
     def add_to_queue(self):
         """Add current file to DSP queue."""
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
@@ -2988,24 +3017,50 @@ class ClassicAudioDetectorWindow(QMainWindow):
         n_total = len(self.dsp_queue)
 
         if n_with > 0:
+            # Categorize files with detections into curated vs uncurated
+            files_curated = [f for f in files_with_dets
+                             if self._file_has_curated_detections(f)]
+            files_uncurated = [f for f in files_with_dets
+                               if f not in files_curated]
+            n_curated = len(files_curated)
+            n_uncurated = len(files_uncurated)
+
             msg = (f"Queue: {n_total} file{'s' if n_total != 1 else ''}\n"
-                   f"  - {n_with} file{'s' if n_with != 1 else ''} with existing detections\n"
-                   f"  - {n_without} file{'s' if n_without != 1 else ''} without detections\n\n"
+                   f"  • {n_without} without detections\n"
+                   f"  • {n_uncurated} with only pending (uncurated) detections\n"
+                   f"  • {n_curated} with manually curated detections "
+                   f"(accepted/rejected)\n\n"
                    "How would you like to proceed?")
             box = QMessageBox(self)
             box.setWindowTitle("Existing Detections Found")
             box.setText(msg)
             btn_overwrite = box.addButton("Overwrite All", QMessageBox.AcceptRole)
-            btn_skip = box.addButton("Skip Existing", QMessageBox.ActionRole)
+            btn_skip_curated = box.addButton(
+                "Protect Curated", QMessageBox.ActionRole)
+            btn_skip = box.addButton("Skip All Existing", QMessageBox.ActionRole)
             box.addButton("Cancel", QMessageBox.RejectRole)
             box.exec_()
 
             clicked = box.clickedButton()
             if clicked == btn_skip:
                 if not files_without_dets:
-                    self.status_bar.showMessage("All queued files already have detections — nothing to process")
+                    self.status_bar.showMessage(
+                        "All queued files already have detections — nothing to process")
                     return
                 self.dsp_queue = files_without_dets
+            elif clicked == btn_skip_curated:
+                # Keep files without detections + files with only pending detections
+                safe_queue = files_without_dets + files_uncurated
+                if not safe_queue:
+                    self.status_bar.showMessage(
+                        "All queued files have been manually curated — nothing to overwrite")
+                    return
+                skipped = n_curated
+                self.dsp_queue = safe_queue
+                if skipped > 0:
+                    self.status_bar.showMessage(
+                        f"Protecting {skipped} curated file{'s' if skipped != 1 else ''} — "
+                        f"processing {len(safe_queue)} file{'s' if len(safe_queue) != 1 else ''}")
             elif clicked == btn_overwrite:
                 pass  # Keep full queue
             else:

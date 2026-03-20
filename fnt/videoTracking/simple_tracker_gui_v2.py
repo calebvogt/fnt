@@ -36,10 +36,13 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QSpinBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
     QSlider, QScrollArea, QCheckBox, QTableWidget, QTableWidgetItem,
-    QInputDialog, QFrame
+    QInputDialog, QFrame, QComboBox, QShortcut
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
-from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QPen, QBrush, QPainterPath
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPointF
+from PyQt5.QtGui import (
+    QImage, QPixmap, QFont, QPainter, QColor, QPen, QBrush,
+    QPainterPath, QKeySequence, QPolygonF
+)
 
 # Check for required dependencies
 try:
@@ -62,6 +65,26 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
     print("Warning: scipy not available - using simple nearest neighbor matching")
+
+
+def detect_opencv_cuda_devices():
+    """Detect CUDA devices available to OpenCV.
+
+    Returns list of dicts with keys: name, device_id, type.
+    Returns empty list if OpenCV CUDA is not available.
+    """
+    devices = []
+    try:
+        count = cv2.cuda.getCudaEnabledDeviceCount()
+        for i in range(count):
+            devices.append({
+                'name': f'CUDA Device {i}',
+                'device_id': i,
+                'type': 'cuda',
+            })
+    except Exception:
+        pass
+    return devices
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -94,17 +117,27 @@ class VideoTrackingConfig:
         self.max_object_area = 10000
         self.history = 500
         self.var_threshold = 16
-        self.contrast = 1.0
-        self.brightness = 0
+        self.threshold = 0       # 0 = disabled, 1-255 = binary threshold on grayscale
+        self.invert = False      # True = dark object on light background (inverts fg_mask)
 
         # Blob refinement
         self.morph_open_size = 3
         self.morph_close_size = 5
         self.morph_open_iterations = 1
         self.morph_close_iterations = 2
+        self.erosion_size = 0        # 0 = off, standalone erosion kernel
         self.gaussian_blur_size = 0  # 0 = off, odd numbers 3,5,7...
-        self.fill_holes = True
+        self.median_filter_size = 0  # 0 = off, odd numbers 3,5,7...
+        self.fill_holes = False
         self.convex_hull = False
+
+        # Per-parameter enable toggles (all default False — user must enable)
+        self.threshold_enabled = False
+        self.median_enabled = False
+        self.erosion_enabled = False
+        self.opening_enabled = False
+        self.closing_enabled = False
+        self.blur_enabled = False
 
         # ROIs
         self.rois = []  # List of (roi_name, polygon_points) tuples
@@ -176,15 +209,23 @@ class VideoTrackingConfig:
             'max_object_area': self.max_object_area,
             'history': self.history,
             'var_threshold': self.var_threshold,
-            'contrast': self.contrast,
-            'brightness': self.brightness,
+            'threshold': self.threshold,
+            'invert': self.invert,
             'morph_open_size': self.morph_open_size,
             'morph_close_size': self.morph_close_size,
             'morph_open_iterations': self.morph_open_iterations,
             'morph_close_iterations': self.morph_close_iterations,
+            'erosion_size': self.erosion_size,
             'gaussian_blur_size': self.gaussian_blur_size,
+            'median_filter_size': self.median_filter_size,
             'fill_holes': self.fill_holes,
             'convex_hull': self.convex_hull,
+            'threshold_enabled': self.threshold_enabled,
+            'median_enabled': self.median_enabled,
+            'erosion_enabled': self.erosion_enabled,
+            'opening_enabled': self.opening_enabled,
+            'closing_enabled': self.closing_enabled,
+            'blur_enabled': self.blur_enabled,
             'rois': [(name, polygon) for name, polygon in self.rois],
             'scale_bar_set': self.scale_bar_set,
             'scale_bar_pixels': self.scale_bar_pixels,
@@ -215,15 +256,23 @@ class VideoTrackingConfig:
         self.max_object_area = config_dict.get('max_object_area', 10000)
         self.history = config_dict.get('history', 500)
         self.var_threshold = config_dict.get('var_threshold', 16)
-        self.contrast = config_dict.get('contrast', 1.0)
-        self.brightness = config_dict.get('brightness', 0)
+        self.threshold = config_dict.get('threshold', 0)
+        self.invert = config_dict.get('invert', False)
         self.morph_open_size = config_dict.get('morph_open_size', 3)
         self.morph_close_size = config_dict.get('morph_close_size', 5)
         self.morph_open_iterations = config_dict.get('morph_open_iterations', 1)
         self.morph_close_iterations = config_dict.get('morph_close_iterations', 2)
+        self.erosion_size = config_dict.get('erosion_size', 0)
         self.gaussian_blur_size = config_dict.get('gaussian_blur_size', 0)
+        self.median_filter_size = config_dict.get('median_filter_size', 0)
         self.fill_holes = config_dict.get('fill_holes', True)
         self.convex_hull = config_dict.get('convex_hull', False)
+        self.threshold_enabled = config_dict.get('threshold_enabled', False)
+        self.median_enabled = config_dict.get('median_enabled', False)
+        self.erosion_enabled = config_dict.get('erosion_enabled', False)
+        self.opening_enabled = config_dict.get('opening_enabled', False)
+        self.closing_enabled = config_dict.get('closing_enabled', False)
+        self.blur_enabled = config_dict.get('blur_enabled', False)
         self.rois = [(name, polygon) for name, polygon in config_dict.get('rois', [])]
         self.scale_bar_set = config_dict.get('scale_bar_set', False)
         self.scale_bar_pixels = config_dict.get('scale_bar_pixels', None)
@@ -267,9 +316,21 @@ class BackgroundSubtractionTracker:
         morph_close_size: int = 5,
         morph_open_iterations: int = 1,
         morph_close_iterations: int = 2,
+        erosion_size: int = 0,
         gaussian_blur_size: int = 0,
+        median_filter_size: int = 0,
         fill_holes: bool = True,
         convex_hull: bool = False,
+        use_gpu: bool = False,
+        threshold: int = 0,
+        invert: bool = False,
+        # Per-parameter enable toggles
+        threshold_enabled: bool = False,
+        median_enabled: bool = False,
+        erosion_enabled: bool = False,
+        opening_enabled: bool = False,
+        closing_enabled: bool = False,
+        blur_enabled: bool = False,
     ):
         self.video_path = video_path
         self.min_object_area = min_object_area
@@ -278,14 +339,29 @@ class BackgroundSubtractionTracker:
         self.var_threshold = var_threshold
         self.num_animals = num_animals
 
+        # Preprocessing params
+        self.threshold = threshold    # 0 = disabled, 1-255 = binary threshold
+        self.invert = invert          # True = dark object on light bg (invert fg_mask)
+
+        # Per-parameter enable toggles (default False — user must enable)
+        self.threshold_enabled = threshold_enabled
+        self.median_enabled = median_enabled
+        self.erosion_enabled = erosion_enabled
+        self.opening_enabled = opening_enabled
+        self.closing_enabled = closing_enabled
+        self.blur_enabled = blur_enabled
+
         # Blob refinement params
         self.morph_open_size = morph_open_size
         self.morph_close_size = morph_close_size
         self.morph_open_iterations = morph_open_iterations
         self.morph_close_iterations = morph_close_iterations
+        self.erosion_size = erosion_size
         self.gaussian_blur_size = gaussian_blur_size
+        self.median_filter_size = median_filter_size
         self.fill_holes = fill_holes
         self.convex_hull = convex_hull
+        self.use_gpu = use_gpu
 
         # Background subtractor
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -332,27 +408,47 @@ class BackgroundSubtractionTracker:
         return cv2.bitwise_and(frame, frame, mask=mask)
 
     def _refine_mask(self, fg_mask: np.ndarray) -> np.ndarray:
-        """Apply morphological refinement operations to foreground mask."""
-        # Opening (remove noise)
-        if self.morph_open_size > 0 and self.morph_open_iterations > 0:
+        """Apply morphological refinement operations to foreground mask.
+
+        Pipeline: Median → Erosion → Opening → Closing → Gaussian → Fill Holes.
+        All kernels are square (np.ones) for simplicity and predictability.
+        Each step is skipped if its toggle is disabled.
+        """
+        # Median filter (salt-and-pepper noise removal, before morphology)
+        if self.median_enabled and self.median_filter_size > 0:
+            k = max(3, self.median_filter_size)
+            if k % 2 == 0:
+                k += 1
+            fg_mask = cv2.medianBlur(fg_mask, k)
+
+        # Standalone erosion (shrinks blobs, removes small particles)
+        if self.erosion_enabled and self.erosion_size > 0:
+            k_size = max(1, self.erosion_size)
+            if k_size % 2 == 0:
+                k_size += 1
+            kernel = np.ones((k_size, k_size), np.uint8)
+            fg_mask = cv2.erode(fg_mask, kernel, iterations=1)
+
+        # Opening (erosion → dilation: removes small noise)
+        if self.opening_enabled and self.morph_open_size > 0 and self.morph_open_iterations > 0:
             k_size = max(1, self.morph_open_size)
             if k_size % 2 == 0:
                 k_size += 1
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_open,
+            kernel = np.ones((k_size, k_size), np.uint8)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel,
                                        iterations=self.morph_open_iterations)
 
-        # Closing (fill gaps)
-        if self.morph_close_size > 0 and self.morph_close_iterations > 0:
+        # Closing (dilation → erosion: fills small gaps)
+        if self.closing_enabled and self.morph_close_size > 0 and self.morph_close_iterations > 0:
             k_size = max(1, self.morph_close_size)
             if k_size % 2 == 0:
                 k_size += 1
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close,
+            kernel = np.ones((k_size, k_size), np.uint8)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel,
                                        iterations=self.morph_close_iterations)
 
-        # Gaussian blur
-        if self.gaussian_blur_size > 0:
+        # Gaussian blur (edge smoothing)
+        if self.blur_enabled and self.gaussian_blur_size > 0:
             blur_size = self.gaussian_blur_size
             if blur_size % 2 == 0:
                 blur_size += 1
@@ -390,8 +486,12 @@ class BackgroundSubtractionTracker:
         if tracking_area:
             gray = self.apply_roi_mask(gray, tracking_area)
 
-        # Background subtraction
+        # Background subtraction (produces foreground difference mask)
         fg_mask = self.bg_subtractor.apply(gray)
+
+        # Binary threshold on foreground mask (sharpen weak detections)
+        if self.threshold_enabled and self.threshold > 0:
+            _, fg_mask = cv2.threshold(fg_mask, self.threshold, 255, cv2.THRESH_BINARY)
 
         # Refine mask with morphological operations
         fg_mask = self._refine_mask(fg_mask)
@@ -401,11 +501,13 @@ class BackgroundSubtractionTracker:
             fg_mask, connectivity=8
         )
 
-        # Extract valid objects (filter by area)
+        # Extract valid objects (filter by area) and build filtered mask
         current_objects = []
+        filtered_mask = np.zeros_like(fg_mask)
         for i in range(1, num_labels):  # Skip background (label 0)
             area = stats[i, cv2.CC_STAT_AREA]
             if self.min_object_area <= area <= self.max_object_area:
+                filtered_mask[labels == i] = 255
                 if self.convex_hull:
                     # Compute convex hull centroid
                     blob_mask = (labels == i).astype(np.uint8) * 255
@@ -422,6 +524,7 @@ class BackgroundSubtractionTracker:
                 # Standard centroid
                 cx, cy = centroids[i]
                 current_objects.append((cx, cy, area))
+        fg_mask = filtered_mask
 
         # Single-animal mode: keep only the largest blob
         if self.num_animals == 1 and len(current_objects) > 1:
@@ -550,18 +653,21 @@ class BackgroundSubtractionTracker:
 
     def get_standard_view_frame(self, frame: np.ndarray, mask: np.ndarray,
                                 objects: Dict, tracking_area=None, rois=None) -> np.ndarray:
-        """Render camera view with green semi-transparent mask overlay + IDs."""
+        """Render camera view: raw video + tracking area outline + ROIs + centroids.
+
+        Everything outside the tracking area is blacked out.
+        No green overlay — just the raw frame with annotation overlays.
+        """
         display = frame.copy()
 
-        # Green semi-transparent overlay for detected blobs
-        if mask is not None:
-            mask_colored = np.zeros_like(display)
-            mask_colored[:, :, 1] = mask  # Green channel
-            display = cv2.addWeighted(display, 0.7, mask_colored, 0.3, 0)
-
-        # Draw tracking area boundary
+        # Black out everything outside tracking area
         if tracking_area and len(tracking_area) >= 3:
+            h, w = display.shape[:2]
+            ta_mask = np.zeros((h, w), dtype=np.uint8)
             pts = np.array(tracking_area, dtype=np.int32)
+            cv2.fillPoly(ta_mask, [pts], 255)
+            display[ta_mask == 0] = [0, 0, 0]
+            # Draw tracking area boundary (green outline)
             cv2.polylines(display, [pts], True, (0, 255, 0), 2)
 
         # Draw ROIs
@@ -630,6 +736,54 @@ class BackgroundSubtractionTracker:
             cv2.circle(display, (int(cx), int(cy)), 11, (220, 40, 40), 2)
             cv2.putText(display, f"ID{obj_id}", (int(cx) + 14, int(cy)),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 40, 40), 2)
+
+        return display
+
+    def get_detection_view_frame(self, frame: np.ndarray, mask: np.ndarray,
+                                 objects: Dict, tracking_area=None, rois=None) -> np.ndarray:
+        """Render detection overlay: white blobs on black background.
+
+        Shows exactly what the tracker detects after all refinement.
+        White pixels = detected foreground (blobs).
+        Black pixels = eliminated background.
+        """
+        h, w = frame.shape[:2]
+
+        # Black background with white blobs
+        display = np.zeros((h, w, 3), dtype=np.uint8)
+        if mask is not None:
+            blob_pixels = mask > 127
+            display[blob_pixels] = [255, 255, 255]
+
+        # Dark grey outside tracking area
+        if tracking_area and len(tracking_area) >= 3:
+            ta_mask = np.zeros((h, w), dtype=np.uint8)
+            pts = np.array(tracking_area, dtype=np.int32)
+            cv2.fillPoly(ta_mask, [pts], 255)
+            outside = ta_mask == 0
+            display[outside] = [20, 20, 20]
+            cv2.polylines(display, [pts], True, (0, 180, 0), 2)
+
+        # Draw ROIs
+        if rois:
+            for roi_name, roi_polygon in rois:
+                if len(roi_polygon) < 3:
+                    continue
+                pts = np.array(roi_polygon, dtype=np.int32)
+                if 'center' in roi_name.lower():
+                    color = (0, 130, 200)
+                else:
+                    color = (0, 180, 180)
+                cv2.polylines(display, [pts], True, color, 2)
+                cv2.putText(display, roi_name, tuple(roi_polygon[0]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        # Draw object centroids — bright green for visibility on black
+        for obj_id, (cx, cy, area) in objects.items():
+            cv2.circle(display, (int(cx), int(cy)), 8, (0, 220, 0), -1)
+            cv2.circle(display, (int(cx), int(cy)), 11, (0, 220, 0), 2)
+            cv2.putText(display, f"ID{obj_id}", (int(cx) + 14, int(cy)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 2)
 
         return display
 
@@ -786,9 +940,19 @@ class BatchTrackingWorker(QThread):
                     morph_close_size=config.morph_close_size,
                     morph_open_iterations=config.morph_open_iterations,
                     morph_close_iterations=config.morph_close_iterations,
+                    erosion_size=config.erosion_size,
                     gaussian_blur_size=config.gaussian_blur_size,
+                    median_filter_size=config.median_filter_size,
                     fill_holes=config.fill_holes,
                     convex_hull=config.convex_hull,
+                    threshold=config.threshold,
+                    invert=config.invert,
+                    threshold_enabled=config.threshold_enabled,
+                    median_enabled=config.median_enabled,
+                    erosion_enabled=config.erosion_enabled,
+                    opening_enabled=config.opening_enabled,
+                    closing_enabled=config.closing_enabled,
+                    blur_enabled=config.blur_enabled,
                 )
                 tracker.initialize_video()
 
@@ -806,12 +970,6 @@ class BatchTrackingWorker(QThread):
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     else:
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-
-                    # Apply contrast/brightness
-                    if config.contrast != 1.0 or config.brightness != 0:
-                        adj = frame_rgb.astype(np.float32)
-                        adj = config.contrast * (adj - 128) + 128 + config.brightness
-                        frame_rgb = np.clip(adj, 0, 255).astype(np.uint8)
 
                     objects, mask = tracker.process_frame(
                         frame_rgb, frame_idx, tracking_area=tracking_area
@@ -1567,75 +1725,136 @@ class SimpleTrackerGUI(QMainWindow):
 
     # Dark theme + blue scrollbar stylesheet
     DARK_THEME = """
-        QMainWindow { background-color: #2b2b2b; color: #cccccc; }
-        QWidget { background-color: #2b2b2b; color: #cccccc; }
+        QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
+        QWidget { background-color: #1e1e1e; color: #d4d4d4; }
         QGroupBox {
-            font-weight: bold; border: 1px solid #3f3f3f;
-            border-radius: 4px; margin-top: 6px; padding-top: 6px;
-            padding-bottom: 2px; color: #cccccc;
+            font-weight: bold; font-size: 11px;
+            border: 1px solid #333333;
+            border-radius: 6px; margin-top: 8px; padding-top: 8px;
+            padding-bottom: 4px; color: #e0e0e0;
+            background-color: #252526;
         }
-        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+        QGroupBox::title {
+            subcontrol-origin: margin; left: 10px; padding: 0 6px;
+            background-color: #252526;
+        }
         QPushButton {
             background-color: #0078d4; color: white; border: none;
-            padding: 4px 10px; border-radius: 3px; font-weight: bold; font-size: 12px;
+            padding: 5px 12px; border-radius: 4px;
+            font-weight: 600; font-size: 11px;
         }
-        QPushButton:hover { background-color: #106ebe; }
+        QPushButton:hover { background-color: #1a8ae8; }
         QPushButton:pressed { background-color: #005a9e; }
-        QPushButton:disabled { background-color: #3f3f3f; color: #888888; }
-        QLabel { color: #cccccc; background-color: transparent; font-size: 11px; }
+        QPushButton:disabled { background-color: #333333; color: #666666; }
+        QLabel { color: #d4d4d4; background-color: transparent; font-size: 11px; }
         QSpinBox, QDoubleSpinBox {
-            background-color: #3f3f3f; color: #cccccc;
-            border: 1px solid #555555; border-radius: 3px; padding: 2px;
+            background-color: #2d2d30; color: #d4d4d4;
+            border: 1px solid #3f3f46; border-radius: 4px;
+            padding: 3px 6px; min-height: 18px;
         }
+        QSpinBox:focus, QDoubleSpinBox:focus {
+            border: 1px solid #0078d4;
+        }
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+            background-color: #444444; border: none; width: 18px;
+        }
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover { background-color: #555555; }
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #555555; }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image: url(UP_ARROW_PATH); width: 9px; height: 6px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+            image: url(DOWN_ARROW_PATH); width: 9px; height: 6px;
+        }
+        QComboBox {
+            background-color: #2d2d30; color: #d4d4d4;
+            border: 1px solid #3f3f46; border-radius: 4px;
+            padding: 3px 8px; min-height: 18px;
+        }
+        QComboBox:focus { border: 1px solid #0078d4; }
+        QComboBox::drop-down {
+            border: none; width: 20px;
+            background-color: #333333; border-radius: 0 4px 4px 0;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #2d2d30; color: #d4d4d4;
+            border: 1px solid #3f3f46; selection-background-color: #0078d4;
+        }
+        QSlider::groove:horizontal {
+            border: none; height: 4px; border-radius: 2px;
+            background-color: #3f3f46;
+        }
+        QSlider::handle:horizontal {
+            background-color: #0078d4; width: 14px; height: 14px;
+            margin: -5px 0; border-radius: 7px;
+        }
+        QSlider::handle:horizontal:hover { background-color: #1a8ae8; }
+        QSlider::sub-page:horizontal {
+            background-color: #0078d4; border-radius: 2px;
+        }
+        QSlider::groove:horizontal:disabled { background-color: #2d2d30; }
+        QSlider::handle:horizontal:disabled { background-color: #555555; }
+        QSlider::sub-page:horizontal:disabled { background-color: #3f3f46; }
         QListWidget {
-            background-color: #1e1e1e; color: #cccccc;
-            border: 1px solid #3f3f3f; border-radius: 3px;
+            background-color: #1e1e1e; color: #d4d4d4;
+            border: 1px solid #333333; border-radius: 4px;
         }
-        QListWidget::item { padding: 3px; border-bottom: 1px solid #3f3f3f; }
-        QListWidget::item:selected { background-color: #0078d4; }
+        QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #2d2d30; }
+        QListWidget::item:selected { background-color: #0078d4; border-radius: 2px; }
+        QListWidget::item:hover { background-color: #2d2d30; }
         QProgressBar {
-            border: 1px solid #555555; border-radius: 3px;
-            background-color: #3f3f3f; text-align: center; color: #cccccc;
+            border: 1px solid #3f3f46; border-radius: 4px;
+            background-color: #2d2d30; text-align: center;
+            color: #d4d4d4; min-height: 16px;
         }
-        QProgressBar::chunk { background-color: #0078d4; }
-        QStatusBar { background-color: #1e1e1e; color: #cccccc; border-top: 1px solid #3f3f3f; }
-        QCheckBox { color: #cccccc; spacing: 8px; }
+        QProgressBar::chunk { background-color: #0078d4; border-radius: 3px; }
+        QStatusBar {
+            background-color: #1a1a1a; color: #999999;
+            border-top: 1px solid #333333; font-size: 10px;
+        }
+        QCheckBox { color: #d4d4d4; spacing: 8px; }
         QCheckBox::indicator {
             width: 16px; height: 16px; border: 2px solid #555; border-radius: 3px;
-            background-color: #3f3f3f;
+            background-color: #2d2d30;
         }
         QCheckBox::indicator:checked {
             background-color: #0078d4; border-color: #0078d4;
             image: none;
         }
         QTableWidget {
-            background-color: #1e1e1e; color: #cccccc;
-            border: 1px solid #3f3f3f; gridline-color: #3f3f3f;
+            background-color: #1e1e1e; color: #d4d4d4;
+            border: 1px solid #333333; gridline-color: #2d2d30;
         }
-        QTableWidget::item { padding: 3px; }
+        QTableWidget::item { padding: 4px; }
         QTableWidget::item:selected { background-color: #0078d4; }
         QHeaderView::section {
-            background-color: #2b2b2b; color: #cccccc;
-            border: 1px solid #3f3f3f; padding: 3px;
+            background-color: #252526; color: #d4d4d4;
+            border: 1px solid #333333; padding: 4px;
         }
         QScrollBar:vertical {
-            background-color: #2b2b2b; width: 12px; border-radius: 6px;
+            background-color: transparent; width: 8px; border-radius: 4px;
         }
         QScrollBar::handle:vertical {
-            background-color: #0078d4; border-radius: 4px; min-height: 20px;
+            background-color: #555555; border-radius: 4px; min-height: 20px;
         }
-        QScrollBar::handle:vertical:hover { background-color: #106ebe; }
+        QScrollBar::handle:vertical:hover { background-color: #777777; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
         QScrollBar:horizontal {
-            background-color: #2b2b2b; height: 12px; border-radius: 6px;
+            background-color: transparent; height: 8px; border-radius: 4px;
         }
         QScrollBar::handle:horizontal {
-            background-color: #0078d4; border-radius: 4px; min-width: 20px;
+            background-color: #555555; border-radius: 4px; min-width: 20px;
         }
-        QScrollBar::handle:horizontal:hover { background-color: #106ebe; }
+        QScrollBar::handle:horizontal:hover { background-color: #777777; }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
         QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+        QToolTip {
+            background-color: #2d2d30; color: #d4d4d4;
+            border: 1px solid #3f3f46; border-radius: 4px;
+            padding: 4px 8px; font-size: 11px;
+        }
     """
 
     def __init__(self):
@@ -1657,8 +1876,16 @@ class SimpleTrackerGUI(QMainWindow):
         self.scale_bar_points = []
         self.oft_corners = []
 
-        # View mode
-        self.view_mode = 'mask'  # 'mask' or 'standard'
+        # Detection overlay (replaces old view_mode)
+        self.detection_overlay_active = False
+
+        # Persistent tracker for real-time scrubbing
+        self._persistent_tracker = None
+        self._persistent_bg_config_hash = None
+
+        # GPU state
+        self.use_gpu = False
+        self._selected_gpu_device = 'auto'
 
         # Worker thread
         self.tracking_worker = None
@@ -1668,9 +1895,14 @@ class SimpleTrackerGUI(QMainWindow):
         self.preview_update_timer.setSingleShot(True)
         self.preview_update_timer.timeout.connect(self.update_preview_with_current_settings)
 
-        # Apply theme
-        self.setStyleSheet(self.DARK_THEME)
+        # Apply theme with runtime arrow images
+        self._create_arrow_images()
+        up = self._up_arrow_path.replace('\\', '/')
+        down = self._down_arrow_path.replace('\\', '/')
+        themed = self.DARK_THEME.replace('UP_ARROW_PATH', up).replace('DOWN_ARROW_PATH', down)
+        self.setStyleSheet(themed)
         self.init_ui()
+        self._setup_shortcuts()
 
     def keyPressEvent(self, event):
         """Handle key press events."""
@@ -1681,6 +1913,201 @@ class SimpleTrackerGUI(QMainWindow):
             if self.drawing_mode:
                 self.cancel_drawing()
 
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _make_label(self, text, tooltip=None, min_width=0):
+        """Helper to create a label with optional tooltip and minimum width."""
+        lbl = QLabel(text)
+        if tooltip:
+            lbl.setToolTip(tooltip)
+        if min_width > 0:
+            lbl.setMinimumWidth(min_width)
+        return lbl
+
+    def _add_section_header(self, layout, text):
+        """Add a subtle section divider label."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color: #666666; font-size: 10px; font-weight: 600; "
+            "margin-top: 6px; padding: 2px 0; "
+            "border-top: 1px solid #333333; background: transparent;"
+        )
+        layout.addWidget(lbl)
+
+    def _add_slider_row(self, layout, label_text, tooltip,
+                        min_val, max_val, default,
+                        attr_slider, attr_label,
+                        on_change, on_release,
+                        format_fn=None):
+        """Add a label + slider + value label row. Stores widgets as attributes."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(self._make_label(label_text, tooltip, min_width=70))
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
+        slider.setToolTip(tooltip)
+        slider.valueChanged.connect(on_change)
+        slider.sliderReleased.connect(on_release)
+        slider.setEnabled(False)
+        row.addWidget(slider, 1)
+        fmt = format_fn or str
+        val_lbl = QLabel(fmt(default))
+        val_lbl.setMinimumWidth(28)
+        val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        val_lbl.setStyleSheet("color: #999999; font-size: 10px; background: transparent;")
+        row.addWidget(val_lbl)
+        layout.addLayout(row)
+        setattr(self, attr_slider, slider)
+        setattr(self, attr_label, val_lbl)
+
+    def _add_toggled_slider_row(self, layout, label_text, tooltip,
+                                min_val, max_val, default,
+                                attr_slider, attr_label, attr_toggle,
+                                on_change, on_release,
+                                format_fn=None, toggle_default=False):
+        """Add a [checkbox] [label] [slider] [value] row for refinement controls.
+
+        Each processing step can be individually toggled on/off via the checkbox.
+        When unchecked, the slider is greyed out and the step is skipped.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        # Toggle checkbox
+        toggle = DarkCheckBox("")
+        toggle.setChecked(toggle_default)
+        toggle.setToolTip(f"Enable/disable {label_text.lower()}")
+        toggle.stateChanged.connect(on_change)
+        row.addWidget(toggle)
+
+        # Label
+        row.addWidget(self._make_label(label_text, tooltip, min_width=52))
+
+        # Slider
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
+        slider.setToolTip(tooltip)
+        slider.valueChanged.connect(on_change)
+        slider.sliderReleased.connect(on_release)
+        slider.setEnabled(False)
+        row.addWidget(slider, 1)
+
+        # Value label
+        fmt = format_fn or (lambda v: str(v))
+        val_lbl = QLabel(fmt(default))
+        val_lbl.setMinimumWidth(28)
+        val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        val_lbl.setStyleSheet("color: #999999; font-size: 10px; background: transparent;")
+        row.addWidget(val_lbl)
+
+        layout.addLayout(row)
+        setattr(self, attr_slider, slider)
+        setattr(self, attr_label, val_lbl)
+        setattr(self, attr_toggle, toggle)
+
+    def _add_compact_spin_row(self, layout, label_text, tooltip,
+                              attr, min_val, max_val, default,
+                              step=1, suffix=""):
+        """Add a compact label + spinbox row for refinement controls."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(self._make_label(label_text, tooltip, min_width=52))
+        spin = QSpinBox()
+        spin.setRange(min_val, max_val)
+        spin.setValue(default)
+        spin.setSingleStep(step)
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.setToolTip(tooltip)
+        spin.valueChanged.connect(self._on_refinement_changed)
+        row.addWidget(spin)
+        row.addStretch()
+        layout.addLayout(row)
+        setattr(self, attr, spin)
+
+    # ── Keyboard Shortcuts ────────────────────────────────────────────────
+
+    def _setup_shortcuts(self):
+        """Set up keyboard shortcuts (V = detection overlay, arrows = frame nav)."""
+        sc_overlay = QShortcut(QKeySequence(Qt.Key_V), self)
+        sc_overlay.setContext(Qt.ApplicationShortcut)
+        sc_overlay.activated.connect(self._shortcut_toggle_detection_overlay)
+
+        sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
+        sc_left.setContext(Qt.ApplicationShortcut)
+        sc_left.activated.connect(self._shortcut_prev_frame)
+
+        sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
+        sc_right.setContext(Qt.ApplicationShortcut)
+        sc_right.activated.connect(self._shortcut_next_frame)
+
+    def _shortcut_toggle_detection_overlay(self):
+        """Toggle detection overlay (V key). Guard against spin box focus."""
+        w = self.focusWidget()
+        if isinstance(w, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        self.btn_detection_overlay.toggle()
+
+    def _shortcut_prev_frame(self):
+        """Step frame slider back by 1 (Left arrow)."""
+        w = self.focusWidget()
+        if isinstance(w, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        val = self.frame_slider.value()
+        if val > self.frame_slider.minimum():
+            self.frame_slider.setValue(val - 1)
+
+    def _shortcut_next_frame(self):
+        """Step frame slider forward by 1 (Right arrow)."""
+        w = self.focusWidget()
+        if isinstance(w, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        val = self.frame_slider.value()
+        if val < self.frame_slider.maximum():
+            self.frame_slider.setValue(val + 1)
+
+    # ── Arrow Image Generation ────────────────────────────────────────────
+
+    def _create_arrow_images(self):
+        """Create small arrow PNG images for spinbox/combobox buttons.
+
+        Generates 9×6 triangle PNGs at runtime using QPainter, saved to
+        a temp directory. This avoids the macOS rendering bug where CSS
+        border-triangle arrows appear as white boxes.
+        """
+        import tempfile
+        self._arrow_dir = tempfile.mkdtemp(prefix='simple_tracker_arrows_')
+
+        # Up arrow (light triangle on transparent bg)
+        up_img = QImage(9, 6, QImage.Format_ARGB32)
+        up_img.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(up_img)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor('#cccccc'))
+        painter.drawPolygon(QPolygonF([
+            QPointF(4.5, 0.5), QPointF(8.5, 5.5), QPointF(0.5, 5.5)
+        ]))
+        painter.end()
+        self._up_arrow_path = os.path.join(self._arrow_dir, 'up.png')
+        up_img.save(self._up_arrow_path)
+
+        # Down arrow
+        down_img = QImage(9, 6, QImage.Format_ARGB32)
+        down_img.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(down_img)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor('#cccccc'))
+        painter.drawPolygon(QPolygonF([
+            QPointF(4.5, 5.5), QPointF(0.5, 0.5), QPointF(8.5, 0.5)
+        ]))
+        painter.end()
+        self._down_arrow_path = os.path.join(self._arrow_dir, 'down.png')
+        down_img.save(self._down_arrow_path)
+
     # ── UI Initialization ─────────────────────────────────────────────────
 
     def init_ui(self):
@@ -1689,13 +2116,15 @@ class SimpleTrackerGUI(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # Left panel - scrollable controls
+        # Left panel - scrollable controls (narrower)
         left_panel = self.create_left_panel()
-        main_layout.addWidget(left_panel, stretch=2)
+        left_panel.setMinimumWidth(340)
+        left_panel.setMaximumWidth(420)
+        main_layout.addWidget(left_panel, stretch=1)
 
-        # Right panel - preview
+        # Right panel - preview (wider)
         right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel, stretch=3)
+        main_layout.addWidget(right_panel, stretch=4)
 
         # Status bar
         self.status_bar = self.statusBar()
@@ -1718,13 +2147,10 @@ class SimpleTrackerGUI(QMainWindow):
         # Section 2: Set Tracking Area
         self._create_section_tracking_area()
 
-        # Section 3: Number of Animals
-        self._create_section_num_animals()
-
-        # Section 4: Object Detection Settings
+        # Section 3: Object Detection Settings
         self._create_section_detection_settings()
 
-        # Section 5: Draw ROIs
+        # Section 4: Draw ROIs
         self._create_section_draw_rois()
 
         # Section 6: Export Options
@@ -1894,88 +2320,121 @@ class SimpleTrackerGUI(QMainWindow):
         roi_group.setLayout(roi_layout)
         self.left_layout.addWidget(roi_group)
 
-    # ── Section 3: Number of Animals ─────────────────────────────────────
-
-    def _create_section_num_animals(self):
-        group = QGroupBox("3. Number of Animals")
-        layout = QVBoxLayout()
-
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Animals to track:"))
-        self.num_animals_spin = QSpinBox()
-        self.num_animals_spin.setRange(1, 20)
-        self.num_animals_spin.setValue(1)
-        self.num_animals_spin.valueChanged.connect(self._on_num_animals_changed)
-        h.addWidget(self.num_animals_spin)
-        h.addStretch()
-        layout.addLayout(h)
-
-        self.num_animals_info = QLabel(
-            "Set to 1 for single-animal tracking (only largest blob used)"
-        )
-        self.num_animals_info.setWordWrap(True)
-        self.num_animals_info.setStyleSheet("color: #aaaaaa; font-size: 10px;")
-        layout.addWidget(self.num_animals_info)
-
-        group.setLayout(layout)
-        self.left_layout.addWidget(group)
-
     def _on_num_animals_changed(self, value):
         if self.video_configs:
             self.video_configs[self.current_config_idx].num_animals = value
         if value == 1:
-            self.num_animals_info.setText(
-                "Set to 1 for single-animal tracking (only largest blob used)"
-            )
+            self.num_animals_info.setText("1 = largest blob only")
         else:
-            self.num_animals_info.setText(
-                f"Tracking top {value} blobs by area with ID assignment"
-            )
-        self._schedule_preview_update()
+            self.num_animals_info.setText(f"Top {value} blobs by area")
+        self._update_current_config()
 
-    # ── Section 4: Object Detection Settings ──────────────────────────────
+    # ── Section 3: Object Detection Settings ──────────────────────────────
 
     def _create_section_detection_settings(self):
-        group = QGroupBox("4. Object Detection Settings")
+        group = QGroupBox("3. Object Detection")
         settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(6)
+        settings_layout.setContentsMargins(8, 10, 8, 6)
 
-        # View toggle
-        view_layout = QHBoxLayout()
-        self.btn_mask_view = QPushButton("Background Subtraction View")
-        self.btn_mask_view.setCheckable(True)
-        self.btn_mask_view.setChecked(True)
-        self.btn_mask_view.clicked.connect(lambda: self._set_view_mode('mask'))
-        view_layout.addWidget(self.btn_mask_view)
+        # Hidden polarity combo (kept for config compatibility, always index 0)
+        self.polarity_combo = QComboBox()
+        self.polarity_combo.addItems(["Light on Dark", "Dark on Light"])
+        self.polarity_combo.setCurrentIndex(0)
+        self.polarity_combo.setVisible(False)
 
-        self.btn_standard_view = QPushButton("Standard View")
-        self.btn_standard_view.setCheckable(True)
-        self.btn_standard_view.setChecked(False)
-        self.btn_standard_view.clicked.connect(lambda: self._set_view_mode('standard'))
-        view_layout.addWidget(self.btn_standard_view)
-        settings_layout.addLayout(view_layout)
-        self._update_view_toggle_styles()
+        # ── Background Subtraction ────────────────────────────────────────
+        self._add_section_header(settings_layout, "Background Subtraction")
 
-        # Object size range (dual-handle slider)
-        self.area_range_label = QLabel("Object Size: 100 – 10000 px²")
+        # Sensitivity (var_threshold)
+        sens_tip = (
+            "MOG2 variance threshold.\n"
+            "Lower = more sensitive (detects subtle changes).\n"
+            "Higher = less sensitive (ignores small changes).\n\n"
+            "Typical: 10-25 for rodent tracking."
+        )
+        self._add_slider_row(
+            settings_layout, "Sensitivity", sens_tip, 1, 100, 16,
+            attr_slider='sensitivity_slider',
+            attr_label='sensitivity_value_label',
+            on_change=self._on_sensitivity_changed,
+            on_release=self._on_bg_slider_released,
+        )
+
+        # History
+        hist_tip = (
+            "Number of frames for background model.\n"
+            "More = stable background, slower adaptation.\n"
+            "Fewer = adapts quickly to lighting changes.\n\n"
+            "Typical: 200-500 for static camera setups."
+        )
+        self._add_slider_row(
+            settings_layout, "History", hist_tip, 50, 1000, 500,
+            attr_slider='history_slider',
+            attr_label='history_value_label',
+            on_change=self._on_history_changed,
+            on_release=self._on_bg_slider_released,
+            format_fn=lambda v: str(v),
+        )
+
+        # Apply Background Subtraction button
+        self.btn_apply_bg = QPushButton("Apply Background Subtraction")
+        self.btn_apply_bg.setToolTip(
+            "Build the background model with the current\n"
+            "Sensitivity and History settings. You must apply\n"
+            "before the detection overlay will work."
+        )
+        self.btn_apply_bg.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4; color: white; border: none;
+                padding: 6px 12px; border-radius: 4px; font-weight: 600;
+            }
+            QPushButton:hover { background-color: #1a8ae8; }
+            QPushButton:disabled { background-color: #333333; color: #666666; }
+        """)
+        self.btn_apply_bg.setEnabled(False)
+        self.btn_apply_bg.clicked.connect(self._on_apply_bg_subtraction)
+        settings_layout.addWidget(self.btn_apply_bg)
+
+        self.bg_status_label = QLabel("")
+        self.bg_status_label.setStyleSheet("color: #999999; font-size: 9px;")
+        settings_layout.addWidget(self.bg_status_label)
+
+        # ── Object Size ──────────────────────────────────────────────────
+        self._add_section_header(settings_layout, "Object Size Filter")
+
+        size_tip = (
+            "Filter detected blobs by pixel area.\n"
+            "Min: Removes small noise (dust, reflections).\n"
+            "Max: Removes large artifacts (shadows, cage).\n\n"
+            "Mouse: ~200-3000 px²  |  Rat: ~500-8000 px²"
+        )
+        self.area_range_label = self._make_label(
+            "100 – 10000 px²", size_tip
+        )
+        self.area_range_label.setStyleSheet(
+            "color: #999999; font-size: 10px; background: transparent;"
+        )
         settings_layout.addWidget(self.area_range_label)
 
         area_spin_h = QHBoxLayout()
-        area_spin_h.addWidget(QLabel("Min:"))
+        area_spin_h.setSpacing(6)
+        area_spin_h.addWidget(self._make_label("Min", None, min_width=24))
         self.min_area_spinbox = QSpinBox()
         self.min_area_spinbox.setRange(10, 50000)
         self.min_area_spinbox.setValue(100)
         self.min_area_spinbox.setSuffix(" px²")
         self.min_area_spinbox.valueChanged.connect(self._on_min_spinbox_changed)
         self.min_area_spinbox.setEnabled(False)
-        area_spin_h.addWidget(self.min_area_spinbox)
-        area_spin_h.addWidget(QLabel("Max:"))
+        area_spin_h.addWidget(self.min_area_spinbox, 1)
+        area_spin_h.addWidget(self._make_label("Max", None, min_width=28))
         self.max_area_spinbox = QSpinBox()
         self.max_area_spinbox.setRange(10, 50000)
         self.max_area_spinbox.setValue(10000)
         self.max_area_spinbox.setSuffix(" px²")
         self.max_area_spinbox.valueChanged.connect(self._on_max_spinbox_changed)
         self.max_area_spinbox.setEnabled(False)
-        area_spin_h.addWidget(self.max_area_spinbox)
+        area_spin_h.addWidget(self.max_area_spinbox, 1)
         settings_layout.addLayout(area_spin_h)
 
         self.area_range_slider = RangeSlider(10, 50000)
@@ -1986,138 +2445,296 @@ class SimpleTrackerGUI(QMainWindow):
         self.area_range_slider.setEnabled(False)
         settings_layout.addWidget(self.area_range_slider)
 
-        # Sensitivity
-        self.sensitivity_label = QLabel("Sensitivity: 16")
-        settings_layout.addWidget(self.sensitivity_label)
-        self.sensitivity_slider = QSlider(Qt.Horizontal)
-        self.sensitivity_slider.setRange(1, 100)
-        self.sensitivity_slider.setValue(16)
-        self.sensitivity_slider.setToolTip("Lower = more sensitive. Higher = less sensitive.")
-        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
-        self.sensitivity_slider.sliderReleased.connect(self._on_slider_released)
-        self.sensitivity_slider.setEnabled(False)
-        settings_layout.addWidget(self.sensitivity_slider)
+        # Number of animals (inline within Object Detection)
+        num_row = QHBoxLayout()
+        num_row.setSpacing(6)
+        num_tip = (
+            "How many animals/objects to track.\n\n"
+            "1 = single-animal mode (keeps only the largest blob).\n"
+            "2+ = multi-animal mode (tracks top N blobs by area\n"
+            "     with frame-to-frame ID assignment)."
+        )
+        num_row.addWidget(self._make_label("Animals", num_tip, min_width=55))
+        self.num_animals_spin = QSpinBox()
+        self.num_animals_spin.setRange(1, 20)
+        self.num_animals_spin.setValue(1)
+        self.num_animals_spin.setToolTip(num_tip)
+        self.num_animals_spin.valueChanged.connect(self._on_num_animals_changed)
+        num_row.addWidget(self.num_animals_spin)
+        self.num_animals_info = QLabel("1 = largest blob only")
+        self.num_animals_info.setStyleSheet("color: #999999; font-size: 9px;")
+        num_row.addWidget(self.num_animals_info, 1)
+        settings_layout.addLayout(num_row)
 
-        # Contrast
-        self.contrast_label = QLabel("Contrast: 1.0x")
-        settings_layout.addWidget(self.contrast_label)
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setRange(50, 300)
-        self.contrast_slider.setValue(100)
-        self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
-        self.contrast_slider.sliderReleased.connect(self._on_slider_released)
-        self.contrast_slider.setEnabled(False)
-        settings_layout.addWidget(self.contrast_slider)
+        # ── Blob Refinement ───────────────────────────────────────────────
+        self._add_section_header(settings_layout, "Blob Refinement")
 
-        # Brightness
-        self.brightness_label = QLabel("Brightness: 0")
-        settings_layout.addWidget(self.brightness_label)
-        self.brightness_slider = QSlider(Qt.Horizontal)
-        self.brightness_slider.setRange(-100, 100)
-        self.brightness_slider.setValue(0)
-        self.brightness_slider.valueChanged.connect(self._on_brightness_changed)
-        self.brightness_slider.sliderReleased.connect(self._on_slider_released)
-        self.brightness_slider.setEnabled(False)
-        settings_layout.addWidget(self.brightness_slider)
+        # Pixel Threshold toggle + slider
+        thresh_refine_tip = (
+            "Binary threshold on the foreground mask.\n"
+            "Sharpens weak detections from BG subtraction.\n"
+            "Higher values require stronger foreground signal.\n\n"
+            "0 = Off (use raw BG subtraction output).\n"
+            "Typical: 20-80 for noisy environments."
+        )
+        self._add_toggled_slider_row(
+            settings_layout, "Threshold", thresh_refine_tip,
+            min_val=0, max_val=255, default=0,
+            attr_slider='threshold_refine_slider',
+            attr_label='threshold_refine_label',
+            attr_toggle='threshold_refine_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
 
-        # Blob Refinement sub-group
-        refine_group = QGroupBox("Blob Refinement")
-        refine_layout = QVBoxLayout()
+        # Median filter
+        median_tip = (
+            "Median filter removes salt-and-pepper noise.\n"
+            "Applied before morphological operations.\n"
+            "Very effective for speckle noise from cameras.\n\n"
+            "0 = Off. Typical: 3-7 for noisy detections."
+        )
+        self._add_toggled_slider_row(
+            settings_layout, "Median", median_tip,
+            min_val=0, max_val=15, default=0,
+            attr_slider='median_slider',
+            attr_label='median_value_label',
+            attr_toggle='median_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
 
-        # Opening kernel
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Opening Kernel:"))
-        self.open_kernel_spin = QSpinBox()
-        self.open_kernel_spin.setRange(1, 15)
-        self.open_kernel_spin.setValue(3)
-        self.open_kernel_spin.setSingleStep(2)
-        self.open_kernel_spin.valueChanged.connect(self._on_refinement_changed)
-        h.addWidget(self.open_kernel_spin)
-        h.addWidget(QLabel("Iter:"))
-        self.open_iter_spin = QSpinBox()
-        self.open_iter_spin.setRange(0, 10)
-        self.open_iter_spin.setValue(1)
-        self.open_iter_spin.valueChanged.connect(self._on_refinement_changed)
-        h.addWidget(self.open_iter_spin)
-        refine_layout.addLayout(h)
+        # Erosion (standalone — shrinks blobs, removes noise)
+        erosion_tip = (
+            "Standalone erosion shrinks blobs and removes\n"
+            "small noise particles. Square kernel.\n\n"
+            "0 = Off. Larger values remove more.\n"
+            "Unlike Opening, erosion does not restore size.\n"
+            "Typical: 3-5 px."
+        )
+        self._add_toggled_slider_row(
+            settings_layout, "Erosion", erosion_tip,
+            min_val=0, max_val=15, default=0,
+            attr_slider='erosion_slider',
+            attr_label='erosion_value_label',
+            attr_toggle='erosion_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
 
-        # Closing kernel
-        h2 = QHBoxLayout()
-        h2.addWidget(QLabel("Closing Kernel:"))
-        self.close_kernel_spin = QSpinBox()
-        self.close_kernel_spin.setRange(1, 15)
-        self.close_kernel_spin.setValue(5)
-        self.close_kernel_spin.setSingleStep(2)
-        self.close_kernel_spin.valueChanged.connect(self._on_refinement_changed)
-        h2.addWidget(self.close_kernel_spin)
-        h2.addWidget(QLabel("Iter:"))
-        self.close_iter_spin = QSpinBox()
-        self.close_iter_spin.setRange(0, 10)
-        self.close_iter_spin.setValue(2)
-        self.close_iter_spin.valueChanged.connect(self._on_refinement_changed)
-        h2.addWidget(self.close_iter_spin)
-        refine_layout.addLayout(h2)
+        # Opening (noise removal: erosion → dilation)
+        open_tip = (
+            "Morphological opening removes small noise\n"
+            "while preserving blob size (erosion then dilation).\n\n"
+            "0 = Off. Typical: 3-5 px."
+        )
+        self._add_toggled_slider_row(
+            settings_layout, "Opening", open_tip,
+            min_val=0, max_val=15, default=3,
+            attr_slider='open_kernel_slider',
+            attr_label='open_kernel_value_label',
+            attr_toggle='opening_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
+
+        # Closing (gap filling: dilation → erosion)
+        close_tip = (
+            "Morphological closing fills small gaps and\n"
+            "connects nearby fragments (dilation then erosion).\n\n"
+            "0 = Off. Typical: 5-9 px."
+        )
+        self._add_toggled_slider_row(
+            settings_layout, "Closing", close_tip,
+            min_val=0, max_val=15, default=5,
+            attr_slider='close_kernel_slider',
+            attr_label='close_kernel_value_label',
+            attr_toggle='closing_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
 
         # Gaussian blur
-        h3 = QHBoxLayout()
-        h3.addWidget(QLabel("Gaussian Blur:"))
-        self.blur_spin = QSpinBox()
-        self.blur_spin.setRange(0, 31)
-        self.blur_spin.setValue(0)
-        self.blur_spin.setSingleStep(2)
-        self.blur_spin.setToolTip("0 = off, odd numbers (3, 5, 7...)")
-        self.blur_spin.valueChanged.connect(self._on_refinement_changed)
-        h3.addWidget(self.blur_spin)
-        refine_layout.addLayout(h3)
-
-        # Checkboxes
-        self.chk_fill_holes = DarkCheckBox("Fill Holes")
-        self.chk_fill_holes.setChecked(True)
-        self.chk_fill_holes.stateChanged.connect(self._on_refinement_changed)
-        refine_layout.addWidget(self.chk_fill_holes)
-
-        self.chk_convex_hull = DarkCheckBox("Convex Hull")
-        self.chk_convex_hull.setChecked(False)
-        self.chk_convex_hull.stateChanged.connect(self._on_refinement_changed)
-        refine_layout.addWidget(self.chk_convex_hull)
-
-        refine_group.setLayout(refine_layout)
-        settings_layout.addWidget(refine_group)
-
-        # Info
-        info_label = QLabel(
-            "<b>Settings:</b><br>"
-            "\u2022 <b>Min/Max Size:</b> Filter objects by area<br>"
-            "\u2022 <b>Sensitivity:</b> Background subtraction threshold<br>"
-            "\u2022 Changes apply automatically on slider release"
+        blur_tip = (
+            "Gaussian blur smooths blob edges.\n"
+            "Applied after morphological operations.\n"
+            "0 = Off. Typical: 3-7 for noisy detections."
         )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #aaaaaa; font-size: 10px; padding: 2px;")
-        settings_layout.addWidget(info_label)
+        self._add_toggled_slider_row(
+            settings_layout, "Blur", blur_tip,
+            min_val=0, max_val=31, default=0,
+            attr_slider='blur_slider',
+            attr_label='blur_value_label',
+            attr_toggle='blur_toggle',
+            on_change=self._on_refinement_changed,
+            on_release=self._on_slider_released,
+        )
+
+        # Checkboxes row (Fill holes, Convex hull)
+        chk_row = QHBoxLayout()
+        chk_row.setSpacing(12)
+        fill_tip = (
+            "Fills enclosed holes within blobs using floodFill.\n"
+            "Recommended ON for animals with lighter patches."
+        )
+        self.chk_fill_holes = DarkCheckBox("Fill holes")
+        self.chk_fill_holes.setChecked(False)
+        self.chk_fill_holes.setToolTip(fill_tip)
+        self.chk_fill_holes.stateChanged.connect(self._on_refinement_changed)
+        chk_row.addWidget(self.chk_fill_holes)
+
+        hull_tip = (
+            "Replaces each blob with its convex hull.\n"
+            "Smooths concavities. May over-estimate area."
+        )
+        self.chk_convex_hull = DarkCheckBox("Convex hull")
+        self.chk_convex_hull.setChecked(False)
+        self.chk_convex_hull.setToolTip(hull_tip)
+        self.chk_convex_hull.stateChanged.connect(self._on_refinement_changed)
+        chk_row.addWidget(self.chk_convex_hull)
+        chk_row.addStretch()
+        settings_layout.addLayout(chk_row)
+
+        # Hidden iteration spinboxes (fixed at 1) for compatibility
+        self.open_iter_spin = QSpinBox()
+        self.open_iter_spin.setValue(1)
+        self.open_iter_spin.setVisible(False)
+        self.close_iter_spin = QSpinBox()
+        self.close_iter_spin.setValue(2)
+        self.close_iter_spin.setVisible(False)
+
+        # ── GPU Acceleration ──────────────────────────────────────────────
+        gpu_tip = (
+            "Use NVIDIA CUDA for OpenCV operations.\n"
+            "Requires opencv-contrib-python with CUDA.\n"
+            "Falls back to CPU if unavailable."
+        )
+        gpu_row = QHBoxLayout()
+        gpu_row.setSpacing(6)
+        self.chk_gpu_accel = DarkCheckBox("GPU Acceleration")
+        self.chk_gpu_accel.setToolTip(gpu_tip)
+        self.chk_gpu_accel.toggled.connect(self._on_gpu_toggle)
+        gpu_row.addWidget(self.chk_gpu_accel)
+        self.lbl_gpu_status = QLabel("")
+        self.lbl_gpu_status.setStyleSheet("color: #999999; font-size: 9px;")
+        gpu_row.addWidget(self.lbl_gpu_status)
+        gpu_row.addStretch()
+        settings_layout.addLayout(gpu_row)
+
+        # ── Detection Overlay Toggle (V key) ─────────────────────────────
+        overlay_tip = (
+            "Toggle Detection Overlay (shortcut: V).\n"
+            "Shows exactly what the tracker detects:\n"
+            "  White pixels = detected foreground (blobs)\n"
+            "  Black pixels = eliminated background\n"
+            "  Green dots = blob centroids with IDs\n\n"
+            "You must Apply Background Subtraction first.\n"
+            "Scrub the frame slider to see detection in real-time."
+        )
+        self.btn_detection_overlay = QPushButton("Detection Overlay (V)")
+        self.btn_detection_overlay.setCheckable(True)
+        self.btn_detection_overlay.setToolTip(overlay_tip)
+        self.btn_detection_overlay.setStyleSheet("""
+            QPushButton {
+                background-color: #333333; color: #cccccc; border: 1px solid #444444;
+                padding: 6px 12px; border-radius: 4px; font-weight: 600;
+            }
+            QPushButton:hover { background-color: #3f3f46; border-color: #555555; }
+            QPushButton:checked {
+                background-color: #8b5cf6; color: white; border-color: #a78bfa;
+            }
+            QPushButton:checked:hover { background-color: #7c3aed; }
+        """)
+        self.btn_detection_overlay.toggled.connect(self._on_detection_overlay_toggled)
+        settings_layout.addWidget(self.btn_detection_overlay)
+
+        # ── Shortcut hint ─────────────────────────────────────────────────
+        hint_label = QLabel("V = overlay  •  ←→ = step frames")
+        hint_label.setStyleSheet(
+            "color: #555555; font-size: 9px; padding: 2px 0; background: transparent;"
+        )
+        settings_layout.addWidget(hint_label)
 
         group.setLayout(settings_layout)
         self.left_layout.addWidget(group)
 
     # ── Section 4 Event Handlers ──────────────────────────────────────────
 
-    def _set_view_mode(self, mode):
-        self.view_mode = mode
-        self._update_view_toggle_styles()
+    def _on_detection_overlay_toggled(self, checked):
+        """Handle detection overlay toggle (V key or button click)."""
+        self.detection_overlay_active = checked
+        # Styling handled by QPushButton:checked in the button's stylesheet
         self._schedule_preview_update()
 
-    def _update_view_toggle_styles(self):
-        active = "QPushButton { background-color: #0078d4; color: white; font-weight: bold; }"
-        inactive = "QPushButton { background-color: #555555; color: #aaaaaa; }"
-        if self.view_mode == 'mask':
-            self.btn_mask_view.setStyleSheet(active)
-            self.btn_standard_view.setStyleSheet(inactive)
-            self.btn_mask_view.setChecked(True)
-            self.btn_standard_view.setChecked(False)
-        else:
-            self.btn_mask_view.setStyleSheet(inactive)
-            self.btn_standard_view.setStyleSheet(active)
-            self.btn_mask_view.setChecked(False)
-            self.btn_standard_view.setChecked(True)
+    def _on_apply_bg_subtraction(self):
+        """Build background model with current sensitivity/history settings."""
+        if not self.video_configs:
+            return
+        config = self.video_configs[self.current_config_idx]
+        self._update_current_config()
+        self._invalidate_persistent_tracker()
+        self.bg_status_label.setText("Building background model...")
+        self.bg_status_label.setStyleSheet("color: #FFA500; font-size: 9px;")
+        QApplication.processEvents()
+
+        try:
+            tracker = self._get_or_create_persistent_tracker(config)
+            self.bg_status_label.setText("✓ Background model applied")
+            self.bg_status_label.setStyleSheet("color: #90EE90; font-size: 9px;")
+            # Auto-enable detection overlay after applying
+            if not self.detection_overlay_active:
+                self.btn_detection_overlay.setChecked(True)
+            else:
+                self._schedule_preview_update()
+        except Exception as e:
+            self.bg_status_label.setText(f"Error: {e}")
+            self.bg_status_label.setStyleSheet("color: #ff6666; font-size: 9px;")
+
+    def _on_gpu_toggle(self, checked):
+        """Handle GPU acceleration checkbox toggle."""
+        if not checked:
+            self.use_gpu = False
+            self.lbl_gpu_status.setText("")
+            return
+
+        # Try to detect GPU devices using fnt.usv gpu_utils (CUDA + MPS)
+        try:
+            from fnt.usv.usv_detector.gpu_utils import detect_available_devices
+            devices = detect_available_devices()
+            # Filter out CPU-only entries
+            gpu_devices = [d for d in devices if d.get('type') != 'cpu']
+        except ImportError:
+            gpu_devices = []
+
+        # Fall back to OpenCV CUDA detection
+        if not gpu_devices:
+            gpu_devices = detect_opencv_cuda_devices()
+
+        if not gpu_devices:
+            self.chk_gpu_accel.blockSignals(True)
+            self.chk_gpu_accel.setChecked(False)
+            self.chk_gpu_accel.blockSignals(False)
+            self.use_gpu = False
+            self.lbl_gpu_status.setText("No GPU devices found")
+            self.lbl_gpu_status.setStyleSheet("color: #ff6666; font-size: 9px;")
+            QMessageBox.warning(
+                self, "GPU Not Available",
+                "No GPU devices detected.\n\n"
+                "GPU acceleration supports:\n"
+                "  • NVIDIA CUDA (via PyTorch or OpenCV)\n"
+                "  • Apple MPS (M1/M2/M3 Mac, via PyTorch)\n\n"
+                "Install PyTorch for GPU support:\n"
+                "  pip install torch\n\n"
+                "Falling back to CPU processing."
+            )
+            return
+
+        self.use_gpu = True
+        dev = gpu_devices[0]
+        self._selected_gpu_device = dev.get('device', dev.get('device_id', 'auto'))
+        dev_name = dev.get('name', str(self._selected_gpu_device))
+        self.lbl_gpu_status.setText(dev_name)
+        self.lbl_gpu_status.setStyleSheet("color: #90EE90; font-size: 9px;")
 
     def _on_area_range_changed(self, low, high):
         """Handle range slider drag updates."""
@@ -2156,21 +2773,83 @@ class SimpleTrackerGUI(QMainWindow):
         self._schedule_preview_update()
 
     def _on_sensitivity_changed(self, value):
-        self.sensitivity_label.setText(f"Sensitivity: {value}")
+        self.sensitivity_value_label.setText(str(value))
 
-    def _on_contrast_changed(self, value):
-        self.contrast_label.setText(f"Contrast: {value / 100.0:.1f}x")
-
-    def _on_brightness_changed(self, value):
-        self.brightness_label.setText(f"Brightness: {value:+d}")
+    def _on_history_changed(self, value):
+        self.history_value_label.setText(str(value))
 
     def _on_slider_released(self):
+        """Handle slider release — update config and schedule preview."""
         self._update_current_config()
+        self._schedule_preview_update()
+
+    def _on_bg_slider_released(self):
+        """Handle release of BG-model sliders (sensitivity, history) — needs model rebuild."""
+        self._invalidate_persistent_tracker()
+        self._update_current_config()
+        # Signal that BG model needs re-application
+        self.bg_status_label.setText("Settings changed — click Apply")
+        self.bg_status_label.setStyleSheet("color: #FFA500; font-size: 9px;")
         self._schedule_preview_update()
 
     def _on_refinement_changed(self, _=None):
+        # Update slider value labels
+        self.threshold_refine_label.setText(
+            "Off" if self.threshold_refine_slider.value() == 0
+            else str(self.threshold_refine_slider.value())
+        )
+        self.median_value_label.setText(str(self.median_slider.value()))
+        self.erosion_value_label.setText(str(self.erosion_slider.value()))
+        self.open_kernel_value_label.setText(str(self.open_kernel_slider.value()))
+        self.close_kernel_value_label.setText(str(self.close_kernel_slider.value()))
+        self.blur_value_label.setText(str(self.blur_slider.value()))
+
+        # Sync slider enabled state with toggle checkboxes
+        self.threshold_refine_slider.setEnabled(
+            self.threshold_refine_toggle.isChecked() and bool(self.video_configs))
+        self.median_slider.setEnabled(
+            self.median_toggle.isChecked() and bool(self.video_configs))
+        self.erosion_slider.setEnabled(
+            self.erosion_toggle.isChecked() and bool(self.video_configs))
+        self.open_kernel_slider.setEnabled(
+            self.opening_toggle.isChecked() and bool(self.video_configs))
+        self.close_kernel_slider.setEnabled(
+            self.closing_toggle.isChecked() and bool(self.video_configs))
+        self.blur_slider.setEnabled(
+            self.blur_toggle.isChecked() and bool(self.video_configs))
+
         self._update_current_config()
+
+        # Update persistent tracker params in-place (no model rebuild needed)
+        if self._persistent_tracker is not None:
+            t = self._persistent_tracker
+            config = self.video_configs[self.current_config_idx]
+            t.threshold = config.threshold
+            t.invert = config.invert
+            t.threshold_enabled = config.threshold_enabled
+            t.median_enabled = config.median_enabled
+            t.erosion_enabled = config.erosion_enabled
+            t.opening_enabled = config.opening_enabled
+            t.closing_enabled = config.closing_enabled
+            t.blur_enabled = config.blur_enabled
+            t.median_filter_size = config.median_filter_size
+            t.erosion_size = config.erosion_size
+            t.morph_open_size = config.morph_open_size
+            t.morph_close_size = config.morph_close_size
+            t.gaussian_blur_size = config.gaussian_blur_size
+            t.fill_holes = config.fill_holes
+            t.convex_hull = config.convex_hull
+            t.min_object_area = config.min_object_area
+            t.max_object_area = config.max_object_area
+
         self._schedule_preview_update()
+
+    def _invalidate_persistent_tracker(self):
+        """Invalidate persistent tracker when detection params change."""
+        if self._persistent_tracker is not None:
+            self._persistent_tracker.cleanup()
+            self._persistent_tracker = None
+            self._persistent_bg_config_hash = None
 
     def _schedule_preview_update(self):
         """Debounced preview update."""
@@ -2185,13 +2864,24 @@ class SimpleTrackerGUI(QMainWindow):
         config.min_object_area = self.area_range_slider.low()
         config.max_object_area = self.area_range_slider.high()
         config.var_threshold = self.sensitivity_slider.value()
-        config.contrast = self.contrast_slider.value() / 100.0
-        config.brightness = self.brightness_slider.value()
-        config.morph_open_size = self.open_kernel_spin.value()
-        config.morph_close_size = self.close_kernel_spin.value()
-        config.morph_open_iterations = self.open_iter_spin.value()
-        config.morph_close_iterations = self.close_iter_spin.value()
-        config.gaussian_blur_size = self.blur_spin.value()
+        config.threshold = self.threshold_refine_slider.value()
+        config.invert = self.polarity_combo.currentIndex() == 1  # "Dark on Light" = index 1
+        config.history = self.history_slider.value()
+        config.morph_open_size = self.open_kernel_slider.value()
+        config.morph_close_size = self.close_kernel_slider.value()
+        config.morph_open_iterations = 1  # Simplified: always 1 iteration
+        config.morph_close_iterations = 1
+        config.erosion_size = self.erosion_slider.value()
+        config.gaussian_blur_size = self.blur_slider.value()
+        config.median_filter_size = self.median_slider.value()
+
+        # Per-parameter toggles
+        config.threshold_enabled = self.threshold_refine_toggle.isChecked()
+        config.median_enabled = self.median_toggle.isChecked()
+        config.erosion_enabled = self.erosion_toggle.isChecked()
+        config.opening_enabled = self.opening_toggle.isChecked()
+        config.closing_enabled = self.closing_toggle.isChecked()
+        config.blur_enabled = self.blur_toggle.isChecked()
         config.fill_holes = self.chk_fill_holes.isChecked()
         config.convex_hull = self.chk_convex_hull.isChecked()
         config.configured = True
@@ -2203,8 +2893,16 @@ class SimpleTrackerGUI(QMainWindow):
         self.min_area_spinbox.setEnabled(True)
         self.max_area_spinbox.setEnabled(True)
         self.sensitivity_slider.setEnabled(True)
-        self.contrast_slider.setEnabled(True)
-        self.brightness_slider.setEnabled(True)
+        self.history_slider.setEnabled(True)
+        self.polarity_combo.setEnabled(True)
+        self.btn_apply_bg.setEnabled(True)
+        # Enable refinement sliders respecting toggle state
+        self.threshold_refine_slider.setEnabled(self.threshold_refine_toggle.isChecked())
+        self.median_slider.setEnabled(self.median_toggle.isChecked())
+        self.erosion_slider.setEnabled(self.erosion_toggle.isChecked())
+        self.open_kernel_slider.setEnabled(self.opening_toggle.isChecked())
+        self.close_kernel_slider.setEnabled(self.closing_toggle.isChecked())
+        self.blur_slider.setEnabled(self.blur_toggle.isChecked())
 
     def _disable_detection_settings(self):
         """Disable detection controls when tracking area not set."""
@@ -2212,13 +2910,21 @@ class SimpleTrackerGUI(QMainWindow):
         self.min_area_spinbox.setEnabled(False)
         self.max_area_spinbox.setEnabled(False)
         self.sensitivity_slider.setEnabled(False)
-        self.contrast_slider.setEnabled(False)
-        self.brightness_slider.setEnabled(False)
+        self.history_slider.setEnabled(False)
+        self.polarity_combo.setEnabled(False)
+        self.btn_apply_bg.setEnabled(False)
+        # Disable all refinement sliders
+        self.threshold_refine_slider.setEnabled(False)
+        self.median_slider.setEnabled(False)
+        self.erosion_slider.setEnabled(False)
+        self.open_kernel_slider.setEnabled(False)
+        self.close_kernel_slider.setEnabled(False)
+        self.blur_slider.setEnabled(False)
 
     # ── Section 5: Draw ROIs ─────────────────────────────────────────────
 
     def _create_section_draw_rois(self):
-        group = QGroupBox("5. Draw ROIs")
+        group = QGroupBox("4. Draw ROIs")
         layout = QVBoxLayout()
 
         self.btn_oft = QPushButton("Open Field Test Layout")
@@ -2479,7 +3185,7 @@ class SimpleTrackerGUI(QMainWindow):
     # ── Section 6: Export Options ─────────────────────────────────────────
 
     def _create_section_export_options(self):
-        group = QGroupBox("6. Export Options")
+        group = QGroupBox("5. Export Options")
         layout = QVBoxLayout()
 
         self.chk_save_coords = DarkCheckBox("Save Position Coordinates CSV")
@@ -2547,10 +3253,6 @@ class SimpleTrackerGUI(QMainWindow):
         self.chk_interpolate.setChecked(True)
         layout.addWidget(self.chk_interpolate)
 
-        self.chk_overwrite = DarkCheckBox("Overwrite existing output files")
-        self.chk_overwrite.setChecked(True)
-        layout.addWidget(self.chk_overwrite)
-
         group.setLayout(layout)
         self.left_layout.addWidget(group)
 
@@ -2560,8 +3262,37 @@ class SimpleTrackerGUI(QMainWindow):
     # ── Section 7: Batch Processing ───────────────────────────────────────
 
     def _create_section_batch_processing(self):
-        group = QGroupBox("7. Batch Processing")
+        group = QGroupBox("6. Batch Processing")
         batch_layout = QVBoxLayout()
+        batch_layout.setSpacing(6)
+
+        # Number of Animals (moved here from early pipeline)
+        animals_tip = (
+            "Number of animals to track during batch processing.\n\n"
+            "1 = Single-animal mode (tracks largest blob only).\n"
+            "2+ = Multi-animal mode (tracks top N blobs by area,\n"
+            "  assigns IDs using Hungarian algorithm).\n\n"
+            "During detection preview, ALL blobs passing the\n"
+            "size filter are shown regardless of this setting."
+        )
+        animals_row = QHBoxLayout()
+        animals_row.setSpacing(6)
+        animals_row.addWidget(self._make_label("Animals to track:", animals_tip, min_width=100))
+        self.num_animals_spin = QSpinBox()
+        self.num_animals_spin.setRange(1, 20)
+        self.num_animals_spin.setValue(1)
+        self.num_animals_spin.setToolTip(animals_tip)
+        self.num_animals_spin.valueChanged.connect(self._on_num_animals_changed)
+        animals_row.addWidget(self.num_animals_spin)
+        animals_row.addStretch()
+        batch_layout.addLayout(animals_row)
+
+        self.num_animals_info = QLabel(
+            "1 = largest blob only  •  2+ = multi-animal tracking"
+        )
+        self.num_animals_info.setWordWrap(True)
+        self.num_animals_info.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        batch_layout.addWidget(self.num_animals_info)
 
         self.add_queue_btn = QPushButton("Add Video to Queue")
         self.add_queue_btn.clicked.connect(self._add_to_queue)
@@ -2652,7 +3383,7 @@ class SimpleTrackerGUI(QMainWindow):
         config.trail_length = self.trail_length_spin.value()
         config.save_data_view = self.chk_data_view.isChecked()
         config.interpolate_tracks = self.chk_interpolate.isChecked()
-        config.overwrite_files = self.chk_overwrite.isChecked()
+        # overwrite_files is now handled by the dialog prompt in start_batch_tracking
 
     def start_batch_tracking(self):
         """Start batch processing queued videos."""
@@ -2664,6 +3395,40 @@ class SimpleTrackerGUI(QMainWindow):
         for i in range(self.queue_list.count()):
             idx = self.queue_list.item(i).data(Qt.UserRole)
             queued_configs.append(self.video_configs[idx])
+
+        # Check for existing analysis folders
+        existing = []
+        for config in queued_configs:
+            video_base = os.path.splitext(os.path.basename(config.video_path))[0]
+            video_dir = os.path.dirname(config.video_path)
+            folder = os.path.join(video_dir, f"{video_base}_FNT_SimpleTracker_analysis")
+            if os.path.exists(folder) and os.listdir(folder):
+                existing.append(video_base)
+
+        if existing:
+            n = len(existing)
+            if n <= 3:
+                names = "\n  • ".join(existing)
+                detail = f"  • {names}"
+            else:
+                names = "\n  • ".join(existing[:3])
+                detail = f"  • {names}\n  ... and {n - 3} more"
+
+            reply = QMessageBox.question(
+                self, "Previous Analysis Detected",
+                f"Existing analysis results were found for {n} video(s):\n\n"
+                f"{detail}\n\n"
+                "Do you want to overwrite the previous results?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                self.status_bar.showMessage("Batch processing cancelled")
+                return
+
+            # Mark configs for overwrite
+            for config in queued_configs:
+                config.overwrite_files = True
 
         self.tracking_worker = BatchTrackingWorker(queued_configs)
         self.tracking_worker.progress.connect(self._update_progress)
@@ -2743,6 +3508,7 @@ class SimpleTrackerGUI(QMainWindow):
 
     def clear_videos(self):
         """Clear all selected videos."""
+        self._invalidate_persistent_tracker()
         self.video_configs = []
         self.video_list.clear()
         self.current_config_idx = 0
@@ -2758,6 +3524,7 @@ class SimpleTrackerGUI(QMainWindow):
     def on_video_selected(self, row):
         """Handle video selection from list."""
         if 0 <= row < len(self.video_configs):
+            self._invalidate_persistent_tracker()
             self.current_config_idx = row
             self.load_current_config()
             self.update_config_status()
@@ -2794,11 +3561,17 @@ class SimpleTrackerGUI(QMainWindow):
             self.max_area_spinbox.setRange(10, max_area)
 
         # Block signals while syncing
-        for w in (self.sensitivity_slider,
-                  self.contrast_slider, self.brightness_slider, self.min_area_spinbox,
-                  self.max_area_spinbox, self.num_animals_spin, self.open_kernel_spin,
-                  self.close_kernel_spin, self.open_iter_spin, self.close_iter_spin,
-                  self.blur_spin, self.chk_fill_holes, self.chk_convex_hull):
+        widgets_to_block = (
+            self.sensitivity_slider, self.polarity_combo,
+            self.min_area_spinbox, self.max_area_spinbox, self.num_animals_spin,
+            self.history_slider, self.open_kernel_slider, self.close_kernel_slider,
+            self.erosion_slider, self.blur_slider,
+            self.median_slider, self.threshold_refine_slider,
+            self.threshold_refine_toggle, self.median_toggle, self.erosion_toggle,
+            self.opening_toggle, self.closing_toggle, self.blur_toggle,
+            self.chk_fill_holes, self.chk_convex_hull,
+        )
+        for w in widgets_to_block:
             w.blockSignals(True)
 
         self.area_range_slider.setLow(config.min_object_area)
@@ -2806,31 +3579,46 @@ class SimpleTrackerGUI(QMainWindow):
         self.min_area_spinbox.setValue(config.min_object_area)
         self.max_area_spinbox.setValue(config.max_object_area)
         self.sensitivity_slider.setValue(config.var_threshold)
-        self.contrast_slider.setValue(int(config.contrast * 100))
-        self.brightness_slider.setValue(config.brightness)
+        # threshold is set via threshold_refine_slider below
+        self.polarity_combo.setCurrentIndex(1 if config.invert else 0)
         self.num_animals_spin.setValue(config.num_animals)
-        self.open_kernel_spin.setValue(config.morph_open_size)
-        self.close_kernel_spin.setValue(config.morph_close_size)
-        self.open_iter_spin.setValue(config.morph_open_iterations)
-        self.close_iter_spin.setValue(config.morph_close_iterations)
-        self.blur_spin.setValue(config.gaussian_blur_size)
+        self.history_slider.setValue(config.history)
+        self.history_value_label.setText(str(config.history))
+        self.open_kernel_slider.setValue(config.morph_open_size)
+        self.close_kernel_slider.setValue(config.morph_close_size)
+        self.erosion_slider.setValue(config.erosion_size)
+        self.blur_slider.setValue(config.gaussian_blur_size)
+        self.median_slider.setValue(config.median_filter_size)
+        self.threshold_refine_slider.setValue(config.threshold)
+
+        # Sync toggle states
+        self.threshold_refine_toggle.setChecked(config.threshold_enabled)
+        self.median_toggle.setChecked(config.median_enabled)
+        self.erosion_toggle.setChecked(config.erosion_enabled)
+        self.opening_toggle.setChecked(config.opening_enabled)
+        self.closing_toggle.setChecked(config.closing_enabled)
+        self.blur_toggle.setChecked(config.blur_enabled)
+
+        # Update value labels for refinement sliders
+        self.open_kernel_value_label.setText(str(config.morph_open_size))
+        self.close_kernel_value_label.setText(str(config.morph_close_size))
+        self.erosion_value_label.setText(str(config.erosion_size))
+        self.blur_value_label.setText(str(config.gaussian_blur_size))
+        self.median_value_label.setText(str(config.median_filter_size))
+        self.threshold_refine_label.setText(
+            "Off" if config.threshold == 0 else str(config.threshold)
+        )
         self.chk_fill_holes.setChecked(config.fill_holes)
         self.chk_convex_hull.setChecked(config.convex_hull)
 
-        for w in (self.sensitivity_slider,
-                  self.contrast_slider, self.brightness_slider, self.min_area_spinbox,
-                  self.max_area_spinbox, self.num_animals_spin, self.open_kernel_spin,
-                  self.close_kernel_spin, self.open_iter_spin, self.close_iter_spin,
-                  self.blur_spin, self.chk_fill_holes, self.chk_convex_hull):
+        for w in widgets_to_block:
             w.blockSignals(False)
 
-        # Update labels
+        # Update value labels
         self.area_range_label.setText(
-            f"Object Size: {config.min_object_area} – {config.max_object_area} px²"
+            f"Object Size: {config.min_object_area} \u2013 {config.max_object_area} px\u00B2"
         )
-        self.sensitivity_label.setText(f"Sensitivity: {config.var_threshold}")
-        self.contrast_label.setText(f"Contrast: {config.contrast:.1f}x")
-        self.brightness_label.setText(f"Brightness: {config.brightness:+d}")
+        self.sensitivity_value_label.setText(str(config.var_threshold))
 
     def update_config_status(self):
         """Update configuration status in preview panel."""
@@ -2933,7 +3721,7 @@ class SimpleTrackerGUI(QMainWindow):
             self.set_roi_btn.setEnabled(True)
             self.skip_roi_btn.setEnabled(True)
             self.clear_roi_btn.setEnabled(False)
-            self.roi_status_label.setText("Click Draw Area or Skip to continue")
+            self.roi_status_label.setText("Draw Area or Skip to continue")
             self.roi_status_label.setStyleSheet("color: #FFA500; font-size: 10px;")
             self._disable_detection_settings()
 
@@ -3112,9 +3900,14 @@ class SimpleTrackerGUI(QMainWindow):
 
         display = config.first_frame.copy()
 
-        # Draw tracking area
+        # Black out everything outside tracking area
         if config.tracking_area and len(config.tracking_area) >= 3:
+            h, w = display.shape[:2]
+            ta_mask = np.zeros((h, w), dtype=np.uint8)
             pts = np.array(config.tracking_area, np.int32)
+            cv2.fillPoly(ta_mask, [pts], 255)
+            display[ta_mask == 0] = [0, 0, 0]
+            # Draw tracking area boundary (green outline)
             cv2.polylines(display, [pts.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
 
         # Draw ROIs
@@ -3124,10 +3917,8 @@ class SimpleTrackerGUI(QMainWindow):
             pts = np.array(roi_polygon, np.int32)
             if 'center' in roi_name.lower():
                 color = (0, 165, 255)
-            elif 'light' in roi_name.lower():
-                color = (0, 255, 0)
             else:
-                color = (0, 255, 0)
+                color = (0, 255, 255)  # Cyan for ROIs
             cv2.polylines(display, [pts.reshape((-1, 1, 2))], True, color, 2)
             cv2.putText(display, roi_name, tuple(roi_polygon[0]),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -3191,10 +3982,15 @@ class SimpleTrackerGUI(QMainWindow):
         config = self.video_configs[self.current_config_idx]
         config.current_frame_idx = frame_idx
         self.frame_label.setText(f"{frame_idx} / {config.total_frames}")
-        self._load_and_show_frame(frame_idx)
+
+        # If detection overlay is active, use the fast persistent-tracker path
+        if self.detection_overlay_active and not self.drawing_mode:
+            self._update_detection_frame(frame_idx)
+        else:
+            self._load_and_show_frame(frame_idx)
 
     def _load_and_show_frame(self, frame_idx):
-        """Load a specific frame and display it (with or without detection)."""
+        """Load a specific frame and display it (no detection)."""
         if not self.video_configs:
             return
         config = self.video_configs[self.current_config_idx]
@@ -3211,20 +4007,185 @@ class SimpleTrackerGUI(QMainWindow):
                 else:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
 
-                frame_rgb = self.apply_contrast_brightness(
-                    frame_rgb, config.contrast, config.brightness
-                )
                 config.first_frame = frame_rgb
                 self._redraw_preview()
         except Exception as e:
             print(f"Error loading frame {frame_idx}: {e}")
 
-    def apply_contrast_brightness(self, frame, contrast, brightness):
-        """Apply contrast and brightness adjustments."""
-        adjusted = frame.astype(np.float32)
-        adjusted = contrast * (adjusted - 128) + 128
-        adjusted = adjusted + brightness
-        return np.clip(adjusted, 0, 255).astype(np.uint8)
+    # ── Persistent Tracker for Real-Time Scrubbing ────────────────────────
+
+    def _get_detection_config_hash(self, config):
+        """Compute a hash of detection-relevant config fields.
+
+        Note: threshold and invert are NOT included because they operate on
+        the foreground mask (after BG subtraction), not the input to the
+        BG model. Changing them doesn't require rebuilding the model.
+        """
+        return hash((
+            config.video_path, config.var_threshold, config.history,
+            tuple(config.tracking_area) if config.tracking_area else (),
+        ))
+
+    def _get_or_create_persistent_tracker(self, config):
+        """Get or create a persistent tracker with a pre-built background model.
+
+        The background model is built once from the first 100 frames.
+        Subsequent calls reuse it for instant detection via learningRate=0.
+        """
+        config_hash = self._get_detection_config_hash(config)
+
+        if (self._persistent_tracker is not None
+                and self._persistent_bg_config_hash == config_hash):
+            return self._persistent_tracker
+
+        # Cleanup old tracker
+        if self._persistent_tracker is not None:
+            self._persistent_tracker.cleanup()
+
+        tracker = BackgroundSubtractionTracker(
+            video_path=config.video_path,
+            min_object_area=config.min_object_area,
+            max_object_area=config.max_object_area,
+            history=config.history,
+            var_threshold=config.var_threshold,
+            num_animals=config.num_animals,
+            morph_open_size=config.morph_open_size,
+            morph_close_size=config.morph_close_size,
+            morph_open_iterations=config.morph_open_iterations,
+            morph_close_iterations=config.morph_close_iterations,
+            erosion_size=config.erosion_size,
+            gaussian_blur_size=config.gaussian_blur_size,
+            median_filter_size=config.median_filter_size,
+            fill_holes=config.fill_holes,
+            convex_hull=config.convex_hull,
+            use_gpu=self.use_gpu,
+            threshold=config.threshold,
+            invert=config.invert,
+            threshold_enabled=config.threshold_enabled,
+            median_enabled=config.median_enabled,
+            erosion_enabled=config.erosion_enabled,
+            opening_enabled=config.opening_enabled,
+            closing_enabled=config.closing_enabled,
+            blur_enabled=config.blur_enabled,
+        )
+        tracker.initialize_video()
+
+        # Build background model from frames sampled across the ENTIRE video.
+        # This ensures the model captures the true background even if the
+        # animal is stationary at the start/end of the recording.
+        n_sample = min(200, tracker.total_frames)
+        total = tracker.total_frames
+        self.status_bar.showMessage(f"Building background model ({n_sample} frames across video)...")
+        QApplication.processEvents()
+
+        if total <= n_sample:
+            # Short video — just read all frames sequentially
+            sample_indices = list(range(total))
+        else:
+            # Uniformly sample frame indices across the entire video
+            sample_indices = [int(i * total / n_sample) for i in range(n_sample)]
+
+        for frame_idx in sample_indices:
+            tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = tracker.cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            if config.tracking_area:
+                gray = tracker.apply_roi_mask(gray, config.tracking_area)
+            tracker.bg_subtractor.apply(gray)
+
+        self._persistent_tracker = tracker
+        self._persistent_bg_config_hash = config_hash
+        self.status_bar.showMessage("Background model ready")
+        return tracker
+
+    def _update_detection_frame(self, frame_idx):
+        """Fast detection preview on a single frame using persistent tracker.
+
+        Uses learningRate=0 so the background model is not updated during
+        scrubbing — this gives consistent results and is very fast (~2-5ms).
+        """
+        if not self.video_configs:
+            return
+        config = self.video_configs[self.current_config_idx]
+
+        try:
+            tracker = self._get_or_create_persistent_tracker(config)
+
+            # Seek and read target frame
+            tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = tracker.cap.read()
+            if not ret:
+                return
+
+            if len(frame.shape) == 3:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+            config.first_frame = frame_rgb
+
+            # Convert to grayscale for BG subtraction
+            if len(frame_rgb.shape) == 3:
+                gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = frame_rgb.copy()
+
+            # Apply tracking area mask before BG subtraction
+            tracking_area = config.tracking_area if config.tracking_area else None
+            if tracking_area:
+                gray = tracker.apply_roi_mask(gray, tracking_area)
+
+            # Apply BG subtraction with learningRate=0 (no model update)
+            fg_mask = tracker.bg_subtractor.apply(gray, learningRate=0)
+
+            # Binary threshold on foreground mask
+            if tracker.threshold_enabled and tracker.threshold > 0:
+                _, fg_mask = cv2.threshold(fg_mask, tracker.threshold, 255, cv2.THRESH_BINARY)
+
+            fg_mask = tracker._refine_mask(fg_mask)
+
+            # Find blobs and filter by size
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                fg_mask, connectivity=8
+            )
+            objects = {}
+            current_objects = []
+            # Build a size-filtered mask: only keep blobs within min/max area
+            filtered_mask = np.zeros_like(fg_mask)
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if tracker.min_object_area <= area <= tracker.max_object_area:
+                    cx, cy = centroids[i]
+                    current_objects.append((cx, cy, area))
+                    filtered_mask[labels == i] = 255
+
+            # Show ALL blobs passing size filter during detection preview
+            # (num_animals filtering is only applied during batch processing)
+            for idx, (cx, cy, area) in enumerate(current_objects):
+                objects[idx] = (cx, cy, area)
+
+            # Render detection view using SIZE-FILTERED mask (white blobs on black)
+            display = tracker.get_detection_view_frame(
+                frame_rgb, filtered_mask, objects,
+                tracking_area=config.tracking_area,
+                rois=config.rois
+            )
+            self.display_frame(display)
+
+            # Update detection info
+            info_text = f"<b>Objects Detected: {len(objects)}</b><br>"
+            for obj_id, (cx, cy, area) in objects.items():
+                info_text += f"\u2022 ID {obj_id}: {int(area)}px\u00B2 at ({int(cx)}, {int(cy)})<br>"
+            if not objects:
+                info_text += "<span style='color: #ff9900;'>No objects detected</span>"
+            self.detection_info_label.setText(info_text)
+
+        except Exception as e:
+            print(f"Detection frame error: {e}")
+
+    # ── Debounced Preview Update ──────────────────────────────────────────
 
     def update_preview_with_current_settings(self):
         """Update preview with detection overlay - debounced."""
@@ -3238,91 +4199,13 @@ class SimpleTrackerGUI(QMainWindow):
             self._redraw_preview()
             return
 
-        if not config.tracking_area_set:
-            self._redraw_preview()
+        # If detection overlay is active, use the fast persistent path
+        if self.detection_overlay_active:
+            self._update_detection_frame(config.current_frame_idx)
             return
 
-        try:
-            self.status_bar.showMessage("Updating detection preview...")
-
-            temp_tracker = BackgroundSubtractionTracker(
-                video_path=config.video_path,
-                min_object_area=config.min_object_area,
-                max_object_area=config.max_object_area,
-                history=config.history,
-                var_threshold=config.var_threshold,
-                num_animals=config.num_animals,
-                morph_open_size=config.morph_open_size,
-                morph_close_size=config.morph_close_size,
-                morph_open_iterations=config.morph_open_iterations,
-                morph_close_iterations=config.morph_close_iterations,
-                gaussian_blur_size=config.gaussian_blur_size,
-                fill_holes=config.fill_holes,
-                convex_hull=config.convex_hull,
-            )
-            temp_tracker.initialize_video()
-
-            # Build background model
-            target = config.current_frame_idx
-            start = max(0, target - 60)
-            temp_tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            for _ in range(min(60, target - start + 1)):
-                ret, frame = temp_tracker.cap.read()
-                if not ret:
-                    break
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-                temp_tracker.bg_subtractor.apply(gray)
-
-            # Get target frame
-            temp_tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            ret, frame = temp_tracker.cap.read()
-
-            if ret:
-                if len(frame.shape) == 3:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                else:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-
-                frame_adjusted = self.apply_contrast_brightness(
-                    frame_rgb, config.contrast, config.brightness
-                )
-                config.first_frame = frame_rgb
-
-                tracking_area = config.tracking_area if config.tracking_area else None
-                objects, mask = temp_tracker.process_frame(
-                    frame_adjusted, target, tracking_area=tracking_area
-                )
-
-                # Render based on view mode
-                if self.view_mode == 'mask':
-                    display = temp_tracker.get_mask_view_frame(
-                        frame_adjusted, mask, objects,
-                        tracking_area=config.tracking_area,
-                        rois=config.rois
-                    )
-                else:
-                    display = temp_tracker.get_standard_view_frame(
-                        frame_adjusted, mask, objects,
-                        tracking_area=config.tracking_area,
-                        rois=config.rois
-                    )
-
-                self.display_frame(display)
-
-                # Update detection info
-                info_text = f"<b>Objects Detected: {len(objects)}</b><br>"
-                for obj_id, (cx, cy, area) in objects.items():
-                    info_text += f"\u2022 ID {obj_id}: {int(area)}px\u00B2 at ({int(cx)}, {int(cy)})<br>"
-                if not objects:
-                    info_text += "<span style='color: #ff9900;'>No objects detected</span>"
-                self.detection_info_label.setText(info_text)
-
-            temp_tracker.cleanup()
-            self.status_bar.showMessage("Preview updated")
-
-        except Exception as e:
-            self.status_bar.showMessage(f"Preview error: {str(e)}")
-            print(f"Preview error: {e}")
+        # Standard view: just redraw the raw frame with tracking area / ROIs
+        self._redraw_preview()
 
 def main():
     """Run the Simple Tracker GUI."""
