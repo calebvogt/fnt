@@ -890,7 +890,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
                    "Longer calls (20-50 ms) measure 0.15-0.60.\n\n"
                    "Literature values (e.g. DeepSqueak's 0.3 default) assume\n"
                    "different FFT parameters. Tune empirically using the\n"
-                   "diagnostic output from Process Preview Snapshot.\n"
+                   "diagnostic output from Query Preview Snapshot.\n"
                    "Set to 0 to disable.")
         ton_row = QHBoxLayout()
         ton_row.setSpacing(4)
@@ -1253,13 +1253,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_run_dsp.setEnabled(False)
         group_layout.addWidget(self.btn_run_dsp)
 
-        # Process Preview Snapshot button
-        self.btn_preview_snapshot = QPushButton("Process Preview Snapshot")
+        # Query Preview Snapshot button
+        self.btn_preview_snapshot = QPushButton("Query Preview Snapshot")
         self.btn_preview_snapshot.setStyleSheet("background-color: #2d7d46;")
         self.btn_preview_snapshot.setToolTip(
             "Run the full DSP detection pipeline on only the currently\n"
-            "visible spectrogram window. Uses all current parameter\n"
-            "settings (both preprocessing and detection parameters).\n\n"
+            "visible spectrogram window (shortcut: Q).\n\n"
+            "Uses all current parameter settings (both preprocessing\n"
+            "and detection parameters).\n\n"
             "Existing detections within the visible time range are\n"
             "replaced; detections outside the window are preserved.\n\n"
             "Prints per-stage diagnostic counts to the terminal:\n"
@@ -1892,6 +1893,19 @@ class ClassicAudioDetectorWindow(QMainWindow):
         sc_overlay = QShortcut(QKeySequence(Qt.Key_V), self)
         sc_overlay.setContext(Qt.ApplicationShortcut)
         sc_overlay.activated.connect(self._shortcut_toggle_filter_overlay)
+
+        sc_snapshot = QShortcut(QKeySequence(Qt.Key_Q), self)
+        sc_snapshot.setContext(Qt.ApplicationShortcut)
+        sc_snapshot.activated.connect(self._shortcut_preview_snapshot)
+
+    def _shortcut_preview_snapshot(self):
+        """Handle Q key shortcut — run preview snapshot."""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return
+        if self.btn_preview_snapshot.isEnabled():
+            self._flash_button(self.btn_preview_snapshot)
+            self.run_preview_snapshot()
 
     def _shortcut_next_detection(self):
         """Handle N key shortcut — next detection."""
@@ -2555,7 +2569,19 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.btn_undo.setEnabled(False)
 
             self._update_display()
-            self.status_bar.showMessage(f"Loaded: {os.path.basename(filepath)}")
+
+            # Auto-adjust FFT settings for sample rate on first load
+            # or when sample rate changes
+            prev_sr = getattr(self, '_last_sample_rate', None)
+            if prev_sr != self.sample_rate:
+                self._auto_adjust_fft_for_sample_rate(self.sample_rate)
+                self._last_sample_rate = self.sample_rate
+
+            nyquist = self.sample_rate / 2
+            self.status_bar.showMessage(
+                f"Loaded: {os.path.basename(filepath)} "
+                f"(SR: {self.sample_rate:,.0f} Hz, "
+                f"Nyquist: {nyquist:,.0f} Hz)")
 
         except Exception as e:
             self.status_bar.showMessage(f"Error loading file: {e}")
@@ -2564,6 +2590,49 @@ class ClassicAudioDetectorWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
         self._update_ui_state()
+
+    def _auto_adjust_fft_for_sample_rate(self, sample_rate):
+        """Auto-adjust FFT parameters to maintain consistent frequency resolution.
+
+        Targets ~500 Hz frequency resolution regardless of sample rate.
+        Only adjusts if using "Manual" profile (doesn't override preset profiles).
+
+        Sample rate → nperseg mapping (targeting ~500 Hz/bin):
+            44100 Hz  → 128  (344 Hz/bin)
+            96000 Hz  → 256  (375 Hz/bin)
+            192000 Hz → 512  (375 Hz/bin)
+            250000 Hz → 512  (488 Hz/bin)
+            500000 Hz → 1024 (488 Hz/bin)
+
+        Overlap is set to 75% of nperseg for good time resolution.
+        """
+        # Only auto-adjust in Manual mode
+        profile = self.combo_species.currentText()
+        if profile != "Manual":
+            return
+
+        # Find nearest power-of-2 nperseg targeting ~500 Hz resolution
+        target_resolution = 500.0  # Hz per bin
+        ideal_nperseg = sample_rate / target_resolution
+        # Round to nearest power of 2
+        import math
+        nperseg = int(2 ** round(math.log2(ideal_nperseg)))
+        nperseg = max(64, min(2048, nperseg))  # Clamp to spinner range
+        noverlap = int(nperseg * 0.75)
+
+        actual_resolution = sample_rate / nperseg
+        nyquist = sample_rate / 2
+
+        self.spin_nperseg.blockSignals(True)
+        self.spin_noverlap.blockSignals(True)
+        self.spin_nperseg.setValue(nperseg)
+        self.spin_noverlap.setValue(noverlap)
+        self.spin_nperseg.blockSignals(False)
+        self.spin_noverlap.blockSignals(False)
+
+        print(f"[Auto FFT] SR={sample_rate:,.0f} Hz, Nyquist={nyquist:,.0f} Hz → "
+              f"nperseg={nperseg}, overlap={noverlap}, "
+              f"freq_resolution={actual_resolution:.0f} Hz/bin")
 
     def _load_with_ffmpeg(self, filepath):
         """Load audio using ffmpeg."""
@@ -2765,6 +2834,10 @@ class ClassicAudioDetectorWindow(QMainWindow):
         if self.audio_data is None or self.sample_rate is None:
             self.status_bar.showMessage("No audio loaded")
             return
+
+        print("\n" + "=" * 60)
+        print("  NEW PREVIEW SNAPSHOT")
+        print("=" * 60)
 
         filepath = self.audio_files[self.current_file_idx]
         view_start, view_end = self.spectrogram.get_view_range()
@@ -3001,7 +3074,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
             traceback.print_exc()
         finally:
             self.btn_preview_snapshot.setEnabled(True)
-            self.btn_preview_snapshot.setText("Process Preview Snapshot")
+            self.btn_preview_snapshot.setText("Query Preview Snapshot")
             self._update_ui_state()
 
     def run_dsp_detection(self):

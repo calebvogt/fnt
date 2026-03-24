@@ -381,7 +381,8 @@ class DSPDetector:
                 span = freq_hi - freq_lo + 1
 
                 # Only attempt energy splitting on regions spanning enough bins
-                if span >= min_gap_bins * 3:
+                # Need room for two sub-regions + the gap itself
+                if span >= min_gap_bins * 2:
                     # Compute energy profile: mean dB per frequency row in the region
                     energy_profile = np.full(span, -100.0)
                     for local_idx, global_idx in enumerate(range(freq_lo, freq_hi + 1)):
@@ -437,12 +438,17 @@ class DSPDetector:
                                 split_at = freq_lo + m
                                 split_boundaries.append(split_at)
                     elif len(minima) == 0:
-                        print(f"[DSP]   Region {i}: no local minima found")
+                        print(f"[DSP]   Region {i}: no local minima found "
+                              f"(span={span} bins)")
                     elif len(maxima) < 2:
-                        print(f"[DSP]   Region {i}: fewer than 2 maxima found")
+                        print(f"[DSP]   Region {i}: fewer than 2 maxima found "
+                              f"(span={span} bins)")
                 else:
-                    print(f"[DSP]   Region {i}: span={span} bins too small "
-                          f"(need {min_gap_bins * 3} = 3 * {min_gap_bins})")
+                    # Only log "too small" for regions that are at least
+                    # min_gap_bins wide (skip tiny noise blobs)
+                    if span >= min_gap_bins:
+                        print(f"[DSP]   Region {i}: span={span} bins too small "
+                              f"(need {min_gap_bins * 2} = 2 * {min_gap_bins})")
 
             if len(split_boundaries) == 0:
                 continue
@@ -473,10 +479,11 @@ class DSPDetector:
 
         Two calls are only merged if:
         1. Their time gap is less than min_gap_ms, AND
-        2. Their frequency ranges overlap or are closer than min_freq_gap_hz.
+        2. Their frequency ranges actually overlap (share common frequencies).
 
-        This prevents the merge step from recombining a fundamental and
-        its harmonic that were previously split by the freq gap detector.
+        Calls whose frequency ranges are separated by any gap — even a small
+        one — are kept separate.  This preserves splits made by the valley
+        detector between a fundamental and its harmonic.
         """
         if len(calls) < 2:
             return calls
@@ -485,7 +492,6 @@ class DSPDetector:
         calls = sorted(calls, key=lambda x: x['start_seconds'])
 
         min_gap_s = self.config.min_gap_ms / 1000
-        min_freq_gap_hz = getattr(self.config, 'min_freq_gap_hz', 0)
         merged = [calls[0]]
 
         for call in calls[1:]:
@@ -493,19 +499,17 @@ class DSPDetector:
             time_gap = call['start_seconds'] - prev['stop_seconds']
 
             if time_gap < min_gap_s:
-                # Check frequency overlap/proximity before merging
+                # Check frequency overlap before merging
                 prev_min_f = prev.get('min_freq_hz', 0)
                 prev_max_f = prev.get('max_freq_hz', 0)
                 call_min_f = call.get('min_freq_hz', 0)
                 call_max_f = call.get('max_freq_hz', 0)
 
-                # Frequency gap between the two calls
-                freq_gap = max(0, max(call_min_f - prev_max_f,
-                                       prev_min_f - call_max_f))
+                # Frequency ranges overlap if one's min is below the other's max
+                freq_overlap = (call_min_f <= prev_max_f and
+                                prev_min_f <= call_max_f)
 
-                # Only merge if frequency ranges overlap or are close
-                # (closer than min_freq_gap_hz)
-                if freq_gap < min_freq_gap_hz:
+                if freq_overlap:
                     # Merge with previous call
                     prev['stop_seconds'] = call['stop_seconds']
                     prev['duration_ms'] = (prev['stop_seconds'] - prev['start_seconds']) * 1000
