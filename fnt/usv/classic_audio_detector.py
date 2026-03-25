@@ -1457,9 +1457,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_harmonic.clicked.connect(self.mark_harmonic)
         self.btn_harmonic.setEnabled(False)
         self.btn_harmonic.setToolTip("Mark current detection as a harmonic (H key).\n"
-                                     "Sets status to 'harmonic' (purple box).\n"
-                                     "Harmonics are excluded from call counts but\n"
-                                     "preserved in CSV with is_harmonic=True.")
+                                     "Sets status='accepted' and is_harmonic=True.\n"
+                                     "Displayed as purple 'H' box. The is_harmonic\n"
+                                     "column is independent of curation status:\n"
+                                     "auto-detected harmonics remain 'pending' until\n"
+                                     "manually reviewed.")
         btn_row1.addWidget(self.btn_harmonic)
 
         self.btn_skip = QPushButton("Skip (S)")
@@ -2685,6 +2687,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
                     self.detections_df = pd.read_csv(csv_path)
                     if 'status' not in self.detections_df.columns:
                         self.detections_df['status'] = 'pending'
+                    # Migrate legacy status='harmonic' to
+                    # is_harmonic=True + status='pending'
+                    if 'is_harmonic' not in self.detections_df.columns:
+                        self.detections_df['is_harmonic'] = False
+                    legacy_harm = self.detections_df['status'] == 'harmonic'
+                    if legacy_harm.any():
+                        self.detections_df.loc[legacy_harm, 'is_harmonic'] = True
+                        self.detections_df.loc[legacy_harm, 'status'] = 'pending'
                     # Handle legacy CSVs missing min_freq_hz/max_freq_hz
                     self._ensure_freq_bounds(self.detections_df)
                     self.all_detections[filepath] = self.detections_df.copy()
@@ -2736,14 +2746,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
         """Check if a file has any manually curated detections.
 
         A file is considered 'curated' if it has at least one detection
-        with a status other than 'pending' (e.g. accepted, rejected,
-        harmonic, noise).  This indicates a user has invested manual
-        review time on this file.
+        with status 'accepted' or 'rejected'.  Auto-detected harmonics
+        (is_harmonic=True with status='pending') do NOT count as curated
+        since they haven't been manually reviewed.
         """
         df = self.all_detections.get(filepath)
         if df is not None and len(df) > 0 and 'status' in df.columns:
-            non_pending = df[df['status'] != 'pending']
-            return len(non_pending) > 0
+            curated = df[df['status'].isin(['accepted', 'rejected'])]
+            return len(curated) > 0
 
         # Check on-disk CSV if not loaded in memory
         base = Path(filepath).stem
@@ -2755,8 +2765,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                     import pandas as pd
                     disk_df = pd.read_csv(csv_path)
                     if 'status' in disk_df.columns:
-                        non_pending = disk_df[disk_df['status'] != 'pending']
-                        return len(non_pending) > 0
+                        curated = disk_df[disk_df['status'].isin(['accepted', 'rejected'])]
+                        return len(curated) > 0
                 except Exception:
                     pass
         return False
@@ -3029,13 +3039,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
             if n_det > 0:
                 new_df = pd.DataFrame(detections)
-                # Mark harmonics with special status, others as pending
-                if 'is_harmonic' in new_df.columns:
-                    new_df['status'] = new_df['is_harmonic'].apply(
-                        lambda h: 'harmonic' if h else 'pending'
-                    )
-                else:
-                    new_df['status'] = 'pending'
+                # All new detections start as pending; is_harmonic is a
+                # separate boolean column (not a status value)
+                new_df['status'] = 'pending'
+                if 'is_harmonic' not in new_df.columns:
+                    new_df['is_harmonic'] = False
                 self._ensure_freq_bounds(new_df)
 
                 if self.detections_df is not None and len(self.detections_df) > 0:
@@ -3203,13 +3211,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         if len(df) > 0:
             if 'status' not in df.columns:
-                # Mark harmonics with special status if labeling is enabled
-                if 'is_harmonic' in df.columns:
-                    df['status'] = df['is_harmonic'].apply(
-                        lambda h: 'harmonic' if h else 'pending'
-                    )
-                else:
-                    df['status'] = 'pending'
+                # All detections start as pending; is_harmonic is a
+                # separate boolean column (not a status value)
+                df['status'] = 'pending'
+            if 'is_harmonic' not in df.columns:
+                df['is_harmonic'] = False
             if 'source' not in df.columns:
                 df['source'] = 'dsp'
             if 'call_number' not in df.columns:
@@ -3340,13 +3346,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         # Status
         status = det.get('status', 'pending')
-        self.lbl_det_status.setText(f"Status: {status.capitalize()}")
-        if status == 'accepted':
+        is_harmonic = det.get('is_harmonic', False)
+        status_text = status.capitalize()
+        if is_harmonic:
+            status_text += " (Harmonic)"
+        self.lbl_det_status.setText(f"Status: {status_text}")
+        if is_harmonic:
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
+        elif status == 'accepted':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #107c10;")
         elif status == 'rejected':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #d13438;")
-        elif status == 'harmonic':
-            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
         elif status == 'noise':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #8b4513;")
         else:
@@ -3422,13 +3432,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.lbl_det_info.setText(f"Peak: {peak:.0f} Hz | Dur: {dur:.1f} ms")
 
         status = det.get('status', 'pending')
-        self.lbl_det_status.setText(f"Status: {status.capitalize()}")
-        if status == 'accepted':
+        is_harmonic = det.get('is_harmonic', False)
+        status_text = status.capitalize()
+        if is_harmonic:
+            status_text += " (Harmonic)"
+        self.lbl_det_status.setText(f"Status: {status_text}")
+        if is_harmonic:
+            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
+        elif status == 'accepted':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #107c10;")
         elif status == 'rejected':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #d13438;")
-        elif status == 'harmonic':
-            self.lbl_det_status.setStyleSheet("font-weight: bold; color: #b464ff;")
         elif status == 'noise':
             self.lbl_det_status.setStyleSheet("font-weight: bold; color: #8b4513;")
         else:
@@ -3799,15 +3813,24 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self._auto_advance()
 
     def mark_harmonic(self):
-        """Mark current detection as a harmonic."""
+        """Mark current detection as a harmonic.
+
+        Sets status='accepted' (counts as curated) and is_harmonic=True.
+        The is_harmonic flag is a separate boolean column independent of
+        the curation status, so harmonics auto-detected by DSP stay
+        'pending' until the user reviews them.
+        """
         if self.detections_df is None:
             return
         old_status = self.detections_df.at[self.current_detection_idx, 'status']
-        self.undo_stack.append(('label', self.current_detection_idx, old_status))
+        old_harmonic = self.detections_df.at[self.current_detection_idx, 'is_harmonic'] \
+            if 'is_harmonic' in self.detections_df.columns else False
+        self.undo_stack.append(('harmonic', self.current_detection_idx, old_status, old_harmonic))
         self.btn_undo.setEnabled(True)
-        self.detections_df.at[self.current_detection_idx, 'status'] = 'harmonic'
-        if 'is_harmonic' in self.detections_df.columns:
-            self.detections_df.at[self.current_detection_idx, 'is_harmonic'] = True
+        self.detections_df.at[self.current_detection_idx, 'status'] = 'accepted'
+        if 'is_harmonic' not in self.detections_df.columns:
+            self.detections_df['is_harmonic'] = False
+        self.detections_df.at[self.current_detection_idx, 'is_harmonic'] = True
         self._store_current_detections()
         self._update_display()
         self._update_button_counts()
@@ -4383,6 +4406,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 self._update_display()
                 self._update_button_counts()
                 self.status_bar.showMessage(f"Undid label change on detection {idx + 1}")
+        elif action[0] == 'harmonic':
+            _, idx, old_status, old_harmonic = action
+            if 0 <= idx < len(self.detections_df):
+                self.detections_df.at[idx, 'status'] = old_status
+                if 'is_harmonic' in self.detections_df.columns:
+                    self.detections_df.at[idx, 'is_harmonic'] = old_harmonic
+                self.current_detection_idx = idx
+                self._store_current_detections()
+                self._update_display()
+                self._update_button_counts()
+                self.status_bar.showMessage(f"Undid harmonic label on detection {idx + 1}")
         elif action[0] == 'batch_label':
             _, indices, old_status = action
             for idx in indices:

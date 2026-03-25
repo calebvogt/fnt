@@ -519,12 +519,16 @@ class SpectrogramWidget(QWidget):
         elif status == 'negative':
             color = QColor(255, 50, 50, 180)  # Dark red for negative/background
             label = "N"
-        elif status == 'harmonic':
-            color = QColor(180, 100, 255, 180)  # Purple for harmonics
-            label = "H"
         else:
             color = QColor(255, 255, 0, 200)  # Yellow for pending
             label = "P"
+
+        # Override color/label for harmonics (is_harmonic flag is
+        # independent of status column)
+        is_harmonic = det.get('is_harmonic', False)
+        if is_harmonic:
+            color = QColor(180, 100, 255, 180)  # Purple for harmonics
+            label = "H"
 
         # Selected = white border; non-selected = yellow outline
         if is_selected:
@@ -554,7 +558,7 @@ class SpectrogramWidget(QWidget):
 
         # Draw frequency contour dots+lines when peak_freq samples exist
         # (for accepted, pending, and harmonic detections)
-        if status in ('accepted', 'pending', 'harmonic') and det.get('peak_freq_1'):
+        if status in ('accepted', 'pending') and det.get('peak_freq_1'):
             self._draw_freq_contour(painter, det, x1, x2, spec_rect)
 
     def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
