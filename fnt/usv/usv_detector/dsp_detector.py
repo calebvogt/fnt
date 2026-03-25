@@ -505,9 +505,13 @@ class DSPDetector:
                 call_min_f = call.get('min_freq_hz', 0)
                 call_max_f = call.get('max_freq_hz', 0)
 
-                # Frequency ranges overlap if one's min is below the other's max
-                freq_overlap = (call_min_f <= prev_max_f and
-                                prev_min_f <= call_max_f)
+                # Frequency ranges overlap if one's min is strictly below
+                # the other's max.  Using strict inequality (<) so that
+                # regions sharing an exact boundary (from valley splitting)
+                # are NOT considered overlapping and stay separate.
+                min_freq_gap_hz = getattr(self.config, 'min_freq_gap_hz', 0)
+                freq_overlap = (call_min_f < (prev_max_f - min_freq_gap_hz) and
+                                prev_min_f < (call_max_f - min_freq_gap_hz))
 
                 if freq_overlap:
                     # Merge with previous call

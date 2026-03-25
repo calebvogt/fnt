@@ -25,6 +25,7 @@ build/
 
 # Local test data (not for distribution)
 LocalTestData/
+LocalData/
 
 # Claude Code instructions (keep private)
 CLAUDE.md

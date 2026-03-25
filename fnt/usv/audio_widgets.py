@@ -552,8 +552,9 @@ class SpectrogramWidget(QWidget):
                 painter.setPen(color)
             painter.drawText(int(center_x - 10), int(label_y - 16), 20, 18, Qt.AlignCenter, label)
 
-        # Draw frequency contour dots+lines for accepted detections
-        if status == 'accepted':
+        # Draw frequency contour dots+lines when peak_freq samples exist
+        # (for accepted, pending, and harmonic detections)
+        if status in ('accepted', 'pending', 'harmonic') and det.get('peak_freq_1'):
             self._draw_freq_contour(painter, det, x1, x2, spec_rect)
 
     def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):

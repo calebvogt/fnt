@@ -410,7 +410,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         controls_layout.addWidget(sep3)
 
         # Playback controls (moved from left panel)
-        self.btn_play = QPushButton("Play")
+        self.btn_play = QPushButton("Play (Space)")
         self.btn_play.setToolTip("Play the current detection audio (Space key).\nAudio is slowed down according to the speed setting\nso ultrasonic calls become audible.")
         self.btn_play.clicked.connect(self.toggle_playback)
         self.btn_play.setEnabled(False)
@@ -627,7 +627,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
                       "Pixel passes if: pixel_dB > noise_floor_dB + threshold\n\n"
                       "Lower values (6-8 dB) = more sensitive, more noise.\n"
                       "Higher values (12-15 dB) = fewer false positives.\n"
-                      "Typical: 8-12 dB. Visible in Filter Overlay (V key).")
+                      "Typical: 8-12 dB. Visible in Filter Overlay (F key).")
         thresh_row = QHBoxLayout()
         thresh_row.setSpacing(4)
         thresh_row.addWidget(self._make_label("Threshold:", thresh_tip, min_width=80))
@@ -653,7 +653,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
                      "false positives in noisy recordings.\n"
                      "Higher values (30-40) = more aggressive noise removal,\n"
                      "may suppress faint calls.\n\n"
-                     "Typical: 20-30. Visible in Filter Overlay (V key).")
+                     "Typical: 20-30. Visible in Filter Overlay (F key).")
         noise_row = QHBoxLayout()
         noise_row.setSpacing(4)
         noise_row.addWidget(self._make_label("Noise %tile:", noise_tip, min_width=80))
@@ -665,14 +665,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
         group_layout.addLayout(noise_row)
 
         # Filter Overlay button (below Noise %tile)
-        overlay_tip = ("Toggle the DSP Filter Overlay (shortcut: V).\n"
+        overlay_tip = ("Toggle the DSP Filter Overlay (shortcut: F).\n"
                        "Shows exactly what survives preprocessing:\n"
                        "  1. Frequency band mask\n"
                        "  2. Noise floor subtraction\n"
                        "  3. Energy threshold\n"
                        "Black pixels = removed by preprocessing.\n"
                        "Colored pixels = signal the detector will analyze.")
-        self.btn_filter_overlay = QPushButton("Filter Overlay")
+        self.btn_filter_overlay = QPushButton("Filter Overlay (F)")
         self.btn_filter_overlay.setCheckable(True)
         self.btn_filter_overlay.setToolTip(overlay_tip)
         self.btn_filter_overlay.toggled.connect(self._on_filter_overlay_toggled)
@@ -1254,7 +1254,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         group_layout.addWidget(self.btn_run_dsp)
 
         # Query Preview Snapshot button
-        self.btn_preview_snapshot = QPushButton("Query Preview Snapshot")
+        self.btn_preview_snapshot = QPushButton("Query Preview Snapshot (Q)")
         self.btn_preview_snapshot.setStyleSheet("background-color: #2d7d46;")
         self.btn_preview_snapshot.setToolTip(
             "Run the full DSP detection pipeline on only the currently\n"
@@ -1335,9 +1335,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
         nav_row = QHBoxLayout()
         nav_row.setSpacing(2)
 
-        self.btn_prev_det = QPushButton("<")
+        self.btn_prev_det = QPushButton("< (B)")
         self.btn_prev_det.setObjectName("small_btn")
-        self.btn_prev_det.setToolTip("Go to previous detection (Left arrow key)")
+        self.btn_prev_det.setToolTip("Go to previous detection (B key)")
         self.btn_prev_det.clicked.connect(self.prev_detection)
         self.btn_prev_det.setEnabled(False)
         nav_row.addWidget(self.btn_prev_det)
@@ -1346,9 +1346,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.lbl_det_num.setAlignment(Qt.AlignCenter)
         nav_row.addWidget(self.lbl_det_num, 1)
 
-        self.btn_next_det = QPushButton(">")
+        self.btn_next_det = QPushButton("(N) >")
         self.btn_next_det.setObjectName("small_btn")
-        self.btn_next_det.setToolTip("Go to next detection (Right arrow key)")
+        self.btn_next_det.setToolTip("Go to next detection (N key)")
         self.btn_next_det.clicked.connect(self.next_detection)
         self.btn_next_det.setEnabled(False)
         nav_row.addWidget(self.btn_next_det)
@@ -1432,22 +1432,27 @@ class ClassicAudioDetectorWindow(QMainWindow):
         # Accept/Reject
         btn_row1 = QHBoxLayout()
         btn_row1.setSpacing(2)
+        _label_font = QFont()
+        _label_font.setPointSize(10)
 
-        self.btn_accept = QPushButton("Accept")
+        self.btn_accept = QPushButton("Accept (A)")
+        self.btn_accept.setFont(_label_font)
         self.btn_accept.setObjectName("accept_btn")
         self.btn_accept.setToolTip("Mark current detection as a valid USV call (A key).\nAccepted calls are saved and used for ML training.")
         self.btn_accept.clicked.connect(self.accept_detection)
         self.btn_accept.setEnabled(False)
         btn_row1.addWidget(self.btn_accept)
 
-        self.btn_reject = QPushButton("Reject")
+        self.btn_reject = QPushButton("Reject (R)")
+        self.btn_reject.setFont(_label_font)
         self.btn_reject.setObjectName("reject_btn")
         self.btn_reject.setToolTip("Mark current detection as a false positive (R key).\nRejected calls are excluded from analysis but kept for ML training.")
         self.btn_reject.clicked.connect(self.reject_detection)
         self.btn_reject.setEnabled(False)
         btn_row1.addWidget(self.btn_reject)
 
-        self.btn_harmonic = QPushButton("Harmonic")
+        self.btn_harmonic = QPushButton("Harmonic (H)")
+        self.btn_harmonic.setFont(_label_font)
         self.btn_harmonic.setStyleSheet("background-color: #6b3fa0;")
         self.btn_harmonic.clicked.connect(self.mark_harmonic)
         self.btn_harmonic.setEnabled(False)
@@ -1457,14 +1462,18 @@ class ClassicAudioDetectorWindow(QMainWindow):
                                      "preserved in CSV with is_harmonic=True.")
         btn_row1.addWidget(self.btn_harmonic)
 
-        self.btn_skip = QPushButton("Skip")
+        self.btn_skip = QPushButton("Skip (S)")
+        self.btn_skip.setFont(_label_font)
         self.btn_skip.setStyleSheet("background-color: #5c5c5c;")
         self.btn_skip.clicked.connect(self.skip_detection)
         self.btn_skip.setEnabled(False)
         self.btn_skip.setToolTip("Skip to the next detection without changing\nits current status (S key).\nUseful for reviewing without modifying labels.")
         btn_row1.addWidget(self.btn_skip)
 
-        self.btn_undo = QPushButton("Undo")
+        import sys as _sys
+        _undo_key = "⌘Z" if _sys.platform == "darwin" else "Ctrl+Z"
+        self.btn_undo = QPushButton(f"Undo ({_undo_key})")
+        self.btn_undo.setFont(_label_font)
         self.btn_undo.setStyleSheet("background-color: #5c5c5c;")
         self.btn_undo.clicked.connect(self.undo_action)
         self.btn_undo.setEnabled(False)
@@ -1497,14 +1506,14 @@ class ClassicAudioDetectorWindow(QMainWindow):
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(2)
 
-        self.btn_add_usv = QPushButton("+ Add Label")
+        self.btn_add_usv = QPushButton("+ Add Label (P)")
         self.btn_add_usv.setStyleSheet("background-color: #6b4c9a;")
         self.btn_add_usv.setToolTip("Manually draw a new USV detection box on the spectrogram.\nClick and drag on the spectrogram to define the region.")
         self.btn_add_usv.clicked.connect(self.add_new_usv)
         self.btn_add_usv.setEnabled(False)
         btn_row2.addWidget(self.btn_add_usv)
 
-        self.btn_delete = QPushButton("Delete")
+        self.btn_delete = QPushButton("Delete (D)")
         self.btn_delete.setStyleSheet("background-color: #5c5c5c;")
         self.btn_delete.setToolTip("Permanently delete the currently selected detection (D key).\nThis cannot be undone.")
         self.btn_delete.clicked.connect(self.delete_current)
@@ -1890,7 +1899,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         sc_harmonic.activated.connect(self._shortcut_mark_harmonic)
 
         # V = toggle filter overlay
-        sc_overlay = QShortcut(QKeySequence(Qt.Key_V), self)
+        sc_overlay = QShortcut(QKeySequence(Qt.Key_F), self)
         sc_overlay.setContext(Qt.ApplicationShortcut)
         sc_overlay.activated.connect(self._shortcut_toggle_filter_overlay)
 
@@ -2607,7 +2616,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         Overlap is set to 75% of nperseg for good time resolution.
         """
         # Only auto-adjust in Manual mode
-        profile = self.combo_species.currentText()
+        profile = self.combo_species_profile.currentText()
         if profile != "Manual":
             return
 
@@ -3074,7 +3083,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
             traceback.print_exc()
         finally:
             self.btn_preview_snapshot.setEnabled(True)
-            self.btn_preview_snapshot.setText("Query Preview Snapshot")
+            self.btn_preview_snapshot.setText("Query Preview Snapshot (Q)")
             self._update_ui_state()
 
     def run_dsp_detection(self):
@@ -3832,16 +3841,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
     def _update_button_counts(self):
         """Update Accept/Reject/Noise button labels with counts."""
         if self.detections_df is None or len(self.detections_df) == 0:
-            self.btn_accept.setText("Accept")
-            self.btn_reject.setText("Reject")
+            self.btn_accept.setText("Accept (A)")
+            self.btn_reject.setText("Reject (R)")
             return
 
         counts = self.detections_df['status'].value_counts()
         n_accepted = counts.get('accepted', 0)
         n_rejected = counts.get('rejected', 0)
 
-        self.btn_accept.setText(f"Accept ({n_accepted})")
-        self.btn_reject.setText(f"Reject ({n_rejected})")
+        self.btn_accept.setText(f"Accept {n_accepted} (A)")
+        self.btn_reject.setText(f"Reject {n_rejected} (R)")
 
     def add_new_usv(self):
         """Add a new USV detection at view center."""
@@ -4068,6 +4077,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 self._save_detections_csv(filepath)
             elif filepath in self.all_detections:
                 del self.all_detections[filepath]
+            # Update the file list to reflect current detection counts
+            self._refresh_file_list_items()
 
     def _save_detections_csv(self, filepath):
         """Save current detections to CSV file, preserving original naming."""
