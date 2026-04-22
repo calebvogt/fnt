@@ -1478,7 +1478,18 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except:
         pass
-    
+
+    # HiDPI scaling — also must be set before QApplication is constructed.
+    # Without these, widgets on Windows at 125%/150% display scaling end up
+    # with fonts that grow but layouts that don't, clipping control-panel
+    # content that fits fine at 100% on macOS.
+    try:
+        from PyQt5.QtCore import Qt as _Qt
+        QApplication.setAttribute(_Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(_Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     
     # Set application properties

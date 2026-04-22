@@ -485,6 +485,8 @@ class SpectrogramWidget(QWidget):
 
     def _draw_detection_box(self, painter, det, idx, spec_rect):
         """Draw a detection bounding box."""
+        if det.get('_hidden'):
+            return
         start_s = det.get('start_seconds', 0)
         stop_s = det.get('stop_seconds', 0)
         min_freq = det.get('min_freq_hz', self.min_freq)
@@ -788,6 +790,13 @@ class SpectrogramWidget(QWidget):
                 self.setCursor(Qt.SizeHorCursor)
             elif edge in ('resize_top', 'resize_bottom'):
                 self.setCursor(Qt.SizeVerCursor)
+            # Diagonal corner cursors. Qt uses screen coords (y grows down):
+            #   FDiagCursor is a '\' shape — top-left / bottom-right.
+            #   BDiagCursor is a '/' shape — top-right / bottom-left.
+            elif edge in ('resize_tl', 'resize_br'):
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif edge in ('resize_tr', 'resize_bl'):
+                self.setCursor(Qt.SizeBDiagCursor)
             elif edge == 'move':
                 self.setCursor(Qt.SizeAllCursor)
             else:
@@ -836,8 +845,15 @@ class SpectrogramWidget(QWidget):
         event.accept()
 
     def _find_edge_at_pos(self, pos, spec_rect, threshold=8):
-        """Find if position is near a detection edge. Prioritizes selected detection."""
+        """Find if position is near a detection edge or corner.
+
+        Corner zones are checked first so diagonal resize wins when the mouse
+        is in the intersection region near any box vertex. ``threshold`` is the
+        half-width (in screen pixels) of each edge/corner hit zone.
+        """
         def _check_det(i, det):
+            if det.get('_hidden'):
+                return None, None
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
             min_freq = det.get('min_freq_hz', self.min_freq)
@@ -845,18 +861,35 @@ class SpectrogramWidget(QWidget):
 
             x1 = self._time_to_x(start_s, spec_rect)
             x2 = self._time_to_x(stop_s, spec_rect)
-            y1 = self._freq_to_y(max_freq, spec_rect)
-            y2 = self._freq_to_y(min_freq, spec_rect)
+            y1 = self._freq_to_y(max_freq, spec_rect)  # top (higher freq)
+            y2 = self._freq_to_y(min_freq, spec_rect)  # bottom (lower freq)
 
-            # Expand y-range slightly for edge detection
+            near_left = abs(pos.x() - x1) < threshold
+            near_right = abs(pos.x() - x2) < threshold
+            near_top = abs(pos.y() - y1) < threshold
+            near_bottom = abs(pos.y() - y2) < threshold
+
+            # Corners first — stricter hit-test requires proximity on BOTH
+            # axes, so the corner only wins when the mouse is actually in
+            # the intersection.
+            if near_left and near_top:
+                return 'resize_tl', i
+            if near_right and near_top:
+                return 'resize_tr', i
+            if near_left and near_bottom:
+                return 'resize_bl', i
+            if near_right and near_bottom:
+                return 'resize_br', i
+
+            # Edges (y-extended slightly for easier vertical grabs).
             y_pad = threshold
-            if abs(pos.x() - x1) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
+            if near_left and y1 - y_pad <= pos.y() <= y2 + y_pad:
                 return 'resize_left', i
-            if abs(pos.x() - x2) < threshold and y1 - y_pad <= pos.y() <= y2 + y_pad:
+            if near_right and y1 - y_pad <= pos.y() <= y2 + y_pad:
                 return 'resize_right', i
-            if abs(pos.y() - y1) < threshold and x1 <= pos.x() <= x2:
+            if near_top and x1 <= pos.x() <= x2:
                 return 'resize_top', i
-            if abs(pos.y() - y2) < threshold and x1 <= pos.x() <= x2:
+            if near_bottom and x1 <= pos.x() <= x2:
                 return 'resize_bottom', i
 
             if i == self.current_detection_idx:
@@ -889,6 +922,8 @@ class SpectrogramWidget(QWidget):
         """
         pad = 6  # pixels of padding around each box
         for i, det in enumerate(self.detections):
+            if det.get('_hidden'):
+                continue
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
             min_freq = det.get('min_freq_hz', self.min_freq)
@@ -929,6 +964,18 @@ class SpectrogramWidget(QWidget):
         elif self.drag_mode == 'resize_top':
             max_freq = min(self.max_freq, max(freq_hz, min_freq + 100))
         elif self.drag_mode == 'resize_bottom':
+            min_freq = max(0, min(freq_hz, max_freq - 100))
+        elif self.drag_mode == 'resize_tl':
+            start_s = max(0, min(time_s, stop_s - 0.001))
+            max_freq = min(self.max_freq, max(freq_hz, min_freq + 100))
+        elif self.drag_mode == 'resize_tr':
+            stop_s = min(self.total_duration, max(time_s, start_s + 0.001))
+            max_freq = min(self.max_freq, max(freq_hz, min_freq + 100))
+        elif self.drag_mode == 'resize_bl':
+            start_s = max(0, min(time_s, stop_s - 0.001))
+            min_freq = max(0, min(freq_hz, max_freq - 100))
+        elif self.drag_mode == 'resize_br':
+            stop_s = min(self.total_duration, max(time_s, start_s + 0.001))
             min_freq = max(0, min(freq_hz, max_freq - 100))
         elif self.drag_mode == 'move' and self.drag_start and self.drag_start_box:
             delta_t = time_s - self.drag_start[0]

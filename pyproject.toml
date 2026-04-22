@@ -1,4 +1,5 @@
-tracking  # GUIes = ["setuptools>=64", "wheel"]
+[build-system]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -36,6 +37,12 @@ dependencies = [
     "Pillow",
     "soundfile",
     "opencv-python",
+    # USV detection + classification
+    "sounddevice",
+    "scikit-learn",
+    "joblib",
+    "ultralytics>=8.3.0",
+    "sahi>=0.11.18",
 ]
 
 [project.optional-dependencies]
@@ -44,12 +51,6 @@ imaging = [
     "aicsimageio",
     "fsspec",
     "scikit-image",
-]
-usv = [
-    "sounddevice",
-    "scikit-learn",
-    "joblib",
-    "ultralytics>=8.0",
 ]
 rfid = [
     "networkx>=3.0",
@@ -61,7 +62,7 @@ tracking = [
     #   pip install git+https://github.com/facebookresearch/sam2.git
 ]
 all = [
-    "fnt[imaging,usv,tracking]",
+    "fnt[imaging,tracking]",
 ]
 
 [project.scripts]

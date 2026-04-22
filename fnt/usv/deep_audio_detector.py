@@ -31,11 +31,16 @@ from PyQt5.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QListWidgetItem,
     QScrollArea, QSplitter, QStatusBar, QMessageBox, QScrollBar,
     QSizePolicy, QFrame, QCheckBox, QShortcut, QSlider,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QAction, QMenu, QInputDialog,
+    QRadioButton, QButtonGroup, QFormLayout, QGridLayout,
 )
 from scipy import signal
 
 from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
+from fnt.usv.usv_detector.labels_io import (
+    DAD_SUFFIX, load_labels, save_labels,
+    find_existing_sibling_csv, merge_with_inference, scan_folders_for_wavs,
+)
 
 # Optional imports
 try:
@@ -57,23 +62,38 @@ except ImportError:
 
 class YOLOTrainingWorker(QThread):
     progress = pyqtSignal(str)       # status message
+    epoch = pyqtSignal(int, dict)    # (epoch_index, metrics dict) — for live plot
     complete = pyqtSignal(str)       # model_path
     error = pyqtSignal(str)          # error message
 
-    def __init__(self, dataset_yaml, output_dir, model_name, pretrained_weights=None):
+    def __init__(self, dataset_yaml, output_dir, model_name,
+                 pretrained_weights=None, model_variant='yolo11s.pt', imgsz=1280):
         super().__init__()
         self.dataset_yaml = dataset_yaml
         self.output_dir = output_dir
         self.model_name = model_name
         self.pretrained_weights = pretrained_weights
+        self.model_variant = model_variant
+        self.imgsz = imgsz
 
     def run(self):
         try:
             from fnt.usv.usv_detector.yolo_detector import train_yolo_model
-            self.progress.emit(f"Training {self.model_name} (auto early stopping)...")
+            self.progress.emit(
+                f"Training {self.model_name} ({self.model_variant}, imgsz={self.imgsz})..."
+            )
+
+            def _emit_epoch(epoch_idx, metrics):
+                # Runs on ultralytics' training thread; Qt signals are
+                # queued automatically across threads.
+                self.epoch.emit(int(epoch_idx), dict(metrics or {}))
+
             model_path = train_yolo_model(
                 self.dataset_yaml, self.output_dir, self.model_name,
                 pretrained_weights=self.pretrained_weights,
+                model_variant=self.model_variant,
+                imgsz=self.imgsz,
+                epoch_callback=_emit_epoch,
             )
             self.complete.emit(model_path)
         except Exception as e:
@@ -86,11 +106,12 @@ class YOLOInferenceWorker(QThread):
     all_complete = pyqtSignal(dict)  # results
     error = pyqtSignal(str, str)  # filename, error
 
-    def __init__(self, files, model_path, config):
+    def __init__(self, files, model_path, config, confidence_threshold=None):
         super().__init__()
         self.files = files
         self.model_path = model_path
         self.config = config
+        self.confidence_threshold = confidence_threshold
 
     def run(self):
         from fnt.usv.usv_detector.yolo_detector import run_yolo_inference
@@ -99,12 +120,290 @@ class YOLOInferenceWorker(QThread):
             filename = os.path.basename(filepath)
             try:
                 self.progress.emit(filename, i + 1, len(self.files))
-                detections = run_yolo_inference(self.model_path, filepath, self.config)
+                detections = run_yolo_inference(
+                    self.model_path, filepath, self.config,
+                    confidence_threshold=self.confidence_threshold,
+                )
                 results[filepath] = detections
                 self.file_complete.emit(filename, filepath, detections, len(detections))
             except Exception as e:
                 self.error.emit(filename, str(e))
         self.all_complete.emit(results)
+
+
+# =============================================================================
+# Predict-menu dialogs (SLEAP-style)
+# =============================================================================
+
+class RunTrainingDialog(QDialog):
+    """Options for ``Predict → Run Training…``.
+
+    Collects model variant, image size, and (optionally) a chained inference
+    pass. Returns via accessor methods; the main window applies the values
+    and kicks off training.
+    """
+
+    def __init__(self, parent, *, n_positive, n_negative, n_files,
+                 model_variant='yolo11s.pt', imgsz=1280,
+                 auto_predict=False, auto_predict_scope='all'):
+        super().__init__(parent)
+        self.setWindowTitle("Run Training")
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+
+        summary = QLabel(
+            f"Training data: <b>{n_positive}</b> positive, "
+            f"<b>{n_negative}</b> negative across <b>{n_files}</b> file(s).<br>"
+            "Tiles are split 80/20 train/val per source file. Training stops "
+            "automatically when validation loss plateaus."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 8, 0, 8)
+
+        self.combo_model_variant = QComboBox()
+        self.combo_model_variant.addItems(
+            ['yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt', 'yolov8n.pt']
+        )
+        idx = self.combo_model_variant.findText(model_variant)
+        if idx >= 0:
+            self.combo_model_variant.setCurrentIndex(idx)
+        self.combo_model_variant.setToolTip(
+            "YOLO weights to fine-tune from.\n"
+            "• yolo11n — fastest, smallest, weakest recall on faint calls\n"
+            "• yolo11s — recommended balance for small-object detection\n"
+            "• yolo11m — highest accuracy, ~2× training time\n"
+            "• yolov8n — legacy; only choose to reproduce older models\n"
+            "Ultralytics auto-downloads the checkpoint on first use."
+        )
+        form.addRow("Model variant:", self.combo_model_variant)
+
+        self.combo_imgsz = QComboBox()
+        self.combo_imgsz.addItems(['640', '960', '1280', '1536'])
+        self.combo_imgsz.setCurrentText(str(imgsz))
+        self.combo_imgsz.setToolTip(
+            "Training image size (px). Higher = better recall on small calls,\n"
+            "slower training and more VRAM. 1280 is the standard for\n"
+            "small-object detection; pick 1536 if tiny/low-SNR USVs are the\n"
+            "bottleneck and you have the VRAM for it."
+        )
+        form.addRow("Image size:", self.combo_imgsz)
+
+        layout.addLayout(form)
+
+        # Optional chained inference group.
+        chain_group = QGroupBox("After training")
+        chain_layout = QVBoxLayout()
+        self.chk_run_inference = QCheckBox("Also run inference with the new model")
+        self.chk_run_inference.setChecked(bool(auto_predict))
+        self.chk_run_inference.setToolTip(
+            "When training finishes successfully, immediately run inference\n"
+            "using the newly trained weights. Accepted calls are preserved;\n"
+            "pending/ml rows are handled per your Run-Inference overwrite policy."
+        )
+        chain_layout.addWidget(self.chk_run_inference)
+
+        scope_row = QHBoxLayout()
+        scope_row.setContentsMargins(20, 0, 0, 0)
+        self.radio_scope_current = QRadioButton("Current file only")
+        self.radio_scope_current.setToolTip(
+            "Run inference only on the currently displayed file."
+        )
+        self.radio_scope_all = QRadioButton("All project files")
+        self.radio_scope_all.setToolTip(
+            "Run inference on every .wav across all source folders of this project."
+        )
+        if auto_predict_scope == 'current':
+            self.radio_scope_current.setChecked(True)
+        else:
+            self.radio_scope_all.setChecked(True)
+        self._scope_group = QButtonGroup(self)
+        self._scope_group.addButton(self.radio_scope_current)
+        self._scope_group.addButton(self.radio_scope_all)
+        scope_row.addWidget(self.radio_scope_current)
+        scope_row.addWidget(self.radio_scope_all)
+        scope_row.addStretch()
+        chain_layout.addLayout(scope_row)
+
+        self.chk_run_inference.toggled.connect(self.radio_scope_current.setEnabled)
+        self.chk_run_inference.toggled.connect(self.radio_scope_all.setEnabled)
+        self.radio_scope_current.setEnabled(self.chk_run_inference.isChecked())
+        self.radio_scope_all.setEnabled(self.chk_run_inference.isChecked())
+
+        chain_group.setLayout(chain_layout)
+        layout.addWidget(chain_group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Train")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def model_variant(self) -> str:
+        return self.combo_model_variant.currentText()
+
+    def imgsz(self) -> int:
+        return int(self.combo_imgsz.currentText())
+
+    def auto_predict(self) -> bool:
+        return self.chk_run_inference.isChecked()
+
+    def auto_predict_scope(self) -> str:
+        return 'current' if self.radio_scope_current.isChecked() else 'all'
+
+
+class RunInferenceDialog(QDialog):
+    """Options for ``Predict → Run Inference…``.
+
+    Returns confidence threshold, SAHI toggle, scope (current/all), and
+    overwrite policy for pending/ml predictions already on disk.
+    """
+
+    def __init__(self, parent, *, confidence=0.15, use_sahi=True,
+                 scope='all', overwrite_policy='replace_pending',
+                 has_current_file=True, any_pending_exists=False):
+        super().__init__(parent)
+        self.setWindowTitle("Run Inference")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Run the current YOLO model on project audio and merge the results "
+            "into each file's sibling CSV. Accepted, rejected, and user-drawn "
+            "labels are always preserved."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # Confidence row
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("Confidence:"))
+        self.slider_confidence = QSlider(Qt.Horizontal)
+        self.slider_confidence.setMinimum(5)   # 0.05
+        self.slider_confidence.setMaximum(60)  # 0.60
+        self.slider_confidence.setValue(int(round(max(0.05, min(0.60, confidence)) * 100)))
+        self.slider_confidence.setToolTip(
+            "Detection confidence threshold.\n"
+            "• Lower → higher recall: more candidate boxes you can reject\n"
+            "  with R, including more false positives.\n"
+            "• Higher → cleaner output, may miss quiet or short calls.\n"
+            "0.15 is the project default for high-recall review."
+        )
+        self.lbl_confidence = QLabel(f"{self.slider_confidence.value()/100:.2f}")
+        self.lbl_confidence.setMinimumWidth(36)
+        self.slider_confidence.valueChanged.connect(
+            lambda v: self.lbl_confidence.setText(f"{v/100:.2f}")
+        )
+        conf_row.addWidget(self.slider_confidence, 1)
+        conf_row.addWidget(self.lbl_confidence)
+        layout.addLayout(conf_row)
+
+        # SAHI
+        self.chk_use_sahi = QCheckBox("Use SAHI sliced inference")
+        self.chk_use_sahi.setChecked(bool(use_sahi))
+        self.chk_use_sahi.setToolTip(
+            "SAHI (Slicing Aided Hyper Inference) runs the detector on overlapping\n"
+            "tile-sized slices of each full spectrogram. Typically 2–3× slower\n"
+            "than plain tiling but markedly better recall on small or sparse calls.\n"
+            "Recommended on unless you're sanity-checking a run."
+        )
+        layout.addWidget(self.chk_use_sahi)
+
+        # Scope
+        scope_group = QGroupBox("Run on")
+        scope_layout = QHBoxLayout()
+        self.radio_scope_current = QRadioButton("Current file")
+        self.radio_scope_current.setToolTip(
+            "Run inference only on the currently displayed file."
+        )
+        self.radio_scope_all = QRadioButton("All project files")
+        self.radio_scope_all.setToolTip(
+            "Run inference on every .wav across all source folders of this project."
+        )
+        if scope == 'current' and has_current_file:
+            self.radio_scope_current.setChecked(True)
+        else:
+            self.radio_scope_all.setChecked(True)
+        if not has_current_file:
+            self.radio_scope_current.setEnabled(False)
+        self._scope_group = QButtonGroup(self)
+        self._scope_group.addButton(self.radio_scope_current)
+        self._scope_group.addButton(self.radio_scope_all)
+        scope_layout.addWidget(self.radio_scope_current)
+        scope_layout.addWidget(self.radio_scope_all)
+        scope_layout.addStretch()
+        scope_group.setLayout(scope_layout)
+        layout.addWidget(scope_group)
+
+        # Overwrite policy
+        policy_group = QGroupBox("Existing predictions")
+        policy_layout = QVBoxLayout()
+        self.radio_replace = QRadioButton(
+            "Replace pending predictions (recommended)"
+        )
+        self.radio_replace.setToolTip(
+            "Before running, delete previous ML-generated pending rows from each\n"
+            "target file. Fresh predictions fully replace stale ones. Accepted\n"
+            "and rejected calls are untouched."
+        )
+        self.radio_merge = QRadioButton(
+            "Merge with existing pending predictions"
+        )
+        self.radio_merge.setToolTip(
+            "Keep previous pending predictions; add new non-overlapping ones.\n"
+            "Use this if you're running the same model with a different\n"
+            "confidence or slicing setup and want to union the results."
+        )
+        if overwrite_policy == 'merge_keep_pending':
+            self.radio_merge.setChecked(True)
+        else:
+            self.radio_replace.setChecked(True)
+        self._policy_group = QButtonGroup(self)
+        self._policy_group.addButton(self.radio_replace)
+        self._policy_group.addButton(self.radio_merge)
+        policy_layout.addWidget(self.radio_replace)
+        policy_layout.addWidget(self.radio_merge)
+
+        note = QLabel(
+            "<i>Note:</i> accepted calls are always preserved. New inference boxes "
+            "that overlap an accepted call are automatically dropped, so you "
+            "never end up with a duplicate pending box shadowing a curated one."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        policy_layout.addWidget(note)
+        policy_group.setLayout(policy_layout)
+        layout.addWidget(policy_group)
+
+        if any_pending_exists:
+            hint = QLabel(
+                "One or more target files already contain pending predictions."
+            )
+            hint.setStyleSheet("color: #f0a500; font-size: 10px;")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Run")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def confidence(self) -> float:
+        return self.slider_confidence.value() / 100.0
+
+    def use_sahi(self) -> bool:
+        return self.chk_use_sahi.isChecked()
+
+    def scope(self) -> str:
+        return 'current' if self.radio_scope_current.isChecked() else 'all'
+
+    def overwrite_policy(self) -> str:
+        return 'merge_keep_pending' if self.radio_merge.isChecked() else 'replace_pending'
 
 
 # =============================================================================
@@ -114,11 +413,16 @@ class YOLOInferenceWorker(QThread):
 class DeepAudioDetectorWindow(QMainWindow):
     """Main window for Deep Audio Detector."""
 
+    BASE_TITLE = "FNT Deep Audio Detector"
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FNT Deep Audio Detector")
+        self.setWindowTitle(self.BASE_TITLE)
         self.setMinimumSize(1000, 700)
         self.resize(1400, 900)
+
+        # Live training plot window (lazy; created on first train).
+        self._training_plot = None
 
         self.audio_files = []  # List of audio file paths
         self.current_file_idx = 0
@@ -132,6 +436,25 @@ class DeepAudioDetectorWindow(QMainWindow):
         # YOLO project state
         self._yolo_project_config = None
         self._yolo_model_path = None
+
+        # Training/inference options — plain state; edited via the dialogs
+        # under the Predict menu. Default values are used until the user
+        # opens a project (whose config may override them) or edits them.
+        self._model_variant = 'yolo11s.pt'
+        self._imgsz = 1280
+        self._confidence = 0.15
+        self._use_sahi = True
+        # Train→predict chain settings.
+        self._auto_predict_after_train = False
+        self._auto_predict_scope = 'all'  # 'current' | 'all'
+        # Inference overwrite policy for existing predictions.
+        # 'replace_pending' removes pending/ml rows before merging fresh ones;
+        # 'merge_keep_pending' leaves existing pending rows alone.
+        self._inference_overwrite_policy = 'replace_pending'
+        # Label-count cache so menu-action enable state can stay in sync
+        # without the old lbl_train_data widget.
+        self._n_positive_labels = 0
+        self._n_negative_labels = 0
 
         # Playback state
         self.is_playing = False
@@ -166,6 +489,8 @@ class DeepAudioDetectorWindow(QMainWindow):
 
     def _setup_ui(self):
         """Setup the main UI."""
+        self._setup_menu_bar()
+
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -173,25 +498,32 @@ class DeepAudioDetectorWindow(QMainWindow):
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
-        # Left panel (scrollable)
+        # Left panel (scrollable).
+        #
+        # Width is font-metric-based so Windows display scaling (125%/150%)
+        # gets proportionally more room than macOS at 100%. Horizontal scroll
+        # is AsNeeded rather than AlwaysOff as a safety net if a row overflows.
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setFixedWidth(380)
+        _fm = self.fontMetrics()
+        _min_w = max(380, _fm.averageCharWidth() * 60 + 40)
+        _max_w = max(480, _fm.averageCharWidth() * 80 + 40)
+        left_scroll.setMinimumWidth(_min_w)
+        left_scroll.setMaximumWidth(_max_w)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(5, 5, 5, 5)
         left_layout.setSpacing(8)
 
-        # Build sections
+        # Build sections — training & inference live in the Predict menu
+        # dialogs, not in the left panel (SLEAP-style layout).
         self._create_project_section(left_layout)
         self._create_training_data_section(left_layout)
         self._create_detection_section(left_layout)
         self._create_labeling_section(left_layout)
-        self._create_train_section(left_layout)
-        self._create_inference_section(left_layout)
 
         left_layout.addStretch()
         left_scroll.setWidget(left_widget)
@@ -381,30 +713,24 @@ class DeepAudioDetectorWindow(QMainWindow):
         return lbl
 
     def _create_project_section(self, layout):
-        """Create project management section."""
+        """Create project status section.
+
+        Project lifecycle (New / Open / Close / Add Folder) lives on the
+        File menu; this section is informational only.
+        """
         group = QGroupBox("1. Project")
         group_layout = QVBoxLayout()
         group_layout.setSpacing(4)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(2)
-
-        self.btn_create_project = QPushButton("Create Project")
-        self.btn_create_project.setObjectName("accept_btn")
-        self.btn_create_project.setToolTip("Create a new YOLO detection project directory")
-        self.btn_create_project.clicked.connect(self._create_project)
-        btn_row.addWidget(self.btn_create_project)
-
-        self.btn_open_project = QPushButton("Open Project")
-        self.btn_open_project.setToolTip("Open an existing YOLO detection project")
-        self.btn_open_project.clicked.connect(self._open_project)
-        btn_row.addWidget(self.btn_open_project)
-
-        group_layout.addLayout(btn_row)
-
-        self.lbl_project_name = QLabel("No project")
+        self.lbl_project_name = QLabel("No project — use File → New Project…")
         self.lbl_project_name.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_project_name.setWordWrap(True)
         group_layout.addWidget(self.lbl_project_name)
+
+        self.lbl_source_folders = QLabel("No source folders")
+        self.lbl_source_folders.setStyleSheet("color: #777777; font-size: 9px;")
+        self.lbl_source_folders.setWordWrap(True)
+        group_layout.addWidget(self.lbl_source_folders)
 
         self.lbl_model_info = QLabel("No trained model")
         self.lbl_model_info.setStyleSheet("color: #999999; font-size: 10px;")
@@ -413,6 +739,90 @@ class DeepAudioDetectorWindow(QMainWindow):
 
         group.setLayout(group_layout)
         layout.addWidget(group)
+
+    def _setup_menu_bar(self):
+        """Construct DAD's menu bar inside the DAD window itself.
+
+        DAD is one of many tools inside FieldNeuroToolbox; using the macOS
+        application-global menu bar (``self.menuBar()`` with native rendering)
+        would plaster File / Labels / Predict across every FNT window while
+        DAD is loaded. We force the menu bar to render as a child widget of
+        the DAD main window so it scopes cleanly to this tool.
+        """
+        menubar = self.menuBar()
+        # On macOS this is the critical flag — it pulls the menu bar out of
+        # the system menu and renders it inline at the top of the DAD window.
+        menubar.setNativeMenuBar(False)
+        file_menu = menubar.addMenu("&File")
+
+        act_new = QAction("&New Project…", self)
+        act_new.setShortcut(QKeySequence.New)
+        act_new.triggered.connect(self._menu_new_project)
+        file_menu.addAction(act_new)
+
+        act_open = QAction("&Open Project…", self)
+        act_open.setShortcut(QKeySequence.Open)
+        act_open.triggered.connect(self._menu_open_project)
+        file_menu.addAction(act_open)
+
+        self.menu_recent = file_menu.addMenu("Open &Recent")
+        self._rebuild_recent_projects_menu()
+
+        file_menu.addSeparator()
+
+        self.act_add_folder = QAction("&Add Folder…", self)
+        self.act_add_folder.setShortcut("Ctrl+Shift+O")
+        self.act_add_folder.triggered.connect(self._menu_add_folder)
+        self.act_add_folder.setEnabled(False)
+        file_menu.addAction(self.act_add_folder)
+
+        self.act_add_files = QAction("Add &Files…", self)
+        self.act_add_files.triggered.connect(self._add_audio_files)
+        self.act_add_files.setEnabled(False)
+        file_menu.addAction(self.act_add_files)
+
+        file_menu.addSeparator()
+
+        self.act_close_project = QAction("&Close Project", self)
+        self.act_close_project.triggered.connect(self._menu_close_project)
+        self.act_close_project.setEnabled(False)
+        file_menu.addAction(self.act_close_project)
+
+        labels_menu = menubar.addMenu("&Labels")
+        self.act_import_cad = QAction("Import from &CAD CSV…", self)
+        self.act_import_cad.setToolTip(
+            "Import a Classic Audio Detector sidecar CSV for the current file "
+            "as reviewable accepted labels."
+        )
+        self.act_import_cad.triggered.connect(self._menu_import_cad)
+        self.act_import_cad.setEnabled(False)
+        labels_menu.addAction(self.act_import_cad)
+
+        # SLEAP-style Predict menu — training and inference both pop out into
+        # their own dialogs so the main window stays focused on labeling.
+        predict_menu = menubar.addMenu("&Predict")
+
+        self.act_run_training = QAction("Run &Training…", self)
+        self.act_run_training.setShortcut("Ctrl+T")
+        self.act_run_training.setToolTip(
+            "Export labeled tiles and fine-tune a YOLO model on this project.\n"
+            "Opens a dialog where you pick the model variant, image size, and\n"
+            "optionally chain an inference pass on the resulting weights."
+        )
+        self.act_run_training.triggered.connect(self._menu_run_training)
+        self.act_run_training.setEnabled(False)
+        predict_menu.addAction(self.act_run_training)
+
+        self.act_run_inference = QAction("Run &Inference…", self)
+        self.act_run_inference.setShortcut("Ctrl+I")
+        self.act_run_inference.setToolTip(
+            "Run the current model on one or all project files. Opens a dialog\n"
+            "for confidence, SAHI, scope, and how to handle existing predictions.\n"
+            "Accepted calls are always preserved."
+        )
+        self.act_run_inference.triggered.connect(self._menu_run_inference)
+        self.act_run_inference.setEnabled(False)
+        predict_menu.addAction(self.act_run_inference)
 
     def _create_training_data_section(self, layout):
         """Create training data / file management section."""
@@ -694,71 +1104,9 @@ class DeepAudioDetectorWindow(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
 
-    def _create_train_section(self, layout):
-        """Create model training section."""
-        group = QGroupBox("5. Train Model")
-        group_layout = QVBoxLayout()
-        group_layout.setSpacing(4)
-
-        self.lbl_train_data = QLabel("Labels: 0 positive, 0 negative")
-        self.lbl_train_data.setStyleSheet("color: #999999; font-size: 10px;")
-        group_layout.addWidget(self.lbl_train_data)
-
-        self.btn_train = QPushButton("Export & Train")
-        self.btn_train.setObjectName("accept_btn")
-        self.btn_train.setToolTip("Export labeled data and train a YOLO model.")
-        self.btn_train.clicked.connect(self._train_model)
-        self.btn_train.setEnabled(False)
-        group_layout.addWidget(self.btn_train)
-
-        self.train_progress = QProgressBar()
-        self.train_progress.setValue(0)
-        self.train_progress.setVisible(False)
-        group_layout.addWidget(self.train_progress)
-
-        self.lbl_train_status = QLabel("")
-        self.lbl_train_status.setStyleSheet("color: #999999; font-size: 9px;")
-        self.lbl_train_status.setWordWrap(True)
-        group_layout.addWidget(self.lbl_train_status)
-
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-
-    def _create_inference_section(self, layout):
-        """Create inference section."""
-        group = QGroupBox("6. Inference")
-        group_layout = QVBoxLayout()
-        group_layout.setSpacing(4)
-
-        run_row = QHBoxLayout()
-        run_row.setSpacing(2)
-
-        self.btn_detect_current = QPushButton("Detect Current")
-        self.btn_detect_current.setToolTip("Run YOLO detection on the current file.")
-        self.btn_detect_current.clicked.connect(self._detect_current)
-        self.btn_detect_current.setEnabled(False)
-        run_row.addWidget(self.btn_detect_current)
-
-        self.btn_detect_all = QPushButton("Detect All")
-        self.btn_detect_all.setToolTip("Run YOLO detection on all loaded files.")
-        self.btn_detect_all.clicked.connect(self._detect_all)
-        self.btn_detect_all.setEnabled(False)
-        run_row.addWidget(self.btn_detect_all)
-
-        group_layout.addLayout(run_row)
-
-        self.infer_progress = QProgressBar()
-        self.infer_progress.setValue(0)
-        self.infer_progress.setVisible(False)
-        group_layout.addWidget(self.infer_progress)
-
-        self.lbl_infer_status = QLabel("")
-        self.lbl_infer_status.setStyleSheet("color: #999999; font-size: 9px;")
-        self.lbl_infer_status.setWordWrap(True)
-        group_layout.addWidget(self.lbl_infer_status)
-
-        group.setLayout(group_layout)
-        layout.addWidget(group)
+    # Training and inference UI live in separate pop-out dialogs invoked
+    # from the Predict menu — see RunTrainingDialog / RunInferenceDialog
+    # below, and ``_menu_run_training`` / ``_menu_run_inference``.
 
     # =========================================================================
     # Styles
@@ -1000,6 +1348,46 @@ class DeepAudioDetectorWindow(QMainWindow):
             QCheckBox::indicator {
                 width: 14px;
                 height: 14px;
+            }
+            /* In-window menu bar — blue strip so it reads as part of DAD
+               and is visually distinct from the black content area. */
+            QMenuBar {
+                background-color: #0078d4;
+                color: white;
+                padding: 2px 6px;
+                font-weight: bold;
+                spacing: 4px;
+            }
+            QMenuBar::item {
+                background: transparent;
+                color: white;
+                padding: 4px 10px;
+                border-radius: 3px;
+            }
+            QMenuBar::item:selected {
+                background-color: #106ebe;
+            }
+            QMenuBar::item:pressed {
+                background-color: #005a9e;
+            }
+            QMenu {
+                background-color: #2b2b2b;
+                color: #cccccc;
+                border: 1px solid #0078d4;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 4px 18px;
+                border-radius: 2px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: white;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3f3f3f;
+                margin: 4px 6px;
             }
         """.replace('UP_ARROW_PATH', up).replace('DOWN_ARROW_PATH', down))
 
@@ -1368,29 +1756,36 @@ class DeepAudioDetectorWindow(QMainWindow):
         return audio, sr
 
     def _try_load_detections(self, filepath):
-        """Try to load existing detections for a file."""
-        base = Path(filepath).stem
-        parent = Path(filepath).parent
+        """Load existing sibling-CSV labels for a file.
 
-        for suffix in ['_yoloDetection', '_usv_yolo', '_usv_dsp', '_usv_detections']:
-            csv_path = parent / f"{base}{suffix}.csv"
-            if csv_path.exists():
-                try:
-                    df = pd.read_csv(csv_path)
-                    if 'status' not in df.columns:
-                        df['status'] = 'pending'
-                    self._ensure_freq_bounds(df)
-                    self.all_detections[filepath] = df
-                    self.detection_sources[filepath] = suffix.lstrip('_')
-                    if filepath == self.audio_files[self.current_file_idx] if self.audio_files else False:
-                        self.detections_df = df.copy()
-                        self.current_detection_idx = 0
-                    return
-                except Exception:
-                    pass
+        Reads the canonical ``<stem>_dad.csv`` first, then legacy suffixes
+        (``_yoloDetection``, ``_usv_yolo``). CAD-family suffixes (``_usv_dsp``,
+        ``_usv_detections``) are deliberately NOT auto-imported — DAD is a
+        standalone tool; users pull CAD labels in via ``Labels → Import…``.
+        """
+        df = load_labels(filepath)
+        is_current = (
+            self.audio_files
+            and self.current_file_idx < len(self.audio_files)
+            and filepath == self.audio_files[self.current_file_idx]
+        )
 
-        if filepath == (self.audio_files[self.current_file_idx] if self.audio_files else None):
-            self.detections_df = None
+        if df is None or len(df) == 0:
+            if is_current:
+                self.detections_df = None
+                self.current_detection_idx = 0
+            return
+
+        if 'status' not in df.columns:
+            df['status'] = 'pending'
+        self._ensure_freq_bounds(df)
+        self.all_detections[filepath] = df
+        found = find_existing_sibling_csv(filepath)
+        if found is not None:
+            # 'dad', 'yoloDetection', etc. — used only for log/UI purposes now.
+            self.detection_sources[filepath] = found.stem.rsplit("_", 1)[-1]
+        if is_current:
+            self.detections_df = df.copy()
             self.current_detection_idx = 0
 
     @staticmethod
@@ -2065,12 +2460,23 @@ class DeepAudioDetectorWindow(QMainWindow):
 
         if self.audio_files and self.current_file_idx < len(self.audio_files):
             filepath = self.audio_files[self.current_file_idx]
+            # save_labels with empty df removes the canonical sibling CSV.
+            try:
+                save_labels(filepath, None)
+            except Exception:
+                pass
+            # Also clean up the legacy _yoloDetection.csv so it doesn't resurface.
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            source = self.detection_sources.get(filepath, 'yoloDetection')
-            csv_path = parent / f"{base}_{source}.csv"
-            if csv_path.exists():
-                csv_path.unlink()
+            for legacy in ('_yoloDetection', '_usv_yolo'):
+                p = parent / f"{base}{legacy}.csv"
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            self.detection_sources.pop(filepath, None)
+            self.all_detections.pop(filepath, None)
 
         self.detections_df = None
         self.current_detection_idx = 0
@@ -2133,12 +2539,8 @@ class DeepAudioDetectorWindow(QMainWindow):
 
             has_dets = filepath in self.all_detections and len(self.all_detections[filepath]) > 0
             if not has_dets:
-                base = Path(filepath).stem
-                parent = Path(filepath).parent
-                for suffix in ['_yoloDetection', '_usv_yolo', '_usv_dsp', '_usv_detections']:
-                    if (parent / f"{base}{suffix}.csv").exists():
-                        has_dets = True
-                        break
+                if find_existing_sibling_csv(filepath) is not None:
+                    has_dets = True
 
             if has_dets:
                 self.file_list.setCurrentRow(next_idx)
@@ -2169,24 +2571,16 @@ class DeepAudioDetectorWindow(QMainWindow):
                 del self.all_detections[filepath]
 
     def _save_detections_csv(self, filepath):
-        """Save current detections to CSV file as {stem}_yoloDetection.csv."""
-        if self.detections_df is None or len(self.detections_df) == 0:
-            return
+        """Save current detections to the canonical sibling CSV (``<stem>_dad.csv``).
 
-        self.detections_df['call_number'] = range(1, len(self.detections_df) + 1)
-        cols = self.detections_df.columns.tolist()
-        if 'call_number' in cols:
-            cols.remove('call_number')
-            cols.insert(0, 'call_number')
-            self.detections_df = self.detections_df[cols]
-
-        base = Path(filepath).stem
-        parent = Path(filepath).parent
-        csv_path = parent / f"{base}_yoloDetection.csv"
-
+        If the in-memory df is empty/None, the canonical file is removed so the
+        filesystem stays in sync. Legacy ``_yoloDetection.csv`` files are left
+        untouched — upgrading is a one-way migration the next write performs.
+        """
         try:
-            self.detections_df.to_csv(csv_path, index=False)
-            self.detection_sources[filepath] = 'yoloDetection'
+            written = save_labels(filepath, self.detections_df)
+            if written is not None:
+                self.detection_sources[filepath] = DAD_SUFFIX.lstrip('_')
         except Exception as e:
             self.status_bar.showMessage(f"Error saving CSV: {e}")
 
@@ -2405,79 +2799,456 @@ class DeepAudioDetectorWindow(QMainWindow):
     # Project Management
     # =========================================================================
 
-    def _create_project(self):
-        """Create a new YOLO detection project."""
-        project_dir = QFileDialog.getExistingDirectory(
-            self, "Select Directory for New Project"
+    # ------------------------------------------------------------------
+    # Project lifecycle (File menu handlers)
+    # ------------------------------------------------------------------
+
+    def _menu_new_project(self):
+        """Create a new DAD project: prompt for name, then parent folder.
+
+        No directory is auto-created on disk before the user picks a location —
+        if the user cancels the folder picker, no state is left behind.
+        """
+        from fnt.usv.usv_detector.yolo_detector import create_project
+
+        name, ok = QInputDialog.getText(
+            self, "New Project", "Project name:", text="dad_v1"
         )
-        if not project_dir:
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # Default to the user's home dir — do not auto-create a projects root.
+        start_dir = os.path.expanduser("~")
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, f"Choose where to save '{name}'", start_dir,
+        )
+        if not parent_dir:
+            return
+        project_dir = os.path.join(parent_dir, name)
+        if os.path.exists(project_dir):
+            QMessageBox.warning(
+                self, "Project exists",
+                f"A directory named '{name}' already exists in:\n{parent_dir}\n\n"
+                "Choose a different name or open the existing project.")
             return
 
         try:
-            from fnt.usv.usv_detector.yolo_detector import create_project
-            self._yolo_project_config = create_project(project_dir)
-            self._yolo_model_path = None
-            self.lbl_project_name.setText(f"Project: {os.path.basename(project_dir)}")
-            self.lbl_project_name.setStyleSheet("color: #4CAF50; font-size: 10px;")
-            self.lbl_model_info.setText("No trained model")
-            self.lbl_model_info.setStyleSheet("color: #999999; font-size: 10px;")
-            self.status_bar.showMessage(f"Created project: {project_dir}")
-            self._update_project_state()
+            config = create_project(project_dir)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
-
-    def _open_project(self):
-        """Open an existing YOLO detection project."""
-        project_dir = QFileDialog.getExistingDirectory(
-            self, "Select Existing Project Directory"
-        )
-        if not project_dir:
             return
 
-        config_path = os.path.join(project_dir, 'project_config.json')
-        if not os.path.exists(config_path):
+        self._close_project(silent=True)
+        self._activate_project(config)
+        self._remember_recent_project(project_dir)
+        self.status_bar.showMessage(f"Created project: {project_dir}")
+
+    def _menu_open_project(self):
+        """Open an existing project — user picks the project_info.json file."""
+        from fnt.usv.usv_detector.yolo_detector import (
+            YOLOProjectConfig, LEGACY_CONFIG_FILENAME,
+        )
+        start_dir = os.path.expanduser("~")
+
+        config_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project — select project_info.json",
+            start_dir,
+            "Project Info (project_info.json);;Legacy Config (project_config.json);;All Files (*)",
+        )
+        if not config_path:
+            return
+
+        basename = os.path.basename(config_path)
+        if basename not in ("project_info.json", LEGACY_CONFIG_FILENAME):
             QMessageBox.warning(
-                self, "Invalid Project",
-                f"No project_config.json found in:\n{project_dir}\n\n"
-                "Use 'Create Project' to create a new project."
+                self, "Not a project",
+                f"Expected project_info.json but got:\n{basename}")
+            return
+
+        try:
+            config = YOLOProjectConfig.load(config_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open project:\n{e}")
+            return
+
+        self._close_project(silent=True)
+        self._activate_project(config)
+        self._remember_recent_project(config.project_dir)
+
+    def _menu_close_project(self):
+        if self._yolo_project_config is None:
+            return
+        self._close_project(silent=False)
+
+    def _menu_add_folder(self):
+        """Add a folder of wavs to the current project (recursively scanned)."""
+        if self._yolo_project_config is None:
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Add folder of .wav files", os.path.expanduser("~"),
+        )
+        if not folder:
+            return
+        config = self._yolo_project_config
+        if folder in config.source_folders:
+            QMessageBox.information(
+                self, "Already added",
+                f"'{folder}' is already part of this project.")
+            return
+        config.source_folders.append(folder)
+        try:
+            config.save()
+        except Exception:
+            pass
+        added = self._rescan_project_wavs()
+        self.status_bar.showMessage(
+            f"Added folder: {folder} (+{added} new wavs)")
+
+    def _menu_import_cad(self):
+        """Import a CAD sidecar CSV into the current file's label set."""
+        if not self.audio_files or self.current_file_idx >= len(self.audio_files):
+            return
+        filepath = self.audio_files[self.current_file_idx]
+        base = Path(filepath).stem
+        parent = Path(filepath).parent
+
+        # Sensible default: look for any CAD-style sibling CSV.
+        candidate = None
+        for suffix in ("_usv_dsp", "_usv_detections", "_usv_yolo"):
+            p = parent / f"{base}{suffix}.csv"
+            if p.exists():
+                candidate = str(p)
+                break
+
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self, f"Import CAD labels for {base}",
+            candidate or str(parent),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not csv_path:
+            return
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", str(e))
+            return
+
+        required = {"start_seconds", "stop_seconds"}
+        if not required.issubset(df.columns):
+            QMessageBox.warning(
+                self, "Invalid CSV",
+                f"Expected columns {required} — got {set(df.columns)}.")
+            return
+
+        self._ensure_freq_bounds(df)
+        df["status"] = "accepted"
+        df["source"] = "cad_import"
+
+        existing = self.detections_df if self.detections_df is not None else pd.DataFrame()
+        combined = merge_with_inference(existing, df.to_dict("records"))
+        self.detections_df = combined
+        self.current_detection_idx = 0
+        self._store_current_detections()
+        self._update_display()
+        self._update_ui_state()
+        self.status_bar.showMessage(
+            f"Imported {len(df)} labels from {os.path.basename(csv_path)}")
+
+    # ------------------------------------------------------------------
+    # Predict menu handlers
+    # ------------------------------------------------------------------
+
+    def _menu_run_training(self):
+        """Open Run Training dialog and kick off training on accept."""
+        if self._yolo_project_config is None:
+            return
+        try:
+            from fnt.usv.usv_detector.yolo_detector import get_training_data_counts
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+            return
+
+        counts = get_training_data_counts(self.all_detections)
+        if counts['n_positive'] < 1:
+            QMessageBox.warning(
+                self, "No Positive Labels",
+                f"Need at least 1 accepted USV call to train.\n"
+                f"Currently: {counts['n_positive']} positive, "
+                f"{counts['n_negative']} negative.\n\n"
+                "Use A to accept a call. X to mark a background region is\n"
+                "optional but helps reduce false positives."
             )
             return
 
-        try:
-            from fnt.usv.usv_detector.yolo_detector import YOLOProjectConfig
-            self._yolo_project_config = YOLOProjectConfig.load(config_path)
-            self.lbl_project_name.setText(f"Project: {os.path.basename(project_dir)}")
-            self.lbl_project_name.setStyleSheet("color: #4CAF50; font-size: 10px;")
+        dlg = RunTrainingDialog(
+            self,
+            n_positive=counts['n_positive'],
+            n_negative=counts['n_negative'],
+            n_files=counts['n_files_with_labels'],
+            model_variant=self._model_variant,
+            imgsz=self._imgsz,
+            auto_predict=self._auto_predict_after_train,
+            auto_predict_scope=self._auto_predict_scope,
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
 
-            # Check for existing models
-            self._yolo_model_path = None
-            if self._yolo_project_config.models:
-                last_model = self._yolo_project_config.models[-1]
-                model_path = last_model.get('path', '')
-                if os.path.exists(model_path):
-                    self._yolo_model_path = model_path
-                    model_name = last_model.get('name', 'unknown')
-                    n_pos = last_model.get('n_positive', '?')
-                    n_neg = last_model.get('n_negative', '?')
-                    self.lbl_model_info.setText(
-                        f"Model: {model_name}\n"
-                        f"Trained on: {n_pos} positive, {n_neg} negative"
-                    )
-                    self.lbl_model_info.setStyleSheet("color: #4CAF50; font-size: 10px;")
-                else:
-                    self.lbl_model_info.setText("Model file not found (retrain needed)")
-                    self.lbl_model_info.setStyleSheet("color: #d13438; font-size: 10px;")
+        self._model_variant = dlg.model_variant()
+        self._imgsz = dlg.imgsz()
+        self._auto_predict_after_train = dlg.auto_predict()
+        self._auto_predict_scope = dlg.auto_predict_scope()
+
+        self._train_model()
+
+    def _menu_run_inference(self):
+        """Open Run Inference dialog and kick off detection on accept."""
+        if not self._yolo_model_path:
+            QMessageBox.warning(
+                self, "No Model",
+                "No trained model is loaded for this project.\n\n"
+                "Run 'Predict → Run Training…' first, or open a project that\n"
+                "already contains a trained model.")
+            return
+        if not self.audio_files:
+            QMessageBox.information(
+                self, "No Files",
+                "This project has no audio files yet. Use\n"
+                "'File → Add Folder…' to load some wavs.")
+            return
+
+        # Flag whether any target file has pending rows, so the dialog can
+        # surface a mild heads-up.
+        any_pending = False
+        for df in self.all_detections.values():
+            if df is None or len(df) == 0:
+                continue
+            if (df['status'].astype(str) == 'pending').any():
+                any_pending = True
+                break
+
+        has_current = bool(
+            self.audio_files
+            and 0 <= self.current_file_idx < len(self.audio_files)
+        )
+
+        dlg = RunInferenceDialog(
+            self,
+            confidence=self._confidence,
+            use_sahi=self._use_sahi,
+            scope='current' if has_current else 'all',
+            overwrite_policy=self._inference_overwrite_policy,
+            has_current_file=has_current,
+            any_pending_exists=any_pending,
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        self._confidence = dlg.confidence()
+        self._use_sahi = dlg.use_sahi()
+        self._inference_overwrite_policy = dlg.overwrite_policy()
+
+        if dlg.scope() == 'current' and has_current:
+            targets = [self.audio_files[self.current_file_idx]]
+        else:
+            targets = list(self.audio_files)
+
+        self._detect_files(targets)
+
+    # ------------------------------------------------------------------
+    # Project state helpers
+    # ------------------------------------------------------------------
+
+    def _activate_project(self, config):
+        """Switch the UI over to a freshly loaded project config."""
+        self._yolo_project_config = config
+        self._sync_ui_from_config(config)
+        self.setWindowTitle(f"{self.BASE_TITLE} — {config.project_name}")
+        self.lbl_project_name.setText(f"Project: {config.project_name}")
+        self.lbl_project_name.setStyleSheet("color: #4CAF50; font-size: 10px;")
+
+        self._yolo_model_path = None
+        if config.models:
+            last_model = config.models[-1]
+            model_path = last_model.get('path', '')
+            if os.path.exists(model_path):
+                self._yolo_model_path = model_path
+                model_name = last_model.get('name', 'unknown')
+                n_pos = last_model.get('n_positive', '?')
+                n_neg = last_model.get('n_negative', '?')
+                self.lbl_model_info.setText(
+                    f"Model: {model_name}\n"
+                    f"Trained on: {n_pos} positive, {n_neg} negative"
+                )
+                self.lbl_model_info.setStyleSheet("color: #4CAF50; font-size: 10px;")
             else:
-                self.lbl_model_info.setText("No trained model")
-                self.lbl_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+                self.lbl_model_info.setText("Model file not found (retrain needed)")
+                self.lbl_model_info.setStyleSheet("color: #d13438; font-size: 10px;")
+        else:
+            self.lbl_model_info.setText("No trained model")
+            self.lbl_model_info.setStyleSheet("color: #999999; font-size: 10px;")
 
-            self.status_bar.showMessage(f"Opened project: {project_dir}")
-            self._update_project_state()
+        self.act_add_folder.setEnabled(True)
+        self.act_add_files.setEnabled(True)
+        self.act_close_project.setEnabled(True)
+
+        # Load wavs and labels from all referenced source folders.
+        self._rescan_project_wavs()
+        self.status_bar.showMessage(f"Opened project: {config.project_dir}")
+        self._update_source_folders_label()
+        self._update_project_state()
+
+    def _close_project(self, silent: bool = False):
+        """Tear down the current project state."""
+        if self._yolo_project_config is None:
+            return
+        if not silent:
+            self.status_bar.showMessage(
+                f"Closed project: {self._yolo_project_config.project_name}")
+        # Flush any pending in-memory changes to disk before we forget them.
+        self._store_current_detections()
+
+        self._yolo_project_config = None
+        self._yolo_model_path = None
+        self.audio_files = []
+        self.all_detections = {}
+        self.detection_sources = {}
+        self.detections_df = None
+        self.current_detection_idx = 0
+        self.audio_data = None
+        self.sample_rate = None
+
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        self.file_list.blockSignals(False)
+
+        self.setWindowTitle(self.BASE_TITLE)
+        self.lbl_project_name.setText("No project — use File → New Project…")
+        self.lbl_project_name.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_source_folders.setText("No source folders")
+        self.lbl_model_info.setText("No trained model")
+        self.lbl_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.act_add_folder.setEnabled(False)
+        self.act_add_files.setEnabled(False)
+        self.act_close_project.setEnabled(False)
+        self.act_import_cad.setEnabled(False)
+
+        self.spectrogram.set_audio_data(None, None)
+        self.waveform_overview.set_audio_data(None, None)
+        self._update_data_summary()
+        self._update_display()
+        self._update_project_state()
+
+    def _update_source_folders_label(self):
+        """Update the 'source folders' status label with the current list."""
+        cfg = self._yolo_project_config
+        if cfg is None or not cfg.source_folders:
+            self.lbl_source_folders.setText("No source folders (File → Add Folder…)")
+            return
+        lines = []
+        for folder in cfg.source_folders:
+            lines.append(os.path.basename(os.path.normpath(folder)) or folder)
+        n = len(lines)
+        self.lbl_source_folders.setText(
+            f"{n} folder(s): " + ", ".join(lines[:3])
+            + (" …" if n > 3 else "")
+        )
+
+    def _rescan_project_wavs(self) -> int:
+        """Re-scan source_folders for wavs and (re)load sibling-CSV labels.
+
+        Returns the number of newly added wavs since the last scan.
+        """
+        cfg = self._yolo_project_config
+        if cfg is None:
+            return 0
+
+        wavs = [str(p) for p in scan_folders_for_wavs(cfg.source_folders)]
+        existing = set(self.audio_files)
+        new_wavs = [w for w in wavs if w not in existing]
+        added = 0
+
+        for w in wavs:
+            if w not in self.audio_files:
+                self.audio_files.append(w)
+                added += 1
+            if w not in self.all_detections:
+                df = load_labels(w)
+                if df is not None and len(df) > 0:
+                    self.all_detections[w] = df
+                    found = find_existing_sibling_csv(w)
+                    if found:
+                        self.detection_sources[w] = found.stem.rsplit("_", 1)[-1]
+
+        if self.audio_files:
+            self.current_file_idx = min(self.current_file_idx, len(self.audio_files) - 1)
+            self._refresh_file_list_items_full()
+            self._load_current_file()
+        else:
+            self.file_list.blockSignals(True)
+            self.file_list.clear()
+            self.file_list.blockSignals(False)
+
+        self._update_source_folders_label()
+        self._update_data_summary()
+        self._update_project_state()
+        return added
+
+    # ------------------------------------------------------------------
+    # Recent projects (QSettings list)
+    # ------------------------------------------------------------------
+
+    def _remember_recent_project(self, project_dir):
+        settings = QSettings("FNT", "DeepAudioDetector")
+        recents = settings.value("recent_projects", [], type=list) or []
+        if project_dir in recents:
+            recents.remove(project_dir)
+        recents.insert(0, project_dir)
+        recents = recents[:10]
+        settings.setValue("recent_projects", recents)
+        self._rebuild_recent_projects_menu()
+
+    def _rebuild_recent_projects_menu(self):
+        if not hasattr(self, "menu_recent"):
+            return
+        self.menu_recent.clear()
+        settings = QSettings("FNT", "DeepAudioDetector")
+        recents = settings.value("recent_projects", [], type=list) or []
+        if not recents:
+            act = QAction("(no recent projects)", self)
+            act.setEnabled(False)
+            self.menu_recent.addAction(act)
+            return
+        for path in recents:
+            act = QAction(path, self)
+            act.triggered.connect(lambda _checked=False, p=path: self._open_recent_project(p))
+            self.menu_recent.addAction(act)
+
+    def _open_recent_project(self, project_dir):
+        from fnt.usv.usv_detector.yolo_detector import (
+            YOLOProjectConfig, PROJECT_INFO_FILENAME, LEGACY_CONFIG_FILENAME,
+        )
+        candidate = os.path.join(project_dir, PROJECT_INFO_FILENAME)
+        if not os.path.exists(candidate):
+            candidate = os.path.join(project_dir, LEGACY_CONFIG_FILENAME)
+        if not os.path.exists(candidate):
+            QMessageBox.warning(
+                self, "Missing",
+                f"Project file not found at:\n{project_dir}\n\n"
+                "It may have been moved or deleted.")
+            return
+        try:
+            config = YOLOProjectConfig.load(candidate)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open project:\n{e}")
+            return
+        self._close_project(silent=True)
+        self._activate_project(config)
+        self._remember_recent_project(config.project_dir)
 
     def _update_project_state(self):
-        """Update label counts and enable/disable train & detect buttons."""
+        """Update label counts and Predict-menu enable state."""
         has_project = self._yolo_project_config is not None
         has_model = self._yolo_model_path is not None
         has_files = len(self.audio_files) > 0
@@ -2488,25 +3259,39 @@ class DeepAudioDetectorWindow(QMainWindow):
         for filepath, df in self.all_detections.items():
             if df is None or len(df) == 0:
                 continue
-            n_positive += (df['status'] == 'accepted').sum()
-            n_negative += df['status'].isin(['negative', 'rejected']).sum()
+            n_positive += int((df['status'] == 'accepted').sum())
+            n_negative += int(df['status'].isin(['negative', 'rejected']).sum())
+        self._n_positive_labels = n_positive
+        self._n_negative_labels = n_negative
 
-        self.lbl_train_data.setText(f"Labels: {n_positive} positive, {n_negative} negative")
+        # Train: needs project + at least 1 positive.
+        can_train = has_project and n_positive >= 1
+        # Inference: needs model + files.
+        can_infer = has_model and has_files
+        if hasattr(self, 'act_run_training'):
+            self.act_run_training.setEnabled(can_train)
+        if hasattr(self, 'act_run_inference'):
+            self.act_run_inference.setEnabled(can_infer)
 
-        # Train button: needs project + at least 1 positive + at least 1 negative
-        can_train = has_project and n_positive >= 1 and n_negative >= 1
-        self.btn_train.setEnabled(can_train)
-
-        # Detect buttons: needs model + files
-        self.btn_detect_current.setEnabled(has_model and has_files)
-        self.btn_detect_all.setEnabled(has_model and has_files)
+    def _sync_ui_from_config(self, config):
+        """Load training/inference defaults from the persisted project config."""
+        self._model_variant = str(getattr(config, 'model_variant', 'yolo11s.pt'))
+        self._imgsz = int(getattr(config, 'imgsz', 1280))
+        conf = float(getattr(config, 'confidence_threshold', 0.15))
+        self._confidence = max(0.05, min(0.60, conf))
+        self._use_sahi = bool(getattr(config, 'use_sahi', True))
 
     # =========================================================================
     # Training
     # =========================================================================
 
     def _train_model(self):
-        """Export training data and train YOLO model."""
+        """Export training data and train a YOLO model.
+
+        Reads options from ``self._model_variant`` / ``self._imgsz`` —
+        RunTrainingDialog sets these before calling us. The legacy confirmation
+        prompt is skipped because the dialog itself is the confirmation step.
+        """
         if self._yolo_project_config is None:
             return
 
@@ -2524,31 +3309,36 @@ class DeepAudioDetectorWindow(QMainWindow):
         n_pos = counts['n_positive']
         n_neg = counts['n_negative']
 
-        if n_pos < 1 or n_neg < 1:
+        if n_pos < 1:
             QMessageBox.warning(
-                self, "Insufficient Labels",
-                f"Need at least 1 positive and 1 negative label.\n"
+                self, "No Positive Labels",
+                f"Need at least 1 accepted USV call to train.\n"
                 f"Currently: {n_pos} positive, {n_neg} negative.\n\n"
-                f"Use A key to accept USV calls, X key to mark background."
+                f"Use A to accept a call. X to mark a background region is\n"
+                f"optional but helps reduce false positives."
             )
             return
 
-        reply = QMessageBox.question(
-            self, "Train YOLO Model",
-            f"Training data: {n_pos} positive, {n_neg} negative "
-            f"from {counts['n_files_with_labels']} files.\n\n"
-            f"This will export spectrogram tiles and train a YOLOv8 model.\n"
-            f"Training stops automatically when loss plateaus.\n"
-            f"Continue?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+        model_variant = self._model_variant
+        imgsz = int(self._imgsz)
 
-        self.btn_train.setEnabled(False)
-        self.train_progress.setVisible(True)
-        self.train_progress.setValue(0)
-        self.lbl_train_status.setText("Exporting training data...")
+        # Persist model/imgsz choices into the project config so future
+        # sessions and inference runs agree on tile size.
+        config.model_variant = model_variant
+        config.imgsz = imgsz
+        config.tile_size = (imgsz, imgsz)
+        try:
+            config.save()
+        except Exception:
+            pass
+
+        # Disable Predict menu actions so the user can't double-start.
+        if hasattr(self, 'act_run_training'):
+            self.act_run_training.setEnabled(False)
+        if hasattr(self, 'act_run_inference'):
+            self.act_run_inference.setEnabled(False)
+
+        self.status_bar.showMessage("Exporting training data…")
         QApplication.processEvents()
 
         dataset_dir = os.path.join(config.project_dir, 'datasets', 'train')
@@ -2556,22 +3346,20 @@ class DeepAudioDetectorWindow(QMainWindow):
             export_stats = export_training_data(
                 self.audio_files, self.all_detections, dataset_dir, config,
                 progress_callback=lambda msg, cur, tot: (
-                    self.lbl_train_status.setText(msg),
-                    self.train_progress.setValue(int(cur / max(tot, 1) * 30)),
+                    self.status_bar.showMessage(msg),
                     QApplication.processEvents(),
                 )
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export training data:\n{e}")
-            self.btn_train.setEnabled(True)
-            self.train_progress.setVisible(False)
+            self._update_project_state()
             return
 
-        self.lbl_train_status.setText(
+        self.status_bar.showMessage(
             f"Exported {export_stats['n_tiles']} tiles "
-            f"({export_stats['n_positive']} positive, {export_stats['n_negative']} negative)"
+            f"({export_stats['n_positive']} positive, {export_stats['n_negative']} negative); "
+            f"training…"
         )
-        self.train_progress.setValue(30)
         QApplication.processEvents()
 
         yaml_path = write_yolo_dataset_yaml(config.project_dir, dataset_dir)
@@ -2585,15 +3373,27 @@ class DeepAudioDetectorWindow(QMainWindow):
             if os.path.exists(prev_path):
                 prev_weights = prev_path
 
-        self.lbl_train_status.setText("Training YOLO model...")
-        self.train_progress.setValue(35)
-        QApplication.processEvents()
+        # Live training plot — separate top-level window, thread-safe signal.
+        if self._training_plot is None:
+            try:
+                from fnt.usv.usv_detector.training_plot import TrainingPlotWindow
+                self._training_plot = TrainingPlotWindow(self)
+            except Exception:
+                self._training_plot = None
+        if self._training_plot is not None:
+            self._training_plot.reset()
+            self._training_plot.show()
+            self._training_plot.raise_()
 
         self._yolo_train_worker = YOLOTrainingWorker(
             yaml_path, model_dir, model_name,
             pretrained_weights=prev_weights,
+            model_variant=model_variant,
+            imgsz=imgsz,
         )
         self._yolo_train_worker.progress.connect(self._on_train_progress)
+        if self._training_plot is not None:
+            self._yolo_train_worker.epoch.connect(self._training_plot.push_from_worker)
         self._yolo_train_worker.complete.connect(
             lambda path: self._on_train_complete(path, model_name, n_pos, n_neg)
         )
@@ -2601,26 +3401,20 @@ class DeepAudioDetectorWindow(QMainWindow):
         self._yolo_train_worker.start()
 
     def _on_train_progress(self, message):
-        """Handle YOLO training progress."""
-        self.lbl_train_status.setText(message)
-        current = self.train_progress.value()
-        if current < 95:
-            self.train_progress.setValue(current + 1)
+        """Forward training progress to the status bar."""
+        self.status_bar.showMessage(message)
 
     def _on_train_complete(self, model_path, model_name, n_pos, n_neg):
         """Handle YOLO training completion."""
-        self.train_progress.setValue(100)
-        self.train_progress.setVisible(False)
-        self.btn_train.setEnabled(True)
-
         self._yolo_model_path = model_path
         self.lbl_model_info.setText(
             f"Model: {model_name}\n"
             f"Trained on: {n_pos} positive, {n_neg} negative"
         )
         self.lbl_model_info.setStyleSheet("color: #4CAF50; font-size: 10px;")
-        self.lbl_train_status.setText(f"Training complete! Model: {model_name}")
-        self.status_bar.showMessage(f"YOLO model trained: {model_path}")
+        self.status_bar.showMessage(
+            f"Training complete: {model_name} → {model_path}"
+        )
 
         if self._yolo_project_config is not None:
             self._yolo_project_config.models.append({
@@ -2634,11 +3428,24 @@ class DeepAudioDetectorWindow(QMainWindow):
 
         self._update_project_state()
 
+        # Optional train → predict chain.
+        if (self._auto_predict_after_train
+                and self._yolo_project_config is not None
+                and self.audio_files):
+            if self._auto_predict_scope == 'current':
+                targets = [self.audio_files[self.current_file_idx]] if self.audio_files else []
+            else:
+                targets = list(self.audio_files)
+            if targets:
+                self.status_bar.showMessage(
+                    f"Auto-predict: running inference on {len(targets)} file(s)"
+                )
+                self._detect_files(targets)
+
     def _on_train_error(self, error_msg):
         """Handle YOLO training error."""
-        self.train_progress.setVisible(False)
-        self.btn_train.setEnabled(True)
-        self.lbl_train_status.setText("Training failed")
+        self.status_bar.showMessage("Training failed")
+        self._update_project_state()
         QMessageBox.critical(self, "Training Error", f"YOLO training failed:\n{error_msg}")
 
     # =========================================================================
@@ -2658,19 +3465,65 @@ class DeepAudioDetectorWindow(QMainWindow):
             return
         self._detect_files(list(self.audio_files))
 
+    def _clear_pending_predictions(self, files):
+        """Strip pending/ml rows from the given files' label sets in-memory.
+
+        Accepted, rejected, and user-drawn rows are preserved. The canonical
+        sibling CSV is rewritten in place so on-disk state matches memory.
+        """
+        for filepath in files:
+            df = self.all_detections.get(filepath)
+            if df is None or len(df) == 0:
+                continue
+            keep_mask = ~(
+                (df['status'].astype(str) == 'pending')
+                & (df.get('source', pd.Series(['ml'] * len(df))).astype(str) == 'ml')
+            )
+            kept = df[keep_mask].reset_index(drop=True)
+            self.all_detections[filepath] = kept
+            try:
+                save_labels(filepath, kept)
+            except Exception:
+                pass
+
     def _detect_files(self, files):
-        """Run YOLO inference on a list of files."""
+        """Run YOLO inference on a list of files, honoring overwrite policy."""
         if not self._yolo_model_path or not self._yolo_project_config:
             return
+        if not files:
+            return
 
-        self.btn_detect_current.setEnabled(False)
-        self.btn_detect_all.setEnabled(False)
-        self.infer_progress.setVisible(True)
-        self.infer_progress.setValue(0)
-        self.lbl_infer_status.setText("Running YOLO detection...")
+        # Optionally strip pending/ml rows before the merge so old predictions
+        # don't accumulate. Accepted / rejected / user rows are always kept.
+        if self._inference_overwrite_policy == 'replace_pending':
+            self._clear_pending_predictions(files)
+            # Refresh current-file view if it got touched.
+            if self.audio_files and self.current_file_idx < len(self.audio_files):
+                current = self.audio_files[self.current_file_idx]
+                if current in files:
+                    df = self.all_detections.get(current)
+                    self.detections_df = df.copy() if df is not None and len(df) > 0 else None
+                    self.current_detection_idx = 0
+                    self._update_display()
+
+        conf = float(self._confidence)
+        use_sahi = bool(self._use_sahi)
+        self._yolo_project_config.confidence_threshold = conf
+        self._yolo_project_config.use_sahi = use_sahi
+
+        if hasattr(self, 'act_run_training'):
+            self.act_run_training.setEnabled(False)
+        if hasattr(self, 'act_run_inference'):
+            self.act_run_inference.setEnabled(False)
+
+        mode = "SAHI" if use_sahi else "tiled"
+        self.status_bar.showMessage(
+            f"Running YOLO detection ({mode}, conf={conf:.2f}) on {len(files)} file(s)…"
+        )
 
         self._yolo_infer_worker = YOLOInferenceWorker(
             files, self._yolo_model_path, self._yolo_project_config,
+            confidence_threshold=conf,
         )
         self._yolo_infer_worker.progress.connect(self._on_infer_progress)
         self._yolo_infer_worker.file_complete.connect(self._on_infer_file_complete)
@@ -2679,78 +3532,99 @@ class DeepAudioDetectorWindow(QMainWindow):
         self._yolo_infer_worker.start()
 
     def _on_infer_progress(self, filename, current, total):
-        """Handle ML inference progress."""
-        self.infer_progress.setValue(int(current / total * 100))
-        self.lbl_infer_status.setText(f"Detecting: {filename}")
+        """Forward ML inference progress to the status bar."""
+        pct = int(current / total * 100) if total else 0
+        self.status_bar.showMessage(f"Detecting ({pct}%): {filename}")
 
     def _on_infer_file_complete(self, filename, filepath, detections, n_detections):
-        """Handle ML file completion - store results and write CSV."""
-        std_columns = ['call_number', 'start_seconds', 'stop_seconds', 'duration_ms',
-                        'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
-                        'max_power_db', 'mean_power_db', 'confidence', 'status', 'source']
+        """Handle ML file completion — merge with existing user labels and persist.
 
+        New inference boxes arrive with ``status='pending'`` / ``source='ml'``.
+        We merge them into any existing labels via ``merge_with_inference``,
+        which preserves user-sourced rows verbatim and dedupes overlapping
+        inference rows.
+        """
         if isinstance(detections, pd.DataFrame):
-            df = detections.copy()
+            inference_rows = detections.to_dict('records')
+        elif isinstance(detections, list):
+            inference_rows = [dict(d) for d in detections]
         else:
-            df = pd.DataFrame(detections)
+            inference_rows = []
 
-        if len(df) > 0:
-            if 'status' not in df.columns:
-                df['status'] = 'pending'
-            if 'source' not in df.columns:
-                df['source'] = 'ml'
-            if 'call_number' not in df.columns:
-                df.insert(0, 'call_number', range(1, len(df) + 1))
-        else:
-            df = pd.DataFrame(columns=std_columns)
+        # Normalize inference rows: status='pending', source='ml'.
+        for row in inference_rows:
+            row.setdefault('status', 'pending')
+            row.setdefault('source', 'ml')
 
-        self.all_detections[filepath] = df
-        self.detection_sources[filepath] = 'yoloDetection'
+        existing = self.all_detections.get(filepath)
+        if existing is None:
+            existing = load_labels(filepath)  # pick up on-disk labels we haven't seen yet
 
-        # Write CSV as {stem}_yoloDetection.csv
-        base = Path(filepath).stem
-        parent = Path(filepath).parent
-        csv_path = parent / f"{base}_yoloDetection.csv"
+        merged = merge_with_inference(existing, inference_rows)
+        if len(merged) > 0:
+            self._ensure_freq_bounds(merged)
+
+        self.all_detections[filepath] = merged
+        self.detection_sources[filepath] = DAD_SUFFIX.lstrip('_')
+
+        # Persist via the canonical writer.
         try:
-            df.to_csv(csv_path, index=False)
+            save_labels(filepath, merged)
         except Exception as e:
             self.status_bar.showMessage(f"Error saving CSV for {filename}: {e}")
 
-        # Update file list
+        # Update file list count.
         if filepath in self.audio_files:
             idx = self.audio_files.index(filepath)
             item = self.file_list.item(idx)
             if item:
                 self.file_list.blockSignals(True)
-                item.setText(f"{filename} ({len(df)})")
+                item.setText(f"{filename} ({len(merged)})")
                 self.file_list.blockSignals(False)
 
-        # Update current view if this is the displayed file
+        # Update current view if this is the displayed file.
         if (self.audio_files and self.current_file_idx < len(self.audio_files)
                 and self.audio_files[self.current_file_idx] == filepath):
-            self.detections_df = df.copy()
-            self._ensure_freq_bounds(self.detections_df)
+            self.detections_df = merged.copy() if len(merged) > 0 else None
             self.current_detection_idx = 0
-            self._load_current_file()
+            self._update_display()
+            self._update_ui_state()
 
     def _on_infer_complete(self, results):
         """Handle ML inference batch completion."""
-        self.infer_progress.setValue(100)
-        self.infer_progress.setVisible(False)
-        self.btn_detect_current.setEnabled(True)
-        self.btn_detect_all.setEnabled(True)
+        # Prefer the post-merge totals we actually stored, so the status bar
+        # matches what the user sees in the UI (user-drawn rows included).
+        n_files = len(results)
+        total_det = 0
+        for filepath in results:
+            df = self.all_detections.get(filepath)
+            if isinstance(df, pd.DataFrame):
+                total_det += len(df)
+            elif isinstance(results[filepath], (list, pd.DataFrame)):
+                total_det += len(results[filepath])
 
-        total_det = sum(len(d) for d in results.values() if isinstance(d, (list, pd.DataFrame)))
-        self.lbl_infer_status.setText(f"Complete: {total_det} detections in {len(results)} files")
-        self.status_bar.showMessage(f"YOLO detection complete: {total_det} detections")
+        self.status_bar.showMessage(
+            f"Detected {total_det} USVs across {n_files} file(s)"
+        )
 
         self._refresh_file_list_items()
-        self._load_current_file()
+        # Refresh the currently-displayed file's labels from what we merged.
+        if self.audio_files and self.current_file_idx < len(self.audio_files):
+            current = self.audio_files[self.current_file_idx]
+            merged = self.all_detections.get(current)
+            if merged is not None and len(merged):
+                self.detections_df = merged.copy()
+                self._ensure_freq_bounds(self.detections_df)
+            else:
+                self.detections_df = None
+            self.current_detection_idx = 0
+            self._update_display()
+        self._update_ui_state()
         self._update_project_state()
 
     def _on_infer_error(self, filename, error):
         """Handle ML inference error."""
-        self.lbl_infer_status.setText(f"Error: {filename} - {error}")
+        self.status_bar.showMessage(f"Inference error on {filename}: {error}")
 
     # =========================================================================
     # Statistics

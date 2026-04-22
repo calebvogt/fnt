@@ -12,7 +12,8 @@ from typing import List, Dict, Optional, Tuple
 from .config import USVDetectorConfig
 from .spectrogram import (
     load_audio, compute_spectrogram, compute_spectrogram_auto,
-    bandpass_filter, estimate_noise_floor, get_audio_info
+    bandpass_filter, estimate_noise_floor, estimate_noise_floor_blockwise,
+    get_audio_info
 )
 
 
@@ -42,6 +43,10 @@ class DSPDetector:
             from .config import get_prairie_vole_config
             config = get_prairie_vole_config()
         self.config = config
+        # Optional per-bin noise floor override captured from a silence region.
+        # When not None, must be a dict: {'freqs': 1D ndarray, 'noise_db': 1D ndarray}.
+        # The floor is linearly interpolated onto the runtime frequency axis.
+        self.noise_override: Optional[Dict] = None
 
     def detect_file(self, filepath: str, progress_callback=None) -> List[Dict]:
         """
@@ -220,11 +225,31 @@ class DSPDetector:
         Returns:
             List of raw detections
         """
-        # Estimate noise floor per frequency bin
-        noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
-
-        # Create threshold mask
-        threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
+        # Estimate noise floor. Priority:
+        #   1. User-captured silence-region override (per-bin, 1D).
+        #   2. Block-wise time-varying floor (2D) when noise_block_seconds > 0.
+        #   3. Classical 1D per-freq percentile.
+        override = self.noise_override
+        if override and 'freqs' in override and 'noise_db' in override:
+            src_freqs = np.asarray(override['freqs'], dtype=float)
+            src_noise = np.asarray(override['noise_db'], dtype=float)
+            if src_freqs.size >= 2 and src_noise.size == src_freqs.size:
+                noise_floor = np.interp(frequencies, src_freqs, src_noise)
+            else:
+                # Fallback: broadcast a scalar if override is degenerate.
+                noise_floor = np.full(frequencies.shape,
+                                      float(src_noise.mean()) if src_noise.size else -60.0)
+            threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
+        else:
+            block_s = getattr(self.config, 'noise_block_seconds', 0.0) or 0.0
+            if block_s > 0:
+                noise_floor = estimate_noise_floor_blockwise(
+                    Sxx_db, times, block_s, self.config.noise_percentile
+                )
+                threshold = noise_floor + self.config.energy_threshold_db
+            else:
+                noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
+                threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
         mask = Sxx_db > threshold
 
         # Apply morphological operations to clean up mask
@@ -304,9 +329,14 @@ class DSPDetector:
             mean_power_db = np.mean(region_spec[region_spec > -99])
             max_power_db = np.max(region_spec)
 
-            # SNR: max power minus mean noise floor over detection's freq range
-            det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1]
-            snr_db = float(max_power_db - np.mean(det_noise_floor)) if len(det_noise_floor) > 0 else 0.0
+            # SNR: max power minus mean noise floor over the detection's
+            # freq range (and time range too, when using a 2D block-wise floor).
+            if noise_floor.ndim == 2:
+                det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1,
+                                              start_idx:end_idx + 1]
+            else:
+                det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1]
+            snr_db = float(max_power_db - np.mean(det_noise_floor)) if det_noise_floor.size > 0 else 0.0
 
             calls.append({
                 'start_seconds': float(start_s),

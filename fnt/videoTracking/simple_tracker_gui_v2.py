@@ -1717,6 +1717,71 @@ class RangeSlider(QWidget):
                 self.update()
 
 
+class BgModelBuilderWorker(QThread):
+    """Builds the MOG2 background model on a background thread to keep UI responsive."""
+
+    finished = pyqtSignal(object)   # emits the built BackgroundSubtractionTracker
+    error = pyqtSignal(str)
+
+    def __init__(self, config, use_gpu, n_sample=200):
+        super().__init__()
+        self.config = config
+        self.use_gpu = use_gpu
+        self.n_sample = n_sample
+
+    def run(self):
+        try:
+            config = self.config
+            tracker = BackgroundSubtractionTracker(
+                video_path=config.video_path,
+                min_object_area=config.min_object_area,
+                max_object_area=config.max_object_area,
+                history=config.history,
+                var_threshold=config.var_threshold,
+                num_animals=config.num_animals,
+                morph_open_size=config.morph_open_size,
+                morph_close_size=config.morph_close_size,
+                morph_open_iterations=config.morph_open_iterations,
+                morph_close_iterations=config.morph_close_iterations,
+                erosion_size=config.erosion_size,
+                gaussian_blur_size=config.gaussian_blur_size,
+                median_filter_size=config.median_filter_size,
+                fill_holes=config.fill_holes,
+                convex_hull=config.convex_hull,
+                use_gpu=self.use_gpu,
+                threshold=config.threshold,
+                invert=config.invert,
+                threshold_enabled=config.threshold_enabled,
+                median_enabled=config.median_enabled,
+                erosion_enabled=config.erosion_enabled,
+                opening_enabled=config.opening_enabled,
+                closing_enabled=config.closing_enabled,
+                blur_enabled=config.blur_enabled,
+            )
+            tracker.initialize_video()
+
+            n_sample = min(self.n_sample, tracker.total_frames)
+            total = tracker.total_frames
+            if total <= n_sample:
+                sample_indices = list(range(total))
+            else:
+                sample_indices = [int(i * total / n_sample) for i in range(n_sample)]
+
+            for frame_idx in sample_indices:
+                tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = tracker.cap.read()
+                if not ret:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+                if config.tracking_area:
+                    gray = tracker.apply_roi_mask(gray, config.tracking_area)
+                tracker.bg_subtractor.apply(gray)
+
+            self.finished.emit(tracker)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class SimpleTrackerGUI(QMainWindow):
     """
     Simple Tracker V3 - Movement-based blob detection with ROI analysis.
@@ -1883,6 +1948,9 @@ class SimpleTrackerGUI(QMainWindow):
         self._persistent_tracker = None
         self._persistent_bg_config_hash = None
 
+        # Background model builder thread
+        self._bg_build_worker = None
+
         # GPU state
         self.use_gpu = False
         self._selected_gpu_device = 'auto'
@@ -1890,10 +1958,15 @@ class SimpleTrackerGUI(QMainWindow):
         # Worker thread
         self.tracking_worker = None
 
-        # Debounce timer for preview
+        # Debounce timer for preview (param changes)
         self.preview_update_timer = QTimer()
         self.preview_update_timer.setSingleShot(True)
         self.preview_update_timer.timeout.connect(self.update_preview_with_current_settings)
+
+        # Debounce timer for frame-scrubbing during detection overlay
+        self.scrub_preview_timer = QTimer()
+        self.scrub_preview_timer.setSingleShot(True)
+        self.scrub_preview_timer.timeout.connect(self._do_scrub_detection_frame)
 
         # Apply theme with runtime arrow images
         self._create_arrow_images()
@@ -2044,11 +2117,12 @@ class SimpleTrackerGUI(QMainWindow):
         sc_right.activated.connect(self._shortcut_next_frame)
 
     def _shortcut_toggle_detection_overlay(self):
-        """Toggle detection overlay (V key). Guard against spin box focus."""
+        """Toggle background subtraction detection overlay (V key). Guard against spin box focus."""
         w = self.focusWidget()
         if isinstance(w, (QSpinBox, QDoubleSpinBox, QComboBox)):
             return
-        self.btn_detection_overlay.toggle()
+        if self.btn_bg_toggle.isEnabled():
+            self.btn_bg_toggle.toggle()
 
     def _shortcut_prev_frame(self):
         """Step frame slider back by 1 (Left arrow)."""
@@ -2377,24 +2451,31 @@ class SimpleTrackerGUI(QMainWindow):
             format_fn=lambda v: str(v),
         )
 
-        # Apply Background Subtraction button
-        self.btn_apply_bg = QPushButton("Apply Background Subtraction")
-        self.btn_apply_bg.setToolTip(
-            "Build the background model with the current\n"
-            "Sensitivity and History settings. You must apply\n"
-            "before the detection overlay will work."
+        # Background Subtraction toggle (builds model + shows overlay in one click)
+        self.btn_bg_toggle = QPushButton("Background Subtraction")
+        self.btn_bg_toggle.setCheckable(True)
+        self.btn_bg_toggle.setToolTip(
+            "Toggle background subtraction detection overlay (shortcut: V).\n\n"
+            "ON  — builds the background model and shows detected blobs.\n"
+            "OFF — returns to the raw video view.\n\n"
+            "After changing Sensitivity or History, toggle off then on to\n"
+            "rebuild the model with the new settings."
         )
-        self.btn_apply_bg.setStyleSheet("""
+        self.btn_bg_toggle.setStyleSheet("""
             QPushButton {
-                background-color: #0078d4; color: white; border: none;
+                background-color: #333333; color: #cccccc; border: 1px solid #444444;
                 padding: 6px 12px; border-radius: 4px; font-weight: 600;
             }
-            QPushButton:hover { background-color: #1a8ae8; }
-            QPushButton:disabled { background-color: #333333; color: #666666; }
+            QPushButton:hover { background-color: #3f3f46; border-color: #555555; }
+            QPushButton:checked {
+                background-color: #8b5cf6; color: white; border-color: #a78bfa;
+            }
+            QPushButton:checked:hover { background-color: #7c3aed; }
+            QPushButton:disabled { background-color: #2a2a2a; color: #555555; border-color: #333333; }
         """)
-        self.btn_apply_bg.setEnabled(False)
-        self.btn_apply_bg.clicked.connect(self._on_apply_bg_subtraction)
-        settings_layout.addWidget(self.btn_apply_bg)
+        self.btn_bg_toggle.setEnabled(False)
+        self.btn_bg_toggle.toggled.connect(self._on_bg_toggle_clicked)
+        settings_layout.addWidget(self.btn_bg_toggle)
 
         self.bg_status_label = QLabel("")
         self.bg_status_label.setStyleSheet("color: #999999; font-size: 9px;")
@@ -2621,35 +2702,8 @@ class SimpleTrackerGUI(QMainWindow):
         gpu_row.addStretch()
         settings_layout.addLayout(gpu_row)
 
-        # ── Detection Overlay Toggle (V key) ─────────────────────────────
-        overlay_tip = (
-            "Toggle Detection Overlay (shortcut: V).\n"
-            "Shows exactly what the tracker detects:\n"
-            "  White pixels = detected foreground (blobs)\n"
-            "  Black pixels = eliminated background\n"
-            "  Green dots = blob centroids with IDs\n\n"
-            "You must Apply Background Subtraction first.\n"
-            "Scrub the frame slider to see detection in real-time."
-        )
-        self.btn_detection_overlay = QPushButton("Detection Overlay (V)")
-        self.btn_detection_overlay.setCheckable(True)
-        self.btn_detection_overlay.setToolTip(overlay_tip)
-        self.btn_detection_overlay.setStyleSheet("""
-            QPushButton {
-                background-color: #333333; color: #cccccc; border: 1px solid #444444;
-                padding: 6px 12px; border-radius: 4px; font-weight: 600;
-            }
-            QPushButton:hover { background-color: #3f3f46; border-color: #555555; }
-            QPushButton:checked {
-                background-color: #8b5cf6; color: white; border-color: #a78bfa;
-            }
-            QPushButton:checked:hover { background-color: #7c3aed; }
-        """)
-        self.btn_detection_overlay.toggled.connect(self._on_detection_overlay_toggled)
-        settings_layout.addWidget(self.btn_detection_overlay)
-
         # ── Shortcut hint ─────────────────────────────────────────────────
-        hint_label = QLabel("V = overlay  •  ←→ = step frames")
+        hint_label = QLabel("V = toggle detection  •  ←→ = step frames")
         hint_label.setStyleSheet(
             "color: #555555; font-size: 9px; padding: 2px 0; background: transparent;"
         )
@@ -2660,35 +2714,76 @@ class SimpleTrackerGUI(QMainWindow):
 
     # ── Section 4 Event Handlers ──────────────────────────────────────────
 
-    def _on_detection_overlay_toggled(self, checked):
-        """Handle detection overlay toggle (V key or button click)."""
-        self.detection_overlay_active = checked
-        # Styling handled by QPushButton:checked in the button's stylesheet
-        self._schedule_preview_update()
-
-    def _on_apply_bg_subtraction(self):
-        """Build background model with current sensitivity/history settings."""
+    def _on_bg_toggle_clicked(self, checked):
+        """Handle the background subtraction toggle button."""
         if not self.video_configs:
+            self.btn_bg_toggle.blockSignals(True)
+            self.btn_bg_toggle.setChecked(False)
+            self.btn_bg_toggle.blockSignals(False)
+            return
+
+        if not checked:
+            # Turn off: hide overlay, show raw frame
+            self.detection_overlay_active = False
+            self._schedule_preview_update()
+            self.bg_status_label.setText("")
+            self.bg_status_label.setStyleSheet("color: #999999; font-size: 9px;")
+            return
+
+        # Turn on: build model if needed, then enable overlay
+        self._update_current_config()
+        config = self.video_configs[self.current_config_idx]
+        config_hash = self._get_detection_config_hash(config)
+
+        if (self._persistent_tracker is not None
+                and self._persistent_bg_config_hash == config_hash):
+            # Reuse existing model
+            self.detection_overlay_active = True
+            self.bg_status_label.setText("✓ Background model ready")
+            self.bg_status_label.setStyleSheet("color: #90EE90; font-size: 9px;")
+            self._schedule_preview_update()
+            return
+
+        # Need to (re)build — start background thread
+        if self._bg_build_worker and self._bg_build_worker.isRunning():
+            return
+
+        self._invalidate_persistent_tracker()
+        self.btn_bg_toggle.setEnabled(False)
+        self.bg_status_label.setText("Building background model…")
+        self.bg_status_label.setStyleSheet("color: #FFA500; font-size: 9px;")
+
+        worker = BgModelBuilderWorker(config, self.use_gpu)
+        worker.finished.connect(self._on_bg_model_built)
+        worker.error.connect(self._on_bg_model_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._bg_build_worker = worker
+        worker.start()
+
+    def _on_bg_model_built(self, tracker):
+        """Receive finished tracker from the background builder thread."""
+        if not self.video_configs:
+            tracker.cleanup()
             return
         config = self.video_configs[self.current_config_idx]
-        self._update_current_config()
-        self._invalidate_persistent_tracker()
-        self.bg_status_label.setText("Building background model...")
-        self.bg_status_label.setStyleSheet("color: #FFA500; font-size: 9px;")
-        QApplication.processEvents()
+        self._persistent_tracker = tracker
+        self._persistent_bg_config_hash = self._get_detection_config_hash(config)
+        self.detection_overlay_active = True
+        self.btn_bg_toggle.setEnabled(True)
+        self.bg_status_label.setText("✓ Background model ready")
+        self.bg_status_label.setStyleSheet("color: #90EE90; font-size: 9px;")
+        self.status_bar.showMessage("Background model ready")
+        self._schedule_preview_update()
 
-        try:
-            tracker = self._get_or_create_persistent_tracker(config)
-            self.bg_status_label.setText("✓ Background model applied")
-            self.bg_status_label.setStyleSheet("color: #90EE90; font-size: 9px;")
-            # Auto-enable detection overlay after applying
-            if not self.detection_overlay_active:
-                self.btn_detection_overlay.setChecked(True)
-            else:
-                self._schedule_preview_update()
-        except Exception as e:
-            self.bg_status_label.setText(f"Error: {e}")
-            self.bg_status_label.setStyleSheet("color: #ff6666; font-size: 9px;")
+    def _on_bg_model_error(self, msg):
+        """Handle background model build error."""
+        self.btn_bg_toggle.blockSignals(True)
+        self.btn_bg_toggle.setChecked(False)
+        self.btn_bg_toggle.blockSignals(False)
+        self.btn_bg_toggle.setEnabled(True)
+        self.bg_status_label.setText(f"Error: {msg}")
+        self.bg_status_label.setStyleSheet("color: #ff6666; font-size: 9px;")
 
     def _on_gpu_toggle(self, checked):
         """Handle GPU acceleration checkbox toggle."""
@@ -2787,8 +2882,13 @@ class SimpleTrackerGUI(QMainWindow):
         """Handle release of BG-model sliders (sensitivity, history) — needs model rebuild."""
         self._invalidate_persistent_tracker()
         self._update_current_config()
-        # Signal that BG model needs re-application
-        self.bg_status_label.setText("Settings changed — click Apply")
+        # Turn off overlay and inform user to re-toggle
+        if self.btn_bg_toggle.isChecked():
+            self.btn_bg_toggle.blockSignals(True)
+            self.btn_bg_toggle.setChecked(False)
+            self.btn_bg_toggle.blockSignals(False)
+            self.detection_overlay_active = False
+        self.bg_status_label.setText("Settings changed — toggle to re-apply")
         self.bg_status_label.setStyleSheet("color: #FFA500; font-size: 9px;")
         self._schedule_preview_update()
 
@@ -2895,7 +2995,7 @@ class SimpleTrackerGUI(QMainWindow):
         self.sensitivity_slider.setEnabled(True)
         self.history_slider.setEnabled(True)
         self.polarity_combo.setEnabled(True)
-        self.btn_apply_bg.setEnabled(True)
+        self.btn_bg_toggle.setEnabled(True)
         # Enable refinement sliders respecting toggle state
         self.threshold_refine_slider.setEnabled(self.threshold_refine_toggle.isChecked())
         self.median_slider.setEnabled(self.median_toggle.isChecked())
@@ -2912,7 +3012,7 @@ class SimpleTrackerGUI(QMainWindow):
         self.sensitivity_slider.setEnabled(False)
         self.history_slider.setEnabled(False)
         self.polarity_combo.setEnabled(False)
-        self.btn_apply_bg.setEnabled(False)
+        self.btn_bg_toggle.setEnabled(False)
         # Disable all refinement sliders
         self.threshold_refine_slider.setEnabled(False)
         self.median_slider.setEnabled(False)
@@ -3187,28 +3287,28 @@ class SimpleTrackerGUI(QMainWindow):
     def _create_section_export_options(self):
         group = QGroupBox("5. Export Options")
         layout = QVBoxLayout()
+        layout.setSpacing(6)
 
-        self.chk_save_coords = DarkCheckBox("Save Position Coordinates CSV")
-        self.chk_save_coords.setChecked(True)
-        layout.addWidget(self.chk_save_coords)
+        # All standard outputs (coords, ROI CSVs, config JSON, plots) are always
+        # exported — no checkbox needed.
+        always_label = QLabel(
+            "Position CSV, ROI CSVs, tracking plots, and config JSON are\n"
+            "always saved automatically."
+        )
+        always_label.setStyleSheet("color: #666666; font-size: 9px; background: transparent;")
+        layout.addWidget(always_label)
 
-        self.chk_save_occupancy = DarkCheckBox("Save ROI Occupancy CSV")
-        self.chk_save_occupancy.setChecked(True)
-        layout.addWidget(self.chk_save_occupancy)
+        # Interpolate tracks — above video options
+        self.chk_interpolate = DarkCheckBox("Interpolate tracks (fill gaps)")
+        self.chk_interpolate.setChecked(True)
+        self.chk_interpolate.setToolTip(
+            "Fill short gaps in trajectories using linear interpolation.\n"
+            "Useful when animals are briefly occluded or missed."
+        )
+        layout.addWidget(self.chk_interpolate)
 
-        self.chk_save_summary = DarkCheckBox("Save ROI Summary CSV")
-        self.chk_save_summary.setChecked(True)
-        layout.addWidget(self.chk_save_summary)
-
-        self.chk_save_config = DarkCheckBox("Save Configuration JSON")
-        self.chk_save_config.setChecked(True)
-        layout.addWidget(self.chk_save_config)
-
-        self.chk_save_plots = DarkCheckBox("Save Tracking Plots")
-        self.chk_save_plots.setChecked(True)
-        layout.addWidget(self.chk_save_plots)
-
-        self.chk_tracked_video = DarkCheckBox("Create Tracked Video")
+        # Tracked video toggle
+        self.chk_tracked_video = DarkCheckBox("Create tracked video")
         self.chk_tracked_video.setChecked(True)
         self.chk_tracked_video.stateChanged.connect(self._on_tracked_video_toggled)
         layout.addWidget(self.chk_tracked_video)
@@ -3243,15 +3343,7 @@ class SimpleTrackerGUI(QMainWindow):
         trail_h.addStretch()
         vopts.addLayout(trail_h)
 
-        self.chk_data_view = DarkCheckBox("Data view (video + live stats)")
-        self.chk_data_view.setChecked(True)
-        vopts.addWidget(self.chk_data_view)
-
         layout.addWidget(self.video_opts_widget)
-
-        self.chk_interpolate = DarkCheckBox("Interpolate tracks (fill gaps)")
-        self.chk_interpolate.setChecked(True)
-        layout.addWidget(self.chk_interpolate)
 
         group.setLayout(layout)
         self.left_layout.addWidget(group)
@@ -3369,19 +3461,19 @@ class SimpleTrackerGUI(QMainWindow):
         )
 
     def _sync_export_options(self, config):
-        """Sync export option checkboxes to config."""
-        config.save_position_coords = self.chk_save_coords.isChecked()
-        config.save_roi_occupancy = self.chk_save_occupancy.isChecked()
-        config.save_roi_summary = self.chk_save_summary.isChecked()
-        config.save_config = self.chk_save_config.isChecked()
-        config.save_tracking_plots = self.chk_save_plots.isChecked()
+        """Sync export options to config. Standard outputs are always enabled."""
+        config.save_position_coords = True
+        config.save_roi_occupancy = True
+        config.save_roi_summary = True
+        config.save_config = True
+        config.save_tracking_plots = True
+        config.save_data_view = False
         config.create_tracked_video = self.chk_tracked_video.isChecked()
         config.show_tracking_area = self.chk_show_area.isChecked()
         config.show_rois = self.chk_show_rois.isChecked()
         config.show_blob_ids = self.chk_show_ids.isChecked()
         config.show_trail = self.chk_show_trail.isChecked()
         config.trail_length = self.trail_length_spin.value()
-        config.save_data_view = self.chk_data_view.isChecked()
         config.interpolate_tracks = self.chk_interpolate.isChecked()
         # overwrite_files is now handled by the dialog prompt in start_batch_tracking
 
@@ -3960,8 +4052,12 @@ class SimpleTrackerGUI(QMainWindow):
 
     # ── Frame Display & Navigation ────────────────────────────────────────
 
-    def display_frame(self, frame: np.ndarray):
-        """Display frame in preview label."""
+    def display_frame(self, frame: np.ndarray, smooth: bool = False):
+        """Display frame in preview label.
+
+        Uses FastTransformation by default for responsive scrubbing on high-DPI
+        displays (Retina / M-series Macs). Pass smooth=True for a final still frame.
+        """
         height, width = frame.shape[:2]
         channels = frame.shape[2] if len(frame.shape) == 3 else 1
         if channels == 1:
@@ -3970,8 +4066,9 @@ class SimpleTrackerGUI(QMainWindow):
         bytes_per_line = 3 * width
         q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(q_image)
+        transform = Qt.SmoothTransformation if smooth else Qt.FastTransformation
         scaled_pixmap = pixmap.scaled(
-            self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            self.preview_label.size(), Qt.KeepAspectRatio, transform
         )
         self.preview_label.setPixmap(scaled_pixmap)
 
@@ -3983,11 +4080,20 @@ class SimpleTrackerGUI(QMainWindow):
         config.current_frame_idx = frame_idx
         self.frame_label.setText(f"{frame_idx} / {config.total_frames}")
 
-        # If detection overlay is active, use the fast persistent-tracker path
         if self.detection_overlay_active and not self.drawing_mode:
-            self._update_detection_frame(frame_idx)
+            # Debounce detection rendering — show raw frame instantly, then
+            # overlay after 60 ms to keep dragging smooth on M-series Macs.
+            self._load_and_show_frame(frame_idx)
+            self.scrub_preview_timer.start(60)
         else:
             self._load_and_show_frame(frame_idx)
+
+    def _do_scrub_detection_frame(self):
+        """Called by scrub_preview_timer — renders the detection overlay for the current frame."""
+        if not self.video_configs or not self.detection_overlay_active:
+            return
+        config = self.video_configs[self.current_config_idx]
+        self._update_detection_frame(config.current_frame_idx)
 
     def _load_and_show_frame(self, frame_idx):
         """Load a specific frame and display it (no detection)."""
@@ -4027,78 +4133,16 @@ class SimpleTrackerGUI(QMainWindow):
         ))
 
     def _get_or_create_persistent_tracker(self, config):
-        """Get or create a persistent tracker with a pre-built background model.
+        """Return the cached persistent tracker, or None if not yet built.
 
-        The background model is built once from the first 100 frames.
-        Subsequent calls reuse it for instant detection via learningRate=0.
+        Model building is now done asynchronously by BgModelBuilderWorker —
+        callers should check for None and bail out rather than blocking.
         """
         config_hash = self._get_detection_config_hash(config)
-
         if (self._persistent_tracker is not None
                 and self._persistent_bg_config_hash == config_hash):
             return self._persistent_tracker
-
-        # Cleanup old tracker
-        if self._persistent_tracker is not None:
-            self._persistent_tracker.cleanup()
-
-        tracker = BackgroundSubtractionTracker(
-            video_path=config.video_path,
-            min_object_area=config.min_object_area,
-            max_object_area=config.max_object_area,
-            history=config.history,
-            var_threshold=config.var_threshold,
-            num_animals=config.num_animals,
-            morph_open_size=config.morph_open_size,
-            morph_close_size=config.morph_close_size,
-            morph_open_iterations=config.morph_open_iterations,
-            morph_close_iterations=config.morph_close_iterations,
-            erosion_size=config.erosion_size,
-            gaussian_blur_size=config.gaussian_blur_size,
-            median_filter_size=config.median_filter_size,
-            fill_holes=config.fill_holes,
-            convex_hull=config.convex_hull,
-            use_gpu=self.use_gpu,
-            threshold=config.threshold,
-            invert=config.invert,
-            threshold_enabled=config.threshold_enabled,
-            median_enabled=config.median_enabled,
-            erosion_enabled=config.erosion_enabled,
-            opening_enabled=config.opening_enabled,
-            closing_enabled=config.closing_enabled,
-            blur_enabled=config.blur_enabled,
-        )
-        tracker.initialize_video()
-
-        # Build background model from frames sampled across the ENTIRE video.
-        # This ensures the model captures the true background even if the
-        # animal is stationary at the start/end of the recording.
-        n_sample = min(200, tracker.total_frames)
-        total = tracker.total_frames
-        self.status_bar.showMessage(f"Building background model ({n_sample} frames across video)...")
-        QApplication.processEvents()
-
-        if total <= n_sample:
-            # Short video — just read all frames sequentially
-            sample_indices = list(range(total))
-        else:
-            # Uniformly sample frame indices across the entire video
-            sample_indices = [int(i * total / n_sample) for i in range(n_sample)]
-
-        for frame_idx in sample_indices:
-            tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = tracker.cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-            if config.tracking_area:
-                gray = tracker.apply_roi_mask(gray, config.tracking_area)
-            tracker.bg_subtractor.apply(gray)
-
-        self._persistent_tracker = tracker
-        self._persistent_bg_config_hash = config_hash
-        self.status_bar.showMessage("Background model ready")
-        return tracker
+        return None
 
     def _update_detection_frame(self, frame_idx):
         """Fast detection preview on a single frame using persistent tracker.
@@ -4112,6 +4156,8 @@ class SimpleTrackerGUI(QMainWindow):
 
         try:
             tracker = self._get_or_create_persistent_tracker(config)
+            if tracker is None:
+                return  # Model not built yet — caller should not have invoked this
 
             # Seek and read target frame
             tracker.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)

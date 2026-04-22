@@ -75,6 +75,8 @@ class USVDetectorConfig:
 
     # Adaptive threshold parameters
     noise_percentile: float = 25.0      # Percentile for background noise estimate
+    noise_block_seconds: float = 0.0    # If > 0, compute noise floor per N-second block
+                                        # (time-varying) instead of once per file.
 
     # Batch processing
     chunk_duration_s: float = 10.0      # Process in 10-second chunks (finer progress updates)

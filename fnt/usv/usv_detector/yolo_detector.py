@@ -14,6 +14,7 @@ training and inference, ensuring pixel-level consistency.
 
 import json
 import os
+import random
 import shutil
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -30,11 +31,25 @@ from .spectrogram import compute_spectrogram, load_audio
 # Project Configuration
 # =============================================================================
 
+PROJECT_INFO_FILENAME = 'project_info.json'
+LEGACY_CONFIG_FILENAME = 'project_config.json'
+
+
 @dataclass
 class YOLOProjectConfig:
-    """Configuration for a YOLO USV detection project."""
+    """Configuration for a YOLO USV detection project (SLEAP-style).
+
+    A project lives in its own directory (default ``~/fnt_projects/<name>/``)
+    and points at one or more *source_folders* of .wav files. The project owns
+    the trained model, dataset tiles, and training runs; **labels do not live
+    here** — they are sibling CSVs next to each wav (see ``labels_io``).
+    """
     project_dir: str = ""
-    tile_size: Tuple[int, int] = (640, 640)
+    project_name: str = ""
+    source_folders: List[str] = field(default_factory=list)
+    last_opened_file: Optional[str] = None
+
+    tile_size: Tuple[int, int] = (1280, 1280)
     tile_time_window_s: float = 0.5       # Time span per tile in seconds
     tile_overlap_fraction: float = 0.25   # Overlap between inference tiles
     tile_padding_s: float = 0.05          # Padding around labeled regions
@@ -51,30 +66,65 @@ class YOLOProjectConfig:
     # Colormap
     colormap: str = 'viridis'
 
+    # Model + training
+    model_variant: str = 'yolo11s.pt'     # Ultralytics auto-downloads; yolo11n/s/m/l/x or yolov8n
+    imgsz: int = 1280                     # Training/inference image size; 1280 is SOTA for small objects
+    val_fraction: float = 0.20            # Fraction of tiles held out for validation (stratified per source file)
+
     # Inference
-    confidence_threshold: float = 0.25
-    iou_threshold: float = 0.5           # NMS IoU threshold
+    confidence_threshold: float = 0.15    # Low default favors recall; user accepts/rejects downstream
+    iou_threshold: float = 0.5            # NMS IoU threshold
+    use_sahi: bool = True                 # Slicing Aided Hyper Inference for small-object recall
 
     # Model history: list of {name, n_positive, n_negative, path, date}
     models: List[Dict] = field(default_factory=list)
 
+    # Schema version; bump when incompatible changes are made.
+    schema_version: int = 2
+
     def save(self, path: Optional[str] = None):
-        """Save config to JSON."""
+        """Save config to the canonical ``project_info.json``.
+
+        If ``path`` is omitted, writes to ``<project_dir>/project_info.json``.
+        """
         if path is None:
-            path = os.path.join(self.project_dir, 'project_config.json')
+            path = os.path.join(self.project_dir, PROJECT_INFO_FILENAME)
+        # Keep the derived project name in sync with the folder basename on
+        # every save so renames-on-disk are picked up automatically.
+        if self.project_dir and not self.project_name:
+            self.project_name = os.path.basename(os.path.normpath(self.project_dir))
         data = asdict(self)
-        # Convert tuple to list for JSON
         data['tile_size'] = list(data['tile_size'])
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
 
     @classmethod
     def load(cls, path: str) -> 'YOLOProjectConfig':
-        """Load config from JSON."""
+        """Load config from JSON, tolerating missing newer fields for back-compat.
+
+        ``path`` may point at a ``project_info.json`` file *or* at the project
+        directory itself; in the latter case we look for either the canonical
+        name or the legacy ``project_config.json``.
+        """
+        if os.path.isdir(path):
+            candidate = os.path.join(path, PROJECT_INFO_FILENAME)
+            if not os.path.exists(candidate):
+                candidate = os.path.join(path, LEGACY_CONFIG_FILENAME)
+            path = candidate
         with open(path) as f:
             data = json.load(f)
-        data['tile_size'] = tuple(data.get('tile_size', [640, 640]))
-        return cls(**data)
+        data['tile_size'] = tuple(data.get('tile_size', [1280, 1280]))
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        data = {k: v for k, v in data.items() if k in known}
+        cfg = cls(**data)
+        # Backfill project_dir / project_name if the file was loaded from disk
+        # at a path we recognize — surprising absences are common in older v1
+        # configs.
+        if not cfg.project_dir:
+            cfg.project_dir = os.path.dirname(os.path.abspath(path))
+        if not cfg.project_name and cfg.project_dir:
+            cfg.project_name = os.path.basename(os.path.normpath(cfg.project_dir))
+        return cfg
 
 
 # =============================================================================
@@ -410,10 +460,22 @@ def export_training_data(
     """
     from PIL import Image
 
-    images_dir = os.path.join(output_dir, 'images')
-    labels_dir = os.path.join(output_dir, 'labels')
-    os.makedirs(images_dir, exist_ok=True)
-    os.makedirs(labels_dir, exist_ok=True)
+    val_fraction = float(getattr(config, 'val_fraction', 0.20))
+    val_fraction = max(0.0, min(0.5, val_fraction))
+
+    split_dirs = {
+        'train': {
+            'images': os.path.join(output_dir, 'train', 'images'),
+            'labels': os.path.join(output_dir, 'train', 'labels'),
+        },
+        'val': {
+            'images': os.path.join(output_dir, 'val', 'images'),
+            'labels': os.path.join(output_dir, 'val', 'labels'),
+        },
+    }
+    for split in split_dirs.values():
+        os.makedirs(split['images'], exist_ok=True)
+        os.makedirs(split['labels'], exist_ok=True)
 
     colormap_lut = create_colormap_lut(config.colormap)
 
@@ -421,6 +483,8 @@ def export_training_data(
     total_positive = 0
     total_negative = 0
     files_with_labels = 0
+    n_train = 0
+    n_val = 0
 
     total_files = len(audio_files)
 
@@ -461,27 +525,27 @@ def export_training_data(
         nyquist = sr / 2.0
         total_duration = len(audio) / sr
 
-        # --- Process positive detections ---
+        # --- Build the full list of tile work-items for this file ---
+        # Each item: (kind, tile_start, tile_end, cluster_or_none)
+        #   kind='pos' with cluster, or kind='neg' with cluster=None
+        tile_items: List[Tuple[str, float, float, Optional[List[Dict]]]] = []
+
         if positive_dets:
             clusters = _cluster_detections_by_time(positive_dets, config.tile_padding_s)
 
             for cluster in clusters:
-                # Determine tile time span from cluster
                 cluster_start = min(d['start_seconds'] for d in cluster) - config.tile_padding_s
                 cluster_stop = max(d['stop_seconds'] for d in cluster) + config.tile_padding_s
 
-                # Ensure minimum tile width
                 cluster_duration = cluster_stop - cluster_start
                 if cluster_duration < config.tile_time_window_s:
                     center = (cluster_start + cluster_stop) / 2
                     cluster_start = center - config.tile_time_window_s / 2
                     cluster_stop = center + config.tile_time_window_s / 2
 
-                # Clamp to audio bounds
                 cluster_start = max(0, cluster_start)
                 cluster_stop = min(total_duration, cluster_stop)
 
-                # If tile is wider than tile_time_window_s, split into multiple tiles
                 tile_starts = []
                 if cluster_stop - cluster_start <= config.tile_time_window_s * 1.5:
                     tile_starts.append(cluster_start)
@@ -494,48 +558,12 @@ def export_training_data(
 
                 for tile_start in tile_starts:
                     tile_end = min(tile_start + config.tile_time_window_s, total_duration)
+                    tile_items.append(('pos', tile_start, tile_end, cluster))
 
-                    # Render tile
-                    image_rgb, freqs, times = render_spectrogram_tile(
-                        audio, sr, tile_start, tile_end,
-                        tile_size=config.tile_size,
-                        nperseg=config.nperseg, noverlap=config.noverlap,
-                        nfft=config.nfft,
-                        db_min=config.db_min, db_max=config.db_max,
-                        colormap_lut=colormap_lut,
-                    )
-
-                    # Generate YOLO annotations for detections in this tile
-                    annotations = []
-                    for det in cluster:
-                        box = detection_to_yolo_box(
-                            det['start_seconds'], det['stop_seconds'],
-                            det['min_freq_hz'], det['max_freq_hz'],
-                            tile_start, tile_end, 0, nyquist,
-                            class_id=0,
-                        )
-                        if box is not None:
-                            annotations.append(box)
-                            total_positive += 1
-
-                    # Save image and label
-                    tile_name = f"tile_{tile_idx:06d}"
-                    img = Image.fromarray(image_rgb, 'RGB')
-                    img.save(os.path.join(images_dir, f"{tile_name}.png"))
-
-                    label_path = os.path.join(labels_dir, f"{tile_name}.txt")
-                    with open(label_path, 'w') as f:
-                        for ann in annotations:
-                            f.write(f"{ann[0]} {ann[1]:.6f} {ann[2]:.6f} {ann[3]:.6f} {ann[4]:.6f}\n")
-
-                    tile_idx += 1
-
-        # --- Process negative (background) regions ---
         for neg_det in negative_dets:
             neg_start = neg_det['start_seconds'] - config.tile_padding_s
             neg_stop = neg_det['stop_seconds'] + config.tile_padding_s
 
-            # Ensure minimum tile width
             neg_duration = neg_stop - neg_start
             if neg_duration < config.tile_time_window_s:
                 center = (neg_start + neg_stop) / 2
@@ -544,10 +572,25 @@ def export_training_data(
 
             neg_start = max(0, neg_start)
             neg_stop = min(total_duration, neg_stop)
+            tile_items.append(('neg', neg_start, neg_stop, None))
 
-            # Render tile
+        # --- Stratified per-file train/val split (reproducible) ---
+        n_items = len(tile_items)
+        val_indices: set = set()
+        if val_fraction > 0 and n_items >= 2:
+            n_val_for_file = max(1, int(round(n_items * val_fraction)))
+            n_val_for_file = min(n_val_for_file, n_items - 1)  # always keep at least one train
+            rng = random.Random(hash(filepath) & 0xFFFFFFFF)
+            shuffled = list(range(n_items))
+            rng.shuffle(shuffled)
+            val_indices = set(shuffled[:n_val_for_file])
+
+        # --- Render + write each tile ---
+        for local_idx, (kind, tile_start, tile_end, cluster) in enumerate(tile_items):
+            split = 'val' if local_idx in val_indices else 'train'
+
             image_rgb, freqs, times = render_spectrogram_tile(
-                audio, sr, neg_start, neg_stop,
+                audio, sr, tile_start, tile_end,
                 tile_size=config.tile_size,
                 nperseg=config.nperseg, noverlap=config.noverlap,
                 nfft=config.nfft,
@@ -555,18 +598,35 @@ def export_training_data(
                 colormap_lut=colormap_lut,
             )
 
-            # Save image with EMPTY label file (background — no annotations)
+            annotations = []
+            if kind == 'pos' and cluster is not None:
+                for det in cluster:
+                    box = detection_to_yolo_box(
+                        det['start_seconds'], det['stop_seconds'],
+                        det['min_freq_hz'], det['max_freq_hz'],
+                        tile_start, tile_end, 0, nyquist,
+                        class_id=0,
+                    )
+                    if box is not None:
+                        annotations.append(box)
+                        total_positive += 1
+            else:
+                total_negative += 1
+
             tile_name = f"tile_{tile_idx:06d}"
             img = Image.fromarray(image_rgb, 'RGB')
-            img.save(os.path.join(images_dir, f"{tile_name}.png"))
+            img.save(os.path.join(split_dirs[split]['images'], f"{tile_name}.png"))
 
-            # Empty label file = pure background for YOLO
-            label_path = os.path.join(labels_dir, f"{tile_name}.txt")
+            label_path = os.path.join(split_dirs[split]['labels'], f"{tile_name}.txt")
             with open(label_path, 'w') as f:
-                pass  # Empty file
+                for ann in annotations:
+                    f.write(f"{ann[0]} {ann[1]:.6f} {ann[2]:.6f} {ann[3]:.6f} {ann[4]:.6f}\n")
 
             tile_idx += 1
-            total_negative += 1
+            if split == 'val':
+                n_val += 1
+            else:
+                n_train += 1
 
     if progress_callback:
         progress_callback("Export complete", total_files, total_files)
@@ -575,6 +635,8 @@ def export_training_data(
         'n_positive': total_positive,
         'n_negative': total_negative,
         'n_tiles': tile_idx,
+        'n_train': n_train,
+        'n_val': n_val,
         'n_files': files_with_labels,
     }
 
@@ -591,10 +653,23 @@ def write_yolo_dataset_yaml(project_dir: str, dataset_dir: str) -> str:
         Path to the written data.yaml file
     """
     yaml_path = os.path.join(project_dir, 'data.yaml')
+
+    # Prefer new split layout (train/images, val/images). Fall back to the
+    # legacy flat layout (images/) when that's all that exists so old projects
+    # keep working without a re-export.
+    train_images = os.path.join(dataset_dir, 'train', 'images')
+    val_images = os.path.join(dataset_dir, 'val', 'images')
+    if os.path.isdir(train_images) and os.path.isdir(val_images):
+        train_rel = 'train/images'
+        val_rel = 'val/images'
+    else:
+        train_rel = 'images'
+        val_rel = 'images'
+
     content = {
         'path': os.path.abspath(dataset_dir),
-        'train': 'images',
-        'val': 'images',  # Same as train for small initial datasets
+        'train': train_rel,
+        'val': val_rel,
         'nc': 1,
         'names': ['usv_call'],
     }
@@ -622,12 +697,20 @@ def train_yolo_model(
     device: str = 'auto',
     pretrained_weights: Optional[str] = None,
     progress_callback=None,
+    epoch_callback=None,
+    model_variant: str = 'yolo11s.pt',
+    imgsz: int = 1280,
 ) -> str:
     """
-    Train a YOLOv8-nano model for USV detection.
+    Train a YOLO model for USV detection.
 
     Uses automatic early stopping (SLEAP-style): training runs up to a high
     epoch ceiling but stops when validation loss plateaus for `patience` epochs.
+
+    Augmentations are tuned for spectrograms: frequency-axis flip (flipud) and
+    mosaic are disabled because the vertical axis has physical meaning and
+    mosaic splices distort call boundaries. Time-axis flip (fliplr) is also
+    disabled because FM-sweep direction is semantically meaningful.
 
     Args:
         dataset_yaml: Path to data.yaml
@@ -635,8 +718,13 @@ def train_yolo_model(
         model_name: Name for this training run
         device: PyTorch device ('auto', 'cuda:0', 'mps', 'cpu')
         pretrained_weights: Path to previous best.pt for fine-tuning,
-                           or None to start from yolov8n.pt
+                           or None to start from `model_variant` (ultralytics
+                           auto-downloads if not cached)
         progress_callback: Optional callback(epoch: int, total_epochs: int, metrics: dict)
+        model_variant: Ultralytics weights identifier (e.g. 'yolo11n.pt',
+                       'yolo11s.pt', 'yolo11m.pt', 'yolov8n.pt')
+        imgsz: Training image size; 1280 is the community standard for
+               small-object detection on spectrograms
 
     Returns:
         Path to best.pt weights file
@@ -652,14 +740,42 @@ def train_yolo_model(
     if pretrained_weights and os.path.exists(pretrained_weights):
         model = YOLO(pretrained_weights)
     else:
-        model = YOLO('yolov8n.pt')
+        model = YOLO(model_variant)
+
+    # Register an epoch-end callback so the GUI can plot live metrics.
+    # `trainer.metrics` includes box/cls/dfl losses and mAP50, mAP50-95, P, R.
+    # `trainer.loss_items` adds raw per-epoch train losses we can surface.
+    if epoch_callback is not None:
+        def _on_fit_epoch_end(trainer):
+            try:
+                metrics = dict(getattr(trainer, 'metrics', {}) or {})
+                loss_items = getattr(trainer, 'loss_items', None)
+                if loss_items is not None:
+                    names = getattr(trainer, 'loss_names', None) or (
+                        'box_loss', 'cls_loss', 'dfl_loss'
+                    )
+                    try:
+                        vals = loss_items.detach().cpu().tolist()
+                    except Exception:
+                        vals = list(loss_items)
+                    for name, val in zip(names, vals):
+                        metrics.setdefault(f'train/{name}', float(val))
+                epoch_callback(int(getattr(trainer, 'epoch', 0)), metrics)
+            except Exception:
+                # Never let a plotting glitch take down training.
+                pass
+
+        try:
+            model.add_callback('on_fit_epoch_end', _on_fit_epoch_end)
+        except Exception:
+            pass
 
     # Train with high ceiling + early stopping on loss plateau
     os.makedirs(output_dir, exist_ok=True)
     results = model.train(
         data=dataset_yaml,
         epochs=500,           # High ceiling — early stopping controls actual duration
-        imgsz=640,
+        imgsz=imgsz,
         device=device,
         project=output_dir,
         name='train',
@@ -669,6 +785,10 @@ def train_yolo_model(
         patience=20,          # Stop after 20 epochs with no improvement
         save=True,
         plots=False,
+        # Spectrogram-appropriate augmentations
+        flipud=0.0,
+        fliplr=0.0,
+        mosaic=0.0,
     )
 
     # Return path to best weights
@@ -731,60 +851,145 @@ def _measure_detection_power(
 # YOLO Inference
 # =============================================================================
 
-def run_yolo_inference(
+def _run_sahi_inference(
     model_path: str,
-    audio_path: str,
+    audio: np.ndarray,
+    sr: int,
     config: YOLOProjectConfig,
-    confidence_threshold: Optional[float] = None,
+    conf: float,
+    device: str,
     progress_callback=None,
 ) -> List[Dict]:
     """
-    Run YOLO inference on an audio file.
+    Run SAHI (Slicing Aided Hyper Inference) on a full audio recording.
 
-    Chunks audio into overlapping tiles (matching training parameters),
-    runs the model on each tile, and converts predictions back to
-    time/frequency coordinates with cross-tile NMS.
+    Renders the recording as one or more long spectrogram segments at the same
+    pixels-per-second density as training tiles, then lets SAHI slice each
+    segment into tile-sized windows for prediction and merge results.
 
-    Args:
-        model_path: Path to trained YOLO weights (best.pt)
-        audio_path: Path to audio file
-        config: Project configuration (must match training config)
-        confidence_threshold: Override config threshold if provided
-        progress_callback: Optional callback(fraction: float)
-
-    Returns:
-        List of detection dicts ready for detections_df
+    This typically boosts small-object recall vs. naive tile loops
+    (SAHI paper: 31.8% -> 86.4% on COCO small-object benchmarks).
     """
-    from ultralytics import YOLO
-    from .gpu_utils import get_best_device
+    from sahi import AutoDetectionModel
+    from sahi.predict import get_sliced_prediction
 
-    conf = confidence_threshold if confidence_threshold is not None else config.confidence_threshold
+    detection_model = AutoDetectionModel.from_pretrained(
+        model_type='ultralytics',
+        model_path=model_path,
+        confidence_threshold=conf,
+        device=device,
+        image_size=max(config.tile_size),
+    )
 
-    # Load model
-    model = YOLO(model_path)
-    device = get_best_device()
-
-    # Load audio
-    audio, sr = load_audio(audio_path)
     nyquist = sr / 2.0
     total_duration = len(audio) / sr
-
     colormap_lut = create_colormap_lut(config.colormap)
 
-    # Generate overlapping tiles covering the entire file
+    tile_w, tile_h = config.tile_size
+    # Pixels-per-second derived from training tile density
+    px_per_sec = tile_w / config.tile_time_window_s
+    # Cap segment pixel width to keep peak RAM reasonable
+    max_segment_px = 8192
+    segment_duration = max(
+        config.tile_time_window_s,
+        min(30.0, max_segment_px / px_per_sec),
+    )
+    segment_px = max(tile_w, int(round(segment_duration * px_per_sec)))
+
+    # Overlap between adjacent segments so calls that straddle a boundary
+    # get picked up on at least one side
+    overlap_s = config.tile_time_window_s * config.tile_overlap_fraction
+    step_s = max(segment_duration - overlap_s, config.tile_time_window_s)
+
+    seg_starts: List[float] = []
+    t = 0.0
+    while True:
+        seg_starts.append(t)
+        if t + segment_duration >= total_duration:
+            break
+        t += step_s
+
+    all_detections: List[Dict] = []
+    n_segments = len(seg_starts)
+
+    for i, seg_start in enumerate(seg_starts):
+        if progress_callback:
+            progress_callback((i + 1) / n_segments)
+
+        seg_end = min(seg_start + segment_duration, total_duration)
+        seg_dur = seg_end - seg_start
+        seg_w_px = max(tile_w, int(round(seg_dur * px_per_sec)))
+
+        image_rgb, _freqs, _times = render_spectrogram_tile(
+            audio, sr, seg_start, seg_end,
+            tile_size=(seg_w_px, tile_h),
+            nperseg=config.nperseg, noverlap=config.noverlap,
+            nfft=config.nfft,
+            db_min=config.db_min, db_max=config.db_max,
+            colormap_lut=colormap_lut,
+        )
+
+        result = get_sliced_prediction(
+            image_rgb,
+            detection_model,
+            slice_height=tile_h,
+            slice_width=tile_w,
+            overlap_height_ratio=0.0,  # Full frequency range covered by tile height
+            overlap_width_ratio=config.tile_overlap_fraction,
+            postprocess_type='NMS',
+            postprocess_match_threshold=config.iou_threshold,
+            verbose=0,
+        )
+
+        img_h, img_w = image_rgb.shape[:2]
+        for pred in result.object_prediction_list:
+            bbox = pred.bbox
+            x_center = ((bbox.minx + bbox.maxx) / 2.0) / img_w
+            y_center = ((bbox.miny + bbox.maxy) / 2.0) / img_h
+            width = (bbox.maxx - bbox.minx) / img_w
+            height = (bbox.maxy - bbox.miny) / img_h
+
+            det = yolo_box_to_detection(
+                x_center, y_center, width, height,
+                float(pred.score.value),
+                seg_start, seg_end, 0, nyquist,
+            )
+            all_detections.append(det)
+
+    return all_detections
+
+
+def _run_tiled_inference(
+    model_path: str,
+    audio: np.ndarray,
+    sr: int,
+    config: YOLOProjectConfig,
+    conf: float,
+    device: str,
+    progress_callback=None,
+) -> List[Dict]:
+    """Legacy tiled inference path (pre-SAHI). Kept as a fallback."""
+    from ultralytics import YOLO
+
+    model = YOLO(model_path)
+    nyquist = sr / 2.0
+    total_duration = len(audio) / sr
+    colormap_lut = create_colormap_lut(config.colormap)
+
     tile_window = config.tile_time_window_s
     step = tile_window * (1 - config.tile_overlap_fraction)
 
-    tile_starts = []
+    tile_starts: List[float] = []
     t = 0.0
     while t < total_duration - tile_window * 0.25:
         tile_starts.append(t)
         t += step
-    # Ensure last tile reaches the end
-    if total_duration - tile_starts[-1] > tile_window * 0.25 if tile_starts else True:
-        tile_starts.append(max(0, total_duration - tile_window))
+    if not tile_starts:
+        tile_starts.append(0.0)
+    if total_duration - tile_starts[-1] > tile_window * 0.25:
+        tile_starts.append(max(0.0, total_duration - tile_window))
 
-    all_detections = []
+    all_detections: List[Dict] = []
     n_tiles = len(tile_starts)
 
     for i, tile_start in enumerate(tile_starts):
@@ -793,8 +998,7 @@ def run_yolo_inference(
         if progress_callback:
             progress_callback((i + 1) / n_tiles)
 
-        # Render tile (identical to training)
-        image_rgb, freqs, times = render_spectrogram_tile(
+        image_rgb, _freqs, _times = render_spectrogram_tile(
             audio, sr, tile_start, tile_end,
             tile_size=config.tile_size,
             nperseg=config.nperseg, noverlap=config.noverlap,
@@ -803,24 +1007,22 @@ def run_yolo_inference(
             colormap_lut=colormap_lut,
         )
 
-        # Run YOLO prediction
         results = model.predict(
             image_rgb,
             conf=conf,
             iou=config.iou_threshold,
+            imgsz=max(config.tile_size),
             device=device,
             verbose=False,
         )
 
-        # Convert predictions to time/freq detections
         if results and len(results) > 0:
             boxes = results[0].boxes
             if boxes is not None and len(boxes) > 0:
                 for box in boxes:
-                    xyxyn = box.xyxyn[0].cpu().numpy()  # normalized [x1, y1, x2, y2]
+                    xyxyn = box.xyxyn[0].cpu().numpy()
                     confidence = float(box.conf[0].cpu().numpy())
 
-                    # Convert xyxy to xywh center format
                     x_center = (xyxyn[0] + xyxyn[2]) / 2
                     y_center = (xyxyn[1] + xyxyn[3]) / 2
                     width = xyxyn[2] - xyxyn[0]
@@ -832,7 +1034,56 @@ def run_yolo_inference(
                     )
                     all_detections.append(det)
 
-    # Cross-tile NMS: remove duplicate detections from overlapping tiles
+    return all_detections
+
+
+def run_yolo_inference(
+    model_path: str,
+    audio_path: str,
+    config: YOLOProjectConfig,
+    confidence_threshold: Optional[float] = None,
+    progress_callback=None,
+) -> List[Dict]:
+    """
+    Run YOLO inference on an audio file.
+
+    Uses SAHI tiled inference by default (config.use_sahi=True) which boosts
+    small-object recall. Falls back to the legacy per-tile loop otherwise.
+
+    Args:
+        model_path: Path to trained YOLO weights (best.pt)
+        audio_path: Path to audio file
+        config: Project configuration (must match training config)
+        confidence_threshold: Override config threshold if provided
+        progress_callback: Optional callback(fraction: float)
+
+    Returns:
+        List of detection dicts ready for detections_df
+    """
+    from .gpu_utils import get_best_device
+
+    conf = confidence_threshold if confidence_threshold is not None else config.confidence_threshold
+    device = get_best_device()
+
+    audio, sr = load_audio(audio_path)
+
+    use_sahi = getattr(config, 'use_sahi', True)
+    if use_sahi:
+        try:
+            all_detections = _run_sahi_inference(
+                model_path, audio, sr, config, conf, device, progress_callback,
+            )
+        except ImportError:
+            # SAHI not installed — fall back silently
+            all_detections = _run_tiled_inference(
+                model_path, audio, sr, config, conf, device, progress_callback,
+            )
+    else:
+        all_detections = _run_tiled_inference(
+            model_path, audio, sr, config, conf, device, progress_callback,
+        )
+
+    # Cross-segment/tile NMS: remove duplicates from overlapping windows
     all_detections = _nms_temporal(all_detections, iou_threshold=config.iou_threshold)
 
     # Add call numbers and measure real power
@@ -917,31 +1168,71 @@ def _compute_iou(det_a: Dict, det_b: Dict) -> float:
 # Project Management
 # =============================================================================
 
+def default_projects_root() -> str:
+    """Return the default root directory for DAD projects (``~/fnt_projects``)."""
+    return os.path.join(os.path.expanduser('~'), 'fnt_projects')
+
+
 def create_project(
     project_dir: str,
     config: Optional[YOLOProjectConfig] = None,
+    source_folders: Optional[List[str]] = None,
 ) -> YOLOProjectConfig:
     """
-    Create a new YOLO USV detection project.
+    Create a new DAD project at ``project_dir``.
+
+    Layout:
+        <project_dir>/
+            project_info.json
+            datasets/               # exported YOLO tiles (regenerated each train)
+            models/                 # per-run ultralytics outputs
+
+    Labels are NOT stored here — they live as sibling CSVs next to each wav
+    (see :mod:`fnt.usv.usv_detector.labels_io`).
 
     Args:
-        project_dir: Directory path for the project
-        config: Optional config (uses defaults if not provided)
-
-    Returns:
-        YOLOProjectConfig for the new project
+        project_dir: Absolute directory path for the new project.
+        config: Optional starting config; a default one is created otherwise.
+        source_folders: Optional list of wav folders to seed the project with.
     """
     os.makedirs(project_dir, exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, 'datasets', 'train', 'images'), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, 'datasets', 'train', 'labels'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'datasets'), exist_ok=True)
 
     if config is None:
         config = YOLOProjectConfig()
     config.project_dir = project_dir
+    config.project_name = os.path.basename(os.path.normpath(project_dir))
+    if source_folders:
+        for folder in source_folders:
+            if folder and folder not in config.source_folders:
+                config.source_folders.append(folder)
     config.save()
-
     return config
+
+
+def collect_project_labels(
+    config: YOLOProjectConfig,
+) -> Tuple[List[str], Dict[str, pd.DataFrame]]:
+    """Read every sibling-CSV under this project's source folders.
+
+    Returns ``(audio_files, all_detections)`` suitable for passing to
+    :func:`export_training_data` or :func:`get_training_data_counts`. Wavs
+    without a sibling CSV are included in ``audio_files`` with an empty frame
+    so the caller can still see them.
+    """
+    from .labels_io import load_labels, scan_folders_for_wavs
+
+    wavs = scan_folders_for_wavs(config.source_folders)
+    all_detections: Dict[str, pd.DataFrame] = {}
+    audio_files: List[str] = []
+    for wav in wavs:
+        path = str(wav)
+        audio_files.append(path)
+        df = load_labels(wav)
+        if df is not None and len(df) > 0:
+            all_detections[path] = df
+    return audio_files, all_detections
 
 
 def get_training_data_counts(
