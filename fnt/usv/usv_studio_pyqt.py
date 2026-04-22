@@ -1364,11 +1364,11 @@ class USVStudioWindow(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
 
         controls_layout.addWidget(QLabel("Speed:"))
-        # Speed slider: positions map to [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
-        self._speed_values = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+        # Speed slider: positions map to [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0]
+        self._speed_values = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0]
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
-        self.slider_speed.setValue(5)  # Default 1.0x
+        self.slider_speed.setValue(len(self._speed_values) - 1)  # Default 1.0x
         self.slider_speed.setFixedWidth(100)
         self.slider_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.\n0.1x is a good default for ~50 kHz USV calls.")
         self.slider_speed.valueChanged.connect(self.on_speed_changed)
@@ -2772,7 +2772,7 @@ class USVStudioWindow(QMainWindow):
                 continue
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+            for suffix in ['_FNT_CAD_detections', '_FNT_DAD_detections', '_cad', '_dad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
                 csv_path = parent / f"{base}{suffix}.csv"
                 if csv_path.exists():
                     try:
@@ -3032,7 +3032,7 @@ class USVStudioWindow(QMainWindow):
         parent = Path(filepath).parent
 
         # Try different suffixes
-        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_FNT_CAD_detections', '_FNT_DAD_detections', '_cad', '_dad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
             csv_path = parent / f"{base}{suffix}.csv"
             if csv_path.exists():
                 try:
@@ -3082,7 +3082,7 @@ class USVStudioWindow(QMainWindow):
         # Check for CSV on disk
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_FNT_CAD_detections', '_FNT_DAD_detections', '_cad', '_dad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
             if (parent / f"{base}{suffix}.csv").exists():
                 return True
         return False
@@ -3256,7 +3256,7 @@ class USVStudioWindow(QMainWindow):
         # Write CSV immediately (crash-safe — results are on disk per file)
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        csv_path = parent / f"{base}_usv_dsp.csv"
+        csv_path = parent / f"{base}_FNT_CAD_detections.csv"
         try:
             df.to_csv(csv_path, index=False)
         except Exception as e:
@@ -4064,8 +4064,8 @@ class USVStudioWindow(QMainWindow):
 
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        # Use the tracked source suffix, default to _usv_dsp
-        source = self.detection_sources.get(filepath, 'usv_dsp')
+        # Use the tracked source suffix, default to _FNT_CAD_detections
+        source = self.detection_sources.get(filepath, 'FNT_CAD_detections')
         csv_path = parent / f"{base}_{source}.csv"
 
         try:

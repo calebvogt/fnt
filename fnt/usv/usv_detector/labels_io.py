@@ -1,9 +1,9 @@
 """
 Sibling-CSV label I/O for Deep Audio Detector.
 
-DAD labels live next to each audio file as `<wav_stem>_dad.csv`. This keeps
-labels portable and shareable across projects — a DAD project references
-source folders; it does not own labels.
+DAD labels live next to each audio file as `<wav_stem>_FNT_DAD_detections.csv`.
+This keeps labels portable and shareable across projects — a DAD project
+references source folders; it does not own labels.
 
 Schema (one row per box):
     call_number, start_seconds, stop_seconds, duration_ms,
@@ -20,8 +20,9 @@ from typing import List, Optional
 import pandas as pd
 
 
-DAD_SUFFIX = "_dad"            # current canonical suffix
+DAD_SUFFIX = "_FNT_DAD_detections"  # current canonical suffix
 LEGACY_SUFFIXES = (             # recognized but not written
+    "_dad",
     "_yoloDetection",
     "_usv_yolo",
 )
@@ -46,8 +47,8 @@ def sibling_csv_path(wav_path) -> Path:
 def find_existing_sibling_csv(wav_path) -> Optional[Path]:
     """Find any existing sibling label CSV (canonical or legacy).
 
-    Returns the canonical `_dad.csv` path if present, else the first legacy
-    match, else None.
+    Returns the canonical `_FNT_DAD_detections.csv` path if present, else the
+    first legacy match, else None.
     """
     p = Path(wav_path)
     parent = p.parent

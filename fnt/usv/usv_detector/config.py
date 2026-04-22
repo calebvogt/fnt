@@ -59,7 +59,6 @@ class USVDetectorConfig:
     harmonic_filter: bool = True        # Legacy: kept for backward compat with saved profiles
     harmonic_label: bool = False        # Legacy: kept for backward compat with saved profiles
     detect_harmonics: bool = True       # Post-hoc: label harmonics (is_harmonic field in CSV), never removes
-    classify_call_types: bool = False   # Post-hoc: assign call_type (prairie vole 14-type scheme, Ma et al. 2014)
     min_freq_gap_hz: float = 5000.0     # Split connected regions with vertical freq gaps wider than this (0=off)
     valley_split_ratio: float = 0.30    # Energy valley depth ratio for splitting (0.0-1.0); lower = more aggressive
 

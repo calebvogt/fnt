@@ -43,10 +43,6 @@ class DSPDetector:
             from .config import get_prairie_vole_config
             config = get_prairie_vole_config()
         self.config = config
-        # Optional per-bin noise floor override captured from a silence region.
-        # When not None, must be a dict: {'freqs': 1D ndarray, 'noise_db': 1D ndarray}.
-        # The floor is linearly interpolated onto the runtime frequency axis.
-        self.noise_override: Optional[Dict] = None
 
     def detect_file(self, filepath: str, progress_callback=None) -> List[Dict]:
         """
@@ -162,11 +158,6 @@ class DSPDetector:
         calls = self._filter_by_contour_smoothness(calls)
         calls = self._filter_by_ici(calls)
 
-        # Post-hoc call-type classification (Ma et al. 2014, 14 types).
-        # Currently prairie-vole specific; requires peak_freq_* samples.
-        if getattr(self.config, 'classify_call_types', False):
-            calls = self._classify_call_types(calls)
-
         return calls
 
     def _detect_chunked(self, audio: np.ndarray, sr: int, progress_callback=None) -> List[Dict]:
@@ -187,6 +178,7 @@ class DSPDetector:
 
         all_calls = []
         offset = 0
+        group_offset = 0  # keeps call_group_id unique across chunks
 
         while offset < total_samples:
             chunk_end = min(offset + chunk_samples, total_samples)
@@ -195,11 +187,18 @@ class DSPDetector:
             # Detect in this chunk (no recursive progress callback)
             calls = self.detect(chunk, sr)
 
-            # Adjust times for offset
+            # Adjust times for offset; shift group ids into a disjoint range.
             time_offset = offset / sr
+            chunk_max_group = -1
             for call in calls:
                 call['start_seconds'] += time_offset
                 call['stop_seconds'] += time_offset
+                if 'call_group_id' in call:
+                    call['call_group_id'] += group_offset
+                    if call['call_group_id'] > chunk_max_group:
+                        chunk_max_group = call['call_group_id']
+            if chunk_max_group >= 0:
+                group_offset = chunk_max_group + 1
 
             all_calls.extend(calls)
             offset += chunk_samples - overlap_samples
@@ -231,30 +230,17 @@ class DSPDetector:
             List of raw detections
         """
         # Estimate noise floor. Priority:
-        #   1. User-captured silence-region override (per-bin, 1D).
-        #   2. Block-wise time-varying floor (2D) when noise_block_seconds > 0.
-        #   3. Classical 1D per-freq percentile.
-        override = self.noise_override
-        if override and 'freqs' in override and 'noise_db' in override:
-            src_freqs = np.asarray(override['freqs'], dtype=float)
-            src_noise = np.asarray(override['noise_db'], dtype=float)
-            if src_freqs.size >= 2 and src_noise.size == src_freqs.size:
-                noise_floor = np.interp(frequencies, src_freqs, src_noise)
-            else:
-                # Fallback: broadcast a scalar if override is degenerate.
-                noise_floor = np.full(frequencies.shape,
-                                      float(src_noise.mean()) if src_noise.size else -60.0)
-            threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
+        #   1. Block-wise time-varying floor (2D) when noise_block_seconds > 0.
+        #   2. Classical 1D per-freq percentile.
+        block_s = getattr(self.config, 'noise_block_seconds', 0.0) or 0.0
+        if block_s > 0:
+            noise_floor = estimate_noise_floor_blockwise(
+                Sxx_db, times, block_s, self.config.noise_percentile
+            )
+            threshold = noise_floor + self.config.energy_threshold_db
         else:
-            block_s = getattr(self.config, 'noise_block_seconds', 0.0) or 0.0
-            if block_s > 0:
-                noise_floor = estimate_noise_floor_blockwise(
-                    Sxx_db, times, block_s, self.config.noise_percentile
-                )
-                threshold = noise_floor + self.config.energy_threshold_db
-            else:
-                noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
-                threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
+            noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
+            threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
         mask = Sxx_db > threshold
 
         # Apply morphological operations to clean up mask
@@ -782,14 +768,24 @@ class DSPDetector:
         (2x, 3x) of the other's. If so, mark the higher-frequency detection
         with ``is_harmonic=True`` and ``harmonic_of=<index>``.
 
+        Also assigns ``call_group_id`` to every detection: fundamentals and
+        their harmonics share a group id, so downstream analyses can pivot
+        on either component-level counts or call-level counts.
+
         This is a post-processing step that preserves all detections but
         annotates harmonics so downstream code can filter or count them.
         """
+        # Always assign group ids, even when harmonic detection is off,
+        # so downstream code can rely on the column existing.
         if not getattr(self.config, 'detect_harmonics', True):
+            for i, c in enumerate(sorted(calls, key=lambda c: c['start_seconds'])):
+                c.setdefault('is_harmonic', False)
+                c['call_group_id'] = i
             return calls
         if len(calls) < 2:
-            for c in calls:
+            for i, c in enumerate(calls):
                 c['is_harmonic'] = False
+                c['call_group_id'] = i
             return calls
 
         # Initialize all as non-harmonic
@@ -861,6 +857,25 @@ class DSPDetector:
                         harm_call['harmonic_of_start'] = fund_call['start_seconds']
                         harm_call['harmonic_ratio'] = round(ratio, 2)
                         break
+
+        # Assign call_group_id: each fundamental gets a fresh id; harmonics
+        # inherit their fundamental's id. Downstream can count groups (calls)
+        # or rows (components).
+        fund_id_to_group: Dict[int, int] = {}
+        next_group = 0
+        for c in calls_sorted:
+            if not c['is_harmonic']:
+                c['call_group_id'] = next_group
+                fund_id_to_group[id(c)] = next_group
+                next_group += 1
+        for c in calls_sorted:
+            if c['is_harmonic']:
+                c['call_group_id'] = fund_id_to_group.get(
+                    c.get('harmonic_of'), next_group
+                )
+                if c['call_group_id'] == next_group:
+                    # Orphan harmonic (fundamental lost to a filter) — own group.
+                    next_group += 1
 
         return calls_sorted
 
@@ -1000,132 +1015,6 @@ class DSPDetector:
                 filtered.append(calls[i])
 
         return filtered
-
-    def _classify_call_types(self, calls: List[Dict]) -> List[Dict]:
-        """Assign ``call_type`` to each detection using the Ma et al. 2014
-        prairie-vole 14-type scheme.
-
-        Uses existing features: ``peak_freq_1..N`` samples, ``duration_ms``,
-        ``freq_bandwidth_hz``, ``min_freq_hz``, ``max_freq_hz``,
-        ``is_harmonic``. This is a rule-based heuristic — the expectation is
-        that it is coarse but useful for downstream statistics; human review
-        or a learned classifier would refine edge cases.
-
-        Categories (Ma et al. 2014, Fig. 1):
-            flat, upward_ramp, downward_ramp, harmonic,
-            step_up, step_down, step_in_left, step_in_right, step_in_both,
-            u_shape, inverted_u, miscellaneous, complex, step_composite
-
-        All detections get a ``call_type`` field. Harmonics (already labeled
-        by ``_label_harmonics``) are tagged ``harmonic`` regardless of shape.
-        """
-        # Thresholds (kHz, ms, kHz/ms) chosen from paper definitions.
-        STEP_ABS_JUMP_KHZ = 5.0      # Step calls: discontinuous ≥5 kHz jump (paper).
-        STEP_OUTLIER_RATIO = 3.0     # A jump is "discontinuous" only if also ≥3x
-                                     # the median jump in the contour — otherwise
-                                     # it's part of a smooth sweep (ramp/U).
-        U_END_KHZ = 5.0              # U/inverted-U: ≥5 kHz at both ends (paper).
-        RAMP_SLOPE_KHZ_MS = 0.3      # Paper: ~0.5 kHz/ms; be a bit permissive.
-        FLAT_SLOPE_KHZ_MS = 0.1      # Flat: slope below this = essentially flat.
-        FLAT_BW_KHZ = 4.0            # Flat: narrow overall bandwidth.
-
-        def _peak_samples(call):
-            freqs = []
-            i = 1
-            while True:
-                v = call.get(f'peak_freq_{i}')
-                if v is None:
-                    break
-                try:
-                    fv = float(v)
-                except (TypeError, ValueError):
-                    break
-                if not np.isnan(fv):
-                    freqs.append(fv / 1000.0)  # Hz → kHz
-                i += 1
-            return freqs
-
-        for call in calls:
-            if call.get('is_harmonic', False):
-                call['call_type'] = 'harmonic'
-                continue
-
-            freqs_khz = _peak_samples(call)
-            duration_ms = float(call.get('duration_ms', 0) or 0)
-            bw_khz = float(call.get('freq_bandwidth_hz', 0) or 0) / 1000.0
-
-            if len(freqs_khz) < 2 or duration_ms <= 0:
-                call['call_type'] = 'miscellaneous'
-                continue
-
-            n = len(freqs_khz)
-            dt_ms = duration_ms / (n - 1)
-            diffs = np.diff(freqs_khz)          # signed Δ per segment (kHz)
-            abs_diffs = np.abs(diffs)
-            slopes = diffs / dt_ms              # signed slope (kHz/ms)
-
-            # Detect step-like outliers: a jump is "discontinuous" only if it
-            # is both (a) absolutely large (≥5 kHz) and (b) an outlier relative
-            # to the rest of the contour (≥3x the median jump). Otherwise it
-            # is part of a smooth sweep.
-            median_jump = float(np.median(abs_diffs)) if len(abs_diffs) > 0 else 0.0
-            min_outlier_thresh = max(STEP_ABS_JUMP_KHZ, STEP_OUTLIER_RATIO * median_jump)
-            step_mask = abs_diffs >= min_outlier_thresh
-            n_jumps = int(np.sum(step_mask))
-
-            mean_slope = float(np.mean(slopes))
-            start_f, end_f = freqs_khz[0], freqs_khz[-1]
-            min_f, max_f = min(freqs_khz), max(freqs_khz)
-            min_idx, max_idx = int(np.argmin(freqs_khz)), int(np.argmax(freqs_khz))
-
-            # --- Step-family (discontinuous jumps) --------------------------
-            if n_jumps >= 2:
-                call['call_type'] = 'step_composite'
-                continue
-            if n_jumps == 1:
-                jump_idx = int(np.argmax(abs_diffs))
-                jump_dir = 'up' if diffs[jump_idx] > 0 else 'down'
-                # Paper distinguishes 'step up/down' (single jump) from
-                # 'step_in_*' (jump adjacent to a harmonic structure). We
-                # don't have a harmonic-adjacency signal here, so fall back
-                # to step_up / step_down and let downstream classification
-                # refine.
-                call['call_type'] = f'step_{jump_dir}'
-                continue
-
-            # --- U / inverted-U --------------------------------------------
-            # U: min is in the interior, both ends ≥ U_END_KHZ above the min.
-            if 0 < min_idx < n - 1:
-                if (start_f - min_f) >= U_END_KHZ and (end_f - min_f) >= U_END_KHZ:
-                    call['call_type'] = 'u_shape'
-                    continue
-            # Inverted U: max is interior, both ends ≥ U_END_KHZ below max.
-            if 0 < max_idx < n - 1:
-                if (max_f - start_f) >= U_END_KHZ and (max_f - end_f) >= U_END_KHZ:
-                    call['call_type'] = 'inverted_u'
-                    continue
-
-            # --- Flat / ramp ------------------------------------------------
-            if abs(mean_slope) < FLAT_SLOPE_KHZ_MS and bw_khz < FLAT_BW_KHZ:
-                call['call_type'] = 'flat'
-                continue
-            if mean_slope >= RAMP_SLOPE_KHZ_MS:
-                call['call_type'] = 'upward_ramp'
-                continue
-            if mean_slope <= -RAMP_SLOPE_KHZ_MS:
-                call['call_type'] = 'downward_ramp'
-                continue
-
-            # --- Complex (wide bandwidth, not otherwise classified) --------
-            # Complex calls during socio-sexual interaction have rich
-            # structure spanning a wide band. Use bandwidth as a proxy.
-            if bw_khz >= 15.0:
-                call['call_type'] = 'complex'
-                continue
-
-            call['call_type'] = 'miscellaneous'
-
-        return calls
 
     def _sample_peak_frequencies(
         self,

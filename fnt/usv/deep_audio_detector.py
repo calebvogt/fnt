@@ -673,10 +673,10 @@ class DeepAudioDetectorWindow(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
 
         controls_layout.addWidget(QLabel("Speed:"))
-        self._speed_values = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+        self._speed_values = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0]
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
-        self.slider_speed.setValue(5)
+        self.slider_speed.setValue(len(self._speed_values) - 1)
         self.slider_speed.setFixedWidth(100)
         self.slider_speed.setToolTip("Playback speed multiplier.\nLower values slow audio down, shifting\nultrasonic frequencies into the audible range.")
         self.slider_speed.valueChanged.connect(self.on_speed_changed)
@@ -1758,9 +1758,10 @@ class DeepAudioDetectorWindow(QMainWindow):
     def _try_load_detections(self, filepath):
         """Load existing sibling-CSV labels for a file.
 
-        Reads the canonical ``<stem>_dad.csv`` first, then legacy suffixes
-        (``_yoloDetection``, ``_usv_yolo``). CAD-family suffixes (``_cad``,
-        ``_usv_dsp``, ``_usv_detections``) are deliberately NOT auto-imported — DAD is a
+        Reads the canonical ``<stem>_FNT_DAD_detections.csv`` first, then legacy
+        suffixes (``_dad``, ``_yoloDetection``, ``_usv_yolo``). CAD-family
+        suffixes (``_FNT_CAD_detections``, ``_cad``, ``_usv_dsp``,
+        ``_usv_detections``) are deliberately NOT auto-imported — DAD is a
         standalone tool; users pull CAD labels in via ``Labels → Import…``.
         """
         df = load_labels(filepath)
@@ -2468,7 +2469,7 @@ class DeepAudioDetectorWindow(QMainWindow):
             # Also clean up the legacy _yoloDetection.csv so it doesn't resurface.
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            for legacy in ('_yoloDetection', '_usv_yolo'):
+            for legacy in ('_dad', '_yoloDetection', '_usv_yolo'):
                 p = parent / f"{base}{legacy}.csv"
                 if p.exists():
                     try:
@@ -2571,11 +2572,13 @@ class DeepAudioDetectorWindow(QMainWindow):
                 del self.all_detections[filepath]
 
     def _save_detections_csv(self, filepath):
-        """Save current detections to the canonical sibling CSV (``<stem>_dad.csv``).
+        """Save current detections to the canonical sibling CSV
+        (``<stem>_FNT_DAD_detections.csv``).
 
         If the in-memory df is empty/None, the canonical file is removed so the
-        filesystem stays in sync. Legacy ``_yoloDetection.csv`` files are left
-        untouched — upgrading is a one-way migration the next write performs.
+        filesystem stays in sync. Legacy ``_dad.csv`` / ``_yoloDetection.csv``
+        files are left untouched — upgrading is a one-way migration the next
+        write performs.
         """
         try:
             written = save_labels(filepath, self.detections_df)
@@ -2915,7 +2918,7 @@ class DeepAudioDetectorWindow(QMainWindow):
 
         # Sensible default: look for any CAD-style sibling CSV.
         candidate = None
-        for suffix in ("_cad", "_usv_dsp", "_usv_detections", "_usv_yolo"):
+        for suffix in ("_FNT_CAD_detections", "_cad", "_usv_dsp", "_usv_detections", "_usv_yolo"):
             p = parent / f"{base}{suffix}.csv"
             if p.exists():
                 candidate = str(p)
@@ -3168,6 +3171,7 @@ class DeepAudioDetectorWindow(QMainWindow):
         existing = set(self.audio_files)
         new_wavs = [w for w in wavs if w not in existing]
         added = 0
+        legacy_dad = []
 
         for w in wavs:
             if w not in self.audio_files:
@@ -3180,6 +3184,11 @@ class DeepAudioDetectorWindow(QMainWindow):
                     found = find_existing_sibling_csv(w)
                     if found:
                         self.detection_sources[w] = found.stem.rsplit("_", 1)[-1]
+                        if found.name.endswith("_dad.csv"):
+                            legacy_dad.append((w, found))
+
+        if legacy_dad:
+            self._offer_legacy_dad_rename(legacy_dad)
 
         if self.audio_files:
             self.current_file_idx = min(self.current_file_idx, len(self.audio_files) - 1)
@@ -3194,6 +3203,52 @@ class DeepAudioDetectorWindow(QMainWindow):
         self._update_data_summary()
         self._update_project_state()
         return added
+
+    def _offer_legacy_dad_rename(self, legacy_files):
+        """Prompt the user to rename legacy ``_dad.csv`` files to
+        ``_FNT_DAD_detections.csv``."""
+        n = len(legacy_files)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Legacy CSV filenames detected")
+        box.setText(
+            f"{n} file{'s' if n != 1 else ''} in the project use the old "
+            f"DAD naming convention (_dad.csv).\n\n"
+            "Rename them to the new convention (_FNT_DAD_detections.csv)?"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec_() != QMessageBox.Yes:
+            return
+
+        renamed = 0
+        skipped = 0
+        errors = 0
+        for filepath, old_path in legacy_files:
+            new_path = old_path.with_name(
+                old_path.name.replace('_dad.csv', '_FNT_DAD_detections.csv')
+            )
+            if new_path.exists():
+                skipped += 1
+                continue
+            try:
+                old_path.rename(new_path)
+                self.detection_sources[filepath] = 'FNT_DAD_detections'
+                renamed += 1
+            except Exception as e:
+                print(f"[DAD] Rename failed for {old_path}: {e}")
+                errors += 1
+
+        parts = [f"Renamed {renamed}"]
+        if skipped:
+            parts.append(f"{skipped} skipped (target exists)")
+        if errors:
+            parts.append(f"{errors} errors")
+        if hasattr(self, 'statusBar'):
+            try:
+                self.statusBar().showMessage(" — ".join(parts), 5000)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Recent projects (QSettings list)
