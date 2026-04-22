@@ -2772,7 +2772,7 @@ class USVStudioWindow(QMainWindow):
                 continue
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+            for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
                 csv_path = parent / f"{base}{suffix}.csv"
                 if csv_path.exists():
                     try:
@@ -3032,7 +3032,7 @@ class USVStudioWindow(QMainWindow):
         parent = Path(filepath).parent
 
         # Try different suffixes
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
             csv_path = parent / f"{base}{suffix}.csv"
             if csv_path.exists():
                 try:
@@ -3082,7 +3082,7 @@ class USVStudioWindow(QMainWindow):
         # Check for CSV on disk
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
+        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_yolo', '_usv_detections']:
             if (parent / f"{base}{suffix}.csv").exists():
                 return True
         return False

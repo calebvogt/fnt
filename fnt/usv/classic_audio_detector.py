@@ -85,6 +85,7 @@ class DSPDetectionWorker(QThread):
             min_tonality=self.config.get('min_tonality', 0.3),
             min_call_freq_hz=self.config.get('min_call_freq_hz', 0.0),
             detect_harmonics=self.config.get('detect_harmonics', True),
+            classify_call_types=self.config.get('classify_call_types', False),
             min_freq_gap_hz=self.config.get('min_freq_gap_hz', 5000.0),
             valley_split_ratio=self.config.get('valley_split_ratio', 0.30),
             min_gap_ms=self.config.get('min_gap_ms', 5.0),
@@ -267,58 +268,73 @@ class ClassicAudioDetectorWindow(QMainWindow):
     # Add new species by adding a key with a dict of DSP config values.
     SPECIES_PROFILES = {
         'Manual': None,
-        'Rodent USVs': {
-            'min_freq_hz': 18000, 'max_freq_hz': 120000,
-            'energy_threshold_db': 8.0,
-            'min_duration_ms': 3.0, 'max_duration_ms': 3000.0,
-            'max_bandwidth_hz': 25000, 'min_tonality': 0.05,
-            'min_call_freq_hz': 15000, 'detect_harmonics': True,
-            'min_freq_gap_hz': 5000, 'valley_split_ratio': 0.30,
-            'min_gap_ms': 5.0, 'noise_percentile': 25.0,
-            'nperseg': 512, 'noverlap': 384,
-            # Advanced noise rejection
-            'min_bandwidth_hz': 500, 'min_snr_db': 6.0,
-            'min_spectral_entropy': 0.0, 'max_spectral_entropy': 0.0,
-            'min_power_db': 0.0, 'max_power_db': 0.0,
-            'max_mean_sweep_rate': 0.0, 'max_contour_jitter': 0.0,
-            'min_ici_ms': 0.0,
-        },
         'Prairie Vole USVs': {
-            # Freq range: adults 20-45 kHz fundamental (Stewart 2015).
-            # Cap at 55 kHz to capture full FM sweeps while excluding
-            # most harmonic energy and broadband noise.
-            'min_freq_hz': 20000, 'max_freq_hz': 55000,
-            # Threshold: 10 dB — real calls are bright and well above noise.
+            # Tuned to Ma et al. 2014 (Integr Zool 9:280-93), which documents
+            # 14 adult prairie vole call types. Goals:
+            #   • capture all 14 types (flat, up/down ramp, harmonic, 5 step
+            #     variants, U, inverted-U, misc, complex, step composite)
+            #   • one-shot detection — bias toward recall, reject noise via
+            #     tonality+SNR+bandwidth, not duration
+            #   • harmonics are *labeled* post-hoc (not removed); downstream
+            #     classification handles the 14-way split
+
+            # Fundamentals 20-80 kHz per paper; top raised to 80 kHz so we
+            # also capture the harmonic component of 'harmonic' calls
+            # (fundamental ~25, harmonic ~50) and expanded-range calls that
+            # reach ~80 kHz during socio-sexual interaction.
+            'min_freq_hz': 20000, 'max_freq_hz': 80000,
+
+            # Threshold: 10 dB above per-bin noise floor.
             'energy_threshold_db': 10.0,
-            # Duration: 8 ms min — noise fragments are 3-5 ms; real prairie
-            # vole syllables are typically 10-40 ms (Stewart 2015).
-            'min_duration_ms': 8.0, 'max_duration_ms': 500.0,
-            # Bandwidth: 30 kHz max — real swept calls span 15-25 kHz;
-            # 20 kHz was too tight and rejected legitimate FM sweeps.
-            'max_bandwidth_hz': 30000,
-            # Tonality: 0.20 — empirically tuned. Real calls measure
-            # 0.14-0.62 tonality; 0.20 balances sensitivity vs noise.
-            'min_tonality': 0.20,
-            # Min call freq: 15 kHz — provides margin below the 20 kHz
-            # fundamental floor without admitting low-frequency noise.
-            'min_call_freq_hz': 15000,
-            # Harmonic detection with 5 kHz gap.
+
+            # Duration: 5 ms floor — ramps and step fragments can be brief;
+            # typical 'flat' calls are ~30 ms, complex calls can be long.
+            'min_duration_ms': 5.0, 'max_duration_ms': 500.0,
+
+            # Bandwidth: 40 kHz max — harmonic calls span fundamental+overtone
+            # (~25-50 kHz = 25 kHz); complex/step-composite calls can span
+            # more. 40 kHz leaves headroom without admitting broadband noise.
+            'max_bandwidth_hz': 40000,
+
+            # Tonality: 0.15 — step/harmonic calls have discontinuities that
+            # lower the purity score; 0.15 keeps them while rejecting
+            # broadband hiss and clicks.
+            'min_tonality': 0.15,
+
+            # Min call freq: 18 kHz — margin below the 20 kHz fundamental
+            # without admitting the ~15 kHz cage-rustle / handling-noise band.
+            'min_call_freq_hz': 18000,
+
+            # Harmonic labeling (not removal) + 5 kHz gap matches the paper's
+            # ≥5 kHz criterion for U/inverted-U and step jumps.
             'detect_harmonics': True,
             'min_freq_gap_hz': 5000, 'valley_split_ratio': 0.30,
-            # Min gap: 4 ms — preserves rapid syllable sequences.
-            'min_gap_ms': 4.0,
+
+            # Min gap: 20 ms — matches Ma et al.'s max-within-call
+            # discontinuity. Prefers merging step/complex fragments into
+            # a single detection over splitting. Occasional fusion of
+            # distinct adjacent calls is acceptable; downstream cleanup
+            # can split them.
+            'min_gap_ms': 20.0,
+
+            # Post-hoc call-type classification (Ma et al. 2014, 14 types).
+            # Toggled in the GUI for the Prairie Vole profile only.
+            'classify_call_types': True,
+
             'noise_percentile': 25.0,
+            # 512-point FFT / 75% overlap matches Ma et al. (391 Hz res).
             'nperseg': 512, 'noverlap': 384,
-            # Advanced noise rejection — empirically tuned
-            # Min bandwidth 1000 Hz: rejects pure-tone electrical noise.
+
+            # Min bandwidth 1 kHz: rejects pure-tone electrical artifacts.
             'min_bandwidth_hz': 1000,
-            # Min SNR 8 dB: real calls are clearly above noise floor.
+            # SNR 8 dB: real calls sit well above the per-bin floor.
             'min_snr_db': 8.0,
-            # Spectral entropy: disabled — not reliable at our FFT resolution.
+
+            # Advanced filters disabled — they add false negatives for the
+            # rarer call types (step composite, complex) without meaningful
+            # noise-rejection gain at this detection stage.
             'min_spectral_entropy': 0.0, 'max_spectral_entropy': 0.0,
-            # Power: disabled.
             'min_power_db': 0.0, 'max_power_db': 0.0,
-            # Sweep/contour/ICI: disabled.
             'max_mean_sweep_rate': 0.0,
             'max_contour_jitter': 0.0,
             'min_ici_ms': 0.0,
@@ -796,17 +812,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
         noise_row.addWidget(self.spin_noise_pct, 1)
         group_layout.addLayout(noise_row)
 
-        # Filter Overlay button (below Noise %tile)
-        overlay_tip = ("Overlay the thresholded detection mask on the spectrogram (shortcut: F).\n"
-                       "Colored pixels = above threshold (signal the detector will analyze).\n"
-                       "Black pixels = removed by preprocessing (band mask + noise floor + threshold).\n"
-                       "Use this to tune Threshold and Noise %tile before running a batch.")
-        self.btn_filter_overlay = QPushButton("Filter Overlay (F)")
-        self.btn_filter_overlay.setCheckable(True)
-        self.btn_filter_overlay.setToolTip(overlay_tip)
-        self.btn_filter_overlay.toggled.connect(self._on_filter_overlay_toggled)
-        group_layout.addWidget(self.btn_filter_overlay)
-
         # --- Detection Parameters (collapsible) ---
         self.btn_advanced_toggle = QPushButton("▶ Detection Parameters")
         self.btn_advanced_toggle.setFlat(True)
@@ -1246,6 +1251,23 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.chk_detect_harmonics.setToolTip(detect_harm_tip)
         advanced_layout.addWidget(self.chk_detect_harmonics)
 
+        # Post-hoc call-type classification (prairie vole only).
+        # Shown/hidden by the profile dropdown handler; hidden by default.
+        classify_tip = (
+            "Classify each detection into one of 14 prairie vole call types\n"
+            "(Ma et al. 2014): flat, upward_ramp, downward_ramp, harmonic,\n"
+            "step_up, step_down, step_in_left/right/both, u_shape,\n"
+            "inverted_u, miscellaneous, complex, step_composite.\n\n"
+            "Rule-based heuristic using duration, bandwidth, and peak-freq\n"
+            "contour samples. Adds a 'call_type' column to the CSV.\n"
+            "Intended as a first-pass label — human review will be needed\n"
+            "for edge cases, especially complex and step-in variants.")
+        self.chk_classify_call_types = QCheckBox("Classify Call Types (Prairie Vole)")
+        self.chk_classify_call_types.setChecked(True)
+        self.chk_classify_call_types.setToolTip(classify_tip)
+        self.chk_classify_call_types.setVisible(False)
+        advanced_layout.addWidget(self.chk_classify_call_types)
+
         # --- Infrastructure settings ---
 
         # Adaptive (block-wise) noise floor
@@ -1350,24 +1372,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.advanced_options_widget.setVisible(False)
         group_layout.addWidget(self.advanced_options_widget)
 
-        # GPU acceleration checkbox
-        gpu_row = QHBoxLayout()
-        gpu_row.setSpacing(4)
-        self.chk_gpu_accel = QCheckBox("Enable GPU Acceleration")
-        self.chk_gpu_accel.setChecked(False)
-        self.chk_gpu_accel.setToolTip(
-            "Use GPU for spectrogram / STFT computation.\n"
-            "Backends: CUDA (NVIDIA) or MPS (Apple Silicon) via PyTorch.\n"
-            "Falls back silently to CPU if no compatible GPU is found.\n"
-            "Benefit is significant on long files; negligible on short clips."
-        )
-        self.chk_gpu_accel.toggled.connect(self._on_gpu_toggle)
-        gpu_row.addWidget(self.chk_gpu_accel)
-        self.lbl_gpu_status = QLabel("")
-        self.lbl_gpu_status.setStyleSheet("color: #999999; font-size: 9px;")
-        gpu_row.addWidget(self.lbl_gpu_status)
-        gpu_row.addStretch()
-        group_layout.addLayout(gpu_row)
+        # Filter Overlay button (after Detection Parameters section)
+        overlay_tip = ("Overlay the thresholded detection mask on the spectrogram (shortcut: F).\n"
+                       "Colored pixels = above threshold (signal the detector will analyze).\n"
+                       "Black pixels = removed by preprocessing (band mask + noise floor + threshold).\n"
+                       "Use this to tune Threshold and Noise %tile before running a batch.")
+        self.btn_filter_overlay = QPushButton("Filter Overlay (F)")
+        self.btn_filter_overlay.setCheckable(True)
+        self.btn_filter_overlay.setToolTip(overlay_tip)
+        self.btn_filter_overlay.toggled.connect(self._on_filter_overlay_toggled)
+        group_layout.addWidget(self.btn_filter_overlay)
+
         self._selected_gpu_device = "auto"
 
         # Collect all DSP parameter widgets for profile enable/disable
@@ -1394,48 +1409,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.spin_max_freq.valueChanged.connect(self._push_filter_overlay_params)
         self.spin_threshold.valueChanged.connect(self._push_filter_overlay_params)
         self.spin_noise_pct.valueChanged.connect(self._push_filter_overlay_params)
-
-        # Queue display
-        self.lbl_queue = QLabel("Queue: 0 files")
-        self.lbl_queue.setStyleSheet("color: #999999;")
-        group_layout.addWidget(self.lbl_queue)
-
-        # Queue buttons - row 1
-        queue_row = QHBoxLayout()
-        queue_row.setSpacing(2)
-
-        self.btn_add_to_queue = QPushButton("Add Current")
-        self.btn_add_to_queue.setToolTip("Add the currently selected file to the detection queue")
-        self.btn_add_to_queue.clicked.connect(self.add_to_queue)
-        self.btn_add_to_queue.setEnabled(False)
-        queue_row.addWidget(self.btn_add_to_queue)
-
-        self.btn_add_all_to_queue = QPushButton("Add All")
-        self.btn_add_all_to_queue.setToolTip("Add all imported files to the detection queue")
-        self.btn_add_all_to_queue.clicked.connect(self.add_all_to_queue)
-        self.btn_add_all_to_queue.setEnabled(False)
-        queue_row.addWidget(self.btn_add_all_to_queue)
-
-        self.btn_clear_queue = QPushButton("Clear")
-        self.btn_clear_queue.setStyleSheet("background-color: #5c5c5c;")
-        self.btn_clear_queue.setToolTip("Remove all files from the detection queue")
-        self.btn_clear_queue.clicked.connect(self.clear_queue)
-        queue_row.addWidget(self.btn_clear_queue)
-
-        group_layout.addLayout(queue_row)
-
-        # Run button
-        self.btn_run_dsp = QPushButton("Run DSP Detection")
-        self.btn_run_dsp.setStyleSheet("background-color: #0078d4;")
-        self.btn_run_dsp.setToolTip(
-            "Run DSP-based detection on all queued files.\n"
-            "Writes <wav>_usv_dsp.csv next to each file.\n"
-            "Safe to stop mid-batch — completed files stay;\n"
-            "the currently processing file is discarded."
-        )
-        self.btn_run_dsp.clicked.connect(self.run_dsp_detection)
-        self.btn_run_dsp.setEnabled(False)
-        group_layout.addWidget(self.btn_run_dsp)
 
         # Query Preview Snapshot button
         self.btn_preview_snapshot = QPushButton("Query Preview Snapshot (Q)")
@@ -1520,6 +1493,77 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_pipeline_inspector.clicked.connect(self._open_pipeline_inspector)
         self.btn_pipeline_inspector.setEnabled(False)
         group_layout.addWidget(self.btn_pipeline_inspector)
+
+        # Copy current DSP settings to the clipboard for sharing / troubleshooting.
+        self.btn_copy_settings = QPushButton("Copy Settings to Clipboard")
+        self.btn_copy_settings.setToolTip(
+            "Copy all current DSP detection parameters to the clipboard as\n"
+            "pretty-printed JSON. Paste into a chat to share your profile\n"
+            "for troubleshooting or iteration."
+        )
+        self.btn_copy_settings.clicked.connect(self._copy_settings_to_clipboard)
+        group_layout.addWidget(self.btn_copy_settings)
+
+        # Queue buttons - row 1
+        queue_row = QHBoxLayout()
+        queue_row.setSpacing(2)
+
+        self.btn_add_to_queue = QPushButton("Add Current")
+        self.btn_add_to_queue.setToolTip("Add the currently selected file to the detection queue")
+        self.btn_add_to_queue.clicked.connect(self.add_to_queue)
+        self.btn_add_to_queue.setEnabled(False)
+        queue_row.addWidget(self.btn_add_to_queue)
+
+        self.btn_add_all_to_queue = QPushButton("Add All")
+        self.btn_add_all_to_queue.setToolTip("Add all imported files to the detection queue")
+        self.btn_add_all_to_queue.clicked.connect(self.add_all_to_queue)
+        self.btn_add_all_to_queue.setEnabled(False)
+        queue_row.addWidget(self.btn_add_all_to_queue)
+
+        self.btn_clear_queue = QPushButton("Clear")
+        self.btn_clear_queue.setStyleSheet("background-color: #5c5c5c;")
+        self.btn_clear_queue.setToolTip("Remove all files from the detection queue")
+        self.btn_clear_queue.clicked.connect(self.clear_queue)
+        queue_row.addWidget(self.btn_clear_queue)
+
+        group_layout.addLayout(queue_row)
+
+        # Queue display (after queue-button row)
+        self.lbl_queue = QLabel("Queue: 0 files")
+        self.lbl_queue.setStyleSheet("color: #999999;")
+        group_layout.addWidget(self.lbl_queue)
+
+        # GPU acceleration checkbox (directly above Run DSP Detection)
+        gpu_row = QHBoxLayout()
+        gpu_row.setSpacing(4)
+        self.chk_gpu_accel = QCheckBox("Enable GPU Acceleration")
+        self.chk_gpu_accel.setChecked(False)
+        self.chk_gpu_accel.setToolTip(
+            "Use GPU for spectrogram / STFT computation.\n"
+            "Backends: CUDA (NVIDIA) or MPS (Apple Silicon) via PyTorch.\n"
+            "Falls back silently to CPU if no compatible GPU is found.\n"
+            "Benefit is significant on long files; negligible on short clips."
+        )
+        self.chk_gpu_accel.toggled.connect(self._on_gpu_toggle)
+        gpu_row.addWidget(self.chk_gpu_accel)
+        self.lbl_gpu_status = QLabel("")
+        self.lbl_gpu_status.setStyleSheet("color: #999999; font-size: 9px;")
+        gpu_row.addWidget(self.lbl_gpu_status)
+        gpu_row.addStretch()
+        group_layout.addLayout(gpu_row)
+
+        # Run button
+        self.btn_run_dsp = QPushButton("Run DSP Detection")
+        self.btn_run_dsp.setStyleSheet("background-color: #0078d4;")
+        self.btn_run_dsp.setToolTip(
+            "Run DSP-based detection on all queued files.\n"
+            "Writes <wav>_cad.csv next to each file.\n"
+            "Safe to stop mid-batch — completed files stay;\n"
+            "the currently processing file is discarded."
+        )
+        self.btn_run_dsp.clicked.connect(self.run_dsp_detection)
+        self.btn_run_dsp.setEnabled(False)
+        group_layout.addWidget(self.btn_run_dsp)
 
         self.lbl_dsp_status = QLabel("")
         self.lbl_dsp_status.setStyleSheet("color: #999999; font-size: 9px;")
@@ -1646,106 +1690,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.progress_bar.setValue(0)
         group_layout.addWidget(self.progress_bar)
 
-        # Review filters (post-run, visual-only; never deletes detections)
-        rf_sep = QFrame()
-        rf_sep.setFrameShape(QFrame.HLine)
-        rf_sep.setStyleSheet("color: #444;")
-        group_layout.addWidget(rf_sep)
-
-        rf_header_row = QHBoxLayout()
-        rf_header_row.setSpacing(2)
-        rf_header = QLabel("Review Filters:")
-        rf_header.setStyleSheet("color: #aaaaaa; font-size: 9px;")
-        rf_header_row.addWidget(rf_header)
-        self.lbl_rf_count = QLabel("")
-        self.lbl_rf_count.setStyleSheet("color: #aaaaaa; font-size: 9px;")
-        self.lbl_rf_count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rf_header_row.addWidget(self.lbl_rf_count, 1)
-        group_layout.addLayout(rf_header_row)
-
-        rf_dur_row = QHBoxLayout()
-        rf_dur_row.setSpacing(2)
-        rf_dur_row.addWidget(QLabel("Dur:"))
-        self.spin_rf_min_dur = QDoubleSpinBox()
-        self.spin_rf_min_dur.setRange(0, 10000)
-        self.spin_rf_min_dur.setDecimals(1)
-        self.spin_rf_min_dur.setSingleStep(1)
-        self.spin_rf_min_dur.setSuffix(" ms")
-        self.spin_rf_min_dur.setSpecialValueText("off")
-        self.spin_rf_min_dur.setToolTip(
-            "Hide detections shorter than this duration (ms).\n"
-            "Does not delete — cleared by Reset Filters.\n"
-            "0 = off."
-        )
-        self.spin_rf_min_dur.valueChanged.connect(self._on_review_filter_changed)
-        rf_dur_row.addWidget(self.spin_rf_min_dur, 1)
-        rf_dur_row.addWidget(QLabel("\u2013"))
-        self.spin_rf_max_dur = QDoubleSpinBox()
-        self.spin_rf_max_dur.setRange(0, 10000)
-        self.spin_rf_max_dur.setDecimals(1)
-        self.spin_rf_max_dur.setSingleStep(1)
-        self.spin_rf_max_dur.setSuffix(" ms")
-        self.spin_rf_max_dur.setSpecialValueText("off")
-        self.spin_rf_max_dur.setToolTip(
-            "Hide detections longer than this duration (ms).\n"
-            "0 = off."
-        )
-        self.spin_rf_max_dur.valueChanged.connect(self._on_review_filter_changed)
-        rf_dur_row.addWidget(self.spin_rf_max_dur, 1)
-        group_layout.addLayout(rf_dur_row)
-
-        rf_snr_row = QHBoxLayout()
-        rf_snr_row.setSpacing(2)
-        rf_snr_row.addWidget(QLabel("SNR \u2265"))
-        self.spin_rf_min_snr = QDoubleSpinBox()
-        self.spin_rf_min_snr.setRange(0, 200)
-        self.spin_rf_min_snr.setDecimals(1)
-        self.spin_rf_min_snr.setSingleStep(1)
-        self.spin_rf_min_snr.setSuffix(" dB")
-        self.spin_rf_min_snr.setSpecialValueText("off")
-        self.spin_rf_min_snr.setToolTip(
-            "Hide detections with SNR below this threshold (dB).\n"
-            "Only applies if the CSV has an snr_db column.\n"
-            "0 = off."
-        )
-        self.spin_rf_min_snr.valueChanged.connect(self._on_review_filter_changed)
-        rf_snr_row.addWidget(self.spin_rf_min_snr, 1)
-        group_layout.addLayout(rf_snr_row)
-
-        rf_freq_row = QHBoxLayout()
-        rf_freq_row.setSpacing(2)
-        rf_freq_row.addWidget(QLabel("F:"))
-        self.spin_rf_min_freq = QSpinBox()
-        self.spin_rf_min_freq.setRange(0, 200000)
-        self.spin_rf_min_freq.setSingleStep(1000)
-        self.spin_rf_min_freq.setSuffix(" Hz")
-        self.spin_rf_min_freq.setSpecialValueText("off")
-        self.spin_rf_min_freq.setToolTip(
-            "Hide detections that lie entirely below this frequency (Hz).\n"
-            "0 = off."
-        )
-        self.spin_rf_min_freq.valueChanged.connect(self._on_review_filter_changed)
-        rf_freq_row.addWidget(self.spin_rf_min_freq, 1)
-        rf_freq_row.addWidget(QLabel("\u2013"))
-        self.spin_rf_max_freq = QSpinBox()
-        self.spin_rf_max_freq.setRange(0, 200000)
-        self.spin_rf_max_freq.setSingleStep(1000)
-        self.spin_rf_max_freq.setSuffix(" Hz")
-        self.spin_rf_max_freq.setSpecialValueText("off")
-        self.spin_rf_max_freq.setToolTip(
-            "Hide detections that lie entirely above this frequency (Hz).\n"
-            "0 = off."
-        )
-        self.spin_rf_max_freq.valueChanged.connect(self._on_review_filter_changed)
-        rf_freq_row.addWidget(self.spin_rf_max_freq, 1)
-        group_layout.addLayout(rf_freq_row)
-
-        self.btn_rf_reset = QPushButton("Reset Filters")
-        self.btn_rf_reset.setObjectName("small_btn")
-        self.btn_rf_reset.setToolTip("Clear all review filters (show every detection again).")
-        self.btn_rf_reset.clicked.connect(self._reset_review_filters)
-        group_layout.addWidget(self.btn_rf_reset)
-
         group.setLayout(group_layout)
         layout.addWidget(group)
 
@@ -1766,7 +1710,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_accept.setObjectName("accept_btn")
         self.btn_accept.setToolTip(
             "Mark current detection as a valid USV call (A key).\n"
-            "Accepted calls are written to <wav>_usv_dsp.csv and can\n"
+            "Accepted calls are written to <wav>_cad.csv and can\n"
             "later be imported into DAD for model training."
         )
         self.btn_accept.clicked.connect(self.accept_detection)
@@ -2020,6 +1964,12 @@ class ClassicAudioDetectorWindow(QMainWindow):
         is_custom = profile_name in self._custom_profiles
         self.btn_delete_profile.setEnabled(is_custom)
 
+        # Call-type classification is prairie-vole specific — show only there.
+        is_prairie_vole = (profile_name == 'Prairie Vole USVs')
+        self.chk_classify_call_types.setVisible(is_prairie_vole)
+        if not is_prairie_vole:
+            self.chk_classify_call_types.setChecked(False)
+
         if preset is None:
             # Manual mode — re-enable all DSP parameter widgets
             for w in self._dsp_param_widgets:
@@ -2061,6 +2011,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             detect_harm = preset.get('detect_harmonics',
                                      preset.get('harmonic_filter', True) or preset.get('harmonic_label', False))
             self.chk_detect_harmonics.setChecked(detect_harm)
+            if is_prairie_vole:
+                self.chk_classify_call_types.setChecked(
+                    bool(preset.get('classify_call_types', False)))
             self.spin_freq_gap.setValue(preset.get('min_freq_gap_hz', 5000))
             self.spin_valley_ratio.setValue(preset.get('valley_split_ratio', 0.30))
             # Advanced noise rejection
@@ -2706,12 +2659,18 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
     def _scan_existing_csvs(self):
         """Pre-scan for existing CSV detection files to show counts in file list."""
+        # Track files whose CSVs use the legacy CAD suffix ``_usv_dsp`` so we
+        # can offer a bulk rename to the new ``_cad`` convention. Only
+        # ``_usv_dsp`` is treated as legacy CAD output; ``_usv_rf`` (Random
+        # Forest) and ``_usv_detections`` (generic batch) are NOT auto-renamed.
+        legacy_dsp = []
+
         for filepath in self.audio_files:
             if filepath in self.all_detections:
                 continue
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+            for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_detections']:
                 csv_path = parent / f"{base}{suffix}.csv"
                 if csv_path.exists():
                     try:
@@ -2721,9 +2680,54 @@ class ClassicAudioDetectorWindow(QMainWindow):
                         self._ensure_freq_bounds(df)
                         self.all_detections[filepath] = df
                         self.detection_sources[filepath] = suffix.lstrip('_')
+                        if suffix == '_usv_dsp':
+                            legacy_dsp.append((filepath, csv_path))
                         break
                     except Exception:
                         pass
+
+        if legacy_dsp:
+            self._offer_legacy_rename(legacy_dsp)
+
+    def _offer_legacy_rename(self, legacy_files):
+        """Prompt the user to rename legacy ``_usv_dsp.csv`` files to ``_cad.csv``."""
+        n = len(legacy_files)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Legacy CSV filenames detected")
+        box.setText(
+            f"{n} file{'s' if n != 1 else ''} in the folder use the old "
+            f"CAD naming convention (_usv_dsp.csv).\n\n"
+            "Rename them to the new convention (_cad.csv)?"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec_() != QMessageBox.Yes:
+            return
+
+        renamed = 0
+        skipped = 0
+        errors = 0
+        for filepath, old_path in legacy_files:
+            new_path = old_path.with_name(old_path.name.replace('_usv_dsp.csv', '_cad.csv'))
+            if new_path.exists():
+                # Don't clobber an existing _cad.csv; leave the legacy in place.
+                skipped += 1
+                continue
+            try:
+                old_path.rename(new_path)
+                self.detection_sources[filepath] = 'cad'
+                renamed += 1
+            except Exception as e:
+                print(f"[CAD] Rename failed for {old_path}: {e}")
+                errors += 1
+
+        parts = [f"Renamed {renamed}"]
+        if skipped:
+            parts.append(f"{skipped} skipped (target exists)")
+        if errors:
+            parts.append(f"{errors} errors")
+        self.status_bar.showMessage(" — ".join(parts))
 
     def clear_files(self):
         """Clear all files."""
@@ -3027,7 +3031,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         parent = Path(filepath).parent
 
         # Try different suffixes
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_detections']:
             csv_path = parent / f"{base}{suffix}.csv"
             if csv_path.exists():
                 try:
@@ -3084,7 +3088,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         # Check for CSV on disk
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_detections']:
             if (parent / f"{base}{suffix}.csv").exists():
                 return True
         return False
@@ -3105,7 +3109,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         # Check on-disk CSV if not loaded in memory
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        for suffix in ['_usv_dsp', '_usv_rf', '_usv_detections']:
+        for suffix in ['_cad', '_usv_dsp', '_usv_rf', '_usv_detections']:
             csv_path = parent / f"{base}{suffix}.csv"
             if csv_path.exists():
                 try:
@@ -3174,6 +3178,10 @@ class ClassicAudioDetectorWindow(QMainWindow):
             'min_tonality': self.spin_tonality.value(),
             'min_call_freq_hz': self.spin_min_call_freq.value(),
             'detect_harmonics': self.chk_detect_harmonics.isChecked(),
+            'classify_call_types': (
+                self.chk_classify_call_types.isChecked()
+                if hasattr(self, 'chk_classify_call_types') else False
+            ),
             'min_freq_gap_hz': self.spin_freq_gap.value(),
             'valley_split_ratio': self.spin_valley_ratio.value(),
             'min_gap_ms': self.spin_min_gap.value(),
@@ -3197,6 +3205,25 @@ class ClassicAudioDetectorWindow(QMainWindow):
             'max_contour_jitter': self.spin_max_jitter.value(),
             'min_ici_ms': self.spin_min_ici.value(),
         }
+
+    def _copy_settings_to_clipboard(self):
+        """Copy current DSP detection settings to the clipboard as JSON."""
+        cfg = self._gather_dsp_config()
+        profile_name = None
+        if hasattr(self, 'combo_profile'):
+            profile_name = self.combo_profile.currentText()
+        payload = {
+            'profile': profile_name,
+            'config': cfg,
+            'noise_override_active': self._noise_override is not None,
+        }
+        try:
+            text = json.dumps(payload, indent=2, sort_keys=True, default=float)
+        except (TypeError, ValueError) as e:
+            self.status_bar.showMessage(f"Copy failed: {e}")
+            return
+        QApplication.clipboard().setText(text)
+        self.status_bar.showMessage(f"Copied {len(cfg)} DSP settings to clipboard")
 
     def _calibrate_noise_from_view(self):
         """Capture per-bin noise floor from the currently visible spectrogram window."""
@@ -3306,11 +3333,22 @@ class ClassicAudioDetectorWindow(QMainWindow):
         filepath = self.audio_files[self.current_file_idx]
         view_start, view_end = self.spectrogram.get_view_range()
 
-        # Extract the audio segment for the visible window
-        start_sample = int(view_start * self.sample_rate)
-        end_sample = int(view_end * self.sample_rate)
-        start_sample = max(0, start_sample)
-        end_sample = min(len(self.audio_data), end_sample)
+        # Grow the analysis window so the noise floor matches what a full-file
+        # run would compute. Without this, tight zooms dominated by calls yield
+        # an inflated noise floor and miss detections the full run would find.
+        file_dur = len(self.audio_data) / self.sample_rate
+        cfg_preview = self._gather_dsp_config()
+        chunk_dur = float(cfg_preview.get('chunk_duration_s', 10.0) or 10.0)
+        min_analysis_dur = max(chunk_dur, view_end - view_start)
+        view_mid = 0.5 * (view_start + view_end)
+        analysis_start = max(0.0, view_mid - min_analysis_dur / 2.0)
+        analysis_end = min(file_dur, analysis_start + min_analysis_dur)
+        # If we hit the end of the file, back up the start so we keep full span
+        if analysis_end - analysis_start < min_analysis_dur:
+            analysis_start = max(0.0, analysis_end - min_analysis_dur)
+
+        start_sample = max(0, int(analysis_start * self.sample_rate))
+        end_sample = min(len(self.audio_data), int(analysis_end * self.sample_rate))
         audio_segment = self.audio_data[start_sample:end_sample]
 
         if len(audio_segment) == 0:
@@ -3336,6 +3374,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 min_tonality=cfg.get('min_tonality', 0.3),
                 min_call_freq_hz=cfg.get('min_call_freq_hz', 0.0),
                 detect_harmonics=cfg.get('detect_harmonics', True),
+                classify_call_types=cfg.get('classify_call_types', False),
                 min_freq_gap_hz=cfg.get('min_freq_gap_hz', 5000.0),
                 valley_split_ratio=cfg.get('valley_split_ratio', 0.30),
                 min_gap_ms=cfg.get('min_gap_ms', 5.0),
@@ -3364,7 +3403,10 @@ class ClassicAudioDetectorWindow(QMainWindow):
             print(f"\n{'='*60}", flush=True)
             print(f"  NEW PREVIEW SNAPSHOT", flush=True)
             print(f"{'='*60}", flush=True)
-            print(f"[Preview Snapshot] view={view_start:.3f}-{view_end:.3f}s, "
+            print(f"[Preview Snapshot] view={view_start:.3f}-{view_end:.3f}s "
+                  f"(analysis={analysis_start:.3f}-{analysis_end:.3f}s, "
+                  f"grown by {(seg_dur - (view_end - view_start)):.2f}s "
+                  f"to stabilize noise floor), "
                   f"samples={len(audio_segment)}, sr={self.sample_rate}, "
                   f"dur={seg_dur:.3f}s")
             print(f"[Preview Snapshot] Config: freq={detector_config.min_freq_hz}-"
@@ -3486,18 +3528,41 @@ class ClassicAudioDetectorWindow(QMainWindow):
             _stage("jitter", n0, calls); n0 = len(calls)
             calls = detector._filter_by_ici(calls)
             _stage("ICI", n0, calls); n0 = len(calls)
+
+            # Post-hoc call-type classification (prairie vole 14-type scheme)
+            if getattr(detector_config, 'classify_call_types', False):
+                calls = detector._classify_call_types(calls)
+                if calls:
+                    type_counts = {}
+                    for c in calls:
+                        t = c.get('call_type', 'miscellaneous')
+                        type_counts[t] = type_counts.get(t, 0) + 1
+                    summary = ", ".join(f"{t}:{n}" for t, n in sorted(
+                        type_counts.items(), key=lambda kv: -kv[1]))
+                    print(f"[Preview Snapshot] Call types: {summary}")
+
             print(f"[Preview Snapshot] Final detections: {len(calls)}")
             if not funnel or funnel[-1][1] != len(calls):
                 funnel.append(("final", len(calls)))
 
-            detections = calls
+            # Offset all detection times by the analysis-window start,
+            # not the view start — the pipeline ran on the grown window.
+            for det in calls:
+                det['start_seconds'] += analysis_start
+                det['stop_seconds'] += analysis_start
 
-            # Offset all detection times by the view start
-            for det in detections:
-                det['start_seconds'] += view_start
-                det['stop_seconds'] += view_start
-
+            # Keep only detections overlapping the user's visible range.
+            # This preserves the user's "preview = what I see" mental model
+            # while still benefiting from the grown noise-floor estimate.
+            n_total_analysis = len(calls)
+            detections = [
+                d for d in calls
+                if d['stop_seconds'] > view_start and d['start_seconds'] < view_end
+            ]
             n_det = len(detections)
+            if n_total_analysis != n_det:
+                print(f"[Preview Snapshot] In-view: {n_det} of {n_total_analysis} "
+                      f"calls from grown analysis window")
             import pandas as pd
 
             # Always clear existing detections within the preview window first
@@ -3532,7 +3597,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
             # Update stored detections
             self.all_detections[filepath] = self.detections_df.copy() if self.detections_df is not None else pd.DataFrame()
-            self.detection_sources[filepath] = 'usv_dsp'
+            self.detection_sources[filepath] = 'cad'
 
             # Keep current_detection_idx valid without jumping the view
             if self.detections_df is not None and len(self.detections_df) > 0:
@@ -3711,12 +3776,12 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         # Store in memory
         self.all_detections[filepath] = df
-        self.detection_sources[filepath] = 'usv_dsp'
+        self.detection_sources[filepath] = 'cad'
 
         # Write CSV immediately (crash-safe — results are on disk per file)
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        csv_path = parent / f"{base}_usv_dsp.csv"
+        csv_path = parent / f"{base}_cad.csv"
         try:
             df.to_csv(csv_path, index=False)
         except Exception as e:
@@ -3867,7 +3932,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self._update_button_counts()
         self._update_button_counts()
         self._update_statistics()
-        self._update_review_filter_count()
 
 
     def _update_display_no_scroll(self):
@@ -4129,12 +4193,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.spectrogram.set_detections([], -1)
             return
 
-        # Visual-only: flag rows failing review filters so the widget can skip them.
-        # Indices into self.detections_df (and the passed list) remain in parity.
-        visible_set = set(self._get_filtered_indices())
-
         detections = []
-        for pos, (_, row) in enumerate(self.detections_df.iterrows()):
+        for _, row in self.detections_df.iterrows():
             min_freq = row['min_freq_hz'] if 'min_freq_hz' in row and not pd.isna(row['min_freq_hz']) else 20000
             max_freq = row['max_freq_hz'] if 'max_freq_hz' in row and not pd.isna(row['max_freq_hz']) else 80000
             status = row['status'] if 'status' in row and not pd.isna(row['status']) else 'pending'
@@ -4145,7 +4205,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 'min_freq_hz': min_freq,
                 'max_freq_hz': max_freq,
                 'status': status,
-                '_hidden': pos not in visible_set,
             }
             # Pass through peak_freq_N contour columns only if freq sampling is enabled
             if self.chk_freq_samples.isChecked():
@@ -4485,7 +4544,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
             filepath = self.audio_files[self.current_file_idx]
             base = Path(filepath).stem
             parent = Path(filepath).parent
-            source = self.detection_sources.get(filepath, 'usv_dsp')
+            source = self.detection_sources.get(filepath, 'cad')
             csv_path = parent / f"{base}_{source}.csv"
             if csv_path.exists():
                 csv_path.unlink()
@@ -4614,8 +4673,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         base = Path(filepath).stem
         parent = Path(filepath).parent
-        # Use the tracked source suffix, default to _usv_dsp
-        source = self.detection_sources.get(filepath, 'usv_dsp')
+        # Use the tracked source suffix, default to _cad
+        source = self.detection_sources.get(filepath, 'cad')
         csv_path = parent / f"{base}_{source}.csv"
 
         try:
@@ -5058,41 +5117,6 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.filter_status = self.combo_filter.currentData()
         self._update_display()
 
-    def _on_review_filter_changed(self):
-        """Handle any review-filter spinbox change (visual-only, no row deletion)."""
-        visible = self._get_filtered_indices()
-        if visible and self.current_detection_idx not in visible:
-            self.current_detection_idx = visible[0]
-        self._update_display()
-        self._update_detection_boxes()
-
-    def _reset_review_filters(self):
-        """Clear all review filters to 0 (off)."""
-        for w in (getattr(self, 'spin_rf_min_dur', None),
-                  getattr(self, 'spin_rf_max_dur', None),
-                  getattr(self, 'spin_rf_min_snr', None),
-                  getattr(self, 'spin_rf_min_freq', None),
-                  getattr(self, 'spin_rf_max_freq', None)):
-            if w is not None:
-                w.blockSignals(True)
-                w.setValue(0)
-                w.blockSignals(False)
-        self._on_review_filter_changed()
-
-    def _update_review_filter_count(self):
-        """Refresh the 'N/M shown' indicator on the review-filter panel."""
-        if not hasattr(self, 'lbl_rf_count'):
-            return
-        if self.detections_df is None or len(self.detections_df) == 0:
-            self.lbl_rf_count.setText("")
-            return
-        n_visible = len(self._get_filtered_indices())
-        n_total = len(self.detections_df)
-        if n_visible == n_total:
-            self.lbl_rf_count.setText(f"{n_total} shown")
-        else:
-            self.lbl_rf_count.setText(f"{n_visible}/{n_total} shown")
-
     def on_jump_to_detection(self):
         """Jump to a specific detection number."""
         idx = self.spin_jump.value() - 1
@@ -5101,32 +5125,12 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self._update_display()
 
     def _get_filtered_indices(self):
-        """Get detection indices matching current filter (status + review filters)."""
+        """Get detection indices matching current filter."""
         if self.detections_df is None or len(self.detections_df) == 0:
             return []
-        df = self.detections_df
         if self.filter_status == 'all':
-            mask = pd.Series(True, index=df.index)
-        else:
-            mask = (df['status'] == self.filter_status)
-
-        min_dur = getattr(self, 'spin_rf_min_dur', None)
-        if min_dur is not None and min_dur.value() > 0 and 'duration_ms' in df.columns:
-            mask &= df['duration_ms'].fillna(-1) >= min_dur.value()
-        max_dur = getattr(self, 'spin_rf_max_dur', None)
-        if max_dur is not None and max_dur.value() > 0 and 'duration_ms' in df.columns:
-            mask &= df['duration_ms'].fillna(float('inf')) <= max_dur.value()
-        min_snr = getattr(self, 'spin_rf_min_snr', None)
-        if min_snr is not None and min_snr.value() > 0 and 'snr_db' in df.columns:
-            mask &= df['snr_db'].fillna(-1) >= min_snr.value()
-        min_f = getattr(self, 'spin_rf_min_freq', None)
-        if min_f is not None and min_f.value() > 0 and 'max_freq_hz' in df.columns:
-            mask &= df['max_freq_hz'].fillna(-1) >= min_f.value()
-        max_f = getattr(self, 'spin_rf_max_freq', None)
-        if max_f is not None and max_f.value() > 0 and 'min_freq_hz' in df.columns:
-            mask &= df['min_freq_hz'].fillna(float('inf')) <= max_f.value()
-
-        return [i for i, keep in enumerate(mask.tolist()) if keep]
+            return list(range(len(self.detections_df)))
+        return list(self.detections_df.index[self.detections_df['status'] == self.filter_status])
 
     # =========================================================================
     # Wheel Zoom / Overview Navigation / Display Frequency

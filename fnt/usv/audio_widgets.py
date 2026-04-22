@@ -485,8 +485,6 @@ class SpectrogramWidget(QWidget):
 
     def _draw_detection_box(self, painter, det, idx, spec_rect):
         """Draw a detection bounding box."""
-        if det.get('_hidden'):
-            return
         start_s = det.get('start_seconds', 0)
         stop_s = det.get('stop_seconds', 0)
         min_freq = det.get('min_freq_hz', self.min_freq)
@@ -852,8 +850,6 @@ class SpectrogramWidget(QWidget):
         half-width (in screen pixels) of each edge/corner hit zone.
         """
         def _check_det(i, det):
-            if det.get('_hidden'):
-                return None, None
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
             min_freq = det.get('min_freq_hz', self.min_freq)
@@ -922,8 +918,6 @@ class SpectrogramWidget(QWidget):
         """
         pad = 6  # pixels of padding around each box
         for i, det in enumerate(self.detections):
-            if det.get('_hidden'):
-                continue
             start_s = det.get('start_seconds', 0)
             stop_s = det.get('stop_seconds', 0)
             min_freq = det.get('min_freq_hz', self.min_freq)

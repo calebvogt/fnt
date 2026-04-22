@@ -162,6 +162,11 @@ class DSPDetector:
         calls = self._filter_by_contour_smoothness(calls)
         calls = self._filter_by_ici(calls)
 
+        # Post-hoc call-type classification (Ma et al. 2014, 14 types).
+        # Currently prairie-vole specific; requires peak_freq_* samples.
+        if getattr(self.config, 'classify_call_types', False):
+            calls = self._classify_call_types(calls)
+
         return calls
 
     def _detect_chunked(self, audio: np.ndarray, sr: int, progress_callback=None) -> List[Dict]:
@@ -995,6 +1000,132 @@ class DSPDetector:
                 filtered.append(calls[i])
 
         return filtered
+
+    def _classify_call_types(self, calls: List[Dict]) -> List[Dict]:
+        """Assign ``call_type`` to each detection using the Ma et al. 2014
+        prairie-vole 14-type scheme.
+
+        Uses existing features: ``peak_freq_1..N`` samples, ``duration_ms``,
+        ``freq_bandwidth_hz``, ``min_freq_hz``, ``max_freq_hz``,
+        ``is_harmonic``. This is a rule-based heuristic — the expectation is
+        that it is coarse but useful for downstream statistics; human review
+        or a learned classifier would refine edge cases.
+
+        Categories (Ma et al. 2014, Fig. 1):
+            flat, upward_ramp, downward_ramp, harmonic,
+            step_up, step_down, step_in_left, step_in_right, step_in_both,
+            u_shape, inverted_u, miscellaneous, complex, step_composite
+
+        All detections get a ``call_type`` field. Harmonics (already labeled
+        by ``_label_harmonics``) are tagged ``harmonic`` regardless of shape.
+        """
+        # Thresholds (kHz, ms, kHz/ms) chosen from paper definitions.
+        STEP_ABS_JUMP_KHZ = 5.0      # Step calls: discontinuous ≥5 kHz jump (paper).
+        STEP_OUTLIER_RATIO = 3.0     # A jump is "discontinuous" only if also ≥3x
+                                     # the median jump in the contour — otherwise
+                                     # it's part of a smooth sweep (ramp/U).
+        U_END_KHZ = 5.0              # U/inverted-U: ≥5 kHz at both ends (paper).
+        RAMP_SLOPE_KHZ_MS = 0.3      # Paper: ~0.5 kHz/ms; be a bit permissive.
+        FLAT_SLOPE_KHZ_MS = 0.1      # Flat: slope below this = essentially flat.
+        FLAT_BW_KHZ = 4.0            # Flat: narrow overall bandwidth.
+
+        def _peak_samples(call):
+            freqs = []
+            i = 1
+            while True:
+                v = call.get(f'peak_freq_{i}')
+                if v is None:
+                    break
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    break
+                if not np.isnan(fv):
+                    freqs.append(fv / 1000.0)  # Hz → kHz
+                i += 1
+            return freqs
+
+        for call in calls:
+            if call.get('is_harmonic', False):
+                call['call_type'] = 'harmonic'
+                continue
+
+            freqs_khz = _peak_samples(call)
+            duration_ms = float(call.get('duration_ms', 0) or 0)
+            bw_khz = float(call.get('freq_bandwidth_hz', 0) or 0) / 1000.0
+
+            if len(freqs_khz) < 2 or duration_ms <= 0:
+                call['call_type'] = 'miscellaneous'
+                continue
+
+            n = len(freqs_khz)
+            dt_ms = duration_ms / (n - 1)
+            diffs = np.diff(freqs_khz)          # signed Δ per segment (kHz)
+            abs_diffs = np.abs(diffs)
+            slopes = diffs / dt_ms              # signed slope (kHz/ms)
+
+            # Detect step-like outliers: a jump is "discontinuous" only if it
+            # is both (a) absolutely large (≥5 kHz) and (b) an outlier relative
+            # to the rest of the contour (≥3x the median jump). Otherwise it
+            # is part of a smooth sweep.
+            median_jump = float(np.median(abs_diffs)) if len(abs_diffs) > 0 else 0.0
+            min_outlier_thresh = max(STEP_ABS_JUMP_KHZ, STEP_OUTLIER_RATIO * median_jump)
+            step_mask = abs_diffs >= min_outlier_thresh
+            n_jumps = int(np.sum(step_mask))
+
+            mean_slope = float(np.mean(slopes))
+            start_f, end_f = freqs_khz[0], freqs_khz[-1]
+            min_f, max_f = min(freqs_khz), max(freqs_khz)
+            min_idx, max_idx = int(np.argmin(freqs_khz)), int(np.argmax(freqs_khz))
+
+            # --- Step-family (discontinuous jumps) --------------------------
+            if n_jumps >= 2:
+                call['call_type'] = 'step_composite'
+                continue
+            if n_jumps == 1:
+                jump_idx = int(np.argmax(abs_diffs))
+                jump_dir = 'up' if diffs[jump_idx] > 0 else 'down'
+                # Paper distinguishes 'step up/down' (single jump) from
+                # 'step_in_*' (jump adjacent to a harmonic structure). We
+                # don't have a harmonic-adjacency signal here, so fall back
+                # to step_up / step_down and let downstream classification
+                # refine.
+                call['call_type'] = f'step_{jump_dir}'
+                continue
+
+            # --- U / inverted-U --------------------------------------------
+            # U: min is in the interior, both ends ≥ U_END_KHZ above the min.
+            if 0 < min_idx < n - 1:
+                if (start_f - min_f) >= U_END_KHZ and (end_f - min_f) >= U_END_KHZ:
+                    call['call_type'] = 'u_shape'
+                    continue
+            # Inverted U: max is interior, both ends ≥ U_END_KHZ below max.
+            if 0 < max_idx < n - 1:
+                if (max_f - start_f) >= U_END_KHZ and (max_f - end_f) >= U_END_KHZ:
+                    call['call_type'] = 'inverted_u'
+                    continue
+
+            # --- Flat / ramp ------------------------------------------------
+            if abs(mean_slope) < FLAT_SLOPE_KHZ_MS and bw_khz < FLAT_BW_KHZ:
+                call['call_type'] = 'flat'
+                continue
+            if mean_slope >= RAMP_SLOPE_KHZ_MS:
+                call['call_type'] = 'upward_ramp'
+                continue
+            if mean_slope <= -RAMP_SLOPE_KHZ_MS:
+                call['call_type'] = 'downward_ramp'
+                continue
+
+            # --- Complex (wide bandwidth, not otherwise classified) --------
+            # Complex calls during socio-sexual interaction have rich
+            # structure spanning a wide band. Use bandwidth as a proxy.
+            if bw_khz >= 15.0:
+                call['call_type'] = 'complex'
+                continue
+
+            call['call_type'] = 'miscellaneous'
+
+        return calls
 
     def _sample_peak_frequencies(
         self,

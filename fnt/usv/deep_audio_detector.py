@@ -1759,8 +1759,8 @@ class DeepAudioDetectorWindow(QMainWindow):
         """Load existing sibling-CSV labels for a file.
 
         Reads the canonical ``<stem>_dad.csv`` first, then legacy suffixes
-        (``_yoloDetection``, ``_usv_yolo``). CAD-family suffixes (``_usv_dsp``,
-        ``_usv_detections``) are deliberately NOT auto-imported — DAD is a
+        (``_yoloDetection``, ``_usv_yolo``). CAD-family suffixes (``_cad``,
+        ``_usv_dsp``, ``_usv_detections``) are deliberately NOT auto-imported — DAD is a
         standalone tool; users pull CAD labels in via ``Labels → Import…``.
         """
         df = load_labels(filepath)
@@ -2915,7 +2915,7 @@ class DeepAudioDetectorWindow(QMainWindow):
 
         # Sensible default: look for any CAD-style sibling CSV.
         candidate = None
-        for suffix in ("_usv_dsp", "_usv_detections", "_usv_yolo"):
+        for suffix in ("_cad", "_usv_dsp", "_usv_detections", "_usv_yolo"):
             p = parent / f"{base}{suffix}.csv"
             if p.exists():
                 candidate = str(p)
