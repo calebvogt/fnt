@@ -43,6 +43,9 @@ dependencies = [
     "joblib",
     "ultralytics>=8.3.0",
     "sahi>=0.11.18",
+    # MAD (Mask Audio Detector) — U-Net segmentation
+    "torch>=2.5.1",
+    "segmentation-models-pytorch>=0.3.4",
 ]
 
 [project.optional-dependencies]
@@ -56,7 +59,6 @@ rfid = [
     "networkx>=3.0",
 ]
 tracking = [
-    "torch>=2.5.1",
     "torchvision>=0.20.1",
     # segment-anything and SAM-2 must be installed separately:
     #   pip install git+https://github.com/facebookresearch/sam2.git

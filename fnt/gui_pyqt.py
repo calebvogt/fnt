@@ -420,6 +420,7 @@ class FNTMainWindow(QMainWindow):
         analysis_buttons = [
             ("Classic Audio Detector", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
             ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
+            ("Mask Audio Detector", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
         ]
 
         self.create_button_grid(analysis_layout, analysis_buttons)
@@ -888,6 +889,16 @@ class FNTMainWindow(QMainWindow):
             self.dad_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Deep Audio Detector failed: {str(e)}")
+
+    def run_mask_audio_detector(self):
+        """Launch Mask Audio Detector - segmentation-based labeling, training, inference"""
+        try:
+            from fnt.usv.mad_pyqt import MADMainWindow
+
+            self.mad_window = MADMainWindow()
+            self.mad_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Mask Audio Detector failed: {str(e)}")
 
     def run_usv_studio(self):
         """Launch USV Studio - DEPRECATED, use Classic/Deep Audio Detector instead"""
