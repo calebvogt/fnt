@@ -66,11 +66,20 @@ class InferenceWorker(QThread):
 
     def _read_stream(self, stream):
         """Read a stream character-by-character, emitting signals in real time.
-        Handles \\r (carriage return) for in-place progress bar updates and
-        \\n for normal new lines. ANSI escape codes are stripped so that the
-        QTextEdit log shows clean, readable text.
+
+        Detects two kinds of "overwrite the last line" indicators:
+          1. \\r (carriage return) — used by tqdm in classic mode.
+          2. ANSI cursor-up (``ESC[<n>A``) — used by rich's Live display
+             when it rewrites the progress bar on a non-TTY pipe.
+
+        A content-based fallback also catches repeated progress lines
+        (same prefix + contains '%') in case neither \\r nor cursor-up
+        appears in the raw bytes.
+
+        All ANSI escape codes are stripped before text reaches the GUI.
         """
         buf = ""
+        _last_clean = ""
         try:
             while True:
                 ch = stream.read(1)
@@ -79,15 +88,40 @@ class InferenceWorker(QThread):
                 if self._stop_requested:
                     break
                 if ch == '\r':
-                    # Carriage return — overwrite last line (progress bar)
                     clean = self._strip_ansi(buf).strip()
                     if clean:
                         self.progress_update.emit(clean)
+                        _last_clean = clean
                     buf = ""
                 elif ch == '\n':
+                    # Check for ANSI cursor-up (ESC[<digits>A) in the raw
+                    # buffer BEFORE stripping.  Rich uses this to tell the
+                    # terminal "go back up and overwrite the previous line."
+                    has_cursor_up = (
+                        '\x1b[' in buf
+                        and bool(re.search(r'\x1b\[\d*A', buf))
+                    )
+
                     clean = self._strip_ansi(buf).strip()
-                    if clean:
+                    if not clean:
+                        buf = ""
+                        continue
+
+                    is_update = has_cursor_up
+
+                    # Fallback: if the line shares its first 12 characters
+                    # with the previous emitted line AND contains '%', it is
+                    # almost certainly a progress-bar update.
+                    if not is_update and _last_clean and '%' in clean:
+                        pfx = min(12, len(clean), len(_last_clean))
+                        if pfx > 5 and clean[:pfx] == _last_clean[:pfx]:
+                            is_update = True
+
+                    if is_update:
+                        self.progress_update.emit(clean)
+                    else:
                         self.progress.emit(clean)
+                    _last_clean = clean
                     buf = ""
                 else:
                     buf += ch
@@ -829,8 +863,15 @@ class VideoInferenceWindow(QWidget):
         )
 
     def log_update(self, message):
-        """Replace the last line in the log (for progress bar updates)"""
+        """Replace the last line in the log (for progress bar updates).
+        If the log is empty, falls back to appending instead."""
+        doc = self.log_output.document()
+        if doc.blockCount() <= 1:
+            # Nothing to replace — just append
+            self.log(message)
+            return
         cursor = self.log_output.textCursor()
+        # Move to end, select entire last line, replace it
         cursor.movePosition(cursor.End)
         cursor.select(cursor.LineUnderCursor)
         cursor.removeSelectedText()
