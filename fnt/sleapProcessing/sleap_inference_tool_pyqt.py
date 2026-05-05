@@ -9,6 +9,7 @@ Automatically converts output to CSV format.
 import os
 import subprocess
 import glob
+import threading
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
@@ -52,7 +53,39 @@ class InferenceWorker(QThread):
         if self._current_process:
             self._current_process.terminate()
         self.progress.emit("\n⚠️ Stop requested by user...")
-        
+
+    def _read_stream(self, stream):
+        """Read a stream character-by-character, emitting signals in real time.
+        Handles \\r (carriage return) for in-place progress bar updates and
+        \\n for normal new lines. Runs in its own thread.
+        """
+        buf = ""
+        try:
+            while True:
+                ch = stream.read(1)
+                if not ch:
+                    break
+                if self._stop_requested:
+                    break
+                if ch == '\r':
+                    # Carriage return — overwrite last line (tqdm progress bar)
+                    stripped = buf.strip()
+                    if stripped:
+                        self.progress_update.emit(stripped)
+                    buf = ""
+                elif ch == '\n':
+                    stripped = buf.strip()
+                    if stripped:
+                        self.progress.emit(stripped)
+                    buf = ""
+                else:
+                    buf += ch
+            # Flush any remaining text
+            if buf.strip():
+                self.progress.emit(buf.strip())
+        except Exception:
+            pass
+
     def run(self):
         try:
             total_processed = 0
@@ -242,44 +275,51 @@ class InferenceWorker(QThread):
         
         self.progress.emit(f"\n🔁 Running inference on: {os.path.basename(video_file)}")
         
-        # Build full command with conda run
+        # Build full command with conda run.
+        # --no-capture-output tells conda not to buffer the child process output,
+        # so lines flow through to our pipe immediately.
         if self.conda_env:
-            full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
+            full_cmd = ["conda", "run", "--no-capture-output", "-n", self.conda_env] + cmd
             self.progress.emit(f"Environment: {self.conda_env}")
         else:
             full_cmd = cmd
             self.progress.emit("Warning: No conda environment specified")
-        
+
         self.progress.emit(f"Command: {' '.join(full_cmd)}\n")
-        
+
+        # PYTHONUNBUFFERED=1 stops Python inside SLEAP from buffering its own output.
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
         try:
             self.progress.emit("🔄 Running SLEAP inference...\n")
 
+            # Keep stdout and stderr SEPARATE so tqdm's \r progress bar
+            # (which goes to stderr) can be read char-by-char in its own thread.
             process = subprocess.Popen(
                 full_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 shell=True,
-                bufsize=1,
+                bufsize=0,
+                env=env,
             )
             self._current_process = process
 
-            for raw_line in process.stdout:
-                if self._stop_requested:
-                    process.terminate()
-                    break
-                # SLEAP uses \r for progress bar updates
-                segments = raw_line.rstrip('\n').split('\r')
-                for i, segment in enumerate(segments):
-                    segment = segment.strip()
-                    if not segment:
-                        continue
-                    if i > 0 or raw_line.startswith('\r'):
-                        self.progress_update.emit(segment)
-                    else:
-                        self.progress.emit(segment)
+            # stderr thread: captures tqdm progress bars and INFO log lines
+            stderr_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stderr,),
+                daemon=True,
+            )
+            stderr_thread.start()
 
+            # stdout: read in this thread (normal print() output, if any)
+            self._read_stream(process.stdout)
+
+            # Wait for stderr thread and process to finish
+            stderr_thread.join(timeout=30)
             process.wait()
             self._current_process = None
 
