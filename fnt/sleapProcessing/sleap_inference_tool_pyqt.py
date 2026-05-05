@@ -11,11 +11,12 @@ import re
 import subprocess
 import glob
 import threading
+import time
 from datetime import datetime
 
 # Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
 # that rich/tqdm emit when they think they are writing to a terminal.
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[[\d;]*m')
+_ANSI_RE = re.compile(r'\x1b[\[\(][0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
     QFileDialog, QMessageBox, QGroupBox, QTextEdit, QCheckBox,
@@ -64,71 +65,66 @@ class InferenceWorker(QThread):
         """Remove ANSI escape codes (colors, cursor moves) from text."""
         return _ANSI_RE.sub('', text)
 
-    def _read_stream(self, stream):
-        """Read a stream character-by-character, emitting signals in real time.
+    @staticmethod
+    def _is_progress_line(text):
+        """Return True if *text* looks like a SLEAP progress-bar update.
 
-        Detects two kinds of "overwrite the last line" indicators:
-          1. \\r (carriage return) — used by tqdm in classic mode.
-          2. ANSI cursor-up (``ESC[<n>A``) — used by rich's Live display
-             when it rewrites the progress bar on a non-TTY pipe.
-
-        A content-based fallback also catches repeated progress lines
-        (same prefix + contains '%') in case neither \\r nor cursor-up
-        appears in the raw bytes.
-
-        All ANSI escape codes are stripped before text reaches the GUI.
+        SLEAP progress lines look like:
+            Predicting...  ━━━  8%  1420/18000  ETA: 0:06:23  Elapsed: 0:00:32  43.4 FPS
+        They always contain a fraction (N/M) and at least one timing keyword.
         """
-        buf = ""
-        _last_clean = ""
+        return ('/' in text
+                and any(kw in text for kw in ('ETA:', 'Elapsed:', 'FPS', 'Predicting')))
+
+    def _read_stream(self, stream):
+        """Read lines from *stream*, routing each to the correct GUI signal.
+
+        * Lines that match SLEAP's progress-bar pattern are sent to
+          ``progress_update`` (replaces the last line in the log).
+        * Everything else (INFO messages, warnings, etc.) is sent to
+          ``progress`` (appends a new line).
+
+        Progress-bar updates are **throttled** to at most 2/second so the
+        QTextEdit can keep up.  ANSI escape codes are stripped before any
+        text reaches the GUI.
+        """
+        last_update_time = 0.0
+        progress_started = False
+        UPDATE_INTERVAL = 0.5          # seconds between GUI refreshes
+
         try:
-            while True:
-                ch = stream.read(1)
-                if not ch:
-                    break
+            for raw_line in iter(stream.readline, ''):
                 if self._stop_requested:
                     break
-                if ch == '\r':
-                    clean = self._strip_ansi(buf).strip()
-                    if clean:
-                        self.progress_update.emit(clean)
-                        _last_clean = clean
-                    buf = ""
-                elif ch == '\n':
-                    # Check for ANSI cursor-up (ESC[<digits>A) in the raw
-                    # buffer BEFORE stripping.  Rich uses this to tell the
-                    # terminal "go back up and overwrite the previous line."
-                    has_cursor_up = (
-                        '\x1b[' in buf
-                        and bool(re.search(r'\x1b\[\d*A', buf))
-                    )
 
-                    clean = self._strip_ansi(buf).strip()
+                # A single readline() may contain \r-separated sub-segments
+                # (rich sometimes puts cursor-control + content + \r + … + \n).
+                segments = raw_line.split('\r')
+
+                for segment in segments:
+                    clean = self._strip_ansi(segment).strip()
                     if not clean:
-                        buf = ""
                         continue
 
-                    is_update = has_cursor_up
-
-                    # Fallback: if the line shares its first 12 characters
-                    # with the previous emitted line AND contains '%', it is
-                    # almost certainly a progress-bar update.
-                    if not is_update and _last_clean and '%' in clean:
-                        pfx = min(12, len(clean), len(_last_clean))
-                        if pfx > 5 and clean[:pfx] == _last_clean[:pfx]:
-                            is_update = True
-
-                    if is_update:
-                        self.progress_update.emit(clean)
+                    if self._is_progress_line(clean):
+                        now = time.time()
+                        if not progress_started:
+                            # First progress line — append so there is a line
+                            # to overwrite on subsequent updates.
+                            self.progress.emit(clean)
+                            progress_started = True
+                            last_update_time = now
+                        elif now - last_update_time >= UPDATE_INTERVAL:
+                            self.progress_update.emit(clean)
+                            last_update_time = now
+                        # else: throttled — silently skip this update
                     else:
                         self.progress.emit(clean)
-                    _last_clean = clean
-                    buf = ""
-                else:
-                    buf += ch
-            # Flush any remaining text
-            remaining = self._strip_ansi(buf).strip()
-            if remaining:
-                self.progress.emit(remaining)
+                        # If a non-progress line appears after progress was
+                        # running, reset so the next progress phase starts
+                        # with a fresh append.
+                        if progress_started:
+                            progress_started = False
         except Exception:
             pass
 
@@ -333,35 +329,32 @@ class InferenceWorker(QThread):
 
         self.progress.emit(f"Command: {' '.join(full_cmd)}\n")
 
-        # Force the child process to behave as if connected to a real terminal:
-        #   PYTHONUNBUFFERED  — no internal Python buffering
-        #   FORCE_COLOR       — rich library treats the stream as a terminal
-        #                       and renders its progress bar instead of suppressing it
-        #   COLUMNS           — tells rich/tqdm the terminal width for formatting
-        #   TERM              — generic TTY hint for other libraries
+        # PYTHONUNBUFFERED — prevents Python from buffering SLEAP's output.
+        # FORCE_COLOR      — makes rich render its progress bar (it would
+        #                    suppress it entirely on a non-TTY pipe).
+        # COLUMNS          — tells rich the "terminal" width for formatting.
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["FORCE_COLOR"] = "1"
         env["COLUMNS"] = "120"
-        env["TERM"] = "xterm-256color"
 
         try:
             self.progress.emit("🔄 Running SLEAP inference...\n")
 
-            # Keep stdout and stderr SEPARATE so tqdm's \r progress bar
-            # (which goes to stderr) can be read char-by-char in its own thread.
+            # stdout and stderr are read in separate threads so neither
+            # pipe blocks the other.
             process = subprocess.Popen(
                 full_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 shell=True,
-                bufsize=0,
+                bufsize=1,
                 env=env,
             )
             self._current_process = process
 
-            # stderr thread: captures tqdm progress bars and INFO log lines
+            # stderr thread — rich progress bar + INFO log lines go here
             stderr_thread = threading.Thread(
                 target=self._read_stream,
                 args=(process.stderr,),
@@ -369,10 +362,9 @@ class InferenceWorker(QThread):
             )
             stderr_thread.start()
 
-            # stdout: read in this thread (normal print() output, if any)
+            # stdout — normal print() output, if any
             self._read_stream(process.stdout)
 
-            # Wait for stderr thread and process to finish
             stderr_thread.join(timeout=30)
             process.wait()
             self._current_process = None
