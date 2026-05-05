@@ -7,10 +7,15 @@ Automatically converts output to CSV format.
 """
 
 import os
+import re
 import subprocess
 import glob
 import threading
 from datetime import datetime
+
+# Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
+# that rich/tqdm emit when they think they are writing to a terminal.
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[[\d;]*m')
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
     QFileDialog, QMessageBox, QGroupBox, QTextEdit, QCheckBox,
@@ -54,10 +59,16 @@ class InferenceWorker(QThread):
             self._current_process.terminate()
         self.progress.emit("\n⚠️ Stop requested by user...")
 
+    @staticmethod
+    def _strip_ansi(text):
+        """Remove ANSI escape codes (colors, cursor moves) from text."""
+        return _ANSI_RE.sub('', text)
+
     def _read_stream(self, stream):
         """Read a stream character-by-character, emitting signals in real time.
         Handles \\r (carriage return) for in-place progress bar updates and
-        \\n for normal new lines. Runs in its own thread.
+        \\n for normal new lines. ANSI escape codes are stripped so that the
+        QTextEdit log shows clean, readable text.
         """
         buf = ""
         try:
@@ -68,21 +79,22 @@ class InferenceWorker(QThread):
                 if self._stop_requested:
                     break
                 if ch == '\r':
-                    # Carriage return — overwrite last line (tqdm progress bar)
-                    stripped = buf.strip()
-                    if stripped:
-                        self.progress_update.emit(stripped)
+                    # Carriage return — overwrite last line (progress bar)
+                    clean = self._strip_ansi(buf).strip()
+                    if clean:
+                        self.progress_update.emit(clean)
                     buf = ""
                 elif ch == '\n':
-                    stripped = buf.strip()
-                    if stripped:
-                        self.progress.emit(stripped)
+                    clean = self._strip_ansi(buf).strip()
+                    if clean:
+                        self.progress.emit(clean)
                     buf = ""
                 else:
                     buf += ch
             # Flush any remaining text
-            if buf.strip():
-                self.progress.emit(buf.strip())
+            remaining = self._strip_ansi(buf).strip()
+            if remaining:
+                self.progress.emit(remaining)
         except Exception:
             pass
 
@@ -287,9 +299,17 @@ class InferenceWorker(QThread):
 
         self.progress.emit(f"Command: {' '.join(full_cmd)}\n")
 
-        # PYTHONUNBUFFERED=1 stops Python inside SLEAP from buffering its own output.
+        # Force the child process to behave as if connected to a real terminal:
+        #   PYTHONUNBUFFERED  — no internal Python buffering
+        #   FORCE_COLOR       — rich library treats the stream as a terminal
+        #                       and renders its progress bar instead of suppressing it
+        #   COLUMNS           — tells rich/tqdm the terminal width for formatting
+        #   TERM              — generic TTY hint for other libraries
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["FORCE_COLOR"] = "1"
+        env["COLUMNS"] = "120"
+        env["TERM"] = "xterm-256color"
 
         try:
             self.progress.emit("🔄 Running SLEAP inference...\n")
