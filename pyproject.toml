@@ -30,13 +30,23 @@ dependencies = [
     "pandas",
     "scipy",
     "matplotlib",
+    "pytz",
     # GUI
-    "PyQt5",
+    "PyQt6",
     # I/O
     "h5py",
     "Pillow",
     "soundfile",
     "opencv-python",
+    # USV detection + classification
+    "sounddevice",
+    "scikit-learn",
+    "joblib",
+    "ultralytics>=8.3.0",
+    "sahi>=0.11.18",
+    # MAD (Mask Audio Detector) — U-Net segmentation
+    "torch>=2.5.1",
+    "segmentation-models-pytorch>=0.3.4",
 ]
 
 [project.optional-dependencies]
@@ -46,23 +56,16 @@ imaging = [
     "fsspec",
     "scikit-image",
 ]
-usv = [
-    "sounddevice",
-    "scikit-learn",
-    "joblib",
-    "ultralytics>=8.0",
-]
 rfid = [
     "networkx>=3.0",
 ]
 tracking = [
-    "torch>=2.5.1",
     "torchvision>=0.20.1",
     # segment-anything and SAM-2 must be installed separately:
     #   pip install git+https://github.com/facebookresearch/sam2.git
 ]
 all = [
-    "fnt[imaging,usv,tracking]",
+    "fnt[imaging,tracking]",
 ]
 
 [project.scripts]

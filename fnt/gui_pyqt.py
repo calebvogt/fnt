@@ -18,6 +18,9 @@ import os
 from pathlib import Path
 import webbrowser
 
+if os.environ.get('WAYLAND_DISPLAY'):
+    os.environ['QT_QPA_PLATFORM'] = 'wayland'
+
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
