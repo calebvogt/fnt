@@ -23,10 +23,11 @@ if os.environ.get('WAYLAND_DISPLAY'):
 
 try:
     from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
-        QHBoxLayout, QGridLayout, QPushButton, QLabel, QStatusBar, 
-        QMessageBox, QGroupBox, QTextEdit, QSplitter, QFrame,
-        QScrollArea, QSizePolicy, QFileDialog, QInputDialog
+            QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
+            QHBoxLayout, QGridLayout, QPushButton, QLabel, QStatusBar, 
+            QMessageBox, QGroupBox, QTextEdit, QSplitter, QFrame,
+            QScrollArea, QSizePolicy, QFileDialog, QInputDialog,
+            QComboBox, QSpinBox, QLineEdit, QCheckBox
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap
@@ -35,6 +36,10 @@ except ImportError:
     PYQT_AVAILABLE = False
     print("PyQt5 not available. Please install with: pip install PyQt5")
     sys.exit(1)
+
+import threading
+from datetime import datetime
+from .fed3 import timesync
 
 
 class WorkerThread(QThread):
@@ -537,36 +542,255 @@ class FNTMainWindow(QMainWindow):
     def create_fed_tab(self):
         """Create the FED processing tab"""
         tab, layout = self._make_scrollable_tab("FED")
-        
+
         # Description
         desc = QLabel("Feeding Experimentation Device (FED) data analysis")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
-        # FED processing group
-        group = QGroupBox("FED Analysis Tools")
-        group_layout = QGridLayout()
-        
-        # Placeholder for future FED tools
-        info_label = QLabel(
-            "<b>Coming Soon:</b> FED data analysis tools will be added here.<br><br>"
-            "Planned features:<br>"
-            "• FED data import and preprocessing<br>"
-            "• Feeding pattern analysis<br>"
-            "• Circadian rhythm visualization<br>"
-            "• Multi-device synchronization<br>"
-            "• Integration with behavioral data"
-        )
-        info_label.setTextFormat(Qt.RichText)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
-        info_label.setWordWrap(True)
-        group_layout.addWidget(info_label, 0, 0)
-        
+
+        # FED Sync group with multi-device support
+        group = QGroupBox("FED Sync Tools")
+        group_layout = QVBoxLayout()
+
+        # Top controls: add device, start/stop all, refresh ports
+        top_controls = QHBoxLayout()
+        add_device_btn = QPushButton("Add Device")
+        start_all_btn = QPushButton("Start All")
+        stop_all_btn = QPushButton("Stop All")
+        refresh_ports_btn = QPushButton("Refresh Ports")
+        top_controls.addWidget(add_device_btn)
+        top_controls.addWidget(start_all_btn)
+        top_controls.addWidget(stop_all_btn)
+        top_controls.addStretch()
+        top_controls.addWidget(refresh_ports_btn)
+        group_layout.addLayout(top_controls)
+
+        # Scroll area to hold device entries
+        devices_container = QWidget()
+        devices_layout = QVBoxLayout()
+        devices_layout.setContentsMargins(4, 4, 4, 4)
+        devices_layout.setSpacing(8)
+        devices_container.setLayout(devices_layout)
+
+        devices_scroll = QScrollArea()
+        devices_scroll.setWidgetResizable(True)
+        devices_scroll.setWidget(devices_container)
+        devices_scroll.setFixedHeight(300)
+        group_layout.addWidget(devices_scroll)
+
+        # Log area
+        log_text = QTextEdit()
+        log_text.setReadOnly(True)
+        log_text.setFixedHeight(120)
+        log_text.setStyleSheet("background-color: #1e1e1e; color: #cccccc;")
+        group_layout.addWidget(log_text)
+
         group.setLayout(group_layout)
         layout.addWidget(group)
-        
         layout.addStretch()
+
+        # Devices state
+        self.fed_devices = []
+
+        def append_log(text, success=True):
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            prefix = "[OK] " if success else "[ERR] "
+            log_text.append(f"{ts} {prefix}{text}")
+
+        def populate_port_combo(combo):
+            combo.clear()
+            ports = []
+            try:
+                ports = timesync.list_serial_ports()
+            except Exception:
+                ports = []
+            # Only include ports that can be opened (likely have a device attached)
+            available_ports = []
+            try:
+                import serial
+                for p in ports:
+                    try:
+                        ser = serial.Serial(p, 115200, timeout=0.5)
+                        ser.close()
+                        available_ports.append(p)
+                    except Exception:
+                        # Could not open this port; skip it
+                        pass
+            except Exception:
+                # pyserial not available: fall back to reported ports
+                available_ports = ports
+
+            for p in available_ports:
+                combo.addItem(p)
+            combo.setEditable(True)
+
+        def get_interval_ms(device):
+            unit = device['unit_combo'].currentText()
+            value = device['interval_spin'].value()
+            mult = 1
+            if unit == 'Seconds':
+                mult = 1
+            elif unit == 'Minutes':
+                mult = 60
+            elif unit == 'Hours':
+                mult = 3600
+            elif unit == 'Days':
+                mult = 86400
+            seconds = max(1, value * mult)
+            return int(seconds * 1000)
+
+        def do_device_sync(device):
+            selected_port = device['port_combo'].currentText() or None
+            baud = 115200  # FED3 uses 115200 by default; hide baud choice for simplicity
+            self.status_bar.showMessage("Syncing FED3...")
+
+            def worker():
+                success, message = timesync.sync_time(port=selected_port, baud=baud)
+                dev_name = device['name_edit'].text().strip() or device['box'].title()
+                # Prefix each line of message with device name
+                prefixed = "\n".join([f"{dev_name}: {l}" for l in message.splitlines()])
+                QTimer.singleShot(0, lambda: append_log(prefixed, success))
+                QTimer.singleShot(0, lambda: self.status_bar.showMessage("Ready"))
+
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+
+        def start_device_auto(device, started):
+            if started:
+                device['start_btn'].setText("Stop Auto")
+                interval_ms = get_interval_ms(device)
+                device['timer'].start(interval_ms)
+                # Run an immediate sync when starting
+                do_device_sync(device)
+            else:
+                device['start_btn'].setText("Start Auto")
+                device['timer'].stop()
+
+        def remove_device(device):
+            # Removal should be disabled when only one device exists; safeguard here
+            if len(self.fed_devices) <= 1:
+                return
+
+            try:
+                device['timer'].stop()
+                device['timer'].deleteLater()
+            except Exception:
+                pass
+            devices_layout.removeWidget(device['box'])
+            device['box'].deleteLater()
+            if device in self.fed_devices:
+                self.fed_devices.remove(device)
+            update_remove_buttons()
+
+        def update_remove_buttons():
+            enable = len(self.fed_devices) > 1
+            for dev in self.fed_devices:
+                try:
+                    dev['remove_btn'].setEnabled(enable)
+                except Exception:
+                    pass
+
+        def create_device_widget():
+            idx = len(self.fed_devices) + 1
+            box = QGroupBox(f"Device {idx}")
+            box_layout = QGridLayout()
+
+            name_label = QLabel("Name:")
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("Optional device name")
+
+            port_label = QLabel("Port:")
+            port_combo = QComboBox()
+            port_combo.setEditable(True)
+
+            interval_label = QLabel("Interval:")
+            interval_spin = QSpinBox()
+            interval_spin.setRange(1, 99999)
+            interval_spin.setValue(1)
+            unit_combo = QComboBox()
+            unit_combo.addItems(["Seconds", "Minutes", "Hours", "Days"])
+            unit_combo.setCurrentText("Days")
+
+            start_btn = QPushButton("Start Auto")
+            start_btn.setCheckable(True)
+            manual_btn = QPushButton("Sync Now")
+            remove_btn = QPushButton("Remove")
+
+            last_sync_label = QLabel("Last Sync: Never")
+
+            # Arrange layout
+            box_layout.addWidget(name_label, 0, 0)
+            box_layout.addWidget(name_edit, 0, 1, 1, 3)
+            box_layout.addWidget(port_label, 1, 0)
+            box_layout.addWidget(port_combo, 1, 1, 1, 3)
+            box_layout.addWidget(interval_label, 2, 0)
+            box_layout.addWidget(interval_spin, 2, 1)
+            box_layout.addWidget(unit_combo, 2, 2)
+            box_layout.addWidget(start_btn, 3, 0)
+            box_layout.addWidget(manual_btn, 3, 1)
+            box_layout.addWidget(remove_btn, 3, 2)
+            box_layout.addWidget(last_sync_label, 4, 0, 1, 4)
+
+            box.setLayout(box_layout)
+
+            # Timer and device record
+            timer = QTimer(self)
+            timer.setSingleShot(False)
+
+            device = {
+                'box': box,
+                'name_edit': name_edit,
+                'port_combo': port_combo,
+                'interval_spin': interval_spin,
+                'unit_combo': unit_combo,
+                'start_btn': start_btn,
+                'manual_btn': manual_btn,
+                'remove_btn': remove_btn,
+                'last_sync_label': last_sync_label,
+                'timer': timer,
+            }
+
+            # Connect handlers
+            manual_btn.clicked.connect(lambda _, d=device: do_device_sync(d))
+            start_btn.toggled.connect(lambda started, d=device: start_device_auto(d, started))
+            remove_btn.clicked.connect(lambda _, d=device: remove_device(d))
+
+            # Single timer handler
+            timer.timeout.connect(lambda d=device: do_device_sync(d))
+
+            # Populate ports now
+            populate_port_combo(port_combo)
+
+            # Add to UI and list
+            devices_layout.addWidget(box)
+            self.fed_devices.append(device)
+            # Update remove button states so the last remaining device cannot be removed
+            update_remove_buttons()
+            return device
+
+        def refresh_all_ports():
+            for dev in self.fed_devices:
+                populate_port_combo(dev['port_combo'])
+
+        def start_all():
+            for dev in list(self.fed_devices):
+                if not dev['start_btn'].isChecked():
+                    dev['start_btn'].setChecked(True)
+
+        def stop_all():
+            for dev in list(self.fed_devices):
+                if dev['start_btn'].isChecked():
+                    dev['start_btn'].setChecked(False)
+
+        # Wire top-level controls
+        add_device_btn.clicked.connect(create_device_widget)
+        refresh_ports_btn.clicked.connect(refresh_all_ports)
+        start_all_btn.clicked.connect(start_all)
+        stop_all_btn.clicked.connect(stop_all)
+
+        # Create one default device entry
+        create_device_widget()
 
     def create_wifp_tab(self):
         """Create the WiFP (Wireless Fiber Photometry) processing tab"""
