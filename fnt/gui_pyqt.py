@@ -553,15 +553,29 @@ class FNTMainWindow(QMainWindow):
         group = QGroupBox("FED Sync Tools")
         group_layout = QVBoxLayout()
 
-        # Top controls: add device, start/stop all, refresh ports
+        # Top controls: add device, global autosync interval, start/stop all, refresh ports
         top_controls = QHBoxLayout()
         add_device_btn = QPushButton("Add Device")
-        start_all_btn = QPushButton("Start All")
-        stop_all_btn = QPushButton("Stop All")
+        interval_label = QLabel("Interval:")
+        global_interval_spin = QSpinBox()
+        global_interval_spin.setRange(1, 99999)
+        global_interval_spin.setValue(1)
+        global_interval_spin.setFixedWidth(80)
+        global_unit_combo = QComboBox()
+        global_unit_combo.addItems(["Seconds", "Minutes", "Hours", "Days"])
+        global_unit_combo.setCurrentText("Days")
+        global_unit_combo.setFixedWidth(100)
+        start_all_btn = QPushButton("Start Auto")
+        stop_all_btn = QPushButton("Stop Auto")
+        sync_now_btn = QPushButton("Sync Now")
         refresh_ports_btn = QPushButton("Refresh Ports")
         top_controls.addWidget(add_device_btn)
+        top_controls.addWidget(interval_label)
+        top_controls.addWidget(global_interval_spin)
+        top_controls.addWidget(global_unit_combo)
         top_controls.addWidget(start_all_btn)
         top_controls.addWidget(stop_all_btn)
+        top_controls.addWidget(sync_now_btn)
         top_controls.addStretch()
         top_controls.addWidget(refresh_ports_btn)
         group_layout.addLayout(top_controls)
@@ -571,6 +585,8 @@ class FNTMainWindow(QMainWindow):
         devices_layout = QVBoxLayout()
         devices_layout.setContentsMargins(4, 4, 4, 4)
         devices_layout.setSpacing(8)
+        # Ensure device boxes are aligned to the top (avoid centering when only one exists)
+        devices_layout.setAlignment(Qt.AlignTop)
         devices_container.setLayout(devices_layout)
 
         devices_scroll = QScrollArea()
@@ -625,9 +641,9 @@ class FNTMainWindow(QMainWindow):
                 combo.addItem(p)
             combo.setEditable(True)
 
-        def get_interval_ms(device):
-            unit = device['unit_combo'].currentText()
-            value = device['interval_spin'].value()
+        def get_global_interval_ms():
+            unit = global_unit_combo.currentText()
+            value = global_interval_spin.value()
             mult = 1
             if unit == 'Seconds':
                 mult = 1
@@ -651,21 +667,15 @@ class FNTMainWindow(QMainWindow):
                 # Prefix each line of message with device name
                 prefixed = "\n".join([f"{dev_name}: {l}" for l in message.splitlines()])
                 QTimer.singleShot(0, lambda: append_log(prefixed, success))
+                # Update per-device label with last sync time
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                QTimer.singleShot(0, lambda: device['last_sync_label'].setText(f"Last Sync: {now_ts}"))
                 QTimer.singleShot(0, lambda: self.status_bar.showMessage("Ready"))
 
             t = threading.Thread(target=worker, daemon=True)
             t.start()
 
-        def start_device_auto(device, started):
-            if started:
-                device['start_btn'].setText("Stop Auto")
-                interval_ms = get_interval_ms(device)
-                device['timer'].start(interval_ms)
-                # Run an immediate sync when starting
-                do_device_sync(device)
-            else:
-                device['start_btn'].setText("Start Auto")
-                device['timer'].stop()
+        # Per-device auto control removed; use global Start/Stop buttons instead.
 
         def remove_device(device):
             # Removal should be disabled when only one device exists; safeguard here
@@ -700,39 +710,34 @@ class FNTMainWindow(QMainWindow):
             name_edit = QLineEdit()
             name_edit.setPlaceholderText("Optional device name")
 
+            remove_btn = QPushButton("Remove")
+
             port_label = QLabel("Port:")
             port_combo = QComboBox()
             port_combo.setEditable(True)
 
-            interval_label = QLabel("Interval:")
-            interval_spin = QSpinBox()
-            interval_spin.setRange(1, 99999)
-            interval_spin.setValue(1)
-            unit_combo = QComboBox()
-            unit_combo.addItems(["Seconds", "Minutes", "Hours", "Days"])
-            unit_combo.setCurrentText("Days")
-
-            start_btn = QPushButton("Start Auto")
-            start_btn.setCheckable(True)
-            manual_btn = QPushButton("Sync Now")
-            remove_btn = QPushButton("Remove")
-
             last_sync_label = QLabel("Last Sync: Never")
 
-            # Arrange layout
+            # Arrange layout with consistent spacing and fixed height
+            box_layout.setSpacing(6)
+            box_layout.setContentsMargins(6, 6, 6, 6)
             box_layout.addWidget(name_label, 0, 0)
             box_layout.addWidget(name_edit, 0, 1, 1, 3)
+            box_layout.addWidget(remove_btn, 0, 4, 1, 1, Qt.AlignRight)
             box_layout.addWidget(port_label, 1, 0)
             box_layout.addWidget(port_combo, 1, 1, 1, 3)
-            box_layout.addWidget(interval_label, 2, 0)
-            box_layout.addWidget(interval_spin, 2, 1)
-            box_layout.addWidget(unit_combo, 2, 2)
-            box_layout.addWidget(start_btn, 3, 0)
-            box_layout.addWidget(manual_btn, 3, 1)
-            box_layout.addWidget(remove_btn, 3, 2)
-            box_layout.addWidget(last_sync_label, 4, 0, 1, 4)
+            # Align last sync label with name/port columns (do not include remove column)
+            box_layout.addWidget(last_sync_label, 2, 0, 1, 4)
+
+            # Make the central columns flexible horizontally but keep rows compact
+            box_layout.setColumnStretch(1, 1)
+            box_layout.setColumnStretch(2, 0)
+            box_layout.setColumnStretch(3, 0)
+            box_layout.setColumnStretch(4, 0)
 
             box.setLayout(box_layout)
+            # Prevent the group box from stretching vertically when only one device exists
+            box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
             # Timer and device record
             timer = QTimer(self)
@@ -742,18 +747,12 @@ class FNTMainWindow(QMainWindow):
                 'box': box,
                 'name_edit': name_edit,
                 'port_combo': port_combo,
-                'interval_spin': interval_spin,
-                'unit_combo': unit_combo,
-                'start_btn': start_btn,
-                'manual_btn': manual_btn,
                 'remove_btn': remove_btn,
                 'last_sync_label': last_sync_label,
                 'timer': timer,
             }
 
             # Connect handlers
-            manual_btn.clicked.connect(lambda _, d=device: do_device_sync(d))
-            start_btn.toggled.connect(lambda started, d=device: start_device_auto(d, started))
             remove_btn.clicked.connect(lambda _, d=device: remove_device(d))
 
             # Single timer handler
@@ -774,20 +773,28 @@ class FNTMainWindow(QMainWindow):
                 populate_port_combo(dev['port_combo'])
 
         def start_all():
+            interval_ms = get_global_interval_ms()
             for dev in list(self.fed_devices):
-                if not dev['start_btn'].isChecked():
-                    dev['start_btn'].setChecked(True)
+                if not dev['timer'].isActive():
+                    dev['timer'].start(interval_ms)
+                    # Run an immediate sync when starting
+                    do_device_sync(dev)
 
         def stop_all():
             for dev in list(self.fed_devices):
-                if dev['start_btn'].isChecked():
-                    dev['start_btn'].setChecked(False)
+                if dev['timer'].isActive():
+                    dev['timer'].stop()
+
+        def sync_all():
+            for dev in list(self.fed_devices):
+                do_device_sync(dev)
 
         # Wire top-level controls
         add_device_btn.clicked.connect(create_device_widget)
         refresh_ports_btn.clicked.connect(refresh_all_ports)
         start_all_btn.clicked.connect(start_all)
         stop_all_btn.clicked.connect(stop_all)
+        sync_now_btn.clicked.connect(sync_all)
 
         # Create one default device entry
         create_device_widget()

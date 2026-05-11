@@ -1,19 +1,12 @@
-import importlib
-import pkgutil
-import inspect
+"""fnt package
 
-def _import_submodules(package_name):
-    """Dynamically imports all submodules and makes their functions available."""
-    package = importlib.import_module(package_name)
-    
-    for _, module_name, _ in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
-        module = importlib.import_module(module_name)
+Keep package init minimal to avoid importing submodules at import-time. Some
+submodules create threads or Qt objects during import which can cause
+warnings or crashes (e.g., QSocketNotifier errors) when the application
+imports the package before a QApplication/QCoreApplication is created.
 
-        # Import only functions and make them directly accessible in fnt
-        for attribute_name in dir(module):
-            attribute = getattr(module, attribute_name)
-            if inspect.isfunction(attribute):  # Import only functions
-                globals()[attribute_name] = attribute  # Make it accessible as fnt.function_name
+Import submodules explicitly where needed (e.g., `from fnt import gui_pyqt`) or
+use importlib.import_module.
+"""
 
-# Automatically import all submodules
-_import_submodules("fnt")
+__all__ = []
