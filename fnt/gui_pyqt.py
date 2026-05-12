@@ -552,11 +552,20 @@ class FNTMainWindow(QMainWindow):
         # FED Sync group with multi-device support
         group = QGroupBox("FED Sync Tools")
         group_layout = QVBoxLayout()
+        group_layout.setSpacing(12)
+        group_layout.setContentsMargins(10, 15, 10, 10)
 
-        # Top controls: add device, global autosync interval, start/stop all, refresh ports
-        top_controls = QHBoxLayout()
+        # Top controls: split into management and global sync settings
+        mgmt_layout = QHBoxLayout()
         add_device_btn = QPushButton("Add Device")
-        interval_label = QLabel("Interval:")
+        refresh_ports_btn = QPushButton("Refresh Ports")
+        mgmt_layout.addWidget(add_device_btn)
+        mgmt_layout.addStretch()
+        mgmt_layout.addWidget(refresh_ports_btn)
+        group_layout.addLayout(mgmt_layout)
+
+        sync_settings_layout = QHBoxLayout()
+        interval_label = QLabel("Sync Interval:")
         global_interval_spin = QSpinBox()
         global_interval_spin.setRange(1, 99999)
         global_interval_spin.setValue(1)
@@ -568,17 +577,16 @@ class FNTMainWindow(QMainWindow):
         start_all_btn = QPushButton("Start Auto")
         stop_all_btn = QPushButton("Stop Auto")
         sync_now_btn = QPushButton("Sync Now")
-        refresh_ports_btn = QPushButton("Refresh Ports")
-        top_controls.addWidget(add_device_btn)
-        top_controls.addWidget(interval_label)
-        top_controls.addWidget(global_interval_spin)
-        top_controls.addWidget(global_unit_combo)
-        top_controls.addWidget(start_all_btn)
-        top_controls.addWidget(stop_all_btn)
-        top_controls.addWidget(sync_now_btn)
-        top_controls.addStretch()
-        top_controls.addWidget(refresh_ports_btn)
-        group_layout.addLayout(top_controls)
+        
+        sync_settings_layout.addWidget(interval_label)
+        sync_settings_layout.addWidget(global_interval_spin)
+        sync_settings_layout.addWidget(global_unit_combo)
+        sync_settings_layout.addSpacing(20)
+        sync_settings_layout.addWidget(start_all_btn)
+        sync_settings_layout.addWidget(stop_all_btn)
+        sync_settings_layout.addWidget(sync_now_btn)
+        sync_settings_layout.addStretch()
+        group_layout.addLayout(sync_settings_layout)
 
         # Scroll area to hold device entries
         devices_container = QWidget()
