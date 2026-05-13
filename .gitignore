@@ -29,3 +29,4 @@ LocalData/
 
 # Claude Code instructions (keep private)
 CLAUDE.md
+sam_models_local/

@@ -21,7 +21,8 @@ except ImportError:
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QComboBox, QFileDialog, QMessageBox, QCheckBox
+    QProgressBar, QComboBox, QFileDialog, QMessageBox, QRadioButton,
+    QButtonGroup, QGroupBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -58,38 +59,38 @@ SAM2_CHECKPOINTS = {
     }
 }
 
+# FNT repo root (go up from fnt/videoTracking/ to repo root)
+_FNT_REPO_ROOT = Path(__file__).parent.parent.parent
+
 
 class DownloadThread(QThread):
     """Thread for downloading checkpoint files."""
-    
+
     progress_signal = pyqtSignal(int, int)  # (downloaded_mb, total_mb)
     finished_signal = pyqtSignal(str)  # (file_path)
     error_signal = pyqtSignal(str)  # (error_message)
-    
+
     def __init__(self, url: str, output_path: Path):
         super().__init__()
         self.url = url
         self.output_path = output_path
         self.is_cancelled = False
-        
+
     def run(self):
-        """Download file with progress reporting."""
         try:
             if not REQUESTS_AVAILABLE:
                 self.error_signal.emit("requests library not installed. Install with: pip install requests")
                 return
-                
-            # Create directory if it doesn't exist
+
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Download with streaming
+
             response = requests.get(self.url, stream=True, timeout=30)
             response.raise_for_status()
-            
+
             total_size = int(response.headers.get('content-length', 0))
             total_mb = total_size / (1024 * 1024)
             downloaded = 0
-            
+
             with open(self.output_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if self.is_cancelled:
@@ -97,280 +98,298 @@ class DownloadThread(QThread):
                         if self.output_path.exists():
                             self.output_path.unlink()
                         return
-                        
+
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
                         downloaded_mb = downloaded / (1024 * 1024)
                         self.progress_signal.emit(int(downloaded_mb), int(total_mb))
-            
+
             self.finished_signal.emit(str(self.output_path))
-            
+
         except Exception as e:
             self.error_signal.emit(f"Download failed: {str(e)}")
-            
+
     def cancel(self):
-        """Cancel download."""
         self.is_cancelled = True
 
 
+def _ensure_gitignore_entry(repo_root: Path, entry: str):
+    """Add an entry to .gitignore if it doesn't already exist."""
+    gitignore = repo_root / ".gitignore"
+    if gitignore.exists():
+        content = gitignore.read_text()
+        if entry in content:
+            return
+        if not content.endswith("\n"):
+            content += "\n"
+        content += f"{entry}\n"
+        gitignore.write_text(content)
+    else:
+        gitignore.write_text(f"{entry}\n")
+
+
+def _find_existing_checkpoints(*search_dirs: Path) -> Dict[str, Path]:
+    """Search multiple directories for existing SAM2 checkpoints."""
+    found = {}
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        for name in SAM2_CHECKPOINTS:
+            p = d / name
+            if p.exists() and p.stat().st_size > 0:
+                if name not in found:
+                    found[name] = p
+    return found
+
+
 class SAM2CheckpointDialog(QDialog):
-    """Dialog for downloading SAM 2 checkpoints."""
-    
-    def __init__(self, default_dir: Optional[Path] = None, parent=None):
+    """Dialog for selecting / downloading SAM 2 checkpoints."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SAM 2 Model Checkpoints")
-        self.setMinimumWidth(600)
-        
-        # Default to SAM_models in FNT repo
-        if default_dir is None:
-            # Assume we're in fnt/videoTracking, go up two levels
-            default_dir = Path(__file__).parent.parent.parent / "SAM_models"
-        
-        self.checkpoint_dir = default_dir
-        self.selected_checkpoint = None
-        self.download_thread = None
-        
-        self.init_ui()
-        
-    def init_ui(self):
-        """Initialize UI components."""
+        self.setWindowTitle("SAM 2 Model Setup")
+        self.setMinimumWidth(620)
+
+        self.selected_checkpoint: Optional[str] = None
+        self.download_thread: Optional[DownloadThread] = None
+
+        self._default_local_dir = _FNT_REPO_ROOT / "sam_models_local"
+        self._default_legacy_dir = _FNT_REPO_ROOT / "SAM_models"
+        self._custom_dir: Optional[Path] = None
+
+        self._existing = _find_existing_checkpoints(
+            self._default_local_dir,
+            self._default_legacy_dir,
+        )
+
+        self._init_ui()
+
+    def _init_ui(self):
         layout = QVBoxLayout()
-        
-        # Title and explanation
+        self.setLayout(layout)
+
+        # Title
         title = QLabel("<h2>SAM 2 Model Setup</h2>")
         layout.addWidget(title)
-        
+
         explanation = QLabel(
-            "The Mask Tracker requires a SAM 2 model checkpoint to run.\n"
-            "Select a model size based on your GPU and speed requirements.\n"
-            "Models will be saved for future use."
+            "Select a SAM2 model to download. The Tiny model is recommended "
+            "for annotation (fast, lower accuracy). The Large model provides "
+            "the best segmentation quality but is slower and larger."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
-        
+
         # Model selection
-        model_group = QLabel("<b>Select Model:</b>")
-        layout.addWidget(model_group)
-        
+        model_group = QGroupBox("Model Selection")
+        model_layout = QVBoxLayout()
+
         self.model_combo = QComboBox()
-        for checkpoint_name, info in SAM2_CHECKPOINTS.items():
-            display_text = f"{checkpoint_name.replace('.pt', '')} - {info['description']}"
-            self.model_combo.addItem(display_text, checkpoint_name)
-        
-        # Default to base_plus (good balance)
-        self.model_combo.setCurrentIndex(2)
-        layout.addWidget(self.model_combo)
-        
-        # Download location
-        location_layout = QHBoxLayout()
-        location_label = QLabel("<b>Save Location:</b>")
-        layout.addWidget(location_label)
-        
-        self.location_display = QLabel(str(self.checkpoint_dir))
-        self.location_display.setStyleSheet("padding: 5px; background-color: #2b2b2b; border: 1px solid #3f3f3f;")
-        location_layout.addWidget(self.location_display)
-        
-        self.browse_btn = QPushButton("Browse...")
-        self.browse_btn.clicked.connect(self.browse_location)
-        location_layout.addWidget(self.browse_btn)
-        
-        layout.addLayout(location_layout)
-        
-        # Progress bar
+        self.model_combo.addItem(
+            "SAM2.1 Tiny (155 MB) - Fast, recommended for annotation",
+            "sam2.1_hiera_tiny.pt",
+        )
+        self.model_combo.addItem(
+            "SAM2.1 Large (897 MB) - Best accuracy, slower",
+            "sam2.1_hiera_large.pt",
+        )
+        self.model_combo.setCurrentIndex(0)
+        model_layout.addWidget(self.model_combo)
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+
+        # Save location
+        loc_group = QGroupBox("Save Location")
+        loc_layout = QVBoxLayout()
+
+        self._radio_group = QButtonGroup(self)
+        self.radio_local = QRadioButton(
+            f"FNT repo: sam_models_local/  (auto-added to .gitignore)"
+        )
+        self.radio_local.setChecked(True)
+        self._radio_group.addButton(self.radio_local)
+        loc_layout.addWidget(self.radio_local)
+
+        browse_row = QHBoxLayout()
+        self.radio_custom = QRadioButton("Custom location:")
+        self._radio_group.addButton(self.radio_custom)
+        browse_row.addWidget(self.radio_custom)
+
+        self.lbl_custom_path = QLabel("(not set)")
+        self.lbl_custom_path.setStyleSheet("color: #999999;")
+        browse_row.addWidget(self.lbl_custom_path, 1)
+
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.setMaximumWidth(100)
+        self.btn_browse.clicked.connect(self._browse_custom)
+        browse_row.addWidget(self.btn_browse)
+        loc_layout.addLayout(browse_row)
+
+        loc_group.setLayout(loc_layout)
+        layout.addWidget(loc_group)
+
+        # Existing checkpoints
+        if self._existing:
+            names = [n.replace(".pt", "") for n in self._existing]
+            self.lbl_existing = QLabel(f"Found existing: {', '.join(names)}")
+            self.lbl_existing.setStyleSheet("color: #4CAF50;")
+        else:
+            self.lbl_existing = QLabel("No existing checkpoints found")
+            self.lbl_existing.setStyleSheet("color: #999999;")
+        layout.addWidget(self.lbl_existing)
+
+        # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
-        
+
         # Buttons
-        button_layout = QHBoxLayout()
-        
+        btn_layout = QHBoxLayout()
         self.download_btn = QPushButton("Download")
-        self.download_btn.clicked.connect(self.start_download)
-        button_layout.addWidget(self.download_btn)
-        
-        self.skip_btn = QPushButton("Skip (Use Existing)")
-        self.skip_btn.clicked.connect(self.skip_download)
-        button_layout.addWidget(self.skip_btn)
-        
+        self.download_btn.clicked.connect(self._start_download)
+        btn_layout.addWidget(self.download_btn)
+
+        self.use_existing_btn = QPushButton("Use Existing")
+        self.use_existing_btn.clicked.connect(self._use_existing)
+        self.use_existing_btn.setEnabled(bool(self._existing))
+        btn_layout.addWidget(self.use_existing_btn)
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_btn)
-        
-        layout.addLayout(button_layout)
-        
-        self.setLayout(layout)
-        
-        # Check for existing checkpoints
-        self.check_existing_checkpoints()
-        
-    def check_existing_checkpoints(self):
-        """Check if any checkpoints already exist."""
-        if not self.checkpoint_dir.exists():
-            return
-            
-        existing = []
-        for checkpoint_name in SAM2_CHECKPOINTS.keys():
-            checkpoint_path = self.checkpoint_dir / checkpoint_name
-            if checkpoint_path.exists():
-                existing.append(checkpoint_name)
-        
-        if existing:
-            self.status_label.setText(
-                f"✓ Found existing checkpoints: {', '.join([c.replace('.pt', '') for c in existing])}"
-            )
-            self.status_label.setStyleSheet("color: #4CAF50;")
-            
-    def browse_location(self):
-        """Browse for save location."""
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Select Checkpoint Save Location",
-            str(self.checkpoint_dir)
-        )
-        
-        if directory:
-            self.checkpoint_dir = Path(directory)
-            self.location_display.setText(str(self.checkpoint_dir))
+        btn_layout.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _get_save_dir(self) -> Path:
+        if self.radio_custom.isChecked() and self._custom_dir:
+            return self._custom_dir
+        return self._default_local_dir
+
+    def _browse_custom(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Checkpoint Save Location")
+        if d:
+            self._custom_dir = Path(d)
+            self.lbl_custom_path.setText(d)
+            self.lbl_custom_path.setStyleSheet("color: #cccccc;")
+            self.radio_custom.setChecked(True)
+
+            new_existing = _find_existing_checkpoints(self._custom_dir)
+            if new_existing:
+                self._existing.update(new_existing)
+                names = [n.replace(".pt", "") for n in self._existing]
+                self.lbl_existing.setText(f"Found existing: {', '.join(names)}")
+                self.lbl_existing.setStyleSheet("color: #4CAF50;")
+                self.use_existing_btn.setEnabled(True)
+
+    def _start_download(self):
         if not REQUESTS_AVAILABLE:
             QMessageBox.critical(
-                self,
-                "Missing Dependency",
+                self, "Missing Dependency",
                 "The 'requests' library is required for downloading.\n\n"
-                "Please install it with:\n\n"
-                "pip install requests\n\n"
-                "Then restart the application."
+                "Install with: pip install requests"
             )
             return
-            
-            self.check_existing_checkpoints()
-            
-    def start_download(self):
-        """Start downloading selected checkpoint."""
+
         checkpoint_name = self.model_combo.currentData()
         checkpoint_info = SAM2_CHECKPOINTS[checkpoint_name]
-        
-        output_path = self.checkpoint_dir / checkpoint_name
-        
-        # Check if already exists
+        save_dir = self._get_save_dir()
+        output_path = save_dir / checkpoint_name
+
+        # If saving to repo-local dir, ensure gitignore
+        if save_dir == self._default_local_dir:
+            _ensure_gitignore_entry(_FNT_REPO_ROOT, "sam_models_local/")
+
         if output_path.exists():
             reply = QMessageBox.question(
-                self,
-                "File Exists",
-                f"{checkpoint_name} already exists. Re-download?",
-                QMessageBox.Yes | QMessageBox.No
+                self, "File Exists",
+                f"{checkpoint_name} already exists at:\n{output_path}\n\nRe-download?",
+                QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.No:
-                self.selected_checkpoint = output_path
+                self.selected_checkpoint = str(output_path)
                 self.accept()
                 return
-        
-        # Start download
+
         self.download_btn.setEnabled(False)
-        self.skip_btn.setEnabled(False)
-        self.browse_btn.setEnabled(False)
+        self.use_existing_btn.setEnabled(False)
+        self.btn_browse.setEnabled(False)
         self.model_combo.setEnabled(False)
-        
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(checkpoint_info['size_mb'])
-        
-        self.status_label.setText(f"Downloading {checkpoint_name}...")
+        self.progress_bar.setMaximum(checkpoint_info["size_mb"])
+
+        self.status_label.setText(f"Downloading {checkpoint_name} ({checkpoint_info['size_mb']} MB)...")
         self.status_label.setStyleSheet("color: #2196F3;")
-        
-        # Create download thread
-        self.download_thread = DownloadThread(checkpoint_info['url'], output_path)
-        self.download_thread.progress_signal.connect(self.update_progress)
-        self.download_thread.finished_signal.connect(self.download_finished)
-        self.download_thread.error_signal.connect(self.download_error)
+
+        self.download_thread = DownloadThread(checkpoint_info["url"], output_path)
+        self.download_thread.progress_signal.connect(self._on_progress)
+        self.download_thread.finished_signal.connect(self._on_download_finished)
+        self.download_thread.error_signal.connect(self._on_download_error)
         self.download_thread.start()
-        
-    def update_progress(self, downloaded_mb: int, total_mb: int):
-        """Update progress bar."""
+
+    def _on_progress(self, downloaded_mb: int, total_mb: int):
         self.progress_bar.setValue(downloaded_mb)
         self.status_label.setText(f"Downloading: {downloaded_mb} / {total_mb} MB")
-        
-    def download_finished(self, file_path: str):
-        """Handle download completion."""
-        self.selected_checkpoint = Path(file_path)
-        self.status_label.setText("✓ Download complete!")
+
+    def _on_download_finished(self, file_path: str):
+        self.selected_checkpoint = file_path
+        self.status_label.setText("Download complete!")
         self.status_label.setStyleSheet("color: #4CAF50;")
-        
-        QMessageBox.information(
-            self,
-            "Download Complete",
-            f"Checkpoint saved to:\n{file_path}\n\nYou can now use the Mask Tracker!"
-        )
-        
+        QMessageBox.information(self, "Download Complete", f"Checkpoint saved to:\n{file_path}")
         self.accept()
-        
-    def download_error(self, error_message: str):
-        """Handle download error."""
-        self.status_label.setText(f"✗ {error_message}")
+
+    def _on_download_error(self, error_message: str):
+        self.status_label.setText(f"Error: {error_message}")
         self.status_label.setStyleSheet("color: #f44336;")
-        
         self.download_btn.setEnabled(True)
-        self.skip_btn.setEnabled(True)
-        self.browse_btn.setEnabled(True)
+        self.use_existing_btn.setEnabled(bool(self._existing))
+        self.btn_browse.setEnabled(True)
         self.model_combo.setEnabled(True)
         self.progress_bar.setVisible(False)
-        
         QMessageBox.critical(self, "Download Error", error_message)
-        
-    def skip_download(self):
-        """Skip download and select existing checkpoint."""
-        # Look for any existing checkpoint
-        if not self.checkpoint_dir.exists():
-            QMessageBox.warning(
-                self,
-                "No Checkpoints",
-                "No checkpoint directory found. Please download a model first."
-            )
+
+    def _use_existing(self):
+        if not self._existing:
+            QMessageBox.warning(self, "No Checkpoints", "No existing checkpoints found.")
             return
-            
-        existing_checkpoints = [
-            self.checkpoint_dir / name
-            for name in SAM2_CHECKPOINTS.keys()
-            if (self.checkpoint_dir / name).exists()
-        ]
-        
-        if not existing_checkpoints:
-            QMessageBox.warning(
-                self,
-                "No Checkpoints",
-                "No checkpoints found in the selected directory. Please download one first."
-            )
+
+        # Prefer the model currently selected in the dropdown
+        selected_name = self.model_combo.currentData()
+        if selected_name in self._existing:
+            self.selected_checkpoint = str(self._existing[selected_name])
+            self.accept()
             return
-        
-        # Use first available checkpoint
-        self.selected_checkpoint = existing_checkpoints[0]
+
+        # Otherwise use the first available
+        first_name = next(iter(self._existing))
+        self.selected_checkpoint = str(self._existing[first_name])
         self.accept()
-        
+
     def get_checkpoint_path(self) -> Optional[Path]:
-        """Get selected checkpoint path."""
-        return self.selected_checkpoint
-        
-    def get_config_name(self) -> Optional[str]:
-        """Get config file name for selected checkpoint."""
         if self.selected_checkpoint:
-            checkpoint_name = self.selected_checkpoint.name
+            return Path(self.selected_checkpoint)
+        return None
+
+    def get_config_name(self) -> Optional[str]:
+        if self.selected_checkpoint:
+            checkpoint_name = Path(self.selected_checkpoint).name
             return SAM2_CHECKPOINTS.get(checkpoint_name, {}).get("config")
         return None
 
 
-def get_sam2_checkpoint(parent=None) -> tuple[Optional[Path], Optional[str]]:
-    """
-    Show dialog to get SAM 2 checkpoint.
-    
+def get_sam2_checkpoint(parent=None) -> tuple:
+    """Show dialog to get SAM 2 checkpoint.
+
     Returns:
         (checkpoint_path, config_name) or (None, None) if cancelled
     """
     dialog = SAM2CheckpointDialog(parent=parent)
-    
+
     if dialog.exec_() == QDialog.Accepted:
         return dialog.get_checkpoint_path(), dialog.get_config_name()
-    
+
     return None, None

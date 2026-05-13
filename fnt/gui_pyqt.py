@@ -207,10 +207,11 @@ class FNTMainWindow(QMainWindow):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         
-        # Create tabs - Original order
+        # Create tabs
         self.create_video_tab()
         self.create_video_tracking_tab()
         self.create_sleap_tab()
+        self.create_labgym_tab()
         self.create_uwb_tab()
         self.create_usv_tab()
         self.create_rfid_tab()
@@ -314,24 +315,23 @@ class FNTMainWindow(QMainWindow):
     def create_video_tab(self):
         """Create the video processing tab"""
         tab, layout = self._make_scrollable_tab("Video")
-        
+
         # Description
         desc = QLabel("Tools for video file processing and manipulation")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # Video processing group
         group = QGroupBox("Video Processing Tools")
         group_layout = QGridLayout()
-        
-        # Create buttons with descriptions
+
         buttons = [
             ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
             ("Video Trim and Crop", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
         ]
-        
+
         self.create_button_grid(group_layout, buttons)
         group.setLayout(group_layout)
         layout.addWidget(group)
@@ -350,43 +350,104 @@ class FNTMainWindow(QMainWindow):
 
         layout.addStretch()
 
+    def create_video_tracking_tab(self):
+        """Create the video tracking tab"""
+        tab, layout = self._make_scrollable_tab("Video Tracking")
+
+        # Description
+        desc = QLabel("Interactive tracking tools for behavioral tests")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        # Tracking tools group
+        tracking_group = QGroupBox("Tracking Tools")
+        tracking_layout = QGridLayout()
+
+        tracking_buttons = [
+            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
+        ]
+
+        self.create_button_grid(tracking_layout, tracking_buttons)
+        tracking_group.setLayout(tracking_layout)
+        layout.addWidget(tracking_group)
+
+        # Mask Tracker Pipeline group
+        pipeline_group = QGroupBox("Mask Tracker Pipeline")
+        pipeline_layout = QGridLayout()
+
+        pipeline_buttons = [
+            ("Mask Tracker", "Annotate, train, and run Mask R-CNN instance segmentation", self.run_sam2_annotator),
+        ]
+
+        self.create_button_grid(pipeline_layout, pipeline_buttons)
+        pipeline_group.setLayout(pipeline_layout)
+        layout.addWidget(pipeline_group)
+
+        layout.addStretch()
+
     def create_sleap_tab(self):
         """Create the SLEAP processing tab"""
         tab, layout = self._make_scrollable_tab("SLEAP")
-        
+
         # Description
         desc = QLabel("SLEAP pose estimation pipeline tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # SLEAP processing group
-        group = QGroupBox("SLEAP Analysis Pipeline")
-        group_layout = QGridLayout()
-        
-        buttons = [
+        sleap_group = QGroupBox("SLEAP Analysis Pipeline")
+        sleap_layout = QGridLayout()
+
+        sleap_buttons = [
             ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
             ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
             ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
             ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
         ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
+
+        self.create_button_grid(sleap_layout, sleap_buttons)
+        sleap_group.setLayout(sleap_layout)
+        layout.addWidget(sleap_group)
+
         # SLEAP post-processing group
-        post_group = QGroupBox("SLEAP Post-Processing")
-        post_layout = QGridLayout()
-        
-        post_buttons = [
+        sleap_post_group = QGroupBox("SLEAP Post-Processing")
+        sleap_post_layout = QGridLayout()
+
+        sleap_post_buttons = [
             ("ROI Tool", "Define ROIs and analyze spatial occupancy", self.run_sleap_roi_tool),
         ]
-        
-        self.create_button_grid(post_layout, post_buttons)
-        post_group.setLayout(post_layout)
-        layout.addWidget(post_group)
-        
+
+        self.create_button_grid(sleap_post_layout, sleap_post_buttons)
+        sleap_post_group.setLayout(sleap_post_layout)
+        layout.addWidget(sleap_post_group)
+
+        layout.addStretch()
+
+    def create_labgym_tab(self):
+        """Create the LabGym tools tab"""
+        tab, layout = self._make_scrollable_tab("LabGym")
+
+        # Description
+        desc = QLabel("Supplementary tools for LabGym behavioral analysis workflows")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        # LabGym tools group
+        labgym_group = QGroupBox("LabGym Tools")
+        labgym_layout = QGridLayout()
+
+        labgym_buttons = [
+            ("Generate Training Images", "Extract frames from videos for LabGym training datasets", self.run_generate_training_images),
+        ]
+
+        self.create_button_grid(labgym_layout, labgym_buttons)
+        labgym_group.setLayout(labgym_layout)
+        layout.addWidget(labgym_group)
+
         layout.addStretch()
 
     def create_usv_tab(self):
@@ -453,43 +514,6 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
 
-    def create_video_tracking_tab(self):
-        """Create the video tracking tab"""
-        tab, layout = self._make_scrollable_tab("Video Tracking")
-        
-        # Description
-        desc = QLabel("Interactive tracking using SAM (Segment Anything Model) for behavioral tests")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # Tracking tools group
-        group = QGroupBox("Tracking Tools")
-        group_layout = QGridLayout()
-
-        buttons = [
-            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
-            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        # Info box
-        info_label = QLabel(
-            "<b>Note:</b> Video tracking requires SAM model checkpoint.<br>"
-            "Download from: <a href='https://github.com/facebookresearch/segment-anything#model-checkpoints'>"
-            "github.com/facebookresearch/segment-anything</a><br><br>"
-            "<b>Workflow:</b> Select video → Click on animal → Draw ROI → Track automatically"
-        )
-        info_label.setTextFormat(Qt.RichText)
-        info_label.setOpenExternalLinks(True)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 10px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        
-        layout.addStretch()
 
     def create_rfid_tab(self):
         """Create the RFID processing tab"""
@@ -861,14 +885,35 @@ class FNTMainWindow(QMainWindow):
         """Launch SLEAP ROI Analysis Tool"""
         try:
             from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
-            
+
             # Create and show the ROI tool window
             self.roi_tool_window = ROIToolGUI()
             self.roi_tool_window.show()
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
-    
+
+    def run_sam2_annotator(self):
+        """Launch SAM2 Annotator tool"""
+        try:
+            from fnt.videoTracking.sam2_annotator_pyqt import SAM2AnnotatorWindow
+            self.sam2_annotator_window = SAM2AnnotatorWindow()
+            self.sam2_annotator_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch SAM2 Annotator: {str(e)}")
+
+
+    # LabGym Methods
+    def run_generate_training_images(self):
+        """Launch Generate Training Images tool"""
+        try:
+            from fnt.labgym.generate_training_images_pyqt import GenerateTrainingImagesWindow
+
+            self.generate_training_images_window = GenerateTrainingImagesWindow()
+            self.generate_training_images_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch Generate Training Images: {str(e)}")
+
     # USV Processing Methods
     def run_classic_audio_detector(self):
         """Launch Classic Audio Detector - DSP-based detection and labeling"""
