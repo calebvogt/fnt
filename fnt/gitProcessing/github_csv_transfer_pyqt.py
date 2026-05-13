@@ -1,6 +1,6 @@
 """
-GitHub Data Transfer Tool
-Transfer CSV/TXT/JSON files to a GitHub repository with optional automatic splitting for large files.
+Data Transfer Tool
+Transfer data files to a destination folder with optional automatic splitting for large files.
 
 This tool:
 - Recursively copies selected file types from source to destination
@@ -26,6 +26,7 @@ from PyQt5.QtGui import QFont
 FILE_TYPE_MAP = {
     'CSV': ['.csv', '.tsv'],
     'TXT': ['.txt'],
+    'XLS': ['.xls', '.xlsx'],
     'JSON': ['.json'],
 }
 
@@ -115,6 +116,11 @@ class SourceCurationDialog(QDialog):
         self.txt_checkbox.stateChanged.connect(self._on_filter_changed)
         filter_layout.addWidget(self.txt_checkbox)
 
+        self.xls_checkbox = QCheckBox("XLS/XLSX")
+        self.xls_checkbox.setChecked(True)
+        self.xls_checkbox.stateChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self.xls_checkbox)
+
         self.json_checkbox = QCheckBox("JSON")
         self.json_checkbox.setChecked(True)
         self.json_checkbox.stateChanged.connect(self._on_filter_changed)
@@ -172,6 +178,8 @@ class SourceCurationDialog(QDialog):
             exts.update(FILE_TYPE_MAP['CSV'])
         if self.txt_checkbox.isChecked():
             exts.update(FILE_TYPE_MAP['TXT'])
+        if self.xls_checkbox.isChecked():
+            exts.update(FILE_TYPE_MAP['XLS'])
         if self.json_checkbox.isChecked():
             exts.update(FILE_TYPE_MAP['JSON'])
         return exts
@@ -763,7 +771,7 @@ class TransferWorker(QThread):
 
 
 class GitHubCSVTransferWindow(QWidget):
-    """Main window for GitHub Data Transfer tool."""
+    """Main window for Data Transfer tool."""
 
     def __init__(self):
         super().__init__()
@@ -771,7 +779,7 @@ class GitHubCSVTransferWindow(QWidget):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("GitHub Data Transfer Tool - FNT")
+        self.setWindowTitle("Data Transfer Tool - FNT")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 500)
 
@@ -800,7 +808,8 @@ class GitHubCSVTransferWindow(QWidget):
                 color: white;
                 border: none;
                 border-radius: 3px;
-                padding: 8px 16px;
+                padding: 6px 14px;
+                font-size: 11px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -841,13 +850,13 @@ class GitHubCSVTransferWindow(QWidget):
         layout = QVBoxLayout()
 
         # Title
-        title = QLabel("GitHub Data Transfer Tool")
+        title = QLabel("Data Transfer Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setStyleSheet("color: #0078d4;")
         layout.addWidget(title)
 
         # Description
-        desc = QLabel("Transfer CSV, TXT, and JSON files to a GitHub repository with optional automatic splitting for large files.")
+        desc = QLabel("Transfer data files to a destination folder with optional automatic splitting for large files.")
         desc.setFont(QFont("Arial", 10))
         desc.setStyleSheet("color: #999999; font-style: italic; margin-bottom: 10px;")
         desc.setWordWrap(True)
@@ -855,70 +864,115 @@ class GitHubCSVTransferWindow(QWidget):
 
         # Folder Selection Group
         folder_group = QGroupBox("Folder Selection")
-        folder_layout = QGridLayout()
+        folder_layout = QVBoxLayout()
 
         # Source folder
-        folder_layout.addWidget(QLabel("Source Folder:"), 0, 0)
+        source_row = QHBoxLayout()
+        source_lbl = QLabel("Source Folder:")
+        source_lbl.setFixedWidth(100)
+        source_row.addWidget(source_lbl)
         self.source_label = QLabel("No folder selected")
         self.source_label.setStyleSheet("color: #999999;")
-        folder_layout.addWidget(self.source_label, 0, 1)
-
-        source_btn_layout = QHBoxLayout()
-        self.source_btn = QPushButton("Browse...")
+        self.source_label.setWordWrap(True)
+        source_row.addWidget(self.source_label, 1)
+        self.source_btn = QPushButton("Browse")
+        self.source_btn.setFixedWidth(80)
         self.source_btn.clicked.connect(self.select_source_folder)
-        source_btn_layout.addWidget(self.source_btn)
-
-        self.curate_btn = QPushButton("Curate...")
+        source_row.addWidget(self.source_btn)
+        self.curate_btn = QPushButton("Curate")
+        self.curate_btn.setFixedWidth(80)
         self.curate_btn.clicked.connect(self.open_curation_dialog)
         self.curate_btn.setEnabled(False)
         self.curate_btn.setToolTip("Select which files and folders to include in the transfer")
-        source_btn_layout.addWidget(self.curate_btn)
-        folder_layout.addLayout(source_btn_layout, 0, 2)
+        source_row.addWidget(self.curate_btn)
+        folder_layout.addLayout(source_row)
 
         # Destination folder
-        folder_layout.addWidget(QLabel("Destination (GitHub Repo):"), 1, 0)
+        dest_row = QHBoxLayout()
+        dest_lbl = QLabel("Destination:")
+        dest_lbl.setFixedWidth(100)
+        dest_row.addWidget(dest_lbl)
         self.dest_label = QLabel("No folder selected")
         self.dest_label.setStyleSheet("color: #999999;")
-        folder_layout.addWidget(self.dest_label, 1, 1)
-        self.dest_btn = QPushButton("Browse...")
+        self.dest_label.setWordWrap(True)
+        dest_row.addWidget(self.dest_label, 1)
+        self.dest_btn = QPushButton("Browse")
+        self.dest_btn.setFixedWidth(80)
         self.dest_btn.clicked.connect(self.select_dest_folder)
-        folder_layout.addWidget(self.dest_btn, 1, 2)
+        dest_row.addWidget(self.dest_btn)
+        folder_layout.addLayout(dest_row)
 
         folder_group.setLayout(folder_layout)
         layout.addWidget(folder_group)
 
-        # Configuration Group (split toggle + threshold — file types are in curation dialog)
+        # Configuration Group
         config_group = QGroupBox("Transfer Configuration")
         config_outer_layout = QVBoxLayout()
 
-        config_row = QHBoxLayout()
+        # File type checkboxes
+        file_type_label = QLabel("File types to include:")
+        file_type_label.setStyleSheet("color: #cccccc; font-weight: bold;")
+        config_outer_layout.addWidget(file_type_label)
+
+        file_type_row = QHBoxLayout()
+
+        self.csv_checkbox = QCheckBox("CSV")
+        self.csv_checkbox.setChecked(True)
+        self.csv_checkbox.stateChanged.connect(self._scan_other_filetypes)
+        file_type_row.addWidget(self.csv_checkbox)
+
+        self.txt_checkbox = QCheckBox("TXT")
+        self.txt_checkbox.setChecked(True)
+        self.txt_checkbox.stateChanged.connect(self._scan_other_filetypes)
+        file_type_row.addWidget(self.txt_checkbox)
+
+        self.xls_checkbox = QCheckBox("XLS/XLSX")
+        self.xls_checkbox.setChecked(True)
+        self.xls_checkbox.stateChanged.connect(self._scan_other_filetypes)
+        file_type_row.addWidget(self.xls_checkbox)
+
+        self.json_checkbox = QCheckBox("JSON")
+        self.json_checkbox.setChecked(True)
+        self.json_checkbox.stateChanged.connect(self._scan_other_filetypes)
+        file_type_row.addWidget(self.json_checkbox)
+
+        file_type_row.addStretch()
+        config_outer_layout.addLayout(file_type_row)
+
+        # Container for dynamically detected "other" file type checkboxes
+        self.other_types_label = QLabel("Other detected file types:")
+        self.other_types_label.setStyleSheet("color: #999999; font-style: italic;")
+        self.other_types_label.setVisible(False)
+        config_outer_layout.addWidget(self.other_types_label)
+
+        self.other_types_layout = QHBoxLayout()
+        self.other_types_layout.addStretch()
+        config_outer_layout.addLayout(self.other_types_layout)
+        self.other_type_checkboxes = []
+
+        # Split large files
+        split_row = QHBoxLayout()
 
         self.split_checkbox = QCheckBox("Split large files")
-        self.split_checkbox.setChecked(True)
-        self.split_checkbox.setToolTip("Automatically split files exceeding the size threshold (recommended for GitHub's 100MB limit)")
+        self.split_checkbox.setChecked(False)
+        self.split_checkbox.setToolTip("Automatically split files exceeding the size threshold")
         self.split_checkbox.stateChanged.connect(self._on_split_toggle)
-        config_row.addWidget(self.split_checkbox)
+        split_row.addWidget(self.split_checkbox)
 
         self.split_label = QLabel("Threshold:")
-        config_row.addWidget(self.split_label)
+        self.split_label.setEnabled(False)
+        split_row.addWidget(self.split_label)
 
         self.size_spinbox = QSpinBox()
         self.size_spinbox.setRange(1, 100)
         self.size_spinbox.setValue(45)
         self.size_spinbox.setSuffix(" MB")
-        self.size_spinbox.setToolTip("Files larger than this will be automatically split (GitHub limit is 100MB, recommended 45MB)")
-        config_row.addWidget(self.size_spinbox)
-        config_row.addStretch()
+        self.size_spinbox.setToolTip("Files larger than this will be automatically split")
+        self.size_spinbox.setEnabled(False)
+        split_row.addWidget(self.size_spinbox)
+        split_row.addStretch()
 
-        config_outer_layout.addLayout(config_row)
-
-        github_note = QLabel(
-            "ℹ️  GitHub limits: 50 MB per file (warning), 100 MB per file (hard block), ~2 GB per push. "
-            "Push in small batches for best reliability."
-        )
-        github_note.setWordWrap(True)
-        github_note.setStyleSheet("color: #999999; font-size: 9pt; font-style: italic; margin-top: 2px;")
-        config_outer_layout.addWidget(github_note)
+        config_outer_layout.addLayout(split_row)
 
         config_group.setLayout(config_outer_layout)
         layout.addWidget(config_group)
@@ -955,14 +1009,16 @@ class GitHubCSVTransferWindow(QWidget):
 
         self.transfer_btn = QPushButton("Start Transfer")
         self.transfer_btn.clicked.connect(self.start_transfer)
-        self.transfer_btn.setMinimumHeight(40)
-        button_layout.addWidget(self.transfer_btn)
+        self.transfer_btn.setMinimumHeight(36)
+        self.transfer_btn.setStyleSheet("font-size: 12px; font-weight: bold; padding: 8px;")
+        button_layout.addWidget(self.transfer_btn, 1)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self.cancel_transfer)
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setMinimumHeight(40)
-        button_layout.addWidget(self.cancel_btn)
+        self.cancel_btn.setMinimumHeight(36)
+        self.cancel_btn.setStyleSheet("font-size: 12px; font-weight: bold; padding: 8px;")
+        button_layout.addWidget(self.cancel_btn, 1)
 
         layout.addLayout(button_layout)
 
@@ -996,13 +1052,14 @@ class GitHubCSVTransferWindow(QWidget):
             self.curated_file_types = None
             self.curate_btn.setEnabled(True)
             self.log_text.append(f"Source folder: {folder}")
+            self._scan_other_filetypes()
 
             # Ask if user wants to curate
             reply = QMessageBox.question(
                 self,
                 "Curate Source Files",
                 "Would you like to curate which files and folders are transferred?\n\n"
-                "If No, all CSV, TXT, and JSON files will be transferred.",
+                "If No, all selected file types will be transferred.",
                 QMessageBox.Yes | QMessageBox.No
             )
 
@@ -1024,10 +1081,10 @@ class GitHubCSVTransferWindow(QWidget):
             self.source_label.setStyleSheet("color: #4ec9b0;")
 
     def select_dest_folder(self):
-        """Select destination folder (GitHub repo)."""
+        """Select destination folder."""
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Select Destination Folder (GitHub Repository)",
+            "Select Destination Folder",
             "",
             QFileDialog.ShowDirsOnly
         )
@@ -1037,19 +1094,72 @@ class GitHubCSVTransferWindow(QWidget):
             self.dest_label.setStyleSheet("color: #4ec9b0;")
             self.log_text.append(f"Destination folder: {folder}")
 
-    def _get_file_types_for_transfer(self):
-        """Get list of file extensions to transfer.
+    def _scan_other_filetypes(self):
+        """Scan source folder for file types not in the default set and show checkboxes."""
+        if not hasattr(self, 'other_type_checkboxes'):
+            return
+        # Clear existing other-type checkboxes
+        for cb in self.other_type_checkboxes:
+            self.other_types_layout.removeWidget(cb)
+            cb.deleteLater()
+        self.other_type_checkboxes.clear()
 
-        If the user curated, use the file types from the curation dialog.
-        Otherwise, default to all three types (CSV/TSV, TXT, JSON).
+        if not self.source_folder or not os.path.isdir(self.source_folder):
+            self.other_types_label.setVisible(False)
+            return
+
+        # Collect all known extensions from FILE_TYPE_MAP
+        known_exts = set()
+        for exts in FILE_TYPE_MAP.values():
+            known_exts.update(exts)
+
+        # Scan source folder for other extensions
+        other_exts = set()
+        for root, dirs, files in os.walk(self.source_folder):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext and ext not in known_exts:
+                    other_exts.add(ext)
+
+        if other_exts:
+            self.other_types_label.setVisible(True)
+            # Remove the trailing stretch before adding checkboxes
+            stretch_item = self.other_types_layout.takeAt(self.other_types_layout.count() - 1)
+
+            for ext in sorted(other_exts):
+                cb = QCheckBox(ext)
+                cb.setChecked(False)
+                self.other_types_layout.addWidget(cb)
+                self.other_type_checkboxes.append(cb)
+
+            self.other_types_layout.addStretch()
+        else:
+            self.other_types_label.setVisible(False)
+
+    def _get_file_types_for_transfer(self):
+        """Get list of file extensions to transfer based on main window checkboxes.
+
+        If the user curated, use the file types from the curation dialog instead.
         """
         if self.curated_file_types is not None:
             return self.curated_file_types
-        # Default: all types
-        all_types = []
-        for exts in FILE_TYPE_MAP.values():
-            all_types.extend(exts)
-        return all_types
+
+        exts = []
+        if self.csv_checkbox.isChecked():
+            exts.extend(FILE_TYPE_MAP['CSV'])
+        if self.txt_checkbox.isChecked():
+            exts.extend(FILE_TYPE_MAP['TXT'])
+        if self.xls_checkbox.isChecked():
+            exts.extend(FILE_TYPE_MAP['XLS'])
+        if self.json_checkbox.isChecked():
+            exts.extend(FILE_TYPE_MAP['JSON'])
+
+        # Include any checked "other" file types
+        for cb in self.other_type_checkboxes:
+            if cb.isChecked():
+                exts.append(cb.text())
+
+        return exts
 
     def start_transfer(self):
         """Start the file transfer operation."""

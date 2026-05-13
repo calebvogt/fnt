@@ -38,6 +38,7 @@ class MaskInferenceConfig:
     iou_match_threshold: float = 0.3
     matching_algorithm: str = "hungarian"
     inference_size: int = 0
+    use_masks: bool = False
 
 
 def _resolve_device(pref: str) -> str:
@@ -50,8 +51,6 @@ def _resolve_device(pref: str) -> str:
         return "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
     if torch.cuda.is_available():
         return "cuda"
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -67,7 +66,7 @@ class MaskRCNNInference:
     """Loads a trained Mask R-CNN and runs per-frame inference."""
 
     def __init__(self, model_dir: str, device: str = "auto",
-                 inference_size: int = 0):
+                 inference_size: int = 0, use_masks: bool = False):
         self.model_dir = model_dir
         self.device = device
         self.model = None
@@ -75,6 +74,7 @@ class MaskRCNNInference:
         self.categories: Dict = {}
         self._max_dim: int = 800
         self._inference_size: int = inference_size
+        self._use_masks: bool = use_masks
 
     def load_model(self):
         import torch
@@ -112,7 +112,9 @@ class MaskRCNNInference:
             self.model.transform.min_size = (self._inference_size,)
             self.model.transform.max_size = self._inference_size
             self._max_dim = self._inference_size
-            print(f"[MTT Inference] Inference resolution override: {self._inference_size}px")
+
+        if not self._use_masks:
+            self.model.roi_heads.mask_roi_pool = None
 
         self.model.to(device)
         self.model.eval()
@@ -126,8 +128,9 @@ class MaskRCNNInference:
                 pass
 
         precision = "float16" if self._use_half else "float32"
+        mask_str = "masks" if self._use_masks else "boxes-only"
         print(f"[MTT Inference] Model loaded on {device} ({precision}), backbone={backbone}, "
-              f"trained={min_size}/{max_size}, inference={self._max_dim}px")
+              f"inference={self._max_dim}px, {mask_str}")
 
     def _pre_resize(self, frame_rgb: np.ndarray) -> Tuple[np.ndarray, float]:
         """Resize frame on CPU before GPU transfer to reduce MPS memory pressure."""
@@ -172,26 +175,32 @@ class MaskRCNNInference:
         keep = scores >= confidence_threshold
 
         boxes = outputs["boxes"].cpu().numpy()[keep]
-        masks = (outputs["masks"].cpu().numpy()[keep, 0] > 0.5).astype(bool)
         scores = scores[keep]
         labels = outputs["labels"].cpu().numpy()[keep]
+
+        if self._use_masks and "masks" in outputs:
+            masks = (outputs["masks"].cpu().numpy()[keep, 0] > 0.5).astype(bool)
+        else:
+            masks = None
 
         if max_detections > 0 and len(scores) > max_detections:
             top_idx = np.argsort(scores)[::-1][:max_detections]
             boxes = boxes[top_idx]
-            masks = masks[top_idx]
             scores = scores[top_idx]
             labels = labels[top_idx]
+            if masks is not None:
+                masks = masks[top_idx]
 
-        if scale != 1.0 and len(masks) > 0:
+        if scale != 1.0:
             boxes = boxes / scale
-            full_masks = np.zeros((len(masks), orig_h, orig_w), dtype=bool)
-            for i, m in enumerate(masks):
-                full_masks[i] = cv2.resize(
-                    m.astype(np.uint8), (orig_w, orig_h),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-            masks = full_masks
+            if masks is not None and len(masks) > 0:
+                full_masks = np.zeros((len(masks), orig_h, orig_w), dtype=bool)
+                for i, m in enumerate(masks):
+                    full_masks[i] = cv2.resize(
+                        m.astype(np.uint8), (orig_w, orig_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                masks = full_masks
 
         return {
             "boxes": boxes,
@@ -219,24 +228,38 @@ class MultiObjectTracker:
         self._max_match_dist = 0.15 * np.sqrt(frame_h**2 + frame_w**2)
         return self._max_match_dist
 
-    def update(self, detections: Dict, frame_idx: int, fps: float = 30.0) -> Dict[int, Dict]:
+    def update(self, detections: Dict, frame_idx: int, fps: float = 30.0,
+               frame_hw: Optional[Tuple[int, int]] = None) -> Dict[int, Dict]:
         """Process detections for one frame and return matched track assignments."""
         n_det = len(detections["scores"]) if len(detections["scores"]) > 0 else 0
 
+        masks = detections["masks"]
+        has_masks = masks is not None
+
         current_dets = []
         for i in range(n_det):
-            mask = detections["masks"][i]
-            ys, xs = np.where(mask)
-            if len(xs) == 0:
-                continue
-            cx, cy = float(xs.mean()), float(ys.mean())
+            box = detections["boxes"][i]
+            if has_masks:
+                mask = masks[i]
+                ys, xs = np.where(mask)
+                if len(xs) == 0:
+                    cx = float((box[0] + box[2]) / 2)
+                    cy = float((box[1] + box[3]) / 2)
+                else:
+                    cx, cy = float(xs.mean()), float(ys.mean())
+                area = int(mask.sum())
+            else:
+                mask = None
+                cx = float((box[0] + box[2]) / 2)
+                cy = float((box[1] + box[3]) / 2)
+                area = int((box[2] - box[0]) * (box[3] - box[1]))
             current_dets.append({
                 "centroid": (cx, cy),
-                "bbox": detections["boxes"][i],
+                "bbox": box,
                 "mask": mask,
                 "score": float(detections["scores"][i]),
                 "label": int(detections["labels"][i]),
-                "area": int(mask.sum()),
+                "area": area,
             })
 
         if not self.active_tracks:
@@ -262,7 +285,9 @@ class MultiObjectTracker:
         n_tracks = len(track_ids)
         n_dets = len(current_dets)
 
-        if n_det > 0 and len(detections["masks"]) > 0:
+        if frame_hw is not None:
+            max_dist = self._get_max_match_dist(frame_hw[0], frame_hw[1])
+        elif detections["masks"] is not None and len(detections["masks"]) > 0:
             h, w = detections["masks"][0].shape[:2]
             max_dist = self._get_max_match_dist(h, w)
         else:
@@ -454,7 +479,7 @@ def _draw_annotations(
     categories: Dict,
     alpha: float = 0.4,
 ) -> np.ndarray:
-    """Draw semi-transparent mask overlays and track labels on a frame."""
+    """Draw track annotations on a frame (mask overlays or bounding boxes)."""
     overlay = frame_bgr.copy()
 
     cat_map = {}
@@ -463,11 +488,17 @@ def _draw_annotations(
 
     for obj_id, det in matched.items():
         color = TRACK_COLORS[(obj_id - 1) % len(TRACK_COLORS)]
-        mask = det["mask"]
-        overlay[mask] = (
-            np.array(overlay[mask], dtype=np.float32) * (1 - alpha)
-            + np.array(color, dtype=np.float32) * alpha
-        ).astype(np.uint8)
+
+        if det["mask"] is not None:
+            mask = det["mask"]
+            overlay[mask] = (
+                np.array(overlay[mask], dtype=np.float32) * (1 - alpha)
+                + np.array(color, dtype=np.float32) * alpha
+            ).astype(np.uint8)
+        else:
+            box = det["bbox"]
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
 
         cx, cy = int(det["centroid"][0]), int(det["centroid"][1])
         class_name = cat_map.get(det["label"], f"class{det['label']}")
@@ -514,7 +545,8 @@ def run_inference_on_video(
 
     try:
         inference = MaskRCNNInference(model_dir, device=config.device,
-                                      inference_size=config.inference_size)
+                                      inference_size=config.inference_size,
+                                      use_masks=config.use_masks)
         inference.load_model()
 
         cap = cv2.VideoCapture(video_path)
@@ -563,7 +595,7 @@ def run_inference_on_video(
             )
             t2 = time.time()
 
-            matched = tracker.update(detections, frame_idx, fps)
+            matched = tracker.update(detections, frame_idx, fps, frame_hw=(h, w))
             t3 = time.time()
 
             annotated = _draw_annotations(frame, matched, inference.categories)

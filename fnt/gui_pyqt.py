@@ -707,7 +707,7 @@ class FNTMainWindow(QMainWindow):
         
         general_buttons = [
             ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
-            ("GitHub Data Transfer", "Copy CSVs/TXT/JSON to GitHub repo, auto-split large files", self.run_github_csv_transfer),
+            ("Data Transfer", "Copy data files to a destination folder, auto-split large files", self.run_github_csv_transfer),
         ]
         
         self.create_button_grid(general_layout, general_buttons)
@@ -1070,7 +1070,7 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
     
     def run_github_csv_transfer(self):
-        """Launch GitHub Data Transfer tool for copying data files to a GitHub repo"""
+        """Launch Data Transfer tool for copying data files to a destination folder"""
         try:
             from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
 
@@ -1078,7 +1078,7 @@ class FNTMainWindow(QMainWindow):
             self.github_csv_transfer_window = GitHubCSVTransferWindow()
             self.github_csv_transfer_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"GitHub Data Transfer failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Data Transfer failed: {str(e)}")
     
     # Doric WiFP Processing Methods
     def run_doric_processor(self):

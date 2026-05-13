@@ -1736,16 +1736,26 @@ class SAM2AnnotatorWindow(QMainWindow):
         row_res.addWidget(self.combo_track_resolution)
         settings_vbox.addLayout(row_res)
 
+        self.chk_track_masks = QCheckBox("Generate mask overlays (slower)")
+        self.chk_track_masks.setChecked(False)
+        self.chk_track_masks.setToolTip(
+            "When enabled, the model also predicts pixel-level masks for each\n"
+            "detection and draws them on the annotated video. ~2x slower.\n"
+            "When disabled, uses bounding boxes only — faster and sufficient\n"
+            "for tracking since centroids are computed from box centers."
+        )
+        settings_vbox.addWidget(self.chk_track_masks)
+
         row4 = QHBoxLayout()
         row4.addWidget(QLabel("Device:"))
         self.combo_track_device = QComboBox()
         self.combo_track_device.addItems(["CPU", "Auto", "CUDA (GPU)", "MPS (Apple Silicon)"])
         self.combo_track_device.setToolTip(
             "Hardware device for inference.\n"
-            "CPU: recommended for Apple Silicon Macs. Uses torch.compile.\n"
-            "Auto: picks the best available GPU (CUDA > MPS), falls back to CPU.\n"
+            "CPU: recommended for Apple Silicon Macs (~5x faster than MPS for detection).\n"
+            "Auto: uses CUDA if available, otherwise CPU.\n"
             "CUDA: NVIDIA GPU (fastest when available).\n"
-            "MPS: Apple Silicon GPU via Metal (often slower than CPU for detection models)."
+            "MPS: Apple Silicon GPU via Metal (slower than CPU for detection models)."
         )
         row4.addWidget(self.combo_track_device)
         settings_vbox.addLayout(row4)
@@ -2866,16 +2876,20 @@ class SAM2AnnotatorWindow(QMainWindow):
                     cfg = json.load(f)
                 cats = cfg.get("categories", {})
                 cat_names = list(cats.values()) if isinstance(cats, dict) else cats
+                max_sz = cfg.get("max_size", 800)
                 self.lbl_track_model_info.setText(
                     f"Path: {run_dir}\n"
                     f"Backbone: {cfg.get('backbone', '?')}  |  "
                     f"Classes: {', '.join(str(c) for c in cat_names) if cat_names else '?'}  |  "
                     f"Min size: {cfg.get('min_size', '?')}"
                 )
+                self.combo_track_resolution.setItemText(0, f"Trained ({max_sz}px)")
             except Exception:
                 self.lbl_track_model_info.setText(f"Path: {run_dir}")
+                self.combo_track_resolution.setItemText(0, "Trained (default)")
         else:
             self.lbl_track_model_info.setText(f"Path: {run_dir}")
+            self.combo_track_resolution.setItemText(0, "Trained (default)")
         self._update_tracking_button_state()
 
     def _add_tracking_videos(self):
@@ -2975,6 +2989,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             "iou_match_threshold": self.spin_track_iou.value(),
             "matching_algorithm": matching_algo,
             "inference_size": inference_size,
+            "use_masks": self.chk_track_masks.isChecked(),
             "device": device,
         }
 
