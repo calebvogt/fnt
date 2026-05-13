@@ -32,6 +32,24 @@ def sync_time(port=None, baud=115200, timeout=1, wait=0.5):
     Returns:
         (success: bool, message: str)
     """
+    now = datetime.now()
+    sync_string = now.strftime("SYNC:%Y,%m,%d,%H,%M,%S\n")
+    return send_custom_command(sync_string, port=port, baud=baud, timeout=timeout, wait=wait)
+
+
+def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
+    """Send a custom command to a FED3 device.
+
+    Args:
+        command: String to send to the device.
+        port: Serial port string.
+        baud: Baud rate.
+        timeout: Serial timeout.
+        wait: Seconds to wait for response.
+
+    Returns:
+        (success: bool, message: str)
+    """
     try:
         import serial
         from serial.tools import list_ports
@@ -60,17 +78,19 @@ def sync_time(port=None, baud=115200, timeout=1, wait=0.5):
         # Allow device to reset/settle after opening
         time.sleep(2.0)
 
-        now = datetime.now()
-        sync_string = now.strftime("SYNC:%Y,%m,%d,%H,%M,%S\n")
+        if not command.endswith('\n'):
+            command += '\n'
+            
         out_lines.append(f"Opening {port} @ {baud}")
-        out_lines.append(f"Sending: {sync_string.strip()}")
-        ser.write(sync_string.encode("utf-8"))
+        out_lines.append(f"Sending: {command.strip()}")
+        ser.write(command.encode("utf-8"))
         time.sleep(wait)
 
         try:
             while ser.in_waiting > 0:
                 response = ser.readline().decode("utf-8", errors="ignore").strip()
-                out_lines.append(f"FED3 says: {response}")
+                if response:
+                    out_lines.append(f"FED3 says: {response}")
         except Exception:
             # If reading fails, continue to close port
             pass
