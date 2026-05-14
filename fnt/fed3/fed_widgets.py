@@ -21,9 +21,9 @@ class CollapsibleLogBox(QWidget):
         self.layout.setSpacing(0)
 
         # Toggle button
-        self.toggle_button = QPushButton(f"▼ {title}")
+        self.toggle_button = QPushButton(f"▶ {title}")
         self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(True)
+        self.toggle_button.setChecked(False)
         self.toggle_button.setStyleSheet("""
             QPushButton {
                 text-align: left; 
@@ -52,7 +52,8 @@ class CollapsibleLogBox(QWidget):
         self.log_text.setStyleSheet("background-color: #1e1e1e; color: #cccccc; border: none; font-family: monospace;")
 
         self.input_layout = QHBoxLayout()
-        self.input_layout.setContentsMargins(5, 5, 5, 5)
+        self.input_layout.setContentsMargins(0, 0, 0, 0)
+        self.input_layout.setSpacing(0)
         
         self.command_input = QLineEdit()
         self.command_input.setPlaceholderText("Message")
@@ -66,11 +67,13 @@ class CollapsibleLogBox(QWidget):
         self.input_layout.addWidget(self.command_input)
         self.input_layout.addWidget(self.send_btn)
 
-        self.container_layout.addWidget(self.log_text)
         self.container_layout.addLayout(self.input_layout)
+        self.container_layout.addWidget(self.log_text)
 
         self.layout.addWidget(self.toggle_button)
         self.layout.addWidget(self.container)
+        
+        self.container.hide()
 
     def on_toggle(self, checked):
         if checked:
@@ -183,7 +186,7 @@ class FEDTabWidget(QWidget):
         self.scroll_layout.addStretch()
 
         # Log box at bottom
-        self.fed_log = CollapsibleLogBox("FED Device Log")
+        self.fed_log = CollapsibleLogBox("Serial Monitor")
         self.layout.addWidget(self.fed_log)
 
         # Connections
