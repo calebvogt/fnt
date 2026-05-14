@@ -171,7 +171,7 @@ class COCOAnnotationManager:
             return self._category_name_map[name]
         cat_id = self._next_cat_id
         self._next_cat_id += 1
-        self.categories.append({"id": cat_id, "name": name, "supercategory": "animal"})
+        self.categories.append({"id": cat_id, "name": name, "supercategory": ""})
         self._category_name_map[name] = cat_id
         return cat_id
 
@@ -202,6 +202,7 @@ class COCOAnnotationManager:
         image_id: int,
         category_id: int,
         mask: np.ndarray,
+        inferred: bool = False,
     ) -> int:
         polygons = mask_to_coco_polygons(mask)
         if not polygons:
@@ -211,7 +212,7 @@ class COCOAnnotationManager:
 
         ann_id = self._next_ann_id
         self._next_ann_id += 1
-        self.annotations.append({
+        ann = {
             "id": ann_id,
             "image_id": image_id,
             "category_id": category_id,
@@ -219,9 +220,68 @@ class COCOAnnotationManager:
             "bbox": list(bbox),
             "area": area,
             "iscrowd": 0,
-        })
+        }
+        if inferred:
+            ann["inferred"] = True
+        self.annotations.append(ann)
         self._auto_save()
         return ann_id
+
+    def add_annotation_from_polygon(
+        self,
+        image_id: int,
+        category_id: int,
+        segmentation: List[List[float]],
+        bbox: List[float],
+        area: int,
+        inferred: bool = False,
+    ) -> int:
+        """Add an annotation directly from polygon data (no mask conversion)."""
+        ann_id = self._next_ann_id
+        self._next_ann_id += 1
+        ann = {
+            "id": ann_id,
+            "image_id": image_id,
+            "category_id": category_id,
+            "segmentation": segmentation,
+            "bbox": bbox,
+            "area": area,
+            "iscrowd": 0,
+        }
+        if inferred:
+            ann["inferred"] = True
+        self.annotations.append(ann)
+        self._auto_save()
+        return ann_id
+
+    def approve_annotation(self, ann_id: int):
+        """Remove inferred flag from an annotation (approve it)."""
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                ann.pop("inferred", None)
+                self._auto_save()
+                return
+
+    def is_inferred(self, ann_id: int) -> bool:
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                return ann.get("inferred", False)
+        return False
+
+    def count_annotations_for_image(self, image_id: int, exclude_inferred: bool = False) -> int:
+        count = 0
+        for a in self.annotations:
+            if a["image_id"] == image_id:
+                if exclude_inferred and a.get("inferred", False):
+                    continue
+                count += 1
+        return count
+
+    def has_inferred_for_image(self, image_id: int) -> bool:
+        return any(
+            a["image_id"] == image_id and a.get("inferred", False)
+            for a in self.annotations
+        )
 
     def update_annotation_polygon(self, ann_id: int, points: list):
         for ann in self.annotations:
@@ -250,10 +310,14 @@ class COCOAnnotationManager:
                 return c["name"]
         return "unknown"
 
-    def export(self, output_path: str):
+    def export(self, output_path: str, exclude_inferred: bool = False):
+        if exclude_inferred:
+            anns = [a for a in self.annotations if not a.get("inferred", False)]
+        else:
+            anns = self.annotations
         data = {
             "images": self.images,
-            "annotations": self.annotations,
+            "annotations": anns,
             "categories": self.categories,
         }
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

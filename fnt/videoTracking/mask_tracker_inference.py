@@ -41,6 +41,73 @@ class MaskInferenceConfig:
     use_masks: bool = False
 
 
+def detect_system_profile() -> Dict:
+    """Auto-detect hardware and return recommended inference settings."""
+    import platform
+    import subprocess
+
+    profile: Dict = {
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "cpu_cores": os.cpu_count() or 1,
+        "ram_gb": 0,
+        "chip": "Unknown",
+        "has_cuda": False,
+        "cuda_name": None,
+        "has_mps": False,
+        "recommended_device": "cpu",
+        "recommended_resolution": 512,
+        "recommended_use_masks": False,
+    }
+
+    if profile["os"] == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0:
+                profile["ram_gb"] = int(result.stdout.strip()) // (1024 ** 3)
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                profile["chip"] = result.stdout.strip()
+        except Exception:
+            profile["chip"] = platform.processor() or "Apple Silicon"
+
+    try:
+        import torch
+        profile["has_cuda"] = torch.cuda.is_available()
+        if profile["has_cuda"]:
+            profile["cuda_name"] = torch.cuda.get_device_name(0)
+        profile["has_mps"] = bool(
+            getattr(torch.backends, "mps", None)
+            and torch.backends.mps.is_available()
+        )
+    except ImportError:
+        pass
+
+    if profile["has_cuda"]:
+        profile["recommended_device"] = "cuda"
+        profile["recommended_resolution"] = 0
+        profile["recommended_use_masks"] = True
+    elif profile["os"] == "Darwin" and profile["arch"] == "arm64":
+        profile["recommended_device"] = "cpu"
+        profile["recommended_resolution"] = 384
+        profile["recommended_use_masks"] = False
+    else:
+        profile["recommended_device"] = "cpu"
+        profile["recommended_resolution"] = 512
+        profile["recommended_use_masks"] = False
+
+    return profile
+
+
 def _resolve_device(pref: str) -> str:
     import torch
     if pref == "cpu":
@@ -477,9 +544,14 @@ def _draw_annotations(
     frame_bgr: np.ndarray,
     matched: Dict[int, Dict],
     categories: Dict,
-    alpha: float = 0.4,
+    contour_thickness: int = 2,
 ) -> np.ndarray:
-    """Draw track annotations on a frame (mask overlays or bounding boxes)."""
+    """Draw track annotations on a frame (mask contour outlines or bounding boxes).
+
+    Uses contour outlines instead of filled overlays so the animal remains
+    fully visible — the outline directly represents the silhouette boundary
+    that downstream behavioral classifiers will use.
+    """
     overlay = frame_bgr.copy()
 
     cat_map = {}
@@ -490,11 +562,12 @@ def _draw_annotations(
         color = TRACK_COLORS[(obj_id - 1) % len(TRACK_COLORS)]
 
         if det["mask"] is not None:
-            mask = det["mask"]
-            overlay[mask] = (
-                np.array(overlay[mask], dtype=np.float32) * (1 - alpha)
-                + np.array(color, dtype=np.float32) * alpha
-            ).astype(np.uint8)
+            mask_u8 = det["mask"].astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(overlay, contours, -1, color, contour_thickness,
+                             cv2.LINE_AA)
         else:
             box = det["bbox"]
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
@@ -512,12 +585,23 @@ def _draw_annotations(
     return overlay
 
 
+def _detect_architecture(model_dir: str) -> str:
+    """Read training_config.json and return the architecture string."""
+    config_path = os.path.join(model_dir, "training_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+        return cfg.get("architecture", "maskrcnn")
+    return "maskrcnn"
+
+
 def run_inference_on_video(
     video_path: str,
     model_dir: str,
     config: MaskInferenceConfig,
     progress: Optional[Callable] = None,
     should_stop: Optional[Callable] = None,
+    frame_callback: Optional[Callable] = None,
 ) -> Dict:
     """Run full inference + tracking pipeline on a video.
 
@@ -527,6 +611,8 @@ def run_inference_on_video(
         config: Inference and tracking configuration.
         progress: Callback ``progress(frame_idx, total_frames)``.
         should_stop: Callable returning True to abort.
+        frame_callback: Optional ``frame_callback(frame_rgb, frame_idx)``
+            called periodically with the annotated frame (RGB numpy array).
 
     Returns:
         Dict with 'output_dir', 'csv_path', 'num_tracks', 'total_frames'.
@@ -544,9 +630,16 @@ def run_inference_on_video(
             _saved_fd = None
 
     try:
-        inference = MaskRCNNInference(model_dir, device=config.device,
+        architecture = _detect_architecture(model_dir)
+        if architecture == "yolov11-seg":
+            from .yolo_inference import YOLOInference
+            inference = YOLOInference(model_dir, device=config.device,
                                       inference_size=config.inference_size,
                                       use_masks=config.use_masks)
+        else:
+            inference = MaskRCNNInference(model_dir, device=config.device,
+                                          inference_size=config.inference_size,
+                                          use_masks=config.use_masks)
         inference.load_model()
 
         cap = cv2.VideoCapture(video_path)
@@ -603,6 +696,10 @@ def run_inference_on_video(
 
             writer.write(annotated)
             t5 = time.time()
+
+            if frame_callback and (frame_idx % 3 == 0 or frame_idx == 0):
+                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                frame_callback(annotated_rgb, frame_idx)
 
             t_accum["read"] += t1 - t0
             t_accum["model"] += t2 - t1

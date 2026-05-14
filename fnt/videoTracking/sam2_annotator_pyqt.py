@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
     QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent,
@@ -115,11 +115,12 @@ def _class_color(index: int) -> Tuple[int, int, int]:
 # ======================================================================
 class AnnotationObject:
     def __init__(self, points: List[Tuple[float, float]], category: str,
-                 ann_id: int = -1, is_ai: bool = False):
+                 ann_id: int = -1, is_ai: bool = False, inferred: bool = False):
         self.points = list(points)
         self.category = category
         self.ann_id = ann_id
         self.is_ai = is_ai
+        self.inferred = inferred
 
 
 # ======================================================================
@@ -257,6 +258,7 @@ class AnnotationPreviewWidget(QWidget):
     advance_frame_requested = pyqtSignal()
     annotation_edited = pyqtSignal(int)
     delete_annotation_requested = pyqtSignal(int)
+    approve_annotation_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -298,14 +300,15 @@ class AnnotationPreviewWidget(QWidget):
         self._pending_annotation: Optional[List[Tuple[float, float]]] = None
         self._pending_is_ai = False
 
-    def set_frame(self, image_rgb: np.ndarray):
+    def set_frame(self, image_rgb: np.ndarray, reset_view: bool = False):
         h, w = image_rgb.shape[:2]
         self._image_rgb = image_rgb
         self._img_w, self._img_h = w, h
         bytes_per_line = 3 * w
         qimg = QImage(image_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
         self._pixmap = QPixmap.fromImage(qimg)
-        self._reset_view()
+        if reset_view or self._zoom == 1.0:
+            self._reset_view()
         self.update()
 
     def clear(self):
@@ -491,11 +494,24 @@ class AnnotationPreviewWidget(QWidget):
         act_ai = menu.addAction("Add AI-Assisted Mask")
         menu.addSeparator()
         hit_idx = self._find_annotation_at(wx, wy)
+        act_approve = menu.addAction("✔ Approve Mask")
         act_edit = menu.addAction("Edit Mask")
         act_delete = menu.addAction("Delete Mask")
         if hit_idx is None:
+            act_approve.setEnabled(False)
             act_edit.setEnabled(False)
             act_delete.setEnabled(False)
+        elif hit_idx is not None:
+            ann = self.annotations[hit_idx]
+            if not ann.inferred:
+                act_approve.setEnabled(False)
+        # Approve all inferred on this frame
+        act_approve_all = None
+        has_any_inferred = any(a.inferred for a in self.annotations)
+        if has_any_inferred:
+            menu.addSeparator()
+            act_approve_all = menu.addAction("✔ Approve All on Frame")
+
         action = menu.exec_(global_pos)
         if action == act_manual:
             self.drawing_mode = "manual"
@@ -503,6 +519,13 @@ class AnnotationPreviewWidget(QWidget):
         elif action == act_ai:
             self.drawing_mode = "ai"
             self.mode_changed.emit("AI-Assisted Mask")
+        elif action == act_approve and hit_idx is not None:
+            self.approve_annotation_requested.emit(hit_idx)
+        elif action == act_approve_all and act_approve_all is not None:
+            # Approve all inferred annotations on this frame
+            for i in range(len(self.annotations) - 1, -1, -1):
+                if self.annotations[i].inferred:
+                    self.approve_annotation_requested.emit(i)
         elif action == act_edit and hit_idx is not None:
             self._editing_obj_idx = hit_idx
             self.mode_changed.emit("Editing Mask")
@@ -556,6 +579,13 @@ class AnnotationPreviewWidget(QWidget):
                 self.mode_changed.emit("Navigate")
         elif event.key() == Qt.Key_Space:
             self.advance_frame_requested.emit()
+        elif event.key() == Qt.Key_A and not self._drawing_active:
+            # Approve all inferred annotations on current frame
+            has_inferred = any(a.inferred for a in self.annotations)
+            if has_inferred:
+                for i in range(len(self.annotations) - 1, -1, -1):
+                    if self.annotations[i].inferred:
+                        self.approve_annotation_requested.emit(i)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
             self._zoom = min(20.0, self._zoom * 1.2)
             self.zoom_changed.emit(self._zoom)
@@ -653,8 +683,15 @@ class AnnotationPreviewWidget(QWidget):
         cat_counters: Dict[str, int] = {}
 
         for ai, ann in enumerate(self.annotations):
-            ci = ai % len(CLASS_COLORS)
-            r, g, b = CLASS_COLORS[ci]
+            if ann.inferred:
+                # Inferred (pending review): yellow overlay
+                r, g, b = (255, 200, 0)
+                fill_alpha = 35
+            else:
+                # Manual / approved: class-colored overlay
+                ci = ai % len(CLASS_COLORS)
+                r, g, b = CLASS_COLORS[ci]
+                fill_alpha = 50
             color = QColor(r, g, b)
             is_editing = (ai == self._editing_obj_idx)
 
@@ -663,7 +700,7 @@ class AnnotationPreviewWidget(QWidget):
                 for px, py in ann.points:
                     wx, wy = self._img_to_widget(px, py)
                     poly.append(QPointF(wx, wy))
-                painter.setBrush(QBrush(QColor(r, g, b, 50)))
+                painter.setBrush(QBrush(QColor(r, g, b, fill_alpha)))
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
                 else:
@@ -687,13 +724,16 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setBrush(QBrush(QColor(255, 255, 255)))
                 painter.drawEllipse(QPointF(wcx, wcy), 3, 3)
                 label = f"{ann.category}_{instance_num}"
+                if ann.inferred:
+                    label += " [inferred]"
                 font = painter.font()
                 font.setPixelSize(max(10, min(14, int(12 * self._zoom ** 0.3))))
                 font.setBold(True)
                 painter.setFont(font)
                 painter.setPen(QPen(QColor(0, 0, 0), 3))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
-                painter.setPen(QPen(QColor(255, 255, 255)))
+                lbl_color = QColor(255, 200, 0) if ann.inferred else QColor(255, 255, 255)
+                painter.setPen(QPen(lbl_color))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
 
         if self._drawing_active:
@@ -838,20 +878,32 @@ class TrainWorker(QThread):
         try:
             print("[MTT TrainWorker] Starting training thread...")
             print(f"[MTT TrainWorker] Config: {self.config_dict}")
-            from .mask_tracker_training import MaskRCNNTrainingConfig, train_mask_rcnn
-            config = MaskRCNNTrainingConfig(**self.config_dict)
             import time as _pause_time
+
+            arch = self.config_dict.pop("_architecture", "maskrcnn")
 
             def _check_stop():
                 while self._pause_flag and not self._stop_flag:
                     _pause_time.sleep(0.2)
                 return self._stop_flag
 
-            result = train_mask_rcnn(
-                config,
-                progress=lambda it, total, metrics: self.progress.emit(it, total, metrics),
-                should_stop=_check_stop,
-            )
+            if arch == "yolo":
+                from .yolo_training import YOLOTrainingConfig, train_yolo_seg
+                config = YOLOTrainingConfig(**self.config_dict)
+                result = train_yolo_seg(
+                    config,
+                    progress=lambda it, total, metrics: self.progress.emit(it, total, metrics),
+                    should_stop=_check_stop,
+                )
+            else:
+                from .mask_tracker_training import MaskRCNNTrainingConfig, train_mask_rcnn
+                config = MaskRCNNTrainingConfig(**self.config_dict)
+                result = train_mask_rcnn(
+                    config,
+                    progress=lambda it, total, metrics: self.progress.emit(it, total, metrics),
+                    should_stop=_check_stop,
+                )
+
             print(f"[MTT TrainWorker] Training finished: {result.get('iterations_completed')} iterations")
             self.finished.emit(result)
         except Exception as e:
@@ -866,8 +918,112 @@ class TrainWorker(QThread):
                 os.close(_null_fd)
 
 
+class PostTrainInferenceWorker(QThread):
+    """Run the trained model on unlabeled frames and emit inferred annotations."""
+    progress = pyqtSignal(int, int)  # current_frame, total_frames
+    frame_result = pyqtSignal(str, object)  # filename, list of {segmentation, bbox, area, category_id}
+    finished = pyqtSignal(int)  # total inferred count
+    error = pyqtSignal(str)
+
+    def __init__(self, model_dir: str, frame_paths: list, max_det: int = 1,
+                 confidence: float = 0.5, categories: dict = None):
+        super().__init__()
+        self.model_dir = model_dir
+        self.frame_paths = frame_paths
+        self.max_det = max_det
+        self.confidence = confidence
+        self.categories = categories or {}
+        self._stop_flag = False
+
+    def request_stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        try:
+            import json as _json
+
+            config_path = os.path.join(self.model_dir, "training_config.json")
+            arch = "maskrcnn"
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    cfg = _json.load(f)
+                arch = cfg.get("architecture", "maskrcnn")
+
+            if arch == "yolov11-seg":
+                from .yolo_inference import YOLOInference
+                engine = YOLOInference(self.model_dir, device="auto", use_masks=True)
+            else:
+                from .mask_tracker_inference import MaskRCNNInference
+                engine = MaskRCNNInference(self.model_dir, device="auto")
+
+            engine.load_model()
+
+            total = len(self.frame_paths)
+            inferred_count = 0
+
+            for i, path in enumerate(self.frame_paths):
+                if self._stop_flag:
+                    break
+
+                img = cv2.imread(path)
+                if img is None:
+                    self.progress.emit(i + 1, total)
+                    continue
+
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                result = engine.predict(
+                    img_rgb,
+                    confidence_threshold=self.confidence,
+                    max_detections=self.max_det,
+                )
+
+                detections = []
+                n_det = len(result.get("scores", []))
+                for j in range(n_det):
+                    mask = None
+                    if result.get("masks") is not None and j < len(result["masks"]):
+                        mask = result["masks"][j]
+
+                    if mask is not None:
+                        from .mask_tracker_annotator import mask_to_coco_polygons, mask_bbox
+                        polygons = mask_to_coco_polygons(mask)
+                        if not polygons:
+                            continue
+                        bbox = list(mask_bbox(mask))
+                        area = int(mask.sum())
+                    else:
+                        # Use bounding box as a rectangle polygon
+                        box = result["boxes"][j]
+                        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                        polygons = [[x1, y1, x2, y1, x2, y2, x1, y2]]
+                        bbox = [x1, y1, x2 - x1, y2 - y1]
+                        area = int((x2 - x1) * (y2 - y1))
+
+                    label = int(result["labels"][j])
+                    detections.append({
+                        "segmentation": polygons,
+                        "bbox": bbox,
+                        "area": area,
+                        "category_id": label,
+                    })
+
+                if detections:
+                    filename = os.path.basename(path)
+                    self.frame_result.emit(filename, detections)
+                    inferred_count += len(detections)
+
+                self.progress.emit(i + 1, total)
+
+            self.finished.emit(inferred_count)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
 class InferenceWorker(QThread):
     progress = pyqtSignal(int, int)  # frame_idx, total_frames
+    frame_ready = pyqtSignal(object, int)  # annotated_rgb (np.ndarray), frame_idx
     video_finished = pyqtSignal(object)  # result dict
     all_done = pyqtSignal()
     error = pyqtSignal(str)
@@ -902,6 +1058,9 @@ class InferenceWorker(QThread):
                     _pause_time.sleep(0.2)
                 return self._stop_flag
 
+            def _on_frame(frame_rgb, frame_idx):
+                self.frame_ready.emit(frame_rgb, frame_idx)
+
             for video_path in self.video_paths:
                 if self._stop_flag:
                     break
@@ -911,6 +1070,7 @@ class InferenceWorker(QThread):
                     config,
                     progress=lambda f, t: self.progress.emit(f, t),
                     should_stop=_check_stop,
+                    frame_callback=_on_frame,
                 )
                 result["video_path"] = video_path
                 self.video_finished.emit(result)
@@ -922,18 +1082,39 @@ class InferenceWorker(QThread):
             self.error.emit(str(e))
 
 
-class LiveLossPlot(QDialog):
-    """Real-time training loss plot displayed during Mask R-CNN training."""
+class LiveLossPlot(QWidget):
+    """Real-time training loss plot with sub-losses and validation mAP.
 
-    def __init__(self, total_iterations: int, parent=None):
+    Embeddable widget — can be placed in any layout.
+    """
+
+    # Sub-loss colours (semi-transparent thin lines)
+    _SUB_COLORS = {
+        # Mask R-CNN keys
+        "loss_classifier": ("#ff9800", "Classification"),
+        "loss_box_reg": ("#4caf50", "Box regression"),
+        "loss_mask": ("#e91e63", "Mask"),
+        "loss_objectness": ("#9c27b0", "Objectness"),
+        "loss_rpn_box_reg": ("#00bcd4", "RPN box regression"),
+        # YOLO keys
+        "box_loss": ("#4caf50", "Box localization"),
+        "seg_loss": ("#e91e63", "Mask segmentation"),
+        "cls_loss": ("#ff9800", "Classification"),
+    }
+    _MAP_COLORS = {
+        "mAP50(B)": ("#66bb6a", "Val mAP50 (box)"),
+        "mAP50(M)": ("#ef5350", "Val mAP50 (mask)"),
+        "mAP50-95(B)": ("#26a69a", "Val mAP50-95 (box)"),
+        "mAP50-95(M)": ("#ab47bc", "Val mAP50-95 (mask)"),
+    }
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Training Progress")
-        self.setMinimumSize(600, 450)
-        self.setAttribute(Qt.WA_DeleteOnClose, False)
-
         self._iterations = []
         self._losses = []
-        self._total = total_iterations
+        self._sub_data: dict = {}   # key -> list of values
+        self._map_data: dict = {}   # key -> list of (iter, value)
+        self._total = 100
 
         try:
             import matplotlib
@@ -941,20 +1122,23 @@ class LiveLossPlot(QDialog):
             from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
 
-            self._fig = Figure(figsize=(6, 3.5), dpi=100)
+            self._fig = Figure(figsize=(8, 4), dpi=100)
             self._fig.patch.set_facecolor("#1e1e1e")
             self._ax = self._fig.add_subplot(111)
-            self._ax.set_facecolor("#1e1e1e")
-            self._ax.set_xlabel("Iteration", color="#cccccc")
-            self._ax.set_ylabel("Loss", color="#cccccc")
-            self._ax.set_title("Training Loss", color="#cccccc")
-            self._ax.tick_params(colors="#999999")
-            for spine in self._ax.spines.values():
-                spine.set_color("#555555")
-            self._ax.set_xlim(0, 10)
-            self._line, = self._ax.plot([], [], color="#2979ff", linewidth=1.5)
-            self._fig.tight_layout()
+            self._setup_axes()
+            self._line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                        label="Total loss (sum)")
+            self._sub_lines = {}
 
+            # Secondary y-axis for mAP
+            self._ax2 = self._ax.twinx()
+            self._ax2.set_ylabel("mAP", color="#66bb6a")
+            self._ax2.tick_params(axis="y", colors="#66bb6a")
+            self._ax2.set_ylim(0, 1.05)
+            self._ax2.spines["right"].set_color("#66bb6a")
+            self._map_lines = {}
+
+            self._fig.subplots_adjust(right=0.72, bottom=0.15)
             self._canvas = FigureCanvasQTAgg(self._fig)
             self._has_mpl = True
         except ImportError:
@@ -964,28 +1148,187 @@ class LiveLossPlot(QDialog):
             self._has_mpl = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(self._canvas)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._canvas, 1)
 
-        self._lbl_status = QLabel("Waiting for first iteration...")
-        self._lbl_status.setStyleSheet("color: #cccccc; font-size: 12px;")
+        self._lbl_status = QLabel("")
+        self._lbl_status.setStyleSheet("color: #cccccc; font-size: 11px;")
         self._lbl_status.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._lbl_status)
 
-    def add_point(self, iteration: int, loss: float):
+    def _setup_axes(self):
+        self._ax.set_facecolor("#1e1e1e")
+        self._ax.set_xlabel("Epoch", color="#cccccc")
+        self._ax.set_ylabel("Loss", color="#cccccc")
+        self._ax.set_title("Training Loss", color="#cccccc", fontsize=11)
+        self._ax.tick_params(colors="#999999")
+        for spine in self._ax.spines.values():
+            spine.set_color("#555555")
+        self._ax.set_xlim(0, 10)
+
+    def reset(self, total_iterations: int):
+        """Clear all data and prepare for a new training run."""
+        self._iterations.clear()
+        self._losses.clear()
+        self._sub_data.clear()
+        self._map_data.clear()
+        self._total = total_iterations
+        self._lbl_status.setText("Waiting for first epoch...")
+        if self._has_mpl:
+            self._ax.cla()
+            if hasattr(self, "_ax2"):
+                self._ax2.cla()
+                self._ax2.set_ylabel("mAP", color="#66bb6a")
+                self._ax2.tick_params(axis="y", colors="#66bb6a")
+                self._ax2.set_ylim(0, 1.05)
+                self._ax2.spines["right"].set_color("#66bb6a")
+            self._setup_axes()
+            self._line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                        label="Total loss (sum)")
+            self._sub_lines.clear()
+            self._map_lines.clear()
+            self._canvas.draw_idle()
+
+    def add_point(self, iteration: int, loss: float, metrics: dict = None):
         self._iterations.append(iteration)
         self._losses.append(loss)
 
-        self._lbl_status.setText(
-            f"Iteration {iteration} / {self._total}    Loss: {loss:.4f}"
-        )
+        # Build status text
+        parts = [f"Epoch {iteration} / {self._total}    Loss: {loss:.4f}"]
+        if metrics:
+            map50 = metrics.get("mAP50(M)") or metrics.get("mAP50(B)")
+            if map50 is not None:
+                parts.append(f"mAP50: {map50:.3f}")
+        self._lbl_status.setText("    ".join(parts))
 
         if not self._has_mpl:
             return
+
+        # Update total loss line
         self._line.set_data(self._iterations, self._losses)
         self._ax.set_xlim(0, max(iteration * 1.1, 10))
-        self._ax.set_ylim(0, max(self._losses) * 1.1 + 0.01)
+        y_max = max(self._losses) * 1.1 + 0.01
+
+        # Update sub-loss lines
+        if metrics:
+            for key, (color, label_text) in self._SUB_COLORS.items():
+                if key in metrics:
+                    self._sub_data.setdefault(key, []).append(metrics[key])
+                    if key not in self._sub_lines:
+                        ln, = self._ax.plot([], [], color=color, linewidth=0.9,
+                                            alpha=0.7, label=label_text,
+                                            linestyle="--")
+                        self._sub_lines[key] = ln
+                    self._sub_lines[key].set_data(
+                        self._iterations[-len(self._sub_data[key]):],
+                        self._sub_data[key],
+                    )
+
+            # Update mAP lines on secondary axis
+            for key, (color, label_text) in self._MAP_COLORS.items():
+                if key in metrics:
+                    self._map_data.setdefault(key, []).append(
+                        (iteration, metrics[key])
+                    )
+                    if key not in self._map_lines:
+                        ln, = self._ax2.plot([], [], color=color, linewidth=1.2,
+                                             alpha=0.9, label=label_text,
+                                             marker="o", markersize=2)
+                        self._map_lines[key] = ln
+                    xs = [p[0] for p in self._map_data[key]]
+                    ys = [p[1] for p in self._map_data[key]]
+                    self._map_lines[key].set_data(xs, ys)
+
+            # Rebuild legend outside the plot on the right
+            all_handles = [self._line] + list(self._sub_lines.values())
+            all_labels = [h.get_label() for h in all_handles]
+            if self._map_lines:
+                all_handles += list(self._map_lines.values())
+                all_labels += [h.get_label() for h in self._map_lines.values()]
+            self._ax.legend(all_handles, all_labels,
+                            loc="upper left", bbox_to_anchor=(1.12, 1.0),
+                            fontsize=7, facecolor="#2b2b2b",
+                            edgecolor="#555555", labelcolor="#cccccc",
+                            framealpha=0.9)
+
+        self._ax.set_ylim(0, y_max)
         self._canvas.draw_idle()
+
+
+class TrainingSamplePreview(QWidget):
+    """Shows sample validation predictions during/after training.
+
+    Displays a grid of annotated images so the user can visually assess
+    model quality without leaving the Training tab.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._images: List[QPixmap] = []
+        self._labels: List[str] = []
+        self.setMinimumHeight(100)
+
+    def clear(self):
+        self._images.clear()
+        self._labels.clear()
+        self.update()
+
+    def set_images(self, images_rgb: list, labels: list = None):
+        """Set a list of (numpy RGB image) to display in a grid."""
+        self._images.clear()
+        self._labels = labels or []
+        for img_rgb in images_rgb:
+            h, w = img_rgb.shape[:2]
+            bpl = 3 * w
+            qimg = QImage(img_rgb.data, w, h, bpl, QImage.Format_RGB888)
+            self._images.append(QPixmap.fromImage(qimg.copy()))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor(30, 30, 30))
+
+        if not self._images:
+            painter.setPen(QColor(100, 100, 100))
+            painter.drawText(
+                self.rect(), Qt.AlignCenter,
+                "Sample predictions will appear here during training"
+            )
+            painter.end()
+            return
+
+        n = len(self._images)
+        cols = min(n, max(1, self.width() // 200))
+        rows = (n + cols - 1) // cols
+        cell_w = self.width() // cols
+        cell_h = self.height() // rows
+        margin = 4
+
+        for i, pm in enumerate(self._images):
+            r, c = divmod(i, cols)
+            x = c * cell_w + margin
+            y = r * cell_h + margin
+            avail_w = cell_w - 2 * margin
+            avail_h = cell_h - 2 * margin - 16  # room for label
+            scaled = pm.scaled(
+                avail_w, avail_h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            dx = x + (avail_w - scaled.width()) // 2
+            dy = y + (avail_h - scaled.height()) // 2
+            painter.drawPixmap(dx, dy, scaled)
+
+            if i < len(self._labels):
+                painter.setPen(QColor(180, 180, 180))
+                font = painter.font()
+                font.setPixelSize(10)
+                painter.setFont(font)
+                painter.drawText(
+                    x, y + avail_h + 2, avail_w, 14,
+                    Qt.AlignCenter, self._labels[i],
+                )
+
+        painter.end()
 
 
 class FrameExtractWorker(QThread):
@@ -1003,6 +1346,7 @@ class FrameExtractWorker(QThread):
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             saved = []
+            skipped = 0
             total = sum(len(v) for v in self.frame_indices_per_video.values())
             done = 0
             for vpath, frame_idxs in self.frame_indices_per_video.items():
@@ -1011,16 +1355,23 @@ class FrameExtractWorker(QThread):
                     continue
                 stem = Path(vpath).stem
                 for fidx in sorted(frame_idxs):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                    ret, frame = cap.read()
-                    if ret:
-                        fname = f"{stem}_frame_{fidx:06d}.png"
-                        out_path = os.path.join(self.output_dir, fname)
-                        cv2.imwrite(out_path, frame)
+                    fname = f"{stem}_frame_{fidx:06d}.png"
+                    out_path = os.path.join(self.output_dir, fname)
+                    if os.path.exists(out_path):
+                        # Don't overwrite existing frames
                         saved.append((vpath, fidx, out_path))
+                        skipped += 1
+                    else:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                        ret, frame = cap.read()
+                        if ret:
+                            cv2.imwrite(out_path, frame)
+                            saved.append((vpath, fidx, out_path))
                     done += 1
                     self.progress.emit(done, total)
                 cap.release()
+            if skipped:
+                print(f"[MTT] Skipped {skipped} existing frames")
             self.finished.emit(saved)
         except Exception as e:
             self.error.emit(str(e))
@@ -1069,6 +1420,36 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._build_menu_bar()
         self._build_ui()
         self._update_nav_state()
+
+        # Tab activity animation (., .., ...)
+        self._tab_anim_tick = 0
+        self._tab_anim_timer = QTimer(self)
+        self._tab_anim_timer.timeout.connect(self._update_tab_animations)
+        self._tab_anim_timer.start(500)
+
+    def _update_tab_animations(self):
+        self._tab_anim_tick = (self._tab_anim_tick + 1) % 3
+        dots = "." * (self._tab_anim_tick + 1)
+
+        # Training tab (index 1)
+        training_active = (
+            hasattr(self, "_train_worker")
+            and self._train_worker is not None
+            and self._train_worker.isRunning()
+        ) or (
+            hasattr(self, "_post_infer_worker")
+            and self._post_infer_worker is not None
+            and self._post_infer_worker.isRunning()
+        )
+        self.tab_widget.setTabText(1, f"Training{dots}" if training_active else "Training")
+
+        # Tracking tab (index 2)
+        tracking_active = (
+            hasattr(self, "_inference_worker")
+            and self._inference_worker is not None
+            and self._inference_worker.isRunning()
+        )
+        self.tab_widget.setTabText(2, f"Tracking{dots}" if tracking_active else "Tracking")
 
     # ==================================================================
     # Menu bar
@@ -1142,10 +1523,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.preview.advance_frame_requested.connect(self._next_frame)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
+        self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
         right_layout.addWidget(self.preview, 1)
 
         # Info row below preview
-        info_row = QWidget()
+        self._info_row = QWidget()
+        info_row = self._info_row
         info_layout = QHBoxLayout(info_row)
         info_layout.setContentsMargins(5, 2, 5, 2)
         info_layout.setSpacing(8)
@@ -1166,6 +1549,19 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         info_layout.addStretch()
 
+        self.btn_delete_frame = QPushButton("Delete Frame")
+        self.btn_delete_frame.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 3px 12px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+        )
+        self.btn_delete_frame.setToolTip(
+            "Delete the current frame from disk and remove\n"
+            "its annotations. Cannot be undone."
+        )
+        self.btn_delete_frame.clicked.connect(self._delete_current_frame)
+        info_layout.addWidget(self.btn_delete_frame)
+
         self.btn_edit_classes = QPushButton("Edit Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
@@ -1179,6 +1575,34 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.lbl_zoom_info.setStyleSheet("color: #999999;")
         info_layout.addWidget(self.lbl_zoom_info)
         right_layout.addWidget(info_row)
+
+        # Store annotation-specific widgets for show/hide on tab switch
+        self._annotation_bar_widgets = [
+            self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
+            self.btn_delete_frame, self.btn_edit_classes, self.lbl_zoom_info,
+        ]
+        # Tracking info label (hidden by default, shown on Tracking tab)
+        self.lbl_tracking_info = QLabel("")
+        self.lbl_tracking_info.setStyleSheet("color: #999999; font-size: 11px;")
+        self.lbl_tracking_info.setVisible(False)
+        info_layout.addWidget(self.lbl_tracking_info)
+
+        # Training visualization panel (hidden by default, shown on Training tab)
+        self._training_viz_panel = QWidget()
+        training_viz_layout = QVBoxLayout(self._training_viz_panel)
+        training_viz_layout.setContentsMargins(4, 4, 4, 4)
+        training_viz_layout.setSpacing(4)
+
+        self._loss_plot = LiveLossPlot(parent=self._training_viz_panel)
+        training_viz_layout.addWidget(self._loss_plot, 3)
+
+        self._training_sample_preview = TrainingSamplePreview(
+            parent=self._training_viz_panel,
+        )
+        training_viz_layout.addWidget(self._training_sample_preview, 2)
+
+        self._training_viz_panel.setVisible(False)
+        right_layout.addWidget(self._training_viz_panel, 1)
 
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(right_panel, 1)
@@ -1242,6 +1666,18 @@ class SAM2AnnotatorWindow(QMainWindow):
         summary_group.setLayout(summary_vbox)
         layout.addWidget(summary_group)
 
+        # Hardware detection
+        hw_group = QGroupBox("System")
+        hw_vbox = QVBoxLayout()
+        hw_vbox.setSpacing(2)
+        self.lbl_hw_info = QLabel("Detecting hardware...")
+        self.lbl_hw_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_hw_info.setWordWrap(True)
+        hw_vbox.addWidget(self.lbl_hw_info)
+        hw_group.setLayout(hw_vbox)
+        layout.addWidget(hw_group)
+        self._populate_hw_info()
+
         # Blue arrow buttons for spin boxes — generate tiny arrow PNGs
         # at runtime for cross-platform consistency.
         import tempfile
@@ -1281,9 +1717,40 @@ class SAM2AnnotatorWindow(QMainWindow):
         spin_style = self._spin_style
 
         # Training section
-        train_group = QGroupBox("Train Mask R-CNN")
+        train_group = QGroupBox("Train Model")
         train_vbox = QVBoxLayout()
         train_vbox.setSpacing(4)
+
+        tip_arch = (
+            "Detection and segmentation architecture.\n\n"
+            "YOLOv11-small-seg (recommended): single-stage detector\n"
+            "  with 11.8M parameters. Produces high-quality instance\n"
+            "  masks with tight contour boundaries — important for\n"
+            "  silhouette-based behavioral classification. ~12 fps\n"
+            "  on Apple Silicon CPU. Model size: ~23MB.\n\n"
+            "YOLOv11-nano-seg: smallest and fastest single-stage\n"
+            "  detector (2.8M params, 2.6MB). ~30 fps on CPU but\n"
+            "  mask boundaries are coarser. Best when speed matters\n"
+            "  more than mask precision (e.g., box-only tracking).\n\n"
+            "Mask R-CNN (MobileNetV3): two-stage detector. Accurate\n"
+            "  with small datasets but slower (~3-10 fps on CPU).\n"
+            "  Masks add ~2x overhead. Use as fallback if YOLO\n"
+            "  doesn't train well on your data."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Architecture:")
+        lbl.setToolTip(tip_arch)
+        row.addWidget(lbl)
+        self.combo_architecture = QComboBox()
+        self.combo_architecture.addItems([
+            "YOLOv11-small-seg",
+            "YOLOv11-nano-seg",
+            "Mask R-CNN",
+        ])
+        self.combo_architecture.setToolTip(tip_arch)
+        self.combo_architecture.currentIndexChanged.connect(self._on_architecture_changed)
+        row.addWidget(self.combo_architecture)
+        train_vbox.addLayout(row)
 
         tip_device = (
             "Hardware accelerator for training.\n\n"
@@ -1318,10 +1785,11 @@ class SAM2AnnotatorWindow(QMainWindow):
             "  Uses standard convolutions stacked 50 layers deep.\n"
             "  Best for final production models when accuracy matters most."
         )
+        self._maskrcnn_widgets = []
         row = QHBoxLayout()
-        lbl = QLabel("Backbone:")
-        lbl.setToolTip(tip_backbone)
-        row.addWidget(lbl)
+        self._lbl_backbone = QLabel("Backbone:")
+        self._lbl_backbone.setToolTip(tip_backbone)
+        row.addWidget(self._lbl_backbone)
         self.combo_backbone = QComboBox()
         self.combo_backbone.addItems([
             "MobileNetV3-Large FPN",
@@ -1330,6 +1798,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         ])
         self.combo_backbone.setToolTip(tip_backbone)
         row.addWidget(self.combo_backbone)
+        self._maskrcnn_widgets.extend([self._lbl_backbone, self.combo_backbone])
         train_vbox.addLayout(row)
 
         tip_freeze = (
@@ -1348,6 +1817,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.chk_freeze_backbone.setChecked(True)
         self.chk_freeze_backbone.setToolTip(tip_freeze)
         train_vbox.addWidget(self.chk_freeze_backbone)
+        self._maskrcnn_widgets.append(self.chk_freeze_backbone)
 
         tip_optimizer = (
             "Algorithm that updates model weights during training.\n\n"
@@ -1371,21 +1841,23 @@ class SAM2AnnotatorWindow(QMainWindow):
         train_vbox.addLayout(row)
 
         tip_iterations = (
-            "Total number of weight updates to perform.\n\n"
-            "Each iteration loads one batch of images, computes the\n"
-            "loss, and updates the model weights. With AdamW and a\n"
-            "frozen backbone, 200-500 iterations is often sufficient.\n"
-            "With SGD or unfrozen backbone, 1000-5000 may be needed.\n"
-            "Watch the loss plot — if loss is still dropping at the\n"
-            "end, increase iterations. If it plateaus early, the\n"
-            "early stopping feature will handle it automatically."
+            "Maximum training epochs (YOLO) or iterations (Mask R-CNN).\n\n"
+            "YOLO: each epoch processes all images once. 100-1000 epochs\n"
+            "  is typical. At ~1-2s/epoch, 1000 epochs takes ~20-30 min.\n"
+            "Mask R-CNN: each iteration processes one batch. 200-2000\n"
+            "  iterations is typical.\n\n"
+            "Early stopping is always enabled (patience=50): training\n"
+            "will stop automatically when loss plateaus, so it is safe\n"
+            "to set this higher than needed. The best model weights\n"
+            "(lowest loss) are always saved regardless of when training\n"
+            "stops."
         )
         row = QHBoxLayout()
-        lbl = QLabel("Iterations:")
+        lbl = QLabel("Training Iterations:")
         lbl.setToolTip(tip_iterations)
         row.addWidget(lbl)
         self.spin_iterations = QSpinBox()
-        self.spin_iterations.setRange(100, 100000)
+        self.spin_iterations.setRange(10, 100000)
         self.spin_iterations.setValue(1000)
         self.spin_iterations.setSingleStep(100)
         self.spin_iterations.setToolTip(tip_iterations)
@@ -1477,9 +1949,9 @@ class SAM2AnnotatorWindow(QMainWindow):
             "is slow or you hit out-of-memory errors."
         )
         row = QHBoxLayout()
-        lbl = QLabel("Image min size:")
-        lbl.setToolTip(tip_min_size)
-        row.addWidget(lbl)
+        self._lbl_min_size = QLabel("Image min size:")
+        self._lbl_min_size.setToolTip(tip_min_size)
+        row.addWidget(self._lbl_min_size)
         self.spin_min_size = QSpinBox()
         self.spin_min_size.setRange(256, 2048)
         self.spin_min_size.setValue(480)
@@ -1487,6 +1959,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.spin_min_size.setToolTip(tip_min_size)
         self.spin_min_size.setStyleSheet(spin_style)
         row.addWidget(self.spin_min_size)
+        self._maskrcnn_widgets.extend([self._lbl_min_size, self.spin_min_size])
         train_vbox.addLayout(row)
 
         self.chk_augment = QCheckBox("Data augmentation (~8x expansion)")
@@ -1503,30 +1976,49 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         train_vbox.addWidget(self.chk_augment)
 
-        tip_early_stop = (
-            "Automatically stop training when loss stops improving.\n\n"
-            "Monitors a 20-iteration moving average of training loss.\n"
-            "If loss does not improve by >1% for 'patience' consecutive\n"
-            "iterations, training stops and the best weights are kept.\n\n"
-            "Patience 50-100: aggressive — stops quickly, saves time.\n"
-            "Patience 200+: conservative — allows longer plateaus\n"
-            "  before giving up, may find better minima.\n\n"
-            "The best model weights (lowest loss) are always saved\n"
-            "separately regardless of when training stops."
+        # --- Post-training inference (active learning) ---
+        self.chk_post_infer = QCheckBox("Run inference on unlabeled frames after training")
+        self.chk_post_infer.setChecked(False)
+        self.chk_post_infer.setToolTip(
+            "After training completes, automatically run the new model\n"
+            "on all extracted frames that don't have manual annotations.\n\n"
+            "Inferred masks appear in yellow on the Annotator tab.\n"
+            "Right-click → 'Approve Mask' to accept them, or delete\n"
+            "and re-annotate. Approved masks are included in the next\n"
+            "training round, rapidly expanding your dataset.\n\n"
+            "This is an active learning loop:\n"
+            "  Annotate → Train → Auto-infer → Review → Retrain"
         )
-        es_row = QHBoxLayout()
-        self.chk_early_stop = QCheckBox("Early stopping, patience:")
-        self.chk_early_stop.setChecked(True)
-        self.chk_early_stop.setToolTip(tip_early_stop)
-        es_row.addWidget(self.chk_early_stop)
-        self.spin_patience = QSpinBox()
-        self.spin_patience.setRange(20, 1000)
-        self.spin_patience.setValue(100)
-        self.spin_patience.setSingleStep(10)
-        self.spin_patience.setToolTip(tip_early_stop)
-        self.spin_patience.setStyleSheet(spin_style)
-        es_row.addWidget(self.spin_patience)
-        train_vbox.addLayout(es_row)
+        train_vbox.addWidget(self.chk_post_infer)
+
+        post_infer_row = QHBoxLayout()
+        self.lbl_post_infer_max = QLabel("  Max objects per frame:")
+        self.lbl_post_infer_max.setToolTip(
+            "Maximum number of objects to detect per frame during\n"
+            "post-training inference. Set to the expected number of\n"
+            "animals/objects in each frame."
+        )
+        post_infer_row.addWidget(self.lbl_post_infer_max)
+        self.spin_post_infer_max = QSpinBox()
+        self.spin_post_infer_max.setRange(1, 100)
+        self.spin_post_infer_max.setValue(1)
+        self.spin_post_infer_max.setStyleSheet(spin_style)
+        self.spin_post_infer_max.setToolTip(
+            "Maximum number of objects to detect per frame during\n"
+            "post-training inference (1–100)."
+        )
+        post_infer_row.addWidget(self.spin_post_infer_max)
+        train_vbox.addLayout(post_infer_row)
+
+        # Show/hide max objects row based on checkbox
+        def _toggle_post_infer_opts(checked):
+            self.lbl_post_infer_max.setVisible(checked)
+            self.spin_post_infer_max.setVisible(checked)
+        self.chk_post_infer.toggled.connect(_toggle_post_infer_opts)
+        self.lbl_post_infer_max.setVisible(False)
+        self.spin_post_infer_max.setVisible(False)
+
+        self._on_architecture_changed(0)
 
         self.btn_train = QPushButton("Train Model")
         self.btn_train.setStyleSheet(
@@ -1636,6 +2128,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.list_track_videos = QListWidget()
         self.list_track_videos.setMaximumHeight(120)
         self.list_track_videos.setToolTip("Videos queued for tracking. All will be processed sequentially.")
+        self.list_track_videos.currentItemChanged.connect(self._on_tracking_video_selected)
         video_vbox.addWidget(self.list_track_videos)
 
         video_group.setLayout(video_vbox)
@@ -1645,6 +2138,11 @@ class SAM2AnnotatorWindow(QMainWindow):
         settings_group = QGroupBox("Inference Settings")
         settings_vbox = QVBoxLayout()
         settings_vbox.setSpacing(4)
+
+        self.lbl_track_system_info = QLabel("")
+        self.lbl_track_system_info.setStyleSheet("color: #888888; font-size: 10px;")
+        self.lbl_track_system_info.setWordWrap(True)
+        settings_vbox.addWidget(self.lbl_track_system_info)
 
         row0 = QHBoxLayout()
         row0.addWidget(QLabel("Max objects:"))
@@ -1830,6 +2328,42 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.addStretch()
         scroll.setWidget(widget)
         self.tab_widget.addTab(scroll, "Tracking")
+        self._apply_system_defaults()
+
+    def _apply_system_defaults(self):
+        """Auto-detect hardware and set optimal tracking defaults."""
+        try:
+            from .mask_tracker_inference import detect_system_profile
+            profile = detect_system_profile()
+        except Exception:
+            return
+
+        dev = profile["recommended_device"]
+        device_map = {"cpu": "CPU", "cuda": "CUDA (GPU)", "mps": "MPS (Apple Silicon)"}
+        target_text = device_map.get(dev, "CPU")
+        for i in range(self.combo_track_device.count()):
+            if self.combo_track_device.itemText(i).startswith(target_text.split()[0]):
+                self.combo_track_device.setCurrentIndex(i)
+                break
+
+        res = profile["recommended_resolution"]
+        if res > 0:
+            target = f"{res}px"
+            for i in range(self.combo_track_resolution.count()):
+                if self.combo_track_resolution.itemText(i).startswith(str(res)):
+                    self.combo_track_resolution.setCurrentIndex(i)
+                    break
+
+        self.chk_track_masks.setChecked(profile["recommended_use_masks"])
+
+        chip = profile.get("chip", "Unknown")
+        ram = profile.get("ram_gb")
+        ram_str = f", {ram}GB RAM" if ram else ""
+        masks_str = "masks" if profile["recommended_use_masks"] else "boxes"
+        res_str = f"{res}px" if res > 0 else "trained"
+        self.lbl_track_system_info.setText(
+            f"Detected: {chip}{ram_str} — defaults: {dev}, {res_str}, {masks_str}"
+        )
 
     # ------------------------------------------------------------------
     # Annotator tab sections
@@ -2033,6 +2567,14 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(self._project_dir)}")
         self.status_bar.showMessage(f"Opened project: {self._project_dir}")
         self._update_ann_stats()
+
+        # Refresh whichever tab is currently visible
+        current_tab_idx = self.tab_widget.currentIndex()
+        if current_tab_idx == 1:  # Training
+            self._refresh_training_summary()
+            self._refresh_device_label()
+        elif current_tab_idx == 2:  # Tracking
+            self._refresh_model_list()
 
     def _save_project(self):
         if self._project_dir is None:
@@ -2247,10 +2789,23 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _on_extract_finished(self, results: list):
         self.extract_progress.setVisible(False)
         self.btn_generate.setEnabled(True)
-        self._extracted_frames = results
+
+        # Merge new frames with existing ones (append, don't replace)
+        existing_paths = {fp for _, _, fp in self._extracted_frames}
+        new_count = 0
+        for item in results:
+            if item[2] not in existing_paths:
+                self._extracted_frames.append(item)
+                new_count += 1
+
+        # Sort by filename for consistent ordering
+        self._extracted_frames.sort(key=lambda x: os.path.basename(x[2]))
         self._refresh_frame_list()
-        self.status_bar.showMessage(f"Extracted {len(results)} frames to {self._output_dir}")
-        if self._extracted_frames:
+        total = len(self._extracted_frames)
+        self.status_bar.showMessage(
+            f"Added {new_count} new frames ({total} total) in {self._output_dir}"
+        )
+        if self._extracted_frames and self.current_frame_idx < 0:
             self.frame_list.setCurrentRow(0)
 
     def _on_extract_error(self, msg: str):
@@ -2266,23 +2821,38 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.frame_list.clear()
         for _, _, fp in self._extracted_frames:
             filename = os.path.basename(fp)
-            n_ann = self._count_annotations_for_file(filename)
-            if n_ann > 0:
-                label = f"✔ {filename} ({n_ann})"
+            n_total, n_inferred = self._count_annotations_for_file(filename)
+            n_approved = n_total - n_inferred
+            if n_total > 0 and n_inferred == n_total:
+                # All annotations are inferred (pending review)
+                label = f"● {filename} ({n_total})"
+                color = QColor("#e6c830")  # yellow
+            elif n_total > 0 and n_inferred > 0:
+                # Mix of approved and inferred
+                label = f"◐ {filename} ({n_approved}+{n_inferred})"
+                color = QColor("#e6c830")  # yellow
+            elif n_total > 0:
+                # All annotations are approved/manual
+                label = f"✔ {filename} ({n_total})"
+                color = QColor("#4fc456")  # green
             else:
                 label = f"   {filename}"
+                color = QColor("#cccccc")
             item = QListWidgetItem(label)
-            if n_ann > 0:
-                item.setForeground(QColor("#4fc456"))
+            item.setForeground(color)
             self.frame_list.addItem(item)
         self.frame_list.blockSignals(False)
         self._update_nav_state()
 
-    def _count_annotations_for_file(self, filename: str) -> int:
+    def _count_annotations_for_file(self, filename: str) -> Tuple[int, int]:
+        """Return (total_annotations, inferred_count) for a file."""
         if filename not in self._coco._image_id_map:
-            return 0
+            return (0, 0)
         img_id = self._coco._image_id_map[filename]
-        return len(self._coco.get_annotations_for_image(img_id))
+        anns = self._coco.get_annotations_for_image(img_id)
+        total = len(anns)
+        n_inferred = sum(1 for a in anns if a.get("inferred", False))
+        return (total, n_inferred)
 
     def _scan_frames_dir(self, folder: str):
         paths = sorted(
@@ -2320,6 +2890,61 @@ class SAM2AnnotatorWindow(QMainWindow):
         if self.current_frame_idx < len(self._extracted_frames) - 1:
             self.frame_list.setCurrentRow(self.current_frame_idx + 1)
 
+    def _delete_current_frame(self):
+        if self.current_frame_idx < 0 or self.current_frame_idx >= len(self._extracted_frames):
+            return
+        _, _, fp = self._extracted_frames[self.current_frame_idx]
+        filename = os.path.basename(fp)
+
+        # Check if frame has annotations
+        n_total, _ = self._count_annotations_for_file(filename)
+        msg = f"Delete frame '{filename}'?"
+        if n_total > 0:
+            msg += f"\n\nThis frame has {n_total} annotation(s) that will also be removed."
+        msg += "\n\nThe image file will be deleted from disk. This cannot be undone."
+
+        reply = QMessageBox.warning(
+            self, "Delete Frame", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Remove annotations for this frame
+        if filename in self._coco._image_id_map:
+            img_id = self._coco._image_id_map[filename]
+            anns = self._coco.get_annotations_for_image(img_id)
+            for ann in anns:
+                self._coco.remove_annotation(ann["id"])
+            # Remove the image record
+            self._coco.images = [
+                img for img in self._coco.images if img["id"] != img_id
+            ]
+            del self._coco._image_id_map[filename]
+
+        # Delete file from disk
+        try:
+            if os.path.exists(fp):
+                os.remove(fp)
+        except OSError as e:
+            QMessageBox.warning(self, "Error", f"Could not delete file:\n{e}")
+
+        # Remove from extracted frames list
+        self._extracted_frames.pop(self.current_frame_idx)
+
+        # Adjust current index
+        if len(self._extracted_frames) == 0:
+            self.current_frame_idx = -1
+            self.preview.clear()
+        elif self.current_frame_idx >= len(self._extracted_frames):
+            self.current_frame_idx = len(self._extracted_frames) - 1
+
+        self._refresh_frame_list()
+        if self.current_frame_idx >= 0:
+            self.frame_list.setCurrentRow(self.current_frame_idx)
+        self._update_ann_stats()
+        self.status_bar.showMessage(f"Deleted frame: {filename}")
+
     def _load_annotation_frame(self, path: str):
         img = cv2.imread(path)
         if img is None:
@@ -2353,7 +2978,10 @@ class SAM2AnnotatorWindow(QMainWindow):
                 seg = ann["segmentation"][0]
                 for i in range(0, len(seg), 2):
                     points.append((float(seg[i]), float(seg[i + 1])))
-            ann_obj = AnnotationObject(points, cat_name, ann_id=ann["id"])
+            is_inferred = ann.get("inferred", False)
+            ann_obj = AnnotationObject(
+                points, cat_name, ann_id=ann["id"], inferred=is_inferred,
+            )
             self.preview.annotations.append(ann_obj)
 
         self.preview.update()
@@ -2373,12 +3001,9 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _ensure_sam2_loaded(self):
         if self._segmenter is not None and self._segmenter.predictor is not None:
             return
-        from .sam2_checkpoint_manager import SAM2_CHECKPOINTS, _FNT_REPO_ROOT, _find_existing_checkpoints
+        from .sam2_checkpoint_manager import SAM2_CHECKPOINTS, LOCAL_MODELS_DIR, _LEGACY_DIRS, _find_existing_checkpoints
 
-        search_dirs = [
-            _FNT_REPO_ROOT / "sam_models_local",
-            _FNT_REPO_ROOT / "SAM_models",
-        ]
+        search_dirs = [LOCAL_MODELS_DIR] + list(_LEGACY_DIRS)
         custom_path = self._project_config.get("sam2_model_path")
         if custom_path and os.path.isdir(custom_path):
             search_dirs.insert(0, Path(custom_path))
@@ -2582,6 +3207,17 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._coco.update_annotation_polygon(ann.ann_id, ann.points)
             self.status_bar.showMessage(f"Annotation {ann.ann_id} updated")
 
+    def _on_approve_annotation_by_index(self, obj_idx: int):
+        if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
+            return
+        ann = self.preview.annotations[obj_idx]
+        if ann.ann_id >= 0 and ann.inferred:
+            self._coco.approve_annotation(ann.ann_id)
+            ann.inferred = False
+            self.preview.update()
+            self._update_ann_stats()
+            self.status_bar.showMessage(f"Annotation {ann.ann_id} approved")
+
     def _on_delete_annotation_by_index(self, obj_idx: int):
         if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
             return
@@ -2630,6 +3266,61 @@ class SAM2AnnotatorWindow(QMainWindow):
     # ==================================================================
     # Training
     # ==================================================================
+    def _populate_hw_info(self):
+        try:
+            from .mask_tracker_inference import detect_system_profile
+            p = detect_system_profile()
+            lines = []
+            lines.append(f"Chip: {p.get('chip', 'Unknown')}")
+            lines.append(f"CPU cores: {p.get('cpu_cores', '?')}  |  RAM: {p.get('ram_gb', '?')} GB")
+            gpu_parts = []
+            if p.get("has_cuda"):
+                gpu_parts.append(f"CUDA ({p.get('cuda_name', 'Unknown')})")
+            if p.get("has_mps"):
+                gpu_parts.append("MPS (Apple Metal)")
+            if not gpu_parts:
+                gpu_parts.append("None (CPU only)")
+            lines.append(f"GPU: {', '.join(gpu_parts)}")
+            lines.append(f"Recommended: {p['recommended_device'].upper()}, "
+                         f"{p['recommended_resolution']}px, "
+                         f"{'masks' if p['recommended_use_masks'] else 'boxes'}")
+            self.lbl_hw_info.setText("\n".join(lines))
+        except Exception as e:
+            self.lbl_hw_info.setText(f"Hardware detection failed: {e}")
+
+    def _on_architecture_changed(self, index: int):
+        arch_text = self.combo_architecture.currentText()
+        is_maskrcnn = arch_text.startswith("Mask R-CNN")
+        for w in self._maskrcnn_widgets:
+            w.setVisible(is_maskrcnn)
+        if not is_maskrcnn:
+            is_small = "small" in arch_text.lower()
+            self.spin_batch.setValue(2 if is_small else 8)
+            self.spin_lr.setValue(0.01)
+            # YOLO training on MPS produces corrupt models — force CPU
+            import platform
+            if platform.system() == "Darwin":
+                for i in range(self.combo_device.count()):
+                    if self.combo_device.itemText(i) == "CPU":
+                        self.combo_device.setCurrentIndex(i)
+                        break
+                self.combo_device.setToolTip(
+                    "YOLO training uses CPU on macOS.\n"
+                    "Apple MPS is not reliable for YOLO training\n"
+                    "(produces models that cannot detect objects).\n"
+                    "CPU training is fast — typically 2-5 minutes."
+                )
+        else:
+            self.spin_batch.setValue(2)
+            self.spin_lr.setValue(0.005)
+            self.combo_device.setToolTip(
+                "Hardware device for training.\n"
+                "Auto: uses CUDA if available, otherwise best available.\n"
+                "CPU: slower but always works.\n"
+                "CUDA: NVIDIA GPU — fastest.\n"
+                "MPS: Apple Silicon — fast for Mask R-CNN."
+            )
+
     def _start_training(self):
         stats = self._coco.get_stats()
         if stats["num_annotations"] == 0:
@@ -2639,10 +3330,21 @@ class SAM2AnnotatorWindow(QMainWindow):
             QMessageBox.warning(self, "No Project", "Save a project first.")
             return
 
-        ann_path = self._coco.auto_save_path
-        if not ann_path or not os.path.exists(ann_path):
-            ann_path = os.path.join(self._project_dir, "annotations", "annotations.json")
-            self._coco.export(ann_path)
+        # Export training annotations, excluding inferred (unapproved) masks
+        ann_path = os.path.join(self._project_dir, "annotations", "annotations_train.json")
+        self._coco.export(ann_path, exclude_inferred=True)
+
+        # Check that we have actual training data after excluding inferred
+        n_approved = sum(
+            1 for a in self._coco.annotations if not a.get("inferred", False)
+        )
+        if n_approved == 0:
+            QMessageBox.warning(
+                self, "No Approved Annotations",
+                "All annotations are inferred (pending review).\n"
+                "Approve some annotations first, then retrain.",
+            )
+            return
 
         images_dir = self._output_dir or os.path.join(self._project_dir, "training_frames")
 
@@ -2689,29 +3391,58 @@ class SAM2AnnotatorWindow(QMainWindow):
             device_choice = "mps"
         else:
             device_choice = "auto"
-        backbone_text = self.combo_backbone.currentText()
-        if "Small" in backbone_text:
-            backbone = "mobilenet_v3_small"
-        elif "Large" in backbone_text:
-            backbone = "mobilenet_v3_large"
+
+        arch_text = self.combo_architecture.currentText()
+        is_yolo = arch_text.startswith("YOLO")
+
+        if is_yolo:
+            if "small" in arch_text.lower():
+                model_variant = "yolo11s-seg"
+            else:
+                model_variant = "yolo11n-seg"
+            optimizer = self.combo_optimizer.currentText()
+
+            config_dict = {
+                "coco_json_path": coco_json,
+                "images_dir": images_dir,
+                "output_dir": os.path.join(self._project_dir, "models"),
+                "num_iterations": self.spin_iterations.value(),
+                "learning_rate": self.spin_lr.value(),
+                "batch_size": self.spin_batch.value(),
+                "val_fraction": self.spin_val_frac.value(),
+                "device": device_choice,
+                "model_variant": model_variant,
+                "imgsz": 640,
+                "early_stop_patience": 200,
+                "freeze_backbone": self.chk_freeze_backbone.isChecked(),
+                "optimizer": optimizer,
+                "_architecture": "yolo",
+            }
         else:
-            backbone = "resnet50"
-        optimizer = "adamw" if self.combo_optimizer.currentText() == "AdamW" else "sgd"
-        config_dict = {
-            "coco_json_path": coco_json,
-            "images_dir": images_dir,
-            "output_dir": os.path.join(self._project_dir, "models"),
-            "num_iterations": self.spin_iterations.value(),
-            "learning_rate": self.spin_lr.value(),
-            "batch_size": self.spin_batch.value(),
-            "val_fraction": self.spin_val_frac.value(),
-            "min_size": self.spin_min_size.value(),
-            "device": device_choice,
-            "backbone": backbone,
-            "freeze_backbone": self.chk_freeze_backbone.isChecked(),
-            "optimizer": optimizer,
-            "early_stop_patience": self.spin_patience.value() if self.chk_early_stop.isChecked() else 0,
-        }
+            backbone_text = self.combo_backbone.currentText()
+            if "Small" in backbone_text:
+                backbone = "mobilenet_v3_small"
+            elif "Large" in backbone_text:
+                backbone = "mobilenet_v3_large"
+            else:
+                backbone = "resnet50"
+            optimizer = "adamw" if self.combo_optimizer.currentText() == "AdamW" else "sgd"
+            config_dict = {
+                "coco_json_path": coco_json,
+                "images_dir": images_dir,
+                "output_dir": os.path.join(self._project_dir, "models"),
+                "num_iterations": self.spin_iterations.value(),
+                "learning_rate": self.spin_lr.value(),
+                "batch_size": self.spin_batch.value(),
+                "val_fraction": self.spin_val_frac.value(),
+                "min_size": self.spin_min_size.value(),
+                "device": device_choice,
+                "backbone": backbone,
+                "freeze_backbone": self.chk_freeze_backbone.isChecked(),
+                "optimizer": optimizer,
+                "early_stop_patience": 50,
+                "_architecture": "maskrcnn",
+            }
 
         self.btn_train.setEnabled(False)
         total = self.spin_iterations.value()
@@ -2723,8 +3454,9 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_stop.setVisible(True)
         self.lbl_train_status.setText("Starting training...")
 
-        self._loss_plot = LiveLossPlot(total_iterations=total, parent=self)
-        self._loss_plot.show()
+        # Reset embedded loss plot for new run
+        self._loss_plot.reset(total)
+        self._training_sample_preview.clear()
 
         self._train_worker = TrainWorker(config_dict)
         self._train_worker.progress.connect(self._on_train_progress)
@@ -2761,17 +3493,18 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.train_progress.setValue(iteration)
         loss = metrics.get("loss", 0.0)
         self.lbl_train_status.setText(f"Iteration {iteration}/{total}  —  loss: {loss:.4f}")
-        if hasattr(self, "_loss_plot") and self._loss_plot is not None:
-            self._loss_plot.add_point(iteration, loss)
+        self._loss_plot.add_point(iteration, loss, metrics)
 
     def _on_train_finished(self, summary: dict):
         self.train_progress.setVisible(False)
         self.btn_train.setEnabled(True)
         self.btn_pause.setVisible(False)
         self.btn_stop.setVisible(False)
-        if hasattr(self, "_loss_plot") and self._loss_plot is not None:
-            self._loss_plot.close()
-            self._loss_plot = None
+
+        # Show sample predictions from the trained model
+        run_dir = summary.get("run_dir", "")
+        if run_dir:
+            self._show_training_samples(run_dir)
 
         model_path = summary.get("model_path", "")
         run_dir = summary.get("run_dir", "")
@@ -2804,16 +3537,219 @@ class SAM2AnnotatorWindow(QMainWindow):
         QMessageBox.information(self, title, detail)
         self.status_bar.showMessage(f"Training complete: {model_path}")
 
+        # Trigger post-training inference if enabled
+        if self.chk_post_infer.isChecked() and run_dir:
+            self._run_post_train_inference(run_dir)
+
+    def _run_post_train_inference(self, model_dir: str):
+        """Run the trained model on unlabeled extracted frames."""
+        if not self._extracted_frames:
+            self.lbl_train_status.setText("No extracted frames for post-training inference.")
+            return
+
+        # Collect frames without manual (non-inferred) annotations
+        unlabeled_paths = []
+        for _, _, fp in self._extracted_frames:
+            filename = os.path.basename(fp)
+            if filename in self._coco._image_id_map:
+                img_id = self._coco._image_id_map[filename]
+                n_manual = self._coco.count_annotations_for_image(
+                    img_id, exclude_inferred=True,
+                )
+                if n_manual > 0:
+                    continue  # has manual annotations — skip
+            unlabeled_paths.append(fp)
+
+        if not unlabeled_paths:
+            self.lbl_train_status.setText(
+                "All frames already have annotations — no inference needed."
+            )
+            return
+
+        # Remove any existing inferred annotations from these frames
+        # (in case of a previous inference run)
+        for fp in unlabeled_paths:
+            filename = os.path.basename(fp)
+            if filename in self._coco._image_id_map:
+                img_id = self._coco._image_id_map[filename]
+                existing = self._coco.get_annotations_for_image(img_id)
+                for ann in existing:
+                    if ann.get("inferred", False):
+                        self._coco.remove_annotation(ann["id"])
+
+        max_det = self.spin_post_infer_max.value()
+
+        self.btn_train.setEnabled(False)
+        self.train_progress.setMaximum(len(unlabeled_paths))
+        self.train_progress.setValue(0)
+        self.train_progress.setVisible(True)
+        self.lbl_train_status.setText(
+            f"Running inference on {len(unlabeled_paths)} unlabeled frames..."
+        )
+
+        self._post_infer_worker = PostTrainInferenceWorker(
+            model_dir=model_dir,
+            frame_paths=unlabeled_paths,
+            max_det=max_det,
+            confidence=0.5,
+        )
+        self._post_infer_worker.progress.connect(self._on_post_infer_progress)
+        self._post_infer_worker.frame_result.connect(self._on_post_infer_frame)
+        self._post_infer_worker.finished.connect(self._on_post_infer_finished)
+        self._post_infer_worker.error.connect(self._on_post_infer_error)
+        self._post_infer_worker.start()
+
+    def _on_post_infer_progress(self, current: int, total: int):
+        self.train_progress.setValue(current)
+        self.lbl_train_status.setText(
+            f"Auto-inferring frame {current}/{total}..."
+        )
+
+    def _on_post_infer_frame(self, filename: str, detections: list):
+        """Add inferred annotations for a single frame."""
+        # Find image dimensions
+        frame_path = None
+        for _, _, fp in self._extracted_frames:
+            if os.path.basename(fp) == filename:
+                frame_path = fp
+                break
+        if frame_path is None:
+            return
+
+        img = cv2.imread(frame_path)
+        if img is None:
+            return
+        h, w = img.shape[:2]
+
+        img_id = self._coco.get_or_add_image(filename, w, h)
+
+        for det in detections:
+            # Map YOLO category_id (1-indexed label) back to COCO category_id
+            label = det["category_id"]
+            # YOLO labels are 1-indexed (cls+1), map back to COCO category
+            cat_id = None
+            coco_cats_by_idx = {}
+            for ci, cat in enumerate(self._coco.categories):
+                coco_cats_by_idx[ci + 1] = cat["id"]
+            cat_id = coco_cats_by_idx.get(label)
+            if cat_id is None and self._coco.categories:
+                cat_id = self._coco.categories[0]["id"]
+            if cat_id is None:
+                continue
+
+            self._coco.add_annotation_from_polygon(
+                image_id=img_id,
+                category_id=cat_id,
+                segmentation=det["segmentation"],
+                bbox=det["bbox"],
+                area=det["area"],
+                inferred=True,
+            )
+
+    def _on_post_infer_finished(self, count: int):
+        self.train_progress.setVisible(False)
+        self.btn_train.setEnabled(True)
+        self.lbl_train_status.setText(
+            f"Post-training inference complete: {count} masks inferred. "
+            f"Switch to Annotator tab to review."
+        )
+        self._refresh_frame_list()
+        # Reload current frame annotations in case it was just inferred
+        if self.current_frame_idx >= 0:
+            _, _, path = self._extracted_frames[self.current_frame_idx]
+            self._load_frame_annotations(path)
+
+    def _on_post_infer_error(self, msg: str):
+        self.train_progress.setVisible(False)
+        self.btn_train.setEnabled(True)
+        self.lbl_train_status.setText(f"Post-inference error: {msg}")
+        QMessageBox.critical(self, "Post-Training Inference Error", msg)
+
     def _on_train_error(self, msg: str):
         self.train_progress.setVisible(False)
         self.btn_train.setEnabled(True)
         self.btn_pause.setVisible(False)
         self.btn_stop.setVisible(False)
-        if hasattr(self, "_loss_plot") and self._loss_plot is not None:
-            self._loss_plot.close()
-            self._loss_plot = None
         self.lbl_train_status.setText(f"Error: {msg}")
         QMessageBox.critical(self, "Training Error", msg)
+
+    def _show_training_samples(self, model_dir: str):
+        """Run the trained model on a few random frames and show predictions."""
+        if not self._extracted_frames:
+            return
+
+        # Pick up to 4 random frames
+        sample_paths = []
+        indices = list(range(len(self._extracted_frames)))
+        random.shuffle(indices)
+        for i in indices[:4]:
+            _, _, fp = self._extracted_frames[i]
+            sample_paths.append(fp)
+
+        if not sample_paths:
+            return
+
+        try:
+            import json as _json
+            config_path = os.path.join(model_dir, "training_config.json")
+            arch = "maskrcnn"
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    cfg = _json.load(f)
+                arch = cfg.get("architecture", "maskrcnn")
+
+            if arch == "yolov11-seg":
+                from .yolo_inference import YOLOInference
+                engine = YOLOInference(model_dir, device="auto", use_masks=True)
+            else:
+                from .mask_tracker_inference import MaskRCNNInference
+                engine = MaskRCNNInference(model_dir, device="auto")
+            engine.load_model()
+
+            annotated_images = []
+            labels = []
+            for fp in sample_paths:
+                img = cv2.imread(fp)
+                if img is None:
+                    continue
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                result = engine.predict(img_rgb, confidence_threshold=0.3)
+
+                # Draw detections on image
+                overlay = img_rgb.copy()
+                n = len(result.get("scores", []))
+                for j in range(n):
+                    score = float(result["scores"][j])
+                    box = result["boxes"][j]
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    color = (41, 121, 255)  # blue
+
+                    # Draw mask contour if available
+                    if result.get("masks") is not None and j < len(result["masks"]):
+                        mask_u8 = result["masks"][j].astype(np.uint8) * 255
+                        contours, _ = cv2.findContours(
+                            mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                        )
+                        cv2.drawContours(overlay, contours, -1, color, 2)
+                    else:
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+
+                    # Score label
+                    cv2.putText(
+                        overlay, f"{score:.2f}", (x1, max(y1 - 5, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                    )
+
+                annotated_images.append(overlay)
+                labels.append(
+                    f"{os.path.basename(fp)} — {n} det"
+                )
+
+            if annotated_images:
+                self._training_sample_preview.set_images(annotated_images, labels)
+
+        except Exception as e:
+            print(f"[MTT] Sample preview error: {e}")
 
     # ==================================================================
     # Tracking
@@ -2849,9 +3785,16 @@ class SAM2AnnotatorWindow(QMainWindow):
                 try:
                     with open(config_path) as f:
                         cfg = json.load(f)
-                    backbone = cfg.get("backbone", "?")
-                    n_cls = cfg.get("num_classes", "?")
-                    label = f"{entry}  [{backbone}, {n_cls} classes]"
+                    arch = cfg.get("architecture", "maskrcnn")
+                    cats = cfg.get("categories", {})
+                    cat_names = list(cats.values()) if isinstance(cats, dict) else cats
+                    cat_str = ", ".join(str(c) for c in cat_names) if cat_names else "?"
+                    if arch == "yolov11-seg":
+                        variant = cfg.get("model_variant", "yolo11n-seg")
+                        label = f"{entry}  [YOLO {variant}: {cat_str}]"
+                    else:
+                        backbone = cfg.get("backbone", "?")
+                        label = f"{entry}  [{backbone}: {cat_str}]"
                 except Exception:
                     pass
 
@@ -2861,7 +3804,9 @@ class SAM2AnnotatorWindow(QMainWindow):
         if not self._track_model_dirs:
             self.lbl_track_model_info.setText("No trained models found — train a model first")
         else:
-            self._on_track_model_changed(0)
+            last_idx = len(self._track_model_dirs) - 1
+            self.combo_track_model.setCurrentIndex(last_idx)
+            self._on_track_model_changed(last_idx)
         self._update_tracking_button_state()
 
     def _on_track_model_changed(self, index: int):
@@ -2876,14 +3821,42 @@ class SAM2AnnotatorWindow(QMainWindow):
                     cfg = json.load(f)
                 cats = cfg.get("categories", {})
                 cat_names = list(cats.values()) if isinstance(cats, dict) else cats
-                max_sz = cfg.get("max_size", 800)
-                self.lbl_track_model_info.setText(
-                    f"Path: {run_dir}\n"
-                    f"Backbone: {cfg.get('backbone', '?')}  |  "
-                    f"Classes: {', '.join(str(c) for c in cat_names) if cat_names else '?'}  |  "
-                    f"Min size: {cfg.get('min_size', '?')}"
-                )
-                self.combo_track_resolution.setItemText(0, f"Trained ({max_sz}px)")
+                arch = cfg.get("architecture", "maskrcnn")
+                if arch == "yolov11-seg":
+                    variant = cfg.get("model_variant", "yolo11n-seg")
+                    imgsz = cfg.get("imgsz", 640)
+                    self.lbl_track_model_info.setText(
+                        f"Path: {run_dir}\n"
+                        f"Architecture: YOLO ({variant})  |  "
+                        f"Classes: {', '.join(str(c) for c in cat_names) if cat_names else '?'}  |  "
+                        f"Image size: {imgsz}px"
+                    )
+                    self.combo_track_resolution.setItemText(0, f"Trained ({imgsz}px)")
+                    # YOLO should default to its trained resolution for best accuracy
+                    self.combo_track_resolution.setCurrentIndex(0)
+                    # YOLO produces masks at negligible cost — always enable
+                    self.chk_track_masks.setChecked(True)
+                    self.chk_track_masks.setEnabled(False)
+                    self.chk_track_masks.setToolTip(
+                        "Masks are always enabled for YOLO models (no speed penalty)."
+                    )
+                else:
+                    max_sz = cfg.get("max_size", 800)
+                    self.lbl_track_model_info.setText(
+                        f"Path: {run_dir}\n"
+                        f"Architecture: Mask R-CNN ({cfg.get('backbone', '?')})  |  "
+                        f"Classes: {', '.join(str(c) for c in cat_names) if cat_names else '?'}  |  "
+                        f"Min size: {cfg.get('min_size', '?')}"
+                    )
+                    self.combo_track_resolution.setItemText(0, f"Trained ({max_sz}px)")
+                    # Mask R-CNN: user can choose (masks add ~48% cost)
+                    self.chk_track_masks.setEnabled(True)
+                    self.chk_track_masks.setToolTip(
+                        "When enabled, the model also predicts pixel-level masks for each\n"
+                        "detection and draws them on the annotated video. ~2x slower.\n"
+                        "When disabled, uses bounding boxes only — faster and sufficient\n"
+                        "for tracking since centroids are computed from box centers."
+                    )
             except Exception:
                 self.lbl_track_model_info.setText(f"Path: {run_dir}")
                 self.combo_track_resolution.setItemText(0, "Trained (default)")
@@ -2893,6 +3866,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._update_tracking_button_state()
 
     def _add_tracking_videos(self):
+        had_none = self.list_track_videos.count() == 0
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select Videos", "",
             "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm);;All Files (*)",
@@ -2903,11 +3877,14 @@ class SAM2AnnotatorWindow(QMainWindow):
                 self.list_track_videos.count() - 1
             ).setData(Qt.UserRole, f)
         self._update_tracking_button_state()
+        if had_none and self.list_track_videos.count() > 0:
+            self.list_track_videos.setCurrentRow(0)
 
     def _add_tracking_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Video Folder")
         if not folder:
             return
+        had_none = self.list_track_videos.count() == 0
         for fname in sorted(os.listdir(folder)):
             if Path(fname).suffix.lower() in VIDEO_EXTENSIONS:
                 full = os.path.join(folder, fname)
@@ -2916,6 +3893,8 @@ class SAM2AnnotatorWindow(QMainWindow):
                     self.list_track_videos.count() - 1
                 ).setData(Qt.UserRole, full)
         self._update_tracking_button_state()
+        if had_none and self.list_track_videos.count() > 0:
+            self.list_track_videos.setCurrentRow(0)
 
     def _clear_tracking_videos(self):
         self.list_track_videos.clear()
@@ -3009,21 +3988,56 @@ class SAM2AnnotatorWindow(QMainWindow):
             f"{os.path.basename(video_paths[0])}"
         )
 
+        self.preview.setEnabled(False)
+
         self._inference_worker = InferenceWorker(video_paths, model_dir, config_dict)
         self._inference_worker.progress.connect(self._on_tracking_progress)
+        self._inference_worker.frame_ready.connect(self._on_tracking_frame)
         self._inference_worker.video_finished.connect(self._on_video_finished)
         self._inference_worker.all_done.connect(self._on_all_tracking_done)
         self._inference_worker.error.connect(self._on_tracking_error)
         self._inference_worker.start()
+
+    def _on_tracking_frame(self, frame_rgb, frame_idx: int):
+        """Display an annotated frame in the preview during live tracking."""
+        if frame_rgb is not None:
+            self.preview.set_frame(frame_rgb)
+
+    def _on_tracking_video_selected(self, current, previous):
+        """Load first frame of selected video into preview."""
+        if current is None:
+            return
+        video_path = current.data(Qt.UserRole)
+        if not video_path or not os.path.exists(video_path):
+            return
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.preview.set_frame(frame_rgb)
+            duration = total / fps if fps > 0 else 0
+            self.lbl_tracking_info.setText(
+                f"{os.path.basename(video_path)}  —  "
+                f"{w}x{h}, {total} frames, {fps:.0f}fps, {duration:.1f}s"
+            )
 
     def _on_tracking_progress(self, frame_idx: int, total_frames: int):
         self.track_progress.setMaximum(total_frames)
         self.track_progress.setValue(frame_idx)
         vid_num = self._track_videos_done + 1
         vid_name = os.path.basename(self._track_video_paths[self._track_videos_done])
-        self.lbl_track_status.setText(
+        status_text = (
             f"Processing video {vid_num} of {self._track_total_videos}: "
             f"{vid_name}  —  frame {frame_idx}/{total_frames}"
+        )
+        self.lbl_track_status.setText(status_text)
+        self.lbl_tracking_info.setText(
+            f"Frame {frame_idx}/{total_frames}  —  {vid_name}"
         )
 
     def _on_video_finished(self, result: dict):
@@ -3033,9 +4047,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         output_dir = result.get("output_dir", "")
         total_frames = result.get("total_frames", 0)
 
-        item = QListWidgetItem(
-            f"{video_name}: {n_tracks} tracks, {total_frames} frames -> {os.path.basename(output_dir)}/"
-        )
+        summary = f"{video_name}: {n_tracks} tracks, {total_frames} frames"
+        if n_tracks == 0:
+            summary += " ⚠ No detections — try lowering confidence threshold"
+        summary += f" → {os.path.basename(output_dir)}/"
+
+        item = QListWidgetItem(summary)
         item.setData(Qt.UserRole, output_dir)
         item.setForeground(QColor("#4fc456"))
         self.list_track_results.addItem(item)
@@ -3055,8 +4072,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_start_tracking.setEnabled(True)
         self.btn_track_pause.setVisible(False)
         self.btn_track_stop.setVisible(False)
+        self.preview.setEnabled(True)
         self.lbl_track_status.setText(
             f"Done — {self._track_videos_done} video(s) processed"
+        )
+        self.lbl_tracking_info.setText(
+            f"Tracking complete — {self._track_videos_done} video(s) processed"
         )
         self.status_bar.showMessage(
             f"Tracking complete: {self._track_videos_done} video(s)"
@@ -3094,6 +4115,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_start_tracking.setEnabled(True)
         self.btn_track_pause.setVisible(False)
         self.btn_track_stop.setVisible(False)
+        self.preview.setEnabled(True)
         self.lbl_track_status.setText(f"Error: {msg}")
         QMessageBox.critical(self, "Tracking Error", msg)
 
@@ -3109,15 +4131,46 @@ class SAM2AnnotatorWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", output_dir])
 
     def _on_tab_changed(self, index: int):
-        tab_name = self.tab_widget.tabText(index)
-        if tab_name == "Training":
+        # Use index (0=Annotation, 1=Training, 2=Tracking) instead of
+        # tab text, since tab text may include animated dots.
+        is_annotation = index == 0
+        is_training = index == 1
+        is_tracking = index == 2
+
+        # Annotation bar: only on Annotation tab
+        for w in self._annotation_bar_widgets:
+            w.setVisible(is_annotation)
+        # Tracking info label: only on Tracking tab
+        self.lbl_tracking_info.setVisible(is_tracking)
+        # Preview + info row: visible on Annotation and Tracking tabs, hidden on Training
+        self.preview.setVisible(not is_training)
+        self._info_row.setVisible(not is_training)
+        # Training visualization panel: only on Training tab
+        self._training_viz_panel.setVisible(is_training)
+
+        if is_training:
             self._refresh_training_summary()
             self._refresh_device_label()
-        elif tab_name == "Tracking":
+        elif is_tracking:
+            if self._project_dir is None:
+                reply = QMessageBox.question(
+                    self, "No Project Loaded",
+                    "No project is loaded. Tracking requires a project with "
+                    "trained models.\n\nWould you like to open an existing project?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply == QMessageBox.Yes:
+                    self._open_project()
             self._refresh_model_list()
-            self.preview.clear()
-            self.preview.update()
-        elif tab_name == "Annotation":
+            # Show first frame of selected video, or clear
+            current = self.list_track_videos.currentItem()
+            if current:
+                self._on_tracking_video_selected(current, None)
+            else:
+                self.preview.clear()
+                self.preview.update()
+                self.lbl_tracking_info.setText("Add videos to begin tracking")
+        elif is_annotation:
             if self.current_frame_idx >= 0 and self.current_frame_idx < len(self._extracted_frames):
                 _, _, path = self._extracted_frames[self.current_frame_idx]
                 self._load_annotation_frame(path)
@@ -3136,9 +4189,18 @@ class SAM2AnnotatorWindow(QMainWindow):
         stats = self._coco.get_stats()
         n_img = stats["images_with_annotations"]
         n_ann = stats["num_annotations"]
+        n_inferred = sum(
+            1 for a in self._coco.annotations if a.get("inferred", False)
+        )
+        n_approved = n_ann - n_inferred
         cats = stats["categories"]
         self.lbl_train_images.setText(f"Annotated images: {n_img}")
-        self.lbl_train_annotations.setText(f"Total annotations: {n_ann}")
+        if n_inferred > 0:
+            self.lbl_train_annotations.setText(
+                f"Total annotations: {n_ann}  ({n_approved} approved, {n_inferred} inferred)"
+            )
+        else:
+            self.lbl_train_annotations.setText(f"Total annotations: {n_ann}")
         if cats:
             self.lbl_train_classes.setText(f"Classes ({len(cats)}): {', '.join(cats)}")
         else:
@@ -3186,14 +4248,24 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _update_ann_stats(self):
         stats = self._coco.get_stats()
         n_this_frame = len(self.preview.annotations)
+        n_inferred_frame = sum(1 for a in self.preview.annotations if a.inferred)
         if stats["num_annotations"] == 0:
             self.lbl_ann_stats.setText("")
         else:
-            self.lbl_ann_stats.setText(
-                f"{n_this_frame} on frame  |  "
-                f"{stats['num_annotations']} total across {stats['images_with_annotations']} images"
+            n_total_inferred = sum(
+                1 for a in self._coco.annotations if a.get("inferred", False)
             )
-            self.lbl_ann_stats.setStyleSheet("color: #4caf50; font-size: 10px;")
+            frame_str = f"{n_this_frame} on frame"
+            if n_inferred_frame > 0:
+                frame_str += f" ({n_inferred_frame} inferred)"
+            total_str = f"{stats['num_annotations']} total across {stats['images_with_annotations']} images"
+            if n_total_inferred > 0:
+                total_str += f" ({n_total_inferred} inferred)"
+            self.lbl_ann_stats.setText(f"{frame_str}  |  {total_str}")
+            if n_inferred_frame > 0:
+                self.lbl_ann_stats.setStyleSheet("color: #e6c830; font-size: 10px;")
+            else:
+                self.lbl_ann_stats.setStyleSheet("color: #4caf50; font-size: 10px;")
         self._update_frame_list_item(self.current_frame_idx)
 
     def _update_frame_list_item(self, row: int):
@@ -3204,9 +4276,16 @@ class SAM2AnnotatorWindow(QMainWindow):
             return
         _, _, fp = self._extracted_frames[row]
         filename = os.path.basename(fp)
-        n_ann = self._count_annotations_for_file(filename)
-        if n_ann > 0:
-            item.setText(f"✔ {filename} ({n_ann})")
+        n_total, n_inferred = self._count_annotations_for_file(filename)
+        n_approved = n_total - n_inferred
+        if n_total > 0 and n_inferred == n_total:
+            item.setText(f"● {filename} ({n_total})")
+            item.setForeground(QColor("#e6c830"))
+        elif n_total > 0 and n_inferred > 0:
+            item.setText(f"◐ {filename} ({n_approved}+{n_inferred})")
+            item.setForeground(QColor("#e6c830"))
+        elif n_total > 0:
+            item.setText(f"✔ {filename} ({n_total})")
             item.setForeground(QColor("#4fc456"))
         else:
             item.setText(f"   {filename}")
@@ -3214,17 +4293,5 @@ class SAM2AnnotatorWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._close_video()
-        stats = self._coco.get_stats()
-        if stats["num_annotations"] > 0:
-            reply = QMessageBox.question(
-                self, "Unsaved Work",
-                f"You have {stats['num_annotations']} annotations.\n"
-                "Save project before closing?",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Yes:
-                self._save_project()
-            elif reply == QMessageBox.Cancel:
-                event.ignore()
-                return
+        # Annotations are auto-saved on every action, so no prompt needed.
         event.accept()

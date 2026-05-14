@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Simple Tracker GUI V3 - Movement-Based Blob Detection with ROI Analysis
+Simple Tracker GUI - Movement-Based Blob Detection
 
 Fast, CPU-only tracking using background subtraction for static camera setups.
-Features blob refinement, ROI analysis, and comprehensive export pipeline.
 
 Key features:
 - Background subtraction (MOG2) with configurable blob refinement
 - Multi-object centroid tracking with Hungarian matching
 - Single-animal mode (largest blob only)
-- ROI drawing (OFT, LDB, Custom) with scale bar calibration
 - Toggle between background subtraction view and standard view
 - Batch processing with per-video configuration
 - Comprehensive exports: CSVs, plots, tracked/data view video
@@ -92,7 +90,7 @@ def detect_opencv_cuda_devices():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VideoTrackingConfig:
-    """Configuration for a single video's tracking and ROI analysis."""
+    """Configuration for a single video's tracking parameters."""
 
     def __init__(self, video_path: str):
         self.video_path = video_path
@@ -139,25 +137,15 @@ class VideoTrackingConfig:
         self.closing_enabled = False
         self.blur_enabled = False
 
-        # ROIs
-        self.rois = []  # List of (roi_name, polygon_points) tuples
-        self.scale_bar_set = False
-        self.scale_bar_pixels = None
-        self.scale_bar_cm = None
-        self.pixels_per_cm = None
-
         # Interpolation
         self.interpolate_tracks = True
 
         # Export options
         self.save_position_coords = True
-        self.save_roi_occupancy = True
-        self.save_roi_summary = True
         self.save_config = True
         self.save_tracking_plots = True
         self.create_tracked_video = True
         self.show_tracking_area = True
-        self.show_rois = True
         self.show_blob_ids = True
         self.show_trail = True
         self.trail_length = 30
@@ -166,37 +154,6 @@ class VideoTrackingConfig:
 
         # State
         self.configured = False
-
-    def add_roi(self, name: str, polygon: List[Tuple[int, int]]):
-        """Add or update an ROI (maintains order if updating)."""
-        for i, (roi_name, _) in enumerate(self.rois):
-            if roi_name == name:
-                self.rois[i] = (name, polygon)
-                return
-        self.rois.append((name, polygon))
-
-    def get_roi_names(self) -> List[str]:
-        """Get list of ROI names in priority order."""
-        return [name for name, _ in self.rois]
-
-    def get_roi_polygon(self, name: str) -> Optional[List[Tuple[int, int]]]:
-        """Get polygon for a specific ROI."""
-        for roi_name, polygon in self.rois:
-            if roi_name == name:
-                return polygon
-        return None
-
-    def rename_roi(self, old_name: str, new_name: str):
-        """Rename an ROI."""
-        for i, (roi_name, polygon) in enumerate(self.rois):
-            if roi_name == old_name:
-                self.rois[i] = (new_name, polygon)
-                return
-
-    def reorder_rois(self, new_order: List[str]):
-        """Reorder ROIs based on list of names."""
-        roi_dict = {name: polygon for name, polygon in self.rois}
-        self.rois = [(name, roi_dict[name]) for name in new_order if name in roi_dict]
 
     def to_config_dict(self) -> dict:
         """Export configuration to dictionary for saving."""
@@ -226,20 +183,12 @@ class VideoTrackingConfig:
             'opening_enabled': self.opening_enabled,
             'closing_enabled': self.closing_enabled,
             'blur_enabled': self.blur_enabled,
-            'rois': [(name, polygon) for name, polygon in self.rois],
-            'scale_bar_set': self.scale_bar_set,
-            'scale_bar_pixels': self.scale_bar_pixels,
-            'scale_bar_cm': self.scale_bar_cm,
-            'pixels_per_cm': self.pixels_per_cm,
             'interpolate_tracks': self.interpolate_tracks,
             'save_position_coords': self.save_position_coords,
-            'save_roi_occupancy': self.save_roi_occupancy,
-            'save_roi_summary': self.save_roi_summary,
             'save_config': self.save_config,
             'save_tracking_plots': self.save_tracking_plots,
             'create_tracked_video': self.create_tracked_video,
             'show_tracking_area': self.show_tracking_area,
-            'show_rois': self.show_rois,
             'show_blob_ids': self.show_blob_ids,
             'show_trail': self.show_trail,
             'trail_length': self.trail_length,
@@ -273,20 +222,12 @@ class VideoTrackingConfig:
         self.opening_enabled = config_dict.get('opening_enabled', False)
         self.closing_enabled = config_dict.get('closing_enabled', False)
         self.blur_enabled = config_dict.get('blur_enabled', False)
-        self.rois = [(name, polygon) for name, polygon in config_dict.get('rois', [])]
-        self.scale_bar_set = config_dict.get('scale_bar_set', False)
-        self.scale_bar_pixels = config_dict.get('scale_bar_pixels', None)
-        self.scale_bar_cm = config_dict.get('scale_bar_cm', None)
-        self.pixels_per_cm = config_dict.get('pixels_per_cm', None)
         self.interpolate_tracks = config_dict.get('interpolate_tracks', True)
         self.save_position_coords = config_dict.get('save_position_coords', True)
-        self.save_roi_occupancy = config_dict.get('save_roi_occupancy', True)
-        self.save_roi_summary = config_dict.get('save_roi_summary', True)
         self.save_config = config_dict.get('save_config', True)
         self.save_tracking_plots = config_dict.get('save_tracking_plots', True)
         self.create_tracked_video = config_dict.get('create_tracked_video', True)
         self.show_tracking_area = config_dict.get('show_tracking_area', True)
-        self.show_rois = config_dict.get('show_rois', True)
         self.show_blob_ids = config_dict.get('show_blob_ids', True)
         self.show_trail = config_dict.get('show_trail', True)
         self.trail_length = config_dict.get('trail_length', 30)
@@ -652,12 +593,8 @@ class BackgroundSubtractionTracker:
         return matched
 
     def get_standard_view_frame(self, frame: np.ndarray, mask: np.ndarray,
-                                objects: Dict, tracking_area=None, rois=None) -> np.ndarray:
-        """Render camera view: raw video + tracking area outline + ROIs + centroids.
-
-        Everything outside the tracking area is blacked out.
-        No green overlay — just the raw frame with annotation overlays.
-        """
+                                objects: Dict, tracking_area=None) -> np.ndarray:
+        """Render camera view: raw video + tracking area outline + centroids."""
         display = frame.copy()
 
         # Black out everything outside tracking area
@@ -667,22 +604,7 @@ class BackgroundSubtractionTracker:
             pts = np.array(tracking_area, dtype=np.int32)
             cv2.fillPoly(ta_mask, [pts], 255)
             display[ta_mask == 0] = [0, 0, 0]
-            # Draw tracking area boundary (green outline)
             cv2.polylines(display, [pts], True, (0, 255, 0), 2)
-
-        # Draw ROIs
-        if rois:
-            for roi_name, roi_polygon in rois:
-                if len(roi_polygon) < 3:
-                    continue
-                pts = np.array(roi_polygon, dtype=np.int32)
-                if 'center' in roi_name.lower():
-                    color = (0, 165, 255)
-                else:
-                    color = (0, 255, 255)  # Cyan for ROIs
-                cv2.polylines(display, [pts], True, color, 2)
-                cv2.putText(display, roi_name, tuple(roi_polygon[0]),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # Draw object center dots + IDs
         colors = [(255, 0, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 0)]
@@ -696,14 +618,13 @@ class BackgroundSubtractionTracker:
         return display
 
     def get_mask_view_frame(self, frame: np.ndarray, mask: np.ndarray,
-                            objects: Dict, tracking_area=None, rois=None) -> np.ndarray:
+                            objects: Dict, tracking_area=None) -> np.ndarray:
         """Render white background with black blobs (inside tracking area only)."""
         h, w = frame.shape[:2]
 
         # White background with black blobs
         display = np.ones((h, w, 3), dtype=np.uint8) * 255
         if mask is not None:
-            # Black where the mask is active (blobs)
             blob_pixels = mask > 127
             display[blob_pixels] = [0, 0, 0]
 
@@ -713,22 +634,8 @@ class BackgroundSubtractionTracker:
             pts = np.array(tracking_area, dtype=np.int32)
             cv2.fillPoly(ta_mask, [pts], 255)
             outside = ta_mask == 0
-            display[outside] = [40, 40, 40]  # Dark grey outside tracking area
+            display[outside] = [40, 40, 40]
             cv2.polylines(display, [pts], True, (0, 180, 0), 2)
-
-        # Draw ROIs
-        if rois:
-            for roi_name, roi_polygon in rois:
-                if len(roi_polygon) < 3:
-                    continue
-                pts = np.array(roi_polygon, dtype=np.int32)
-                if 'center' in roi_name.lower():
-                    color = (0, 130, 200)
-                else:
-                    color = (0, 180, 180)
-                cv2.polylines(display, [pts], True, color, 2)
-                cv2.putText(display, roi_name, tuple(roi_polygon[0]),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # Draw object centers with red dots for visibility on white bg
         for obj_id, (cx, cy, area) in objects.items():
@@ -740,16 +647,10 @@ class BackgroundSubtractionTracker:
         return display
 
     def get_detection_view_frame(self, frame: np.ndarray, mask: np.ndarray,
-                                 objects: Dict, tracking_area=None, rois=None) -> np.ndarray:
-        """Render detection overlay: white blobs on black background.
-
-        Shows exactly what the tracker detects after all refinement.
-        White pixels = detected foreground (blobs).
-        Black pixels = eliminated background.
-        """
+                                 objects: Dict, tracking_area=None) -> np.ndarray:
+        """Render detection overlay: white blobs on black background."""
         h, w = frame.shape[:2]
 
-        # Black background with white blobs
         display = np.zeros((h, w, 3), dtype=np.uint8)
         if mask is not None:
             blob_pixels = mask > 127
@@ -763,20 +664,6 @@ class BackgroundSubtractionTracker:
             outside = ta_mask == 0
             display[outside] = [20, 20, 20]
             cv2.polylines(display, [pts], True, (0, 180, 0), 2)
-
-        # Draw ROIs
-        if rois:
-            for roi_name, roi_polygon in rois:
-                if len(roi_polygon) < 3:
-                    continue
-                pts = np.array(roi_polygon, dtype=np.int32)
-                if 'center' in roi_name.lower():
-                    color = (0, 130, 200)
-                else:
-                    color = (0, 180, 180)
-                cv2.polylines(display, [pts], True, color, 2)
-                cv2.putText(display, roi_name, tuple(roi_polygon[0]),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # Draw object centroids — bright green for visibility on black
         for obj_id, (cx, cy, area) in objects.items():
@@ -870,7 +757,7 @@ class BatchTrackingWorker(QThread):
         """Get/create analysis output folder for a video."""
         video_base = os.path.splitext(os.path.basename(video_path))[0]
         video_dir = os.path.dirname(video_path)
-        folder = os.path.join(video_dir, f"{video_base}_FNT_SimpleTracker_analysis")
+        folder = os.path.join(video_dir, f"{video_base}_SimpleTracker")
         os.makedirs(folder, exist_ok=True)
         return folder
 
@@ -1040,107 +927,12 @@ class BatchTrackingWorker(QThread):
 
                 pos_df = pd.DataFrame(pos_data)
 
-                # ── Phase 3: ROI Analysis ─────────────────────────
-                occupancy_dfs = {}
-                if config.rois:
-                    self.status.emit("Calculating ROI occupancy...")
-                    for oid in object_ids:
-                        occ_data = []
-                        x_col = f'object_{oid}_x'
-                        y_col = f'object_{oid}_y'
-                        for _, row in pos_df.iterrows():
-                            x, y = row[x_col], row[y_col]
-                            if pd.isna(x) or pd.isna(y):
-                                occ_data.append({'frame': int(row['frame']), 'region': 'none'})
-                                continue
-                            found = False
-                            for roi_name, roi_poly in config.rois:
-                                if self.point_in_polygon((float(x), float(y)), roi_poly):
-                                    occ_data.append({'frame': int(row['frame']), 'region': roi_name})
-                                    found = True
-                                    break
-                            if not found:
-                                occ_data.append({'frame': int(row['frame']), 'region': 'none'})
-                        occupancy_dfs[oid] = pd.DataFrame(occ_data)
-
-                # ── Phase 4: Exports ──────────────────────────────
-                # 4a: Position Coordinates CSV
+                # ── Phase 3: Exports ─────────────────────────────
+                # Position Coordinates CSV
                 if config.save_position_coords:
                     path = self.get_output_path(config.video_path, '_positionCoordinates.csv')
                     pos_df.to_csv(path, index=False)
                     self.status.emit(f"\u2713 Saved position coordinates")
-
-                # 4b: ROI Occupancy CSV (per object)
-                if config.save_roi_occupancy and config.rois:
-                    for oid in object_ids:
-                        path = self.get_output_path(
-                            config.video_path, f'_roiOccupancy_object{oid}.csv'
-                        )
-                        occupancy_dfs[oid].to_csv(path, index=False)
-                    self.status.emit(f"\u2713 Saved ROI occupancy for {len(object_ids)} object(s)")
-
-                # 4c: ROI Summary CSV
-                if config.save_roi_summary and config.rois:
-                    summary_rows = []
-                    for oid in object_ids:
-                        row_data = {
-                            'video': os.path.basename(config.video_path),
-                            'object_id': oid,
-                            'video_duration_s': total_frames / fps,
-                        }
-
-                        # Total distance
-                        obj_traj = traj_df[traj_df['object_id'] == oid].sort_values('frame')
-                        if len(obj_traj) > 1:
-                            dists = np.sqrt(
-                                np.diff(obj_traj['x'].values)**2 +
-                                np.diff(obj_traj['y'].values)**2
-                            )
-                            total_dist_pix = float(np.nansum(dists))
-                        else:
-                            total_dist_pix = 0.0
-
-                        if config.scale_bar_set and config.pixels_per_cm:
-                            row_data['total_distance_cm'] = total_dist_pix / config.pixels_per_cm
-                        else:
-                            row_data['total_distance_pix'] = total_dist_pix
-
-                        # Per-ROI metrics
-                        occ = occupancy_dfs[oid]
-                        for roi_name, _ in config.rois:
-                            safe = roi_name.replace(' ', '_').replace('-', '_')
-                            in_roi = occ['region'] == roi_name
-                            frames_in = int(in_roi.sum())
-                            time_in = frames_in / fps
-
-                            row_data[f'time_s_{safe}'] = time_in
-
-                            # Latency
-                            first_entry = None
-                            for idx_r, r in occ.iterrows():
-                                if r['region'] == roi_name:
-                                    first_entry = idx_r
-                                    break
-                            row_data[f'latency_enter_s_{safe}'] = (
-                                first_entry / fps if first_entry is not None else np.nan
-                            )
-
-                            # Entry count
-                            entries = 0
-                            if len(in_roi) > 0:
-                                if in_roi.iloc[0]:
-                                    entries = 1
-                                entries += int(np.sum(np.diff(in_roi.astype(int)) > 0))
-                            row_data[f'roi_entry_count_{safe}'] = entries
-                            row_data[f'frames_{safe}'] = frames_in
-
-                        summary_rows.append(row_data)
-
-                    summary_df = pd.DataFrame(summary_rows)
-                    path = self.get_output_path(config.video_path, '_roiSummary.csv')
-                    summary_df.to_csv(path, index=False)
-                    self.status.emit(f"\u2713 Saved ROI summary")
-
                 # 4d: Config JSON
                 if config.save_config:
                     path = self.get_output_path(config.video_path, '_trackerConfig.json')
@@ -1156,12 +948,12 @@ class BatchTrackingWorker(QThread):
                 if config.create_tracked_video:
                     if config.save_data_view:
                         self._create_data_view_video(
-                            config, traj_df, pos_df, occupancy_dfs,
+                            config, traj_df, pos_df,
                             object_ids, fps, total_frames, video_idx
                         )
                     else:
                         self._create_tracked_video(
-                            config, traj_df, pos_df, occupancy_dfs,
+                            config, traj_df, pos_df,
                             object_ids, fps, total_frames, video_idx
                         )
 
@@ -1204,13 +996,6 @@ class BatchTrackingWorker(QThread):
                        'ko', markersize=10, label='Start', zorder=5)
                 ax.plot(obj_data['x'].iloc[-1], obj_data['y'].iloc[-1],
                        'ks', markersize=10, label='End', zorder=5)
-
-                # Draw ROIs
-                for roi_name, roi_poly in config.rois:
-                    if len(roi_poly) < 3:
-                        continue
-                    rp = np.array(roi_poly + [roi_poly[0]], dtype=np.int32)
-                    ax.plot(rp[:, 0], rp[:, 1], color='black', linewidth=2)
 
                 ax.set_xlabel('X (pixels)', fontsize=12)
                 ax.set_ylabel('Y (pixels)', fontsize=12)
@@ -1277,7 +1062,7 @@ class BatchTrackingWorker(QThread):
         except Exception as e:
             self.status.emit(f"Warning: Heatmap error: {e}")
 
-    def _create_tracked_video(self, config, traj_df, pos_df, occupancy_dfs,
+    def _create_tracked_video(self, config, traj_df, pos_df,
                               object_ids, fps, total_frames, video_idx):
         """Create tracked video with overlays."""
         self.status.emit("Rendering tracked video...")
@@ -1319,20 +1104,6 @@ class BatchTrackingWorker(QThread):
                 pts = np.array(config.tracking_area, dtype=np.int32)
                 cv2.polylines(frame, [pts], True, (255, 0, 255), 2)
 
-            # Draw ROIs
-            if config.show_rois and config.rois:
-                for roi_name, roi_poly in config.rois:
-                    if len(roi_poly) < 3:
-                        continue
-                    pts = np.array(roi_poly, dtype=np.int32)
-                    if 'center' in roi_name.lower():
-                        color = (0, 165, 255)
-                    else:
-                        color = (0, 255, 0)
-                    cv2.polylines(frame, [pts], True, color, 2)
-                    cv2.putText(frame, roi_name, tuple(roi_poly[0]),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
             # Draw trails first (behind objects)
             if config.show_trail:
                 for oid in object_ids:
@@ -1371,7 +1142,7 @@ class BatchTrackingWorker(QThread):
         out.release()
         self.status.emit(f"\u2713 Saved tracked video: {os.path.basename(output_path)}")
 
-    def _create_data_view_video(self, config, traj_df, pos_df, occupancy_dfs,
+    def _create_data_view_video(self, config, traj_df, pos_df,
                                 object_ids, fps, total_frames, video_idx):
         """Create data view video: tracked video on left, live stats on right."""
         self.status.emit("Rendering data view video...")
@@ -1417,11 +1188,6 @@ class BatchTrackingWorker(QThread):
         trail_history = {oid: [] for oid in object_ids}
         colors_bgr = [(255, 0, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 0)]
 
-        # ROI time accumulators
-        roi_time = {oid: {rn: 0 for rn, _ in config.rois} for oid in object_ids}
-        roi_entries = {oid: {rn: 0 for rn, _ in config.rois} for oid in object_ids}
-        prev_region = {oid: 'none' for oid in object_ids}
-
         frame_num = 0
         while True:
             ret, frame = cap.read()
@@ -1432,21 +1198,9 @@ class BatchTrackingWorker(QThread):
                 self.progress.emit(video_idx, frame_num, total_frames)
 
             # ── Left side: tracked video ──
-            # Draw tracking area
             if config.show_tracking_area and config.tracking_area:
                 pts = np.array(config.tracking_area, dtype=np.int32)
                 cv2.polylines(frame, [pts], True, (255, 0, 255), 2)
-
-            # Draw ROIs
-            if config.show_rois and config.rois:
-                for rn, rp in config.rois:
-                    if len(rp) < 3:
-                        continue
-                    pts = np.array(rp, dtype=np.int32)
-                    c = (0, 165, 255) if 'center' in rn.lower() else (0, 255, 0)
-                    cv2.polylines(frame, [pts], True, c, 2)
-                    cv2.putText(frame, rn, tuple(rp[0]),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
 
             # Draw trails
             if config.show_trail:
@@ -1457,7 +1211,7 @@ class BatchTrackingWorker(QThread):
                         alpha = (i + 1) / len(trail)
                         cv2.line(frame, trail[i], trail[i + 1], c, max(1, int(3 * alpha)))
 
-            # Draw objects and update ROI accumulators
+            # Draw objects
             for oid in object_ids:
                 if frame_num in obj_positions[oid]:
                     x, y = obj_positions[oid][frame_num]
@@ -1472,18 +1226,6 @@ class BatchTrackingWorker(QThread):
                         trail_history[oid].append((ix, iy))
                         if len(trail_history[oid]) > config.trail_length:
                             trail_history[oid].pop(0)
-
-                    # Update ROI time
-                    if config.rois and oid in occupancy_dfs:
-                        occ_df = occupancy_dfs[oid]
-                        if frame_num < len(occ_df):
-                            region = occ_df.iloc[frame_num]['region']
-                            for rn, _ in config.rois:
-                                if region == rn:
-                                    roi_time[oid][rn] += 1.0 / fps
-                            if region != prev_region[oid] and region != 'none':
-                                roi_entries[oid][region] = roi_entries[oid].get(region, 0) + 1
-                            prev_region[oid] = region
 
             # ── Right side: stats panel ──
             stats_panel = np.zeros((output_h, stats_w, 3), dtype=np.uint8)
@@ -1512,25 +1254,10 @@ class BatchTrackingWorker(QThread):
                            font, 0.6, c, 2)
                 y_pos += 22
 
-                # Distance
                 dist = cum_distances[oid].get(frame_num, 0.0)
-                if config.scale_bar_set and config.pixels_per_cm:
-                    cv2.putText(stats_panel, f"  Distance: {dist / config.pixels_per_cm:.1f} cm",
-                               (10, y_pos), font, 0.45, (180, 180, 180), 1)
-                else:
-                    cv2.putText(stats_panel, f"  Distance: {dist:.0f} px",
-                               (10, y_pos), font, 0.45, (180, 180, 180), 1)
+                cv2.putText(stats_panel, f"  Distance: {dist:.0f} px",
+                           (10, y_pos), font, 0.45, (180, 180, 180), 1)
                 y_pos += 18
-
-                # ROI info
-                if config.rois:
-                    for rn, _ in config.rois:
-                        t = roi_time[oid].get(rn, 0)
-                        e = roi_entries[oid].get(rn, 0)
-                        cv2.putText(stats_panel,
-                                   f"  {rn}: {t:.1f}s, {e} entries",
-                                   (10, y_pos), font, 0.4, (150, 150, 150), 1)
-                        y_pos += 16
 
                 y_pos += 10
 
@@ -1783,10 +1510,7 @@ class BgModelBuilderWorker(QThread):
 
 
 class SimpleTrackerGUI(QMainWindow):
-    """
-    Simple Tracker V3 - Movement-based blob detection with ROI analysis.
-    Complete rewrite with blob refinement, ROI drawing, and export pipeline.
-    """
+    """Simple Tracker - Movement-based blob detection with batch export pipeline."""
 
     # Dark theme + blue scrollbar stylesheet
     DARK_THEME = """
@@ -1936,10 +1660,8 @@ class SimpleTrackerGUI(QMainWindow):
         self.auto_preview_enabled = False
 
         # Drawing state
-        self.drawing_mode = None  # None, 'tracking_area', 'oft', 'ldb_light', 'custom', 'scale_bar'
+        self.drawing_mode = None  # None or 'tracking_area'
         self.polygon_points = []
-        self.scale_bar_points = []
-        self.oft_corners = []
 
         # Detection overlay (replaces old view_mode)
         self.detection_overlay_active = False
@@ -2224,10 +1946,7 @@ class SimpleTrackerGUI(QMainWindow):
         # Section 3: Object Detection Settings
         self._create_section_detection_settings()
 
-        # Section 4: Draw ROIs
-        self._create_section_draw_rois()
-
-        # Section 6: Export Options
+        # Section 4: Export Options
         self._create_section_export_options()
 
         # Section 7: Batch Processing
@@ -3021,284 +2740,19 @@ class SimpleTrackerGUI(QMainWindow):
         self.close_kernel_slider.setEnabled(False)
         self.blur_slider.setEnabled(False)
 
-    # ── Section 5: Draw ROIs ─────────────────────────────────────────────
-
-    def _create_section_draw_rois(self):
-        group = QGroupBox("4. Draw ROIs")
-        layout = QVBoxLayout()
-
-        self.btn_oft = QPushButton("Open Field Test Layout")
-        self.btn_oft.clicked.connect(self._start_oft_drawing)
-        layout.addWidget(self.btn_oft)
-
-        self.btn_ldb = QPushButton("Light-Dark Box Layout")
-        self.btn_ldb.clicked.connect(self._start_ldb_drawing)
-        layout.addWidget(self.btn_ldb)
-
-        self.btn_custom_roi = QPushButton("Custom ROI")
-        self.btn_custom_roi.clicked.connect(self._start_custom_roi)
-        layout.addWidget(self.btn_custom_roi)
-
-        self.btn_scale_bar = QPushButton("Set Scale Bar (optional)")
-        self.btn_scale_bar.clicked.connect(self._start_scale_bar)
-        self.btn_scale_bar.setStyleSheet(
-            "QPushButton { background-color: #666666; }"
-            "QPushButton:hover { background-color: #777777; }"
-        )
-        layout.addWidget(self.btn_scale_bar)
-
-        self.scale_status_label = QLabel("")
-        self.scale_status_label.setStyleSheet("color: #aaaaaa; font-size: 10px;")
-        layout.addWidget(self.scale_status_label)
-
-        # ROI priority table
-        self.roi_table = QTableWidget()
-        self.roi_table.setColumnCount(1)
-        self.roi_table.setHorizontalHeaderLabels(["ROI Name (priority order)"])
-        self.roi_table.horizontalHeader().setStretchLastSection(True)
-        self.roi_table.setMaximumHeight(150)
-        self.roi_table.itemChanged.connect(self._on_roi_renamed)
-        layout.addWidget(self.roi_table)
-
-        roi_ctrl = QHBoxLayout()
-        self.roi_up_btn = QPushButton("\u25B2")
-        self.roi_up_btn.setMaximumWidth(40)
-        self.roi_up_btn.clicked.connect(self._roi_move_up)
-        roi_ctrl.addWidget(self.roi_up_btn)
-        self.roi_down_btn = QPushButton("\u25BC")
-        self.roi_down_btn.setMaximumWidth(40)
-        self.roi_down_btn.clicked.connect(self._roi_move_down)
-        roi_ctrl.addWidget(self.roi_down_btn)
-        roi_ctrl.addStretch()
-        self.roi_clear_btn = QPushButton("Clear ROIs")
-        self.roi_clear_btn.clicked.connect(self._clear_all_rois)
-        self.roi_clear_btn.setStyleSheet(
-            "QPushButton { background-color: #d47800; }"
-            "QPushButton:hover { background-color: #e68a00; }"
-        )
-        roi_ctrl.addWidget(self.roi_clear_btn)
-        layout.addLayout(roi_ctrl)
-
-        group.setLayout(layout)
-        self.left_layout.addWidget(group)
-
-    # ── ROI Drawing Methods ───────────────────────────────────────────────
-
-    def _show_drawing_instructions(self, text):
-        """Show drawing instructions above the preview pane."""
-        self.drawing_instruction_label.setText(text)
-        self.drawing_instruction_label.show()
-
-    def _hide_drawing_instructions(self):
-        """Hide drawing instructions."""
-        self.drawing_instruction_label.hide()
-
-    def _start_oft_drawing(self):
-        """Start OFT layout: 4 corner clicks."""
-        if not self.video_configs:
-            return
-        self.drawing_mode = 'oft'
-        self.oft_corners = []
-        self._show_drawing_instructions("OFT: Click 4 corners of the outer boundary")
-        self.status_bar.showMessage("OFT: Click 4 corners of the outer boundary")
-
-    def _start_ldb_drawing(self):
-        """Start LDB layout: draw light box polygon."""
-        if not self.video_configs:
-            return
-        self.drawing_mode = 'ldb_light'
-        self.polygon_points = []
-        self._show_drawing_instructions(
-            "LDB: Click to draw the LIGHT box boundary  •  Enter = finish  •  Esc = cancel"
-        )
-        self.status_bar.showMessage(
-            "LDB: Click to draw the LIGHT box boundary. Enter to finish."
-        )
-
-    def _start_custom_roi(self):
-        """Start custom ROI polygon drawing."""
-        if not self.video_configs:
-            return
-        self.drawing_mode = 'custom'
-        self.polygon_points = []
-        self._show_drawing_instructions(
-            "Custom ROI: Click to draw polygon  •  Enter = finish  •  Esc = cancel"
-        )
-        self.status_bar.showMessage(
-            "Custom ROI: Click to draw polygon. Enter to finish."
-        )
-
-    def _start_scale_bar(self):
-        """Start scale bar: 2-point click."""
-        if not self.video_configs:
-            return
-        self.drawing_mode = 'scale_bar'
-        self.scale_bar_points = []
-        self._show_drawing_instructions(
-            "Scale bar: Click two endpoints of a known distance  •  Esc = cancel"
-        )
-        self.status_bar.showMessage(
-            "Scale bar: Click two endpoints of a known distance"
-        )
-
-    def _finish_oft(self):
-        """Finish OFT drawing from 4 corners: create outer + center ROIs."""
-        if len(self.oft_corners) != 4:
-            return
-        config = self.video_configs[self.current_config_idx]
-        self._hide_drawing_instructions()
-
-        # Outer boundary = the 4 corners
-        outer_polygon = self.oft_corners.copy()
-        config.add_roi('oft_outer', outer_polygon)
-
-        # Calculate center zone (50% area scaled from centroid)
-        center = self._calculate_oft_center(outer_polygon)
-        config.add_roi('oft_center', center)
-
-        self.drawing_mode = None
-        self.oft_corners = []
-        self._update_roi_table()
-        self._redraw_preview()
-        self.status_bar.showMessage("OFT layout created (outer + center)")
-
-        # Auto-transition to scale bar
-        self._prompt_scale_bar()
-
-    def _calculate_oft_center(self, outer_polygon):
-        """Calculate OFT center zone as 50% area scaled polygon from centroid."""
-        pts = np.array(outer_polygon, dtype=np.float64)
-        cx = np.mean(pts[:, 0])
-        cy = np.mean(pts[:, 1])
-        scale = np.sqrt(0.5)  # 50% area = sqrt(0.5) linear scale
-        center_pts = []
-        for x, y in outer_polygon:
-            nx = cx + (x - cx) * scale
-            ny = cy + (y - cy) * scale
-            center_pts.append((int(nx), int(ny)))
-        return center_pts
-
-    def _finish_scale_bar(self):
-        """Finish scale bar measurement."""
-        if len(self.scale_bar_points) != 2:
-            return
-        config = self.video_configs[self.current_config_idx]
-        self._hide_drawing_instructions()
-
-        p1, p2 = self.scale_bar_points
-        pixel_dist = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-
-        cm_val, ok = QInputDialog.getDouble(
-            self, "Scale Bar", "Enter the real-world distance (cm):",
-            value=10.0, min=0.01, max=10000.0, decimals=2
-        )
-        if ok:
-            config.scale_bar_set = True
-            config.scale_bar_pixels = pixel_dist
-            config.scale_bar_cm = cm_val
-            config.pixels_per_cm = pixel_dist / cm_val
-            self.scale_status_label.setText(
-                f"Scale: {config.pixels_per_cm:.1f} px/cm "
-                f"({pixel_dist:.0f} px = {cm_val} cm)"
-            )
-            self.scale_status_label.setStyleSheet("color: #90EE90; font-size: 10px;")
-
-        self.drawing_mode = None
-        self.scale_bar_points = []
-        self._redraw_preview()
-
-    def _prompt_scale_bar(self):
-        """Ask user if they want to set a scale bar after ROI drawing."""
-        reply = QMessageBox.question(
-            self, "Scale Bar",
-            "Would you like to set a scale bar for distance measurements?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            self._start_scale_bar()
-
-    # ── ROI Table Methods ─────────────────────────────────────────────────
-
-    def _update_roi_table(self):
-        """Sync ROI table with current config."""
-        if not self.video_configs:
-            return
-        config = self.video_configs[self.current_config_idx]
-
-        self.roi_table.blockSignals(True)
-        self.roi_table.setRowCount(len(config.rois))
-        for i, (name, _) in enumerate(config.rois):
-            item = QTableWidgetItem(name)
-            self.roi_table.setItem(i, 0, item)
-        self.roi_table.blockSignals(False)
-
-    def _on_roi_renamed(self, item):
-        """Handle ROI rename in table."""
-        if not self.video_configs:
-            return
-        config = self.video_configs[self.current_config_idx]
-        row = item.row()
-        if 0 <= row < len(config.rois):
-            old_name = config.rois[row][0]
-            new_name = item.text().strip()
-            if new_name and new_name != old_name:
-                config.rename_roi(old_name, new_name)
-                self._redraw_preview()
-
-    def _roi_move_up(self):
-        """Move selected ROI up in priority."""
-        row = self.roi_table.currentRow()
-        if row <= 0 or not self.video_configs:
-            return
-        config = self.video_configs[self.current_config_idx]
-        config.rois[row], config.rois[row - 1] = config.rois[row - 1], config.rois[row]
-        self._update_roi_table()
-        self.roi_table.setCurrentCell(row - 1, 0)
-
-    def _roi_move_down(self):
-        """Move selected ROI down in priority."""
-        if not self.video_configs:
-            return
-        config = self.video_configs[self.current_config_idx]
-        row = self.roi_table.currentRow()
-        if row < 0 or row >= len(config.rois) - 1:
-            return
-        config.rois[row], config.rois[row + 1] = config.rois[row + 1], config.rois[row]
-        self._update_roi_table()
-        self.roi_table.setCurrentCell(row + 1, 0)
-
-    def _clear_all_rois(self):
-        """Clear all ROIs and scale bar."""
-        if not self.video_configs:
-            return
-        config = self.video_configs[self.current_config_idx]
-        config.rois = []
-        config.scale_bar_set = False
-        config.scale_bar_pixels = None
-        config.scale_bar_cm = None
-        config.pixels_per_cm = None
-        self.scale_status_label.setText("")
-        self._update_roi_table()
-        self._redraw_preview()
-        self.status_bar.showMessage("ROIs and scale bar cleared")
-
-    # ── Section 6: Export Options ─────────────────────────────────────────
-
     def _create_section_export_options(self):
-        group = QGroupBox("5. Export Options")
+        group = QGroupBox("4. Export Options")
         layout = QVBoxLayout()
         layout.setSpacing(6)
 
-        # All standard outputs (coords, ROI CSVs, config JSON, plots) are always
-        # exported — no checkbox needed.
         always_label = QLabel(
-            "Position CSV, ROI CSVs, tracking plots, and config JSON are\n"
-            "always saved automatically."
+            "Position CSV, tracking plots, and config JSON are\n"
+            "always saved automatically. Use the ROI Tool for\n"
+            "ROI analysis after tracking."
         )
         always_label.setStyleSheet("color: #666666; font-size: 9px; background: transparent;")
         layout.addWidget(always_label)
 
-        # Interpolate tracks — above video options
         self.chk_interpolate = DarkCheckBox("Interpolate tracks (fill gaps)")
         self.chk_interpolate.setChecked(True)
         self.chk_interpolate.setToolTip(
@@ -3307,13 +2761,11 @@ class SimpleTrackerGUI(QMainWindow):
         )
         layout.addWidget(self.chk_interpolate)
 
-        # Tracked video toggle
         self.chk_tracked_video = DarkCheckBox("Create tracked video")
         self.chk_tracked_video.setChecked(True)
         self.chk_tracked_video.stateChanged.connect(self._on_tracked_video_toggled)
         layout.addWidget(self.chk_tracked_video)
 
-        # Indented video sub-options
         self.video_opts_widget = QWidget()
         vopts = QVBoxLayout(self.video_opts_widget)
         vopts.setContentsMargins(20, 0, 0, 0)
@@ -3322,10 +2774,6 @@ class SimpleTrackerGUI(QMainWindow):
         self.chk_show_area = DarkCheckBox("Show tracking area boundary")
         self.chk_show_area.setChecked(True)
         vopts.addWidget(self.chk_show_area)
-
-        self.chk_show_rois = DarkCheckBox("Show ROI boundaries")
-        self.chk_show_rois.setChecked(True)
-        vopts.addWidget(self.chk_show_rois)
 
         self.chk_show_ids = DarkCheckBox("Show blob ID labels")
         self.chk_show_ids.setChecked(True)
@@ -3351,10 +2799,10 @@ class SimpleTrackerGUI(QMainWindow):
     def _on_tracked_video_toggled(self, state):
         self.video_opts_widget.setEnabled(state == Qt.Checked)
 
-    # ── Section 7: Batch Processing ───────────────────────────────────────
+    # ── Section 5: Batch Processing ───────────────────────────────────────
 
     def _create_section_batch_processing(self):
-        group = QGroupBox("6. Batch Processing")
+        group = QGroupBox("5. Batch Processing")
         batch_layout = QVBoxLayout()
         batch_layout.setSpacing(6)
 
@@ -3463,14 +2911,11 @@ class SimpleTrackerGUI(QMainWindow):
     def _sync_export_options(self, config):
         """Sync export options to config. Standard outputs are always enabled."""
         config.save_position_coords = True
-        config.save_roi_occupancy = True
-        config.save_roi_summary = True
         config.save_config = True
         config.save_tracking_plots = True
         config.save_data_view = False
         config.create_tracked_video = self.chk_tracked_video.isChecked()
         config.show_tracking_area = self.chk_show_area.isChecked()
-        config.show_rois = self.chk_show_rois.isChecked()
         config.show_blob_ids = self.chk_show_ids.isChecked()
         config.show_trail = self.chk_show_trail.isChecked()
         config.trail_length = self.trail_length_spin.value()
@@ -3493,7 +2938,7 @@ class SimpleTrackerGUI(QMainWindow):
         for config in queued_configs:
             video_base = os.path.splitext(os.path.basename(config.video_path))[0]
             video_dir = os.path.dirname(config.video_path)
-            folder = os.path.join(video_dir, f"{video_base}_FNT_SimpleTracker_analysis")
+            folder = os.path.join(video_dir, f"{video_base}_SimpleTracker")
             if os.path.exists(folder) and os.listdir(folder):
                 existing.append(video_base)
 
@@ -3791,6 +3236,13 @@ class SimpleTrackerGUI(QMainWindow):
             self.status_bar.showMessage(f"Error loading video: {str(e)}")
             QMessageBox.warning(self, "Load Error", f"Could not load video:\n{str(e)}")
 
+    def _show_drawing_instructions(self, text):
+        self.drawing_instruction_label.setText(text)
+        self.drawing_instruction_label.show()
+
+    def _hide_drawing_instructions(self):
+        self.drawing_instruction_label.hide()
+
     def _update_tracking_area_ui(self):
         """Update tracking area UI based on current config state."""
         if not self.video_configs:
@@ -3907,25 +3359,6 @@ class SimpleTrackerGUI(QMainWindow):
 
         frame_x, frame_y = self._label_to_frame_coords(event.pos().x(), event.pos().y())
 
-        if self.drawing_mode == 'scale_bar':
-            self.scale_bar_points.append((frame_x, frame_y))
-            self._redraw_preview()
-            if len(self.scale_bar_points) == 2:
-                self._finish_scale_bar()
-            return
-
-        if self.drawing_mode == 'oft':
-            self.oft_corners.append((frame_x, frame_y))
-            self._redraw_preview()
-            if len(self.oft_corners) == 4:
-                self._finish_oft()
-            else:
-                msg = f"OFT corner {len(self.oft_corners)}/4 placed. Click next corner.  •  Esc = cancel"
-                self._show_drawing_instructions(msg)
-                self.status_bar.showMessage(msg)
-            return
-
-        # General polygon drawing (tracking_area, ldb_light, custom)
         self.polygon_points.append((frame_x, frame_y))
         self._redraw_preview()
         self.status_bar.showMessage(
@@ -3952,38 +3385,17 @@ class SimpleTrackerGUI(QMainWindow):
             self._redraw_preview()
             self.status_bar.showMessage("Tracking area defined")
 
-        elif self.drawing_mode == 'ldb_light':
-            config.add_roi('ldb_light', self.polygon_points.copy())
-            self.drawing_mode = None
-            self.polygon_points = []
-            self._update_roi_table()
-            self._redraw_preview()
-            # Auto-transition to scale bar
-            self._prompt_scale_bar()
-
-        elif self.drawing_mode == 'custom':
-            # Ask for name
-            name, ok = QInputDialog.getText(self, "ROI Name", "Enter ROI name:")
-            if ok and name.strip():
-                config.add_roi(name.strip(), self.polygon_points.copy())
-            self.drawing_mode = None
-            self.polygon_points = []
-            self._update_roi_table()
-            self._redraw_preview()
-
     def cancel_drawing(self):
         """Cancel current drawing mode."""
         self.drawing_mode = None
         self.polygon_points = []
-        self.scale_bar_points = []
-        self.oft_corners = []
         self._hide_drawing_instructions()
         self._update_tracking_area_ui()
         self._redraw_preview()
         self.status_bar.showMessage("Drawing cancelled")
 
     def _redraw_preview(self):
-        """Redraw preview with all overlays (tracking area, ROIs, in-progress drawing)."""
+        """Redraw preview with tracking area and in-progress drawing overlays."""
         if not self.video_configs:
             return
         config = self.video_configs[self.current_config_idx]
@@ -4002,51 +3414,14 @@ class SimpleTrackerGUI(QMainWindow):
             # Draw tracking area boundary (green outline)
             cv2.polylines(display, [pts.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
 
-        # Draw ROIs
-        for roi_name, roi_polygon in config.rois:
-            if len(roi_polygon) < 3:
-                continue
-            pts = np.array(roi_polygon, np.int32)
-            if 'center' in roi_name.lower():
-                color = (0, 165, 255)
-            else:
-                color = (0, 255, 255)  # Cyan for ROIs
-            cv2.polylines(display, [pts.reshape((-1, 1, 2))], True, color, 2)
-            cv2.putText(display, roi_name, tuple(roi_polygon[0]),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-        # Draw scale bar
-        if config.scale_bar_set and config.scale_bar_pixels:
-            # Just a visual indicator - no persistent overlay needed
-            pass
-
         # Draw in-progress polygon
-        if self.drawing_mode in ('tracking_area', 'ldb_light', 'custom'):
+        if self.drawing_mode == 'tracking_area' and self.polygon_points:
             if len(self.polygon_points) > 1:
                 pts = np.array(self.polygon_points, np.int32)
                 cv2.polylines(display, [pts.reshape((-1, 1, 2))], False, (0, 255, 0), 2)
             for pt in self.polygon_points:
                 cv2.circle(display, pt, 8, (0, 255, 0), -1)
                 cv2.circle(display, pt, 10, (255, 255, 255), 2)
-
-        # Draw in-progress OFT corners
-        if self.drawing_mode == 'oft':
-            for i, pt in enumerate(self.oft_corners):
-                cv2.circle(display, pt, 8, (0, 165, 255), -1)
-                cv2.circle(display, pt, 10, (255, 255, 255), 2)
-                cv2.putText(display, str(i + 1), (pt[0] + 12, pt[1]),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-            if len(self.oft_corners) > 1:
-                pts = np.array(self.oft_corners, np.int32)
-                cv2.polylines(display, [pts.reshape((-1, 1, 2))], False, (0, 165, 255), 2)
-
-        # Draw in-progress scale bar
-        if self.drawing_mode == 'scale_bar' and self.scale_bar_points:
-            for pt in self.scale_bar_points:
-                cv2.circle(display, pt, 6, (255, 255, 0), -1)
-            if len(self.scale_bar_points) == 2:
-                cv2.line(display, self.scale_bar_points[0],
-                        self.scale_bar_points[1], (255, 255, 0), 2)
 
         self.display_frame(display)
 
@@ -4215,8 +3590,7 @@ class SimpleTrackerGUI(QMainWindow):
             # Render detection view using SIZE-FILTERED mask (white blobs on black)
             display = tracker.get_detection_view_frame(
                 frame_rgb, filtered_mask, objects,
-                tracking_area=config.tracking_area,
-                rois=config.rois
+                tracking_area=config.tracking_area
             )
             self.display_frame(display)
 

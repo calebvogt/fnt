@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-SAM 2 Checkpoint Manager
+Model Checkpoint Manager
 
-Handles downloading and managing SAM 2 model checkpoints.
+Handles downloading and managing pretrained model checkpoints (SAM2, YOLO).
 Provides user-friendly dialogs for checkpoint management.
+All models are stored in ``LocalModels/`` at the FNT repo root
+(auto-added to .gitignore).
 
 Author: FieldNeuroToolbox Contributors
 """
@@ -59,8 +61,31 @@ SAM2_CHECKPOINTS = {
     }
 }
 
+# YOLO pretrained model checkpoints
+YOLO_CHECKPOINTS = {
+    "yolo11n-seg.pt": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-seg.pt",
+        "size_mb": 6,
+        "description": "YOLOv11-nano-seg (6 MB) - Fastest, recommended for field use",
+    },
+    "yolo11s-seg.pt": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s-seg.pt",
+        "size_mb": 12,
+        "description": "YOLOv11-small-seg (12 MB) - Higher accuracy, slightly slower",
+    },
+}
+
 # FNT repo root (go up from fnt/videoTracking/ to repo root)
 _FNT_REPO_ROOT = Path(__file__).parent.parent.parent
+
+# Canonical local model directory (auto-added to .gitignore)
+LOCAL_MODELS_DIR = _FNT_REPO_ROOT / "LocalModels"
+
+# Legacy directories (checked for backward compatibility)
+_LEGACY_DIRS = [
+    _FNT_REPO_ROOT / "sam_models_local",
+    _FNT_REPO_ROOT / "SAM_models",
+]
 
 
 class DownloadThread(QThread):
@@ -129,18 +154,110 @@ def _ensure_gitignore_entry(repo_root: Path, entry: str):
         gitignore.write_text(f"{entry}\n")
 
 
-def _find_existing_checkpoints(*search_dirs: Path) -> Dict[str, Path]:
-    """Search multiple directories for existing SAM2 checkpoints."""
+def _find_existing_checkpoints(*search_dirs: Path,
+                               checkpoint_dict: Optional[Dict] = None) -> Dict[str, Path]:
+    """Search multiple directories for existing checkpoints.
+
+    Args:
+        search_dirs: Directories to search (searched in order, first hit wins).
+        checkpoint_dict: Dict of checkpoint names to look for.
+            Defaults to SAM2_CHECKPOINTS if not given.
+    """
+    if checkpoint_dict is None:
+        checkpoint_dict = SAM2_CHECKPOINTS
     found = {}
     for d in search_dirs:
         if not d.exists():
             continue
-        for name in SAM2_CHECKPOINTS:
+        for name in checkpoint_dict:
             p = d / name
             if p.exists() and p.stat().st_size > 0:
                 if name not in found:
                     found[name] = p
     return found
+
+
+def find_yolo_checkpoint(model_name: str) -> Optional[Path]:
+    """Find a YOLO pretrained checkpoint in LocalModels or Ultralytics cache.
+
+    Returns the path if found, None otherwise.
+    """
+    local = LOCAL_MODELS_DIR / model_name
+    if local.exists() and local.stat().st_size > 0:
+        return local
+
+    for legacy in _LEGACY_DIRS:
+        p = legacy / model_name
+        if p.exists() and p.stat().st_size > 0:
+            return p
+
+    try:
+        from ultralytics.utils import SETTINGS as ul_settings
+        cache_dir = Path(ul_settings.get("weights_dir", ""))
+        if cache_dir.exists():
+            p = cache_dir / model_name
+            if p.exists() and p.stat().st_size > 0:
+                return p
+    except Exception:
+        pass
+
+    home_ul = Path.home() / ".config" / "Ultralytics"
+    for candidate in [home_ul, Path.home() / ".ultralytics"]:
+        if candidate.exists():
+            p = candidate / model_name
+            if p.exists() and p.stat().st_size > 0:
+                return p
+
+    return None
+
+
+def ensure_yolo_checkpoint(model_name: str) -> Path:
+    """Return path to a YOLO checkpoint, downloading if necessary.
+
+    Raises FileNotFoundError with a helpful message if offline and
+    the checkpoint is not cached.
+    """
+    existing = find_yolo_checkpoint(model_name)
+    if existing is not None:
+        return existing
+
+    LOCAL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_gitignore_entry(_FNT_REPO_ROOT, "LocalModels/")
+    dest = LOCAL_MODELS_DIR / model_name
+
+    info = YOLO_CHECKPOINTS.get(model_name, {})
+    url = info.get("url")
+    if not url:
+        url = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{model_name}"
+
+    print(f"[FNT] Downloading {model_name} to {dest} ...")
+
+    try:
+        if REQUESTS_AVAILABLE:
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            print(f"[FNT] Download complete: {dest}")
+            return dest
+        else:
+            import urllib.request
+            urllib.request.urlretrieve(url, str(dest))
+            print(f"[FNT] Download complete: {dest}")
+            return dest
+    except Exception as e:
+        if dest.exists():
+            dest.unlink()
+        raise FileNotFoundError(
+            f"Cannot find or download YOLO pretrained weights '{model_name}'.\n\n"
+            f"This is needed for transfer learning (COCO pre-trained weights).\n"
+            f"You appear to be offline or the download failed:\n  {e}\n\n"
+            f"To fix: connect to the internet and try again, or manually\n"
+            f"download from:\n  {url}\n"
+            f"and place it in:\n  {LOCAL_MODELS_DIR}/{model_name}"
+        ) from e
 
 
 class SAM2CheckpointDialog(QDialog):
@@ -154,13 +271,12 @@ class SAM2CheckpointDialog(QDialog):
         self.selected_checkpoint: Optional[str] = None
         self.download_thread: Optional[DownloadThread] = None
 
-        self._default_local_dir = _FNT_REPO_ROOT / "sam_models_local"
-        self._default_legacy_dir = _FNT_REPO_ROOT / "SAM_models"
+        self._default_local_dir = LOCAL_MODELS_DIR
         self._custom_dir: Optional[Path] = None
 
         self._existing = _find_existing_checkpoints(
             self._default_local_dir,
-            self._default_legacy_dir,
+            *_LEGACY_DIRS,
         )
 
         self._init_ui()
@@ -205,7 +321,7 @@ class SAM2CheckpointDialog(QDialog):
 
         self._radio_group = QButtonGroup(self)
         self.radio_local = QRadioButton(
-            f"FNT repo: sam_models_local/  (auto-added to .gitignore)"
+            "FNT repo: LocalModels/  (auto-added to .gitignore)"
         )
         self.radio_local.setChecked(True)
         self._radio_group.addButton(self.radio_local)
@@ -300,7 +416,7 @@ class SAM2CheckpointDialog(QDialog):
 
         # If saving to repo-local dir, ensure gitignore
         if save_dir == self._default_local_dir:
-            _ensure_gitignore_entry(_FNT_REPO_ROOT, "sam_models_local/")
+            _ensure_gitignore_entry(_FNT_REPO_ROOT, "LocalModels/")
 
         if output_path.exists():
             reply = QMessageBox.question(

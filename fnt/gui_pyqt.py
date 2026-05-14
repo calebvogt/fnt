@@ -361,29 +361,18 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(desc)
 
         # Tracking tools group
-        tracking_group = QGroupBox("Tracking Tools")
+        tracking_group = QGroupBox("FNT Tracking Tools")
         tracking_layout = QGridLayout()
 
         tracking_buttons = [
             ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
-            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
+            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
+            ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
         ]
 
         self.create_button_grid(tracking_layout, tracking_buttons)
         tracking_group.setLayout(tracking_layout)
         layout.addWidget(tracking_group)
-
-        # Mask Tracker Pipeline group
-        pipeline_group = QGroupBox("Mask Tracker Pipeline")
-        pipeline_layout = QGridLayout()
-
-        pipeline_buttons = [
-            ("Mask Tracker", "Annotate, train, and run Mask R-CNN instance segmentation", self.run_sam2_annotator),
-        ]
-
-        self.create_button_grid(pipeline_layout, pipeline_buttons)
-        pipeline_group.setLayout(pipeline_layout)
-        layout.addWidget(pipeline_group)
 
         layout.addStretch()
 
@@ -411,18 +400,6 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(sleap_layout, sleap_buttons)
         sleap_group.setLayout(sleap_layout)
         layout.addWidget(sleap_group)
-
-        # SLEAP post-processing group
-        sleap_post_group = QGroupBox("SLEAP Post-Processing")
-        sleap_post_layout = QGridLayout()
-
-        sleap_post_buttons = [
-            ("ROI Tool", "Define ROIs and analyze spatial occupancy", self.run_sleap_roi_tool),
-        ]
-
-        self.create_button_grid(sleap_post_layout, sleap_post_buttons)
-        sleap_post_group.setLayout(sleap_post_layout)
-        layout.addWidget(sleap_post_group)
 
         layout.addStretch()
 
@@ -881,12 +858,11 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
     
-    def run_sleap_roi_tool(self):
-        """Launch SLEAP ROI Analysis Tool"""
+    def run_roi_tool(self):
+        """Launch ROI Analysis Tool (supports SLEAP, Mask Tracker, and Simple Tracker data)"""
         try:
             from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
 
-            # Create and show the ROI tool window
             self.roi_tool_window = ROIToolGUI()
             self.roi_tool_window.show()
 
