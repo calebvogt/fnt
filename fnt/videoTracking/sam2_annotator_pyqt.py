@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,13 +26,13 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QSpinBox, QComboBox, QDialog, QAction, QMenuBar,
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
-    QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget,
-    QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox,
+    QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
+    QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
-    QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent,
+    QIcon, QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
+    QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent, QPainterPath,
 )
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
@@ -110,6 +111,17 @@ def _class_color(index: int) -> Tuple[int, int, int]:
     return CLASS_COLORS[index % len(CLASS_COLORS)]
 
 
+BEHAVIOR_PRESETS = {
+    "Rodent Solo": [
+        "locomotion", "idle", "rear", "self-groom",
+    ],
+    "Rodent Social": [
+        "locomotion", "idle", "rear", "self-groom",
+        "huddle", "attack", "flee",
+    ],
+}
+
+
 # ======================================================================
 # Annotation data structures
 # ======================================================================
@@ -178,12 +190,12 @@ class CategorySelectDialog(QDialog):
 
 
 # ======================================================================
-# Edit Classes dialog
+# Edit Object Classes dialog
 # ======================================================================
 class EditClassesDialog(QDialog):
     def __init__(self, categories: List[str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Edit Classes")
+        self.setWindowTitle("Edit Object Classes")
         self.setMinimumWidth(300)
         self.setStyleSheet(
             "QDialog { background-color: #2b2b2b; color: #cccccc; }"
@@ -288,6 +300,8 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask: Optional[np.ndarray] = None
         self._ai_mask_contour_pts: List[Tuple[float, float]] = []
         self._ai_score: float = 0.0
+
+        self.annotation_keys_enabled = True
 
         self._drag_obj_idx: Optional[int] = None
         self._drag_pt_idx: Optional[int] = None
@@ -436,6 +450,15 @@ class AnnotationPreviewWidget(QWidget):
                     self._ai_negative_points.append((int(coords[0]), int(coords[1])))
                     self.update()
                     self._request_ai_prediction()
+            elif hasattr(self, "_cls_mask_handler") and self._cls_mask_handler:
+                coords = self._widget_to_img(event.x(), event.y())
+                if coords:
+                    handled = self._cls_mask_handler(
+                        int(coords[0]), int(coords[1]), event.globalPos()
+                    )
+                    if handled:
+                        return
+                self._show_context_menu(event.globalPos(), event.x(), event.y())
             else:
                 self._show_context_menu(event.globalPos(), event.x(), event.y())
             return
@@ -512,6 +535,11 @@ class AnnotationPreviewWidget(QWidget):
             menu.addSeparator()
             act_approve_all = menu.addAction("✔ Approve All on Frame")
 
+        act_clear_all = None
+        if self.annotations:
+            menu.addSeparator()
+            act_clear_all = menu.addAction("Clear All Masks on Frame")
+
         action = menu.exec_(global_pos)
         if action == act_manual:
             self.drawing_mode = "manual"
@@ -532,6 +560,9 @@ class AnnotationPreviewWidget(QWidget):
             self.update()
         elif action == act_delete and hit_idx is not None:
             self.delete_annotation_requested.emit(hit_idx)
+        elif action == act_clear_all and act_clear_all is not None:
+            for i in range(len(self.annotations) - 1, -1, -1):
+                self.delete_annotation_requested.emit(i)
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._panning and self._pan_start is not None:
@@ -559,6 +590,9 @@ class AnnotationPreviewWidget(QWidget):
             self._drag_pt_idx = None
 
     def keyPressEvent(self, event: QKeyEvent):
+        if not self.annotation_keys_enabled:
+            super().keyPressEvent(event)
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if self._editing_obj_idx is not None:
                 idx = self._editing_obj_idx
@@ -684,14 +718,10 @@ class AnnotationPreviewWidget(QWidget):
 
         for ai, ann in enumerate(self.annotations):
             if ann.inferred:
-                # Inferred (pending review): yellow overlay
                 r, g, b = (255, 200, 0)
-                fill_alpha = 35
             else:
-                # Manual / approved: class-colored overlay
                 ci = ai % len(CLASS_COLORS)
                 r, g, b = CLASS_COLORS[ci]
-                fill_alpha = 50
             color = QColor(r, g, b)
             is_editing = (ai == self._editing_obj_idx)
 
@@ -700,7 +730,7 @@ class AnnotationPreviewWidget(QWidget):
                 for px, py in ann.points:
                     wx, wy = self._img_to_widget(px, py)
                     poly.append(QPointF(wx, wy))
-                painter.setBrush(QBrush(QColor(r, g, b, fill_alpha)))
+                painter.setBrush(Qt.NoBrush)
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
                 else:
@@ -745,7 +775,7 @@ class AnnotationPreviewWidget(QWidget):
         if self._drawing_accepted and self._pending_annotation:
             pen = QPen(QColor(0, 220, 0), 2)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(0, 220, 0, 40)))
+            painter.setBrush(Qt.NoBrush)
             poly = QPolygonF()
             for px, py in self._pending_annotation:
                 wx, wy = self._img_to_widget(px, py)
@@ -772,7 +802,7 @@ class AnnotationPreviewWidget(QWidget):
     def _paint_ai_drawing(self, painter: QPainter, pr: float):
         if self._ai_mask_contour_pts and len(self._ai_mask_contour_pts) >= 3:
             painter.setPen(QPen(QColor(255, 220, 50), 2))
-            painter.setBrush(QBrush(QColor(255, 220, 50, 40)))
+            painter.setBrush(Qt.NoBrush)
             poly = QPolygonF()
             for px, py in self._ai_mask_contour_pts:
                 wx, wy = self._img_to_widget(px, py)
@@ -1082,6 +1112,537 @@ class InferenceWorker(QThread):
             self.error.emit(str(e))
 
 
+class _ClipExtractWorker(QThread):
+    """Extract masks for a short clip (N frames) at a specific position."""
+    finished_ok = pyqtSignal(dict)  # {obj_id: [list of det dicts per frame]}
+    error = pyqtSignal(str)
+
+    def __init__(self, model_dir, video_path, start_frame, clip_length,
+                 confidence, max_det):
+        super().__init__()
+        self.model_dir = model_dir
+        self.video_path = video_path
+        self.start_frame = start_frame
+        self.clip_length = clip_length
+        self.confidence = confidence
+        self.max_det = max_det
+
+    def run(self):
+        try:
+            from .silhouette_extractor import SilhouetteExtractor, _detect_architecture
+            from .mask_tracker_inference import MaskInferenceConfig, MultiObjectTracker
+
+            architecture = _detect_architecture(self.model_dir)
+            if architecture == "yolov11-seg":
+                from .yolo_inference import YOLOInference
+                inference = YOLOInference(
+                    self.model_dir, device="cpu",
+                    inference_size=0, use_masks=True,
+                )
+            else:
+                from .mask_tracker_inference import MaskRCNNInference
+                inference = MaskRCNNInference(
+                    self.model_dir, device="cpu",
+                    inference_size=0, use_masks=True,
+                )
+            inference.load_model()
+
+            config = MaskInferenceConfig(
+                confidence_threshold=self.confidence,
+                max_detections=self.max_det,
+                use_masks=True,
+            )
+            tracker = MultiObjectTracker(config)
+
+            cap = cv2.VideoCapture(self.video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+            # {obj_id: [det_or_None per clip frame]}
+            object_frames: dict = {}
+
+            for i in range(self.clip_length):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = inference.predict(
+                    frame_rgb, self.confidence, self.max_det,
+                )
+                fi = self.start_frame + i
+                matched = tracker.update(
+                    detections, fi, fps, frame_hw=(frame_h, frame_w),
+                )
+                seen = set()
+                for obj_id, det in matched.items():
+                    if obj_id not in object_frames:
+                        object_frames[obj_id] = [None] * i
+                    object_frames[obj_id].append(det)
+                    seen.add(obj_id)
+                for obj_id in object_frames:
+                    if obj_id not in seen:
+                        object_frames[obj_id].append(None)
+
+            cap.release()
+            self.finished_ok.emit(object_frames)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
+class _BatchClipExtractWorker(QThread):
+    """Extract multiple clips from videos, saving each to disk."""
+    clip_ready = pyqtSignal(int, str)  # clip_idx, clip_dir
+    all_done = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, model_dir, clip_positions, clip_length, confidence,
+                 max_det, clips_base_dir, start_clip_num):
+        super().__init__()
+        self.model_dir = model_dir
+        self.clip_positions = clip_positions  # [(video_path, start_frame), ...]
+        self.clip_length = clip_length
+        self.confidence = confidence
+        self.max_det = max_det
+        self.clips_base_dir = clips_base_dir
+        self.start_clip_num = start_clip_num
+        self._stop_flag = False
+
+    def request_stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        try:
+            from .silhouette_extractor import _detect_architecture
+            from .mask_tracker_inference import MaskInferenceConfig, MultiObjectTracker
+
+            architecture = _detect_architecture(self.model_dir)
+            if architecture == "yolov11-seg":
+                from .yolo_inference import YOLOInference
+                inference = YOLOInference(
+                    self.model_dir, device="cpu",
+                    inference_size=0, use_masks=True,
+                )
+            else:
+                from .mask_tracker_inference import MaskRCNNInference
+                inference = MaskRCNNInference(
+                    self.model_dir, device="cpu",
+                    inference_size=0, use_masks=True,
+                )
+            inference.load_model()
+
+            config = MaskInferenceConfig(
+                confidence_threshold=self.confidence,
+                max_detections=self.max_det,
+                use_masks=True,
+            )
+
+            current_cap = None
+            current_path = None
+
+            for clip_idx, (video_path, start_frame) in enumerate(self.clip_positions):
+                if self._stop_flag:
+                    break
+
+                if video_path != current_path:
+                    if current_cap is not None:
+                        current_cap.release()
+                    current_cap = cv2.VideoCapture(video_path)
+                    current_path = video_path
+
+                fps = current_cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frame_h = int(current_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                frame_w = int(current_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                current_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+                tracker = MultiObjectTracker(config)
+                object_frames: dict = {}
+                raw_frames = []
+
+                for i in range(self.clip_length):
+                    ret, frame = current_cap.read()
+                    if not ret:
+                        break
+                    raw_frames.append(frame)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    detections = inference.predict(
+                        frame_rgb, self.confidence, self.max_det,
+                    )
+                    fi = start_frame + i
+                    matched = tracker.update(
+                        detections, fi, fps, frame_hw=(frame_h, frame_w),
+                    )
+                    seen = set()
+                    for obj_id, det in matched.items():
+                        if obj_id not in object_frames:
+                            object_frames[obj_id] = [None] * i
+                        object_frames[obj_id].append(det)
+                        seen.add(obj_id)
+                    for obj_id in object_frames:
+                        if obj_id not in seen:
+                            object_frames[obj_id].append(None)
+
+                # Save clip to disk
+                clip_num = self.start_clip_num + clip_idx
+                clip_id = f"clip_{clip_num:04d}"
+                clip_dir = os.path.join(self.clips_base_dir, clip_id)
+                os.makedirs(clip_dir, exist_ok=True)
+
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(
+                    os.path.join(clip_dir, "frames.mp4"),
+                    fourcc, fps, (frame_w, frame_h),
+                )
+                for f in raw_frames:
+                    writer.write(f)
+                writer.release()
+
+                mask_arrays = {}
+                for obj_id, fdata in object_frames.items():
+                    per_frame = []
+                    for det in fdata:
+                        if det is not None and det.get("mask") is not None:
+                            per_frame.append(det["mask"].astype(bool))
+                        else:
+                            per_frame.append(
+                                np.zeros((frame_h, frame_w), dtype=bool)
+                            )
+                    mask_arrays[f"obj_{obj_id}"] = np.stack(per_frame, axis=0)
+                np.savez_compressed(
+                    os.path.join(clip_dir, "masks.npz"), **mask_arrays,
+                )
+
+                objects = {}
+                for obj_id in object_frames:
+                    objects[str(obj_id)] = {"behavior": None, "color": None}
+                meta = {
+                    "clip_id": clip_id,
+                    "source_video": video_path,
+                    "start_frame": start_frame,
+                    "clip_length": len(raw_frames),
+                    "fps": fps,
+                    "frame_width": frame_w,
+                    "frame_height": frame_h,
+                    "num_objects": len(object_frames),
+                    "status": "pending",
+                    "objects": objects,
+                }
+                with open(os.path.join(clip_dir, "meta.json"), "w") as f:
+                    json.dump(meta, f, indent=2)
+
+                self.clip_ready.emit(clip_idx, clip_dir)
+
+            if current_cap is not None:
+                current_cap.release()
+
+            self.all_done.emit()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
+class _ClassifierTrainWorker(QThread):
+    """Train a behavior classifier on composite images."""
+    epoch_done = pyqtSignal(int, float, float, float)  # epoch, train_loss, val_loss, val_acc
+    log_message = pyqtSignal(str)
+    finished = pyqtSignal(object)  # summary dict
+    error = pyqtSignal(str)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.config = config
+        self._stop_flag = False
+
+    def request_stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        import platform
+        _saved_fd = None
+        _null_fd = None
+        if platform.system() == "Darwin":
+            try:
+                _saved_fd = os.dup(2)
+                _null_fd = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(_null_fd, 2)
+            except OSError:
+                _saved_fd = None
+        try:
+            self._train()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+        finally:
+            if _saved_fd is not None:
+                os.dup2(_saved_fd, 2)
+                os.close(_saved_fd)
+            if _null_fd is not None:
+                os.close(_null_fd)
+
+    def _train(self):
+        import time as _time
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, Dataset, random_split
+        from torchvision import transforms, models
+
+        composite_paths = self.config["composite_paths"]
+        labels = self.config["labels"]
+        class_names = self.config["class_names"]
+        epochs = self.config["epochs"]
+        lr = self.config["lr"]
+        batch_size = self.config["batch_size"]
+        val_split = self.config["val_split"]
+        augment = self.config["augment"]
+        backbone = self.config["backbone"]
+        output_dir = self.config["output_dir"]
+
+        os.makedirs(output_dir, exist_ok=True)
+        train_start = _time.time()
+
+        self.log_message.emit(f"[Classifier] Output directory: {output_dir}")
+        self.log_message.emit(
+            f"[Classifier] Dataset: {len(composite_paths)} composites, "
+            f"{len(class_names)} classes ({', '.join(class_names)})"
+        )
+        self.log_message.emit(
+            f"[Classifier] Config: backbone={backbone}, epochs={epochs}, "
+            f"lr={lr}, batch_size={batch_size}, val_split={val_split}, augment={augment}"
+        )
+
+        class CompositeDataset(Dataset):
+            def __init__(self, paths, targets, transform=None):
+                self.paths = paths
+                self.targets = targets
+                self.transform = transform
+
+            def __len__(self):
+                return len(self.paths)
+
+            def __getitem__(self, idx):
+                img = cv2.imread(self.paths[idx])
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (128, 128))
+                img = img.astype(np.float32) / 255.0
+                img = torch.from_numpy(img).permute(2, 0, 1)
+                if self.transform:
+                    img = self.transform(img)
+                return img, self.targets[idx]
+
+        aug_transform = None
+        if augment:
+            aug_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(brightness=0.2),
+            ])
+
+        dataset = CompositeDataset(composite_paths, labels, aug_transform)
+        n_val = max(1, int(len(dataset) * val_split)) if val_split > 0 else 0
+        n_train = len(dataset) - n_val
+        if n_val > 0:
+            train_ds, val_ds = random_split(dataset, [n_train, n_val])
+            val_ds.dataset = CompositeDataset(composite_paths, labels, None)
+        else:
+            train_ds = dataset
+            val_ds = None
+
+        self.log_message.emit(
+            f"[Classifier] Split: {n_train} train, {n_val} val"
+        )
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  drop_last=False)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
+
+        n_classes = len(class_names)
+        if backbone == "ResNet-34":
+            model = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
+            model.fc = nn.Linear(model.fc.in_features, n_classes)
+        elif backbone == "MobileNetV3":
+            model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_classes)
+        else:
+            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            model.fc = nn.Linear(model.fc.in_features, n_classes)
+
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        model = model.to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        self.log_message.emit(
+            f"[Classifier] Model: {backbone} ({n_params:,} params) on {device.upper()}"
+        )
+        self.log_message.emit(
+            f"[Classifier] Optimizer: AdamW (lr={lr}, weight_decay=1e-4) + CosineAnnealingLR"
+        )
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.CrossEntropyLoss()
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        patience = 10
+
+        self.log_message.emit(f"[Classifier] Starting training for {epochs} epochs (early stopping patience={patience})")
+
+        for epoch in range(1, epochs + 1):
+            if self._stop_flag:
+                self.log_message.emit("[Classifier] Training stopped by user.")
+                break
+
+            model.train()
+            running_loss = 0.0
+            n_batches = 0
+            for imgs, targets in train_loader:
+                imgs = imgs.to(device)
+                targets = targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(imgs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+                n_batches += 1
+            scheduler.step()
+            train_loss = running_loss / max(n_batches, 1)
+
+            val_loss = 0.0
+            val_acc = 0.0
+            if val_loader is not None:
+                model.eval()
+                v_loss = 0.0
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for imgs, targets in val_loader:
+                        imgs = imgs.to(device)
+                        targets = targets.to(device)
+                        outputs = model(imgs)
+                        v_loss += criterion(outputs, targets).item()
+                        preds = outputs.argmax(dim=1)
+                        correct += (preds == targets).sum().item()
+                        total += targets.size(0)
+                val_loss = v_loss / max(len(val_loader), 1)
+                val_acc = correct / max(total, 1)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    torch.save(model.state_dict(),
+                               os.path.join(output_dir, "best_classifier.pth"))
+                    self.log_message.emit(
+                        f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
+                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  ★ best"
+                    )
+                else:
+                    patience_counter += 1
+                    self.log_message.emit(
+                        f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
+                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  "
+                        f"(patience {patience_counter}/{patience})"
+                    )
+            else:
+                torch.save(model.state_dict(),
+                           os.path.join(output_dir, "best_classifier.pth"))
+                self.log_message.emit(
+                    f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}"
+                )
+
+            self.epoch_done.emit(epoch, train_loss, val_loss, val_acc)
+
+            if patience_counter >= patience:
+                self.log_message.emit(
+                    f"[Classifier] Early stopping at epoch {epoch} "
+                    f"(val loss did not improve for {patience} epochs)"
+                )
+                break
+
+        elapsed = _time.time() - train_start
+        final_epoch = epoch if not self._stop_flag else epoch - 1
+
+        torch.save(model.state_dict(),
+                   os.path.join(output_dir, "last_classifier.pth"))
+        config_out = {
+            "backbone": backbone,
+            "class_names": class_names,
+            "n_classes": n_classes,
+            "input_size": 128,
+            "epochs_trained": final_epoch,
+        }
+        with open(os.path.join(output_dir, "classifier_config.json"), "w") as f:
+            json.dump(config_out, f, indent=2)
+
+        self.log_message.emit(
+            f"[Classifier] Training complete: {final_epoch} epochs in {elapsed:.1f}s"
+        )
+        self.log_message.emit(f"[Classifier] Best val loss: {best_val_loss:.4f}")
+        self.log_message.emit(f"[Classifier] Saved: best_classifier.pth, last_classifier.pth, classifier_config.json")
+        self.log_message.emit(f"[Classifier] Output: {output_dir}")
+
+        self.finished.emit({
+            "output_dir": output_dir,
+            "epochs_trained": final_epoch,
+            "best_val_loss": best_val_loss if best_val_loss < float("inf") else None,
+            "class_names": class_names,
+        })
+
+
+class _SilhouetteExtractionWorker(QThread):
+    progress = pyqtSignal(int, int, str)  # frame_idx, total_frames, video_name
+    video_done = pyqtSignal(str, int)  # video_name, num_tracks
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, model_dir, video_paths, output_dir, confidence, max_det):
+        super().__init__()
+        self.model_dir = model_dir
+        self.video_paths = list(video_paths)
+        self.output_dir = output_dir
+        self.confidence = confidence
+        self.max_det = max_det
+        self._stop_flag = False
+
+    def request_stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        try:
+            from .silhouette_extractor import SilhouetteExtractor
+
+            extractor = SilhouetteExtractor(self.model_dir)
+            extractor.load_model()
+
+            for vpath in self.video_paths:
+                if self._stop_flag:
+                    break
+                vname = os.path.basename(vpath)
+                result = extractor.extract_video(
+                    vpath,
+                    self.output_dir,
+                    confidence_threshold=self.confidence,
+                    max_detections=self.max_det,
+                    progress=lambda f, t: self.progress.emit(f, t, vname),
+                    should_stop=lambda: self._stop_flag,
+                )
+                self.video_done.emit(vname, result["num_tracks"])
+
+            self.finished.emit()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
 class LiveLossPlot(QWidget):
     """Real-time training loss plot with sub-losses and validation mAP.
 
@@ -1130,8 +1691,10 @@ class LiveLossPlot(QWidget):
                                         label="Total loss (sum)")
             self._sub_lines = {}
 
-            # Secondary y-axis for mAP
+            # Secondary y-axis for mAP (right side)
             self._ax2 = self._ax.twinx()
+            self._ax2.yaxis.set_label_position("right")
+            self._ax2.yaxis.tick_right()
             self._ax2.set_ylabel("mAP", color="#66bb6a")
             self._ax2.tick_params(axis="y", colors="#66bb6a")
             self._ax2.set_ylim(0, 1.05)
@@ -1178,6 +1741,8 @@ class LiveLossPlot(QWidget):
             self._ax.cla()
             if hasattr(self, "_ax2"):
                 self._ax2.cla()
+                self._ax2.yaxis.set_label_position("right")
+                self._ax2.yaxis.tick_right()
                 self._ax2.set_ylabel("mAP", color="#66bb6a")
                 self._ax2.tick_params(axis="y", colors="#66bb6a")
                 self._ax2.set_ylim(0, 1.05)
@@ -1251,6 +1816,138 @@ class LiveLossPlot(QWidget):
                             edgecolor="#555555", labelcolor="#cccccc",
                             framealpha=0.9)
 
+        self._ax.set_ylim(0, y_max)
+        self._canvas.draw_idle()
+
+
+class ClassifierLossPlot(QWidget):
+    """Real-time training/validation loss and accuracy plot for the behavior classifier."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._epochs = []
+        self._train_losses = []
+        self._val_losses = []
+        self._val_accs = []
+        self._total = 50
+
+        try:
+            import matplotlib
+            matplotlib.use("Qt5Agg")
+            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+            from matplotlib.figure import Figure
+
+            self._fig = Figure(figsize=(8, 4), dpi=100)
+            self._fig.patch.set_facecolor("#1e1e1e")
+            self._ax = self._fig.add_subplot(111)
+            self._setup_axes()
+            self._train_line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                              label="Train loss")
+            self._val_line, = self._ax.plot([], [], color="#ff9800", linewidth=1.8,
+                                            linestyle="--", label="Val loss")
+            self._ax2 = self._ax.twinx()
+            self._ax2.yaxis.set_label_position("right")
+            self._ax2.yaxis.tick_right()
+            self._ax2.set_ylabel("Accuracy", color="#66bb6a")
+            self._ax2.tick_params(axis="y", colors="#66bb6a")
+            self._ax2.set_ylim(0, 1.05)
+            self._ax2.spines["right"].set_color("#66bb6a")
+            self._acc_line, = self._ax2.plot([], [], color="#66bb6a", linewidth=1.4,
+                                             marker="o", markersize=3,
+                                             label="Val accuracy")
+            all_handles = [self._train_line, self._val_line, self._acc_line]
+            all_labels = [h.get_label() for h in all_handles]
+            self._ax.legend(all_handles, all_labels,
+                            loc="upper right", fontsize=8,
+                            facecolor="#2b2b2b", edgecolor="#555555",
+                            labelcolor="#cccccc", framealpha=0.9)
+            self._fig.subplots_adjust(right=0.88, bottom=0.15)
+            self._canvas = FigureCanvasQTAgg(self._fig)
+            self._has_mpl = True
+        except ImportError:
+            self._canvas = QLabel("matplotlib not installed — loss values shown below")
+            self._canvas.setAlignment(Qt.AlignCenter)
+            self._canvas.setStyleSheet("color: #cccccc; font-size: 13px;")
+            self._has_mpl = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._canvas, 1)
+        self._lbl_status = QLabel("")
+        self._lbl_status.setStyleSheet("color: #cccccc; font-size: 11px;")
+        self._lbl_status.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._lbl_status)
+
+    def _setup_axes(self):
+        self._ax.set_facecolor("#1e1e1e")
+        self._ax.set_xlabel("Epoch", color="#cccccc")
+        self._ax.set_ylabel("Loss", color="#cccccc")
+        self._ax.set_title("Classifier Training", color="#cccccc", fontsize=11)
+        self._ax.tick_params(colors="#999999")
+        for spine in self._ax.spines.values():
+            spine.set_color("#555555")
+        self._ax.set_xlim(0, 10)
+
+    def reset(self, total_epochs: int):
+        self._epochs.clear()
+        self._train_losses.clear()
+        self._val_losses.clear()
+        self._val_accs.clear()
+        self._total = total_epochs
+        self._lbl_status.setText("Waiting for first epoch...")
+        if self._has_mpl:
+            self._ax.cla()
+            self._ax2.cla()
+            self._ax2.yaxis.set_label_position("right")
+            self._ax2.yaxis.tick_right()
+            self._ax2.set_ylabel("Accuracy", color="#66bb6a")
+            self._ax2.tick_params(axis="y", colors="#66bb6a")
+            self._ax2.set_ylim(0, 1.05)
+            self._ax2.spines["right"].set_color("#66bb6a")
+            self._setup_axes()
+            self._train_line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                              label="Train loss")
+            self._val_line, = self._ax.plot([], [], color="#ff9800", linewidth=1.8,
+                                            linestyle="--", label="Val loss")
+            self._acc_line, = self._ax2.plot([], [], color="#66bb6a", linewidth=1.4,
+                                             marker="o", markersize=3,
+                                             label="Val accuracy")
+            all_handles = [self._train_line, self._val_line, self._acc_line]
+            all_labels = [h.get_label() for h in all_handles]
+            self._ax.legend(all_handles, all_labels,
+                            loc="upper right", fontsize=8,
+                            facecolor="#2b2b2b", edgecolor="#555555",
+                            labelcolor="#cccccc", framealpha=0.9)
+            self._canvas.draw_idle()
+
+    def add_point(self, epoch: int, train_loss: float,
+                  val_loss: float = None, val_acc: float = None):
+        self._epochs.append(epoch)
+        self._train_losses.append(train_loss)
+
+        parts = [f"Epoch {epoch}/{self._total}    Train loss: {train_loss:.4f}"]
+        if val_loss is not None:
+            self._val_losses.append(val_loss)
+            parts.append(f"Val loss: {val_loss:.4f}")
+        if val_acc is not None:
+            self._val_accs.append(val_acc)
+            parts.append(f"Val acc: {val_acc:.1%}")
+        self._lbl_status.setText("    ".join(parts))
+
+        if not self._has_mpl:
+            return
+
+        self._train_line.set_data(self._epochs, self._train_losses)
+        if self._val_losses:
+            val_epochs = self._epochs[-len(self._val_losses):]
+            self._val_line.set_data(val_epochs, self._val_losses)
+        if self._val_accs:
+            acc_epochs = self._epochs[-len(self._val_accs):]
+            self._acc_line.set_data(acc_epochs, self._val_accs)
+
+        self._ax.set_xlim(0, max(epoch * 1.1, 10))
+        all_losses = self._train_losses + self._val_losses
+        y_max = max(all_losses) * 1.1 + 0.01 if all_losses else 1.0
         self._ax.set_ylim(0, y_max)
         self._canvas.draw_idle()
 
@@ -1398,6 +2095,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._video_cap: Optional[cv2.VideoCapture] = None
         self._video_frame_count: int = 0
         self._video_fps: float = 30.0
+        self._video_frame_idx: int = 0
+        self._annot_in_video_mode: bool = False
 
         self._extracted_frames: List[Tuple[str, int, str]] = []
         self.current_frame_idx: int = -1
@@ -1421,35 +2120,107 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._build_ui()
         self._update_nav_state()
 
-        # Tab activity animation (., .., ...)
+        # Tab activity animation — pixel-art running mouse on right side
+        self._mouse_pixmaps = self._build_mouse_sprites()
         self._tab_anim_tick = 0
+        self._mouse_active = {}  # track which tabs currently show the mouse
         self._tab_anim_timer = QTimer(self)
         self._tab_anim_timer.timeout.connect(self._update_tab_animations)
-        self._tab_anim_timer.start(500)
+        self._tab_anim_timer.start(150)
+
+    @staticmethod
+    def _build_mouse_sprites() -> list:
+        """Generate 4 frames of a running mouse as 16x16 QPixmaps."""
+        frames = []
+        sz = 16
+        leg_poses = [
+            (2, 2, -2, 1),
+            (1, 3, -1, 3),
+            (-1, 1, 2, 2),
+            (0, 3, 0, 3),
+        ]
+        body_color = QColor(200, 200, 200)
+        ear_color = QColor(255, 180, 180)
+        leg_color = QColor(180, 180, 180)
+        tail_color = QColor(170, 170, 170)
+        eye_color = QColor(40, 40, 40)
+
+        for fdx, fdy, bdx, bdy in leg_poses:
+            pix = QPixmap(sz, sz)
+            pix.fill(QColor(0, 0, 0, 0))
+            p = QPainter(pix)
+            p.setRenderHint(QPainter.Antialiasing)
+
+            p.setPen(QPen(tail_color, 1.2))
+            tail = QPainterPath()
+            tail.moveTo(2, 8)
+            tail.cubicTo(0, 5, 1, 2, 3, 3)
+            p.drawPath(tail)
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(body_color))
+            p.drawEllipse(3, 5, 9, 6)
+            p.drawEllipse(10, 4, 5, 5)
+
+            p.setBrush(QBrush(ear_color))
+            p.drawEllipse(11, 2, 3, 3)
+            p.drawEllipse(13, 3, 3, 3)
+
+            p.setBrush(QBrush(eye_color))
+            p.drawEllipse(13, 5, 2, 2)
+
+            p.setPen(QPen(leg_color, 1.3))
+            p.drawLine(10, 10, int(10 + fdx), int(10 + fdy))
+            p.drawLine(5, 10, int(5 + bdx), int(10 + bdy))
+
+            p.end()
+            frames.append(pix)
+        return frames
 
     def _update_tab_animations(self):
-        self._tab_anim_tick = (self._tab_anim_tick + 1) % 3
-        dots = "." * (self._tab_anim_tick + 1)
+        self._tab_anim_tick = (self._tab_anim_tick + 1) % len(self._mouse_pixmaps)
+        pixmap = self._mouse_pixmaps[self._tab_anim_tick]
 
-        # Training tab (index 1)
-        training_active = (
-            hasattr(self, "_train_worker")
-            and self._train_worker is not None
-            and self._train_worker.isRunning()
-        ) or (
-            hasattr(self, "_post_infer_worker")
-            and self._post_infer_worker is not None
-            and self._post_infer_worker.isRunning()
-        )
-        self.tab_widget.setTabText(1, f"Training{dots}" if training_active else "Training")
+        active_map = {
+            1: (  # Training
+                (hasattr(self, "_train_worker")
+                 and self._train_worker is not None
+                 and self._train_worker.isRunning())
+                or (hasattr(self, "_post_infer_worker")
+                    and self._post_infer_worker is not None
+                    and self._post_infer_worker.isRunning())
+            ),
+            2: (  # Classifier
+                (hasattr(self, "_clip_extract_worker")
+                 and self._clip_extract_worker is not None
+                 and self._clip_extract_worker.isRunning())
+                or (hasattr(self, "_batch_worker")
+                    and self._batch_worker is not None
+                    and self._batch_worker.isRunning())
+            ),
+            3: (  # Tracking
+                hasattr(self, "_inference_worker")
+                and self._inference_worker is not None
+                and self._inference_worker.isRunning()
+            ),
+        }
 
-        # Tracking tab (index 2)
-        tracking_active = (
-            hasattr(self, "_inference_worker")
-            and self._inference_worker is not None
-            and self._inference_worker.isRunning()
-        )
-        self.tab_widget.setTabText(2, f"Tracking{dots}" if tracking_active else "Tracking")
+        tab_bar = self.tab_widget.tabBar()
+        for tab_idx, active in active_map.items():
+            was_active = self._mouse_active.get(tab_idx, False)
+            if active:
+                if not was_active:
+                    lbl = QLabel()
+                    lbl.setFixedSize(18, 16)
+                    lbl.setPixmap(pixmap)
+                    tab_bar.setTabButton(tab_idx, QTabBar.RightSide, lbl)
+                    self._mouse_active[tab_idx] = lbl
+                else:
+                    self._mouse_active[tab_idx].setPixmap(pixmap)
+            else:
+                if was_active:
+                    tab_bar.setTabButton(tab_idx, QTabBar.RightSide, None)
+                    self._mouse_active[tab_idx] = False
 
     # ==================================================================
     # Menu bar
@@ -1504,6 +2275,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self._build_annotator_tab()
         self._build_training_tab()
+        self._build_classifier_tab()
         self._build_tracking_tab()
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -1513,6 +2285,13 @@ class SAM2AnnotatorWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(2)
 
+        self._lbl_preview_title = QLabel("")
+        self._lbl_preview_title.setStyleSheet(
+            "color: #aaaaaa; font-size: 11px; font-weight: bold; padding: 2px 4px;"
+        )
+        self._lbl_preview_title.setVisible(False)
+        right_layout.addWidget(self._lbl_preview_title)
+
         self.preview = AnnotationPreviewWidget()
         self.preview.annotation_accepted.connect(self._on_annotation_accepted)
         self.preview.ai_prediction_requested.connect(self._request_ai_prediction)
@@ -1520,7 +2299,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             lambda z: self.lbl_zoom_info.setText(f"{int(z * 100)}%")
         )
         self.preview.mode_changed.connect(self._on_mode_changed)
-        self.preview.advance_frame_requested.connect(self._next_frame)
+        self.preview.advance_frame_requested.connect(self._on_advance_frame)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -1562,7 +2341,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_delete_frame.clicked.connect(self._delete_current_frame)
         info_layout.addWidget(self.btn_delete_frame)
 
-        self.btn_edit_classes = QPushButton("Edit Classes")
+        self.btn_edit_classes = QPushButton("Edit Object Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
             "padding: 3px 12px; border-radius: 3px; }"
@@ -1581,11 +2360,87 @@ class SAM2AnnotatorWindow(QMainWindow):
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
             self.btn_delete_frame, self.btn_edit_classes, self.lbl_zoom_info,
         ]
+        # Classifier info label (hidden by default, shown on Classifier tab)
+        self.lbl_classifier_info = QLabel("")
+        self.lbl_classifier_info.setStyleSheet("color: #999999; font-size: 11px;")
+        self.lbl_classifier_info.setVisible(False)
+        info_layout.addWidget(self.lbl_classifier_info)
+
+        # Edit Behavior Classes button (hidden by default, shown on Classifier tab)
+        self.btn_edit_behaviors = QPushButton("Edit Behavior Classes")
+        self.btn_edit_behaviors.setStyleSheet(
+            "QPushButton { background-color: #7b1fa2; color: white; font-weight: bold; "
+            "padding: 3px 12px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #9c27b0; }"
+        )
+        self.btn_edit_behaviors.setToolTip(
+            "Add, edit, or remove behavior categories for classification."
+        )
+        self.btn_edit_behaviors.clicked.connect(self._show_behavior_categories_popup)
+        self.btn_edit_behaviors.setVisible(False)
+        info_layout.addWidget(self.btn_edit_behaviors)
+
         # Tracking info label (hidden by default, shown on Tracking tab)
         self.lbl_tracking_info = QLabel("")
         self.lbl_tracking_info.setStyleSheet("color: #999999; font-size: 11px;")
         self.lbl_tracking_info.setVisible(False)
         info_layout.addWidget(self.lbl_tracking_info)
+
+        # Classifier frame slider (hidden by default, shown on Classifier tab)
+        self._cls_nav_bar = QWidget()
+        cls_nav_layout = QHBoxLayout(self._cls_nav_bar)
+        cls_nav_layout.setContentsMargins(5, 2, 5, 2)
+        cls_nav_layout.setSpacing(5)
+        self._cls_frame_slider = QSlider(Qt.Horizontal)
+        self._cls_frame_slider.setMinimum(0)
+        self._cls_frame_slider.setMaximum(0)
+        self._cls_frame_slider.valueChanged.connect(self._on_cls_slider_changed)
+        self._cls_frame_slider.sliderPressed.connect(self._on_cls_slider_pressed)
+        self._cls_frame_slider.setStyleSheet(
+            "QSlider::groove:horizontal { background: #3c3c3c; height: 6px; "
+            "border-radius: 3px; }"
+            "QSlider::handle:horizontal { background: #2979ff; width: 12px; "
+            "margin: -4px 0; border-radius: 6px; }"
+            "QSlider::sub-page:horizontal { background: #2979ff; border-radius: 3px; }"
+        )
+        self.lbl_cls_frame_num = QLabel("0 / 0")
+        self.lbl_cls_frame_num.setStyleSheet("color: #cccccc; font-size: 10px;")
+        self.lbl_cls_frame_num.setMinimumWidth(80)
+        cls_nav_layout.addWidget(self._cls_frame_slider, 1)
+        cls_nav_layout.addWidget(self.lbl_cls_frame_num)
+
+        playback_btn_style = (
+            "QPushButton { background-color: #3c3c3c; color: #cccccc; "
+            "border: 1px solid #555; border-radius: 3px; padding: 2px 8px; "
+            "font-size: 12px; min-width: 24px; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+            "QPushButton:checked { background-color: #2979ff; color: white; }"
+        )
+        self._btn_cls_play_pause = QPushButton("▶")
+        self._btn_cls_play_pause.setToolTip("Play / Pause (Space)")
+        self._btn_cls_play_pause.setStyleSheet(playback_btn_style)
+        self._btn_cls_play_pause.clicked.connect(self._cls_toggle_playback)
+        cls_nav_layout.addWidget(self._btn_cls_play_pause)
+
+        self._combo_cls_speed = QComboBox()
+        self._combo_cls_speed.setToolTip("Playback speed")
+        self._combo_cls_speed.addItems(
+            ["0.5x", "1x", "1.25x", "1.5x", "2x", "3x", "4x", "8x"]
+        )
+        self._combo_cls_speed.setCurrentIndex(1)  # default 1x
+        self._combo_cls_speed.setStyleSheet(
+            "QComboBox { background-color: #3c3c3c; color: #cccccc; "
+            "border: 1px solid #555; border-radius: 3px; padding: 2px 6px; "
+            "font-size: 11px; min-width: 44px; }"
+            "QComboBox QAbstractItemView { background-color: #3c3c3c; "
+            "color: #cccccc; selection-background-color: #2979ff; }"
+        )
+        self._combo_cls_speed.currentIndexChanged.connect(self._on_cls_speed_changed)
+        self._cls_speed_multiplier = 1.0
+        cls_nav_layout.addWidget(self._combo_cls_speed)
+
+        self._cls_nav_bar.setVisible(False)
+        right_layout.addWidget(self._cls_nav_bar)
 
         # Training visualization panel (hidden by default, shown on Training tab)
         self._training_viz_panel = QWidget()
@@ -1603,6 +2458,16 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self._training_viz_panel.setVisible(False)
         right_layout.addWidget(self._training_viz_panel, 1)
+
+        # Classifier training visualization panel (hidden by default)
+        self._cls_training_viz_panel = QWidget()
+        cls_train_viz_layout = QVBoxLayout(self._cls_training_viz_panel)
+        cls_train_viz_layout.setContentsMargins(4, 4, 4, 4)
+        cls_train_viz_layout.setSpacing(4)
+        self._cls_loss_plot = ClassifierLossPlot(parent=self._cls_training_viz_panel)
+        cls_train_viz_layout.addWidget(self._cls_loss_plot, 1)
+        self._cls_training_viz_panel.setVisible(False)
+        right_layout.addWidget(self._cls_training_viz_panel, 1)
 
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(right_panel, 1)
@@ -1632,7 +2497,9 @@ class SAM2AnnotatorWindow(QMainWindow):
             "Manual: click to place vertices, Enter to accept.\n"
             "AI: left-click to include, right-click to exclude, Enter to accept.\n"
             "Right-click a mask to Edit or Delete it.\n"
-            "Left-click + drag to pan. Scroll to zoom. Space = next frame."
+            "Left-click + drag to pan. Scroll to zoom. Space = next frame.\n"
+            "E = extract current video frame to Training Frames.\n"
+            "Arrow keys scrub video (Shift ±10, Ctrl ±100)."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
         info.setWordWrap(True)
@@ -2065,6 +2932,465 @@ class SAM2AnnotatorWindow(QMainWindow):
         scroll.setWidget(widget)
         self.tab_widget.addTab(scroll, "Training")
 
+    # ==================================================================
+    # Classifier tab
+    # ==================================================================
+    def _build_classifier_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(8)
+
+        spin_style = getattr(self, "_spin_style", "")
+
+        # Classifier state
+        self._cls_video_cap = None
+        self._cls_frame_idx = 0
+        self._cls_total_frames = 0
+        self._cls_fps = 30.0
+        self._cls_video_path = None
+        self._cls_clip_masks = {}    # obj_id -> list of {mask, bbox, centroid, label}
+        self._cls_clip_start = 0
+        self._cls_model_loaded = None
+        self._cls_annotations = []   # list of annotation dicts
+        self._batch_clips = []       # batch extraction clip queue
+        self._cls_in_queue_mode = False
+        self._cls_pending_clip_mode = False
+        self._cls_playback_offset = 0
+        self._cls_playback_clip_idx = -1
+        self._cls_speed_multiplier = 1.0
+        self._cls_playback_was_playing = False
+        self._pending_frames = []
+        self._queue_frames = []
+
+        # --- Mask Model ---
+        model_group = QGroupBox("Mask Model")
+        model_vbox = QVBoxLayout()
+        model_vbox.setSpacing(4)
+
+        model_row = QHBoxLayout()
+        self.combo_cls_model = QComboBox()
+        self.combo_cls_model.setToolTip(
+            "Select a trained mask model for silhouette extraction.\n"
+            "Defaults to the most recently trained model."
+        )
+        model_row.addWidget(self.combo_cls_model, 1)
+        btn_refresh_cls = QPushButton("Refresh")
+        btn_refresh_cls.setToolTip("Rescan the models/ directory.")
+        btn_refresh_cls.clicked.connect(self._refresh_classifier_models)
+        model_row.addWidget(btn_refresh_cls)
+        model_vbox.addLayout(model_row)
+
+        self.lbl_cls_model_info = QLabel("No model selected")
+        self.lbl_cls_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_cls_model_info.setWordWrap(True)
+        model_vbox.addWidget(self.lbl_cls_model_info)
+
+        model_group.setLayout(model_vbox)
+        layout.addWidget(model_group)
+
+        # --- Load Videos ---
+        vid_group = QGroupBox("Load Videos")
+        vid_vbox = QVBoxLayout()
+        vid_vbox.setSpacing(4)
+
+        vid_info = QLabel(
+            "Load videos to watch and classify behaviors.\n"
+            "Select a video to preview it, then scrub to behaviors."
+        )
+        vid_info.setStyleSheet("color: #888888; font-size: 9px;")
+        vid_info.setWordWrap(True)
+        vid_vbox.addWidget(vid_info)
+
+        vid_btn_row = QHBoxLayout()
+        btn_add_cls_vids = QPushButton("Add Videos")
+        btn_add_cls_vids.setToolTip("Add videos for behavioral annotation.")
+        btn_add_cls_vids.clicked.connect(self._add_classifier_videos)
+        vid_btn_row.addWidget(btn_add_cls_vids)
+        btn_clear_cls_vids = QPushButton("Clear")
+        btn_clear_cls_vids.setToolTip("Remove all annotation videos.")
+        btn_clear_cls_vids.clicked.connect(self._clear_classifier_videos)
+        vid_btn_row.addWidget(btn_clear_cls_vids)
+        vid_vbox.addLayout(vid_btn_row)
+
+        self.list_cls_videos = QListWidget()
+        self.list_cls_videos.setMaximumHeight(80)
+        self.list_cls_videos.currentItemChanged.connect(self._on_cls_video_selected)
+        vid_vbox.addWidget(self.list_cls_videos)
+
+        vid_group.setLayout(vid_vbox)
+        layout.addWidget(vid_group)
+
+        # Behavior categories list (managed via popup, not shown in left panel)
+        self.list_cls_categories = QListWidget()
+        self.list_cls_categories.setVisible(False)
+
+        # --- Clip Extraction ---
+        clip_group = QGroupBox("Clip Extraction")
+        clip_vbox = QVBoxLayout()
+        clip_vbox.setSpacing(4)
+
+        row_clip = QHBoxLayout()
+        row_clip.addWidget(QLabel("Clip length:"))
+        self.spin_cls_clip_length = QSpinBox()
+        self.spin_cls_clip_length.setRange(5, 60)
+        self.spin_cls_clip_length.setValue(15)
+        self.spin_cls_clip_length.setStyleSheet(spin_style)
+        self.spin_cls_clip_length.setToolTip(
+            "Number of frames per clip (5-60).\n"
+            "Default 15 frames = ~0.5s at 30fps.\n"
+            "Shorter = fast behaviors (grooming).\n"
+            "Longer = slow behaviors (exploration)."
+        )
+        row_clip.addWidget(self.spin_cls_clip_length)
+        row_clip.addWidget(QLabel("frames"))
+        clip_vbox.addLayout(row_clip)
+
+        row_conf = QHBoxLayout()
+        row_conf.addWidget(QLabel("Confidence:"))
+        self.spin_cls_confidence = QDoubleSpinBox()
+        self.spin_cls_confidence.setRange(0.05, 0.99)
+        self.spin_cls_confidence.setValue(0.5)
+        self.spin_cls_confidence.setSingleStep(0.05)
+        self.spin_cls_confidence.setStyleSheet(spin_style)
+        self.spin_cls_confidence.setToolTip(
+            "Minimum detection confidence for mask extraction."
+        )
+        row_conf.addWidget(self.spin_cls_confidence)
+        clip_vbox.addLayout(row_conf)
+
+        row_max = QHBoxLayout()
+        row_max.addWidget(QLabel("Max objects:"))
+        self.spin_cls_max_det = QSpinBox()
+        self.spin_cls_max_det.setRange(1, 100)
+        self.spin_cls_max_det.setValue(1)
+        self.spin_cls_max_det.setStyleSheet(spin_style)
+        self.spin_cls_max_det.setToolTip(
+            "Maximum objects to detect per frame."
+        )
+        row_max.addWidget(self.spin_cls_max_det)
+        clip_vbox.addLayout(row_max)
+
+        row_method = QHBoxLayout()
+        row_method.addWidget(QLabel("Method:"))
+        self.combo_batch_method = QComboBox()
+        self.combo_batch_method.addItems([
+            "Uniform sample", "Random sample", "Every Nth frame",
+        ])
+        self.combo_batch_method.setToolTip(
+            "How to select clip start positions across the video.\n"
+            "Uniform: evenly spaced across the video.\n"
+            "Random: randomly sampled positions.\n"
+            "Every Nth: one clip every N frames."
+        )
+        row_method.addWidget(self.combo_batch_method, 1)
+        clip_vbox.addLayout(row_method)
+
+        row_nclips = QHBoxLayout()
+        self.lbl_batch_count = QLabel("Clips per video:")
+        row_nclips.addWidget(self.lbl_batch_count)
+        self.spin_batch_count = QSpinBox()
+        self.spin_batch_count.setRange(1, 500)
+        self.spin_batch_count.setValue(20)
+        self.spin_batch_count.setStyleSheet(spin_style)
+        self.spin_batch_count.setToolTip(
+            "Number of clips to extract per video.\n"
+            "For 'Every Nth frame', this is the stride in frames."
+        )
+        row_nclips.addWidget(self.spin_batch_count)
+        clip_vbox.addLayout(row_nclips)
+
+        self.combo_batch_method.currentIndexChanged.connect(
+            lambda idx: self.lbl_batch_count.setText(
+                "Stride (frames):" if idx == 2 else "Clips per video:"
+            )
+        )
+
+        manual_note = QLabel(
+            "Tip: press E to manually extract a single clip at\n"
+            "the current frame position."
+        )
+        manual_note.setStyleSheet("color: #888888; font-size: 9px;")
+        manual_note.setWordWrap(True)
+        clip_vbox.addWidget(manual_note)
+
+        self.btn_batch_extract = QPushButton("Extract Clips")
+        self.btn_batch_extract.setStyleSheet(
+            "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #448aff; }"
+            "QPushButton:disabled { background-color: #333333; color: #666666; }"
+        )
+        self.btn_batch_extract.setToolTip(
+            "Extract clips from all loaded videos in the background.\n"
+            "You can start labeling as clips finish extracting."
+        )
+        self.btn_batch_extract.clicked.connect(self._start_batch_extraction)
+        clip_vbox.addWidget(self.btn_batch_extract)
+
+        self.lbl_cls_extract_status = QLabel(
+            "Scrub to a behavior, press E to extract clip"
+        )
+        self.lbl_cls_extract_status.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_cls_extract_status.setWordWrap(True)
+        clip_vbox.addWidget(self.lbl_cls_extract_status)
+
+        clip_group.setLayout(clip_vbox)
+        layout.addWidget(clip_group)
+
+        # --- Clip Queue ---
+        queue_group = QGroupBox("Clip Queue")
+        queue_vbox = QVBoxLayout()
+        queue_vbox.setSpacing(4)
+
+        self.list_clip_queue = QListWidget()
+        self.list_clip_queue.setMaximumHeight(160)
+        self.list_clip_queue.setToolTip(
+            "Extracted clips. Yellow ● = pending, Green ✔ = labeled.\n"
+            "Click a clip or press Space to advance.\n"
+            "Selected clip auto-plays in the preview."
+        )
+        self.list_clip_queue.currentItemChanged.connect(self._on_clip_queue_selected)
+        queue_vbox.addWidget(self.list_clip_queue)
+
+        self.lbl_cls_annotation_stats = QLabel("No clips yet")
+        self.lbl_cls_annotation_stats.setStyleSheet("color: #cccccc; font-size: 10px;")
+        self.lbl_cls_annotation_stats.setWordWrap(True)
+        queue_vbox.addWidget(self.lbl_cls_annotation_stats)
+
+        del_btn_row = QHBoxLayout()
+        self.btn_delete_selected_clip = QPushButton("Delete Selected")
+        self.btn_delete_selected_clip.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 4px 8px; border-radius: 3px; font-size: 10px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+        )
+        self.btn_delete_selected_clip.setToolTip("Delete the selected clip from disk.")
+        self.btn_delete_selected_clip.clicked.connect(self._delete_selected_clips)
+        del_btn_row.addWidget(self.btn_delete_selected_clip)
+
+        self.btn_delete_all_clips = QPushButton("Delete All")
+        self.btn_delete_all_clips.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 4px 8px; border-radius: 3px; font-size: 10px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+        )
+        self.btn_delete_all_clips.setToolTip("Delete all clips from disk.")
+        self.btn_delete_all_clips.clicked.connect(self._delete_all_clips)
+        del_btn_row.addWidget(self.btn_delete_all_clips)
+        queue_vbox.addLayout(del_btn_row)
+
+        # Enable multi-selection in clip queue
+        self.list_clip_queue.setSelectionMode(QListWidget.ExtendedSelection)
+
+        queue_group.setLayout(queue_vbox)
+        layout.addWidget(queue_group)
+
+        # --- Train Classifier ---
+        cls_train_group = QGroupBox("Train Classifier")
+        cls_train_vbox = QVBoxLayout()
+        cls_train_vbox.setSpacing(4)
+        spin_style = self._spin_style
+
+        cls_train_info = QLabel(
+            "Train a CNN on time-colored silhouette contour composites\n"
+            "from your annotated clips."
+        )
+        cls_train_info.setStyleSheet("color: #888888; font-size: 9px;")
+        cls_train_info.setWordWrap(True)
+        cls_train_vbox.addWidget(cls_train_info)
+
+        # Training data summary
+        self.lbl_cls_train_data = QLabel("Training data: —")
+        self.lbl_cls_train_data.setStyleSheet("color: #cccccc; font-size: 10px;")
+        self.lbl_cls_train_data.setWordWrap(True)
+        cls_train_vbox.addWidget(self.lbl_cls_train_data)
+
+        # System info
+        self.lbl_cls_system_info = QLabel("System: detecting...")
+        self.lbl_cls_system_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_cls_system_info.setWordWrap(True)
+        cls_train_vbox.addWidget(self.lbl_cls_system_info)
+        self._populate_cls_system_info()
+
+        self.lbl_cls_train_reqs = QLabel("")
+        self.lbl_cls_train_reqs.setStyleSheet(
+            "color: #ff9800; font-size: 9px; padding: 2px 0px;"
+        )
+        self.lbl_cls_train_reqs.setWordWrap(True)
+        cls_train_vbox.addWidget(self.lbl_cls_train_reqs)
+
+        # -- Backbone --
+        tip_backbone = (
+            "CNN architecture used as the image classifier.\n\n"
+            "ResNet-18: lightweight, fast to train, good for small datasets\n"
+            "  (20-200 composites). Recommended starting point.\n"
+            "ResNet-34: deeper network with more capacity. Better for\n"
+            "  larger datasets (200+) or when behaviors are visually\n"
+            "  similar and harder to distinguish.\n"
+            "MobileNetV3: very small and fast. Good for quick experiments\n"
+            "  or when you plan to run inference on CPU. Slightly less\n"
+            "  accurate than ResNet-18 on small datasets."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Backbone:")
+        lbl.setToolTip(tip_backbone)
+        row.addWidget(lbl)
+        self.combo_cls_backbone = QComboBox()
+        self.combo_cls_backbone.addItems(["ResNet-18", "ResNet-34", "MobileNetV3"])
+        self.combo_cls_backbone.setToolTip(tip_backbone)
+        row.addWidget(self.combo_cls_backbone)
+        cls_train_vbox.addLayout(row)
+
+        # -- Epochs --
+        tip_epochs = (
+            "Number of full passes through the training data.\n\n"
+            "Each epoch processes every composite image once. More\n"
+            "epochs give the model more chances to learn, but too\n"
+            "many can cause overfitting (memorizing training images\n"
+            "instead of learning general patterns).\n\n"
+            "Early stopping (patience=10) will automatically halt\n"
+            "training if validation loss stops improving, so it's\n"
+            "safe to set this higher than needed.\n\n"
+            "50 epochs: good default for most datasets.\n"
+            "100-200: use with larger or more complex datasets."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Epochs:")
+        lbl.setToolTip(tip_epochs)
+        row.addWidget(lbl)
+        self.spin_cls_epochs = QSpinBox()
+        self.spin_cls_epochs.setRange(5, 500)
+        self.spin_cls_epochs.setValue(50)
+        self.spin_cls_epochs.setSingleStep(10)
+        self.spin_cls_epochs.setToolTip(tip_epochs)
+        self.spin_cls_epochs.setStyleSheet(spin_style)
+        row.addWidget(self.spin_cls_epochs)
+        cls_train_vbox.addLayout(row)
+
+        # -- Learning Rate --
+        tip_cls_lr = (
+            "Controls how much model weights change per training step.\n\n"
+            "Higher = faster learning but risk of instability (loss\n"
+            "  spikes or model fails to converge).\n"
+            "Lower = more stable but slower training.\n\n"
+            "0.001: recommended default for AdamW optimizer.\n"
+            "0.0001: use if training loss is unstable or spiky.\n"
+            "0.01: use if training is very slow to converge.\n\n"
+            "A cosine annealing schedule gradually reduces the LR\n"
+            "toward zero over the course of training."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Learning rate:")
+        lbl.setToolTip(tip_cls_lr)
+        row.addWidget(lbl)
+        self.spin_cls_lr = QDoubleSpinBox()
+        self.spin_cls_lr.setRange(0.0001, 0.01)
+        self.spin_cls_lr.setValue(0.001)
+        self.spin_cls_lr.setSingleStep(0.0001)
+        self.spin_cls_lr.setDecimals(4)
+        self.spin_cls_lr.setToolTip(tip_cls_lr)
+        self.spin_cls_lr.setStyleSheet(spin_style)
+        row.addWidget(self.spin_cls_lr)
+        cls_train_vbox.addLayout(row)
+
+        # -- Batch Size --
+        tip_cls_batch = (
+            "Number of composite images processed per training step.\n\n"
+            "Larger batches give more stable gradient estimates and\n"
+            "faster training, but use more GPU memory.\n\n"
+            "16: good default for 128x128 composites (very small images).\n"
+            "8: use if you have very few training examples (<20).\n"
+            "32: use with larger datasets (100+) for faster training."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Batch size:")
+        lbl.setToolTip(tip_cls_batch)
+        row.addWidget(lbl)
+        self.spin_cls_batch = QSpinBox()
+        self.spin_cls_batch.setRange(4, 64)
+        self.spin_cls_batch.setValue(16)
+        self.spin_cls_batch.setToolTip(tip_cls_batch)
+        self.spin_cls_batch.setStyleSheet(spin_style)
+        row.addWidget(self.spin_cls_batch)
+        cls_train_vbox.addLayout(row)
+
+        # -- Validation Split --
+        tip_cls_val = (
+            "Fraction of composites held out for validation.\n\n"
+            "These images are NOT used for training. After each epoch,\n"
+            "validation loss is computed to detect overfitting and\n"
+            "trigger early stopping.\n\n"
+            "0.20 (20%%): good default. E.g., 50 clips → 40 train, 10 val.\n"
+            "0.10: use with very small datasets (<20 clips).\n"
+            "0.00: train on all clips. Not recommended — early stopping\n"
+            "  won't work and overfitting can't be detected."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Validation split:")
+        lbl.setToolTip(tip_cls_val)
+        row.addWidget(lbl)
+        self.spin_cls_val = QDoubleSpinBox()
+        self.spin_cls_val.setRange(0.0, 0.5)
+        self.spin_cls_val.setValue(0.20)
+        self.spin_cls_val.setSingleStep(0.05)
+        self.spin_cls_val.setDecimals(2)
+        self.spin_cls_val.setToolTip(tip_cls_val)
+        self.spin_cls_val.setStyleSheet(spin_style)
+        row.addWidget(self.spin_cls_val)
+        cls_train_vbox.addLayout(row)
+
+        # -- Augmentation --
+        tip_aug = (
+            "Apply random transformations to training images.\n\n"
+            "OFF (default): composites are used as-is. Fine for most\n"
+            "  datasets where you have enough examples per behavior.\n"
+            "ON: applies random horizontal flip, small rotation (±15°),\n"
+            "  and brightness jitter. Helps the model generalize when\n"
+            "  you have few examples per behavior (<10). Can slow\n"
+            "  training slightly."
+        )
+        self.chk_cls_augment = QCheckBox("Enable augmentation")
+        self.chk_cls_augment.setChecked(False)
+        self.chk_cls_augment.setToolTip(tip_aug)
+        cls_train_vbox.addWidget(self.chk_cls_augment)
+
+        self.btn_train_classifier = QPushButton("Train Behavior Classifier")
+        self.btn_train_classifier.setStyleSheet(
+            "QPushButton { background-color: #7b1fa2; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #9c27b0; }"
+            "QPushButton:disabled { background-color: #333333; color: #666666; }"
+        )
+        self.btn_train_classifier.setToolTip(
+            "Train a behavior classifier on the annotated clips.\n"
+            "Requires at least 2 behavior categories with labeled clips."
+        )
+        self.btn_train_classifier.clicked.connect(self._start_classifier_training)
+        self.btn_train_classifier.setEnabled(False)
+        cls_train_vbox.addWidget(self.btn_train_classifier)
+
+        self.cls_train_progress = QProgressBar()
+        self.cls_train_progress.setVisible(False)
+        cls_train_vbox.addWidget(self.cls_train_progress)
+
+        self.lbl_cls_train_status = QLabel("")
+        self.lbl_cls_train_status.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_cls_train_status.setWordWrap(True)
+        cls_train_vbox.addWidget(self.lbl_cls_train_status)
+
+        cls_train_group.setLayout(cls_train_vbox)
+        layout.addWidget(cls_train_group)
+
+        layout.addStretch()
+        scroll.setWidget(widget)
+        self.tab_widget.addTab(scroll, "Classifier")
+
     def _build_tracking_tab(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2466,7 +3792,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_frames_section(self, layout):
-        group = QGroupBox("3. Extracted Frames")
+        group = QGroupBox("3. Training Frames")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -2503,6 +3829,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         if not d:
             return
         self._project_dir = d
+        self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
         os.makedirs(os.path.join(d, "annotations"), exist_ok=True)
         os.makedirs(os.path.join(d, "models"), exist_ok=True)
@@ -2533,6 +3860,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         with open(config_path) as f:
             cfg = json.load(f)
         self._project_dir = os.path.dirname(config_path)
+        self._cls_data_loaded = False
         self._project_config = cfg
 
         saved_paths = cfg.get("video_paths", [])
@@ -2573,7 +3901,9 @@ class SAM2AnnotatorWindow(QMainWindow):
         if current_tab_idx == 1:  # Training
             self._refresh_training_summary()
             self._refresh_device_label()
-        elif current_tab_idx == 2:  # Tracking
+        elif current_tab_idx == 2:  # Classifier
+            self._refresh_classifier_models()
+        elif current_tab_idx == 3:  # Tracking
             self._refresh_model_list()
 
     def _save_project(self):
@@ -2660,6 +3990,15 @@ class SAM2AnnotatorWindow(QMainWindow):
         if row < 0 or row >= len(self.video_paths):
             return
         self.current_video_idx = row
+        self._annot_in_video_mode = True
+
+        # Deselect extracted frames — video and frame preview are mutually exclusive
+        self.frame_list.blockSignals(True)
+        self.frame_list.clearSelection()
+        self.frame_list.setCurrentRow(-1)
+        self.frame_list.blockSignals(False)
+
+        self.preview.annotations.clear()
         self._load_video(self.video_paths[row])
         self._update_nav_state()
 
@@ -2690,14 +4029,69 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._video_cap.release()
             self._video_cap = None
         self._video_frame_count = 0
+        self._video_frame_idx = 0
 
     def _show_video_frame(self, frame_idx: int):
         if self._video_cap is None:
             return
+        frame_idx = max(0, min(frame_idx, self._video_frame_count - 1))
+        self._video_frame_idx = frame_idx
         self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = self._video_cap.read()
         if ret:
+            if self.preview.annotations:
+                self.preview.annotations.clear()
             self.preview.set_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            self.lbl_frame_info.setText(
+                f"Frame: {frame_idx + 1} / {self._video_frame_count}"
+            )
+
+    def _extract_frame_from_video(self):
+        if self._video_cap is None or self.current_video_idx < 0:
+            return
+        if self._project_dir is None:
+            QMessageBox.information(
+                self, "Save Project First",
+                "Please save a project before extracting frames.",
+            )
+            self._new_project()
+            if self._project_dir is None:
+                return
+        if self._output_dir is None:
+            self._output_dir = os.path.join(self._project_dir, "training_frames")
+            self.lbl_output_dir.setText(self._output_dir)
+            self.lbl_output_dir.setStyleSheet("color: #cccccc; font-size: 10px;")
+        os.makedirs(self._output_dir, exist_ok=True)
+
+        vpath = self.video_paths[self.current_video_idx]
+        fidx = self._video_frame_idx
+        stem = Path(vpath).stem
+        fname = f"{stem}_frame_{fidx:06d}.png"
+        out_path = os.path.join(self._output_dir, fname)
+
+        if os.path.exists(out_path):
+            self.status_bar.showMessage(f"Frame already extracted: {fname}", 3000)
+        else:
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = self._video_cap.read()
+            if not ret:
+                self.status_bar.showMessage("Failed to read frame from video", 3000)
+                return
+            cv2.imwrite(out_path, frame)
+
+        existing_paths = {fp for _, _, fp in self._extracted_frames}
+        if out_path not in existing_paths:
+            self._extracted_frames.append((vpath, fidx, out_path))
+            self._extracted_frames.sort(key=lambda x: os.path.basename(x[2]))
+            self._refresh_frame_list()
+
+        # Select the extracted frame, switching to frame mode
+        for i, (_, _, fp) in enumerate(self._extracted_frames):
+            if fp == out_path:
+                self.frame_list.setCurrentRow(i)
+                break
+
+        self.status_bar.showMessage(f"Extracted frame: {fname}", 3000)
 
     # ==================================================================
     # Frame extraction
@@ -2878,6 +4272,14 @@ class SAM2AnnotatorWindow(QMainWindow):
         if row < 0 or row >= len(self._extracted_frames):
             return
         self.current_frame_idx = row
+        self._annot_in_video_mode = False
+
+        # Deselect video list — frame and video preview are mutually exclusive
+        self.video_list.blockSignals(True)
+        self.video_list.clearSelection()
+        self.video_list.setCurrentRow(-1)
+        self.video_list.blockSignals(False)
+
         _, _, img_path = self._extracted_frames[row]
         self._load_annotation_frame(img_path)
         self._update_nav_state()
@@ -2885,6 +4287,14 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _prev_frame(self):
         if self.current_frame_idx > 0:
             self.frame_list.setCurrentRow(self.current_frame_idx - 1)
+
+    def _on_advance_frame(self):
+        if self._annot_in_video_mode and self._video_cap is not None:
+            new_idx = self._video_frame_idx + 1
+            if new_idx < self._video_frame_count:
+                self._show_video_frame(new_idx)
+        else:
+            self._next_frame()
 
     def _next_frame(self):
         if self.current_frame_idx < len(self._extracted_frames) - 1:
@@ -2991,7 +4401,10 @@ class SAM2AnnotatorWindow(QMainWindow):
     # Mode changes
     # ==================================================================
     def _on_mode_changed(self, mode_name: str):
-        self.lbl_mode.setText(mode_name)
+        if mode_name == "AI-Assisted Mask":
+            self.lbl_mode.setText("AI Mask — Enter=accept, Esc=reject")
+        else:
+            self.lbl_mode.setText(mode_name)
         if self.preview.drawing_mode == "ai":
             self._ai_enabled = True
             self._ensure_sam2_loaded()
@@ -3111,7 +4524,9 @@ class SAM2AnnotatorWindow(QMainWindow):
 
     def _on_prediction_done(self, mask: np.ndarray, score: float):
         self.preview.set_ai_mask(mask, score)
-        self.status_bar.showMessage(f"SAM2 prediction (score={score:.3f})")
+        self.status_bar.showMessage(
+            f"SAM2 prediction (score={score:.3f}) — Enter to accept, Escape to reject"
+        )
 
     def _on_prediction_error(self, msg: str):
         self.status_bar.showMessage(f"Prediction error: {msg}")
@@ -3287,6 +4702,22 @@ class SAM2AnnotatorWindow(QMainWindow):
             self.lbl_hw_info.setText("\n".join(lines))
         except Exception as e:
             self.lbl_hw_info.setText(f"Hardware detection failed: {e}")
+
+    def _populate_cls_system_info(self):
+        try:
+            from .mask_tracker_inference import detect_system_profile
+            p = detect_system_profile()
+            parts = [p.get("chip", "Unknown")]
+            if p.get("has_cuda"):
+                parts.append(f"CUDA ({p.get('cuda_name', '?')})")
+            elif p.get("has_mps"):
+                parts.append("MPS (Apple Metal)")
+            else:
+                parts.append("CPU only")
+            parts.append(f"{p.get('ram_gb', '?')} GB RAM")
+            self.lbl_cls_system_info.setText(f"System: {' · '.join(parts)}")
+        except Exception:
+            self.lbl_cls_system_info.setText("System: detection failed")
 
     def _on_architecture_changed(self, index: int):
         arch_text = self.combo_architecture.currentText()
@@ -3752,6 +5183,1913 @@ class SAM2AnnotatorWindow(QMainWindow):
             print(f"[MTT] Sample preview error: {e}")
 
     # ==================================================================
+    # Classifier
+    # ==================================================================
+    def _refresh_classifier_models(self):
+        self.combo_cls_model.clear()
+        self._cls_model_dirs = []
+        if not self._project_dir:
+            self.lbl_cls_model_info.setText("No project open")
+            return
+        models_dir = os.path.join(self._project_dir, "models")
+        if not os.path.isdir(models_dir):
+            self.lbl_cls_model_info.setText("No models found")
+            return
+        for entry in sorted(os.listdir(models_dir)):
+            entry_path = os.path.join(models_dir, entry)
+            config_path = os.path.join(entry_path, "training_config.json")
+            if os.path.isdir(entry_path) and os.path.exists(config_path):
+                self._cls_model_dirs.append(entry_path)
+                label = entry
+                try:
+                    with open(config_path) as f:
+                        cfg = json.load(f)
+                    arch = cfg.get("architecture", "maskrcnn")
+                    cats = cfg.get("categories", {})
+                    cat_str = ", ".join(cats.values()) if cats else "unknown"
+                    label = f"{entry}  [{arch}: {cat_str}]"
+                except Exception:
+                    pass
+                self.combo_cls_model.addItem(label)
+        if not self._cls_model_dirs:
+            self.lbl_cls_model_info.setText("No trained models found — train one first")
+        else:
+            last_idx = len(self._cls_model_dirs) - 1
+            self.combo_cls_model.setCurrentIndex(last_idx)
+            self.lbl_cls_model_info.setText(
+                f"{len(self._cls_model_dirs)} model(s) — using latest"
+            )
+        self._update_classifier_state()
+
+    def _update_classifier_state(self):
+        has_model = len(getattr(self, "_cls_model_dirs", [])) > 0
+        has_video = getattr(self, "_cls_video_cap", None) is not None
+        self.btn_batch_extract.setEnabled(has_model and has_video)
+        self.btn_train_classifier.setEnabled(False)
+
+    def _show_behavior_categories_popup(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Behavior Categories")
+        dlg.setMinimumWidth(320)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #2b2b2b; color: #cccccc; }"
+            "QListWidget { background-color: #1e1e1e; border: 1px solid #444; color: #cccccc; }"
+            "QListWidget::item:selected { background-color: #7b1fa2; color: white; }"
+            "QLineEdit { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 4px; color: #cccccc; }"
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 5px 10px; color: #cccccc; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+        )
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Define behaviors to classify. Right-click a mask\n"
+            "in the preview to assign a behavior."
+        )
+        info.setStyleSheet("color: #888888; font-size: 9px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Preset loadouts
+        preset_row = QHBoxLayout()
+        lbl_preset = QLabel("Presets:")
+        lbl_preset.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        preset_row.addWidget(lbl_preset)
+        combo_preset = QComboBox()
+        combo_preset.addItems(list(BEHAVIOR_PRESETS.keys()))
+        combo_preset.setStyleSheet(
+            "QComboBox { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 3px; color: #cccccc; }"
+        )
+        combo_preset.setToolTip(
+            "Load a preset set of behavior categories.\n"
+            "This will replace any existing categories."
+        )
+        preset_row.addWidget(combo_preset, 1)
+        btn_load_preset = QPushButton("Load")
+        btn_load_preset.setToolTip("Replace current categories with the selected preset.")
+        preset_row.addWidget(btn_load_preset)
+        layout.addLayout(preset_row)
+
+        cat_list = QListWidget()
+        for i in range(self.list_cls_categories.count()):
+            src = self.list_cls_categories.item(i)
+            item = QListWidgetItem(src.text())
+            item.setForeground(src.foreground())
+            item.setData(Qt.UserRole, src.data(Qt.UserRole))
+            cat_list.addItem(item)
+        layout.addWidget(cat_list)
+
+        add_row = QHBoxLayout()
+        txt_new = QLineEdit()
+        txt_new.setPlaceholderText("New behavior name...")
+        add_row.addWidget(txt_new, 1)
+        btn_add = QPushButton("Add")
+        add_row.addWidget(btn_add)
+        layout.addLayout(add_row)
+
+        colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
+                  "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+
+        def _add():
+            name = txt_new.text().strip()
+            if not name:
+                return
+            for j in range(cat_list.count()):
+                if cat_list.item(j).data(Qt.UserRole)["name"] == name:
+                    return
+            color = colors[cat_list.count() % len(colors)]
+            item = QListWidgetItem(f"● {name}")
+            item.setForeground(QColor(color))
+            item.setData(Qt.UserRole, {"name": name, "color": color})
+            cat_list.addItem(item)
+            txt_new.clear()
+
+        btn_add.clicked.connect(_add)
+        txt_new.returnPressed.connect(_add)
+
+        def _load_preset():
+            preset_name = combo_preset.currentText()
+            behaviors = BEHAVIOR_PRESETS.get(preset_name, [])
+            if not behaviors:
+                return
+            if cat_list.count() > 0:
+                reply = QMessageBox.question(
+                    dlg, "Replace Categories?",
+                    f"Replace current categories with '{preset_name}' preset?\n\n"
+                    f"Behaviors: {', '.join(behaviors)}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            cat_list.clear()
+            for i, name in enumerate(behaviors):
+                color = colors[i % len(colors)]
+                item = QListWidgetItem(f"● {name}")
+                item.setForeground(QColor(color))
+                item.setData(Qt.UserRole, {"name": name, "color": color})
+                cat_list.addItem(item)
+
+        btn_load_preset.clicked.connect(_load_preset)
+
+        btn_row = QHBoxLayout()
+        btn_edit = QPushButton("Edit")
+        btn_remove = QPushButton("Remove")
+        btn_row.addWidget(btn_edit)
+        btn_row.addWidget(btn_remove)
+        layout.addLayout(btn_row)
+
+        def _edit():
+            item = cat_list.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.UserRole)
+            name, ok = QInputDialog.getText(
+                dlg, "Edit Category", "Behavior name:", text=data["name"]
+            )
+            if ok and name.strip():
+                data["name"] = name.strip()
+                item.setText(f"● {name.strip()}")
+                item.setData(Qt.UserRole, data)
+
+        def _remove():
+            row = cat_list.currentRow()
+            if row >= 0:
+                cat_list.takeItem(row)
+
+        btn_edit.clicked.connect(_edit)
+        btn_remove.clicked.connect(_remove)
+
+        btn_done = QPushButton("Done")
+        btn_done.setStyleSheet(
+            "QPushButton { background-color: #7b1fa2; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #9c27b0; }"
+        )
+        btn_done.clicked.connect(dlg.accept)
+        layout.addWidget(btn_done)
+
+        if dlg.exec_() == QDialog.Accepted:
+            new_names = set()
+            for i in range(cat_list.count()):
+                d = cat_list.item(i).data(Qt.UserRole)
+                if d:
+                    new_names.add(d["name"])
+
+            if not self._check_and_reset_clips_for_removed_behaviors(new_names):
+                return
+
+            self.list_cls_categories.clear()
+            for i in range(cat_list.count()):
+                src = cat_list.item(i)
+                item = QListWidgetItem(src.text())
+                item.setForeground(src.foreground())
+                item.setData(Qt.UserRole, src.data(Qt.UserRole))
+                self.list_cls_categories.addItem(item)
+
+    def _add_behavior_category(self):
+        name, ok = QInputDialog.getText(
+            self, "Add Behavior Category",
+            "Behavior name (e.g. grooming, rearing, locomotion):"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
+                  "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+        color = colors[self.list_cls_categories.count() % len(colors)]
+        item = QListWidgetItem(f"● {name}")
+        item.setForeground(QColor(color))
+        item.setData(Qt.UserRole, {"name": name, "color": color})
+        self.list_cls_categories.addItem(item)
+
+    def _edit_behavior_category(self):
+        item = self.list_cls_categories.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.UserRole)
+        name, ok = QInputDialog.getText(
+            self, "Edit Category", "Behavior name:", text=data["name"]
+        )
+        if not ok or not name.strip():
+            return
+        data["name"] = name.strip()
+        item.setText(f"● {name.strip()}")
+        item.setData(Qt.UserRole, data)
+
+    def _remove_behavior_category(self):
+        row = self.list_cls_categories.currentRow()
+        if row >= 0:
+            self.list_cls_categories.takeItem(row)
+
+    def _add_classifier_videos(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Videos for Annotation", "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm)"
+        )
+        for f in files:
+            if not any(
+                self.list_cls_videos.item(i).data(Qt.UserRole) == f
+                for i in range(self.list_cls_videos.count())
+            ):
+                item = QListWidgetItem(os.path.basename(f))
+                item.setData(Qt.UserRole, f)
+                self.list_cls_videos.addItem(item)
+        if files:
+            self.list_cls_videos.setCurrentRow(self.list_cls_videos.count() - 1)
+
+    def _clear_classifier_videos(self):
+        self.list_cls_videos.clear()
+        self._release_cls_video()
+        self.preview.clear()
+        self.preview.update()
+        self._update_classifier_state()
+
+    def _release_cls_video(self):
+        if self._cls_video_cap is not None:
+            self._cls_video_cap.release()
+            self._cls_video_cap = None
+        self._cls_video_path = None
+        self._cls_total_frames = 0
+        self._cls_frame_idx = 0
+        self._cls_clip_masks = {}
+
+    def _dismiss_cls_training_viz(self):
+        if self._cls_training_viz_panel.isVisible():
+            self._cls_training_viz_panel.setVisible(False)
+            self.preview.setVisible(True)
+            self._info_row.setVisible(True)
+            self._cls_nav_bar.setVisible(True)
+
+    def _on_cls_video_selected(self, current, previous):
+        if current is None:
+            return
+        video_path = current.data(Qt.UserRole)
+        if not video_path or not os.path.exists(video_path):
+            return
+
+        self._dismiss_cls_training_viz()
+
+        # Deselect clip queue — video and queue are mutually exclusive
+        self._exit_queue_mode()
+        self.list_clip_queue.blockSignals(True)
+        self.list_clip_queue.clearSelection()
+        self.list_clip_queue.setCurrentItem(None)
+        self.list_clip_queue.blockSignals(False)
+
+        if video_path == self._cls_video_path:
+            return
+
+        self._release_cls_video()
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            self.lbl_classifier_info.setText(f"Cannot open: {os.path.basename(video_path)}")
+            return
+
+        self._cls_video_cap = cap
+        self._cls_video_path = video_path
+        self._cls_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._cls_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._cls_frame_idx = 0
+
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setMaximum(max(self._cls_total_frames - 1, 0))
+        self._cls_frame_slider.setValue(0)
+        self._cls_frame_slider.blockSignals(False)
+
+        self._show_cls_frame(0)
+        self._update_classifier_state()
+        self.setFocus()
+
+    def _show_cls_frame(self, frame_idx: int):
+        if self._cls_video_cap is None:
+            return
+        if self.preview.annotations:
+            self.preview.annotations.clear()
+        self._lbl_preview_title.setText("Video Preview")
+        frame_idx = max(0, min(frame_idx, self._cls_total_frames - 1))
+        self._cls_video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = self._cls_video_cap.read()
+        if not ret:
+            return
+
+        self._cls_frame_idx = frame_idx
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Overlay extracted clip masks if we have them
+        if self._cls_clip_masks and self._cls_clip_start <= frame_idx:
+            clip_offset = frame_idx - self._cls_clip_start
+            frame_rgb = self._overlay_clip_masks(frame_rgb, clip_offset)
+
+        self.preview.set_frame(frame_rgb)
+
+        w = int(self._cls_video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cls_video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        t = frame_idx / self._cls_fps if self._cls_fps > 0 else 0
+        vname = os.path.basename(self._cls_video_path or "")
+
+        self.lbl_classifier_info.setText(
+            f"{vname}  —  {w}x{h}  frame {frame_idx}/{self._cls_total_frames}  "
+            f"({t:.1f}s)  [Left/Right: navigate, E: extract clip]"
+        )
+        self.lbl_cls_frame_num.setText(
+            f"{frame_idx} / {self._cls_total_frames}"
+        )
+
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setValue(frame_idx)
+        self._cls_frame_slider.blockSignals(False)
+
+    def _overlay_clip_masks(self, frame_rgb: np.ndarray, clip_offset: int) -> np.ndarray:
+        overlay = frame_rgb.copy()
+        colors = [
+            (233, 57, 53), (67, 160, 71), (30, 136, 229),
+            (251, 140, 0), (142, 36, 170), (0, 172, 193),
+        ]
+        for i, (obj_id, frames_data) in enumerate(self._cls_clip_masks.items()):
+            if clip_offset >= len(frames_data):
+                continue
+            det = frames_data[clip_offset]
+            if det is None:
+                continue
+            mask = det.get("mask")
+            if mask is None:
+                continue
+
+            color = colors[i % len(colors)]
+            mask_u8 = mask.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(overlay, contours, -1, color, 2, cv2.LINE_AA)
+
+            bbox = det["bbox"]
+            x1, y1 = int(bbox[0]), int(bbox[1])
+
+            label_text = f"ID {obj_id}"
+            clip_idx = getattr(self, "_cls_playback_clip_idx", -1)
+            if 0 <= clip_idx < len(self._batch_clips):
+                obj_info = self._batch_clips[clip_idx].get("objects", {}).get(str(obj_id), {})
+                beh = obj_info.get("behavior")
+                if beh:
+                    label_text = f"ID {obj_id}: {beh}"
+
+            text_org = (x1, max(y1 - 5, 12))
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            (tw, th), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
+            tx, ty = text_org
+            cv2.rectangle(
+                overlay,
+                (tx - 1, ty - th - 2),
+                (tx + tw + 1, ty + baseline + 1),
+                (0, 0, 0), cv2.FILLED,
+            )
+            cv2.putText(
+                overlay, label_text, text_org,
+                font, font_scale, color, thickness, cv2.LINE_AA,
+            )
+        return overlay
+
+    def _on_cls_slider_pressed(self):
+        self._stop_clip_playback()
+
+    def _on_cls_slider_changed(self, value: int):
+        self._stop_clip_playback()
+        if self._cls_in_queue_mode:
+            self._cls_playback_offset = value
+            self._show_queue_frame(value)
+        elif self._cls_pending_clip_mode:
+            self._cls_playback_offset = value
+            self._show_pending_frame(value)
+        else:
+            self._show_cls_frame(value)
+
+    def _cls_navigate(self, delta: int):
+        if self._cls_in_queue_mode:
+            frames = getattr(self, "_queue_frames", [])
+            if frames:
+                new_off = max(0, min(
+                    self._cls_playback_offset + delta, len(frames) - 1
+                ))
+                self._cls_playback_offset = new_off
+                self._show_queue_frame(new_off)
+        elif self._cls_pending_clip_mode:
+            frames = getattr(self, "_pending_frames", [])
+            if frames:
+                new_off = max(0, min(self._cls_playback_offset + delta, len(frames) - 1))
+                self._cls_playback_offset = new_off
+                self._show_pending_frame(new_off)
+        else:
+            new_idx = self._cls_frame_idx + delta
+            if 0 <= new_idx < self._cls_total_frames:
+                self._show_cls_frame(new_idx)
+
+    def keyPressEvent(self, event):
+        if self.tab_widget.currentIndex() == 0:  # Annotation tab
+            if self._annot_in_video_mode and self._video_cap is not None:
+                if event.key() == Qt.Key_Left:
+                    mod = event.modifiers()
+                    if mod & Qt.ShiftModifier:
+                        delta = -10
+                    elif mod & Qt.ControlModifier:
+                        delta = -100
+                    else:
+                        delta = -1
+                    self._show_video_frame(self._video_frame_idx + delta)
+                    return
+                elif event.key() == Qt.Key_Right:
+                    mod = event.modifiers()
+                    if mod & Qt.ShiftModifier:
+                        delta = 10
+                    elif mod & Qt.ControlModifier:
+                        delta = 100
+                    else:
+                        delta = 1
+                    self._show_video_frame(self._video_frame_idx + delta)
+                    return
+                elif event.key() == Qt.Key_E:
+                    self._extract_frame_from_video()
+                    return
+        elif self.tab_widget.currentIndex() == 2:  # Classifier tab
+            if event.key() == Qt.Key_Escape:
+                if self._cls_pending_clip_mode:
+                    self._exit_pending_clip_mode()
+                elif self._cls_in_queue_mode:
+                    self._exit_queue_mode()
+                return
+            elif event.key() == Qt.Key_Left:
+                self._stop_clip_playback()
+                mod = event.modifiers()
+                if mod & Qt.ShiftModifier:
+                    self._cls_navigate(-10)
+                elif mod & Qt.ControlModifier:
+                    self._cls_navigate(-100)
+                else:
+                    self._cls_navigate(-1)
+                return
+            elif event.key() == Qt.Key_Right:
+                self._stop_clip_playback()
+                mod = event.modifiers()
+                if mod & Qt.ShiftModifier:
+                    self._cls_navigate(10)
+                elif mod & Qt.ControlModifier:
+                    self._cls_navigate(100)
+                else:
+                    self._cls_navigate(1)
+                return
+            elif event.key() in (Qt.Key_Up, Qt.Key_Down):
+                if self._cls_in_queue_mode or self._cls_pending_clip_mode:
+                    was_playing = hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive()
+                    self._cls_playback_was_playing = was_playing
+                    self._stop_clip_playback()
+                    cur = self.list_clip_queue.currentRow()
+                    total = self.list_clip_queue.count()
+                    if total > 0:
+                        if event.key() == Qt.Key_Up:
+                            nxt = max(0, cur - 1)
+                        else:
+                            nxt = min(total - 1, cur + 1)
+                        if nxt != cur:
+                            self.list_clip_queue.setCurrentRow(nxt)
+                    return
+            elif event.key() == Qt.Key_E:
+                if self._cls_pending_clip_mode:
+                    return
+                self._exit_queue_mode()
+                self._extract_clip_at_current_frame()
+                return
+            elif event.key() == Qt.Key_D:
+                if self._cls_in_queue_mode:
+                    self._delete_current_clip()
+                    return
+            elif event.key() == Qt.Key_S:
+                if self._cls_in_queue_mode:
+                    self._advance_to_next_unlabeled_clip()
+                    return
+            elif event.key() == Qt.Key_Space:
+                if hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive():
+                    self._stop_clip_playback()
+                    self._cls_playback_was_playing = False
+                elif (self._cls_in_queue_mode
+                      or self._cls_pending_clip_mode
+                      or self._cls_video_cap is not None):
+                    self._cls_play_resume()
+                    self._cls_playback_was_playing = True
+                return
+        super().keyPressEvent(event)
+
+    def _extract_clip_at_current_frame(self):
+        if self._cls_video_cap is None:
+            QMessageBox.warning(self, "No Video", "Load a video first.")
+            return
+        model_idx = self.combo_cls_model.currentIndex()
+        if model_idx < 0 or model_idx >= len(getattr(self, "_cls_model_dirs", [])):
+            QMessageBox.warning(self, "No Model", "Select a mask model first.")
+            return
+
+        model_dir = self._cls_model_dirs[model_idx]
+        clip_length = self.spin_cls_clip_length.value()
+        confidence = self.spin_cls_confidence.value()
+        max_det = self.spin_cls_max_det.value()
+        start_frame = self._cls_frame_idx
+
+        self._cls_clip_masks = {}
+        self._cls_clip_start = start_frame
+        self.lbl_cls_extract_status.setText("Extracting clip masks...")
+        self.btn_batch_extract.setEnabled(False)
+
+        self._clip_extract_worker = _ClipExtractWorker(
+            model_dir, self._cls_video_path,
+            start_frame, clip_length, confidence, max_det,
+        )
+        self._clip_extract_worker.finished_ok.connect(self._on_clip_extract_done)
+        self._clip_extract_worker.error.connect(self._on_clip_extract_error)
+        self._clip_extract_worker.start()
+
+    def _on_clip_extract_done(self, clip_data: dict):
+        self._cls_clip_masks = clip_data
+        self.btn_batch_extract.setEnabled(True)
+        n_obj = len(clip_data)
+        clip_len = self.spin_cls_clip_length.value()
+
+        if n_obj == 0:
+            self.lbl_cls_extract_status.setText("No objects detected.")
+            self._show_cls_frame(self._cls_clip_start)
+            QMessageBox.warning(
+                self, "No Detections",
+                "No objects detected in this clip.\n\n"
+                "Possible causes:\n"
+                "• The selected model may be undertrained (stopped early)\n"
+                "• Confidence threshold may be too high\n"
+                "• No recognizable objects at this position\n\n"
+                "Try a different frame, lower the confidence, or select "
+                "a different model.",
+            )
+            return
+
+        has_any_mask = any(
+            det is not None and det.get("mask") is not None
+            for frames in clip_data.values()
+            for det in frames
+        )
+        if not has_any_mask:
+            self.lbl_cls_extract_status.setText("No masks in detections.")
+            self._show_cls_frame(self._cls_clip_start)
+            QMessageBox.warning(
+                self, "No Masks",
+                "Objects were detected but none had masks.\n\n"
+                "The model may not support instance segmentation, "
+                "or it may be undertrained. Try a different model.",
+            )
+            return
+
+        self._enter_pending_clip_mode(n_obj, clip_len)
+
+    def _on_clip_extract_error(self, msg: str):
+        self.btn_batch_extract.setEnabled(True)
+        self.lbl_cls_extract_status.setText(f"Error: {msg}")
+        QMessageBox.critical(self, "Extraction Error", msg)
+
+    def _enter_pending_clip_mode(self, n_obj: int, clip_len: int):
+        self._cls_pending_clip_mode = True
+        self._cls_playback_offset = 0
+
+        # Pre-read clip frames into memory to avoid repeated VideoCapture seeks
+        self._pending_frames = []
+        if self._cls_video_cap is not None:
+            self._cls_video_cap.set(cv2.CAP_PROP_POS_FRAMES, self._cls_clip_start)
+            for _ in range(clip_len):
+                ret, frame = self._cls_video_cap.read()
+                if not ret:
+                    break
+                self._pending_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setMinimum(0)
+        self._cls_frame_slider.setMaximum(max(len(self._pending_frames) - 1, 0))
+        self._cls_frame_slider.setValue(0)
+        self._cls_frame_slider.blockSignals(False)
+
+        self.lbl_cls_extract_status.setText(
+            f"Pending clip — {n_obj} object(s), {len(self._pending_frames)} frames. "
+            f"Right-click mask to label, Escape to cancel."
+        )
+        self.preview._cls_mask_handler = self._on_cls_mask_right_click
+
+        self._show_pending_frame(0)
+        self._cls_play_resume()
+
+    def _show_pending_frame(self, offset: int):
+        frames = getattr(self, "_pending_frames", [])
+        if not frames:
+            return
+        self._lbl_preview_title.setText("Clip Preview — Right-click mask to label · Esc to exit")
+        offset = max(0, min(offset, len(frames) - 1))
+        frame_rgb = frames[offset].copy()
+
+        if self._cls_clip_masks:
+            frame_rgb = self._overlay_clip_masks(frame_rgb, offset)
+
+        self.preview.set_frame(frame_rgb)
+        self._cls_frame_idx = self._cls_clip_start + offset
+
+        clip_len = len(frames)
+        self.lbl_classifier_info.setText(
+            f"PENDING CLIP  —  frame {offset + 1}/{clip_len}  "
+            f"[Right-click mask to label, Esc to cancel]"
+        )
+        self.lbl_cls_frame_num.setText(f"{offset} / {clip_len}")
+
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setValue(offset)
+        self._cls_frame_slider.blockSignals(False)
+
+    def _exit_pending_clip_mode(self):
+        self._stop_clip_playback()
+        self._cls_pending_clip_mode = False
+        self._cls_clip_masks = {}
+        self._pending_frames = []
+        if self._cls_video_cap is not None:
+            self._cls_frame_slider.blockSignals(True)
+            self._cls_frame_slider.setMinimum(0)
+            self._cls_frame_slider.setMaximum(
+                max(self._cls_total_frames - 1, 0)
+            )
+            self._cls_frame_slider.setValue(self._cls_frame_idx)
+            self._cls_frame_slider.blockSignals(False)
+            self._show_cls_frame(self._cls_frame_idx)
+        self.lbl_cls_extract_status.setText("")
+
+    def _on_cls_mask_right_click(self, img_x: int, img_y: int, global_pos):
+        if not self._cls_clip_masks:
+            return False
+
+        if self._cls_in_queue_mode or self._cls_pending_clip_mode:
+            clip_offset = getattr(self, "_cls_playback_offset", 0)
+        else:
+            clip_offset = self._cls_frame_idx - self._cls_clip_start
+        if clip_offset < 0:
+            return False
+
+        hit_obj_id = None
+        for obj_id, frames_data in self._cls_clip_masks.items():
+            if clip_offset >= len(frames_data):
+                continue
+            det = frames_data[clip_offset]
+            if det is None:
+                continue
+            mask = det.get("mask")
+            if mask is None:
+                continue
+            if 0 <= img_y < mask.shape[0] and 0 <= img_x < mask.shape[1]:
+                if mask[img_y, img_x]:
+                    hit_obj_id = obj_id
+                    break
+
+        if hit_obj_id is None:
+            return False
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #2b2b2b; color: #cccccc; border: 1px solid #555; }"
+            "QMenu::item:selected { background-color: #2979ff; }"
+        )
+        current_behavior = None
+        clip_idx = getattr(self, "_cls_playback_clip_idx", -1)
+        if 0 <= clip_idx < len(self._batch_clips):
+            obj_info = self._batch_clips[clip_idx].get("objects", {}).get(str(hit_obj_id), {})
+            current_behavior = obj_info.get("behavior")
+
+        menu.addAction(f"Object {hit_obj_id} — Assign behavior:").setEnabled(False)
+        menu.addSeparator()
+        for i in range(self.list_cls_categories.count()):
+            cat_item = self.list_cls_categories.item(i)
+            data = cat_item.data(Qt.UserRole)
+            label = f"● {data['name']}"
+            if current_behavior and data["name"] == current_behavior:
+                label += "  [selected]"
+            act = menu.addAction(label)
+            act.setData({"obj_id": hit_obj_id, "behavior": data["name"], "color": data["color"]})
+
+        menu.addSeparator()
+        add_new_act = menu.addAction("+ Add new behavior...")
+
+        # Preset loadouts submenu
+        preset_menu = menu.addMenu("Load preset...")
+        preset_menu.setStyleSheet(
+            "QMenu { background-color: #2b2b2b; color: #cccccc; border: 1px solid #555; }"
+            "QMenu::item:selected { background-color: #2979ff; }"
+        )
+        preset_actions = {}
+        for preset_name, behaviors in BEHAVIOR_PRESETS.items():
+            act = preset_menu.addAction(f"{preset_name}  ({', '.join(behaviors)})")
+            preset_actions[id(act)] = (preset_name, behaviors)
+
+        chosen = menu.exec_(global_pos)
+        if not chosen:
+            return True
+
+        if id(chosen) in preset_actions:
+            _, behaviors = preset_actions[id(chosen)]
+            new_names = set(behaviors)
+            if not self._check_and_reset_clips_for_removed_behaviors(new_names):
+                return True
+            colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
+                      "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+            self.list_cls_categories.clear()
+            for i, name in enumerate(behaviors):
+                color = colors[i % len(colors)]
+                item = QListWidgetItem(f"● {name}")
+                item.setForeground(QColor(color))
+                item.setData(Qt.UserRole, {"name": name, "color": color})
+                self.list_cls_categories.addItem(item)
+            self.status_bar.showMessage(
+                f"Loaded preset: {', '.join(behaviors)}", 3000
+            )
+            return True
+
+        if chosen is add_new_act:
+            name, ok = QInputDialog.getText(
+                self, "New Behavior", "Behavior name:"
+            )
+            if not ok or not name.strip():
+                return True
+            name = name.strip()
+            colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
+                      "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+            color = colors[self.list_cls_categories.count() % len(colors)]
+            item = QListWidgetItem(f"● {name}")
+            item.setForeground(QColor(color))
+            item.setData(Qt.UserRole, {"name": name, "color": color})
+            self.list_cls_categories.addItem(item)
+            label_data = {"obj_id": hit_obj_id, "behavior": name, "color": color}
+        elif chosen.data():
+            label_data = chosen.data()
+        else:
+            return True
+
+        if self._cls_in_queue_mode:
+            self._label_batch_clip(label_data)
+        else:
+            self._export_manual_clip(label_data)
+        return True
+
+    # ==================================================================
+    # Clip storage helpers (disk-backed clips)
+    # ==================================================================
+    def _clips_base_dir(self) -> str:
+        return os.path.join(self._project_dir, "behavior_classifier", "clips")
+
+    def _next_clip_id(self) -> str:
+        base = self._clips_base_dir()
+        if not os.path.isdir(base):
+            return "clip_0001"
+        existing = [
+            d for d in os.listdir(base)
+            if d.startswith("clip_") and os.path.isdir(os.path.join(base, d))
+        ]
+        if not existing:
+            return "clip_0001"
+        nums = []
+        for d in existing:
+            try:
+                nums.append(int(d.split("_")[1]))
+            except (IndexError, ValueError):
+                pass
+        return f"clip_{max(nums) + 1:04d}" if nums else "clip_0001"
+
+    def _save_clip_to_disk(self, video_path, start_frame, clip_length,
+                           fps, masks_dict, status="pending"):
+        clip_id = self._next_clip_id()
+        clip_dir = os.path.join(self._clips_base_dir(), clip_id)
+        os.makedirs(clip_dir, exist_ok=True)
+
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            os.path.join(clip_dir, "frames.mp4"),
+            fourcc, fps, (frame_w, frame_h),
+        )
+        actual_frames = 0
+        for _ in range(clip_length):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            writer.write(frame)
+            actual_frames += 1
+        writer.release()
+        cap.release()
+
+        mask_arrays = {}
+        for obj_id, frames_data in masks_dict.items():
+            per_frame = []
+            for det in frames_data:
+                if det is not None and det.get("mask") is not None:
+                    per_frame.append(det["mask"].astype(bool))
+                else:
+                    per_frame.append(np.zeros((frame_h, frame_w), dtype=bool))
+            mask_arrays[f"obj_{obj_id}"] = np.stack(per_frame, axis=0)
+        np.savez_compressed(os.path.join(clip_dir, "masks.npz"), **mask_arrays)
+
+        objects = {}
+        for obj_id in masks_dict:
+            objects[str(obj_id)] = {"behavior": None, "color": None}
+
+        meta = {
+            "clip_id": clip_id,
+            "source_video": video_path,
+            "start_frame": start_frame,
+            "clip_length": actual_frames,
+            "fps": fps,
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "num_objects": len(masks_dict),
+            "status": status,
+            "objects": objects,
+        }
+        with open(os.path.join(clip_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        return clip_dir
+
+    def _load_clip_frames(self, clip_dir):
+        mp4_path = os.path.join(clip_dir, "frames.mp4")
+        if not os.path.exists(mp4_path):
+            return []
+        cap = cv2.VideoCapture(mp4_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        return frames
+
+    def _load_clip_masks(self, clip_dir):
+        npz_path = os.path.join(clip_dir, "masks.npz")
+        if not os.path.exists(npz_path):
+            return {}
+        data = np.load(npz_path)
+        masks_dict = {}
+        for key in data.files:
+            obj_id = int(key.replace("obj_", ""))
+            arr = data[key]  # (N, H, W) bool
+            frames_data = []
+            for i in range(arr.shape[0]):
+                mask = arr[i]
+                ys, xs = np.where(mask)
+                if len(ys) == 0:
+                    frames_data.append(None)
+                    continue
+                x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                frames_data.append({
+                    "mask": mask,
+                    "bbox": (x1, y1, x2, y2),
+                    "centroid": (cx, cy),
+                })
+            masks_dict[obj_id] = frames_data
+        return masks_dict
+
+    def _save_clip_label(self, clip_dir, obj_id, behavior, color):
+        meta_path = os.path.join(clip_dir, "meta.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["objects"][str(obj_id)] = {"behavior": behavior, "color": color}
+        any_labeled = any(
+            v["behavior"] is not None for v in meta["objects"].values()
+        )
+        meta["status"] = "labeled" if any_labeled else "pending"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        masks_dict = self._load_clip_masks(clip_dir)
+        if obj_id in masks_dict:
+            from .silhouette_extractor import generate_composite
+            mask_crops = []
+            for det in masks_dict[obj_id]:
+                if det is None:
+                    mask_crops.append(None)
+                    continue
+                mask = det["mask"]
+                bbox = det["bbox"]
+                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                crop = mask[y1:y2, x1:x2]
+                mask_crops.append(crop.astype(bool))
+            composite = generate_composite(mask_crops, output_size=(128, 128))
+            comp_path = os.path.join(clip_dir, f"composite_obj{obj_id}.png")
+            cv2.imwrite(comp_path, cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+
+    def _delete_clip_from_disk(self, clip_dir):
+        if os.path.isdir(clip_dir):
+            shutil.rmtree(clip_dir)
+
+    def _scan_clips_from_disk(self):
+        base = self._clips_base_dir()
+        if not os.path.isdir(base):
+            return []
+        results = []
+        for d in sorted(os.listdir(base)):
+            clip_dir = os.path.join(base, d)
+            meta_path = os.path.join(clip_dir, "meta.json")
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                results.append((clip_dir, meta))
+            except Exception:
+                continue
+        return results
+
+    def _export_manual_clip(self, label_data: dict):
+        if not self._project_dir:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        if not self._cls_clip_masks:
+            return
+
+        reply = QMessageBox.question(
+            self, "Export Clip",
+            f"Export clip as '{label_data['behavior']}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        clip_dir = self._save_clip_to_disk(
+            self._cls_video_path,
+            self._cls_clip_start,
+            self.spin_cls_clip_length.value(),
+            self._cls_fps,
+            self._cls_clip_masks,
+            status="labeled",
+        )
+
+        self._save_clip_label(
+            clip_dir, label_data["obj_id"],
+            label_data["behavior"], label_data["color"],
+        )
+
+        meta_path = os.path.join(clip_dir, "meta.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        idx = len(self._batch_clips)
+        self._batch_clips.append({
+            "clip_dir": clip_dir,
+            "clip_id": meta["clip_id"],
+            "source_video": self._cls_video_path,
+            "start_frame": self._cls_clip_start,
+            "clip_length": meta["clip_length"],
+            "status": "labeled",
+            "objects": meta.get("objects", {}),
+        })
+
+        vname = os.path.basename(self._cls_video_path)
+        t = self._cls_clip_start / self._cls_fps if self._cls_fps > 0 else 0
+        item = QListWidgetItem(
+            f"✔ {vname}  frame {self._cls_clip_start}  ({t:.1f}s)  "
+            f"→ {label_data['behavior']}"
+        )
+        item.setForeground(QColor("#4fc456"))
+        item.setData(Qt.UserRole, idx)
+        self.list_clip_queue.blockSignals(True)
+        self.list_clip_queue.addItem(item)
+        self.list_clip_queue.clearSelection()
+        self.list_clip_queue.setCurrentItem(None)
+        self.list_clip_queue.blockSignals(False)
+
+        self._stop_clip_playback()
+        self._cls_pending_clip_mode = False
+        self._cls_clip_masks = {}
+        self._pending_frames = []
+
+        if self._cls_video_cap is not None:
+            self._cls_frame_slider.blockSignals(True)
+            self._cls_frame_slider.setMinimum(0)
+            self._cls_frame_slider.setMaximum(
+                max(self._cls_total_frames - 1, 0)
+            )
+            self._cls_frame_slider.setValue(self._cls_frame_idx)
+            self._cls_frame_slider.blockSignals(False)
+
+        self._show_cls_frame(self._cls_frame_idx)
+        self.setFocus()
+        self._refresh_cls_annotation_stats()
+        self.lbl_cls_extract_status.setText(
+            f"Clip exported as '{label_data['behavior']}'. "
+            f"Continue scrubbing or press E for another clip."
+        )
+
+    def _load_classifier_data_from_disk(self):
+        if not self._project_dir:
+            return
+
+        saved_clips = self._scan_clips_from_disk()
+        if not saved_clips:
+            return
+
+        self._batch_clips = []
+        self.list_clip_queue.clear()
+
+        colors_default = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
+                          "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+        seen_behaviors = {}
+
+        for idx, (clip_dir, meta) in enumerate(saved_clips):
+            clip_id = meta.get("clip_id", "?")
+            source = meta.get("source_video", "")
+            start = meta.get("start_frame", 0)
+            fps = meta.get("fps", 30.0)
+            status = meta.get("status", "pending")
+            objects = meta.get("objects", {})
+            n_obj = meta.get("num_objects", 0)
+            t = start / fps if fps > 0 else 0
+            vname = os.path.basename(source)
+
+            behaviors = [
+                v["behavior"] for v in objects.values()
+                if v.get("behavior")
+            ]
+
+            if status == "labeled" and behaviors:
+                beh_str = ", ".join(behaviors)
+                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {beh_str}"
+                color = QColor("#4fc456")
+            else:
+                text = f"● {vname}  frame {start}  ({t:.1f}s)  [{n_obj} obj]"
+                color = QColor("#e6c830")
+
+            item = QListWidgetItem(text)
+            item.setForeground(color)
+            item.setData(Qt.UserRole, idx)
+            self.list_clip_queue.addItem(item)
+
+            self._batch_clips.append({
+                "clip_dir": clip_dir,
+                "clip_id": clip_id,
+                "source_video": source,
+                "start_frame": start,
+                "clip_length": meta.get("clip_length", 15),
+                "status": status,
+                "objects": objects,
+            })
+
+            for v in objects.values():
+                beh = v.get("behavior")
+                clr = v.get("color")
+                if beh and beh not in seen_behaviors:
+                    seen_behaviors[beh] = clr or colors_default[
+                        len(seen_behaviors) % len(colors_default)
+                    ]
+
+        if seen_behaviors and self.list_cls_categories.count() == 0:
+            for beh, clr in seen_behaviors.items():
+                item = QListWidgetItem(f"● {beh}")
+                item.setForeground(QColor(clr))
+                item.setData(Qt.UserRole, {"name": beh, "color": clr})
+                self.list_cls_categories.addItem(item)
+
+        self._cls_data_loaded = True
+
+    def _refresh_cls_annotation_stats(self):
+        if not self._batch_clips:
+            self.lbl_cls_annotation_stats.setText("No clips yet")
+            self.lbl_cls_train_data.setText("Training data: —")
+            self.lbl_cls_train_reqs.setText(
+                "⚠ Requires at least 2 behavior categories with labeled clips to train."
+            )
+            self.btn_train_classifier.setEnabled(False)
+            return
+        from collections import Counter
+        counts = Counter()
+        n_composites = 0
+        for clip in self._batch_clips:
+            for obj_id_str, v in clip.get("objects", {}).items():
+                beh = v.get("behavior")
+                if beh:
+                    counts[beh] += 1
+                    comp = os.path.join(
+                        clip.get("clip_dir", ""),
+                        f"composite_obj{obj_id_str}.png",
+                    )
+                    if clip.get("clip_dir") and os.path.isfile(comp):
+                        n_composites += 1
+        if not counts:
+            total_clips = len(self._batch_clips)
+            labeled = sum(1 for c in self._batch_clips if c["status"] == "labeled")
+            self.lbl_cls_annotation_stats.setText(
+                f"{total_clips} clips ({labeled} labeled)"
+            )
+            self.lbl_cls_train_data.setText("Training data: no labeled clips yet")
+            self.lbl_cls_train_reqs.setText(
+                "⚠ Requires at least 2 behavior categories with labeled clips to train."
+            )
+            self.btn_train_classifier.setEnabled(False)
+            return
+        labeled_clips = sum(1 for c in self._batch_clips if c["status"] == "labeled")
+        total_clips = len(self._batch_clips)
+        parts = [f"{name}: {n}" for name, n in counts.most_common()]
+        self.lbl_cls_annotation_stats.setText(
+            f"{labeled_clips}/{total_clips} clips labeled — " + ", ".join(parts)
+        )
+
+        n_categories = len(counts)
+        total_labels = sum(counts.values())
+        data_lines = [
+            f"Composites: {n_composites}  |  Classes: {n_categories}",
+            "  ".join(f"{name}: {n}" for name, n in counts.most_common()),
+        ]
+        self.lbl_cls_train_data.setText("\n".join(data_lines))
+
+        can_train = n_categories >= 2
+        self.btn_train_classifier.setEnabled(can_train)
+        if can_train:
+            self.lbl_cls_train_reqs.setText("")
+        else:
+            self.lbl_cls_train_reqs.setText(
+                f"⚠ Need at least 2 behavior categories (have {n_categories}). "
+                f"Label clips with different behaviors to enable training."
+            )
+
+    def _get_current_category_names(self) -> set:
+        names = set()
+        for i in range(self.list_cls_categories.count()):
+            data = self.list_cls_categories.item(i).data(Qt.UserRole)
+            if data:
+                names.add(data["name"])
+        return names
+
+    def _check_and_reset_clips_for_removed_behaviors(
+        self, new_names: set, parent=None,
+    ) -> bool:
+        """Check if switching to *new_names* would orphan any labeled clips.
+
+        If so, show a confirmation dialog with a breakdown.  On confirm (or if
+        nothing is affected), reset the orphaned clips and return True.
+        On cancel, return False.
+        """
+        if parent is None:
+            parent = self
+        affected: dict[str, int] = {}
+        for clip in self._batch_clips:
+            if clip["status"] != "labeled":
+                continue
+            for v in clip.get("objects", {}).values():
+                beh = v.get("behavior")
+                if beh and beh not in new_names:
+                    affected[beh] = affected.get(beh, 0) + 1
+
+        if not affected:
+            return True
+
+        total = sum(affected.values())
+        breakdown = "\n".join(f"  • {name}: {n} clip(s)" for name, n in sorted(affected.items()))
+        reply = QMessageBox.warning(
+            parent, "Reset Labeled Clips?",
+            f"This will reset {total} labeled clip(s) back to pending:\n\n"
+            f"{breakdown}\n\n"
+            f"Affected clips will need to be re-labeled.\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        removed_names = set(affected.keys())
+        for idx, clip in enumerate(self._batch_clips):
+            if clip["status"] != "labeled":
+                continue
+            needs_reset = False
+            for v in clip.get("objects", {}).values():
+                beh = v.get("behavior")
+                if beh and beh in removed_names:
+                    needs_reset = True
+                    break
+            if not needs_reset:
+                continue
+
+            for v in clip.get("objects", {}).values():
+                if v.get("behavior") and v["behavior"] in removed_names:
+                    v["behavior"] = None
+                    v["color"] = None
+
+            any_labeled = any(
+                v.get("behavior") is not None for v in clip.get("objects", {}).values()
+            )
+            clip["status"] = "labeled" if any_labeled else "pending"
+
+            if clip.get("clip_dir"):
+                meta_path = os.path.join(clip["clip_dir"], "meta.json")
+                if os.path.isfile(meta_path):
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    for k, v in meta.get("objects", {}).items():
+                        if v.get("behavior") and v["behavior"] in removed_names:
+                            v["behavior"] = None
+                            v["color"] = None
+                    any_labeled_disk = any(
+                        v.get("behavior") is not None
+                        for v in meta.get("objects", {}).values()
+                    )
+                    meta["status"] = "labeled" if any_labeled_disk else "pending"
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+
+            item = self.list_clip_queue.item(idx)
+            if item and clip["status"] == "pending":
+                old_text = item.text()
+                if "→" in old_text:
+                    old_text = old_text.split("→")[0].rstrip()
+                new_text = old_text.replace("✔", "●", 1)
+                item.setText(new_text)
+                item.setForeground(QColor("#ffb300"))
+
+        self._refresh_cls_annotation_stats()
+        return True
+
+    # --- Batch extraction ---
+    def _start_batch_extraction(self):
+        model_idx = self.combo_cls_model.currentIndex()
+        if model_idx < 0 or model_idx >= len(getattr(self, "_cls_model_dirs", [])):
+            QMessageBox.warning(self, "No Model", "Select a mask model first.")
+            return
+        if self.list_cls_videos.count() == 0:
+            QMessageBox.warning(self, "No Videos", "Add annotation videos first.")
+            return
+        if not self._project_dir:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+
+        model_dir = self._cls_model_dirs[model_idx]
+        clip_length = self.spin_cls_clip_length.value()
+        confidence = self.spin_cls_confidence.value()
+        max_det = self.spin_cls_max_det.value()
+        method = self.combo_batch_method.currentIndex()
+        n_clips = self.spin_batch_count.value()
+
+        clip_positions = []
+        video_fps = {}
+        for i in range(self.list_cls_videos.count()):
+            vpath = self.list_cls_videos.item(i).data(Qt.UserRole)
+            cap = cv2.VideoCapture(vpath)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps_val = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap.release()
+            video_fps[vpath] = fps_val
+            if total <= clip_length:
+                continue
+
+            max_start = total - clip_length
+            if method == 0:  # Uniform
+                starts = [int(j * max_start / max(n_clips - 1, 1))
+                          for j in range(n_clips)]
+            elif method == 1:  # Random
+                starts = sorted(random.sample(
+                    range(max_start), min(n_clips, max_start)
+                ))
+            else:  # Every Nth frame
+                stride = n_clips
+                starts = list(range(0, max_start, stride))
+
+            for s in starts:
+                clip_positions.append((vpath, s))
+
+        if not clip_positions:
+            QMessageBox.warning(self, "No Clips", "Videos too short for clip extraction.")
+            return
+
+        clips_base = self._clips_base_dir()
+        os.makedirs(clips_base, exist_ok=True)
+
+        # Determine starting clip number
+        existing = self._scan_clips_from_disk()
+        if existing:
+            last_num = max(
+                int(m["clip_id"].split("_")[1])
+                for _, m in existing
+            )
+            start_num = last_num + 1
+        else:
+            start_num = 1
+
+        # Add placeholder items to queue
+        queue_start_idx = len(self._batch_clips)
+        for idx, (vpath, start) in enumerate(clip_positions):
+            vname = os.path.basename(vpath)
+            fps_val = video_fps.get(vpath, 30.0)
+            t = start / fps_val if fps_val > 0 else 0
+            item = QListWidgetItem(f"● {vname}  frame {start}  ({t:.1f}s)")
+            item.setForeground(QColor("#e6c830"))
+            item.setData(Qt.UserRole, queue_start_idx + idx)
+            self.list_clip_queue.addItem(item)
+            self._batch_clips.append({
+                "clip_dir": None,
+                "clip_id": None,
+                "source_video": vpath,
+                "start_frame": start,
+                "clip_length": clip_length,
+                "status": "extracting",
+                "objects": {},
+            })
+
+        self.btn_batch_extract.setEnabled(False)
+        self.lbl_cls_annotation_stats.setText(
+            f"Extracting {len(clip_positions)} clips..."
+        )
+
+        self._batch_queue_offset = queue_start_idx
+        self._batch_worker = _BatchClipExtractWorker(
+            model_dir, clip_positions, clip_length, confidence, max_det,
+            clips_base, start_num,
+        )
+        self._batch_worker.clip_ready.connect(self._on_batch_clip_ready)
+        self._batch_worker.all_done.connect(self._on_batch_done)
+        self._batch_worker.error.connect(self._on_batch_error)
+        self._batch_worker.start()
+
+    def _on_batch_clip_ready(self, clip_idx, clip_dir):
+        real_idx = getattr(self, "_batch_queue_offset", 0) + clip_idx
+        if real_idx >= len(self._batch_clips):
+            return
+        meta_path = os.path.join(clip_dir, "meta.json")
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except Exception:
+            return
+
+        self._batch_clips[real_idx].update({
+            "clip_dir": clip_dir,
+            "clip_id": meta["clip_id"],
+            "status": "pending",
+            "objects": meta.get("objects", {}),
+            "clip_length": meta.get("clip_length", 15),
+        })
+
+        item = self.list_clip_queue.item(real_idx)
+        if item:
+            vname = os.path.basename(meta.get("source_video", ""))
+            n_obj = meta.get("num_objects", 0)
+            start = meta.get("start_frame", 0)
+            fps = meta.get("fps", 30.0)
+            t = start / fps if fps > 0 else 0
+            item.setText(
+                f"● {vname}  frame {start}  ({t:.1f}s)  [{n_obj} obj]"
+            )
+
+        done = sum(1 for c in self._batch_clips if c["clip_dir"] is not None)
+        total = len(self._batch_clips)
+        self.lbl_cls_annotation_stats.setText(
+            f"Extracted {done}/{total} clips"
+        )
+
+    def _on_batch_done(self):
+        self.btn_batch_extract.setEnabled(True)
+        self._refresh_cls_annotation_stats()
+
+    def _on_batch_error(self, msg):
+        self.btn_batch_extract.setEnabled(True)
+        QMessageBox.critical(self, "Batch Extraction Error", msg)
+
+    def _on_clip_queue_selected(self, current, previous):
+        if current is None:
+            self._stop_clip_playback()
+            if self._cls_in_queue_mode:
+                self._cls_in_queue_mode = False
+                self._cls_clip_masks = {}
+                self._queue_frames = []
+                self._lbl_preview_title.setText("")
+                self.preview.set_frame(np.zeros((100, 100, 3), dtype=np.uint8))
+            return
+        idx = current.data(Qt.UserRole)
+        if idx is None or idx >= len(getattr(self, "_batch_clips", [])):
+            return
+
+        self._dismiss_cls_training_viz()
+
+        # Deselect video list — video and queue are mutually exclusive
+        self.list_cls_videos.blockSignals(True)
+        self.list_cls_videos.clearSelection()
+        self.list_cls_videos.setCurrentItem(None)
+        self.list_cls_videos.blockSignals(False)
+
+        clip = self._batch_clips[idx]
+
+        if clip["clip_dir"] is None:
+            self.lbl_cls_extract_status.setText("Clip still extracting...")
+            return
+
+        self._cls_playback_clip_idx = idx
+        self._cls_playback_offset = 0
+        self._cls_in_queue_mode = True
+        self._cls_pending_clip_mode = False
+
+        # Load frames and masks from disk
+        self._queue_frames = self._load_clip_frames(clip["clip_dir"])
+        self._cls_clip_masks = self._load_clip_masks(clip["clip_dir"])
+        self._cls_clip_start = 0  # queue frames are 0-indexed
+
+        clip_length = len(self._queue_frames)
+        if clip_length == 0:
+            self.lbl_cls_extract_status.setText("Clip has no frames.")
+            return
+
+        # Set slider range for clip playback
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setMinimum(0)
+        self._cls_frame_slider.setMaximum(clip_length - 1)
+        self._cls_frame_slider.setValue(0)
+        self._cls_frame_slider.blockSignals(False)
+
+        # Determine fps from meta
+        meta_path = os.path.join(clip["clip_dir"], "meta.json")
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self._cls_fps = meta.get("fps", 30.0)
+        except Exception:
+            self._cls_fps = 30.0
+
+        self._show_queue_frame(0)
+        if self._cls_playback_was_playing:
+            self._cls_play_resume()
+        n_obj = len(self._cls_clip_masks)
+        status = clip.get("status", "pending")
+        if status == "labeled":
+            behaviors = [
+                v["behavior"] for v in clip.get("objects", {}).values()
+                if v.get("behavior")
+            ]
+            self.lbl_cls_extract_status.setText(
+                f"Labeled: {', '.join(behaviors)}. Right-click to re-label."
+            )
+        else:
+            self.lbl_cls_extract_status.setText(
+                f"Playing clip — {n_obj} object(s). Right-click mask to label."
+            )
+
+    def _show_queue_frame(self, offset):
+        if not hasattr(self, "_queue_frames") or not self._queue_frames:
+            return
+        self._lbl_preview_title.setText("Clip Preview — Right-click mask to label")
+        offset = max(0, min(offset, len(self._queue_frames) - 1))
+        frame_rgb = self._queue_frames[offset].copy()
+
+        if self._cls_clip_masks:
+            frame_rgb = self._overlay_clip_masks(frame_rgb, offset)
+
+        self.preview.set_frame(frame_rgb)
+        self._cls_frame_idx = offset
+
+        clip_idx = getattr(self, "_cls_playback_clip_idx", -1)
+        clip = self._batch_clips[clip_idx] if 0 <= clip_idx < len(self._batch_clips) else {}
+        clip_id = clip.get("clip_id", "?")
+        total = len(self._queue_frames)
+        self.lbl_classifier_info.setText(
+            f"{clip_id}  —  frame {offset + 1}/{total}"
+        )
+        self.lbl_cls_frame_num.setText(f"{offset} / {total}")
+
+        self._cls_frame_slider.blockSignals(True)
+        self._cls_frame_slider.setValue(offset)
+        self._cls_frame_slider.blockSignals(False)
+
+    def _advance_clip_playback(self):
+        if self._cls_in_queue_mode:
+            frames = getattr(self, "_queue_frames", [])
+            if not frames:
+                return
+            self._cls_playback_offset = (self._cls_playback_offset + 1) % len(frames)
+            self._show_queue_frame(self._cls_playback_offset)
+        elif self._cls_pending_clip_mode:
+            frames = getattr(self, "_pending_frames", [])
+            if not frames:
+                return
+            self._cls_playback_offset = (self._cls_playback_offset + 1) % len(frames)
+            self._show_pending_frame(self._cls_playback_offset)
+        elif self._cls_video_cap is not None:
+            new_idx = self._cls_frame_idx + 1
+            if new_idx >= self._cls_total_frames:
+                self._stop_clip_playback()
+                return
+            self._show_cls_frame(new_idx)
+
+    def _stop_clip_playback(self):
+        if hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive():
+            self._clip_play_timer.stop()
+        if hasattr(self, "_btn_cls_play_pause"):
+            self._btn_cls_play_pause.setText("▶")
+
+    def _cls_play_resume(self):
+        if not hasattr(self, "_clip_play_timer"):
+            self._clip_play_timer = QTimer(self)
+            self._clip_play_timer.timeout.connect(self._advance_clip_playback)
+        if self._clip_play_timer.isActive():
+            return
+        fps = self._cls_fps if self._cls_fps > 0 else 30.0
+        interval = max(1, int(1000 / (fps * self._cls_speed_multiplier)))
+        self._clip_play_timer.start(interval)
+        self._btn_cls_play_pause.setText("⏸")
+
+    def _cls_toggle_playback(self):
+        if hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive():
+            self._stop_clip_playback()
+            self._cls_playback_was_playing = False
+        elif (self._cls_in_queue_mode
+              or self._cls_pending_clip_mode
+              or self._cls_video_cap is not None):
+            self._cls_play_resume()
+            self._cls_playback_was_playing = True
+        self.setFocus()
+
+    def _on_cls_speed_changed(self, idx):
+        speed_map = [0.5, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0]
+        self._cls_speed_multiplier = speed_map[idx] if idx < len(speed_map) else 1.0
+        if hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive():
+            fps = self._cls_fps if self._cls_fps > 0 else 30.0
+            interval = max(1, int(1000 / (fps * self._cls_speed_multiplier)))
+            self._clip_play_timer.setInterval(interval)
+
+    def _exit_queue_mode(self):
+        self._stop_clip_playback()
+        self._cls_in_queue_mode = False
+        self._cls_pending_clip_mode = False
+        self._cls_clip_masks = {}
+        self._queue_frames = []
+        # Restore slider to full video range
+        if self._cls_video_cap is not None:
+            self._cls_frame_slider.blockSignals(True)
+            self._cls_frame_slider.setMinimum(0)
+            self._cls_frame_slider.setMaximum(
+                max(self._cls_total_frames - 1, 0)
+            )
+            self._cls_frame_slider.setValue(self._cls_frame_idx)
+            self._cls_frame_slider.blockSignals(False)
+            self._show_cls_frame(self._cls_frame_idx)
+        self.lbl_cls_extract_status.setText("")
+
+    def _advance_to_next_unlabeled_clip(self):
+        was_playing = hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive()
+        self._cls_playback_was_playing = was_playing
+        self._stop_clip_playback()
+        if not self._batch_clips:
+            return
+        current = self.list_clip_queue.currentRow()
+        n = len(self._batch_clips)
+        for offset in range(1, n + 1):
+            idx = (current + offset) % n
+            clip = self._batch_clips[idx]
+            if clip["status"] == "pending" and clip["clip_dir"] is not None:
+                self.list_clip_queue.setCurrentRow(idx)
+                return
+        self.lbl_cls_extract_status.setText("All clips labeled!")
+
+    def _delete_current_clip(self):
+        idx = getattr(self, "_cls_playback_clip_idx", -1)
+        if idx < 0 or idx >= len(self._batch_clips):
+            return
+
+        reply = QMessageBox.question(
+            self, "Delete Clip",
+            "Delete this clip from disk?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        was_playing = hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive()
+        self._cls_playback_was_playing = was_playing
+        self._stop_clip_playback()
+
+        clip = self._batch_clips[idx]
+        if clip.get("clip_dir"):
+            self._delete_clip_from_disk(clip["clip_dir"])
+        self._batch_clips.pop(idx)
+
+        self._cls_in_queue_mode = False
+        self._cls_clip_masks = {}
+        self._queue_frames = []
+
+        self.list_clip_queue.clear()
+        for i, c in enumerate(self._batch_clips):
+            vname = os.path.basename(c.get("source_video", ""))
+            start = c.get("start_frame", 0)
+            fps_meta = 30.0
+            if c.get("clip_dir"):
+                try:
+                    with open(os.path.join(c["clip_dir"], "meta.json")) as f:
+                        fps_meta = json.load(f).get("fps", 30.0)
+                except Exception:
+                    pass
+            t = start / fps_meta if fps_meta > 0 else 0
+            if c["status"] == "labeled":
+                behaviors = [
+                    v["behavior"] for v in c.get("objects", {}).values()
+                    if v.get("behavior")
+                ]
+                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {', '.join(behaviors)}"
+                color = QColor("#4fc456")
+            else:
+                n_obj = len(c.get("objects", {}))
+                text = f"● {vname}  frame {start}  ({t:.1f}s)  [{n_obj} obj]"
+                color = QColor("#e6c830")
+            item = QListWidgetItem(text)
+            item.setForeground(color)
+            item.setData(Qt.UserRole, i)
+            self.list_clip_queue.addItem(item)
+
+        self._refresh_cls_annotation_stats()
+
+        if self._batch_clips:
+            self._advance_to_next_unlabeled_clip()
+        else:
+            self._lbl_preview_title.setText("")
+            self.preview.set_frame(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    def _label_batch_clip(self, label_data: dict):
+        idx = getattr(self, "_cls_playback_clip_idx", -1)
+        if idx < 0 or idx >= len(self._batch_clips):
+            return
+
+        clip = self._batch_clips[idx]
+        if not clip["clip_dir"]:
+            return
+
+        self._save_clip_label(
+            clip["clip_dir"], label_data["obj_id"],
+            label_data["behavior"], label_data.get("color", "#cccccc"),
+        )
+
+        clip["status"] = "labeled"
+        clip["objects"][str(label_data["obj_id"])] = {
+            "behavior": label_data["behavior"],
+            "color": label_data.get("color", "#cccccc"),
+        }
+
+        item = self.list_clip_queue.item(idx)
+        if item:
+            old_text = item.text()
+            new_text = old_text.replace("●", "✔", 1)
+            if "→" in new_text:
+                new_text = new_text.split("→")[0].rstrip()
+            if label_data["behavior"]:
+                new_text += f"  → {label_data['behavior']}"
+            item.setText(new_text)
+            item.setForeground(QColor("#4fc456"))
+
+        self._refresh_cls_annotation_stats()
+        self._advance_to_next_unlabeled_clip()
+
+    def _delete_selected_clips(self):
+        selected = self.list_clip_queue.selectedItems()
+        if not selected:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Clips",
+            f"Delete {len(selected)} clip(s) from disk?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._stop_clip_playback()
+        self._cls_in_queue_mode = False
+        self._cls_pending_clip_mode = False
+
+        indices = sorted(
+            [item.data(Qt.UserRole) for item in selected if item.data(Qt.UserRole) is not None],
+            reverse=True,
+        )
+        for idx in indices:
+            if 0 <= idx < len(self._batch_clips):
+                clip = self._batch_clips[idx]
+                if clip.get("clip_dir"):
+                    self._delete_clip_from_disk(clip["clip_dir"])
+                self._batch_clips.pop(idx)
+
+        # Rebuild queue list
+        self.list_clip_queue.clear()
+        for idx, clip in enumerate(self._batch_clips):
+            vname = os.path.basename(clip.get("source_video", ""))
+            start = clip.get("start_frame", 0)
+            fps_meta = 30.0
+            if clip.get("clip_dir"):
+                try:
+                    with open(os.path.join(clip["clip_dir"], "meta.json")) as f:
+                        fps_meta = json.load(f).get("fps", 30.0)
+                except Exception:
+                    pass
+            t = start / fps_meta if fps_meta > 0 else 0
+            if clip["status"] == "labeled":
+                behaviors = [
+                    v["behavior"] for v in clip.get("objects", {}).values()
+                    if v.get("behavior")
+                ]
+                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {', '.join(behaviors)}"
+                color = QColor("#4fc456")
+            else:
+                n_obj = len(clip.get("objects", {}))
+                text = f"● {vname}  frame {start}  ({t:.1f}s)  [{n_obj} obj]"
+                color = QColor("#e6c830")
+            item = QListWidgetItem(text)
+            item.setForeground(color)
+            item.setData(Qt.UserRole, idx)
+            self.list_clip_queue.addItem(item)
+
+        self._refresh_cls_annotation_stats()
+
+    def _delete_all_clips(self):
+        if not self._batch_clips:
+            return
+        reply = QMessageBox.question(
+            self, "Delete All Clips",
+            f"Delete all {len(self._batch_clips)} clips from disk?\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._stop_clip_playback()
+        self._cls_in_queue_mode = False
+        self._cls_pending_clip_mode = False
+
+        for clip in self._batch_clips:
+            if clip.get("clip_dir"):
+                self._delete_clip_from_disk(clip["clip_dir"])
+
+        self._batch_clips = []
+        self.list_clip_queue.clear()
+        self._refresh_cls_annotation_stats()
+
+    def _start_classifier_training(self):
+        composite_paths = []
+        labels = []
+        class_name_set = set()
+
+        for clip in self._batch_clips:
+            if clip["status"] != "labeled" or clip["clip_dir"] is None:
+                continue
+            for obj_id_str, obj_info in clip.get("objects", {}).items():
+                beh = obj_info.get("behavior")
+                if not beh:
+                    continue
+                comp_path = os.path.join(
+                    clip["clip_dir"], f"composite_obj{obj_id_str}.png"
+                )
+                if os.path.isfile(comp_path):
+                    composite_paths.append(comp_path)
+                    class_name_set.add(beh)
+                    labels.append(beh)
+
+        class_names = sorted(class_name_set)
+        if len(class_names) < 2:
+            QMessageBox.warning(
+                self, "Insufficient Data",
+                "Need at least 2 behavior categories with composite images.\n"
+                "Label more clips and ensure composites were generated."
+            )
+            return
+
+        label_indices = [class_names.index(l) for l in labels]
+
+        from datetime import datetime
+        backbone_tag = self.combo_cls_backbone.currentText().replace("-", "").replace(" ", "")
+        run_name = f"{backbone_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        output_dir = os.path.join(
+            self._project_dir, "behavior_classifier", "model", run_name
+        )
+
+        config = {
+            "composite_paths": composite_paths,
+            "labels": label_indices,
+            "class_names": class_names,
+            "epochs": self.spin_cls_epochs.value(),
+            "lr": self.spin_cls_lr.value(),
+            "batch_size": self.spin_cls_batch.value(),
+            "val_split": self.spin_cls_val.value(),
+            "augment": self.chk_cls_augment.isChecked(),
+            "backbone": self.combo_cls_backbone.currentText(),
+            "output_dir": output_dir,
+        }
+
+        self.btn_train_classifier.setEnabled(False)
+        self.cls_train_progress.setMaximum(config["epochs"])
+        self.cls_train_progress.setValue(0)
+        self.cls_train_progress.setVisible(True)
+        self.lbl_cls_train_status.setText("Starting classifier training...")
+
+        # Show loss plot in preview area
+        self.preview.setVisible(False)
+        self._cls_nav_bar.setVisible(False)
+        self._lbl_preview_title.setText("Training Preview")
+        self._lbl_preview_title.setVisible(True)
+        self._cls_training_viz_panel.setVisible(True)
+        self._cls_loss_plot.reset(config["epochs"])
+
+        self._cls_train_worker = _ClassifierTrainWorker(config)
+        self._cls_train_worker.epoch_done.connect(self._on_cls_train_epoch)
+        self._cls_train_worker.log_message.connect(self._on_cls_train_log)
+        self._cls_train_worker.finished.connect(self._on_cls_train_finished)
+        self._cls_train_worker.error.connect(self._on_cls_train_error)
+        self._cls_train_worker.start()
+
+    def _on_cls_train_log(self, msg):
+        print(msg)
+        self.lbl_cls_train_status.setText(msg.replace("[Classifier] ", ""))
+
+    def _on_cls_train_epoch(self, epoch, train_loss, val_loss, val_acc):
+        self.cls_train_progress.setValue(epoch)
+        self._cls_loss_plot.add_point(epoch, train_loss, val_loss, val_acc)
+        parts = [f"Epoch {epoch}/{self.spin_cls_epochs.value()}",
+                 f"train loss: {train_loss:.4f}"]
+        if val_loss > 0:
+            parts.append(f"val loss: {val_loss:.4f}")
+        if val_acc > 0:
+            parts.append(f"val acc: {val_acc:.1%}")
+        self.lbl_cls_train_status.setText("  —  ".join(parts))
+
+    def _on_cls_train_finished(self, summary):
+        self.cls_train_progress.setVisible(False)
+        self.btn_train_classifier.setEnabled(True)
+
+        n_epochs = summary.get("epochs_trained", 0)
+        best_loss = summary.get("best_val_loss")
+        classes = summary.get("class_names", [])
+        msg = f"Training complete — {n_epochs} epochs, {len(classes)} classes"
+        if best_loss is not None:
+            msg += f", best val loss: {best_loss:.4f}"
+        self.lbl_cls_train_status.setText(msg)
+
+        output_dir = summary.get("output_dir", "")
+        self.status_bar.showMessage(
+            f"Classifier saved to {output_dir}", 10000
+        )
+
+        # Restore preview area (keep loss plot visible until user navigates away)
+        self._lbl_preview_title.setText("Training Complete")
+        self._cls_train_worker = None
+
+    def _on_cls_train_error(self, msg):
+        self.cls_train_progress.setVisible(False)
+        self.btn_train_classifier.setEnabled(True)
+        self.lbl_cls_train_status.setText(f"Training error: {msg}")
+
+        # Restore preview
+        self._cls_training_viz_panel.setVisible(False)
+        self.preview.setVisible(True)
+        self._cls_nav_bar.setVisible(True)
+
+        QMessageBox.critical(self, "Classifier Training Error", msg)
+
+    # ==================================================================
     # Tracking
     # ==================================================================
     def _refresh_model_list(self):
@@ -4131,26 +7469,67 @@ class SAM2AnnotatorWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", output_dir])
 
     def _on_tab_changed(self, index: int):
-        # Use index (0=Annotation, 1=Training, 2=Tracking) instead of
-        # tab text, since tab text may include animated dots.
+        # Tab indices: 0=Annotation, 1=Training, 2=Classifier, 3=Tracking
         is_annotation = index == 0
         is_training = index == 1
-        is_tracking = index == 2
+        is_classifier = index == 2
+        is_tracking = index == 3
+
+        self.preview.annotation_keys_enabled = is_annotation
 
         # Annotation bar: only on Annotation tab
         for w in self._annotation_bar_widgets:
             w.setVisible(is_annotation)
+        # Classifier info + Edit Behaviors button: only on Classifier tab
+        self.lbl_classifier_info.setVisible(is_classifier)
+        self.btn_edit_behaviors.setVisible(is_classifier)
         # Tracking info label: only on Tracking tab
         self.lbl_tracking_info.setVisible(is_tracking)
-        # Preview + info row: visible on Annotation and Tracking tabs, hidden on Training
-        self.preview.setVisible(not is_training)
-        self._info_row.setVisible(not is_training)
+        # Classifier: stop playback and clear mask handler when leaving tab
+        if not is_classifier:
+            self.preview._cls_mask_handler = None
+            self._stop_clip_playback()
+
+        # Check if classifier training is in progress
+        cls_training_active = (
+            hasattr(self, "_cls_train_worker")
+            and self._cls_train_worker is not None
+            and self._cls_train_worker.isRunning()
+        )
+        cls_show_loss = is_classifier and cls_training_active
+
+        # Frame slider + preview title: only on Classifier tab
+        self._cls_nav_bar.setVisible(is_classifier and not cls_training_active)
+        self._lbl_preview_title.setVisible(is_classifier)
+        # Classifier training loss panel
+        self._cls_training_viz_panel.setVisible(cls_show_loss)
+        # Preview + info row: visible on Annotation, Classifier, and Tracking tabs
+        # (hidden during classifier training or when on Training tab)
+        self.preview.setVisible(not is_training and not cls_show_loss)
+        self._info_row.setVisible(not is_training and not cls_show_loss)
         # Training visualization panel: only on Training tab
         self._training_viz_panel.setVisible(is_training)
 
         if is_training:
             self._refresh_training_summary()
             self._refresh_device_label()
+        elif is_classifier:
+            self.preview.annotations.clear()
+            self.preview._cls_mask_handler = self._on_cls_mask_right_click
+            self._refresh_classifier_models()
+            if not getattr(self, "_cls_data_loaded", False):
+                self._load_classifier_data_from_disk()
+            self._refresh_cls_annotation_stats()
+            current = self.list_cls_videos.currentItem()
+            if current:
+                self._on_cls_video_selected(current, None)
+            else:
+                self.preview.clear()
+                self.preview.update()
+                self.lbl_classifier_info.setText(
+                    "Add videos to begin annotating behaviors"
+                )
+            self.setFocus()
         elif is_tracking:
             if self._project_dir is None:
                 reply = QMessageBox.question(
