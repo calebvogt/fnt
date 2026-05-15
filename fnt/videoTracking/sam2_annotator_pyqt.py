@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
+    QTextEdit,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt5.QtGui import (
@@ -1058,11 +1059,20 @@ class InferenceWorker(QThread):
     all_done = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, video_paths, model_dir, config_dict):
+    def __init__(self, video_paths, model_dir, config_dict,
+                 classifier_dir=None, nc_threshold=0.5,
+                 cls_window=15, show_preview=True,
+                 min_bout=5, uncertain_gap=0.10):
         super().__init__()
         self.video_paths = list(video_paths)
         self.model_dir = model_dir
         self.config_dict = config_dict
+        self.classifier_dir = classifier_dir
+        self.nc_threshold = nc_threshold
+        self.cls_window = cls_window
+        self.show_preview = show_preview
+        self.min_bout = min_bout
+        self.uncertain_gap = uncertain_gap
         self._stop_flag = False
         self._pause_flag = False
 
@@ -1076,12 +1086,84 @@ class InferenceWorker(QThread):
     def request_resume(self):
         self._pause_flag = False
 
+    def _load_classifier(self):
+        """Load the behavior classifier model. Returns (model, class_names, device) or None."""
+        if not self.classifier_dir:
+            return None
+        import torch
+        from torchvision import models
+        cfg_path = os.path.join(self.classifier_dir, "classifier_config.json")
+        weights_path = os.path.join(self.classifier_dir, "best_classifier.pth")
+        if not os.path.isfile(cfg_path) or not os.path.isfile(weights_path):
+            print(f"[Classifier Inference] Missing config or weights in {self.classifier_dir}")
+            return None
+
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        class_names = cfg.get("class_names", [])
+        n_classes = cfg.get("n_classes", len(class_names))
+        backbone = cfg.get("backbone", "ResNet-18")
+
+        from torch import nn
+        if backbone == "ResNet-34":
+            model = models.resnet34(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, n_classes)
+        elif backbone == "MobileNetV3":
+            model = models.mobilenet_v3_small(weights=None)
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_classes)
+        else:
+            model = models.resnet18(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, n_classes)
+
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+
+        model.load_state_dict(torch.load(weights_path, map_location=device))
+        model = model.to(device)
+        model.eval()
+
+        print(f"[Classifier Inference] Loaded {backbone} ({n_classes} classes: "
+              f"{', '.join(class_names)}) on {device.upper()}")
+        return model, class_names, device
+
+    @staticmethod
+    def _apply_min_bout_filter(rows, min_bout):
+        """Replace behavior bouts shorter than min_bout frames with NC.
+
+        Groups consecutive same-behavior predictions per object. Bouts
+        shorter than min_bout are relabeled NC to suppress flickering.
+        """
+        from itertools import groupby
+
+        per_obj = {}
+        for i, r in enumerate(rows):
+            per_obj.setdefault(r["object_id"], []).append(i)
+
+        for obj_id, indices in per_obj.items():
+            labels = [rows[i]["behavior"] for i in indices]
+            for _, grp in groupby(enumerate(labels), key=lambda x: x[1]):
+                grp_list = list(grp)
+                if len(grp_list) < min_bout and grp_list[0][1] != "NC":
+                    for local_pos, _ in grp_list:
+                        rows[indices[local_pos]]["behavior"] = "NC"
+
     def run(self):
         try:
             from .mask_tracker_inference import MaskInferenceConfig, run_inference_on_video
+            from .silhouette_extractor import generate_composite
             import time as _pause_time
 
             config = MaskInferenceConfig(**self.config_dict)
+
+            cls_info = self._load_classifier()
+            cls_model = cls_class_names = cls_device = None
+            torch = None
+            if cls_info:
+                cls_model, cls_class_names, cls_device = cls_info
+                import torch
 
             def _check_stop():
                 while self._pause_flag and not self._stop_flag:
@@ -1089,11 +1171,74 @@ class InferenceWorker(QThread):
                 return self._stop_flag
 
             def _on_frame(frame_rgb, frame_idx):
-                self.frame_ready.emit(frame_rgb, frame_idx)
+                if self.show_preview:
+                    self.frame_ready.emit(frame_rgb, frame_idx)
 
             for video_path in self.video_paths:
                 if self._stop_flag:
                     break
+
+                from collections import deque
+                mask_buffers: dict = {}
+                current_labels: dict = {}
+                behavior_rows: list = []
+
+                def _track_cb(matched, frame_idx, fps):
+                    if cls_model is None:
+                        return None
+
+                    for obj_id, det in matched.items():
+                        if obj_id not in mask_buffers:
+                            mask_buffers[obj_id] = deque(maxlen=self.cls_window)
+                        mask = det.get("mask")
+                        if mask is not None:
+                            bbox = det["bbox"]
+                            h_f = mask.shape[0]
+                            w_f = mask.shape[1]
+                            x1 = max(0, int(round(float(bbox[0]))))
+                            y1 = max(0, int(round(float(bbox[1]))))
+                            x2 = min(w_f, int(round(float(bbox[2]))))
+                            y2 = min(h_f, int(round(float(bbox[3]))))
+                            if x2 > x1 and y2 > y1:
+                                mask_buffers[obj_id].append(mask[y1:y2, x1:x2])
+                            else:
+                                mask_buffers[obj_id].append(None)
+                        else:
+                            mask_buffers[obj_id].append(None)
+
+                    for obj_id in list(mask_buffers.keys()):
+                        buf = mask_buffers[obj_id]
+                        if len(buf) < self.cls_window:
+                            continue
+
+                        window = list(buf)
+                        composite = generate_composite(window, output_size=(128, 128))
+                        img = composite.astype(np.float32) / 255.0
+                        inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
+                        with torch.no_grad():
+                            logits = cls_model(inp)
+                            probs = torch.softmax(logits, dim=1)[0]
+                            sorted_probs, sorted_idx = probs.sort(descending=True)
+                            conf = sorted_probs[0].item()
+                            pred_idx = sorted_idx[0].item()
+                            gap = (sorted_probs[0] - sorted_probs[1]).item() if len(sorted_probs) > 1 else conf
+
+                        if conf < self.nc_threshold or gap < self.uncertain_gap:
+                            beh_name = "NC"
+                        else:
+                            beh_name = cls_class_names[pred_idx]
+                        current_labels[obj_id] = (beh_name, conf)
+
+                        behavior_rows.append({
+                            "frame": frame_idx,
+                            "object_id": obj_id,
+                            "behavior": beh_name,
+                            "confidence": round(conf, 4),
+                            "gap": round(gap, 4),
+                        })
+
+                    return current_labels if current_labels else None
+
                 result = run_inference_on_video(
                     video_path,
                     self.model_dir,
@@ -1101,8 +1246,28 @@ class InferenceWorker(QThread):
                     progress=lambda f, t: self.progress.emit(f, t),
                     should_stop=_check_stop,
                     frame_callback=_on_frame,
+                    track_callback=_track_cb if cls_model else None,
                 )
                 result["video_path"] = video_path
+
+                if behavior_rows:
+                    self._apply_min_bout_filter(behavior_rows, self.min_bout)
+
+                    import csv
+                    out_dir = result.get("output_dir", "")
+                    beh_csv = os.path.join(out_dir, "behavior_predictions.csv")
+                    fieldnames = ["frame", "object_id", "behavior", "confidence", "gap"]
+                    with open(beh_csv, "w", newline="") as f:
+                        w = csv.DictWriter(f, fieldnames=fieldnames)
+                        w.writeheader()
+                        w.writerows(behavior_rows)
+                    result["behavior_csv"] = beh_csv
+                    n_pred = len(behavior_rows)
+                    n_nc = sum(1 for r in behavior_rows if r["behavior"] == "NC")
+                    n_objs = len(set(r["object_id"] for r in behavior_rows))
+                    print(f"[Classifier Inference] Saved {n_pred} predictions "
+                          f"({n_nc} NC) for {n_objs} objects → {beh_csv}")
+
                 self.video_finished.emit(result)
 
             self.all_done.emit()
@@ -1399,6 +1564,7 @@ class _ClassifierTrainWorker(QThread):
         batch_size = self.config["batch_size"]
         val_split = self.config["val_split"]
         augment = self.config["augment"]
+        freeze_backbone = self.config.get("freeze_backbone", False)
         backbone = self.config["backbone"]
         output_dir = self.config["output_dir"]
 
@@ -1412,7 +1578,7 @@ class _ClassifierTrainWorker(QThread):
         )
         self.log_message.emit(
             f"[Classifier] Config: backbone={backbone}, epochs={epochs}, "
-            f"lr={lr}, batch_size={batch_size}, val_split={val_split}, augment={augment}"
+            f"lr={lr:.4f}, batch_size={batch_size}, val_split={val_split}, augment={augment}"
         )
 
         class CompositeDataset(Dataset):
@@ -1442,25 +1608,67 @@ class _ClassifierTrainWorker(QThread):
                 transforms.ColorJitter(brightness=0.2),
             ])
 
-        dataset = CompositeDataset(composite_paths, labels, aug_transform)
-        n_val = max(1, int(len(dataset) * val_split)) if val_split > 0 else 0
-        n_train = len(dataset) - n_val
+        n_total = len(composite_paths)
+        n_val = max(1, int(n_total * val_split)) if val_split > 0 else 0
+
         if n_val > 0:
-            train_ds, val_ds = random_split(dataset, [n_train, n_val])
-            val_ds.dataset = CompositeDataset(composite_paths, labels, None)
+            import random as _rnd
+            from collections import defaultdict as _ddict
+            per_class: dict[int, list[int]] = _ddict(list)
+            for i, lbl in enumerate(labels):
+                per_class[lbl].append(i)
+
+            train_idx, val_idx = [], []
+            for cls_id, idxs in per_class.items():
+                _rnd.shuffle(idxs)
+                n_cls_val = max(1, int(len(idxs) * val_split))
+                val_idx.extend(idxs[:n_cls_val])
+                train_idx.extend(idxs[n_cls_val:])
+
+            if not train_idx:
+                train_idx = val_idx[:]
+
+            train_paths = [composite_paths[i] for i in train_idx]
+            train_labels = [labels[i] for i in train_idx]
+            val_paths = [composite_paths[i] for i in val_idx]
+            val_labels = [labels[i] for i in val_idx]
+
+            train_ds = CompositeDataset(train_paths, train_labels, aug_transform)
+            val_ds = CompositeDataset(val_paths, val_labels, None)
+            n_train = len(train_idx)
+            n_val = len(val_idx)
         else:
-            train_ds = dataset
+            train_ds = CompositeDataset(composite_paths, labels, aug_transform)
             val_ds = None
+            n_train = n_total
+            n_val = 0
 
         self.log_message.emit(
-            f"[Classifier] Split: {n_train} train, {n_val} val"
+            f"[Classifier] Split: {n_train} train, {n_val} val (stratified per class)"
         )
+
+        n_classes = len(class_names)
+
+        from collections import Counter as _Counter
+        train_counts = _Counter(train_ds.targets if hasattr(train_ds, "targets") else train_labels)
+        for cls_idx, cls_name in enumerate(class_names):
+            cnt = train_counts.get(cls_idx, 0)
+            self.log_message.emit(f"[Classifier]   {cls_name}: {cnt} train")
+
+        if n_train < 10 * n_classes:
+            self.log_message.emit(
+                f"[Classifier] ⚠ Small dataset: {n_train} train samples for {n_classes} classes. "
+                f"Consider labeling more clips (aim for 10+ per class) for better results."
+            )
+        if n_val > 0 and n_val < n_classes:
+            self.log_message.emit(
+                f"[Classifier] ⚠ Val set ({n_val}) smaller than class count ({n_classes}). "
+                f"Val metrics will be noisy."
+            )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                   drop_last=False)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
-
-        n_classes = len(class_names)
         if backbone == "ResNet-34":
             model = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
             model.fc = nn.Linear(model.fc.in_features, n_classes)
@@ -1471,29 +1679,56 @@ class _ClassifierTrainWorker(QThread):
             model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
             model.fc = nn.Linear(model.fc.in_features, n_classes)
 
+        if freeze_backbone:
+            for param in model.parameters():
+                param.requires_grad = False
+            if backbone == "MobileNetV3":
+                for param in model.classifier[-1].parameters():
+                    param.requires_grad = True
+            else:
+                for param in model.fc.parameters():
+                    param.requires_grad = True
+
         device = "cpu"
         if torch.cuda.is_available():
             device = "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
         model = model.to(device)
-        n_params = sum(p.numel() for p in model.parameters())
+        n_total = sum(p.numel() for p in model.parameters())
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.log_message.emit(
-            f"[Classifier] Model: {backbone} ({n_params:,} params) on {device.upper()}"
+            f"[Classifier] Model: {backbone} ({n_total:,} params, "
+            f"{n_trainable:,} trainable) on {device.upper()}"
         )
+        if freeze_backbone:
+            self.log_message.emit(
+                f"[Classifier] Backbone frozen — training only the classifier head"
+            )
         self.log_message.emit(
-            f"[Classifier] Optimizer: AdamW (lr={lr}, weight_decay=1e-4) + CosineAnnealingLR"
+            f"[Classifier] Optimizer: AdamW (lr={lr:.4f}, weight_decay=1e-4) + CosineAnnealingLR"
         )
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=lr, weight_decay=1e-4,
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         criterion = nn.CrossEntropyLoss()
 
         best_val_loss = float("inf")
         patience_counter = 0
-        patience = 10
+        early_stopping = self.config.get("early_stopping", True)
+        patience = 20 if early_stopping else epochs
 
-        self.log_message.emit(f"[Classifier] Starting training for {epochs} epochs (early stopping patience={patience})")
+        if early_stopping:
+            self.log_message.emit(f"[Classifier] Starting training for {epochs} epochs (early stopping patience={patience})")
+        else:
+            self.log_message.emit(f"[Classifier] Starting training for {epochs} epochs (early stopping disabled)")
+        best_epoch = 0
+        all_train_losses = []
+        all_val_losses = []
+        best_val_acc = 0.0
 
         for epoch in range(1, epochs + 1):
             if self._stop_flag:
@@ -1535,8 +1770,11 @@ class _ClassifierTrainWorker(QThread):
                 val_loss = v_loss / max(len(val_loader), 1)
                 val_acc = correct / max(total, 1)
 
+                all_val_losses.append(val_loss)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_epoch = epoch
+                    best_val_acc = val_acc
                     patience_counter = 0
                     torch.save(model.state_dict(),
                                os.path.join(output_dir, "best_classifier.pth"))
@@ -1558,6 +1796,7 @@ class _ClassifierTrainWorker(QThread):
                     f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}"
                 )
 
+            all_train_losses.append(train_loss)
             self.epoch_done.emit(epoch, train_loss, val_loss, val_acc)
 
             if patience_counter >= patience:
@@ -1582,10 +1821,46 @@ class _ClassifierTrainWorker(QThread):
         with open(os.path.join(output_dir, "classifier_config.json"), "w") as f:
             json.dump(config_out, f, indent=2)
 
+        self.log_message.emit("─" * 60)
         self.log_message.emit(
-            f"[Classifier] Training complete: {final_epoch} epochs in {elapsed:.1f}s"
+            f"[Classifier] Training complete: {final_epoch} epochs in {elapsed:.1f}s "
+            f"({elapsed / max(final_epoch, 1):.2f}s/epoch)"
         )
-        self.log_message.emit(f"[Classifier] Best val loss: {best_val_loss:.4f}")
+        if best_epoch > 0:
+            self.log_message.emit(
+                f"[Classifier] Best model: epoch {best_epoch}  "
+                f"val_loss={best_val_loss:.4f}  val_acc={best_val_acc:.1%}"
+            )
+
+        if all_train_losses and all_val_losses:
+            final_train = all_train_losses[-1]
+            final_val = all_val_losses[-1]
+            if final_val > 2 * final_train and final_train < 0.1:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ Overfitting detected: train loss ({final_train:.4f}) "
+                    f"is much lower than val loss ({final_val:.4f}). "
+                    f"Try: more training data, enable augmentation, or use a smaller backbone."
+                )
+            if best_val_acc < 0.5 and n_val > 0:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ Low val accuracy ({best_val_acc:.1%}). "
+                    f"The model may not have enough data to learn meaningful patterns. "
+                    f"Try labeling more clips (aim for 20+ per class)."
+                )
+        if len(all_train_losses) >= 3:
+            first_third = all_train_losses[:len(all_train_losses) // 3]
+            last_third = all_train_losses[-(len(all_train_losses) // 3):]
+            if first_third and last_third:
+                early_avg = sum(first_third) / len(first_third)
+                late_avg = sum(last_third) / len(last_third)
+                if early_avg > 0 and (early_avg - late_avg) / early_avg < 0.1:
+                    self.log_message.emit(
+                        f"[Classifier] ⚠ Train loss did not drop meaningfully "
+                        f"(early avg: {early_avg:.4f}, late avg: {late_avg:.4f}). "
+                        f"Consider: labeling more clips, increasing learning rate, "
+                        f"or checking that composite images look correct."
+                    )
+
         self.log_message.emit(f"[Classifier] Saved: best_classifier.pth, last_classifier.pth, classifier_config.json")
         self.log_message.emit(f"[Classifier] Output: {output_dir}")
 
@@ -2110,6 +2385,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self._inference_worker: Optional[InferenceWorker] = None
         self._track_model_dirs: List[str] = []
+        self._cls_model_dirs: List[str] = []
 
         from .mask_tracker_annotator import COCOAnnotationManager
         self._coco = COCOAnnotationManager()
@@ -2274,9 +2550,9 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.tab_widget.setMaximumWidth(max_w)
 
         self._build_annotator_tab()
-        self._build_training_tab()
         self._build_classifier_tab()
         self._build_tracking_tab()
+        self._inference_tab_idx = 2
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         # Right panel
@@ -2425,9 +2701,9 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._combo_cls_speed = QComboBox()
         self._combo_cls_speed.setToolTip("Playback speed")
         self._combo_cls_speed.addItems(
-            ["0.5x", "1x", "1.25x", "1.5x", "2x", "3x", "4x", "8x"]
+            ["0.25x", "0.5x", "1x", "1.25x", "1.5x", "2x", "3x", "4x", "8x"]
         )
-        self._combo_cls_speed.setCurrentIndex(1)  # default 1x
+        self._combo_cls_speed.setCurrentIndex(2)  # default 1x
         self._combo_cls_speed.setStyleSheet(
             "QComboBox { background-color: #3c3c3c; color: #cccccc; "
             "border: 1px solid #555; border-radius: 3px; padding: 2px 6px; "
@@ -2465,7 +2741,27 @@ class SAM2AnnotatorWindow(QMainWindow):
         cls_train_viz_layout.setContentsMargins(4, 4, 4, 4)
         cls_train_viz_layout.setSpacing(4)
         self._cls_loss_plot = ClassifierLossPlot(parent=self._cls_training_viz_panel)
-        cls_train_viz_layout.addWidget(self._cls_loss_plot, 1)
+        cls_train_viz_layout.addWidget(self._cls_loss_plot, 3)
+
+        # Training log text box
+        self._cls_log_text = QTextEdit()
+        self._cls_log_text.setReadOnly(True)
+        self._cls_log_text.setStyleSheet(
+            "QTextEdit { background-color: #1a1a1a; color: #b0b0b0; "
+            "font-family: monospace; font-size: 10px; border: 1px solid #333; }"
+        )
+        self._cls_log_text.setLineWrapMode(QTextEdit.NoWrap)
+        cls_train_viz_layout.addWidget(self._cls_log_text, 1)
+
+        btn_copy_log = QPushButton("Copy Training Logs to Clipboard")
+        btn_copy_log.setStyleSheet(
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+        )
+        btn_copy_log.clicked.connect(self._copy_cls_train_log)
+        cls_train_viz_layout.addWidget(btn_copy_log)
+
         self._cls_training_viz_panel.setVisible(False)
         right_layout.addWidget(self._cls_training_viz_panel, 1)
 
@@ -2505,45 +2801,15 @@ class SAM2AnnotatorWindow(QMainWindow):
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        # --- Training section (appended to annotator tab) ---
+        self._build_training_section(layout)
+
         layout.addStretch()
         scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Annotation")
+        self.tab_widget.addTab(scroll, "Segmentation")
 
-    def _build_training_tab(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(8)
-
-        # Training data summary
-        summary_group = QGroupBox("Training Data")
-        summary_vbox = QVBoxLayout()
-        summary_vbox.setSpacing(2)
-        self.lbl_train_images = QLabel("Annotated images: —")
-        self.lbl_train_annotations = QLabel("Total annotations: —")
-        self.lbl_train_classes = QLabel("Classes: —")
-        for lbl in (self.lbl_train_images, self.lbl_train_annotations, self.lbl_train_classes):
-            lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
-            summary_vbox.addWidget(lbl)
-        summary_group.setLayout(summary_vbox)
-        layout.addWidget(summary_group)
-
-        # Hardware detection
-        hw_group = QGroupBox("System")
-        hw_vbox = QVBoxLayout()
-        hw_vbox.setSpacing(2)
-        self.lbl_hw_info = QLabel("Detecting hardware...")
-        self.lbl_hw_info.setStyleSheet("color: #999999; font-size: 10px;")
-        self.lbl_hw_info.setWordWrap(True)
-        hw_vbox.addWidget(self.lbl_hw_info)
-        hw_group.setLayout(hw_vbox)
-        layout.addWidget(hw_group)
-        self._populate_hw_info()
+    def _build_training_section(self, layout):
+        """Build the model training UI section (appended to the Annotate tab)."""
 
         # Blue arrow buttons for spin boxes — generate tiny arrow PNGs
         # at runtime for cross-platform consistency.
@@ -2587,6 +2853,27 @@ class SAM2AnnotatorWindow(QMainWindow):
         train_group = QGroupBox("Train Model")
         train_vbox = QVBoxLayout()
         train_vbox.setSpacing(4)
+
+        # Training data summary (inline at top)
+        self.lbl_train_images = QLabel("Annotated images: —")
+        self.lbl_train_annotations = QLabel("Total annotations: —")
+        self.lbl_train_classes = QLabel("Classes: —")
+        for lbl in (self.lbl_train_images, self.lbl_train_annotations, self.lbl_train_classes):
+            lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
+            train_vbox.addWidget(lbl)
+
+        # Hardware info (inline)
+        self.lbl_hw_info = QLabel("Detecting hardware...")
+        self.lbl_hw_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_hw_info.setWordWrap(True)
+        train_vbox.addWidget(self.lbl_hw_info)
+        self._populate_hw_info()
+
+        # Separator before controls
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #3f3f3f;")
+        train_vbox.addWidget(sep)
 
         tip_arch = (
             "Detection and segmentation architecture.\n\n"
@@ -2928,10 +3215,6 @@ class SAM2AnnotatorWindow(QMainWindow):
         train_group.setLayout(train_vbox)
         layout.addWidget(train_group)
 
-        layout.addStretch()
-        scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Training")
-
     # ==================================================================
     # Classifier tab
     # ==================================================================
@@ -3164,6 +3447,16 @@ class SAM2AnnotatorWindow(QMainWindow):
         queue_vbox.addWidget(self.lbl_cls_annotation_stats)
 
         del_btn_row = QHBoxLayout()
+        self.btn_clear_all_labels = QPushButton("Clear Labels")
+        self.btn_clear_all_labels.setStyleSheet(
+            "QPushButton { background-color: #f9a825; color: #1a1a1a; font-weight: bold; "
+            "padding: 4px 8px; border-radius: 3px; font-size: 10px; }"
+            "QPushButton:hover { background-color: #fdd835; }"
+        )
+        self.btn_clear_all_labels.setToolTip("Reset all clips to pending (remove behavior assignments).")
+        self.btn_clear_all_labels.clicked.connect(self._clear_all_clip_labels)
+        del_btn_row.addWidget(self.btn_clear_all_labels)
+
         self.btn_delete_selected_clip = QPushButton("Delete Selected")
         self.btn_delete_selected_clip.setStyleSheet(
             "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
@@ -3247,6 +3540,20 @@ class SAM2AnnotatorWindow(QMainWindow):
         row.addWidget(self.combo_cls_backbone)
         cls_train_vbox.addLayout(row)
 
+        self.chk_cls_freeze = QCheckBox("Freeze backbone (recommended for <100 clips)")
+        self.chk_cls_freeze.setChecked(True)
+        self.chk_cls_freeze.setToolTip(
+            "Freeze the pretrained CNN backbone and only train\n"
+            "the final classification layer.\n\n"
+            "ON (default): uses ImageNet features as-is and only\n"
+            "  learns behavior → class mapping. Much less prone to\n"
+            "  overfitting with small datasets (<100 composites).\n"
+            "OFF: fine-tunes the entire network. Better when you\n"
+            "  have 100+ composites per class, but risks overfitting\n"
+            "  on small datasets."
+        )
+        cls_train_vbox.addWidget(self.chk_cls_freeze)
+
         # -- Epochs --
         tip_epochs = (
             "Number of full passes through the training data.\n\n"
@@ -3254,9 +3561,9 @@ class SAM2AnnotatorWindow(QMainWindow):
             "epochs give the model more chances to learn, but too\n"
             "many can cause overfitting (memorizing training images\n"
             "instead of learning general patterns).\n\n"
-            "Early stopping (patience=10) will automatically halt\n"
-            "training if validation loss stops improving, so it's\n"
-            "safe to set this higher than needed.\n\n"
+            "If loss plateau detection is enabled, training will\n"
+            "automatically stop when validation loss stops improving,\n"
+            "so it's safe to set this higher than needed.\n\n"
             "50 epochs: good default for most datasets.\n"
             "100-200: use with larger or more complex datasets."
         )
@@ -3272,6 +3579,18 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.spin_cls_epochs.setStyleSheet(spin_style)
         row.addWidget(self.spin_cls_epochs)
         cls_train_vbox.addLayout(row)
+
+        self.chk_cls_plateau = QCheckBox("Enable loss plateau detection (early stopping)")
+        self.chk_cls_plateau.setChecked(True)
+        self.chk_cls_plateau.setToolTip(
+            "Automatically stop training when validation loss\n"
+            "stops improving (patience = 20 epochs).\n\n"
+            "ON (default): saves time and prevents overfitting.\n"
+            "  Training will stop early if the model has converged.\n"
+            "OFF: always train for the full number of epochs.\n"
+            "  Use if you want to inspect the full training curve."
+        )
+        cls_train_vbox.addWidget(self.chk_cls_plateau)
 
         # -- Learning Rate --
         tip_cls_lr = (
@@ -3389,7 +3708,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         layout.addStretch()
         scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Classifier")
+        self.tab_widget.addTab(scroll, "Classification")
 
     def _build_tracking_tab(self):
         scroll = QScrollArea()
@@ -3402,46 +3721,19 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(8)
 
-        # --- Model Selection ---
-        model_group = QGroupBox("Trained Model")
-        model_vbox = QVBoxLayout()
-        model_vbox.setSpacing(4)
-
-        model_row = QHBoxLayout()
-        self.combo_track_model = QComboBox()
-        self.combo_track_model.setToolTip(
-            "Select a trained Mask R-CNN model from this project.\n"
-            "Models are saved in the project's models/ directory after training."
-        )
-        self.combo_track_model.currentIndexChanged.connect(self._on_track_model_changed)
-        model_row.addWidget(self.combo_track_model, 1)
-        btn_refresh_models = QPushButton("Refresh")
-        btn_refresh_models.setToolTip("Rescan the models/ directory for trained models.")
-        btn_refresh_models.clicked.connect(self._refresh_model_list)
-        model_row.addWidget(btn_refresh_models)
-        model_vbox.addLayout(model_row)
-
-        self.lbl_track_model_info = QLabel("No model selected")
-        self.lbl_track_model_info.setStyleSheet("color: #999999; font-size: 10px;")
-        self.lbl_track_model_info.setWordWrap(True)
-        model_vbox.addWidget(self.lbl_track_model_info)
-
-        model_group.setLayout(model_vbox)
-        layout.addWidget(model_group)
-
-        # --- Video Queue ---
+        # --- Video Queue (top) ---
         video_group = QGroupBox("Video Queue")
         video_vbox = QVBoxLayout()
         video_vbox.setSpacing(4)
 
         vid_btn_row = QHBoxLayout()
         btn_add_vids = QPushButton("Add Videos")
-        btn_add_vids.setToolTip("Add individual video files to the tracking queue.")
+        btn_add_vids.setToolTip("Add individual video files to the inference queue.")
         btn_add_vids.clicked.connect(self._add_tracking_videos)
         vid_btn_row.addWidget(btn_add_vids)
         btn_add_vid_folder = QPushButton("Add Folder")
         btn_add_vid_folder.setToolTip(
-            "Add all video files from a folder to the tracking queue."
+            "Add all video files from a folder to the inference queue."
         )
         btn_add_vid_folder.clicked.connect(self._add_tracking_folder)
         vid_btn_row.addWidget(btn_add_vid_folder)
@@ -3453,17 +3745,38 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self.list_track_videos = QListWidget()
         self.list_track_videos.setMaximumHeight(120)
-        self.list_track_videos.setToolTip("Videos queued for tracking. All will be processed sequentially.")
+        self.list_track_videos.setToolTip("Videos queued for inference. All will be processed sequentially.")
         self.list_track_videos.currentItemChanged.connect(self._on_tracking_video_selected)
         video_vbox.addWidget(self.list_track_videos)
 
         video_group.setLayout(video_vbox)
         layout.addWidget(video_group)
 
-        # --- Inference Settings ---
-        settings_group = QGroupBox("Inference Settings")
+        # --- Tracking Settings (model + inference params) ---
+        settings_group = QGroupBox("Tracking Settings")
         settings_vbox = QVBoxLayout()
         settings_vbox.setSpacing(4)
+
+        model_row = QHBoxLayout()
+        lbl_model = QLabel("Tracking model:")
+        model_row.addWidget(lbl_model)
+        self.combo_track_model = QComboBox()
+        self.combo_track_model.setToolTip(
+            "Select a trained detection/segmentation model from this project.\n"
+            "Models are saved in the project's models/ directory after training."
+        )
+        self.combo_track_model.currentIndexChanged.connect(self._on_track_model_changed)
+        model_row.addWidget(self.combo_track_model, 1)
+        btn_refresh_models = QPushButton("Refresh")
+        btn_refresh_models.setToolTip("Rescan the models/ directory for trained models.")
+        btn_refresh_models.clicked.connect(self._refresh_model_list)
+        model_row.addWidget(btn_refresh_models)
+        settings_vbox.addLayout(model_row)
+
+        self.lbl_track_model_info = QLabel("No model selected")
+        self.lbl_track_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_track_model_info.setWordWrap(True)
+        settings_vbox.addWidget(self.lbl_track_model_info)
 
         self.lbl_track_system_info = QLabel("")
         self.lbl_track_system_info.setStyleSheet("color: #888888; font-size: 10px;")
@@ -3587,20 +3900,169 @@ class SAM2AnnotatorWindow(QMainWindow):
         settings_group.setLayout(settings_vbox)
         layout.addWidget(settings_group)
 
-        # --- Controls ---
-        ctrl_group = QGroupBox("Run Tracking")
+        # --- Behavior Classification ---
+        cls_group = QGroupBox("Behavior Classification")
+        cls_vbox = QVBoxLayout()
+        cls_vbox.setSpacing(4)
+
+        self.chk_behavior_cls = QCheckBox("Enable behavior classification")
+        self.chk_behavior_cls.setChecked(False)
+        self.chk_behavior_cls.setToolTip(
+            "Run a trained behavior classifier on tracked objects.\n\n"
+            "When enabled, each tracked object accumulates mask data\n"
+            "over a sliding window, generates a silhouette composite,\n"
+            "and classifies the behavior using the selected model.\n\n"
+            "Requires a trained classifier model from the Classifier tab."
+        )
+        self.chk_behavior_cls.toggled.connect(self._on_behavior_cls_toggled)
+        cls_vbox.addWidget(self.chk_behavior_cls)
+
+        self._behavior_cls_widgets = []
+
+        row_bcm = QHBoxLayout()
+        lbl_bcm = QLabel("Classifier model:")
+        row_bcm.addWidget(lbl_bcm)
+        self.combo_behavior_model = QComboBox()
+        self.combo_behavior_model.setToolTip(
+            "Select a trained behavior classifier model.\n"
+            "Models are saved in behavior_classifier/model/ after training."
+        )
+        row_bcm.addWidget(self.combo_behavior_model, 1)
+        btn_refresh_cls = QPushButton("Refresh")
+        btn_refresh_cls.setToolTip("Rescan for trained classifier models.")
+        btn_refresh_cls.clicked.connect(self._refresh_classifier_model_list)
+        row_bcm.addWidget(btn_refresh_cls)
+        cls_vbox.addLayout(row_bcm)
+        self._behavior_cls_widgets.extend([lbl_bcm, self.combo_behavior_model, btn_refresh_cls])
+
+        self.lbl_behavior_model_info = QLabel("No classifier model found")
+        self.lbl_behavior_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_behavior_model_info.setWordWrap(True)
+        cls_vbox.addWidget(self.lbl_behavior_model_info)
+        self._behavior_cls_widgets.append(self.lbl_behavior_model_info)
+
+        row_nc = QHBoxLayout()
+        lbl_nc = QLabel("NC threshold:")
+        lbl_nc.setToolTip(
+            "Confidence threshold for classification.\n"
+            "Predictions below this confidence are labeled NC (not classified)."
+        )
+        row_nc.addWidget(lbl_nc)
+        self.spin_nc_threshold = QDoubleSpinBox()
+        self.spin_nc_threshold.setRange(0.10, 0.95)
+        self.spin_nc_threshold.setValue(0.50)
+        self.spin_nc_threshold.setSingleStep(0.05)
+        self.spin_nc_threshold.setDecimals(2)
+        self.spin_nc_threshold.setStyleSheet(self._spin_style)
+        self.spin_nc_threshold.setToolTip(
+            "Minimum softmax confidence to assign a behavior label.\n\n"
+            "0.50 (default): predictions must be >50% confident.\n"
+            "Lower: more predictions, but more noise.\n"
+            "Higher: fewer predictions, but more reliable."
+        )
+        row_nc.addWidget(self.spin_nc_threshold)
+        cls_vbox.addLayout(row_nc)
+        self._behavior_cls_widgets.extend([lbl_nc, self.spin_nc_threshold])
+
+        row_win = QHBoxLayout()
+        lbl_win = QLabel("Window size:")
+        lbl_win.setToolTip("Number of frames used to generate each behavior composite.")
+        row_win.addWidget(lbl_win)
+        self.spin_cls_window = QSpinBox()
+        self.spin_cls_window.setRange(5, 60)
+        self.spin_cls_window.setValue(15)
+        self.spin_cls_window.setSingleStep(5)
+        self.spin_cls_window.setStyleSheet(self._spin_style)
+        self.spin_cls_window.setToolTip(
+            "Number of consecutive frames used to build a silhouette\n"
+            "composite for behavior classification.\n\n"
+            "15 (default): ~0.5s at 30fps. Good for quick behaviors.\n"
+            "30: ~1s. Better for slower behaviors like grooming.\n"
+            "Should roughly match the clip length used during training."
+        )
+        row_win.addWidget(self.spin_cls_window)
+        row_win.addWidget(QLabel("frames"))
+        cls_vbox.addLayout(row_win)
+        self._behavior_cls_widgets.extend([lbl_win, self.spin_cls_window])
+
+        row_bout = QHBoxLayout()
+        lbl_bout = QLabel("Min bout length:")
+        lbl_bout.setToolTip(
+            "Minimum consecutive frames for a behavior label to be kept.\n"
+            "Shorter bouts are relabeled NC to suppress flickering."
+        )
+        row_bout.addWidget(lbl_bout)
+        self.spin_min_bout = QSpinBox()
+        self.spin_min_bout.setRange(1, 30)
+        self.spin_min_bout.setValue(5)
+        self.spin_min_bout.setStyleSheet(self._spin_style)
+        self.spin_min_bout.setToolTip(
+            "Behavior bouts shorter than this many frames\n"
+            "are replaced with NC (not classified).\n\n"
+            "5 (default): suppresses brief flickering between classes.\n"
+            "1: no filtering — keep every per-frame prediction.\n"
+            "10-15: aggressive smoothing for noisy predictions."
+        )
+        row_bout.addWidget(self.spin_min_bout)
+        row_bout.addWidget(QLabel("frames"))
+        cls_vbox.addLayout(row_bout)
+        self._behavior_cls_widgets.extend([lbl_bout, self.spin_min_bout])
+
+        row_gap = QHBoxLayout()
+        lbl_gap = QLabel("Uncertainty gap:")
+        lbl_gap.setToolTip(
+            "Minimum gap between top-2 class probabilities.\n"
+            "If the gap is smaller, the prediction is labeled NC."
+        )
+        row_gap.addWidget(lbl_gap)
+        self.spin_uncertain_gap = QDoubleSpinBox()
+        self.spin_uncertain_gap.setRange(0.0, 0.50)
+        self.spin_uncertain_gap.setValue(0.10)
+        self.spin_uncertain_gap.setSingleStep(0.05)
+        self.spin_uncertain_gap.setDecimals(2)
+        self.spin_uncertain_gap.setStyleSheet(self._spin_style)
+        self.spin_uncertain_gap.setToolTip(
+            "If the difference between the top prediction's confidence\n"
+            "and the second-best is below this threshold, the frame\n"
+            "is labeled NC (ambiguous prediction).\n\n"
+            "0.10 (default): top class must be ≥10%% more confident\n"
+            "  than the runner-up.\n"
+            "0.00: disable this check (rely on NC threshold only).\n"
+            "0.20: stricter — requires a clear winner."
+        )
+        row_gap.addWidget(self.spin_uncertain_gap)
+        cls_vbox.addLayout(row_gap)
+        self._behavior_cls_widgets.extend([lbl_gap, self.spin_uncertain_gap])
+
+        cls_group.setLayout(cls_vbox)
+        layout.addWidget(cls_group)
+
+        self._on_behavior_cls_toggled(False)
+
+        # --- Run Inference ---
+        ctrl_group = QGroupBox("Run Inference")
         ctrl_vbox = QVBoxLayout()
         ctrl_vbox.setSpacing(4)
 
+        self.chk_inference_preview = QCheckBox("Show inference preview")
+        self.chk_inference_preview.setChecked(True)
+        self.chk_inference_preview.setToolTip(
+            "Display annotated frames in the preview window during inference.\n\n"
+            "ON: see live tracking + behavior overlays as videos are processed.\n"
+            "OFF: skip rendering to the preview window for faster processing.\n"
+            "The annotated video is always saved regardless of this setting."
+        )
+        ctrl_vbox.addWidget(self.chk_inference_preview)
+
         btn_row = QHBoxLayout()
-        self.btn_start_tracking = QPushButton("Start Tracking")
+        self.btn_start_tracking = QPushButton("Run Inference")
         self.btn_start_tracking.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
             "padding: 8px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #448aff; }"
             "QPushButton:disabled { background-color: #333333; color: #666666; }"
         )
-        self.btn_start_tracking.setToolTip("Run the selected model on all queued videos.")
+        self.btn_start_tracking.setToolTip("Run inference on all queued videos.")
         self.btn_start_tracking.clicked.connect(self._start_tracking)
         self.btn_start_tracking.setEnabled(False)
         btn_row.addWidget(self.btn_start_tracking)
@@ -3644,7 +4106,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.list_track_results.setMaximumHeight(160)
         self.list_track_results.setToolTip(
             "Completed videos with track counts and CSV output paths.\n"
-            "Double-click to open the CSV file location."
+            "Double-click to open the output folder."
         )
         self.list_track_results.itemDoubleClicked.connect(self._open_tracking_result)
         results_vbox.addWidget(self.list_track_results)
@@ -3653,7 +4115,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         layout.addStretch()
         scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Tracking")
+        self.tab_widget.addTab(scroll, "Inference")
         self._apply_system_defaults()
 
     def _apply_system_defaults(self):
@@ -3695,7 +4157,7 @@ class SAM2AnnotatorWindow(QMainWindow):
     # Annotator tab sections
     # ------------------------------------------------------------------
     def _create_videos_section(self, layout):
-        group = QGroupBox("1. Videos")
+        group = QGroupBox("Add Videos")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -3735,7 +4197,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_extraction_section(self, layout):
-        group = QGroupBox("2. Frame Extraction")
+        group = QGroupBox("Frame Extraction")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -3792,7 +4254,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_frames_section(self, layout):
-        group = QGroupBox("3. Training Frames")
+        group = QGroupBox("Training Frames")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -3898,13 +4360,14 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         # Refresh whichever tab is currently visible
         current_tab_idx = self.tab_widget.currentIndex()
-        if current_tab_idx == 1:  # Training
+        if current_tab_idx == 0:  # Annotate (includes training section)
             self._refresh_training_summary()
             self._refresh_device_label()
-        elif current_tab_idx == 2:  # Classifier
+        elif current_tab_idx == 1:  # Classify
             self._refresh_classifier_models()
-        elif current_tab_idx == 3:  # Tracking
+        elif current_tab_idx == 2:  # Infer
             self._refresh_model_list()
+            self._refresh_classifier_model_list()
 
     def _save_project(self):
         if self._project_dir is None:
@@ -5576,7 +6039,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
             text_org = (x1, max(y1 - 5, 12))
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
+            font_scale = 0.6
             thickness = 1
             (tw, th), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
             tx, ty = text_org
@@ -5652,7 +6115,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 elif event.key() == Qt.Key_E:
                     self._extract_frame_from_video()
                     return
-        elif self.tab_widget.currentIndex() == 2:  # Classifier tab
+        elif self.tab_widget.currentIndex() == 1:  # Classify tab
             if event.key() == Qt.Key_Escape:
                 if self._cls_pending_clip_mode:
                     self._exit_pending_clip_mode()
@@ -6113,15 +6576,38 @@ class SAM2AnnotatorWindow(QMainWindow):
         masks_dict = self._load_clip_masks(clip_dir)
         if obj_id in masks_dict:
             from .silhouette_extractor import generate_composite
+
+            ux1, uy1, ux2, uy2 = float("inf"), float("inf"), 0, 0
+            for det in masks_dict[obj_id]:
+                if det is None:
+                    continue
+                bx1, by1, bx2, by2 = (
+                    int(det["bbox"][0]), int(det["bbox"][1]),
+                    int(det["bbox"][2]), int(det["bbox"][3]),
+                )
+                ux1 = min(ux1, bx1)
+                uy1 = min(uy1, by1)
+                ux2 = max(ux2, bx2)
+                uy2 = max(uy2, by2)
+
+            if ux2 <= ux1 or uy2 <= uy1:
+                return
+
+            pad = int(max(ux2 - ux1, uy2 - uy1) * 0.05)
+            ux1 = max(0, int(ux1) - pad)
+            uy1 = max(0, int(uy1) - pad)
+            ux2 = int(ux2) + pad
+            uy2 = int(uy2) + pad
+
             mask_crops = []
             for det in masks_dict[obj_id]:
                 if det is None:
                     mask_crops.append(None)
                     continue
                 mask = det["mask"]
-                bbox = det["bbox"]
-                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                crop = mask[y1:y2, x1:x2]
+                uy2_c = min(uy2, mask.shape[0])
+                ux2_c = min(ux2, mask.shape[1])
+                crop = mask[uy1:uy2_c, ux1:ux2_c]
                 mask_crops.append(crop.astype(bool))
             composite = generate_composite(mask_crops, output_size=(128, 128))
             comp_path = os.path.join(clip_dir, f"composite_obj{obj_id}.png")
@@ -6195,9 +6681,17 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         vname = os.path.basename(self._cls_video_path)
         t = self._cls_clip_start / self._cls_fps if self._cls_fps > 0 else 0
+        all_behs = list(dict.fromkeys(
+            v["behavior"] for v in meta.get("objects", {}).values()
+            if v.get("behavior")
+        ))
+        if len(all_behs) > 1:
+            beh_str = f"multi ({', '.join(all_behs)})"
+        else:
+            beh_str = all_behs[0] if all_behs else label_data["behavior"]
         item = QListWidgetItem(
             f"✔ {vname}  frame {self._cls_clip_start}  ({t:.1f}s)  "
-            f"→ {label_data['behavior']}"
+            f"→ {beh_str}"
         )
         item.setForeground(QColor("#4fc456"))
         item.setData(Qt.UserRole, idx)
@@ -6255,13 +6749,16 @@ class SAM2AnnotatorWindow(QMainWindow):
             t = start / fps if fps > 0 else 0
             vname = os.path.basename(source)
 
-            behaviors = [
+            behaviors = list(dict.fromkeys(
                 v["behavior"] for v in objects.values()
                 if v.get("behavior")
-            ]
+            ))
 
             if status == "labeled" and behaviors:
-                beh_str = ", ".join(behaviors)
+                if len(behaviors) > 1:
+                    beh_str = f"multi ({', '.join(behaviors)})"
+                else:
+                    beh_str = behaviors[0]
                 text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {beh_str}"
                 color = QColor("#4fc456")
             else:
@@ -6752,7 +7249,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.setFocus()
 
     def _on_cls_speed_changed(self, idx):
-        speed_map = [0.5, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0]
+        speed_map = [0.25, 0.5, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0]
         self._cls_speed_multiplier = speed_map[idx] if idx < len(speed_map) else 1.0
         if hasattr(self, "_clip_play_timer") and self._clip_play_timer.isActive():
             fps = self._cls_fps if self._cls_fps > 0 else 30.0
@@ -6792,6 +7289,13 @@ class SAM2AnnotatorWindow(QMainWindow):
                 self.list_clip_queue.setCurrentRow(idx)
                 return
         self.lbl_cls_extract_status.setText("All clips labeled!")
+        n_labeled = sum(1 for c in self._batch_clips if c["status"] == "labeled")
+        QMessageBox.information(
+            self, "All Clips Labeled",
+            f"All {n_labeled} clip(s) have been labeled.\n\n"
+            f"You can now train the classifier, or add more videos\n"
+            f"and extract additional clips.",
+        )
 
     def _delete_current_clip(self):
         idx = getattr(self, "_cls_playback_clip_idx", -1)
@@ -6832,11 +7336,15 @@ class SAM2AnnotatorWindow(QMainWindow):
                     pass
             t = start / fps_meta if fps_meta > 0 else 0
             if c["status"] == "labeled":
-                behaviors = [
+                behaviors = list(dict.fromkeys(
                     v["behavior"] for v in c.get("objects", {}).values()
                     if v.get("behavior")
-                ]
-                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {', '.join(behaviors)}"
+                ))
+                if len(behaviors) > 1:
+                    beh_text = f"multi ({', '.join(behaviors)})"
+                else:
+                    beh_text = behaviors[0] if behaviors else "?"
+                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {beh_text}"
                 color = QColor("#4fc456")
             else:
                 n_obj = len(c.get("objects", {}))
@@ -6881,8 +7389,14 @@ class SAM2AnnotatorWindow(QMainWindow):
             new_text = old_text.replace("●", "✔", 1)
             if "→" in new_text:
                 new_text = new_text.split("→")[0].rstrip()
-            if label_data["behavior"]:
-                new_text += f"  → {label_data['behavior']}"
+            behaviors = list(dict.fromkeys(
+                v["behavior"] for v in clip.get("objects", {}).values()
+                if v.get("behavior")
+            ))
+            if len(behaviors) > 1:
+                new_text += f"  → multi ({', '.join(behaviors)})"
+            elif behaviors:
+                new_text += f"  → {behaviors[0]}"
             item.setText(new_text)
             item.setForeground(QColor("#4fc456"))
 
@@ -6929,11 +7443,15 @@ class SAM2AnnotatorWindow(QMainWindow):
                     pass
             t = start / fps_meta if fps_meta > 0 else 0
             if clip["status"] == "labeled":
-                behaviors = [
+                behaviors = list(dict.fromkeys(
                     v["behavior"] for v in clip.get("objects", {}).values()
                     if v.get("behavior")
-                ]
-                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {', '.join(behaviors)}"
+                ))
+                if len(behaviors) > 1:
+                    beh_text = f"multi ({', '.join(behaviors)})"
+                else:
+                    beh_text = behaviors[0] if behaviors else "?"
+                text = f"✔ {vname}  frame {start}  ({t:.1f}s)  → {beh_text}"
                 color = QColor("#4fc456")
             else:
                 n_obj = len(clip.get("objects", {}))
@@ -6968,6 +7486,63 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._batch_clips = []
         self.list_clip_queue.clear()
         self._refresh_cls_annotation_stats()
+
+    def _clear_all_clip_labels(self):
+        labeled = [c for c in self._batch_clips if c["status"] == "labeled"]
+        if not labeled:
+            return
+        n_annotations = sum(
+            1 for c in labeled
+            for v in c.get("objects", {}).values()
+            if v.get("behavior")
+        )
+        reply = QMessageBox.warning(
+            self, "Clear All Labels",
+            f"Are you sure you want to clear {n_annotations} annotation(s) "
+            f"from {len(labeled)} clip(s)?\n\n"
+            f"All behavior assignments will be removed.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        for idx, clip in enumerate(self._batch_clips):
+            if clip["status"] != "labeled":
+                continue
+            for v in clip.get("objects", {}).values():
+                v["behavior"] = None
+                v["color"] = None
+            clip["status"] = "pending"
+
+            if clip.get("clip_dir"):
+                meta_path = os.path.join(clip["clip_dir"], "meta.json")
+                if os.path.isfile(meta_path):
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    for v in meta.get("objects", {}).values():
+                        v["behavior"] = None
+                        v["color"] = None
+                    meta["status"] = "pending"
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+
+                import glob
+                for comp in glob.glob(os.path.join(clip["clip_dir"], "composite_obj*.png")):
+                    os.remove(comp)
+
+            item = self.list_clip_queue.item(idx)
+            if item:
+                old_text = item.text()
+                if "→" in old_text:
+                    old_text = old_text.split("→")[0].rstrip()
+                new_text = old_text.replace("✔", "●", 1)
+                item.setText(new_text)
+                item.setForeground(QColor("#ffb300"))
+
+        self._refresh_cls_annotation_stats()
+        self.status_bar.showMessage(
+            f"Cleared labels from {len(labeled)} clip(s).", 3000
+        )
 
     def _start_classifier_training(self):
         composite_paths = []
@@ -7016,6 +7591,8 @@ class SAM2AnnotatorWindow(QMainWindow):
             "batch_size": self.spin_cls_batch.value(),
             "val_split": self.spin_cls_val.value(),
             "augment": self.chk_cls_augment.isChecked(),
+            "freeze_backbone": self.chk_cls_freeze.isChecked(),
+            "early_stopping": self.chk_cls_plateau.isChecked(),
             "backbone": self.combo_cls_backbone.currentText(),
             "output_dir": output_dir,
         }
@@ -7033,6 +7610,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._lbl_preview_title.setVisible(True)
         self._cls_training_viz_panel.setVisible(True)
         self._cls_loss_plot.reset(config["epochs"])
+        self._cls_log_text.clear()
 
         self._cls_train_worker = _ClassifierTrainWorker(config)
         self._cls_train_worker.epoch_done.connect(self._on_cls_train_epoch)
@@ -7043,7 +7621,18 @@ class SAM2AnnotatorWindow(QMainWindow):
 
     def _on_cls_train_log(self, msg):
         print(msg)
+        self._cls_log_text.append(msg)
+        self._cls_log_text.verticalScrollBar().setValue(
+            self._cls_log_text.verticalScrollBar().maximum()
+        )
         self.lbl_cls_train_status.setText(msg.replace("[Classifier] ", ""))
+
+    def _copy_cls_train_log(self):
+        from PyQt5.QtWidgets import QApplication
+        text = self._cls_log_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_bar.showMessage("Training logs copied to clipboard.", 3000)
 
     def _on_cls_train_epoch(self, epoch, train_loss, val_loss, val_acc):
         self.cls_train_progress.setValue(epoch)
@@ -7145,7 +7734,18 @@ class SAM2AnnotatorWindow(QMainWindow):
             last_idx = len(self._track_model_dirs) - 1
             self.combo_track_model.setCurrentIndex(last_idx)
             self._on_track_model_changed(last_idx)
+        self._fit_combo_popup(self.combo_track_model)
         self._update_tracking_button_state()
+
+    @staticmethod
+    def _fit_combo_popup(combo: QComboBox):
+        fm = combo.fontMetrics()
+        max_w = 0
+        for i in range(combo.count()):
+            w = fm.horizontalAdvance(combo.itemText(i))
+            if w > max_w:
+                max_w = w
+        combo.view().setMinimumWidth(max_w + 30)
 
     def _on_track_model_changed(self, index: int):
         if index < 0 or index >= len(getattr(self, "_track_model_dirs", [])):
@@ -7202,6 +7802,70 @@ class SAM2AnnotatorWindow(QMainWindow):
             self.lbl_track_model_info.setText(f"Path: {run_dir}")
             self.combo_track_resolution.setItemText(0, "Trained (default)")
         self._update_tracking_button_state()
+
+    # -- Behavior Classification helpers --
+
+    def _on_behavior_cls_toggled(self, enabled: bool):
+        for w in self._behavior_cls_widgets:
+            w.setEnabled(enabled)
+
+    def _refresh_classifier_model_list(self):
+        self.combo_behavior_model.clear()
+        self._cls_model_dirs = []
+        if not self._project_dir:
+            self.lbl_behavior_model_info.setText("No project open")
+            return
+
+        cls_root = os.path.join(self._project_dir, "behavior_classifier", "model")
+        if not os.path.isdir(cls_root):
+            self.lbl_behavior_model_info.setText(
+                "No classifier models found — train one in the Classifier tab"
+            )
+            return
+
+        for entry in sorted(os.listdir(cls_root)):
+            run_dir = os.path.join(cls_root, entry)
+            cfg_path = os.path.join(run_dir, "classifier_config.json")
+            if not os.path.isfile(cfg_path):
+                continue
+            best_path = os.path.join(run_dir, "best_classifier.pth")
+            if not os.path.isfile(best_path):
+                continue
+
+            label = entry
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                classes = cfg.get("class_names", [])
+                backbone = cfg.get("backbone", "?")
+                n_cls = cfg.get("n_classes", len(classes))
+                cls_str = ", ".join(classes) if classes else "?"
+                label = f"{entry}  [{backbone}: {n_cls} classes — {cls_str}]"
+            except Exception:
+                pass
+
+            self.combo_behavior_model.addItem(label)
+            self._cls_model_dirs.append(run_dir)
+
+        if not self._cls_model_dirs:
+            self.lbl_behavior_model_info.setText(
+                "No classifier models found — train one in the Classifier tab"
+            )
+        else:
+            last_idx = len(self._cls_model_dirs) - 1
+            self.combo_behavior_model.setCurrentIndex(last_idx)
+            run_dir = self._cls_model_dirs[last_idx]
+            try:
+                with open(os.path.join(run_dir, "classifier_config.json")) as f:
+                    cfg = json.load(f)
+                classes = cfg.get("class_names", [])
+                self.lbl_behavior_model_info.setText(
+                    f"Classes: {', '.join(classes)}  |  "
+                    f"Backbone: {cfg.get('backbone', '?')}"
+                )
+            except Exception:
+                self.lbl_behavior_model_info.setText(f"Path: {run_dir}")
+        self._fit_combo_popup(self.combo_behavior_model)
 
     def _add_tracking_videos(self):
         had_none = self.list_track_videos.count() == 0
@@ -7310,6 +7974,9 @@ class SAM2AnnotatorWindow(QMainWindow):
             "device": device,
         }
 
+        if self.chk_behavior_cls.isChecked():
+            config_dict["use_masks"] = True
+
         self._track_video_paths = video_paths
         self._track_videos_done = 0
         self._track_total_videos = len(video_paths)
@@ -7328,7 +7995,29 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self.preview.setEnabled(False)
 
-        self._inference_worker = InferenceWorker(video_paths, model_dir, config_dict)
+        classifier_dir = None
+        if self.chk_behavior_cls.isChecked():
+            cls_idx = self.combo_behavior_model.currentIndex()
+            if cls_idx >= 0 and cls_idx < len(self._cls_model_dirs):
+                classifier_dir = self._cls_model_dirs[cls_idx]
+            else:
+                QMessageBox.warning(
+                    self, "No Classifier Model",
+                    "Behavior classification is enabled but no classifier model\n"
+                    "is selected. Train a model in the Classifier tab first,\n"
+                    "or uncheck 'Enable behavior classification'."
+                )
+                return
+
+        self._inference_worker = InferenceWorker(
+            video_paths, model_dir, config_dict,
+            classifier_dir=classifier_dir,
+            nc_threshold=self.spin_nc_threshold.value(),
+            cls_window=self.spin_cls_window.value(),
+            show_preview=self.chk_inference_preview.isChecked(),
+            min_bout=self.spin_min_bout.value(),
+            uncertain_gap=self.spin_uncertain_gap.value(),
+        )
         self._inference_worker.progress.connect(self._on_tracking_progress)
         self._inference_worker.frame_ready.connect(self._on_tracking_frame)
         self._inference_worker.video_finished.connect(self._on_video_finished)
@@ -7337,8 +8026,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._inference_worker.start()
 
     def _on_tracking_frame(self, frame_rgb, frame_idx: int):
-        """Display an annotated frame in the preview during live tracking."""
-        if frame_rgb is not None:
+        """Display an annotated frame in the preview during live inference."""
+        if frame_rgb is not None and self.tab_widget.currentIndex() == self._inference_tab_idx:
             self.preview.set_frame(frame_rgb)
 
     def _on_tracking_video_selected(self, current, previous):
@@ -7370,8 +8059,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         vid_num = self._track_videos_done + 1
         vid_name = os.path.basename(self._track_video_paths[self._track_videos_done])
         status_text = (
-            f"Processing video {vid_num} of {self._track_total_videos}: "
-            f"{vid_name}  —  frame {frame_idx}/{total_frames}"
+            f"Processing video {vid_num} of {self._track_total_videos}: {vid_name}\n"
+            f"Frame {frame_idx}/{total_frames}"
         )
         self.lbl_track_status.setText(status_text)
         self.lbl_tracking_info.setText(
@@ -7388,6 +8077,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         summary = f"{video_name}: {n_tracks} tracks, {total_frames} frames"
         if n_tracks == 0:
             summary += " ⚠ No detections — try lowering confidence threshold"
+        if result.get("behavior_csv"):
+            summary += " + behavior"
         summary += f" → {os.path.basename(output_dir)}/"
 
         item = QListWidgetItem(summary)
@@ -7415,10 +8106,10 @@ class SAM2AnnotatorWindow(QMainWindow):
             f"Done — {self._track_videos_done} video(s) processed"
         )
         self.lbl_tracking_info.setText(
-            f"Tracking complete — {self._track_videos_done} video(s) processed"
+            f"Inference complete — {self._track_videos_done} video(s) processed"
         )
         self.status_bar.showMessage(
-            f"Tracking complete: {self._track_videos_done} video(s)"
+            f"Inference complete: {self._track_videos_done} video(s)"
         )
 
     def _toggle_tracking_pause(self):
@@ -7469,21 +8160,20 @@ class SAM2AnnotatorWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", output_dir])
 
     def _on_tab_changed(self, index: int):
-        # Tab indices: 0=Annotation, 1=Training, 2=Classifier, 3=Tracking
+        # Tab indices: 0=Annotate, 1=Classify, 2=Infer
         is_annotation = index == 0
-        is_training = index == 1
-        is_classifier = index == 2
-        is_tracking = index == 3
+        is_classifier = index == 1
+        is_tracking = index == 2
 
         self.preview.annotation_keys_enabled = is_annotation
 
-        # Annotation bar: only on Annotation tab
+        # Annotation bar: only on Annotate tab
         for w in self._annotation_bar_widgets:
             w.setVisible(is_annotation)
-        # Classifier info + Edit Behaviors button: only on Classifier tab
+        # Classifier info + Edit Behaviors button: only on Classify tab
         self.lbl_classifier_info.setVisible(is_classifier)
         self.btn_edit_behaviors.setVisible(is_classifier)
-        # Tracking info label: only on Tracking tab
+        # Tracking info label: only on Infer tab
         self.lbl_tracking_info.setVisible(is_tracking)
         # Classifier: stop playback and clear mask handler when leaving tab
         if not is_classifier:
@@ -7498,21 +8188,28 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         cls_show_loss = is_classifier and cls_training_active
 
-        # Frame slider + preview title: only on Classifier tab
+        # Frame slider + preview title: only on Classify tab
         self._cls_nav_bar.setVisible(is_classifier and not cls_training_active)
         self._lbl_preview_title.setVisible(is_classifier)
         # Classifier training loss panel
         self._cls_training_viz_panel.setVisible(cls_show_loss)
-        # Preview + info row: visible on Annotation, Classifier, and Tracking tabs
-        # (hidden during classifier training or when on Training tab)
-        self.preview.setVisible(not is_training and not cls_show_loss)
-        self._info_row.setVisible(not is_training and not cls_show_loss)
-        # Training visualization panel: only on Training tab
-        self._training_viz_panel.setVisible(is_training)
+        # Preview + info row: visible on all tabs (hidden during classifier training)
+        self.preview.setVisible(not cls_show_loss)
+        self._info_row.setVisible(not cls_show_loss)
+        # Training visualization panel: visible on Annotate tab during mask model training
+        mask_training_active = (
+            hasattr(self, "_train_worker")
+            and self._train_worker is not None
+            and self._train_worker.isRunning()
+        )
+        self._training_viz_panel.setVisible(is_annotation and mask_training_active)
 
-        if is_training:
+        if is_annotation:
             self._refresh_training_summary()
             self._refresh_device_label()
+            if self.current_frame_idx >= 0 and self.current_frame_idx < len(self._extracted_frames):
+                _, _, path = self._extracted_frames[self.current_frame_idx]
+                self._load_annotation_frame(path)
         elif is_classifier:
             self.preview.annotations.clear()
             self.preview._cls_mask_handler = self._on_cls_mask_right_click
@@ -7541,6 +8238,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 if reply == QMessageBox.Yes:
                     self._open_project()
             self._refresh_model_list()
+            self._refresh_classifier_model_list()
             # Show first frame of selected video, or clear
             current = self.list_track_videos.currentItem()
             if current:
@@ -7548,11 +8246,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             else:
                 self.preview.clear()
                 self.preview.update()
-                self.lbl_tracking_info.setText("Add videos to begin tracking")
-        elif is_annotation:
-            if self.current_frame_idx >= 0 and self.current_frame_idx < len(self._extracted_frames):
-                _, _, path = self._extracted_frames[self.current_frame_idx]
-                self._load_annotation_frame(path)
+                self.lbl_tracking_info.setText("Add videos to begin inference")
 
     def _refresh_device_label(self):
         if self.combo_device.currentIndex() == 0:

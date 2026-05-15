@@ -209,9 +209,6 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs
         self.create_video_tab()
-        self.create_video_tracking_tab()
-        self.create_sleap_tab()
-        self.create_labgym_tab()
         self.create_uwb_tab()
         self.create_usv_tab()
         self.create_rfid_tab()
@@ -313,11 +310,11 @@ class FNTMainWindow(QMainWindow):
         return scroll, layout
 
     def create_video_tab(self):
-        """Create the video processing tab"""
+        """Create the video tab with processing, tracking, and scoring tools"""
         tab, layout = self._make_scrollable_tab("Video")
 
         # Description
-        desc = QLabel("Tools for video file processing and manipulation")
+        desc = QLabel("Video processing, tracking, and behavioral analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
@@ -336,8 +333,22 @@ class FNTMainWindow(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
 
+        # FNT Tracking Tools group
+        tracking_group = QGroupBox("FNT Tracking Tools")
+        tracking_layout = QGridLayout()
+
+        tracking_buttons = [
+            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
+            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
+        ]
+
+        self.create_button_grid(tracking_layout, tracking_buttons)
+        tracking_group.setLayout(tracking_layout)
+        layout.addWidget(tracking_group)
+
         # Behavioral scoring group
-        scoring_group = QGroupBox("Behavioral Scoring")
+        scoring_group = QGroupBox("Behavior Scoring")
         scoring_group_layout = QGridLayout()
 
         scoring_buttons = [
@@ -347,83 +358,6 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(scoring_group_layout, scoring_buttons)
         scoring_group.setLayout(scoring_group_layout)
         layout.addWidget(scoring_group)
-
-        layout.addStretch()
-
-    def create_video_tracking_tab(self):
-        """Create the video tracking tab"""
-        tab, layout = self._make_scrollable_tab("Video Tracking")
-
-        # Description
-        desc = QLabel("Interactive tracking tools for behavioral tests")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-
-        # Tracking tools group
-        tracking_group = QGroupBox("FNT Tracking Tools")
-        tracking_layout = QGridLayout()
-
-        tracking_buttons = [
-            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
-            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
-            ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
-        ]
-
-        self.create_button_grid(tracking_layout, tracking_buttons)
-        tracking_group.setLayout(tracking_layout)
-        layout.addWidget(tracking_group)
-
-        layout.addStretch()
-
-    def create_sleap_tab(self):
-        """Create the SLEAP processing tab"""
-        tab, layout = self._make_scrollable_tab("SLEAP")
-
-        # Description
-        desc = QLabel("SLEAP pose estimation pipeline tools")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-
-        # SLEAP processing group
-        sleap_group = QGroupBox("SLEAP Analysis Pipeline")
-        sleap_layout = QGridLayout()
-
-        sleap_buttons = [
-            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
-            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
-            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
-            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
-        ]
-
-        self.create_button_grid(sleap_layout, sleap_buttons)
-        sleap_group.setLayout(sleap_layout)
-        layout.addWidget(sleap_group)
-
-        layout.addStretch()
-
-    def create_labgym_tab(self):
-        """Create the LabGym tools tab"""
-        tab, layout = self._make_scrollable_tab("LabGym")
-
-        # Description
-        desc = QLabel("Supplementary tools for LabGym behavioral analysis workflows")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-
-        # LabGym tools group
-        labgym_group = QGroupBox("LabGym Tools")
-        labgym_layout = QGridLayout()
-
-        labgym_buttons = [
-            ("Generate Training Images", "Extract frames from videos for LabGym training datasets", self.run_generate_training_images),
-        ]
-
-        self.create_button_grid(labgym_layout, labgym_buttons)
-        labgym_group.setLayout(labgym_layout)
-        layout.addWidget(labgym_group)
 
         layout.addStretch()
 
@@ -671,41 +605,68 @@ class FNTMainWindow(QMainWindow):
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab, layout = self._make_scrollable_tab("Utilities")
-        
+
         # Description
-        desc = QLabel("General utilities and information")
+        desc = QLabel("General utilities, external tool integrations, and information")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # General Utilities group
         general_group = QGroupBox("General Utilities")
         general_layout = QGridLayout()
-        
+
         general_buttons = [
             ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
             ("Data Transfer", "Copy data files to a destination folder, auto-split large files", self.run_github_csv_transfer),
         ]
-        
+
         self.create_button_grid(general_layout, general_buttons)
         general_group.setLayout(general_layout)
         layout.addWidget(general_group)
-        
-        # Utilities & Information group
-        group = QGroupBox("Utilities & Information")
-        group_layout = QGridLayout()
-        
-        buttons = [
+
+        # SLEAP Utilities group
+        sleap_group = QGroupBox("SLEAP Utilities")
+        sleap_layout = QGridLayout()
+
+        sleap_buttons = [
+            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
+            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
+            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
+        ]
+
+        self.create_button_grid(sleap_layout, sleap_buttons)
+        sleap_group.setLayout(sleap_layout)
+        layout.addWidget(sleap_group)
+
+        # LabGym Utilities group
+        labgym_group = QGroupBox("LabGym Utilities")
+        labgym_layout = QGridLayout()
+
+        labgym_buttons = [
+            ("Generate Training Images", "Extract frames from videos for LabGym training datasets", self.run_generate_training_images),
+        ]
+
+        self.create_button_grid(labgym_layout, labgym_buttons)
+        labgym_group.setLayout(labgym_layout)
+        layout.addWidget(labgym_group)
+
+        # Information group
+        info_group = QGroupBox("Information")
+        info_layout = QGridLayout()
+
+        info_buttons = [
             ("About FNT", "About FieldNeuroToolbox", self.show_about),
             ("Check Dependencies", "Verify required software is installed", self.check_dependencies),
             ("Open Documentation", "Open FNT documentation", self.open_documentation),
             ("Report Issue", "Report a bug or request a feature", self.report_issue),
         ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
+
+        self.create_button_grid(info_layout, info_buttons)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
         layout.addStretch()
 
     def create_button_grid(self, layout, buttons):

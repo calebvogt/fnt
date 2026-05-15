@@ -545,12 +545,17 @@ def _draw_annotations(
     matched: Dict[int, Dict],
     categories: Dict,
     contour_thickness: int = 2,
+    behavior_labels: Optional[Dict[int, tuple]] = None,
 ) -> np.ndarray:
     """Draw track annotations on a frame (mask contour outlines or bounding boxes).
 
     Uses contour outlines instead of filled overlays so the animal remains
     fully visible — the outline directly represents the silhouette boundary
     that downstream behavioral classifiers will use.
+
+    Args:
+        behavior_labels: Optional {obj_id: (behavior_name, confidence)} dict.
+            When provided, appends behavior prediction to the label text.
     """
     overlay = frame_bgr.copy()
 
@@ -576,6 +581,11 @@ def _draw_annotations(
         cx, cy = int(det["centroid"][0]), int(det["centroid"][1])
         class_name = cat_map.get(det["label"], f"class{det['label']}")
         label_text = f"{class_name}_{obj_id}"
+
+        if behavior_labels and obj_id in behavior_labels:
+            beh_name, beh_conf = behavior_labels[obj_id]
+            label_text += f": {beh_name} {beh_conf:.0%}"
+
         (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         tx, ty = cx - tw // 2, cy - 8
         cv2.rectangle(overlay, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), (0, 0, 0), -1)
@@ -602,6 +612,7 @@ def run_inference_on_video(
     progress: Optional[Callable] = None,
     should_stop: Optional[Callable] = None,
     frame_callback: Optional[Callable] = None,
+    track_callback: Optional[Callable] = None,
 ) -> Dict:
     """Run full inference + tracking pipeline on a video.
 
@@ -691,7 +702,14 @@ def run_inference_on_video(
             matched = tracker.update(detections, frame_idx, fps, frame_hw=(h, w))
             t3 = time.time()
 
-            annotated = _draw_annotations(frame, matched, inference.categories)
+            behavior_labels = None
+            if track_callback:
+                behavior_labels = track_callback(matched, frame_idx, fps)
+
+            annotated = _draw_annotations(
+                frame, matched, inference.categories,
+                behavior_labels=behavior_labels,
+            )
             t4 = time.time()
 
             writer.write(annotated)
