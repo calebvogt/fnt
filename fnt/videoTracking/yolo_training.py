@@ -163,8 +163,11 @@ def train_yolo_seg(
     Returns a summary dict compatible with the Mask R-CNN training output.
     """
     import logging
+    import platform
     import sys
     import time as _time
+
+    import torch
 
     # Suppress Ultralytics' per-epoch tables and progress bars
     logging.getLogger("ultralytics").setLevel(logging.WARNING)
@@ -182,17 +185,38 @@ def train_yolo_seg(
     )
 
     device = _resolve_device(cfg.device)
+
+    # --- Diagnostic info ---
+    print(f"[YOLO Train] Python: {platform.python_version()}  |  "
+          f"PyTorch: {torch.__version__}  |  OS: {platform.system()} {platform.release()}")
+    if "cuda" in device and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        cuda_ver = torch.version.cuda or "N/A"
+        print(f"[YOLO Train] GPU: {gpu_name} ({gpu_mem:.1f} GB)  |  CUDA: {cuda_ver}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print(f"[YOLO Train] MPS available (not used for training)")
     print(f"[YOLO Train] Device: {device}")
 
     if "cuda" in device:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     from ultralytics import YOLO
+    try:
+        import ultralytics
+        print(f"[YOLO Train] Ultralytics: {ultralytics.__version__}")
+    except Exception:
+        pass
 
     from .sam2_checkpoint_manager import ensure_yolo_checkpoint
     pretrained_path = ensure_yolo_checkpoint(f"{cfg.model_variant}.pt")
     print(f"[YOLO Train] Pretrained weights: {pretrained_path}")
     model = YOLO(str(pretrained_path))
+
+    # Log model parameter count
+    total_params = sum(p.numel() for p in model.model.parameters())
+    trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    print(f"[YOLO Train] Parameters: {total_params:,} total, {trainable:,} trainable")
 
     freeze_layers = 10 if cfg.freeze_backbone else 0
 
@@ -200,24 +224,33 @@ def train_yolo_seg(
     best_loss = [float("inf")]
     stopped_early = [False]
 
+    epoch_t0 = [_time.time()]
+
     def on_train_epoch_end(trainer):
-        epoch = trainer.epoch + 1
-        total = trainer.epochs
+        """Capture training loss and sub-losses (available before validation)."""
         loss_val = float(trainer.loss) if hasattr(trainer, "loss") else 0.0
         if loss_val < best_loss[0]:
             best_loss[0] = loss_val
-        iteration_count[0] = epoch
-
-        # Collect sub-losses
-        sub_losses = {}
+        iteration_count[0] = trainer.epoch + 1
+        _epoch_cache["loss"] = loss_val
+        _epoch_cache["lr"] = trainer.optimizer.param_groups[0]["lr"]
+        sub = {}
         if hasattr(trainer, "loss_items") and trainer.loss_items is not None:
             names = trainer.loss_names if hasattr(trainer, "loss_names") else []
             items = trainer.loss_items.cpu().numpy() if hasattr(trainer.loss_items, "cpu") else trainer.loss_items
             for i, v in enumerate(items):
                 key = names[i] if i < len(names) else f"loss_{i}"
-                sub_losses[key] = float(v)
+                sub[key] = float(v)
+        _epoch_cache["sub"] = sub
 
-        # Collect validation mAP
+    def on_fit_epoch_end(trainer):
+        """Fire after both training and validation — mAP is now available."""
+        epoch = trainer.epoch + 1
+        total = trainer.epochs
+        loss_val = _epoch_cache.get("loss", 0.0)
+        sub_losses = _epoch_cache.get("sub", {})
+        lr = _epoch_cache.get("lr", 0.0)
+
         map_vals = {}
         if hasattr(trainer, "metrics") and trainer.metrics:
             m = trainer.metrics
@@ -227,6 +260,9 @@ def train_yolo_seg(
                     short = key.split("/")[-1]
                     map_vals[short] = float(m[key])
 
+        epoch_sec = _time.time() - epoch_t0[0]
+        epoch_t0[0] = _time.time()
+
         # Single updating line in terminal
         parts = [f"Epoch {epoch}/{total}"]
         parts.append(f"loss={loss_val:.3f}")
@@ -234,17 +270,25 @@ def train_yolo_seg(
             if k in sub_losses:
                 short = k.replace("_loss", "")
                 parts.append(f"{short}={sub_losses[k]:.3f}")
-        if "mAP50(B)" in map_vals:
+        if "mAP50(M)" in map_vals:
+            parts.append(f"mAP50={map_vals['mAP50(M)']:.3f}")
+        elif "mAP50(B)" in map_vals:
             parts.append(f"mAP50={map_vals['mAP50(B)']:.3f}")
+        gpu_mem_str = ""
+        if "cuda" in device and torch.cuda.is_available():
+            gpu_mb = torch.cuda.max_memory_allocated() / 1024**2
+            gpu_mem_str = f"  GPU mem: {gpu_mb:.0f}MB"
         elapsed = _time.time() - t0
-        parts.append(f"[{elapsed:.0f}s]")
-        print(f"\r[YOLO Train] {' | '.join(parts)}", end="", flush=True)
+        parts.append(f"{epoch_sec:.1f}s/epoch")
+        parts.append(f"[{elapsed:.0f}s total]")
+        print(f"\r[YOLO Train] {' | '.join(parts)}{gpu_mem_str}", end="", flush=True)
 
         if progress:
             metrics = {
                 "loss": loss_val,
-                "lr": trainer.optimizer.param_groups[0]["lr"],
+                "lr": lr,
                 "best_loss": best_loss[0],
+                "epoch_time": epoch_sec,
                 **sub_losses,
                 **map_vals,
             }
@@ -252,7 +296,9 @@ def train_yolo_seg(
         if should_stop and should_stop():
             trainer.stop = True
 
+    _epoch_cache: dict = {}
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
+    model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
     t0 = _time.time()
     results = model.train(

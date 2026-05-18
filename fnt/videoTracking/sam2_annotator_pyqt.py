@@ -5433,6 +5433,35 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         arch = config_dict.get("_architecture", "?")
         variant = config_dict.get("model_variant", config_dict.get("backbone", "?"))
+
+        import platform as _plat
+        self._seg_log_text.append(
+            f"[System] Python {_plat.python_version()}  |  "
+            f"OS: {_plat.system()} {_plat.release()}"
+        )
+        try:
+            import torch as _torch
+            self._seg_log_text.append(f"[System] PyTorch {_torch.__version__}")
+            if _torch.cuda.is_available():
+                gpu = _torch.cuda.get_device_name(0)
+                mem = _torch.cuda.get_device_properties(0).total_mem / 1024**3
+                self._seg_log_text.append(
+                    f"[System] GPU: {gpu} ({mem:.1f} GB)  |  "
+                    f"CUDA: {_torch.version.cuda or 'N/A'}"
+                )
+            elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                self._seg_log_text.append("[System] Apple MPS available")
+            else:
+                self._seg_log_text.append("[System] No GPU detected — training on CPU")
+        except ImportError:
+            pass
+        try:
+            import ultralytics as _ul
+            self._seg_log_text.append(f"[System] Ultralytics {_ul.__version__}")
+        except Exception:
+            pass
+
+        self._seg_log_text.append("")
         self._seg_log_text.append(f"[Segmentation] Architecture: {arch} ({variant})")
         self._seg_log_text.append(
             f"[Segmentation] epochs={total}, lr={config_dict.get('learning_rate', 0):.4f}, "
@@ -5444,6 +5473,9 @@ class SAM2AnnotatorWindow(QMainWindow):
             f"[Segmentation] freeze_backbone={config_dict.get('freeze_backbone', False)}, "
             f"optimizer={config_dict.get('optimizer', '?')}, "
             f"patience={config_dict.get('early_stop_patience', '?')}"
+        )
+        self._seg_log_text.append(
+            f"[Segmentation] Training images: {n_train_images} (approved)"
         )
         self._seg_log_text.append("")
 
@@ -5497,9 +5529,11 @@ class SAM2AnnotatorWindow(QMainWindow):
         for key in ("box_loss", "seg_loss", "cls_loss", "dfl_loss"):
             if key in metrics:
                 parts.append(f"{key}={metrics[key]:.4f}")
-        for key in ("mAP50_box", "mAP50_mask", "mAP50-95_box", "mAP50-95_mask"):
+        for key in ("mAP50(M)", "mAP50(B)", "mAP50-95(M)", "mAP50-95(B)"):
             if key in metrics:
                 parts.append(f"{key}={metrics[key]:.4f}")
+        if "epoch_time" in metrics:
+            parts.append(f"{metrics['epoch_time']:.1f}s/epoch")
         self._seg_log_text.append("  ".join(parts))
 
     def _dismiss_training_viz(self):
