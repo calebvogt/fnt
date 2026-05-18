@@ -5543,8 +5543,6 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._info_row.setVisible(True)
 
     def _on_train_finished(self, summary: dict):
-        self.train_progress.setVisible(False)
-        self.btn_train.setEnabled(True)
         self.btn_pause.setVisible(False)
         self.btn_stop.setVisible(False)
 
@@ -5558,33 +5556,37 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         if stopped_by_user and not early:
             status = f"Training stopped by user at iteration {iters}. Best loss: {best_str}"
-            title = "Training Stopped"
-            detail = (f"Training was stopped at iteration {iters}.\n"
-                      f"Best loss: {best_str}\n\n"
-                      f"Model saved to:\n{run_dir}")
         elif early:
             status = f"Training stopped early (plateau) at iteration {iters}. Best loss: {best_str}"
-            title = "Training Complete (Early Stop)"
-            detail = (f"Training stopped early — loss plateaued after {iters} iterations.\n"
-                      f"Best loss: {best_str}\n\n"
-                      f"Model saved to:\n{run_dir}")
         else:
             status = f"Training complete ({iters} iterations). Best loss: {best_str}"
-            title = "Training Complete"
-            detail = (f"Completed {iters} iterations.\n"
-                      f"Best loss: {best_str}\n\n"
-                      f"Model saved to:\n{run_dir}")
 
-        self.lbl_train_status.setText(status)
         self._seg_log_text.append("")
         self._seg_log_text.append(f"[Segmentation] {status}")
         self._seg_log_text.append(f"[Segmentation] Model saved to: {run_dir}")
-        QMessageBox.information(self, title, detail)
-        self.status_bar.showMessage(f"Training complete: {model_path}")
 
-        # Trigger post-training inference if enabled
+        # Store summary for the combined dialog after inference
+        self._last_train_summary = {
+            "status": status,
+            "run_dir": run_dir,
+            "model_path": model_path,
+            "early": early,
+            "stopped_by_user": stopped_by_user,
+            "iters": iters,
+            "best_str": best_str,
+        }
+
+        # Trigger post-training inference if enabled, otherwise show dialog now
         if self.chk_post_infer.isChecked() and run_dir:
+            self.lbl_train_status.setText("Training done — running inference on unlabeled frames...")
+            self._seg_log_text.append("")
             self._run_post_train_inference(run_dir)
+        else:
+            self.train_progress.setVisible(False)
+            self.btn_train.setEnabled(True)
+            self.lbl_train_status.setText(status)
+            self.status_bar.showMessage(f"Training complete: {model_path}")
+            self._show_train_complete_dialog()
 
     def _run_post_train_inference(self, model_dir: str):
         """Run the trained model on unlabeled extracted frames."""
@@ -5694,21 +5696,70 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _on_post_infer_finished(self, count: int):
         self.train_progress.setVisible(False)
         self.btn_train.setEnabled(True)
-        self.lbl_train_status.setText(
-            f"Post-training inference complete: {count} masks inferred. "
-            f"Switch to Annotator tab to review."
+
+        # Count how many frames got inferred annotations
+        n_inferred_frames = 0
+        for _, _, fp in self._extracted_frames:
+            fn = os.path.basename(fp)
+            if fn in self._coco._image_id_map:
+                img_id = self._coco._image_id_map[fn]
+                for ann in self._coco.get_annotations_for_image(img_id):
+                    if ann.get("inferred", False):
+                        n_inferred_frames += 1
+                        break
+
+        total_frames = len(self._extracted_frames)
+        infer_status = (
+            f"Post-training inference: {count} masks inferred "
+            f"across {n_inferred_frames}/{total_frames} frames"
         )
+        self.lbl_train_status.setText(f"{infer_status}. Review inferred masks.")
+
+        # Log inference results
+        self._seg_log_text.append(f"[Inference] {infer_status}")
+        if count == 0:
+            self._seg_log_text.append(
+                "[Inference] No detections — model may need more training data "
+                "or a lower confidence threshold."
+            )
+
         self._refresh_frame_list()
-        # Reload current frame annotations in case it was just inferred
         if self.current_frame_idx >= 0:
             _, _, path = self._extracted_frames[self.current_frame_idx]
             self._load_frame_annotations(path)
+
+        model_path = getattr(self, "_last_train_summary", {}).get("model_path", "")
+        self.status_bar.showMessage(f"Training + inference complete: {model_path}")
+        self._show_train_complete_dialog(infer_status)
 
     def _on_post_infer_error(self, msg: str):
         self.train_progress.setVisible(False)
         self.btn_train.setEnabled(True)
         self.lbl_train_status.setText(f"Post-inference error: {msg}")
-        QMessageBox.critical(self, "Post-Training Inference Error", msg)
+        self._seg_log_text.append(f"[Inference] ERROR: {msg}")
+        self._show_train_complete_dialog(f"Post-inference error: {msg}")
+
+    def _show_train_complete_dialog(self, infer_info: str = None):
+        s = getattr(self, "_last_train_summary", {})
+        run_dir = s.get("run_dir", "")
+        iters = s.get("iters", "?")
+        best_str = s.get("best_str", "N/A")
+
+        if s.get("stopped_by_user"):
+            title = "Training Stopped"
+        elif s.get("early"):
+            title = "Training Complete (Early Stop)"
+        else:
+            title = "Training Complete"
+
+        lines = [s.get("status", "Training finished.")]
+        if infer_info:
+            lines.append("")
+            lines.append(infer_info)
+        lines.append("")
+        lines.append(f"Model saved to:\n{run_dir}")
+
+        QMessageBox.information(self, title, "\n".join(lines))
 
     def _on_train_error(self, msg: str):
         self.train_progress.setVisible(False)
