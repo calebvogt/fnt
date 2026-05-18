@@ -3193,12 +3193,14 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         post_infer_row.addWidget(self.lbl_post_infer_max)
         self.spin_post_infer_max = QSpinBox()
-        self.spin_post_infer_max.setRange(1, 100)
-        self.spin_post_infer_max.setValue(1)
+        self.spin_post_infer_max.setRange(0, 100)
+        self.spin_post_infer_max.setValue(0)
+        self.spin_post_infer_max.setSpecialValueText("Unlimited")
         self.spin_post_infer_max.setStyleSheet(spin_style)
         self.spin_post_infer_max.setToolTip(
             "Maximum number of objects to detect per frame during\n"
-            "post-training inference (1–100)."
+            "post-training inference. 'Unlimited' detects all objects\n"
+            "above the confidence threshold."
         )
         post_infer_row.addWidget(self.spin_post_infer_max)
         train_vbox.addLayout(post_infer_row)
@@ -3389,11 +3391,13 @@ class SAM2AnnotatorWindow(QMainWindow):
         row_max = QHBoxLayout()
         row_max.addWidget(QLabel("Max objects:"))
         self.spin_cls_max_det = QSpinBox()
-        self.spin_cls_max_det.setRange(1, 100)
-        self.spin_cls_max_det.setValue(1)
+        self.spin_cls_max_det.setRange(0, 100)
+        self.spin_cls_max_det.setValue(0)
+        self.spin_cls_max_det.setSpecialValueText("Unlimited")
         self.spin_cls_max_det.setStyleSheet(spin_style)
         self.spin_cls_max_det.setToolTip(
-            "Maximum objects to detect per frame."
+            "Maximum objects to detect per frame.\n"
+            "'Unlimited' detects all objects above the confidence threshold."
         )
         row_max.addWidget(self.spin_cls_max_det)
         clip_vbox.addLayout(row_max)
@@ -3825,14 +3829,15 @@ class SAM2AnnotatorWindow(QMainWindow):
         row0 = QHBoxLayout()
         row0.addWidget(QLabel("Max objects:"))
         self.spin_track_max_det = QSpinBox()
-        self.spin_track_max_det.setRange(1, 100)
-        self.spin_track_max_det.setValue(1)
+        self.spin_track_max_det.setRange(0, 100)
+        self.spin_track_max_det.setValue(0)
+        self.spin_track_max_det.setSpecialValueText("Unlimited")
         self.spin_track_max_det.setStyleSheet(self._spin_style)
         self.spin_track_max_det.setToolTip(
-            "Maximum number of objects/masks to detect per frame (1–100).\n"
-            "Set this to the number of animals or objects you expect\n"
-            "in the video. Only the top-N highest-confidence detections\n"
-            "are kept each frame. Default 1 for single-animal tracking."
+            "Maximum number of objects/masks to detect per frame.\n"
+            "'Unlimited' detects all objects above the confidence\n"
+            "threshold. Set a number to keep only the top-N highest-\n"
+            "confidence detections each frame."
         )
         row0.addWidget(self.spin_track_max_det)
         settings_vbox.addLayout(row0)
@@ -5583,7 +5588,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                     if ann.get("inferred", False):
                         self._coco.remove_annotation(ann["id"])
 
-        max_det = self.spin_post_infer_max.value()
+        max_det = self.spin_post_infer_max.value() or 100
 
         self.btn_train.setEnabled(False)
         self.train_progress.setMaximum(len(unlabeled_paths))
@@ -6308,7 +6313,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         model_dir = self._cls_model_dirs[model_idx]
         clip_length = self.spin_cls_clip_length.value()
         confidence = self.spin_cls_confidence.value()
-        max_det = self.spin_cls_max_det.value()
+        max_det = self.spin_cls_max_det.value() or 100
         start_frame = self._cls_frame_idx
 
         self._cls_clip_masks = {}
@@ -7082,7 +7087,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         model_dir = self._cls_model_dirs[model_idx]
         clip_length = self.spin_cls_clip_length.value()
         confidence = self.spin_cls_confidence.value()
-        max_det = self.spin_cls_max_det.value()
+        max_det = self.spin_cls_max_det.value() or 100
         method = self.combo_batch_method.currentIndex()
         n_clips = self.spin_batch_count.value()
 
@@ -8086,7 +8091,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         config_dict = {
             "confidence_threshold": self.spin_track_confidence.value(),
-            "max_detections": self.spin_track_max_det.value(),
+            "max_detections": self.spin_track_max_det.value() or 100,
             "max_disappeared_frames": max_disappear,
             "iou_match_threshold": self.spin_track_iou.value(),
             "matching_algorithm": matching_algo,
