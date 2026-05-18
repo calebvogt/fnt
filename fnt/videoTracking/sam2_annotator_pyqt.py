@@ -2934,8 +2934,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         row.addWidget(lbl)
         self.combo_architecture = QComboBox()
         self.combo_architecture.addItems([
-            "YOLOv11-small-seg",
             "YOLOv11-nano-seg",
+            "YOLOv11-small-seg",
             "YOLOv11-medium-seg",
             "YOLOv11-large-seg",
             "Mask R-CNN",
