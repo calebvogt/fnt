@@ -22,6 +22,7 @@ from PyQt5.QtGui import QFont
 class InferenceWorker(QThread):
     """Worker thread for running SLEAP inference"""
     progress = pyqtSignal(str)
+    progress_update = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     
     def __init__(self, video_folders, individual_videos, model_paths, overwrite_existing, create_csv=True, add_tracking=False, 
@@ -43,10 +44,13 @@ class InferenceWorker(QThread):
         self.post_connect_breaks = post_connect_breaks
         self.conda_env = conda_env
         self._stop_requested = False
-    
+        self._current_process = None
+
     def request_stop(self):
         """Request the worker to stop processing"""
         self._stop_requested = True
+        if self._current_process:
+            self._current_process.terminate()
         self.progress.emit("\n⚠️ Stop requested by user...")
         
     def run(self):
@@ -249,43 +253,49 @@ class InferenceWorker(QThread):
         self.progress.emit(f"Command: {' '.join(full_cmd)}\n")
         
         try:
-            # Execute command using conda run
-            self.progress.emit("🔄 Running SLEAP inference... (this may take several minutes)")
-            self.progress.emit("⏳ SLEAP is processing frames - progress will appear when complete")
-            
-            result = subprocess.run(
+            self.progress.emit("🔄 Running SLEAP inference...\n")
+
+            process = subprocess.Popen(
                 full_cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                shell=True
+                shell=True,
+                bufsize=1,
             )
-            
-            # Show all output after completion
-            if result.stdout:
-                output_lines = result.stdout.strip().split('\n')
-                for line in output_lines:
-                    if line.strip():
-                        self.progress.emit(line)
-            
-            if result.stderr:
-                error_lines = result.stderr.strip().split('\n')
-                for line in error_lines:
-                    if line.strip():
-                        self.progress.emit(f"⚠️ {line}")
-            
-            if result.returncode == 0:
-                self.progress.emit(f"✅ Inference completed: {os.path.basename(output_file)}")
-                
-                # Convert to CSV if requested
+            self._current_process = process
+
+            for raw_line in process.stdout:
+                if self._stop_requested:
+                    process.terminate()
+                    break
+                # SLEAP uses \r for progress bar updates
+                segments = raw_line.rstrip('\n').split('\r')
+                for i, segment in enumerate(segments):
+                    segment = segment.strip()
+                    if not segment:
+                        continue
+                    if i > 0 or raw_line.startswith('\r'):
+                        self.progress_update.emit(segment)
+                    else:
+                        self.progress.emit(segment)
+
+            process.wait()
+            self._current_process = None
+
+            if process.returncode == 0:
+                self.progress.emit(f"\n✅ Inference completed: {os.path.basename(output_file)}")
+
                 if self.create_csv:
                     self.convert_to_csv(output_file)
-                    
+
                 return True
             else:
-                self.progress.emit(f"❌ Inference failed with return code {result.returncode}")
+                self.progress.emit(f"\n❌ Inference failed with return code {process.returncode}")
                 return False
-                
+
         except Exception as e:
+            self._current_process = None
             self.progress.emit(f"❌ Error running inference: {str(e)}")
             return False
     
@@ -754,7 +764,18 @@ class VideoInferenceWindow(QWidget):
     def log(self, message):
         """Add message to log output"""
         self.log_output.append(message)
-        # Auto-scroll to bottom
+        self.log_output.verticalScrollBar().setValue(
+            self.log_output.verticalScrollBar().maximum()
+        )
+
+    def log_update(self, message):
+        """Replace the last line in the log (for progress bar updates)"""
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.select(cursor.LineUnderCursor)
+        cursor.removeSelectedText()
+        cursor.deletePreviousChar()
+        cursor.insertText(message)
         self.log_output.verticalScrollBar().setValue(
             self.log_output.verticalScrollBar().maximum()
         )
@@ -1148,6 +1169,7 @@ class VideoInferenceWindow(QWidget):
             self.combo_environment.currentData()
         )
         self.worker.progress.connect(self.log)
+        self.worker.progress_update.connect(self.log_update)
         self.worker.finished.connect(self.on_inference_finished)
         self.worker.start()
     

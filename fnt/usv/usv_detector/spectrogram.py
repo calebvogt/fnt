@@ -316,6 +316,60 @@ def estimate_noise_floor(
     return np.percentile(Sxx_db, percentile, axis=1)
 
 
+def estimate_noise_floor_blockwise(
+    Sxx_db: np.ndarray,
+    times: np.ndarray,
+    block_seconds: float,
+    percentile: float = 25.0
+) -> np.ndarray:
+    """
+    Estimate a time-varying noise floor by computing the per-freq percentile
+    over non-overlapping time blocks, then linearly interpolating between
+    block centers.
+
+    Args:
+        Sxx_db: Spectrogram in dB (freq x time)
+        times: Time array for the spectrogram columns (seconds)
+        block_seconds: Block length in seconds
+        percentile: Percentile for the per-block noise estimate
+
+    Returns:
+        2D noise floor array, shape == Sxx_db.shape
+    """
+    n_time = Sxx_db.shape[1]
+    if block_seconds <= 0 or len(times) < 2 or n_time < 2:
+        nf_1d = np.percentile(Sxx_db, percentile, axis=1)
+        return np.broadcast_to(nf_1d[:, None], Sxx_db.shape).copy()
+
+    dt = float(times[1] - times[0])
+    block_bins = max(2, int(round(block_seconds / dt)))
+    if n_time <= block_bins:
+        nf_1d = np.percentile(Sxx_db, percentile, axis=1)
+        return np.broadcast_to(nf_1d[:, None], Sxx_db.shape).copy()
+
+    centers = []
+    values = []
+    for s in range(0, n_time, block_bins):
+        e = min(s + block_bins, n_time)
+        if e - s < 2:
+            continue
+        centers.append((s + e - 1) / 2.0)
+        values.append(np.percentile(Sxx_db[:, s:e], percentile, axis=1))
+    centers = np.asarray(centers, dtype=float)
+    values = np.stack(values, axis=1)  # (n_freq, n_blocks)
+
+    if values.shape[1] == 1:
+        return np.broadcast_to(values, Sxx_db.shape).copy()
+
+    target = np.arange(n_time, dtype=float)
+    idx = np.searchsorted(centers, target)
+    idx = np.clip(idx, 1, centers.shape[0] - 1)
+    left_c = centers[idx - 1]
+    right_c = centers[idx]
+    alpha = np.clip((target - left_c) / (right_c - left_c), 0.0, 1.0)
+    return values[:, idx - 1] * (1.0 - alpha) + values[:, idx] * alpha
+
+
 def compute_power_envelope(
     Sxx_db: np.ndarray,
     frequencies: np.ndarray,

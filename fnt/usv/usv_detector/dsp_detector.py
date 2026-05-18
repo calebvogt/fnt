@@ -12,7 +12,8 @@ from typing import List, Dict, Optional, Tuple
 from .config import USVDetectorConfig
 from .spectrogram import (
     load_audio, compute_spectrogram, compute_spectrogram_auto,
-    bandpass_filter, estimate_noise_floor, get_audio_info
+    bandpass_filter, estimate_noise_floor, estimate_noise_floor_blockwise,
+    get_audio_info
 )
 
 
@@ -177,6 +178,7 @@ class DSPDetector:
 
         all_calls = []
         offset = 0
+        group_offset = 0  # keeps call_group_id unique across chunks
 
         while offset < total_samples:
             chunk_end = min(offset + chunk_samples, total_samples)
@@ -185,11 +187,18 @@ class DSPDetector:
             # Detect in this chunk (no recursive progress callback)
             calls = self.detect(chunk, sr)
 
-            # Adjust times for offset
+            # Adjust times for offset; shift group ids into a disjoint range.
             time_offset = offset / sr
+            chunk_max_group = -1
             for call in calls:
                 call['start_seconds'] += time_offset
                 call['stop_seconds'] += time_offset
+                if 'call_group_id' in call:
+                    call['call_group_id'] += group_offset
+                    if call['call_group_id'] > chunk_max_group:
+                        chunk_max_group = call['call_group_id']
+            if chunk_max_group >= 0:
+                group_offset = chunk_max_group + 1
 
             all_calls.extend(calls)
             offset += chunk_samples - overlap_samples
@@ -220,11 +229,18 @@ class DSPDetector:
         Returns:
             List of raw detections
         """
-        # Estimate noise floor per frequency bin
-        noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
-
-        # Create threshold mask
-        threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
+        # Estimate noise floor. Priority:
+        #   1. Block-wise time-varying floor (2D) when noise_block_seconds > 0.
+        #   2. Classical 1D per-freq percentile.
+        block_s = getattr(self.config, 'noise_block_seconds', 0.0) or 0.0
+        if block_s > 0:
+            noise_floor = estimate_noise_floor_blockwise(
+                Sxx_db, times, block_s, self.config.noise_percentile
+            )
+            threshold = noise_floor + self.config.energy_threshold_db
+        else:
+            noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
+            threshold = noise_floor[:, np.newaxis] + self.config.energy_threshold_db
         mask = Sxx_db > threshold
 
         # Apply morphological operations to clean up mask
@@ -304,9 +320,14 @@ class DSPDetector:
             mean_power_db = np.mean(region_spec[region_spec > -99])
             max_power_db = np.max(region_spec)
 
-            # SNR: max power minus mean noise floor over detection's freq range
-            det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1]
-            snr_db = float(max_power_db - np.mean(det_noise_floor)) if len(det_noise_floor) > 0 else 0.0
+            # SNR: max power minus mean noise floor over the detection's
+            # freq range (and time range too, when using a 2D block-wise floor).
+            if noise_floor.ndim == 2:
+                det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1,
+                                              start_idx:end_idx + 1]
+            else:
+                det_noise_floor = noise_floor[min_freq_idx:max_freq_idx + 1]
+            snr_db = float(max_power_db - np.mean(det_noise_floor)) if det_noise_floor.size > 0 else 0.0
 
             calls.append({
                 'start_seconds': float(start_s),
@@ -747,14 +768,24 @@ class DSPDetector:
         (2x, 3x) of the other's. If so, mark the higher-frequency detection
         with ``is_harmonic=True`` and ``harmonic_of=<index>``.
 
+        Also assigns ``call_group_id`` to every detection: fundamentals and
+        their harmonics share a group id, so downstream analyses can pivot
+        on either component-level counts or call-level counts.
+
         This is a post-processing step that preserves all detections but
         annotates harmonics so downstream code can filter or count them.
         """
+        # Always assign group ids, even when harmonic detection is off,
+        # so downstream code can rely on the column existing.
         if not getattr(self.config, 'detect_harmonics', True):
+            for i, c in enumerate(sorted(calls, key=lambda c: c['start_seconds'])):
+                c.setdefault('is_harmonic', False)
+                c['call_group_id'] = i
             return calls
         if len(calls) < 2:
-            for c in calls:
+            for i, c in enumerate(calls):
                 c['is_harmonic'] = False
+                c['call_group_id'] = i
             return calls
 
         # Initialize all as non-harmonic
@@ -826,6 +857,25 @@ class DSPDetector:
                         harm_call['harmonic_of_start'] = fund_call['start_seconds']
                         harm_call['harmonic_ratio'] = round(ratio, 2)
                         break
+
+        # Assign call_group_id: each fundamental gets a fresh id; harmonics
+        # inherit their fundamental's id. Downstream can count groups (calls)
+        # or rows (components).
+        fund_id_to_group: Dict[int, int] = {}
+        next_group = 0
+        for c in calls_sorted:
+            if not c['is_harmonic']:
+                c['call_group_id'] = next_group
+                fund_id_to_group[id(c)] = next_group
+                next_group += 1
+        for c in calls_sorted:
+            if c['is_harmonic']:
+                c['call_group_id'] = fund_id_to_group.get(
+                    c.get('harmonic_of'), next_group
+                )
+                if c['call_group_id'] == next_group:
+                    # Orphan harmonic (fundamental lost to a filter) — own group.
+                    next_group += 1
 
         return calls_sorted
 
