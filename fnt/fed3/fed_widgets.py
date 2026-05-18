@@ -402,6 +402,7 @@ class FEDTabWidget(QWidget):
             
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         self.figure.autofmt_xdate()
+        self.figure.tight_layout(pad=1.5)
         self.canvas.draw()
 
     def populate_port_combo(self, combo):
