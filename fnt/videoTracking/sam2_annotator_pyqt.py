@@ -535,6 +535,9 @@ class AnnotationPreviewWidget(QWidget):
                 self._dragging_point = True
                 return
 
+            if self._editing_obj_idx is not None:
+                return
+
             if self.drawing_mode == "manual":
                 if not self._drawing_active:
                     self._drawing_active = True
@@ -1970,37 +1973,19 @@ class _SilhouetteExtractionWorker(QThread):
 
 
 class LiveLossPlot(QWidget):
-    """Real-time training loss plot with sub-losses and validation mAP.
+    """Real-time training loss and validation mAP plot for segmentation.
 
-    Embeddable widget — can be placed in any layout.
+    Matches the ClassifierLossPlot style: train loss, best loss, and
+    mAP50 (mask) on a secondary axis — three clean lines.
     """
-
-    # Sub-loss colours (semi-transparent thin lines)
-    _SUB_COLORS = {
-        # Mask R-CNN keys
-        "loss_classifier": ("#ff9800", "Classification"),
-        "loss_box_reg": ("#4caf50", "Box regression"),
-        "loss_mask": ("#e91e63", "Mask"),
-        "loss_objectness": ("#9c27b0", "Objectness"),
-        "loss_rpn_box_reg": ("#00bcd4", "RPN box regression"),
-        # YOLO keys
-        "box_loss": ("#4caf50", "Box localization"),
-        "seg_loss": ("#e91e63", "Mask segmentation"),
-        "cls_loss": ("#ff9800", "Classification"),
-    }
-    _MAP_COLORS = {
-        "mAP50(B)": ("#66bb6a", "Val mAP50 (box)"),
-        "mAP50(M)": ("#ef5350", "Val mAP50 (mask)"),
-        "mAP50-95(B)": ("#26a69a", "Val mAP50-95 (box)"),
-        "mAP50-95(M)": ("#ab47bc", "Val mAP50-95 (mask)"),
-    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._iterations = []
         self._losses = []
-        self._sub_data: dict = {}   # key -> list of values
-        self._map_data: dict = {}   # key -> list of (iter, value)
+        self._best_losses = []
+        self._map_iters = []
+        self._map_vals = []
         self._total = 100
 
         try:
@@ -2013,11 +1998,10 @@ class LiveLossPlot(QWidget):
             self._fig.patch.set_facecolor("#1e1e1e")
             self._ax = self._fig.add_subplot(111)
             self._setup_axes()
-            self._line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
-                                        label="Total loss (sum)")
-            self._sub_lines = {}
-
-            # Secondary y-axis for mAP (right side)
+            self._train_line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                              label="Train loss")
+            self._best_line, = self._ax.plot([], [], color="#ff9800", linewidth=1.8,
+                                             linestyle="--", label="Best loss")
             self._ax2 = self._ax.twinx()
             self._ax2.yaxis.set_label_position("right")
             self._ax2.yaxis.tick_right()
@@ -2025,9 +2009,16 @@ class LiveLossPlot(QWidget):
             self._ax2.tick_params(axis="y", colors="#66bb6a")
             self._ax2.set_ylim(0, 1.05)
             self._ax2.spines["right"].set_color("#66bb6a")
-            self._map_lines = {}
-
-            self._fig.subplots_adjust(right=0.72, bottom=0.15)
+            self._map_line, = self._ax2.plot([], [], color="#66bb6a", linewidth=1.4,
+                                             marker="o", markersize=3,
+                                             label="Val mAP50")
+            all_handles = [self._train_line, self._best_line, self._map_line]
+            all_labels = [h.get_label() for h in all_handles]
+            self._ax.legend(all_handles, all_labels,
+                            loc="upper right", fontsize=8,
+                            facecolor="#2b2b2b", edgecolor="#555555",
+                            labelcolor="#cccccc", framealpha=0.9)
+            self._fig.subplots_adjust(right=0.88, bottom=0.15)
             self._canvas = FigureCanvasQTAgg(self._fig)
             self._has_mpl = True
         except ImportError:
@@ -2048,44 +2039,56 @@ class LiveLossPlot(QWidget):
     def _setup_axes(self):
         self._ax.set_facecolor("#1e1e1e")
         self._ax.set_xlabel("Epoch", color="#cccccc")
-        self._ax.set_ylabel("Loss", color="#cccccc")
-        self._ax.set_title("Training Loss", color="#cccccc", fontsize=11)
+        self._ax.set_ylabel("Loss (log scale)", color="#cccccc")
+        self._ax.set_title("Segmentation Training", color="#cccccc", fontsize=11)
+        self._ax.set_yscale("log")
         self._ax.tick_params(colors="#999999")
         for spine in self._ax.spines.values():
             spine.set_color("#555555")
         self._ax.set_xlim(0, 10)
 
     def reset(self, total_iterations: int):
-        """Clear all data and prepare for a new training run."""
         self._iterations.clear()
         self._losses.clear()
-        self._sub_data.clear()
-        self._map_data.clear()
+        self._best_losses.clear()
+        self._map_iters.clear()
+        self._map_vals.clear()
         self._total = total_iterations
         self._lbl_status.setText("Waiting for first epoch...")
         if self._has_mpl:
             self._ax.cla()
-            if hasattr(self, "_ax2"):
-                self._ax2.cla()
-                self._ax2.yaxis.set_label_position("right")
-                self._ax2.yaxis.tick_right()
-                self._ax2.set_ylabel("mAP", color="#66bb6a")
-                self._ax2.tick_params(axis="y", colors="#66bb6a")
-                self._ax2.set_ylim(0, 1.05)
-                self._ax2.spines["right"].set_color("#66bb6a")
+            self._ax2.cla()
+            self._ax2.yaxis.set_label_position("right")
+            self._ax2.yaxis.tick_right()
+            self._ax2.set_ylabel("mAP", color="#66bb6a")
+            self._ax2.tick_params(axis="y", colors="#66bb6a")
+            self._ax2.set_ylim(0, 1.05)
+            self._ax2.spines["right"].set_color("#66bb6a")
             self._setup_axes()
-            self._line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
-                                        label="Total loss (sum)")
-            self._sub_lines.clear()
-            self._map_lines.clear()
+            self._train_line, = self._ax.plot([], [], color="#2979ff", linewidth=1.8,
+                                              label="Train loss")
+            self._best_line, = self._ax.plot([], [], color="#ff9800", linewidth=1.8,
+                                             linestyle="--", label="Best loss")
+            self._map_line, = self._ax2.plot([], [], color="#66bb6a", linewidth=1.4,
+                                             marker="o", markersize=3,
+                                             label="Val mAP50")
+            all_handles = [self._train_line, self._best_line, self._map_line]
+            all_labels = [h.get_label() for h in all_handles]
+            self._ax.legend(all_handles, all_labels,
+                            loc="upper right", fontsize=8,
+                            facecolor="#2b2b2b", edgecolor="#555555",
+                            labelcolor="#cccccc", framealpha=0.9)
             self._canvas.draw_idle()
 
     def add_point(self, iteration: int, loss: float, metrics: dict = None):
         self._iterations.append(iteration)
         self._losses.append(loss)
 
-        # Build status text
-        parts = [f"Epoch {iteration} / {self._total}    Loss: {loss:.4f}"]
+        best = metrics.get("best_loss", loss) if metrics else loss
+        self._best_losses.append(best)
+
+        parts = [f"Epoch {iteration}/{self._total}    Loss: {loss:.4f}"]
+        map50 = None
         if metrics:
             map50 = metrics.get("mAP50(M)") or metrics.get("mAP50(B)")
             if map50 is not None:
@@ -2095,54 +2098,20 @@ class LiveLossPlot(QWidget):
         if not self._has_mpl:
             return
 
-        # Update total loss line
-        self._line.set_data(self._iterations, self._losses)
+        self._train_line.set_data(self._iterations, self._losses)
+        self._best_line.set_data(self._iterations, self._best_losses)
+
+        if map50 is not None:
+            self._map_iters.append(iteration)
+            self._map_vals.append(map50)
+            self._map_line.set_data(self._map_iters, self._map_vals)
+
         self._ax.set_xlim(0, max(iteration * 1.1, 10))
-        y_max = max(self._losses) * 1.1 + 0.01
-
-        # Update sub-loss lines
-        if metrics:
-            for key, (color, label_text) in self._SUB_COLORS.items():
-                if key in metrics:
-                    self._sub_data.setdefault(key, []).append(metrics[key])
-                    if key not in self._sub_lines:
-                        ln, = self._ax.plot([], [], color=color, linewidth=0.9,
-                                            alpha=0.7, label=label_text,
-                                            linestyle="--")
-                        self._sub_lines[key] = ln
-                    self._sub_lines[key].set_data(
-                        self._iterations[-len(self._sub_data[key]):],
-                        self._sub_data[key],
-                    )
-
-            # Update mAP lines on secondary axis
-            for key, (color, label_text) in self._MAP_COLORS.items():
-                if key in metrics:
-                    self._map_data.setdefault(key, []).append(
-                        (iteration, metrics[key])
-                    )
-                    if key not in self._map_lines:
-                        ln, = self._ax2.plot([], [], color=color, linewidth=1.2,
-                                             alpha=0.9, label=label_text,
-                                             marker="o", markersize=2)
-                        self._map_lines[key] = ln
-                    xs = [p[0] for p in self._map_data[key]]
-                    ys = [p[1] for p in self._map_data[key]]
-                    self._map_lines[key].set_data(xs, ys)
-
-            # Rebuild legend outside the plot on the right
-            all_handles = [self._line] + list(self._sub_lines.values())
-            all_labels = [h.get_label() for h in all_handles]
-            if self._map_lines:
-                all_handles += list(self._map_lines.values())
-                all_labels += [h.get_label() for h in self._map_lines.values()]
-            self._ax.legend(all_handles, all_labels,
-                            loc="upper left", bbox_to_anchor=(1.12, 1.0),
-                            fontsize=7, facecolor="#2b2b2b",
-                            edgecolor="#555555", labelcolor="#cccccc",
-                            framealpha=0.9)
-
-        self._ax.set_ylim(0, y_max)
+        positive = [v for v in self._losses + self._best_losses if v > 0]
+        if positive:
+            y_min = min(positive) * 0.5
+            y_max = max(positive) * 2.0
+            self._ax.set_ylim(y_min, y_max)
         self._canvas.draw_idle()
 
 
@@ -2781,10 +2750,23 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._loss_plot = LiveLossPlot(parent=self._training_viz_panel)
         training_viz_layout.addWidget(self._loss_plot, 3)
 
-        self._training_sample_preview = TrainingSamplePreview(
-            parent=self._training_viz_panel,
+        self._seg_log_text = QTextEdit()
+        self._seg_log_text.setReadOnly(True)
+        self._seg_log_text.setStyleSheet(
+            "QTextEdit { background-color: #1a1a1a; color: #b0b0b0; "
+            "font-family: monospace; font-size: 10px; border: 1px solid #333; }"
         )
-        training_viz_layout.addWidget(self._training_sample_preview, 2)
+        self._seg_log_text.setLineWrapMode(QTextEdit.NoWrap)
+        training_viz_layout.addWidget(self._seg_log_text, 1)
+
+        btn_copy_seg_log = QPushButton("Copy Training Logs to Clipboard")
+        btn_copy_seg_log.setStyleSheet(
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+        )
+        btn_copy_seg_log.clicked.connect(self._copy_seg_train_log)
+        training_viz_layout.addWidget(btn_copy_seg_log)
 
         self._training_viz_panel.setVisible(False)
         right_layout.addWidget(self._training_viz_panel, 1)
@@ -2931,19 +2913,20 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         tip_arch = (
             "Detection and segmentation architecture.\n\n"
-            "YOLOv11-small-seg (recommended): single-stage detector\n"
-            "  with 11.8M parameters. Produces high-quality instance\n"
-            "  masks with tight contour boundaries — important for\n"
-            "  silhouette-based behavioral classification. ~12 fps\n"
-            "  on Apple Silicon CPU. Model size: ~23MB.\n\n"
-            "YOLOv11-nano-seg: smallest and fastest single-stage\n"
-            "  detector (2.8M params, 2.6MB). ~30 fps on CPU but\n"
-            "  mask boundaries are coarser. Best when speed matters\n"
-            "  more than mask precision (e.g., box-only tracking).\n\n"
+            "YOLOv11-nano-seg: smallest and fastest (2.8M params,\n"
+            "  ~6 MB). Coarser masks but very fast. Best when speed\n"
+            "  matters more than mask precision.\n\n"
+            "YOLOv11-small-seg (recommended): good balance of speed\n"
+            "  and accuracy (9.4M params, ~12 MB). High-quality\n"
+            "  instance masks with tight contour boundaries.\n\n"
+            "YOLOv11-medium-seg: more capacity (22M params, ~44 MB).\n"
+            "  Better accuracy, moderate training time. Good for\n"
+            "  larger datasets or complex scenes.\n\n"
+            "YOLOv11-large-seg: high accuracy (27M params, ~54 MB).\n"
+            "  Best results with large datasets. Slower training.\n\n"
             "Mask R-CNN (MobileNetV3): two-stage detector. Accurate\n"
             "  with small datasets but slower (~3-10 fps on CPU).\n"
-            "  Masks add ~2x overhead. Use as fallback if YOLO\n"
-            "  doesn't train well on your data."
+            "  Use as fallback if YOLO doesn't train well."
         )
         row = QHBoxLayout()
         lbl = QLabel("Architecture:")
@@ -2953,6 +2936,8 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.combo_architecture.addItems([
             "YOLOv11-small-seg",
             "YOLOv11-nano-seg",
+            "YOLOv11-medium-seg",
+            "YOLOv11-large-seg",
             "Mask R-CNN",
         ])
         self.combo_architecture.setToolTip(tip_arch)
@@ -5309,6 +5294,11 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         images_dir = self._output_dir or os.path.join(self._project_dir, "training_frames")
 
+        n_train_images = len(set(
+            a["image_id"] for a in self._coco.annotations
+            if not a.get("inferred", False)
+        ))
+
         if self.chk_augment.isChecked():
             self.btn_train.setEnabled(False)
             self.lbl_train_status.setText("Augmenting dataset...")
@@ -5318,6 +5308,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "images_dir": images_dir,
                 "ann_path": ann_path,
                 "aug_dir": aug_dir,
+                "n_train_images": n_train_images,
             }
             self._augment_worker = AugmentWorker(ann_path, images_dir, aug_dir)
             self._augment_worker.progress.connect(
@@ -5327,20 +5318,23 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._augment_worker.error.connect(self._on_train_error)
             self._augment_worker.start()
         else:
-            self._launch_training(ann_path, images_dir)
+            self._launch_training(ann_path, images_dir, n_train_images)
 
     def _on_augment_then_train(self, aug_output_path: str):
         aug_dir = self._pending_train_config["aug_dir"]
         aug_json = os.path.join(aug_dir, "annotations.json")
+        n_img = self._pending_train_config.get("n_train_images", 0)
         if os.path.exists(aug_json):
-            self._launch_training(aug_json, aug_dir)
+            self._launch_training(aug_json, aug_dir, n_img)
         else:
             self._launch_training(
                 self._pending_train_config["ann_path"],
                 self._pending_train_config["images_dir"],
+                n_img,
             )
 
-    def _launch_training(self, coco_json: str, images_dir: str):
+    def _launch_training(self, coco_json: str, images_dir: str,
+                          n_train_images: int = 0):
         combo_text = self.combo_device.currentText()
         if combo_text.startswith("Auto"):
             device_choice = "auto"
@@ -5356,17 +5350,27 @@ class SAM2AnnotatorWindow(QMainWindow):
         arch_text = self.combo_architecture.currentText()
         is_yolo = arch_text.startswith("YOLO")
 
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         if is_yolo:
-            if "small" in arch_text.lower():
+            arch_lower = arch_text.lower()
+            if "large" in arch_lower:
+                model_variant = "yolo11l-seg"
+            elif "medium" in arch_lower:
+                model_variant = "yolo11m-seg"
+            elif "small" in arch_lower:
                 model_variant = "yolo11s-seg"
             else:
                 model_variant = "yolo11n-seg"
             optimizer = self.combo_optimizer.currentText()
+            run_name = f"{timestamp}_yolo_n={n_train_images}"
 
             config_dict = {
                 "coco_json_path": coco_json,
                 "images_dir": images_dir,
                 "output_dir": os.path.join(self._project_dir, "models"),
+                "run_name": run_name,
                 "num_iterations": self.spin_iterations.value(),
                 "learning_rate": self.spin_lr.value(),
                 "batch_size": self.spin_batch.value(),
@@ -5388,10 +5392,13 @@ class SAM2AnnotatorWindow(QMainWindow):
             else:
                 backbone = "resnet50"
             optimizer = "adamw" if self.combo_optimizer.currentText() == "AdamW" else "sgd"
+            run_name = f"{timestamp}_maskrcnn_n={n_train_images}"
+
             config_dict = {
                 "coco_json_path": coco_json,
                 "images_dir": images_dir,
                 "output_dir": os.path.join(self._project_dir, "models"),
+                "run_name": run_name,
                 "num_iterations": self.spin_iterations.value(),
                 "learning_rate": self.spin_lr.value(),
                 "batch_size": self.spin_batch.value(),
@@ -5415,9 +5422,25 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_stop.setVisible(True)
         self.lbl_train_status.setText("Starting training...")
 
-        # Reset embedded loss plot for new run
+        # Reset embedded loss plot and log for new run
         self._loss_plot.reset(total)
-        self._training_sample_preview.clear()
+        self._seg_log_text.clear()
+
+        arch = config_dict.get("_architecture", "?")
+        variant = config_dict.get("model_variant", config_dict.get("backbone", "?"))
+        self._seg_log_text.append(f"[Segmentation] Architecture: {arch} ({variant})")
+        self._seg_log_text.append(
+            f"[Segmentation] epochs={total}, lr={config_dict.get('learning_rate', 0):.4f}, "
+            f"batch={config_dict.get('batch_size', 0)}, "
+            f"device={config_dict.get('device', '?')}, "
+            f"val_split={config_dict.get('val_fraction', 0)}"
+        )
+        self._seg_log_text.append(
+            f"[Segmentation] freeze_backbone={config_dict.get('freeze_backbone', False)}, "
+            f"optimizer={config_dict.get('optimizer', '?')}, "
+            f"patience={config_dict.get('early_stop_patience', '?')}"
+        )
+        self._seg_log_text.append("")
 
         self._train_worker = TrainWorker(config_dict)
         self._train_worker.progress.connect(self._on_train_progress)
@@ -5460,6 +5483,20 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.lbl_train_status.setText(f"Iteration {iteration}/{total}  —  loss: {loss:.4f}")
         self._loss_plot.add_point(iteration, loss, metrics)
 
+        lr = metrics.get("lr", 0)
+        best = metrics.get("best_loss", 0)
+        parts = [f"Epoch {iteration}/{total}",
+                 f"loss={loss:.4f}",
+                 f"best={best:.4f}",
+                 f"lr={lr:.6f}"]
+        for key in ("box_loss", "seg_loss", "cls_loss", "dfl_loss"):
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.4f}")
+        for key in ("mAP50_box", "mAP50_mask", "mAP50-95_box", "mAP50-95_mask"):
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.4f}")
+        self._seg_log_text.append("  ".join(parts))
+
     def _dismiss_training_viz(self):
         if self._training_viz_panel.isVisible():
             self._training_viz_panel.setVisible(False)
@@ -5471,11 +5508,6 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_train.setEnabled(True)
         self.btn_pause.setVisible(False)
         self.btn_stop.setVisible(False)
-
-        # Show sample predictions from the trained model
-        run_dir = summary.get("run_dir", "")
-        if run_dir:
-            self._show_training_samples(run_dir)
 
         model_path = summary.get("model_path", "")
         run_dir = summary.get("run_dir", "")
@@ -5505,6 +5537,9 @@ class SAM2AnnotatorWindow(QMainWindow):
                       f"Model saved to:\n{run_dir}")
 
         self.lbl_train_status.setText(status)
+        self._seg_log_text.append("")
+        self._seg_log_text.append(f"[Segmentation] {status}")
+        self._seg_log_text.append(f"[Segmentation] Model saved to: {run_dir}")
         QMessageBox.information(self, title, detail)
         self.status_bar.showMessage(f"Training complete: {model_path}")
 
@@ -7655,7 +7690,8 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         from datetime import datetime
         backbone_tag = self.combo_cls_backbone.currentText().replace("-", "").replace(" ", "")
-        run_name = f"{backbone_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        n_clips = len(composite_paths)
+        run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{backbone_tag}_n={n_clips}"
         output_dir = os.path.join(
             self._project_dir, "behavior_classifier", "model", run_name
         )
@@ -7704,6 +7740,13 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._cls_log_text.verticalScrollBar().maximum()
         )
         self.lbl_cls_train_status.setText(msg.replace("[Classifier] ", ""))
+
+    def _copy_seg_train_log(self):
+        from PyQt5.QtWidgets import QApplication
+        text = self._seg_log_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_bar.showMessage("Training logs copied to clipboard.", 3000)
 
     def _copy_cls_train_log(self):
         from PyQt5.QtWidgets import QApplication

@@ -73,6 +73,16 @@ YOLO_CHECKPOINTS = {
         "size_mb": 12,
         "description": "YOLOv11-small-seg (12 MB) - Higher accuracy, slightly slower",
     },
+    "yolo11m-seg.pt": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11m-seg.pt",
+        "size_mb": 44,
+        "description": "YOLOv11-medium-seg (44 MB) - More capacity, better accuracy",
+    },
+    "yolo11l-seg.pt": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt",
+        "size_mb": 54,
+        "description": "YOLOv11-large-seg (54 MB) - High accuracy, needs more data",
+    },
 }
 
 # FNT repo root (go up from fnt/videoTracking/ to repo root)

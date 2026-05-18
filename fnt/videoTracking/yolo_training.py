@@ -184,6 +184,9 @@ def train_yolo_seg(
     device = _resolve_device(cfg.device)
     print(f"[YOLO Train] Device: {device}")
 
+    if "cuda" in device:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     from ultralytics import YOLO
 
     from .sam2_checkpoint_manager import ensure_yolo_checkpoint
