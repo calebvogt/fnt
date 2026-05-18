@@ -2892,7 +2892,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         layout.addStretch()
         scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Segmentation")
+        self.tab_widget.addTab(scroll, "Labelling")
 
     def _build_training_section(self, layout):
         """Build the model training UI section (appended to the Annotate tab)."""
@@ -5085,8 +5085,19 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._next_frame()
 
     def _next_frame(self):
-        if self.current_frame_idx < len(self._extracted_frames) - 1:
-            self.frame_list.setCurrentRow(self.current_frame_idx + 1)
+        n = len(self._extracted_frames)
+        if self.current_frame_idx >= n - 1:
+            return
+        # Advance to next frame that needs review: unlabeled or inferred-only
+        for i in range(self.current_frame_idx + 1, n):
+            _, _, fp = self._extracted_frames[i]
+            filename = os.path.basename(fp)
+            total, n_inferred = self._count_annotations_for_file(filename)
+            if total == 0 or total == n_inferred:
+                self.frame_list.setCurrentRow(i)
+                return
+        # All remaining frames have manual annotations — just go to next
+        self.frame_list.setCurrentRow(self.current_frame_idx + 1)
 
     def _delete_current_frame(self):
         if self.current_frame_idx < 0 or self.current_frame_idx >= len(self._extracted_frames):
