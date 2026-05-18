@@ -1,14 +1,46 @@
 import os
+import csv
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, 
     QLabel, QGroupBox, QTextEdit, QScrollArea, QSizePolicy, 
-    QComboBox, QSpinBox, QLineEdit, QFrame
+    QComboBox, QSpinBox, QLineEdit, QFrame, QFileDialog
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread
 from PyQt5.QtGui import QFont
 
-from . import timesync
+import matplotlib
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.dates as mdates
+
+from . import fed_comms
+
+
+class Fed3TrackerWorker(QThread):
+    line_received = pyqtSignal(str, str) # dev_name, line
+    error_received = pyqtSignal(str, str) # dev_name, error
+
+    def __init__(self, port, dev_name):
+        super().__init__()
+        self.port = port
+        self.dev_name = dev_name
+        self.tracker = fed_comms.Fed3Tracker(self.port)
+
+    def run(self):
+        def callback(line):
+            if line.startswith("ERROR:"):
+                self.error_received.emit(self.dev_name, line)
+            else:
+                self.line_received.emit(self.dev_name, line)
+        self.tracker.start(callback)
+
+    def stop(self):
+        self.tracker.stop()
+        self.quit()
+        self.wait()
+
 
 class CollapsibleLogBox(QWidget):
     """A collapsible log box with a command input for serial communication."""
@@ -129,13 +161,32 @@ class FEDTabWidget(QWidget):
         self.layout.addWidget(scroll)
 
         # Description
-        desc = QLabel("Feeding Experimentation Device (FED) data analysis")
+        desc = QLabel("Feeding Experimentation Device (FED) data analysis & tracking")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         self.scroll_layout.addWidget(desc)
 
+        # Matplotlib visualization
+        self.figure = Figure(figsize=(5, 3))
+        self.figure.patch.set_facecolor('#2b2b2b')
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(300)
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor('#1e1e1e')
+        self.ax.tick_params(colors='white')
+        self.ax.xaxis.label.set_color('white')
+        self.ax.yaxis.label.set_color('white')
+        self.ax.title.set_color('white')
+        self.ax.set_title("Real-Time Events")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Cumulative Count")
+        self.figure.tight_layout(pad=1.5)
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor('#444444')
+        self.scroll_layout.addWidget(self.canvas)
+
         # FED Sync group
-        sync_group = QGroupBox("FED Sync Tools")
+        sync_group = QGroupBox("FED Sync Tools & Tracking")
         sync_group_layout = QVBoxLayout()
         sync_group_layout.setSpacing(12)
         sync_group_layout.setContentsMargins(10, 15, 10, 10)
@@ -150,7 +201,7 @@ class FEDTabWidget(QWidget):
         sync_group_layout.addLayout(mgmt_layout)
 
         sync_settings_layout = QHBoxLayout()
-        sync_settings_layout.addWidget(QLabel("Sync Interval:"))
+        sync_settings_layout.addWidget(QLabel("Auto Sync:"))
         self.global_interval_spin = QSpinBox()
         self.global_interval_spin.setRange(1, 99999)
         self.global_interval_spin.setValue(1)
@@ -160,8 +211,8 @@ class FEDTabWidget(QWidget):
         self.global_unit_combo.setCurrentText("Days")
         self.global_unit_combo.setFixedWidth(100)
         
-        self.start_all_btn = QPushButton("Start Auto")
-        self.stop_all_btn = QPushButton("Stop Auto")
+        self.start_all_btn = QPushButton("Start Auto Sync")
+        self.stop_all_btn = QPushButton("Stop Auto Sync")
         self.sync_now_btn = QPushButton("Sync Now")
         
         sync_settings_layout.addWidget(self.global_interval_spin)
@@ -223,11 +274,22 @@ class FEDTabWidget(QWidget):
         port_combo.setEditable(True)
         last_sync_label = QLabel("Last Sync: Never")
 
+        # Tracking controls
+        track_btn = QPushButton("Start Tracking")
+        track_btn.setCheckable(True)
+        track_btn.setStyleSheet("""
+            QPushButton:checked { background-color: #4caf50; color: white; }
+            QPushButton { font-weight: bold; }
+        """)
+
         box_layout.addWidget(QLabel("Name:"), 0, 0)
-        box_layout.addWidget(name_edit, 0, 1, 1, 3)
-        box_layout.addWidget(remove_btn, 0, 4, 1, 1, Qt.AlignRight)
+        box_layout.addWidget(name_edit, 0, 1, 1, 2)
+        box_layout.addWidget(remove_btn, 0, 3, 1, 1, Qt.AlignRight)
+        
         box_layout.addWidget(QLabel("Port:"), 1, 0)
-        box_layout.addWidget(port_combo, 1, 1, 1, 3)
+        box_layout.addWidget(port_combo, 1, 1, 1, 2)
+        box_layout.addWidget(track_btn, 1, 3, 1, 1)
+
         box_layout.addWidget(last_sync_label, 2, 0, 1, 4)
         box_layout.setColumnStretch(1, 1)
         box.setLayout(box_layout)
@@ -239,13 +301,18 @@ class FEDTabWidget(QWidget):
             'name_edit': name_edit,
             'port_combo': port_combo,
             'remove_btn': remove_btn,
+            'track_btn': track_btn,
             'last_sync_label': last_sync_label,
             'timer': timer,
             'is_syncing': False,
+            'tracker_worker': None,
+            'log_file': None,
+            'events': []
         }
         
         remove_btn.clicked.connect(lambda: self.remove_device(device))
         timer.timeout.connect(lambda: self.do_device_sync(device))
+        track_btn.toggled.connect(lambda checked: self.toggle_tracking(checked, device))
         
         self.populate_port_combo(port_combo)
         self.devices_layout.addWidget(box)
@@ -253,27 +320,105 @@ class FEDTabWidget(QWidget):
         self.update_remove_buttons()
         return device
 
+    def toggle_tracking(self, checked, device):
+        if checked:
+            port = device['port_combo'].currentText()
+            if not port:
+                self.fed_log.append_log("No port selected for tracking.", False)
+                device['track_btn'].setChecked(False)
+                return
+                
+            if not device.get('log_file'):
+                file_path, _ = QFileDialog.getSaveFileName(self, "Select CSV Log File", "", "CSV Files (*.csv)")
+                if not file_path:
+                    device['track_btn'].setChecked(False)
+                    return
+                device['log_file'] = file_path
+                # Write header if new
+                if not os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'w', newline='') as f:
+                            f.write("Timestamp,Device,EventData\n")
+                    except Exception as e:
+                        self.fed_log.append_log(f"Could not create CSV: {e}", False)
+                        device['track_btn'].setChecked(False)
+                        return
+
+            dev_name = device['name_edit'].text().strip() or device['box'].title()
+            device['events'] = [] # Reset events for fresh plot
+            
+            worker = Fed3TrackerWorker(port, dev_name)
+            worker.line_received.connect(lambda d, l: self.on_tracker_line(d, l, device))
+            worker.error_received.connect(lambda d, l: self.fed_log.append_log(f"{d}: {l}", False))
+            device['tracker_worker'] = worker
+            worker.start()
+            
+            device['track_btn'].setText("Stop Tracking")
+            self.fed_log.append_log(f"Started tracking on {port} for {dev_name}")
+        else:
+            worker = device.get('tracker_worker')
+            if worker:
+                worker.stop()
+                device['tracker_worker'] = None
+            device['track_btn'].setText("Start Tracking")
+            self.fed_log.append_log(f"Stopped tracking for {device['box'].title()}")
+
+    def on_tracker_line(self, dev_name, line, device):
+        self.fed_log.append_log(f"[{dev_name}] {line}")
+        
+        # Log to CSV
+        log_file = device.get('log_file')
+        if log_file:
+            try:
+                with open(log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"), dev_name, line])
+            except Exception as e:
+                self.fed_log.append_log(f"CSV Write Error: {e}", False)
+        
+        # Parse for visualization. FED3 lines often contain keywords like "Pellet" or "Poke"
+        if "Pellet" in line or "Poke" in line:
+            device['events'].append(datetime.now())
+            self.update_plot()
+
+    def update_plot(self):
+        self.ax.clear()
+        self.ax.set_title("Real-Time Events")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Cumulative Count")
+        
+        plotted_something = False
+        for dev in self.fed_devices:
+            events = dev.get('events', [])
+            if events:
+                dev_name = dev['name_edit'].text().strip() or dev['box'].title()
+                times = mdates.date2num(events)
+                counts = list(range(1, len(events) + 1))
+                self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o')
+                plotted_something = True
+                
+        if plotted_something:
+            self.ax.legend(facecolor='#2b2b2b', edgecolor='#444444', labelcolor='white')
+            
+        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        self.figure.autofmt_xdate()
+        self.canvas.draw()
+
     def populate_port_combo(self, combo):
         combo.clear()
         try:
             from serial.tools import list_ports
             ports = list(list_ports.comports())
             
-            # Filter for candidates likely to be FED/Arduino devices
-            # These are common strings found in FED3 (which uses Adafruit Feather M0)
             candidates = []
             for p in ports:
                 dev = getattr(p, "device", "")
                 desc = getattr(p, "description", "")
                 hwid = getattr(p, "hwid", "")
                 
-                # Look for common identifiers
                 if any(k in dev or k in desc or k in hwid for k in ("ACM", "USB", "Arduino", "Feather", "Adafruit", "CDC")):
                     candidates.append(dev)
             
-            # If no obvious candidates, we don't fall back to everything anymore
-            # to keep the list clean, but we'll show them if the user refreshes 
-            # and we find *something* that looks like a serial port.
             if not candidates:
                 candidates = [p.device for p in ports]
                 
@@ -287,6 +432,9 @@ class FEDTabWidget(QWidget):
     def remove_device(self, device):
         if len(self.fed_devices) <= 1: return
         device['timer'].stop()
+        worker = device.get('tracker_worker')
+        if worker:
+            worker.stop()
         self.devices_layout.removeWidget(device['box'])
         device['box'].deleteLater()
         if device in self.fed_devices:
@@ -308,12 +456,23 @@ class FEDTabWidget(QWidget):
         if self.main_window:
             self.main_window.statusBar().showMessage(f"Syncing {dev_name}...")
 
+        worker = device.get('tracker_worker')
+        if worker and worker.isRunning():
+            now = datetime.now()
+            sync_string = now.strftime("SYNC:%Y,%m,%d,%H,%M,%S\n")
+            success, msg = worker.tracker.send_command(sync_string)
+            self.fed_log.append_log(f"{dev_name} Sync: {msg}", success)
+            if success:
+                device['last_sync_label'].setText(f"Last Sync: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            if self.main_window: self.main_window.statusBar().showMessage("Ready")
+            return
+
         device['is_syncing'] = True
 
         def task():
-            return timesync.sync_time(port=port)
+            return fed_comms.sync_time(port=port)
 
-        worker = self.WorkerThread(task, f"Sync {dev_name}")
+        thread_worker = self.WorkerThread(task, f"Sync {dev_name}")
         
         def on_finished(success, message):
             prefixed = "\n".join([f"{dev_name}: {l}" for l in message.splitlines()])
@@ -321,12 +480,12 @@ class FEDTabWidget(QWidget):
             device['last_sync_label'].setText(f"Last Sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             device['is_syncing'] = False
             if self.main_window: self.main_window.statusBar().showMessage("Ready")
-            if worker in self._active_workers: self._active_workers.remove(worker)
-            worker.deleteLater()
+            if thread_worker in self._active_workers: self._active_workers.remove(thread_worker)
+            thread_worker.deleteLater()
 
-        worker.finished.connect(on_finished)
-        self._active_workers.append(worker)
-        worker.start()
+        thread_worker.finished.connect(on_finished)
+        self._active_workers.append(thread_worker)
+        thread_worker.start()
 
     def handle_fed_command(self, command):
         if not self.fed_devices:
@@ -341,24 +500,29 @@ class FEDTabWidget(QWidget):
             port = device['port_combo'].currentText() or None
             dev_name = device['name_edit'].text().strip() or device['box'].title()
             
+            worker = device.get('tracker_worker')
+            if worker and worker.isRunning():
+                success, msg = worker.tracker.send_command(command)
+                self.fed_log.append_log(f"[{dev_name}] {msg}", success)
+                continue
+            
             device['is_syncing'] = True
 
-            # Use lambda to capture parameters for the task
             def make_task(p, cmd):
-                return lambda: timesync.send_custom_command(cmd, port=p)
+                return lambda: fed_comms.send_custom_command(cmd, port=p)
 
-            worker = self.WorkerThread(make_task(port, command), f"Cmd {dev_name}")
+            thread_worker = self.WorkerThread(make_task(port, command), f"Cmd {dev_name}")
             
-            def on_cmd_finished(success, msg, d=device, w=worker):
+            def on_cmd_finished(success, msg, d=device, w=thread_worker):
                 prefixed = "\n".join([f"{d['name_edit'].text().strip() or d['box'].title()}: {l}" for l in msg.splitlines()])
                 self.fed_log.append_log(prefixed, success)
                 d['is_syncing'] = False
                 if w in self._active_workers: self._active_workers.remove(w)
                 w.deleteLater()
 
-            worker.finished.connect(on_cmd_finished)
-            self._active_workers.append(worker)
-            worker.start()
+            thread_worker.finished.connect(on_cmd_finished)
+            self._active_workers.append(thread_worker)
+            thread_worker.start()
 
     def refresh_all_ports(self):
         for dev in self.fed_devices:

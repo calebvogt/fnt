@@ -1,10 +1,65 @@
-"""FED3 time-sync helper (moved into fnt.fed3 package).
+"""FED3 device communication helper.
 
-Provides `list_serial_ports()` and `sync_time()` used by the GUI.
+Provides `list_serial_ports()`, `sync_time()`, and `Fed3Tracker` for GUI.
 """
 
 import time
+import threading
 from datetime import datetime
+
+
+class Fed3Tracker:
+    def __init__(self, port, baud=115200):
+        self.port = port
+        self.baud = baud
+        self.ser = None
+        self._running = False
+        self.lock = threading.Lock()
+
+    def start(self, callback):
+        try:
+            import serial
+            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            time.sleep(2.0) # Allow device to reset/settle after opening
+            self._running = True
+            
+            while self._running:
+                if self.ser.in_waiting > 0:
+                    try:
+                        line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                        if line:
+                            callback(line)
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(0.05)
+        except Exception as e:
+            callback(f"ERROR: {e}")
+            self._running = False
+        finally:
+            self.stop()
+
+    def stop(self):
+        self._running = False
+        with self.lock:
+            if self.ser and self.ser.is_open:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+
+    def send_command(self, command):
+        with self.lock:
+            if self.ser and self.ser.is_open:
+                if not command.endswith('\n'):
+                    command += '\n'
+                try:
+                    self.ser.write(command.encode("utf-8"))
+                    return True, f"Sent: {command.strip()}"
+                except Exception as e:
+                    return False, f"Send error: {e}"
+            return False, "Port not open."
 
 
 def list_serial_ports():
