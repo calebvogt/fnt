@@ -32,7 +32,7 @@ dependencies = [
     "matplotlib",
     "pytz",
     # GUI
-    "PyQt6",
+    "PyQt5",
     # I/O
     "h5py",
     "Pillow",

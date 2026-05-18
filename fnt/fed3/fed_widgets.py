@@ -241,6 +241,7 @@ class FEDTabWidget(QWidget):
             'remove_btn': remove_btn,
             'last_sync_label': last_sync_label,
             'timer': timer,
+            'is_syncing': False,
         }
         
         remove_btn.clicked.connect(lambda: self.remove_device(device))
@@ -298,11 +299,16 @@ class FEDTabWidget(QWidget):
             dev['remove_btn'].setEnabled(enable)
 
     def do_device_sync(self, device):
+        if device.get('is_syncing'):
+            return
+            
         port = device['port_combo'].currentText() or None
         dev_name = device['name_edit'].text().strip() or device['box'].title()
         
         if self.main_window:
             self.main_window.statusBar().showMessage(f"Syncing {dev_name}...")
+
+        device['is_syncing'] = True
 
         def task():
             return timesync.sync_time(port=port)
@@ -313,8 +319,10 @@ class FEDTabWidget(QWidget):
             prefixed = "\n".join([f"{dev_name}: {l}" for l in message.splitlines()])
             self.fed_log.append_log(prefixed, success)
             device['last_sync_label'].setText(f"Last Sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            device['is_syncing'] = False
             if self.main_window: self.main_window.statusBar().showMessage("Ready")
             if worker in self._active_workers: self._active_workers.remove(worker)
+            worker.deleteLater()
 
         worker.finished.connect(on_finished)
         self._active_workers.append(worker)
@@ -327,19 +335,26 @@ class FEDTabWidget(QWidget):
         
         self.fed_log.append_log(f"Sending '{command}' to all devices...")
         for device in self.fed_devices:
+            if device.get('is_syncing'):
+                continue
+                
             port = device['port_combo'].currentText() or None
             dev_name = device['name_edit'].text().strip() or device['box'].title()
             
+            device['is_syncing'] = True
+
             # Use lambda to capture parameters for the task
             def make_task(p, cmd):
                 return lambda: timesync.send_custom_command(cmd, port=p)
 
             worker = self.WorkerThread(make_task(port, command), f"Cmd {dev_name}")
             
-            def on_cmd_finished(success, msg, d_name=dev_name, w=worker):
-                prefixed = "\n".join([f"{d_name}: {l}" for l in msg.splitlines()])
+            def on_cmd_finished(success, msg, d=device, w=worker):
+                prefixed = "\n".join([f"{d['name_edit'].text().strip() or d['box'].title()}: {l}" for l in msg.splitlines()])
                 self.fed_log.append_log(prefixed, success)
+                d['is_syncing'] = False
                 if w in self._active_workers: self._active_workers.remove(w)
+                w.deleteLater()
 
             worker.finished.connect(on_cmd_finished)
             self._active_workers.append(worker)

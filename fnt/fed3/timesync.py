@@ -73,6 +73,7 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
         port = candidate
 
     out_lines = []
+    ser = None
     try:
         ser = serial.Serial(port, baud, timeout=timeout)
         # Allow device to reset/settle after opening
@@ -95,13 +96,15 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
             # If reading fails, continue to close port
             pass
 
-        ser.close()
         if not out_lines:
             out_lines.append("No response received from device.")
         return True, "\n".join(out_lines)
 
     except Exception as e:
         return False, f"Error opening {port}: {e}"
+    finally:
+        if ser and ser.is_open:
+            ser.close()
 
 
 if __name__ == "__main__":
