@@ -469,15 +469,6 @@ class AnnotationPreviewWidget(QWidget):
         self.zoom_changed.emit(self._zoom)
         self.update()
 
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if self._pixmap is None or event.button() != Qt.LeftButton:
-            return
-        hit_idx = self._find_annotation_at(event.x(), event.y())
-        if hit_idx is not None:
-            self._editing_obj_idx = hit_idx
-            self.mode_changed.emit("Editing Mask")
-            self.update()
-
     def mousePressEvent(self, event: QMouseEvent):
         if self._pixmap is None:
             return
