@@ -3032,11 +3032,10 @@ class SAM2AnnotatorWindow(QMainWindow):
             "  is typical. At ~1-2s/epoch, 1000 epochs takes ~20-30 min.\n"
             "Mask R-CNN: each iteration processes one batch. 200-2000\n"
             "  iterations is typical.\n\n"
-            "Early stopping is always enabled (patience=50): training\n"
-            "will stop automatically when loss plateaus, so it is safe\n"
-            "to set this higher than needed. The best model weights\n"
-            "(lowest loss) are always saved regardless of when training\n"
-            "stops."
+            "Early stopping will stop training automatically when loss\n"
+            "plateaus (see patience setting below), so it is safe to\n"
+            "set this higher than needed. The best model weights are\n"
+            "always saved regardless of when training stops."
         )
         row = QHBoxLayout()
         lbl = QLabel("Training Iterations:")
@@ -3049,6 +3048,30 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.spin_iterations.setToolTip(tip_iterations)
         self.spin_iterations.setStyleSheet(spin_style)
         row.addWidget(self.spin_iterations)
+        train_vbox.addLayout(row)
+
+        tip_patience = (
+            "Early stopping patience (number of epochs/iterations).\n\n"
+            "Training stops automatically if the loss does not improve\n"
+            "for this many consecutive epochs. The best model weights\n"
+            "(lowest loss) are always saved regardless.\n\n"
+            "Lower patience (10-30): stops sooner, faster iteration.\n"
+            "Higher patience (50-200): allows the model more time to\n"
+            "  recover from temporary loss plateaus.\n\n"
+            "Default: 50. Set higher for larger datasets or if you\n"
+            "see training stopped too early."
+        )
+        row = QHBoxLayout()
+        lbl = QLabel("Early Stop Patience:")
+        lbl.setToolTip(tip_patience)
+        row.addWidget(lbl)
+        self.spin_patience = QSpinBox()
+        self.spin_patience.setRange(5, 1000)
+        self.spin_patience.setValue(50)
+        self.spin_patience.setSingleStep(10)
+        self.spin_patience.setToolTip(tip_patience)
+        self.spin_patience.setStyleSheet(spin_style)
+        row.addWidget(self.spin_patience)
         train_vbox.addLayout(row)
 
         tip_lr = (
@@ -5439,7 +5462,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "device": device_choice,
                 "model_variant": model_variant,
                 "imgsz": 640,
-                "early_stop_patience": 200,
+                "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
                 "_architecture": "yolo",
@@ -5469,7 +5492,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "backbone": backbone,
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
-                "early_stop_patience": 50,
+                "early_stop_patience": self.spin_patience.value(),
                 "_architecture": "maskrcnn",
             }
 
