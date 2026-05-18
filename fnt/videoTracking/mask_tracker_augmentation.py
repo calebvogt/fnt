@@ -111,7 +111,84 @@ def _photometric_transforms():
         ("bright_up", lambda img: cv2.convertScaleAbs(img, alpha=1.0, beta=40)),
         ("bright_dn", lambda img: cv2.convertScaleAbs(img, alpha=1.0, beta=-40)),
         ("blur", lambda img: cv2.GaussianBlur(img, (5, 5), 0)),
+        ("contrast_up", lambda img: cv2.convertScaleAbs(img, alpha=1.3, beta=0)),
+        ("contrast_dn", lambda img: cv2.convertScaleAbs(img, alpha=0.7, beta=0)),
+        ("gnoise", _add_gaussian_noise),
     ]
+
+
+def _add_gaussian_noise(img: np.ndarray) -> np.ndarray:
+    noise = np.random.normal(0, 15, img.shape).astype(np.int16)
+    return np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Stochastic geometric transforms (continuous rotation, random scale)
+# ---------------------------------------------------------------------------
+
+def _apply_affine_augmentation(
+    img: np.ndarray,
+    anns: List[Dict],
+    M: np.ndarray,
+    W: int,
+    H: int,
+) -> Tuple[np.ndarray, List[Dict]]:
+    """Apply a 2x3 affine matrix to image and polygon annotations."""
+    aug_img = cv2.warpAffine(img, M, (W, H), borderMode=cv2.BORDER_REFLECT_101)
+
+    def point_fn(x, y):
+        nx = M[0, 0] * x + M[0, 1] * y + M[0, 2]
+        ny = M[1, 0] * x + M[1, 1] * y + M[1, 2]
+        return (max(0.0, min(float(W), nx)), max(0.0, min(float(H), ny)))
+
+    transformed = _transform_anns(anns, point_fn, W, H)
+    return aug_img, transformed
+
+
+def _generate_rotation_variants(
+    img: np.ndarray,
+    anns: List[Dict],
+    W: int,
+    H: int,
+    max_angle: float,
+    n_samples: int,
+    rng: np.random.RandomState,
+) -> List[Tuple[str, np.ndarray, List[Dict]]]:
+    """Generate n_samples random rotation variants within ±max_angle."""
+    results = []
+    cx, cy = W / 2.0, H / 2.0
+    for i in range(n_samples):
+        angle = rng.uniform(-max_angle, max_angle)
+        while abs(angle) < 2.0:
+            angle = rng.uniform(-max_angle, max_angle)
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        aug_img, aug_anns = _apply_affine_augmentation(img, anns, M, W, H)
+        suffix = f"rot{angle:+.0f}"
+        results.append((suffix, aug_img, aug_anns))
+    return results
+
+
+def _generate_scale_variants(
+    img: np.ndarray,
+    anns: List[Dict],
+    W: int,
+    H: int,
+    scale_range: Tuple[float, float],
+    n_samples: int,
+    rng: np.random.RandomState,
+) -> List[Tuple[str, np.ndarray, List[Dict]]]:
+    """Generate n_samples random scale variants within scale_range."""
+    results = []
+    cx, cy = W / 2.0, H / 2.0
+    for i in range(n_samples):
+        scale = rng.uniform(scale_range[0], scale_range[1])
+        while abs(scale - 1.0) < 0.05:
+            scale = rng.uniform(scale_range[0], scale_range[1])
+        M = cv2.getRotationMatrix2D((cx, cy), 0, scale)
+        aug_img, aug_anns = _apply_affine_augmentation(img, anns, M, W, H)
+        suffix = f"scale{scale:.2f}"
+        results.append((suffix, aug_img, aug_anns))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +199,23 @@ class AugmentationConfig:
     """Controls which augmentations to apply."""
 
     def __init__(self):
+        # Deterministic geometric
         self.horizontal_flip: bool = True
         self.vertical_flip: bool = True
         self.rotate_90: bool = True
         self.rotate_180: bool = True
         self.rotate_270: bool = True
+        # Stochastic geometric
+        self.continuous_rotation: bool = False
+        self.rotation_max_angle: float = 30.0
+        self.rotation_samples: int = 2
+        self.random_scale: bool = False
+        self.scale_range: Tuple[float, float] = (0.80, 1.20)
+        self.scale_samples: int = 2
+        # Photometric
         self.brightness: bool = True
+        self.contrast: bool = False
+        self.gaussian_noise: bool = False
         self.gaussian_blur: bool = True
 
     @property
@@ -144,12 +232,20 @@ class AugmentationConfig:
     @property
     def enabled_photometric(self) -> List[Tuple]:
         photo = _photometric_transforms()
-        flags = [self.brightness, self.brightness, self.gaussian_blur]
+        flags = [
+            self.brightness, self.brightness, self.gaussian_blur,
+            self.contrast, self.contrast, self.gaussian_noise,
+        ]
         return [t for t, flag in zip(photo, flags) if flag]
 
     @property
     def expansion_factor(self) -> int:
-        return 1 + len(self.enabled_geometric) + len(self.enabled_photometric)
+        n = 1 + len(self.enabled_geometric) + len(self.enabled_photometric)
+        if self.continuous_rotation:
+            n += self.rotation_samples
+        if self.random_scale:
+            n += self.scale_samples
+        return n
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +295,7 @@ def augment_coco_dataset(
     geo_transforms = config.enabled_geometric
     photo_transforms = config.enabled_photometric
     total = len(images)
+    rng = np.random.RandomState(42)
 
     for idx, img_info in enumerate(images):
         fname = img_info["file_name"]
@@ -226,6 +323,7 @@ def augment_coco_dataset(
         orig_anns = ann_by_image.get(img_info["id"], [])
         new_annotations.extend(copy.deepcopy(orig_anns))
 
+        # --- Deterministic geometric transforms ---
         for suffix, img_fn, point_fn_factory in geo_transforms:
             aug_img = img_fn(img)
             point_fn, new_W, new_H = point_fn_factory(W, H)
@@ -249,6 +347,51 @@ def augment_coco_dataset(
             new_annotations.extend(transformed)
             next_img_id += 1
 
+        # --- Stochastic geometric: continuous rotation ---
+        if config.continuous_rotation:
+            for suffix, aug_img, aug_anns in _generate_rotation_variants(
+                img, orig_anns, W, H,
+                config.rotation_max_angle, config.rotation_samples, rng,
+            ):
+                aug_fname = f"{stem}_{suffix}{ext}"
+                cv2.imwrite(os.path.join(output_dir, aug_fname), aug_img)
+                aug_img_info = {
+                    "id": next_img_id,
+                    "file_name": aug_fname,
+                    "width": W,
+                    "height": H,
+                }
+                new_images.append(aug_img_info)
+                for a in aug_anns:
+                    a["id"] = next_ann_id
+                    a["image_id"] = next_img_id
+                    next_ann_id += 1
+                new_annotations.extend(aug_anns)
+                next_img_id += 1
+
+        # --- Stochastic geometric: random scale ---
+        if config.random_scale:
+            for suffix, aug_img, aug_anns in _generate_scale_variants(
+                img, orig_anns, W, H,
+                config.scale_range, config.scale_samples, rng,
+            ):
+                aug_fname = f"{stem}_{suffix}{ext}"
+                cv2.imwrite(os.path.join(output_dir, aug_fname), aug_img)
+                aug_img_info = {
+                    "id": next_img_id,
+                    "file_name": aug_fname,
+                    "width": W,
+                    "height": H,
+                }
+                new_images.append(aug_img_info)
+                for a in aug_anns:
+                    a["id"] = next_ann_id
+                    a["image_id"] = next_img_id
+                    next_ann_id += 1
+                new_annotations.extend(aug_anns)
+                next_img_id += 1
+
+        # --- Photometric transforms ---
         for suffix, img_fn in photo_transforms:
             aug_img = img_fn(img)
             aug_fname = f"{stem}_{suffix}{ext}"

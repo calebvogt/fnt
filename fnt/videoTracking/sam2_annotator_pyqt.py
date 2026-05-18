@@ -3185,34 +3185,116 @@ class SAM2AnnotatorWindow(QMainWindow):
         aug_vbox.setContentsMargins(16, 2, 0, 4)
         aug_vbox.setSpacing(2)
 
+        chk_style = "color: #cccccc; font-size: 11px;"
+        lbl_style = "color: #888888; font-size: 10px; font-weight: bold; margin-top: 4px;"
+
+        lbl_geo = QLabel("Geometric")
+        lbl_geo.setStyleSheet(lbl_style)
+        aug_vbox.addWidget(lbl_geo)
+
         self.chk_aug_hflip = QCheckBox("Horizontal flip")
         self.chk_aug_hflip.setChecked(True)
         self.chk_aug_vflip = QCheckBox("Vertical flip")
         self.chk_aug_vflip.setChecked(True)
         self.chk_aug_rot90 = QCheckBox("Rotate 90°")
-        self.chk_aug_rot90.setChecked(True)
+        self.chk_aug_rot90.setChecked(False)
         self.chk_aug_rot180 = QCheckBox("Rotate 180°")
         self.chk_aug_rot180.setChecked(True)
         self.chk_aug_rot270 = QCheckBox("Rotate 270°")
-        self.chk_aug_rot270.setChecked(True)
+        self.chk_aug_rot270.setChecked(False)
+
+        self.chk_aug_cont_rot = QCheckBox("Random rotation")
+        self.chk_aug_cont_rot.setChecked(False)
+        self.chk_aug_cont_rot.setToolTip(
+            "Apply random continuous rotation within ±N degrees.\n"
+            "Use ±180° for top-down views, ±15° for side views.\n"
+            "Generates 2 random rotations per image."
+        )
+        rot_angle_row = QHBoxLayout()
+        rot_angle_row.setContentsMargins(20, 0, 0, 0)
+        self.lbl_aug_rot_angle = QLabel("±")
+        self.lbl_aug_rot_angle.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        self.spin_aug_rot_angle = QSpinBox()
+        self.spin_aug_rot_angle.setRange(5, 180)
+        self.spin_aug_rot_angle.setValue(30)
+        self.spin_aug_rot_angle.setSuffix("°")
+        self.spin_aug_rot_angle.setStyleSheet(spin_style)
+        self.spin_aug_rot_angle.setToolTip(
+            "Maximum rotation angle in degrees.\n"
+            "±180° for top-down recordings (animal can face any direction).\n"
+            "±15° for side-view recordings (animal is roughly horizontal)."
+        )
+        rot_angle_row.addWidget(self.lbl_aug_rot_angle)
+        rot_angle_row.addWidget(self.spin_aug_rot_angle)
+        rot_angle_row.addStretch()
+
+        self.chk_aug_scale = QCheckBox("Random scale (0.8×–1.2×)")
+        self.chk_aug_scale.setChecked(False)
+        self.chk_aug_scale.setToolTip(
+            "Randomly zoom in or out (80%–120%) around the image center.\n"
+            "Helps the model handle animals at varying distances.\n"
+            "Generates 2 random scale variants per image."
+        )
+
+        lbl_photo = QLabel("Photometric")
+        lbl_photo.setStyleSheet(lbl_style)
+
         self.chk_aug_brightness = QCheckBox("Brightness (±40)")
         self.chk_aug_brightness.setChecked(True)
+        self.chk_aug_contrast = QCheckBox("Contrast (±30%)")
+        self.chk_aug_contrast.setChecked(False)
+        self.chk_aug_contrast.setToolTip(
+            "Randomly increase or decrease image contrast.\n"
+            "Helps with varying lighting conditions between sessions."
+        )
+        self.chk_aug_gnoise = QCheckBox("Gaussian noise")
+        self.chk_aug_gnoise.setChecked(False)
+        self.chk_aug_gnoise.setToolTip(
+            "Add random Gaussian noise to pixels.\n"
+            "Improves robustness for low-light or noisy camera feeds."
+        )
         self.chk_aug_blur = QCheckBox("Gaussian blur")
         self.chk_aug_blur.setChecked(True)
 
         self._aug_checkboxes = [
             self.chk_aug_hflip, self.chk_aug_vflip,
             self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-            self.chk_aug_brightness, self.chk_aug_blur,
+            self.chk_aug_cont_rot, self.chk_aug_scale,
+            self.chk_aug_brightness, self.chk_aug_contrast,
+            self.chk_aug_gnoise, self.chk_aug_blur,
         ]
+
+        for chk in [self.chk_aug_hflip, self.chk_aug_vflip,
+                     self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270]:
+            chk.setStyleSheet(chk_style)
+            aug_vbox.addWidget(chk)
+
+        self.chk_aug_cont_rot.setStyleSheet(chk_style)
+        aug_vbox.addWidget(self.chk_aug_cont_rot)
+        self._rot_angle_widget = QWidget()
+        self._rot_angle_widget.setLayout(rot_angle_row)
+        self._rot_angle_widget.setVisible(False)
+        aug_vbox.addWidget(self._rot_angle_widget)
+        self.chk_aug_cont_rot.toggled.connect(self._rot_angle_widget.setVisible)
+
+        self.chk_aug_scale.setStyleSheet(chk_style)
+        aug_vbox.addWidget(self.chk_aug_scale)
+
+        aug_vbox.addWidget(lbl_photo)
+        for chk in [self.chk_aug_brightness, self.chk_aug_contrast,
+                     self.chk_aug_gnoise, self.chk_aug_blur]:
+            chk.setStyleSheet(chk_style)
+            aug_vbox.addWidget(chk)
+
         self._aug_expansion_label = QLabel("")
         self._aug_expansion_label.setStyleSheet("color: #999999; font-size: 10px;")
+        aug_vbox.addWidget(self._aug_expansion_label)
 
         for chk in self._aug_checkboxes:
-            chk.setStyleSheet("color: #cccccc; font-size: 11px;")
-            aug_vbox.addWidget(chk)
             chk.toggled.connect(self._update_aug_expansion_label)
-        aug_vbox.addWidget(self._aug_expansion_label)
+        self.spin_aug_rot_angle.valueChanged.connect(
+            lambda _: self._update_aug_expansion_label()
+        )
 
         self._aug_options_frame.setVisible(False)
         train_vbox.addWidget(self._aug_options_frame)
@@ -5324,8 +5406,14 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _on_architecture_changed(self, index: int):
         arch_text = self.combo_architecture.currentText()
         is_maskrcnn = arch_text.startswith("Mask R-CNN")
+        is_yolo = arch_text.startswith("YOLO")
         for w in self._maskrcnn_widgets:
             w.setVisible(is_maskrcnn)
+        # Gaussian noise and blur are not available in Ultralytics online augmentation
+        for w in [self.chk_aug_gnoise, self.chk_aug_blur]:
+            w.setVisible(not is_yolo)
+        # Discrete 90° rotations are redundant when continuous rotation is available
+        # but keep them visible for all architectures
         if not is_maskrcnn:
             is_small = "small" in arch_text.lower()
             self.spin_batch.setValue(2 if is_small else 8)
@@ -5353,18 +5441,59 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "CUDA: NVIDIA GPU — fastest.\n"
                 "MPS: Apple Silicon — fast for Mask R-CNN."
             )
+        if self.chk_augment.isChecked():
+            self._update_aug_expansion_label()
 
     def _update_aug_expansion_label(self):
-        n_geo = sum(1 for chk in [
-            self.chk_aug_hflip, self.chk_aug_vflip,
-            self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-        ] if chk.isChecked())
-        n_photo = (2 if self.chk_aug_brightness.isChecked() else 0) + \
-                  (1 if self.chk_aug_blur.isChecked() else 0)
-        factor = 1 + n_geo + n_photo
-        self._aug_expansion_label.setText(
-            f"  ~{factor}x expansion ({n_geo} geometric + {n_photo} photometric + original)"
-        )
+        arch_text = self.combo_architecture.currentText()
+        is_yolo = arch_text.startswith("YOLO")
+
+        if is_yolo:
+            parts = []
+            if self.chk_aug_hflip.isChecked():
+                parts.append("flip-LR")
+            if self.chk_aug_vflip.isChecked():
+                parts.append("flip-UD")
+            if self.chk_aug_cont_rot.isChecked():
+                parts.append(f"rot ±{self.spin_aug_rot_angle.value()}°")
+            elif any(c.isChecked() for c in [
+                self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
+            ]):
+                parts.append("rot ±90°")
+            if self.chk_aug_scale.isChecked():
+                parts.append("scale")
+            if self.chk_aug_brightness.isChecked():
+                parts.append("brightness")
+            if self.chk_aug_contrast.isChecked():
+                parts.append("contrast")
+            if parts:
+                self._aug_expansion_label.setText(
+                    f"  Online: {', '.join(parts)} (applied per batch, no disk writes)"
+                )
+            else:
+                self._aug_expansion_label.setText("  No augmentations selected")
+        else:
+            n_det_geo = sum(1 for chk in [
+                self.chk_aug_hflip, self.chk_aug_vflip,
+                self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
+            ] if chk.isChecked())
+            n_stoch_geo = (2 if self.chk_aug_cont_rot.isChecked() else 0) + \
+                          (2 if self.chk_aug_scale.isChecked() else 0)
+            n_photo = (2 if self.chk_aug_brightness.isChecked() else 0) + \
+                      (2 if self.chk_aug_contrast.isChecked() else 0) + \
+                      (1 if self.chk_aug_gnoise.isChecked() else 0) + \
+                      (1 if self.chk_aug_blur.isChecked() else 0)
+            n_geo = n_det_geo + n_stoch_geo
+            factor = 1 + n_geo + n_photo
+            parts = []
+            if n_geo:
+                parts.append(f"{n_geo} geometric")
+            if n_photo:
+                parts.append(f"{n_photo} photometric")
+            parts.append("original")
+            self._aug_expansion_label.setText(
+                f"  ~{factor}x expansion ({' + '.join(parts)})"
+            )
 
     def _build_aug_config(self):
         from .mask_tracker_augmentation import AugmentationConfig
@@ -5374,7 +5503,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         cfg.rotate_90 = self.chk_aug_rot90.isChecked()
         cfg.rotate_180 = self.chk_aug_rot180.isChecked()
         cfg.rotate_270 = self.chk_aug_rot270.isChecked()
+        cfg.continuous_rotation = self.chk_aug_cont_rot.isChecked()
+        cfg.rotation_max_angle = float(self.spin_aug_rot_angle.value())
+        cfg.random_scale = self.chk_aug_scale.isChecked()
         cfg.brightness = self.chk_aug_brightness.isChecked()
+        cfg.contrast = self.chk_aug_contrast.isChecked()
+        cfg.gaussian_noise = self.chk_aug_gnoise.isChecked()
         cfg.gaussian_blur = self.chk_aug_blur.isChecked()
         return cfg
 
@@ -5410,7 +5544,12 @@ class SAM2AnnotatorWindow(QMainWindow):
             if not a.get("inferred", False)
         ))
 
-        if self.chk_augment.isChecked():
+        arch_text = self.combo_architecture.currentText()
+        is_yolo = arch_text.startswith("YOLO")
+        use_aug = self.chk_augment.isChecked()
+
+        if use_aug and not is_yolo:
+            # Mask R-CNN: offline augmentation (write augmented images to disk)
             self.btn_train.setEnabled(False)
             self.lbl_train_status.setText("Augmenting dataset...")
             self.status_bar.showMessage("Running data augmentation...")
@@ -5430,6 +5569,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._augment_worker.error.connect(self._on_train_error)
             self._augment_worker.start()
         else:
+            # YOLO: augmentation is applied online (no disk writes)
             self._launch_training(ann_path, images_dir, n_train_images)
 
     def _on_augment_then_train(self, aug_output_path: str):
@@ -5478,6 +5618,31 @@ class SAM2AnnotatorWindow(QMainWindow):
             optimizer = self.combo_optimizer.currentText()
             run_name = f"{timestamp}_yolo_n={n_train_images}"
 
+            # Map augmentation config to Ultralytics online params
+            aug_fliplr = 0.0
+            aug_flipud = 0.0
+            aug_degrees = 0.0
+            aug_scale = 0.0
+            aug_hsv_v = 0.0
+            aug_hsv_s = 0.0
+            if self.chk_augment.isChecked():
+                if self.chk_aug_hflip.isChecked():
+                    aug_fliplr = 0.5
+                if self.chk_aug_vflip.isChecked():
+                    aug_flipud = 0.5
+                if self.chk_aug_cont_rot.isChecked():
+                    aug_degrees = float(self.spin_aug_rot_angle.value())
+                elif any(c.isChecked() for c in [
+                    self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
+                ]):
+                    aug_degrees = 90.0
+                if self.chk_aug_scale.isChecked():
+                    aug_scale = 0.2
+                if self.chk_aug_brightness.isChecked():
+                    aug_hsv_v = 0.3
+                if self.chk_aug_contrast.isChecked():
+                    aug_hsv_s = 0.4
+
             config_dict = {
                 "coco_json_path": coco_json,
                 "images_dir": images_dir,
@@ -5493,6 +5658,12 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
+                "aug_fliplr": aug_fliplr,
+                "aug_flipud": aug_flipud,
+                "aug_degrees": aug_degrees,
+                "aug_scale": aug_scale,
+                "aug_hsv_v": aug_hsv_v,
+                "aug_hsv_s": aug_hsv_s,
                 "_architecture": "yolo",
             }
         else:

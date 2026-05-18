@@ -34,6 +34,14 @@ class YOLOTrainingConfig:
     early_stop_patience: int = 50
     freeze_backbone: bool = True
     optimizer: str = "AdamW"
+    # Online augmentation (mapped to Ultralytics params)
+    aug_fliplr: float = 0.0
+    aug_flipud: float = 0.0
+    aug_degrees: float = 0.0
+    aug_scale: float = 0.0
+    aug_hsv_v: float = 0.0
+    aug_hsv_s: float = 0.0
+    aug_mosaic: float = 0.0
 
     def resolve_run_dir(self) -> str:
         name = self.run_name or datetime.now().strftime("yolo_%Y%m%d_%H%M%S")
@@ -300,6 +308,26 @@ def train_yolo_seg(
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
+    aug_active = (cfg.aug_fliplr > 0 or cfg.aug_flipud > 0 or cfg.aug_degrees > 0
+                  or cfg.aug_scale > 0 or cfg.aug_hsv_v > 0)
+    if aug_active:
+        parts = []
+        if cfg.aug_fliplr > 0:
+            parts.append(f"fliplr={cfg.aug_fliplr}")
+        if cfg.aug_flipud > 0:
+            parts.append(f"flipud={cfg.aug_flipud}")
+        if cfg.aug_degrees > 0:
+            parts.append(f"degrees=±{cfg.aug_degrees}°")
+        if cfg.aug_scale > 0:
+            parts.append(f"scale=±{cfg.aug_scale}")
+        if cfg.aug_hsv_v > 0:
+            parts.append(f"hsv_v={cfg.aug_hsv_v}")
+        if cfg.aug_hsv_s > 0:
+            parts.append(f"hsv_s={cfg.aug_hsv_s}")
+        print(f"[YOLO Train] Online augmentation: {', '.join(parts)}")
+    else:
+        print("[YOLO Train] Augmentation: disabled")
+
     t0 = _time.time()
     results = model.train(
         data=data_yaml,
@@ -316,6 +344,16 @@ def train_yolo_seg(
         verbose=False,
         freeze=freeze_layers,
         optimizer=cfg.optimizer,
+        plots=True,
+        save=True,
+        # Online augmentation
+        fliplr=cfg.aug_fliplr,
+        flipud=cfg.aug_flipud,
+        degrees=cfg.aug_degrees,
+        scale=cfg.aug_scale,
+        hsv_v=cfg.aug_hsv_v,
+        hsv_s=cfg.aug_hsv_s,
+        mosaic=cfg.aug_mosaic,
     )
     elapsed = _time.time() - t0
     print()  # newline after the \r-updating status line
@@ -324,13 +362,16 @@ def train_yolo_seg(
     best_pt = os.path.join(train_out, "weights", "best.pt")
     last_pt = os.path.join(train_out, "weights", "last.pt")
 
-    final_weights = best_pt if os.path.exists(best_pt) else last_pt
     dest_best = os.path.join(run_dir, "weights_best.pt")
     dest_last = os.path.join(run_dir, "weights.pt")
     if os.path.exists(best_pt):
         shutil.copy2(best_pt, dest_best)
     if os.path.exists(last_pt):
         shutil.copy2(last_pt, dest_last)
+
+    # Remove the temporary YOLO dataset conversion directory
+    if os.path.isdir(yolo_data_dir):
+        shutil.rmtree(yolo_data_dir, ignore_errors=True)
 
     with open(cfg.coco_json_path) as f:
         coco_data = json.load(f)
