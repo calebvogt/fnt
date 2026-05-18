@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
-    QTextEdit,
+    QTextEdit, QSplitter,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt5.QtGui import (
@@ -1105,6 +1105,7 @@ class InferenceWorker(QThread):
     video_finished = pyqtSignal(object)  # result dict
     all_done = pyqtSignal()
     error = pyqtSignal(str)
+    log = pyqtSignal(str)
 
     def __init__(self, video_paths, model_dir, config_dict,
                  classifier_dir=None, nc_threshold=0.5,
@@ -1198,6 +1199,21 @@ class InferenceWorker(QThread):
                         rows[indices[local_pos]]["behavior"] = "NC"
 
     def run(self):
+        import io, sys
+        _real_stdout = sys.stdout
+
+        class _LogCapture(io.TextIOBase):
+            def __init__(self, worker, real):
+                self._worker = worker
+                self._real = real
+            def write(self, s):
+                if s and s.strip():
+                    self._worker.log.emit(s.rstrip())
+                return self._real.write(s)
+            def flush(self):
+                return self._real.flush()
+
+        sys.stdout = _LogCapture(self, _real_stdout)
         try:
             from .mask_tracker_inference import MaskInferenceConfig, run_inference_on_video
             from .silhouette_extractor import generate_composite
@@ -1322,6 +1338,8 @@ class InferenceWorker(QThread):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+        finally:
+            sys.stdout = _real_stdout
 
 
 class _ClipExtractWorker(QThread):
@@ -2555,15 +2573,20 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(5)
+        main_layout.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(5)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background-color: #444444; }"
+        )
 
         # Left panel: tabs
         self.tab_widget = QTabWidget()
         fm = self.fontMetrics()
         min_w = max(340, fm.averageCharWidth() * 52 + 40)
-        max_w = max(440, fm.averageCharWidth() * 70 + 40)
         self.tab_widget.setMinimumWidth(min_w)
-        self.tab_widget.setMaximumWidth(max_w)
 
         self._build_annotator_tab()
         self._build_classifier_tab()
@@ -2794,8 +2817,42 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._cls_training_viz_panel.setVisible(False)
         right_layout.addWidget(self._cls_training_viz_panel, 1)
 
-        main_layout.addWidget(self.tab_widget)
-        main_layout.addWidget(right_panel, 1)
+        # Inference log panel (hidden by default, shown during inference)
+        self._infer_log_panel = QWidget()
+        infer_log_layout = QVBoxLayout(self._infer_log_panel)
+        infer_log_layout.setContentsMargins(4, 4, 4, 4)
+        infer_log_layout.setSpacing(4)
+
+        self._infer_log_text = QTextEdit()
+        self._infer_log_text.setReadOnly(True)
+        self._infer_log_text.setStyleSheet(
+            "QTextEdit { background-color: #1a1a1a; color: #b0b0b0; "
+            "font-family: monospace; font-size: 10px; border: 1px solid #333; }"
+        )
+        self._infer_log_text.setLineWrapMode(QTextEdit.NoWrap)
+        infer_log_layout.addWidget(self._infer_log_text, 1)
+
+        btn_copy_infer_log = QPushButton("Copy Inference Logs to Clipboard")
+        btn_copy_infer_log.setStyleSheet(
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; "
+            "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+        )
+        btn_copy_infer_log.clicked.connect(self._copy_infer_log)
+        infer_log_layout.addWidget(btn_copy_infer_log)
+
+        self._infer_log_panel.setVisible(False)
+        right_layout.addWidget(self._infer_log_panel, 0)
+
+        splitter.addWidget(self.tab_widget)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        max_left = max(600, fm.averageCharWidth() * 95 + 40)
+        splitter.setSizes([min_w, 800])
+        right_panel.setMinimumWidth(300)
+        self.tab_widget.setMaximumWidth(max_left)
+        main_layout.addWidget(splitter)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -3174,127 +3231,178 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.chk_augment = QCheckBox("Data augmentation")
         self.chk_augment.setChecked(False)
         self.chk_augment.setToolTip(
-            "Apply transforms to training images before training.\n"
+            "Apply random transforms to training images each epoch.\n"
             "Expands the effective dataset, reducing overfitting\n"
-            "when you have few annotated images (<20)."
+            "when you have few annotated images."
         )
         train_vbox.addWidget(self.chk_augment)
 
         self._aug_options_frame = QFrame()
         aug_vbox = QVBoxLayout(self._aug_options_frame)
-        aug_vbox.setContentsMargins(16, 2, 0, 4)
-        aug_vbox.setSpacing(2)
+        aug_vbox.setContentsMargins(16, 4, 4, 4)
+        aug_vbox.setSpacing(4)
 
-        chk_style = "color: #cccccc; font-size: 11px;"
-        lbl_style = "color: #888888; font-size: 10px; font-weight: bold; margin-top: 4px;"
+        aug_lbl_style = "color: #cccccc; font-size: 11px;"
+        aug_spin_style = spin_style
 
-        lbl_geo = QLabel("Geometric")
-        lbl_geo.setStyleSheet(lbl_style)
-        aug_vbox.addWidget(lbl_geo)
+        def _aug_row(label_text, tooltip=""):
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(aug_lbl_style)
+            if tooltip:
+                lbl.setToolTip(tooltip)
+            row.addWidget(lbl)
+            return row, lbl
 
-        self.chk_aug_hflip = QCheckBox("Horizontal flip")
-        self.chk_aug_hflip.setChecked(True)
-        self.chk_aug_vflip = QCheckBox("Vertical flip")
-        self.chk_aug_vflip.setChecked(True)
-        self.chk_aug_rot90 = QCheckBox("Rotate 90°")
-        self.chk_aug_rot90.setChecked(False)
-        self.chk_aug_rot180 = QCheckBox("Rotate 180°")
-        self.chk_aug_rot180.setChecked(True)
-        self.chk_aug_rot270 = QCheckBox("Rotate 270°")
-        self.chk_aug_rot270.setChecked(False)
-
-        self.chk_aug_cont_rot = QCheckBox("Random rotation")
-        self.chk_aug_cont_rot.setChecked(False)
-        self.chk_aug_cont_rot.setToolTip(
-            "Apply random continuous rotation within ±N degrees.\n"
-            "Use ±180° for top-down views, ±15° for side views.\n"
-            "Generates 2 random rotations per image."
+        # --- Rotation ---
+        rot_row, _ = _aug_row("Rotation:",
+            "Random continuous rotation applied each batch.\n"
+            "±180° for top-down views (animal faces any direction).\n"
+            "±15° for side views (animal is roughly horizontal).\n"
+            "Select 'None' to disable rotation augmentation.")
+        self.combo_aug_rotation = QComboBox()
+        self.combo_aug_rotation.addItems(["None", "±15°", "±180°"])
+        self.combo_aug_rotation.setCurrentIndex(0)
+        self.combo_aug_rotation.setStyleSheet(spin_style)
+        self.combo_aug_rotation.setToolTip(
+            "±180° — top-down recordings\n"
+            "±15° — side-view recordings\n"
+            "None — no rotation augmentation"
         )
-        rot_angle_row = QHBoxLayout()
-        rot_angle_row.setContentsMargins(20, 0, 0, 0)
-        self.lbl_aug_rot_angle = QLabel("±")
-        self.lbl_aug_rot_angle.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-        self.spin_aug_rot_angle = QSpinBox()
-        self.spin_aug_rot_angle.setRange(5, 180)
-        self.spin_aug_rot_angle.setValue(30)
-        self.spin_aug_rot_angle.setSuffix("°")
-        self.spin_aug_rot_angle.setStyleSheet(spin_style)
-        self.spin_aug_rot_angle.setToolTip(
-            "Maximum rotation angle in degrees.\n"
-            "±180° for top-down recordings (animal can face any direction).\n"
-            "±15° for side-view recordings (animal is roughly horizontal)."
-        )
-        rot_angle_row.addWidget(self.lbl_aug_rot_angle)
-        rot_angle_row.addWidget(self.spin_aug_rot_angle)
-        rot_angle_row.addStretch()
+        rot_row.addWidget(self.combo_aug_rotation)
+        rot_row.addStretch()
+        aug_vbox.addLayout(rot_row)
 
-        self.chk_aug_scale = QCheckBox("Random scale (0.8×–1.2×)")
+        # --- Scale ---
+        self.chk_aug_scale = QCheckBox("Scale")
         self.chk_aug_scale.setChecked(False)
+        self.chk_aug_scale.setStyleSheet(aug_lbl_style)
         self.chk_aug_scale.setToolTip(
-            "Randomly zoom in or out (80%–120%) around the image center.\n"
-            "Helps the model handle animals at varying distances.\n"
-            "Generates 2 random scale variants per image."
+            "Random zoom in/out around the image center.\n"
+            "Helps the model handle animals at varying distances."
         )
+        scale_row = QHBoxLayout()
+        scale_row.setSpacing(4)
+        scale_row.addWidget(self.chk_aug_scale)
+        lbl_smin = QLabel("min:")
+        lbl_smin.setStyleSheet(aug_lbl_style)
+        self.spin_aug_scale_min = QDoubleSpinBox()
+        self.spin_aug_scale_min.setRange(0.50, 0.99)
+        self.spin_aug_scale_min.setValue(0.80)
+        self.spin_aug_scale_min.setSingleStep(0.05)
+        self.spin_aug_scale_min.setDecimals(2)
+        self.spin_aug_scale_min.setStyleSheet(aug_spin_style)
+        lbl_smax = QLabel("max:")
+        lbl_smax.setStyleSheet(aug_lbl_style)
+        self.spin_aug_scale_max = QDoubleSpinBox()
+        self.spin_aug_scale_max.setRange(1.01, 2.00)
+        self.spin_aug_scale_max.setValue(1.20)
+        self.spin_aug_scale_max.setSingleStep(0.05)
+        self.spin_aug_scale_max.setDecimals(2)
+        self.spin_aug_scale_max.setStyleSheet(aug_spin_style)
+        scale_row.addWidget(lbl_smin)
+        scale_row.addWidget(self.spin_aug_scale_min)
+        scale_row.addWidget(lbl_smax)
+        scale_row.addWidget(self.spin_aug_scale_max)
+        scale_row.addStretch()
+        self._scale_min_max = [lbl_smin, self.spin_aug_scale_min,
+                               lbl_smax, self.spin_aug_scale_max]
+        for w in self._scale_min_max:
+            w.setVisible(False)
+        self.chk_aug_scale.toggled.connect(
+            lambda on: [w.setVisible(on) for w in self._scale_min_max]
+        )
+        aug_vbox.addLayout(scale_row)
 
-        lbl_photo = QLabel("Photometric")
-        lbl_photo.setStyleSheet(lbl_style)
-
-        self.chk_aug_brightness = QCheckBox("Brightness (±40)")
+        # --- Brightness ---
+        self.chk_aug_brightness = QCheckBox("Brightness")
         self.chk_aug_brightness.setChecked(True)
-        self.chk_aug_contrast = QCheckBox("Contrast (±30%)")
+        self.chk_aug_brightness.setStyleSheet(aug_lbl_style)
+        bright_row = QHBoxLayout()
+        bright_row.setSpacing(4)
+        bright_row.addWidget(self.chk_aug_brightness)
+        lbl_bmin = QLabel("min:")
+        lbl_bmin.setStyleSheet(aug_lbl_style)
+        self.spin_aug_bright_min = QSpinBox()
+        self.spin_aug_bright_min.setRange(-100, -1)
+        self.spin_aug_bright_min.setValue(-10)
+        self.spin_aug_bright_min.setSuffix("%")
+        self.spin_aug_bright_min.setStyleSheet(aug_spin_style)
+        lbl_bmax = QLabel("max:")
+        lbl_bmax.setStyleSheet(aug_lbl_style)
+        self.spin_aug_bright_max = QSpinBox()
+        self.spin_aug_bright_max.setRange(1, 100)
+        self.spin_aug_bright_max.setValue(10)
+        self.spin_aug_bright_max.setSuffix("%")
+        self.spin_aug_bright_max.setStyleSheet(aug_spin_style)
+        bright_row.addWidget(lbl_bmin)
+        bright_row.addWidget(self.spin_aug_bright_min)
+        bright_row.addWidget(lbl_bmax)
+        bright_row.addWidget(self.spin_aug_bright_max)
+        bright_row.addStretch()
+        self._bright_min_max = [lbl_bmin, self.spin_aug_bright_min,
+                                lbl_bmax, self.spin_aug_bright_max]
+        for w in self._bright_min_max:
+            w.setVisible(False)
+        self.chk_aug_brightness.toggled.connect(
+            lambda on: [w.setVisible(on) for w in self._bright_min_max]
+        )
+        aug_vbox.addLayout(bright_row)
+
+        # --- Contrast ---
+        self.chk_aug_contrast = QCheckBox("Contrast")
         self.chk_aug_contrast.setChecked(False)
+        self.chk_aug_contrast.setStyleSheet(aug_lbl_style)
         self.chk_aug_contrast.setToolTip(
-            "Randomly increase or decrease image contrast.\n"
+            "Randomly adjust image contrast.\n"
             "Helps with varying lighting conditions between sessions."
         )
-        self.chk_aug_gnoise = QCheckBox("Gaussian noise")
-        self.chk_aug_gnoise.setChecked(False)
-        self.chk_aug_gnoise.setToolTip(
-            "Add random Gaussian noise to pixels.\n"
-            "Improves robustness for low-light or noisy camera feeds."
+        contrast_row = QHBoxLayout()
+        contrast_row.setSpacing(4)
+        contrast_row.addWidget(self.chk_aug_contrast)
+        lbl_cmin = QLabel("min:")
+        lbl_cmin.setStyleSheet(aug_lbl_style)
+        self.spin_aug_contrast_min = QSpinBox()
+        self.spin_aug_contrast_min.setRange(-100, -1)
+        self.spin_aug_contrast_min.setValue(-10)
+        self.spin_aug_contrast_min.setSuffix("%")
+        self.spin_aug_contrast_min.setStyleSheet(aug_spin_style)
+        lbl_cmax = QLabel("max:")
+        lbl_cmax.setStyleSheet(aug_lbl_style)
+        self.spin_aug_contrast_max = QSpinBox()
+        self.spin_aug_contrast_max.setRange(1, 100)
+        self.spin_aug_contrast_max.setValue(10)
+        self.spin_aug_contrast_max.setSuffix("%")
+        self.spin_aug_contrast_max.setStyleSheet(aug_spin_style)
+        contrast_row.addWidget(lbl_cmin)
+        contrast_row.addWidget(self.spin_aug_contrast_min)
+        contrast_row.addWidget(lbl_cmax)
+        contrast_row.addWidget(self.spin_aug_contrast_max)
+        contrast_row.addStretch()
+        self._contrast_min_max = [lbl_cmin, self.spin_aug_contrast_min,
+                                  lbl_cmax, self.spin_aug_contrast_max]
+        for w in self._contrast_min_max:
+            w.setVisible(False)
+        self.chk_aug_contrast.toggled.connect(
+            lambda on: [w.setVisible(on) for w in self._contrast_min_max]
         )
-        self.chk_aug_blur = QCheckBox("Gaussian blur")
-        self.chk_aug_blur.setChecked(True)
-
-        self._aug_checkboxes = [
-            self.chk_aug_hflip, self.chk_aug_vflip,
-            self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-            self.chk_aug_cont_rot, self.chk_aug_scale,
-            self.chk_aug_brightness, self.chk_aug_contrast,
-            self.chk_aug_gnoise, self.chk_aug_blur,
-        ]
-
-        for chk in [self.chk_aug_hflip, self.chk_aug_vflip,
-                     self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270]:
-            chk.setStyleSheet(chk_style)
-            aug_vbox.addWidget(chk)
-
-        self.chk_aug_cont_rot.setStyleSheet(chk_style)
-        aug_vbox.addWidget(self.chk_aug_cont_rot)
-        self._rot_angle_widget = QWidget()
-        self._rot_angle_widget.setLayout(rot_angle_row)
-        self._rot_angle_widget.setVisible(False)
-        aug_vbox.addWidget(self._rot_angle_widget)
-        self.chk_aug_cont_rot.toggled.connect(self._rot_angle_widget.setVisible)
-
-        self.chk_aug_scale.setStyleSheet(chk_style)
-        aug_vbox.addWidget(self.chk_aug_scale)
-
-        aug_vbox.addWidget(lbl_photo)
-        for chk in [self.chk_aug_brightness, self.chk_aug_contrast,
-                     self.chk_aug_gnoise, self.chk_aug_blur]:
-            chk.setStyleSheet(chk_style)
-            aug_vbox.addWidget(chk)
+        aug_vbox.addLayout(contrast_row)
 
         self._aug_expansion_label = QLabel("")
         self._aug_expansion_label.setStyleSheet("color: #999999; font-size: 10px;")
         aug_vbox.addWidget(self._aug_expansion_label)
 
-        for chk in self._aug_checkboxes:
-            chk.toggled.connect(self._update_aug_expansion_label)
-        self.spin_aug_rot_angle.valueChanged.connect(
+        # Connect all aug widgets to update summary label
+        self._aug_update_widgets = [
+            self.combo_aug_rotation, self.chk_aug_scale,
+            self.chk_aug_brightness, self.chk_aug_contrast,
+        ]
+        self.combo_aug_rotation.currentIndexChanged.connect(
             lambda _: self._update_aug_expansion_label()
         )
+        for chk in [self.chk_aug_scale, self.chk_aug_brightness, self.chk_aug_contrast]:
+            chk.toggled.connect(self._update_aug_expansion_label)
 
         self._aug_options_frame.setVisible(False)
         train_vbox.addWidget(self._aug_options_frame)
@@ -5406,14 +5514,8 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _on_architecture_changed(self, index: int):
         arch_text = self.combo_architecture.currentText()
         is_maskrcnn = arch_text.startswith("Mask R-CNN")
-        is_yolo = arch_text.startswith("YOLO")
         for w in self._maskrcnn_widgets:
             w.setVisible(is_maskrcnn)
-        # Gaussian noise and blur are not available in Ultralytics online augmentation
-        for w in [self.chk_aug_gnoise, self.chk_aug_blur]:
-            w.setVisible(not is_yolo)
-        # Discrete 90° rotations are redundant when continuous rotation is available
-        # but keep them visible for all architectures
         if not is_maskrcnn:
             is_small = "small" in arch_text.lower()
             self.spin_batch.setValue(2 if is_small else 8)
@@ -5445,71 +5547,63 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._update_aug_expansion_label()
 
     def _update_aug_expansion_label(self):
-        arch_text = self.combo_architecture.currentText()
-        is_yolo = arch_text.startswith("YOLO")
-
-        if is_yolo:
-            parts = []
-            if self.chk_aug_hflip.isChecked():
-                parts.append("flip-LR")
-            if self.chk_aug_vflip.isChecked():
-                parts.append("flip-UD")
-            if self.chk_aug_cont_rot.isChecked():
-                parts.append(f"rot ±{self.spin_aug_rot_angle.value()}°")
-            elif any(c.isChecked() for c in [
-                self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-            ]):
-                parts.append("rot ±90°")
-            if self.chk_aug_scale.isChecked():
-                parts.append("scale")
-            if self.chk_aug_brightness.isChecked():
-                parts.append("brightness")
-            if self.chk_aug_contrast.isChecked():
-                parts.append("contrast")
-            if parts:
-                self._aug_expansion_label.setText(
-                    f"  Online: {', '.join(parts)} (applied per batch, no disk writes)"
-                )
-            else:
-                self._aug_expansion_label.setText("  No augmentations selected")
-        else:
-            n_det_geo = sum(1 for chk in [
-                self.chk_aug_hflip, self.chk_aug_vflip,
-                self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-            ] if chk.isChecked())
-            n_stoch_geo = (2 if self.chk_aug_cont_rot.isChecked() else 0) + \
-                          (2 if self.chk_aug_scale.isChecked() else 0)
-            n_photo = (2 if self.chk_aug_brightness.isChecked() else 0) + \
-                      (2 if self.chk_aug_contrast.isChecked() else 0) + \
-                      (1 if self.chk_aug_gnoise.isChecked() else 0) + \
-                      (1 if self.chk_aug_blur.isChecked() else 0)
-            n_geo = n_det_geo + n_stoch_geo
-            factor = 1 + n_geo + n_photo
-            parts = []
-            if n_geo:
-                parts.append(f"{n_geo} geometric")
-            if n_photo:
-                parts.append(f"{n_photo} photometric")
-            parts.append("original")
+        parts = []
+        rot_idx = self.combo_aug_rotation.currentIndex()
+        if rot_idx == 1:
+            parts.append("rot ±15°")
+        elif rot_idx == 2:
+            parts.append("rot ±180°")
+        if self.chk_aug_scale.isChecked():
+            lo = self.spin_aug_scale_min.value()
+            hi = self.spin_aug_scale_max.value()
+            parts.append(f"scale {lo:.2f}–{hi:.2f}×")
+        if self.chk_aug_brightness.isChecked():
+            parts.append("brightness")
+        if self.chk_aug_contrast.isChecked():
+            parts.append("contrast")
+        if parts:
             self._aug_expansion_label.setText(
-                f"  ~{factor}x expansion ({' + '.join(parts)})"
+                f"  Online: {', '.join(parts)} (applied per batch)"
             )
+        else:
+            self._aug_expansion_label.setText("  No augmentations selected")
 
     def _build_aug_config(self):
         from .mask_tracker_augmentation import AugmentationConfig
         cfg = AugmentationConfig()
-        cfg.horizontal_flip = self.chk_aug_hflip.isChecked()
-        cfg.vertical_flip = self.chk_aug_vflip.isChecked()
-        cfg.rotate_90 = self.chk_aug_rot90.isChecked()
-        cfg.rotate_180 = self.chk_aug_rot180.isChecked()
-        cfg.rotate_270 = self.chk_aug_rot270.isChecked()
-        cfg.continuous_rotation = self.chk_aug_cont_rot.isChecked()
-        cfg.rotation_max_angle = float(self.spin_aug_rot_angle.value())
+        rot_idx = self.combo_aug_rotation.currentIndex()
+        if rot_idx == 0:
+            cfg.horizontal_flip = False
+            cfg.vertical_flip = False
+            cfg.rotate_90 = False
+            cfg.rotate_180 = False
+            cfg.rotate_270 = False
+            cfg.continuous_rotation = False
+        elif rot_idx == 1:
+            cfg.horizontal_flip = True
+            cfg.vertical_flip = False
+            cfg.rotate_90 = False
+            cfg.rotate_180 = False
+            cfg.rotate_270 = False
+            cfg.continuous_rotation = True
+            cfg.rotation_max_angle = 15.0
+        else:
+            cfg.horizontal_flip = True
+            cfg.vertical_flip = True
+            cfg.rotate_90 = True
+            cfg.rotate_180 = True
+            cfg.rotate_270 = True
+            cfg.continuous_rotation = True
+            cfg.rotation_max_angle = 180.0
         cfg.random_scale = self.chk_aug_scale.isChecked()
+        cfg.scale_range = (
+            self.spin_aug_scale_min.value(),
+            self.spin_aug_scale_max.value(),
+        )
         cfg.brightness = self.chk_aug_brightness.isChecked()
         cfg.contrast = self.chk_aug_contrast.isChecked()
-        cfg.gaussian_noise = self.chk_aug_gnoise.isChecked()
-        cfg.gaussian_blur = self.chk_aug_blur.isChecked()
+        cfg.gaussian_noise = False
+        cfg.gaussian_blur = False
         return cfg
 
     def _start_training(self):
@@ -5626,22 +5720,26 @@ class SAM2AnnotatorWindow(QMainWindow):
             aug_hsv_v = 0.0
             aug_hsv_s = 0.0
             if self.chk_augment.isChecked():
-                if self.chk_aug_hflip.isChecked():
+                rot_idx = self.combo_aug_rotation.currentIndex()
+                if rot_idx == 1:
                     aug_fliplr = 0.5
-                if self.chk_aug_vflip.isChecked():
+                    aug_degrees = 15.0
+                elif rot_idx == 2:
+                    aug_fliplr = 0.5
                     aug_flipud = 0.5
-                if self.chk_aug_cont_rot.isChecked():
-                    aug_degrees = float(self.spin_aug_rot_angle.value())
-                elif any(c.isChecked() for c in [
-                    self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
-                ]):
-                    aug_degrees = 90.0
+                    aug_degrees = 180.0
                 if self.chk_aug_scale.isChecked():
-                    aug_scale = 0.2
+                    s_lo = self.spin_aug_scale_min.value()
+                    s_hi = self.spin_aug_scale_max.value()
+                    aug_scale = max(1.0 - s_lo, s_hi - 1.0)
                 if self.chk_aug_brightness.isChecked():
-                    aug_hsv_v = 0.3
+                    b_pct = max(abs(self.spin_aug_bright_min.value()),
+                                abs(self.spin_aug_bright_max.value()))
+                    aug_hsv_v = b_pct / 100.0
                 if self.chk_aug_contrast.isChecked():
-                    aug_hsv_s = 0.4
+                    c_pct = max(abs(self.spin_aug_contrast_min.value()),
+                                abs(self.spin_aug_contrast_max.value()))
+                    aug_hsv_s = c_pct / 100.0
 
             config_dict = {
                 "coco_json_path": coco_json,
@@ -8128,6 +8226,18 @@ class SAM2AnnotatorWindow(QMainWindow):
             QApplication.clipboard().setText(text)
             self.status_bar.showMessage("Training logs copied to clipboard.", 3000)
 
+    def _copy_infer_log(self):
+        from PyQt5.QtWidgets import QApplication
+        text = self._infer_log_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_bar.showMessage("Inference logs copied to clipboard.", 3000)
+
+    def _on_infer_log(self, line: str):
+        self._infer_log_text.append(line)
+        sb = self._infer_log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _on_cls_train_epoch(self, epoch, train_loss, val_loss, val_acc):
         self.cls_train_progress.setValue(epoch)
         self._cls_loss_plot.add_point(epoch, train_loss, val_loss, val_acc)
@@ -8300,8 +8410,10 @@ class SAM2AnnotatorWindow(QMainWindow):
     # -- Behavior Classification helpers --
 
     def _on_behavior_cls_toggled(self, enabled: bool):
+        has_models = len(self._cls_model_dirs) > 0
+        effective = enabled and has_models
         for w in self._behavior_cls_widgets:
-            w.setEnabled(enabled)
+            w.setEnabled(effective)
 
     def _refresh_classifier_model_list(self):
         self.combo_behavior_model.clear()
@@ -8345,7 +8457,12 @@ class SAM2AnnotatorWindow(QMainWindow):
             self.lbl_behavior_model_info.setText(
                 "No classifier models found — train one in the Classifier tab"
             )
+            self.chk_behavior_cls.setChecked(False)
+            self.chk_behavior_cls.setEnabled(False)
+            for w in self._behavior_cls_widgets:
+                w.setEnabled(False)
         else:
+            self.chk_behavior_cls.setEnabled(True)
             last_idx = len(self._cls_model_dirs) - 1
             self.combo_behavior_model.setCurrentIndex(last_idx)
             run_dir = self._cls_model_dirs[last_idx]
@@ -8359,6 +8476,7 @@ class SAM2AnnotatorWindow(QMainWindow):
                 )
             except Exception:
                 self.lbl_behavior_model_info.setText(f"Path: {run_dir}")
+            self._on_behavior_cls_toggled(self.chk_behavior_cls.isChecked())
         self._fit_combo_popup(self.combo_behavior_model)
 
     def _add_tracking_videos(self):
@@ -8517,6 +8635,10 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._inference_worker.video_finished.connect(self._on_video_finished)
         self._inference_worker.all_done.connect(self._on_all_tracking_done)
         self._inference_worker.error.connect(self._on_tracking_error)
+        self._inference_worker.log.connect(self._on_infer_log)
+
+        self._infer_log_text.clear()
+        self._infer_log_panel.setVisible(True)
         self._inference_worker.start()
 
     def _on_tracking_frame(self, frame_rgb, frame_idx: int):
