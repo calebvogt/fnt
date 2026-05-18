@@ -46,6 +46,8 @@ dependencies = [
     # MAD (Mask Audio Detector) — U-Net segmentation
     "torch>=2.5.1",
     "segmentation-models-pytorch>=0.3.4",
+    # SAM2 — AI-assisted mask annotation
+    "sam2 @ git+https://github.com/facebookresearch/sam2.git",
 ]
 
 [project.optional-dependencies]
@@ -61,8 +63,6 @@ rfid = [
 tracking = [
     "torchvision>=0.20.1",
     "pycocotools>=2.0.6",
-    # SAM2 is optional (AI-assisted labeling only); install separately if needed:
-    #   pip install git+https://github.com/facebookresearch/sam2.git
 ]
 all = [
     "fnt[imaging,tracking]",
