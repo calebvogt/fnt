@@ -42,6 +42,42 @@ class Fed3TrackerWorker(QThread):
         self.wait()
 
 
+class PortScannerWorker(QThread):
+    finished_scan = pyqtSignal(list)
+
+    def run(self):
+        import serial
+        from serial.tools import list_ports
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        ports = list(list_ports.comports())
+
+        def check_port(p):
+            dev = p.device
+            try:
+                # Open with a short timeout
+                ser = serial.Serial(dev, 115200, timeout=0.5)
+                # Wait for board to process if it rebooted upon connection
+                time.sleep(2.0)
+                ser.write(b"PING\n")
+                time.sleep(0.1)
+                response = ser.read_all().decode('utf-8', errors='ignore')
+                ser.close()
+                if "PONG_FED3" in response:
+                    return dev
+            except Exception:
+                pass
+            return None
+
+        # Check ports in parallel to avoid long UI hangs
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = executor.map(check_port, ports)
+
+        valid_ports = [r for r in results if r is not None]
+        self.finished_scan.emit(valid_ports)
+
+
 class CollapsibleLogBox(QWidget):
     """A collapsible log box with a command input for serial communication."""
     command_submitted = pyqtSignal(str)
@@ -212,14 +248,17 @@ class FEDTabWidget(QWidget):
         self.global_unit_combo.setFixedWidth(100)
         
         self.start_all_btn = QPushButton("Start Auto Sync")
-        self.stop_all_btn = QPushButton("Stop Auto Sync")
+        self.start_all_btn.setCheckable(True)
+        self.start_all_btn.setStyleSheet("""
+            QPushButton:checked { background-color: #4caf50; color: white; }
+            QPushButton { font-weight: bold; }
+        """)
         self.sync_now_btn = QPushButton("Sync Now")
         
         sync_settings_layout.addWidget(self.global_interval_spin)
         sync_settings_layout.addWidget(self.global_unit_combo)
         sync_settings_layout.addSpacing(20)
         sync_settings_layout.addWidget(self.start_all_btn)
-        sync_settings_layout.addWidget(self.stop_all_btn)
         sync_settings_layout.addWidget(self.sync_now_btn)
         sync_settings_layout.addStretch()
         sync_group_layout.addLayout(sync_settings_layout)
@@ -243,8 +282,7 @@ class FEDTabWidget(QWidget):
         # Connections
         self.add_device_btn.clicked.connect(self.create_device_widget)
         self.refresh_ports_btn.clicked.connect(self.refresh_all_ports)
-        self.start_all_btn.clicked.connect(self.start_all)
-        self.stop_all_btn.clicked.connect(self.stop_all)
+        self.start_all_btn.toggled.connect(self.toggle_auto_sync)
         self.sync_now_btn.clicked.connect(self.sync_all)
         self.fed_log.command_submitted.connect(self.handle_fed_command)
 
@@ -383,9 +421,10 @@ class FEDTabWidget(QWidget):
 
     def update_plot(self):
         self.ax.clear()
-        self.ax.set_title("Real-Time Events")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Cumulative Count")
+        self.ax.set_title("Real-Time Events", color='white')
+        self.ax.set_xlabel("Time", color='white')
+        self.ax.set_ylabel("Cumulative Count", color='white')
+        self.ax.tick_params(colors='white')
         
         plotted_something = False
         for dev in self.fed_devices:
@@ -407,28 +446,24 @@ class FEDTabWidget(QWidget):
 
     def populate_port_combo(self, combo):
         combo.clear()
-        try:
-            from serial.tools import list_ports
-            ports = list(list_ports.comports())
+        combo.addItem("Scanning...")
+        combo.setEnabled(False)
+        
+        # To avoid garbage collection killing the worker, we attach it to the combo
+        combo._scanner_worker = PortScannerWorker()
+        def on_scan_finished(valid_ports):
+            combo.clear()
+            if valid_ports:
+                for p in valid_ports:
+                    combo.addItem(p)
+            else:
+                # Fallback or just empty
+                combo.addItem("No FED3 found")
+            combo.setEnabled(True)
+            combo._scanner_worker = None # Free worker
             
-            candidates = []
-            for p in ports:
-                dev = getattr(p, "device", "")
-                desc = getattr(p, "description", "")
-                hwid = getattr(p, "hwid", "")
-                
-                if any(k in dev or k in desc or k in hwid for k in ("ACM", "USB", "Arduino", "Feather", "Adafruit", "CDC")):
-                    candidates.append(dev)
-            
-            if not candidates:
-                candidates = [p.device for p in ports]
-                
-            for p in candidates:
-                combo.addItem(p)
-                
-        except Exception:
-            pass
-        combo.setEditable(True)
+        combo._scanner_worker.finished_scan.connect(on_scan_finished)
+        combo._scanner_worker.start()
 
     def remove_device(self, device):
         if len(self.fed_devices) <= 1: return
@@ -529,16 +564,18 @@ class FEDTabWidget(QWidget):
         for dev in self.fed_devices:
             self.populate_port_combo(dev['port_combo'])
 
-    def start_all(self):
-        ms = self.get_global_interval_ms()
-        for dev in self.fed_devices:
-            if not dev['timer'].isActive():
-                dev['timer'].start(ms)
-                self.do_device_sync(dev)
-
-    def stop_all(self):
-        for dev in self.fed_devices:
-            dev['timer'].stop()
+    def toggle_auto_sync(self, checked):
+        if checked:
+            self.start_all_btn.setText("Stop Auto Sync")
+            ms = self.get_global_interval_ms()
+            for dev in self.fed_devices:
+                if not dev['timer'].isActive():
+                    dev['timer'].start(ms)
+                    self.do_device_sync(dev)
+        else:
+            self.start_all_btn.setText("Start Auto Sync")
+            for dev in self.fed_devices:
+                dev['timer'].stop()
 
     def sync_all(self):
         for dev in self.fed_devices:

@@ -47,6 +47,8 @@ dependencies = [
     # MAD (Mask Audio Detector) — U-Net segmentation
     "torch>=2.5.1",
     "segmentation-models-pytorch>=0.3.4",
+    # USB serial communication for FED devices
+    "pyserial",
 ]
 
 [project.optional-dependencies]
