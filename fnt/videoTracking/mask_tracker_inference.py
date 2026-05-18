@@ -79,6 +79,44 @@ def detect_system_profile() -> Dict:
                 profile["chip"] = result.stdout.strip()
         except Exception:
             profile["chip"] = platform.processor() or "Apple Silicon"
+    elif profile["os"] == "Windows":
+        try:
+            result = subprocess.run(
+                ["wmic", "computersystem", "get", "TotalPhysicalMemory"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        profile["ram_gb"] = int(line) // (1024 ** 3)
+                        break
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["wmic", "cpu", "get", "Name"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line and line != "Name":
+                        profile["chip"] = line
+                        break
+        except Exception:
+            profile["chip"] = platform.processor() or "Unknown"
+    else:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        profile["ram_gb"] = kb // (1024 ** 2)
+                        break
+        except Exception:
+            pass
+        profile["chip"] = platform.processor() or "Unknown"
 
     try:
         import torch

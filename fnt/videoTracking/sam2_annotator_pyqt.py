@@ -898,17 +898,19 @@ class AugmentWorker(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, coco_json, images_dir, output_dir):
+    def __init__(self, coco_json, images_dir, output_dir, config=None):
         super().__init__()
         self.coco_json = coco_json
         self.images_dir = images_dir
         self.output_dir = output_dir
+        self.config = config
 
     def run(self):
         try:
             from .mask_tracker_augmentation import augment_coco_dataset
             out_path = augment_coco_dataset(
                 self.coco_json, self.images_dir, self.output_dir,
+                config=self.config,
                 progress_callback=lambda cur, total: self.progress.emit(cur, total),
             )
             self.finished.emit(out_path)
@@ -3146,19 +3148,57 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._maskrcnn_widgets.extend([self._lbl_min_size, self.spin_min_size])
         train_vbox.addLayout(row)
 
-        self.chk_augment = QCheckBox("Data augmentation (~8x expansion)")
+        self.chk_augment = QCheckBox("Data augmentation")
         self.chk_augment.setChecked(False)
         self.chk_augment.setToolTip(
-            "Apply random transforms to training images (default: off).\n\n"
-            "Generates augmented copies using random horizontal flips,\n"
-            "brightness/contrast jitter, and spatial transforms.\n"
-            "Expands the effective dataset ~8x, reducing overfitting\n"
-            "when you have few annotated images (<20).\n\n"
-            "OFF: faster training, use when iterating quickly.\n"
-            "ON: slower to start (generates augmented images), but\n"
-            "  produces more robust models that generalize better."
+            "Apply transforms to training images before training.\n"
+            "Expands the effective dataset, reducing overfitting\n"
+            "when you have few annotated images (<20)."
         )
         train_vbox.addWidget(self.chk_augment)
+
+        self._aug_options_frame = QFrame()
+        aug_vbox = QVBoxLayout(self._aug_options_frame)
+        aug_vbox.setContentsMargins(16, 2, 0, 4)
+        aug_vbox.setSpacing(2)
+
+        self.chk_aug_hflip = QCheckBox("Horizontal flip")
+        self.chk_aug_hflip.setChecked(True)
+        self.chk_aug_vflip = QCheckBox("Vertical flip")
+        self.chk_aug_vflip.setChecked(True)
+        self.chk_aug_rot90 = QCheckBox("Rotate 90°")
+        self.chk_aug_rot90.setChecked(True)
+        self.chk_aug_rot180 = QCheckBox("Rotate 180°")
+        self.chk_aug_rot180.setChecked(True)
+        self.chk_aug_rot270 = QCheckBox("Rotate 270°")
+        self.chk_aug_rot270.setChecked(True)
+        self.chk_aug_brightness = QCheckBox("Brightness (±40)")
+        self.chk_aug_brightness.setChecked(True)
+        self.chk_aug_blur = QCheckBox("Gaussian blur")
+        self.chk_aug_blur.setChecked(True)
+
+        self._aug_checkboxes = [
+            self.chk_aug_hflip, self.chk_aug_vflip,
+            self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
+            self.chk_aug_brightness, self.chk_aug_blur,
+        ]
+        self._aug_expansion_label = QLabel("")
+        self._aug_expansion_label.setStyleSheet("color: #999999; font-size: 10px;")
+
+        for chk in self._aug_checkboxes:
+            chk.setStyleSheet("color: #cccccc; font-size: 11px;")
+            aug_vbox.addWidget(chk)
+            chk.toggled.connect(self._update_aug_expansion_label)
+        aug_vbox.addWidget(self._aug_expansion_label)
+
+        self._aug_options_frame.setVisible(False)
+        train_vbox.addWidget(self._aug_options_frame)
+
+        def _toggle_aug_opts(checked):
+            self._aug_options_frame.setVisible(checked)
+            if checked:
+                self._update_aug_expansion_label()
+        self.chk_augment.toggled.connect(_toggle_aug_opts)
 
         # --- Post-training inference (active learning) ---
         self.chk_post_infer = QCheckBox("Run inference on unlabeled frames after training")
@@ -5263,6 +5303,30 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "MPS: Apple Silicon — fast for Mask R-CNN."
             )
 
+    def _update_aug_expansion_label(self):
+        n_geo = sum(1 for chk in [
+            self.chk_aug_hflip, self.chk_aug_vflip,
+            self.chk_aug_rot90, self.chk_aug_rot180, self.chk_aug_rot270,
+        ] if chk.isChecked())
+        n_photo = (2 if self.chk_aug_brightness.isChecked() else 0) + \
+                  (1 if self.chk_aug_blur.isChecked() else 0)
+        factor = 1 + n_geo + n_photo
+        self._aug_expansion_label.setText(
+            f"  ~{factor}x expansion ({n_geo} geometric + {n_photo} photometric + original)"
+        )
+
+    def _build_aug_config(self):
+        from .mask_tracker_augmentation import AugmentationConfig
+        cfg = AugmentationConfig()
+        cfg.horizontal_flip = self.chk_aug_hflip.isChecked()
+        cfg.vertical_flip = self.chk_aug_vflip.isChecked()
+        cfg.rotate_90 = self.chk_aug_rot90.isChecked()
+        cfg.rotate_180 = self.chk_aug_rot180.isChecked()
+        cfg.rotate_270 = self.chk_aug_rot270.isChecked()
+        cfg.brightness = self.chk_aug_brightness.isChecked()
+        cfg.gaussian_blur = self.chk_aug_blur.isChecked()
+        return cfg
+
     def _start_training(self):
         stats = self._coco.get_stats()
         if stats["num_annotations"] == 0:
@@ -5306,7 +5370,8 @@ class SAM2AnnotatorWindow(QMainWindow):
                 "aug_dir": aug_dir,
                 "n_train_images": n_train_images,
             }
-            self._augment_worker = AugmentWorker(ann_path, images_dir, aug_dir)
+            aug_config = self._build_aug_config()
+            self._augment_worker = AugmentWorker(ann_path, images_dir, aug_dir, aug_config)
             self._augment_worker.progress.connect(
                 lambda c, t: self.lbl_train_status.setText(f"Augmenting... {c}/{t} images")
             )
@@ -5435,7 +5500,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._seg_log_text.append(f"[System] PyTorch {_torch.__version__}")
             if _torch.cuda.is_available():
                 gpu = _torch.cuda.get_device_name(0)
-                mem = _torch.cuda.get_device_properties(0).total_mem / 1024**3
+                mem = _torch.cuda.get_device_properties(0).total_memory / 1024**3
                 self._seg_log_text.append(
                     f"[System] GPU: {gpu} ({mem:.1f} GB)  |  "
                     f"CUDA: {_torch.version.cuda or 'N/A'}"
