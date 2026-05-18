@@ -12,6 +12,10 @@ __pycache__/
 LocalModels/
 SAM_models/
 
+# Model weight files (prevent stray Ultralytics/PyTorch checkpoints from being committed)
+*.pt
+*.pth
+
 # Distribution / packaging
 *.egg-info/
 dist/

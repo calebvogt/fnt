@@ -409,6 +409,50 @@ class AnnotationPreviewWidget(QWidget):
                 return oi
         return None
 
+    def _insert_contour_point(self, wx: float, wy: float):
+        """Insert a new editable vertex on the contour edge closest to the click."""
+        if self._editing_obj_idx is None:
+            return
+        ann = self.annotations[self._editing_obj_idx]
+        pts = ann.points
+        if len(pts) < 3:
+            return
+
+        best_dist = float("inf")
+        best_seg = -1
+        best_proj = None
+
+        for i in range(len(pts)):
+            j = (i + 1) % len(pts)
+            ax, ay = self._img_to_widget(*pts[i])
+            bx, by = self._img_to_widget(*pts[j])
+            dx, dy = bx - ax, by - ay
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq < 1e-6:
+                continue
+            t = max(0.0, min(1.0, ((wx - ax) * dx + (wy - ay) * dy) / seg_len_sq))
+            px, py = ax + t * dx, ay + t * dy
+            d = math.hypot(wx - px, wy - py)
+            if d < best_dist:
+                best_dist = d
+                best_seg = i
+                best_proj = (t, pts[i], pts[j])
+
+        max_dist = max(15.0, 20.0 / self._zoom)
+        if best_proj is None or best_dist > max_dist:
+            return
+
+        t, (x0, y0), (x1, y1) = best_proj
+        new_x = x0 + t * (x1 - x0)
+        new_y = y0 + t * (y1 - y0)
+        insert_idx = best_seg + 1
+        ann.points.insert(insert_idx, (new_x, new_y))
+
+        self._drag_obj_idx = self._editing_obj_idx
+        self._drag_pt_idx = insert_idx
+        self._dragging_point = True
+        self.update()
+
     # -- Events --
     def wheelEvent(self, event: QWheelEvent):
         if self._pixmap is None:
@@ -445,6 +489,9 @@ class AnnotationPreviewWidget(QWidget):
             return
 
         if event.button() == Qt.RightButton:
+            if self._editing_obj_idx is not None:
+                self._insert_contour_point(event.x(), event.y())
+                return
             if self.drawing_mode == "ai" and self._drawing_active:
                 coords = self._widget_to_img(event.x(), event.y())
                 if coords:
@@ -515,7 +562,11 @@ class AnnotationPreviewWidget(QWidget):
             "QMenu::item:disabled { color: #666666; }"
         )
         act_manual = menu.addAction("Add Manual Mask")
-        act_ai = menu.addAction("Add AI-Assisted Mask")
+        if self.drawing_mode == "ai":
+            act_ai = menu.addAction("✔ AI Labeling Mode (active)")
+            act_ai.setEnabled(False)
+        else:
+            act_ai = menu.addAction("Enable AI Labeling Mode")
         menu.addSeparator()
         hit_idx = self._find_annotation_at(wx, wy)
         act_approve = menu.addAction("✔ Approve Mask")
@@ -651,8 +702,8 @@ class AnnotationPreviewWidget(QWidget):
             self._drawing_accepted = True
             self.update()
             self.annotation_accepted.emit()
-            self.drawing_mode = "navigate"
-            self.mode_changed.emit("Navigate")
+            self._clear_drawing()
+            self.mode_changed.emit("AI-Assisted Mask")
 
     def accept_annotation(self, category: str, ann_id: int = -1):
         if self._pending_annotation is None:
@@ -2458,7 +2509,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         pixmap = self._mouse_pixmaps[self._tab_anim_tick]
 
         active_map = {
-            1: (  # Training
+            0: (  # Segmentation (mask model training)
                 (hasattr(self, "_train_worker")
                  and self._train_worker is not None
                  and self._train_worker.isRunning())
@@ -2466,15 +2517,18 @@ class SAM2AnnotatorWindow(QMainWindow):
                     and self._post_infer_worker is not None
                     and self._post_infer_worker.isRunning())
             ),
-            2: (  # Classifier
+            1: (  # Classification
                 (hasattr(self, "_clip_extract_worker")
                  and self._clip_extract_worker is not None
                  and self._clip_extract_worker.isRunning())
                 or (hasattr(self, "_batch_worker")
                     and self._batch_worker is not None
                     and self._batch_worker.isRunning())
+                or (hasattr(self, "_cls_train_worker")
+                    and self._cls_train_worker is not None
+                    and self._cls_train_worker.isRunning())
             ),
-            3: (  # Tracking
+            2: (  # Inference
                 hasattr(self, "_inference_worker")
                 and self._inference_worker is not None
                 and self._inference_worker.isRunning()
@@ -4665,6 +4719,14 @@ class SAM2AnnotatorWindow(QMainWindow):
         if self._extracted_frames and self.current_frame_idx < 0:
             self.frame_list.setCurrentRow(0)
 
+        QMessageBox.information(
+            self, "Frames Ready",
+            f"{new_count} frames extracted ({total} total).\n\n"
+            f"Right-click the preview to start labeling objects.\n"
+            f"AI-assisted labeling is recommended — left-click to "
+            f"include regions, right-click to exclude, Enter to accept.",
+        )
+
     def _on_extract_error(self, msg: str):
         self.extract_progress.setVisible(False)
         self.btn_generate.setEnabled(True)
@@ -4734,6 +4796,7 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _on_frame_selected(self, row: int):
         if row < 0 or row >= len(self._extracted_frames):
             return
+        self._dismiss_training_viz()
         self.current_frame_idx = row
         self._annot_in_video_mode = False
 
@@ -4888,13 +4951,17 @@ class SAM2AnnotatorWindow(QMainWindow):
         if found:
             names = list(found.keys())
             descriptions = [f"{n} ({SAM2_CHECKPOINTS.get(n, {}).get('size_mb', '?')} MB)" for n in names]
+            descriptions.append("Download additional model...")
             choice, ok = QInputDialog.getItem(
                 self, "Select SAM2 Model", "Found existing SAM2 model(s). Select one:",
                 descriptions, 0, False,
             )
             if ok:
-                idx = descriptions.index(choice)
-                self._load_sam2_model(str(found[names[idx]]), SAM2_CHECKPOINTS[names[idx]]["config"])
+                if choice == "Download additional model...":
+                    self._show_sam2_download_dialog()
+                else:
+                    idx = descriptions.index(choice)
+                    self._load_sam2_model(str(found[names[idx]]), SAM2_CHECKPOINTS[names[idx]]["config"])
             else:
                 self.preview.drawing_mode = "navigate"
                 self.lbl_mode.setText("Navigate")
@@ -5358,6 +5425,10 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._train_worker.error.connect(self._on_train_error)
         self._train_worker.start()
 
+        self._training_viz_panel.setVisible(True)
+        self.preview.setVisible(False)
+        self._info_row.setVisible(False)
+
     def _toggle_pause(self):
         if not hasattr(self, "_train_worker") or not self._train_worker.isRunning():
             return
@@ -5388,6 +5459,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         loss = metrics.get("loss", 0.0)
         self.lbl_train_status.setText(f"Iteration {iteration}/{total}  —  loss: {loss:.4f}")
         self._loss_plot.add_point(iteration, loss, metrics)
+
+    def _dismiss_training_viz(self):
+        if self._training_viz_panel.isVisible():
+            self._training_viz_panel.setVisible(False)
+            self.preview.setVisible(True)
+            self._info_row.setVisible(True)
 
     def _on_train_finished(self, summary: dict):
         self.train_progress.setVisible(False)
@@ -5564,6 +5641,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_train.setEnabled(True)
         self.btn_pause.setVisible(False)
         self.btn_stop.setVisible(False)
+        self._dismiss_training_viz()
         self.lbl_train_status.setText(f"Error: {msg}")
         QMessageBox.critical(self, "Training Error", msg)
 
@@ -8191,18 +8269,21 @@ class SAM2AnnotatorWindow(QMainWindow):
         # Frame slider + preview title: only on Classify tab
         self._cls_nav_bar.setVisible(is_classifier and not cls_training_active)
         self._lbl_preview_title.setVisible(is_classifier)
-        # Classifier training loss panel
-        self._cls_training_viz_panel.setVisible(cls_show_loss)
-        # Preview + info row: visible on all tabs (hidden during classifier training)
-        self.preview.setVisible(not cls_show_loss)
-        self._info_row.setVisible(not cls_show_loss)
-        # Training visualization panel: visible on Annotate tab during mask model training
+        # Check if mask model training is in progress
         mask_training_active = (
             hasattr(self, "_train_worker")
             and self._train_worker is not None
             and self._train_worker.isRunning()
         )
-        self._training_viz_panel.setVisible(is_annotation and mask_training_active)
+        mask_show_viz = is_annotation and mask_training_active
+
+        # Classifier training loss panel
+        self._cls_training_viz_panel.setVisible(cls_show_loss)
+        # Mask training visualization panel
+        self._training_viz_panel.setVisible(mask_show_viz)
+        # Preview + info row: hidden during any training viz
+        self.preview.setVisible(not cls_show_loss and not mask_show_viz)
+        self._info_row.setVisible(not cls_show_loss and not mask_show_viz)
 
         if is_annotation:
             self._refresh_training_summary()
@@ -8319,6 +8400,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.lbl_zoom_info.setText(f"{int(self.preview._zoom * 100)}%")
 
     def _update_ann_stats(self):
+        self._refresh_training_summary()
         stats = self._coco.get_stats()
         n_this_frame = len(self.preview.annotations)
         n_inferred_frame = sum(1 for a in self.preview.annotations if a.inferred)
