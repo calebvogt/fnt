@@ -80,30 +80,25 @@ def detect_system_profile() -> Dict:
         except Exception:
             profile["chip"] = platform.processor() or "Apple Silicon"
     elif profile["os"] == "Windows":
+        # PowerShell is the reliable approach on modern Windows (wmic is deprecated)
         try:
             result = subprocess.run(
-                ["wmic", "computersystem", "get", "TotalPhysicalMemory"],
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        profile["ram_gb"] = int(line) // (1024 ** 3)
-                        break
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                profile["ram_gb"] = int(result.stdout.strip()) // (1024 ** 3)
         except Exception:
             pass
         try:
             result = subprocess.run(
-                ["wmic", "cpu", "get", "Name"],
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Processor).Name"],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line and line != "Name":
-                        profile["chip"] = line
-                        break
+            if result.returncode == 0 and result.stdout.strip():
+                profile["chip"] = result.stdout.strip()
         except Exception:
             profile["chip"] = platform.processor() or "Unknown"
     else:

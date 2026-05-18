@@ -3259,13 +3259,41 @@ class SAM2AnnotatorWindow(QMainWindow):
         post_infer_row.addWidget(self.spin_post_infer_max)
         train_vbox.addLayout(post_infer_row)
 
-        # Show/hide max objects row based on checkbox
+        post_conf_row = QHBoxLayout()
+        self.lbl_post_infer_conf = QLabel("  Confidence threshold:")
+        self.lbl_post_infer_conf.setToolTip(
+            "Minimum confidence score for a detection to be kept.\n"
+            "Lower values detect more objects but may include false\n"
+            "positives. Higher values are more selective.\n\n"
+            "Default 0.30 is appropriate for early training rounds\n"
+            "with limited data. Increase to 0.5+ once the model\n"
+            "has been trained on more annotated images."
+        )
+        post_conf_row.addWidget(self.lbl_post_infer_conf)
+        self.spin_post_infer_conf = QDoubleSpinBox()
+        self.spin_post_infer_conf.setRange(0.05, 0.95)
+        self.spin_post_infer_conf.setValue(0.30)
+        self.spin_post_infer_conf.setSingleStep(0.05)
+        self.spin_post_infer_conf.setDecimals(2)
+        self.spin_post_infer_conf.setStyleSheet(spin_style)
+        self.spin_post_infer_conf.setToolTip(
+            "Minimum confidence score (0.05–0.95).\n"
+            "Default 0.30 works well for early active learning rounds."
+        )
+        post_conf_row.addWidget(self.spin_post_infer_conf)
+        train_vbox.addLayout(post_conf_row)
+
+        # Show/hide post-infer options based on checkbox
         def _toggle_post_infer_opts(checked):
             self.lbl_post_infer_max.setVisible(checked)
             self.spin_post_infer_max.setVisible(checked)
+            self.lbl_post_infer_conf.setVisible(checked)
+            self.spin_post_infer_conf.setVisible(checked)
         self.chk_post_infer.toggled.connect(_toggle_post_infer_opts)
         self.lbl_post_infer_max.setVisible(False)
         self.spin_post_infer_max.setVisible(False)
+        self.lbl_post_infer_conf.setVisible(False)
+        self.spin_post_infer_conf.setVisible(False)
 
         self._on_architecture_changed(0)
 
@@ -5709,15 +5737,20 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.train_progress.setMaximum(len(unlabeled_paths))
         self.train_progress.setValue(0)
         self.train_progress.setVisible(True)
+        confidence = self.spin_post_infer_conf.value()
         self.lbl_train_status.setText(
             f"Running inference on {len(unlabeled_paths)} unlabeled frames..."
+        )
+        self._seg_log_text.append(
+            f"[Inference] {len(unlabeled_paths)} unlabeled frames, "
+            f"confidence>={confidence:.2f}, max_det={max_det}"
         )
 
         self._post_infer_worker = PostTrainInferenceWorker(
             model_dir=model_dir,
             frame_paths=unlabeled_paths,
             max_det=max_det,
-            confidence=0.5,
+            confidence=confidence,
         )
         self._post_infer_worker.progress.connect(self._on_post_infer_progress)
         self._post_infer_worker.frame_result.connect(self._on_post_infer_frame)
