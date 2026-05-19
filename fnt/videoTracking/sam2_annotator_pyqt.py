@@ -6026,6 +6026,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             f"confidence>={confidence:.2f}, max_det={max_det}"
         )
 
+        self._post_infer_n_unlabeled = len(unlabeled_paths)
         self._post_infer_worker = PostTrainInferenceWorker(
             model_dir=model_dir,
             frame_paths=unlabeled_paths,
@@ -6089,7 +6090,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.train_progress.setVisible(False)
         self.btn_train.setEnabled(True)
 
-        # Count how many frames got inferred annotations
+        # Count how many of the unlabeled frames got inferred annotations
         n_inferred_frames = 0
         for _, _, fp in self._extracted_frames:
             fn = os.path.basename(fp)
@@ -6100,10 +6101,10 @@ class SAM2AnnotatorWindow(QMainWindow):
                         n_inferred_frames += 1
                         break
 
-        total_frames = len(self._extracted_frames)
+        available = getattr(self, "_post_infer_n_unlabeled", len(self._extracted_frames))
         infer_status = (
             f"Post-training inference: {count} masks inferred "
-            f"across {n_inferred_frames}/{total_frames} frames"
+            f"across {n_inferred_frames}/{available} frames"
         )
         self.lbl_train_status.setText(f"{infer_status}. Review inferred masks.")
 
