@@ -486,15 +486,18 @@ class AnnotationPreviewWidget(QWidget):
             return
 
         if event.button() == Qt.RightButton:
-            if self._editing_obj_idx is not None:
-                self._insert_contour_point(event.x(), event.y())
-                return
-            if self.drawing_mode == "ai" and self._drawing_active:
-                coords = self._widget_to_img(event.x(), event.y())
-                if coords:
-                    self._ai_negative_points.append((int(coords[0]), int(coords[1])))
-                    self.update()
-                    self._request_ai_prediction()
+            if self.annotation_keys_enabled:
+                if self._editing_obj_idx is not None:
+                    self._insert_contour_point(event.x(), event.y())
+                    return
+                if self.drawing_mode == "ai" and self._drawing_active:
+                    coords = self._widget_to_img(event.x(), event.y())
+                    if coords:
+                        self._ai_negative_points.append((int(coords[0]), int(coords[1])))
+                        self.update()
+                        self._request_ai_prediction()
+                    return
+                self._show_context_menu(event.globalPos(), event.x(), event.y())
             elif hasattr(self, "_cls_mask_handler") and self._cls_mask_handler:
                 coords = self._widget_to_img(event.x(), event.y())
                 if coords:
@@ -503,12 +506,15 @@ class AnnotationPreviewWidget(QWidget):
                     )
                     if handled:
                         return
-                self._show_context_menu(event.globalPos(), event.x(), event.y())
-            else:
-                self._show_context_menu(event.globalPos(), event.x(), event.y())
             return
 
         if event.button() == Qt.LeftButton:
+            if not self.annotation_keys_enabled:
+                self._panning = True
+                self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
+                self.setCursor(Qt.ClosedHandCursor)
+                return
+
             if self.drawing_mode == "navigate":
                 if self._editing_obj_idx is not None:
                     hit = self._find_point_at(event.x(), event.y())
@@ -9039,6 +9045,10 @@ class SAM2AnnotatorWindow(QMainWindow):
         is_tracking = index == 2
 
         self.preview.annotation_keys_enabled = is_annotation
+        if not is_annotation:
+            self.preview._clear_drawing()
+            self.preview.drawing_mode = "navigate"
+            self.preview._editing_obj_idx = None
 
         # Annotation bar: only on Annotate tab
         for w in self._annotation_bar_widgets:
