@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QSpinBox, QComboBox, QDialog, QAction, QMenuBar,
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
+    QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
     QTextEdit, QSplitter,
@@ -57,6 +58,11 @@ DARK_STYLESHEET = """
     QListWidget { background-color: #1e1e1e; border: 1px solid #444444;
                   color: #cccccc; }
     QListWidget::item:selected { background-color: #2979ff; color: white; }
+    QTreeWidget { background-color: #1e1e1e; border: 1px solid #444444;
+                  color: #cccccc; }
+    QTreeWidget::item:selected { background-color: #2979ff; color: white; }
+    QHeaderView::section { background-color: #333333; color: #cccccc;
+                           border: 1px solid #444444; padding: 2px 6px; }
     QComboBox { background-color: #3c3c3c; border: 1px solid #555555;
                 border-radius: 3px; padding: 3px 6px; color: #cccccc; }
     QComboBox QAbstractItemView { background-color: #3c3c3c; color: #cccccc;
@@ -646,8 +652,10 @@ class AnnotationPreviewWidget(QWidget):
                 self.mode_changed.emit("Navigate")
                 self.update()
                 self.annotation_edited.emit(idx)
-            else:
+            elif self._drawing_active:
                 self._finish_annotation()
+            else:
+                self.advance_frame_requested.emit()
         elif event.key() == Qt.Key_Escape:
             if self._editing_obj_idx is not None:
                 self._editing_obj_idx = None
@@ -1078,11 +1086,13 @@ class PostTrainInferenceWorker(QThread):
                         area = int((x2 - x1) * (y2 - y1))
 
                     label = int(result["labels"][j])
+                    score = float(result["scores"][j])
                     detections.append({
                         "segmentation": polygons,
                         "bbox": bbox,
                         "area": area,
                         "category_id": label,
+                        "score": score,
                     })
 
                 if detections:
@@ -2643,19 +2653,6 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         info_layout.addStretch()
 
-        self.btn_delete_frame = QPushButton("Delete Frame")
-        self.btn_delete_frame.setStyleSheet(
-            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
-            "QPushButton:hover { background-color: #e53935; }"
-        )
-        self.btn_delete_frame.setToolTip(
-            "Delete the current frame from disk and remove\n"
-            "its annotations. Cannot be undone."
-        )
-        self.btn_delete_frame.clicked.connect(self._delete_current_frame)
-        info_layout.addWidget(self.btn_delete_frame)
-
         self.btn_edit_classes = QPushButton("Edit Object Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
@@ -2673,7 +2670,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
-            self.btn_delete_frame, self.btn_edit_classes, self.lbl_zoom_info,
+            self.btn_edit_classes, self.lbl_zoom_info,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -2879,8 +2876,8 @@ class SAM2AnnotatorWindow(QMainWindow):
             "Manual: click to place vertices, Enter to accept.\n"
             "AI: left-click to include, right-click to exclude, Enter to accept.\n"
             "Right-click a mask to Edit or Delete it.\n"
-            "Left-click + drag to pan. Scroll to zoom. Space = next frame.\n"
-            "E = extract current video frame to Training Frames.\n"
+            "Left-click + drag to pan. Scroll to zoom. Space/Enter = next frame.\n"
+            "E = extract current video frame to Training Frames Queue.\n"
             "Arrow keys scrub video (Shift ±10, Ctrl ±100)."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
@@ -4570,13 +4567,24 @@ class SAM2AnnotatorWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_frames_section(self, layout):
-        group = QGroupBox("Training Frames")
+        group = QGroupBox("Training Frames Queue")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
-        self.frame_list = QListWidget()
-        self.frame_list.setMaximumHeight(140)
-        self.frame_list.currentRowChanged.connect(self._on_frame_selected)
+        self._frame_confidence: dict = {}
+        self._shuffle_mode = False
+
+        self.frame_list = QTreeWidget()
+        self.frame_list.setMaximumHeight(160)
+        self.frame_list.setColumnCount(2)
+        self.frame_list.setHeaderLabels(["Frame", "Conf"])
+        self.frame_list.header().setStretchLastSection(False)
+        self.frame_list.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.frame_list.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.frame_list.setRootIsDecorated(False)
+        self.frame_list.setSortingEnabled(True)
+        self.frame_list.sortByColumn(0, Qt.AscendingOrder)
+        self.frame_list.currentItemChanged.connect(self._on_frame_item_changed)
         vbox.addWidget(self.frame_list)
 
         nav_row = QHBoxLayout()
@@ -4590,11 +4598,47 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.btn_next_frame = QPushButton("Next >")
         self.btn_next_frame.clicked.connect(self._next_frame)
         nav_row.addWidget(self.btn_next_frame)
+
+        self.btn_shuffle = QPushButton("Shuffle")
+        self.btn_shuffle.setCheckable(True)
+        self.btn_shuffle.setToolTip(
+            "When enabled, Space/Enter advances to a\n"
+            "random unlabeled/inferred frame instead of\n"
+            "the next one in list order."
+        )
+        self.btn_shuffle.toggled.connect(self._on_shuffle_toggled)
+        nav_row.addWidget(self.btn_shuffle)
         vbox.addLayout(nav_row)
 
-        self.btn_load_frames = QPushButton("Load Existing Frames...")
-        self.btn_load_frames.clicked.connect(self._load_existing_frames)
-        vbox.addWidget(self.btn_load_frames)
+        delete_row = QHBoxLayout()
+        delete_row.setSpacing(4)
+        self.btn_delete_unlabeled = QPushButton("Delete Unlabeled Frames")
+        self.btn_delete_unlabeled.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 3px 12px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+        )
+        self.btn_delete_unlabeled.setToolTip(
+            "Remove all frames that have no annotations\n"
+            "(no manual or inferred masks) from the project."
+        )
+        self.btn_delete_unlabeled.clicked.connect(self._delete_unlabeled_frames)
+        delete_row.addWidget(self.btn_delete_unlabeled)
+
+        self.btn_delete_frame = QPushButton("Delete Frame")
+        self.btn_delete_frame.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 3px 12px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #e53935; }"
+        )
+        self.btn_delete_frame.setToolTip(
+            "Delete the current frame from the project.\n"
+            "The image file and its annotations will be\n"
+            "permanently removed."
+        )
+        self.btn_delete_frame.clicked.connect(self._delete_current_frame)
+        delete_row.addWidget(self.btn_delete_frame)
+        vbox.addLayout(delete_row)
 
         group.setLayout(vbox)
         layout.addWidget(group)
@@ -4660,7 +4704,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         if os.path.isdir(self._output_dir):
             self._scan_frames_dir(self._output_dir)
             if self._extracted_frames:
-                self.frame_list.setCurrentRow(0)
+                self._select_frame_row(0)
 
         ann_path = os.path.join(self._project_dir, "annotations", "annotations.json")
         if os.path.exists(ann_path):
@@ -4668,6 +4712,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._categories = [c["name"] for c in self._coco.categories]
         self._coco.auto_save_path = ann_path
 
+        self._rebuild_frame_confidence()
         self._refresh_frame_list()
 
         self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(self._project_dir)}")
@@ -4774,7 +4819,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         # Deselect extracted frames — video and frame preview are mutually exclusive
         self.frame_list.blockSignals(True)
         self.frame_list.clearSelection()
-        self.frame_list.setCurrentRow(-1)
+        self._select_frame_row(-1)
         self.frame_list.blockSignals(False)
 
         self.preview.annotations.clear()
@@ -4867,7 +4912,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         # Select the extracted frame, switching to frame mode
         for i, (_, _, fp) in enumerate(self._extracted_frames):
             if fp == out_path:
-                self.frame_list.setCurrentRow(i)
+                self._select_frame_row(i)
                 break
 
         self.status_bar.showMessage(f"Extracted frame: {fname}", 3000)
@@ -4979,7 +5024,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             f"Added {new_count} new frames ({total} total) in {self._output_dir}"
         )
         if self._extracted_frames and self.current_frame_idx < 0:
-            self.frame_list.setCurrentRow(0)
+            self._select_frame_row(0)
 
         QMessageBox.information(
             self, "Frames Ready",
@@ -4997,33 +5042,75 @@ class SAM2AnnotatorWindow(QMainWindow):
     # ==================================================================
     # Extracted frames
     # ==================================================================
+    class _NumericTreeItem(QTreeWidgetItem):
+        """QTreeWidgetItem that sorts the confidence column numerically."""
+        def __lt__(self, other):
+            col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+            if col == 1:
+                a = self.data(1, Qt.UserRole)
+                b = other.data(1, Qt.UserRole)
+                if a is None:
+                    a = -1.0
+                if b is None:
+                    b = -1.0
+                return a < b
+            return super().__lt__(other)
+
     def _refresh_frame_list(self):
         self.frame_list.blockSignals(True)
+        self.frame_list.setSortingEnabled(False)
         self.frame_list.clear()
-        for _, _, fp in self._extracted_frames:
+        for idx, (_, _, fp) in enumerate(self._extracted_frames):
             filename = os.path.basename(fp)
             n_total, n_inferred = self._count_annotations_for_file(filename)
             n_approved = n_total - n_inferred
             if n_total > 0 and n_inferred == n_total:
-                # All annotations are inferred (pending review)
                 label = f"● {filename} ({n_total})"
-                color = QColor("#e6c830")  # yellow
+                color = QColor("#e6c830")
             elif n_total > 0 and n_inferred > 0:
-                # Mix of approved and inferred
                 label = f"◐ {filename} ({n_approved}+{n_inferred})"
-                color = QColor("#e6c830")  # yellow
+                color = QColor("#e6c830")
             elif n_total > 0:
-                # All annotations are approved/manual
                 label = f"✔ {filename} ({n_total})"
-                color = QColor("#4fc456")  # green
+                color = QColor("#4fc456")
             else:
                 label = f"   {filename}"
                 color = QColor("#cccccc")
-            item = QListWidgetItem(label)
-            item.setForeground(color)
-            self.frame_list.addItem(item)
+
+            conf = self._frame_confidence.get(filename)
+            conf_text = f"{conf:.2f}" if conf is not None else ""
+
+            item = self._NumericTreeItem([label, conf_text])
+            item.setData(0, Qt.UserRole, idx)
+            item.setData(1, Qt.UserRole, conf if conf is not None else -1.0)
+            item.setForeground(0, color)
+            if conf is not None:
+                if conf < 0.3:
+                    item.setForeground(1, QColor("#e53935"))
+                elif conf < 0.6:
+                    item.setForeground(1, QColor("#e6c830"))
+                else:
+                    item.setForeground(1, QColor("#4fc456"))
+            self.frame_list.addTopLevelItem(item)
+        self.frame_list.setSortingEnabled(True)
         self.frame_list.blockSignals(False)
         self._update_nav_state()
+
+    def _rebuild_frame_confidence(self):
+        """Rebuild _frame_confidence dict from stored annotation scores."""
+        self._frame_confidence.clear()
+        img_id_to_name = {img["id"]: img["file_name"] for img in self._coco.images}
+        for ann in self._coco.annotations:
+            if not ann.get("inferred", False):
+                continue
+            score = ann.get("score")
+            if score is None:
+                continue
+            fname = img_id_to_name.get(ann["image_id"], "")
+            if fname:
+                cur = self._frame_confidence.get(fname, 0.0)
+                if score > cur:
+                    self._frame_confidence[fname] = score
 
     def _count_annotations_for_file(self, filename: str) -> Tuple[int, int]:
         """Return (total_annotations, inferred_count) for a file."""
@@ -5052,17 +5139,20 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.lbl_output_dir.setStyleSheet("color: #cccccc; font-size: 10px;")
         self._scan_frames_dir(folder)
         if self._extracted_frames:
-            self.frame_list.setCurrentRow(0)
+            self._select_frame_row(0)
         self.status_bar.showMessage(f"Loaded {len(self._extracted_frames)} frames from {folder}")
 
-    def _on_frame_selected(self, row: int):
-        if row < 0 or row >= len(self._extracted_frames):
+    def _on_frame_item_changed(self, current, _previous):
+        """Handle QTreeWidget currentItemChanged signal."""
+        if current is None:
+            return
+        row = current.data(0, Qt.UserRole)
+        if row is None or row < 0 or row >= len(self._extracted_frames):
             return
         self._dismiss_training_viz()
         self.current_frame_idx = row
         self._annot_in_video_mode = False
 
-        # Deselect video list — frame and video preview are mutually exclusive
         self.video_list.blockSignals(True)
         self.video_list.clearSelection()
         self.video_list.setCurrentRow(-1)
@@ -5072,9 +5162,23 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._load_annotation_frame(img_path)
         self._update_nav_state()
 
+    def _select_frame_row(self, row: int):
+        """Select the QTreeWidget item whose stored frame index == row."""
+        if row < 0:
+            self.frame_list.setCurrentItem(None)
+            return
+        for i in range(self.frame_list.topLevelItemCount()):
+            item = self.frame_list.topLevelItem(i)
+            if item.data(0, Qt.UserRole) == row:
+                self.frame_list.setCurrentItem(item)
+                return
+
+    def _on_shuffle_toggled(self, checked: bool):
+        self._shuffle_mode = checked
+
     def _prev_frame(self):
         if self.current_frame_idx > 0:
-            self.frame_list.setCurrentRow(self.current_frame_idx - 1)
+            self._select_frame_row(self.current_frame_idx - 1)
 
     def _on_advance_frame(self):
         if self._annot_in_video_mode and self._video_cap is not None:
@@ -5085,19 +5189,35 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._next_frame()
 
     def _next_frame(self):
+        import random
         n = len(self._extracted_frames)
-        if self.current_frame_idx >= n - 1:
+        if n == 0:
             return
-        # Advance to next frame that needs review: unlabeled or inferred-only
-        for i in range(self.current_frame_idx + 1, n):
+
+        # Collect all frames that need review: unlabeled or inferred-only
+        candidates = []
+        for i in range(n):
+            if i == self.current_frame_idx:
+                continue
             _, _, fp = self._extracted_frames[i]
             filename = os.path.basename(fp)
             total, n_inferred = self._count_annotations_for_file(filename)
             if total == 0 or total == n_inferred:
-                self.frame_list.setCurrentRow(i)
-                return
-        # All remaining frames have manual annotations — just go to next
-        self.frame_list.setCurrentRow(self.current_frame_idx + 1)
+                candidates.append(i)
+
+        if not candidates:
+            if self.current_frame_idx < n - 1:
+                self._select_frame_row(self.current_frame_idx + 1)
+            return
+
+        if self._shuffle_mode:
+            self._select_frame_row(random.choice(candidates))
+        else:
+            forward = [i for i in candidates if i > self.current_frame_idx]
+            if forward:
+                self._select_frame_row(forward[0])
+            else:
+                self._select_frame_row(candidates[0])
 
     def _delete_current_frame(self):
         if self.current_frame_idx < 0 or self.current_frame_idx >= len(self._extracted_frames):
@@ -5107,29 +5227,29 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         # Check if frame has annotations
         n_total, _ = self._count_annotations_for_file(filename)
-        msg = f"Delete frame '{filename}'?"
+        msg = f"Delete training frame '{filename}' from project folder?"
         if n_total > 0:
             msg += f"\n\nThis frame has {n_total} annotation(s) that will also be removed."
-        msg += "\n\nThe image file will be deleted from disk. This cannot be undone."
+        msg += "\n\nThis cannot be undone."
 
         reply = QMessageBox.warning(
-            self, "Delete Frame", msg,
+            self, "Delete Training Frame", msg,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
 
-        # Remove annotations for this frame
+        # Remove annotations and image record for this frame
         if filename in self._coco._image_id_map:
             img_id = self._coco._image_id_map[filename]
             anns = self._coco.get_annotations_for_image(img_id)
             for ann in anns:
                 self._coco.remove_annotation(ann["id"])
-            # Remove the image record
             self._coco.images = [
                 img for img in self._coco.images if img["id"] != img_id
             ]
             del self._coco._image_id_map[filename]
+            self._coco._auto_save()
 
         # Delete file from disk
         try:
@@ -5150,9 +5270,68 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self._refresh_frame_list()
         if self.current_frame_idx >= 0:
-            self.frame_list.setCurrentRow(self.current_frame_idx)
+            self._select_frame_row(self.current_frame_idx)
         self._update_ann_stats()
         self.status_bar.showMessage(f"Deleted frame: {filename}")
+
+    def _delete_unlabeled_frames(self):
+        """Delete all frames that have no annotations (manual or inferred)."""
+        to_delete = []
+        for idx, (_, _, fp) in enumerate(self._extracted_frames):
+            filename = os.path.basename(fp)
+            total, _ = self._count_annotations_for_file(filename)
+            if total == 0:
+                to_delete.append((idx, fp, filename))
+
+        if not to_delete:
+            QMessageBox.information(
+                self, "No Unlabeled Frames",
+                "All frames in the queue have at least one annotation.",
+            )
+            return
+
+        reply = QMessageBox.warning(
+            self, "Delete Unlabeled Frames",
+            f"Delete {len(to_delete)} unlabeled frame(s) from the project folder?\n\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        for _, fp, filename in to_delete:
+            if filename in self._coco._image_id_map:
+                img_id = self._coco._image_id_map[filename]
+                self._coco.images = [
+                    img for img in self._coco.images if img["id"] != img_id
+                ]
+                del self._coco._image_id_map[filename]
+            try:
+                if os.path.exists(fp):
+                    os.remove(fp)
+            except OSError:
+                pass
+
+        deleted_indices = {idx for idx, _, _ in to_delete}
+        self._extracted_frames = [
+            f for i, f in enumerate(self._extracted_frames)
+            if i not in deleted_indices
+        ]
+        self._coco._auto_save()
+
+        if len(self._extracted_frames) == 0:
+            self.current_frame_idx = -1
+            self.preview.clear()
+        elif self.current_frame_idx >= len(self._extracted_frames):
+            self.current_frame_idx = len(self._extracted_frames) - 1
+
+        self._refresh_frame_list()
+        if self.current_frame_idx >= 0:
+            self._select_frame_row(self.current_frame_idx)
+        self._update_ann_stats()
+        self.status_bar.showMessage(
+            f"Deleted {len(to_delete)} unlabeled frame(s)."
+        )
 
     def _load_annotation_frame(self, path: str):
         img = cv2.imread(path)
@@ -6047,7 +6226,6 @@ class SAM2AnnotatorWindow(QMainWindow):
 
     def _on_post_infer_frame(self, filename: str, detections: list):
         """Add inferred annotations for a single frame."""
-        # Find image dimensions
         frame_path = None
         for _, _, fp in self._extracted_frames:
             if os.path.basename(fp) == filename:
@@ -6063,10 +6241,9 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         img_id = self._coco.get_or_add_image(filename, w, h)
 
+        max_score = 0.0
         for det in detections:
-            # Map YOLO category_id (1-indexed label) back to COCO category_id
             label = det["category_id"]
-            # YOLO labels are 1-indexed (cls+1), map back to COCO category
             cat_id = None
             coco_cats_by_idx = {}
             for ci, cat in enumerate(self._coco.categories):
@@ -6077,6 +6254,10 @@ class SAM2AnnotatorWindow(QMainWindow):
             if cat_id is None:
                 continue
 
+            score = det.get("score", 0.0)
+            if score > max_score:
+                max_score = score
+
             self._coco.add_annotation_from_polygon(
                 image_id=img_id,
                 category_id=cat_id,
@@ -6084,7 +6265,10 @@ class SAM2AnnotatorWindow(QMainWindow):
                 bbox=det["bbox"],
                 area=det["area"],
                 inferred=True,
+                score=score,
             )
+
+        self._frame_confidence[filename] = max_score
 
     def _on_post_infer_finished(self, count: int):
         self.train_progress.setVisible(False)
@@ -8976,7 +9160,13 @@ class SAM2AnnotatorWindow(QMainWindow):
     def _update_frame_list_item(self, row: int):
         if row < 0 or row >= len(self._extracted_frames):
             return
-        item = self.frame_list.item(row)
+        # Find the tree item with this frame index
+        item = None
+        for i in range(self.frame_list.topLevelItemCount()):
+            candidate = self.frame_list.topLevelItem(i)
+            if candidate.data(0, Qt.UserRole) == row:
+                item = candidate
+                break
         if item is None:
             return
         _, _, fp = self._extracted_frames[row]
@@ -8984,17 +9174,28 @@ class SAM2AnnotatorWindow(QMainWindow):
         n_total, n_inferred = self._count_annotations_for_file(filename)
         n_approved = n_total - n_inferred
         if n_total > 0 and n_inferred == n_total:
-            item.setText(f"● {filename} ({n_total})")
-            item.setForeground(QColor("#e6c830"))
+            item.setText(0, f"● {filename} ({n_total})")
+            item.setForeground(0, QColor("#e6c830"))
         elif n_total > 0 and n_inferred > 0:
-            item.setText(f"◐ {filename} ({n_approved}+{n_inferred})")
-            item.setForeground(QColor("#e6c830"))
+            item.setText(0, f"◐ {filename} ({n_approved}+{n_inferred})")
+            item.setForeground(0, QColor("#e6c830"))
         elif n_total > 0:
-            item.setText(f"✔ {filename} ({n_total})")
-            item.setForeground(QColor("#4fc456"))
+            item.setText(0, f"✔ {filename} ({n_total})")
+            item.setForeground(0, QColor("#4fc456"))
         else:
-            item.setText(f"   {filename}")
-            item.setForeground(QColor("#cccccc"))
+            item.setText(0, f"   {filename}")
+            item.setForeground(0, QColor("#cccccc"))
+
+        conf = self._frame_confidence.get(filename)
+        item.setText(1, f"{conf:.2f}" if conf is not None else "")
+        item.setData(1, Qt.UserRole, conf if conf is not None else -1.0)
+        if conf is not None:
+            if conf < 0.3:
+                item.setForeground(1, QColor("#e53935"))
+            elif conf < 0.6:
+                item.setForeground(1, QColor("#e6c830"))
+            else:
+                item.setForeground(1, QColor("#4fc456"))
 
     def closeEvent(self, event):
         self._close_video()

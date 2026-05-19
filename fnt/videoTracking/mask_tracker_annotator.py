@@ -235,6 +235,7 @@ class COCOAnnotationManager:
         bbox: List[float],
         area: int,
         inferred: bool = False,
+        score: float = None,
     ) -> int:
         """Add an annotation directly from polygon data (no mask conversion)."""
         ann_id = self._next_ann_id
@@ -250,6 +251,8 @@ class COCOAnnotationManager:
         }
         if inferred:
             ann["inferred"] = True
+        if score is not None:
+            ann["score"] = score
         self.annotations.append(ann)
         self._auto_save()
         return ann_id
