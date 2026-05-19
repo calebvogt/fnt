@@ -3317,7 +3317,7 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         # --- Brightness ---
         self.chk_aug_brightness = QCheckBox("Brightness")
-        self.chk_aug_brightness.setChecked(True)
+        self.chk_aug_brightness.setChecked(False)
         self.chk_aug_brightness.setStyleSheet(aug_lbl_style)
         bright_row = QHBoxLayout()
         bright_row.setSpacing(4)

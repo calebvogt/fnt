@@ -230,20 +230,35 @@ def train_yolo_seg(
 
     iteration_count = [0]
     best_loss = [float("inf")]
+    last_loss = [0.0]
     stopped_early = [False]
 
     epoch_t0 = [_time.time()]
 
     def on_train_epoch_end(trainer):
         """Capture training loss and sub-losses (available before validation)."""
-        loss_val = float(trainer.loss) if hasattr(trainer, "loss") else 0.0
+        # Use tloss (epoch-averaged) instead of loss (last batch only).
+        # With small batch sizes, last-batch loss is extremely noisy.
+        if hasattr(trainer, "tloss") and trainer.tloss is not None:
+            loss_val = float(trainer.tloss.mean()) if hasattr(trainer.tloss, "mean") else float(trainer.tloss)
+        elif hasattr(trainer, "loss"):
+            loss_val = float(trainer.loss)
+        else:
+            loss_val = 0.0
         if loss_val < best_loss[0]:
             best_loss[0] = loss_val
+        last_loss[0] = loss_val
         iteration_count[0] = trainer.epoch + 1
         _epoch_cache["loss"] = loss_val
         _epoch_cache["lr"] = trainer.optimizer.param_groups[0]["lr"]
         sub = {}
-        if hasattr(trainer, "loss_items") and trainer.loss_items is not None:
+        if hasattr(trainer, "tloss") and trainer.tloss is not None:
+            names = trainer.loss_names if hasattr(trainer, "loss_names") else []
+            items = trainer.tloss.cpu().numpy() if hasattr(trainer.tloss, "cpu") else trainer.tloss
+            for i, v in enumerate(items):
+                key = names[i] if i < len(names) else f"loss_{i}"
+                sub[key] = float(v)
+        elif hasattr(trainer, "loss_items") and trainer.loss_items is not None:
             names = trainer.loss_names if hasattr(trainer, "loss_names") else []
             items = trainer.loss_items.cpu().numpy() if hasattr(trainer.loss_items, "cpu") else trainer.loss_items
             for i, v in enumerate(items):
@@ -403,7 +418,7 @@ def train_yolo_seg(
         "run_dir": run_dir,
         "num_classes": num_classes,
         "iterations_completed": epochs_completed,
-        "final_loss": best_loss[0] if best_loss[0] < float("inf") else None,
+        "final_loss": last_loss[0],
         "best_loss": best_loss[0] if best_loss[0] < float("inf") else None,
         "device": device,
         "device_description": device,
