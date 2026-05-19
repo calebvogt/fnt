@@ -4578,9 +4578,12 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.frame_list.setMaximumHeight(160)
         self.frame_list.setColumnCount(2)
         self.frame_list.setHeaderLabels(["Frame", "Conf"])
-        self.frame_list.header().setStretchLastSection(False)
-        self.frame_list.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.frame_list.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header = self.frame_list.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
         self.frame_list.setRootIsDecorated(False)
         self.frame_list.setSortingEnabled(True)
         self.frame_list.sortByColumn(0, Qt.AscendingOrder)
@@ -4638,6 +4641,19 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         self.btn_delete_frame.clicked.connect(self._delete_current_frame)
         delete_row.addWidget(self.btn_delete_frame)
+
+        self.btn_clear_inferences = QPushButton("Clear Inferences")
+        self.btn_clear_inferences.setStyleSheet(
+            "QPushButton { background-color: #e65100; color: white; font-weight: bold; "
+            "padding: 3px 12px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #f57c00; }"
+        )
+        self.btn_clear_inferences.setToolTip(
+            "Remove all inferred (AI-generated) annotations.\n"
+            "Manually approved annotations are kept."
+        )
+        self.btn_clear_inferences.clicked.connect(self._clear_all_inferences)
+        delete_row.addWidget(self.btn_clear_inferences)
         vbox.addLayout(delete_row)
 
         group.setLayout(vbox)
@@ -5331,6 +5347,44 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._update_ann_stats()
         self.status_bar.showMessage(
             f"Deleted {len(to_delete)} unlabeled frame(s)."
+        )
+
+    def _clear_all_inferences(self):
+        """Remove all inferred annotations across all frames."""
+        inferred_anns = [a for a in self._coco.annotations if a.get("inferred", False)]
+        if not inferred_anns:
+            QMessageBox.information(
+                self, "No Inferences",
+                "There are no inferred annotations to remove.",
+            )
+            return
+
+        inferred_image_ids = set(a["image_id"] for a in inferred_anns)
+        n_frames = len(inferred_image_ids)
+
+        reply = QMessageBox.warning(
+            self, "Clear Inferences",
+            f"Remove {len(inferred_anns)} inferred annotation(s) "
+            f"from {n_frames} frame(s)?\n\n"
+            "Manually approved annotations will not be affected.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        ids_to_remove = [a["id"] for a in inferred_anns]
+        for ann_id in ids_to_remove:
+            self._coco.remove_annotation(ann_id)
+
+        self._frame_confidence.clear()
+
+        self._refresh_frame_list()
+        if self.current_frame_idx >= 0:
+            _, _, path = self._extracted_frames[self.current_frame_idx]
+            self._load_frame_annotations(path)
+        self._update_ann_stats()
+        self.status_bar.showMessage(
+            f"Cleared {len(ids_to_remove)} inferred annotation(s) from {n_frames} frame(s)."
         )
 
     def _load_annotation_frame(self, path: str):
