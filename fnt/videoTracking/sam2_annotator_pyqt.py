@@ -4604,6 +4604,13 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         self.btn_shuffle = QPushButton("Shuffle")
         self.btn_shuffle.setCheckable(True)
+        self.btn_shuffle.setChecked(False)
+        self.btn_shuffle.setStyleSheet(
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555555; "
+            "border-radius: 3px; padding: 3px 8px; color: #cccccc; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+            "QPushButton:checked { background-color: #2979ff; color: white; }"
+        )
         self.btn_shuffle.setToolTip(
             "When enabled, Space/Enter advances to a\n"
             "random unlabeled/inferred frame instead of\n"
@@ -4641,6 +4648,7 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         self.btn_delete_frame.clicked.connect(self._delete_current_frame)
         delete_row.addWidget(self.btn_delete_frame)
+        vbox.addLayout(delete_row)
 
         self.btn_clear_inferences = QPushButton("Clear Inferences")
         self.btn_clear_inferences.setStyleSheet(
@@ -4653,8 +4661,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             "Manually approved annotations are kept."
         )
         self.btn_clear_inferences.clicked.connect(self._clear_all_inferences)
-        delete_row.addWidget(self.btn_clear_inferences)
-        vbox.addLayout(delete_row)
+        vbox.addWidget(self.btn_clear_inferences)
 
         group.setLayout(vbox)
         layout.addWidget(group)
