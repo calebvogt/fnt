@@ -232,6 +232,7 @@ def train_yolo_seg(
     best_loss = [float("inf")]
     last_loss = [0.0]
     stopped_early = [False]
+    training_log_rows = []
 
     epoch_t0 = [_time.time()]
 
@@ -305,6 +306,9 @@ def train_yolo_seg(
         parts.append(f"{epoch_sec:.1f}s/epoch")
         parts.append(f"[{elapsed:.0f}s total]")
         print(f"\r[YOLO Train] {' | '.join(parts)}{gpu_mem_str}", end="", flush=True)
+
+        log_row = {"epoch": epoch, "loss": loss_val, "lr": lr, **sub_losses, **map_vals}
+        training_log_rows.append(log_row)
 
         if progress:
             metrics = {
@@ -408,6 +412,20 @@ def train_yolo_seg(
 
     epochs_completed = iteration_count[0] or cfg.num_iterations
     early_stopped = epochs_completed < cfg.num_iterations
+
+    # Save per-epoch training log
+    if training_log_rows:
+        import csv as _csv
+        log_path = os.path.join(run_dir, "training_log.csv")
+        all_keys = list(training_log_rows[0].keys())
+        for row in training_log_rows[1:]:
+            for k in row:
+                if k not in all_keys:
+                    all_keys.append(k)
+        with open(log_path, "w", newline="") as lf:
+            writer = _csv.DictWriter(lf, fieldnames=all_keys)
+            writer.writeheader()
+            writer.writerows(training_log_rows)
 
     print(f"[YOLO Train] Done: {epochs_completed} epochs in {elapsed:.1f}s")
     print(f"[YOLO Train] Best weights: {dest_best}")

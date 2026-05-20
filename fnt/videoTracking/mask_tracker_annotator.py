@@ -258,10 +258,11 @@ class COCOAnnotationManager:
         return ann_id
 
     def approve_annotation(self, ann_id: int):
-        """Remove inferred flag from an annotation (approve it)."""
+        """Remove inferred flag and confidence score from an annotation (approve it)."""
         for ann in self.annotations:
             if ann["id"] == ann_id:
                 ann.pop("inferred", None)
+                ann.pop("score", None)
                 self._auto_save()
                 return
 

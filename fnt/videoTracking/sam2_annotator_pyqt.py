@@ -120,10 +120,10 @@ def _class_color(index: int) -> Tuple[int, int, int]:
 
 BEHAVIOR_PRESETS = {
     "Rodent Solo": [
-        "locomotion", "idle", "rear", "self-groom",
+        "locomotion", "idle", "rearing", "self-grooming",
     ],
     "Rodent Social": [
-        "locomotion", "idle", "rear", "self-groom",
+        "locomotion", "idle", "rearing", "self-grooming",
         "huddle", "attack", "flee",
     ],
 }
@@ -613,6 +613,8 @@ class AnnotationPreviewWidget(QWidget):
                 if self.annotations[i].inferred:
                     self.approve_annotation_requested.emit(i)
         elif action == act_edit and hit_idx is not None:
+            if self.annotations[hit_idx].inferred:
+                self.approve_annotation_requested.emit(hit_idx)
             self._editing_obj_idx = hit_idx
             self.mode_changed.emit("Editing Mask")
             self.update()
@@ -1279,7 +1281,10 @@ class InferenceWorker(QThread):
                             x2 = min(w_f, int(round(float(bbox[2]))))
                             y2 = min(h_f, int(round(float(bbox[3]))))
                             if x2 > x1 and y2 > y1:
-                                mask_buffers[obj_id].append(mask[y1:y2, x1:x2])
+                                mask_buffers[obj_id].append({
+                                    "crop": mask[y1:y2, x1:x2],
+                                    "bbox": (x1, y1, x2, y2),
+                                })
                             else:
                                 mask_buffers[obj_id].append(None)
                         else:
@@ -1291,7 +1296,9 @@ class InferenceWorker(QThread):
                             continue
 
                         window = list(buf)
-                        composite = generate_composite(window, output_size=(128, 128))
+                        crops = [w["crop"] if w is not None else None for w in window]
+                        boxes = [w["bbox"] if w is not None else None for w in window]
+                        composite = generate_composite(crops, output_size=(128, 128), bboxes=boxes)
                         img = composite.astype(np.float32) / 255.0
                         inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
                         with torch.no_grad():
@@ -1683,11 +1690,17 @@ class _ClassifierTrainWorker(QThread):
 
         aug_transform = None
         if augment:
-            aug_transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomRotation(15),
-                transforms.ColorJitter(brightness=0.2),
-            ])
+            aug_rotation = self.config.get("aug_rotation", 15)
+            aug_list = []
+            if aug_rotation >= 180:
+                aug_list.append(transforms.RandomHorizontalFlip())
+                aug_list.append(transforms.RandomVerticalFlip())
+                aug_list.append(transforms.RandomRotation(180))
+            elif aug_rotation > 0:
+                aug_list.append(transforms.RandomHorizontalFlip())
+                aug_list.append(transforms.RandomRotation(aug_rotation))
+            if aug_list:
+                aug_transform = transforms.Compose(aug_list)
 
         n_total = len(composite_paths)
         n_val = max(1, int(n_total * val_split)) if val_split > 0 else 0
@@ -1800,7 +1813,7 @@ class _ClassifierTrainWorker(QThread):
         best_val_loss = float("inf")
         patience_counter = 0
         early_stopping = self.config.get("early_stopping", True)
-        patience = 20 if early_stopping else epochs
+        patience = self.config.get("patience", 50) if early_stopping else epochs
 
         if early_stopping:
             self.log_message.emit(f"[Classifier] Starting training for {epochs} epochs (early stopping patience={patience})")
@@ -1901,6 +1914,40 @@ class _ClassifierTrainWorker(QThread):
         }
         with open(os.path.join(output_dir, "classifier_config.json"), "w") as f:
             json.dump(config_out, f, indent=2)
+
+        # Save per-epoch training log
+        import csv as _csv
+        log_path = os.path.join(output_dir, "training_log.csv")
+        with open(log_path, "w", newline="") as lf:
+            writer = _csv.writer(lf)
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc"])
+            for ei in range(len(all_train_losses)):
+                t_loss = all_train_losses[ei]
+                v_loss = all_val_losses[ei] if ei < len(all_val_losses) else ""
+                v_acc = ""
+                writer.writerow([ei + 1, f"{t_loss:.6f}", v_loss if v_loss == "" else f"{v_loss:.6f}", v_acc])
+
+        # Save training summary
+        summary_out = {
+            "backbone": backbone,
+            "class_names": class_names,
+            "n_classes": n_classes,
+            "epochs_trained": final_epoch,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss if best_val_loss < float("inf") else None,
+            "best_val_acc": best_val_acc,
+            "final_train_loss": all_train_losses[-1] if all_train_losses else None,
+            "final_val_loss": all_val_losses[-1] if all_val_losses else None,
+            "training_time_sec": round(elapsed, 1),
+            "device": str(device),
+            "learning_rate": lr,
+            "batch_size": batch_size,
+            "n_train": n_train,
+            "n_val": n_val,
+            "early_stopping": early_stopping,
+        }
+        with open(os.path.join(output_dir, "training_summary.json"), "w") as sf:
+            json.dump(summary_out, sf, indent=2)
 
         self.log_message.emit("─" * 60)
         self.log_message.emit(
@@ -3567,32 +3614,6 @@ class SAM2AnnotatorWindow(QMainWindow):
         self._pending_frames = []
         self._queue_frames = []
 
-        # --- Mask Model ---
-        model_group = QGroupBox("Mask Model")
-        model_vbox = QVBoxLayout()
-        model_vbox.setSpacing(4)
-
-        model_row = QHBoxLayout()
-        self.combo_cls_model = QComboBox()
-        self.combo_cls_model.setToolTip(
-            "Select a trained mask model for silhouette extraction.\n"
-            "Defaults to the most recently trained model."
-        )
-        model_row.addWidget(self.combo_cls_model, 1)
-        btn_refresh_cls = QPushButton("Refresh")
-        btn_refresh_cls.setToolTip("Rescan the models/ directory.")
-        btn_refresh_cls.clicked.connect(self._refresh_classifier_models)
-        model_row.addWidget(btn_refresh_cls)
-        model_vbox.addLayout(model_row)
-
-        self.lbl_cls_model_info = QLabel("No model selected")
-        self.lbl_cls_model_info.setStyleSheet("color: #999999; font-size: 10px;")
-        self.lbl_cls_model_info.setWordWrap(True)
-        model_vbox.addWidget(self.lbl_cls_model_info)
-
-        model_group.setLayout(model_vbox)
-        layout.addWidget(model_group)
-
         # --- Load Videos ---
         vid_group = QGroupBox("Load Videos")
         vid_vbox = QVBoxLayout()
@@ -3624,6 +3645,32 @@ class SAM2AnnotatorWindow(QMainWindow):
 
         vid_group.setLayout(vid_vbox)
         layout.addWidget(vid_group)
+
+        # --- Mask Model ---
+        model_group = QGroupBox("Mask Model")
+        model_vbox = QVBoxLayout()
+        model_vbox.setSpacing(4)
+
+        model_row = QHBoxLayout()
+        self.combo_cls_model = QComboBox()
+        self.combo_cls_model.setToolTip(
+            "Select a trained mask model for silhouette extraction.\n"
+            "Defaults to the most recently trained model."
+        )
+        model_row.addWidget(self.combo_cls_model, 1)
+        btn_refresh_cls = QPushButton("Refresh")
+        btn_refresh_cls.setToolTip("Rescan the models/ directory.")
+        btn_refresh_cls.clicked.connect(self._refresh_classifier_models)
+        model_row.addWidget(btn_refresh_cls)
+        model_vbox.addLayout(model_row)
+
+        self.lbl_cls_model_info = QLabel("No model selected")
+        self.lbl_cls_model_info.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_cls_model_info.setWordWrap(True)
+        model_vbox.addWidget(self.lbl_cls_model_info)
+
+        model_group.setLayout(model_vbox)
+        layout.addWidget(model_group)
 
         # Behavior categories list (managed via popup, not shown in left panel)
         self.list_cls_categories = QListWidget()
@@ -3872,43 +3919,51 @@ class SAM2AnnotatorWindow(QMainWindow):
         )
         cls_train_vbox.addWidget(self.chk_cls_freeze)
 
-        # -- Epochs --
-        tip_epochs = (
-            "Number of full passes through the training data.\n\n"
-            "Each epoch processes every composite image once. More\n"
-            "epochs give the model more chances to learn, but too\n"
-            "many can cause overfitting (memorizing training images\n"
-            "instead of learning general patterns).\n\n"
-            "If loss plateau detection is enabled, training will\n"
-            "automatically stop when validation loss stops improving,\n"
-            "so it's safe to set this higher than needed.\n\n"
-            "50 epochs: good default for most datasets.\n"
+        # -- Training Iterations --
+        tip_iters = (
+            "Number of full passes (epochs) through the training data.\n\n"
+            "Each iteration processes every composite image once. More\n"
+            "iterations give the model more chances to learn, but too\n"
+            "many can cause overfitting.\n\n"
+            "If early stop patience is set, training will stop\n"
+            "automatically when validation loss plateaus.\n\n"
+            "50: good default for most datasets.\n"
             "100-200: use with larger or more complex datasets."
         )
         row = QHBoxLayout()
-        lbl = QLabel("Epochs:")
-        lbl.setToolTip(tip_epochs)
+        lbl = QLabel("Training Iterations:")
+        lbl.setToolTip(tip_iters)
         row.addWidget(lbl)
         self.spin_cls_epochs = QSpinBox()
-        self.spin_cls_epochs.setRange(5, 500)
-        self.spin_cls_epochs.setValue(50)
-        self.spin_cls_epochs.setSingleStep(10)
-        self.spin_cls_epochs.setToolTip(tip_epochs)
+        self.spin_cls_epochs.setRange(100, 5000)
+        self.spin_cls_epochs.setValue(500)
+        self.spin_cls_epochs.setSingleStep(100)
+        self.spin_cls_epochs.setToolTip(tip_iters)
         self.spin_cls_epochs.setStyleSheet(spin_style)
         row.addWidget(self.spin_cls_epochs)
         cls_train_vbox.addLayout(row)
 
-        self.chk_cls_plateau = QCheckBox("Enable loss plateau detection (early stopping)")
-        self.chk_cls_plateau.setChecked(True)
-        self.chk_cls_plateau.setToolTip(
-            "Automatically stop training when validation loss\n"
-            "stops improving (patience = 20 epochs).\n\n"
-            "ON (default): saves time and prevents overfitting.\n"
-            "  Training will stop early if the model has converged.\n"
-            "OFF: always train for the full number of epochs.\n"
-            "  Use if you want to inspect the full training curve."
+        # -- Early Stop Patience --
+        tip_patience = (
+            "Stop training if validation loss does not improve\n"
+            "for this many consecutive epochs.\n\n"
+            "50: good default — gives the model enough time to\n"
+            "  recover from temporary plateaus.\n"
+            "Lower values stop sooner but risk cutting off learning.\n"
+            "Set equal to Training Iterations to disable early stopping."
         )
-        cls_train_vbox.addWidget(self.chk_cls_plateau)
+        row = QHBoxLayout()
+        lbl = QLabel("Early Stop Patience:")
+        lbl.setToolTip(tip_patience)
+        row.addWidget(lbl)
+        self.spin_cls_patience = QSpinBox()
+        self.spin_cls_patience.setRange(5, 500)
+        self.spin_cls_patience.setValue(50)
+        self.spin_cls_patience.setSingleStep(10)
+        self.spin_cls_patience.setToolTip(tip_patience)
+        self.spin_cls_patience.setStyleSheet(spin_style)
+        row.addWidget(self.spin_cls_patience)
+        cls_train_vbox.addLayout(row)
 
         # -- Learning Rate --
         tip_cls_lr = (
@@ -3982,20 +4037,31 @@ class SAM2AnnotatorWindow(QMainWindow):
         row.addWidget(self.spin_cls_val)
         cls_train_vbox.addLayout(row)
 
-        # -- Augmentation --
-        tip_aug = (
-            "Apply random transformations to training images.\n\n"
-            "OFF (default): composites are used as-is. Fine for most\n"
-            "  datasets where you have enough examples per behavior.\n"
-            "ON: applies random horizontal flip, small rotation (±15°),\n"
-            "  and brightness jitter. Helps the model generalize when\n"
-            "  you have few examples per behavior (<10). Can slow\n"
-            "  training slightly."
+        # -- Data Augmentation --
+        aug_group = QGroupBox("Data augmentation")
+        aug_vbox = QVBoxLayout()
+        aug_vbox.setSpacing(4)
+
+        rot_tip = (
+            "Random continuous rotation applied each batch.\n"
+            "±180° for top-down views (animal faces any direction).\n"
+            "±15° for side views (animal is roughly horizontal).\n"
+            "Select 'None' to disable rotation augmentation.\n\n"
+            "Silhouette composites have black backgrounds,\n"
+            "so rotation is the most useful augmentation."
         )
-        self.chk_cls_augment = QCheckBox("Enable augmentation")
-        self.chk_cls_augment.setChecked(False)
-        self.chk_cls_augment.setToolTip(tip_aug)
-        cls_train_vbox.addWidget(self.chk_cls_augment)
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("Rotation:"))
+        self.combo_cls_aug_rotation = QComboBox()
+        self.combo_cls_aug_rotation.addItems(["None", "±15°", "±180°"])
+        self.combo_cls_aug_rotation.setCurrentIndex(0)
+        self.combo_cls_aug_rotation.setToolTip(rot_tip)
+        self.combo_cls_aug_rotation.setStyleSheet(spin_style)
+        rot_row.addWidget(self.combo_cls_aug_rotation)
+        aug_vbox.addLayout(rot_row)
+
+        aug_group.setLayout(aug_vbox)
+        cls_train_vbox.addWidget(aug_group)
 
         self.btn_train_classifier = QPushButton("Train Behavior Classifier")
         self.btn_train_classifier.setStyleSheet(
@@ -5125,6 +5191,31 @@ class SAM2AnnotatorWindow(QMainWindow):
         self.frame_list.blockSignals(False)
         self._update_nav_state()
 
+    def _recalc_current_frame_confidence(self):
+        """Recalculate confidence for the current frame after approval/deletion."""
+        if self.current_frame_idx < 0:
+            return
+        _, _, fp = self._extracted_frames[self.current_frame_idx]
+        filename = os.path.basename(fp)
+        if filename not in self._coco._image_id_map:
+            self._frame_confidence.pop(filename, None)
+            self._update_frame_list_item(self.current_frame_idx)
+            return
+        img_id = self._coco._image_id_map[filename]
+        max_score = 0.0
+        has_inferred = False
+        for ann in self._coco.get_annotations_for_image(img_id):
+            if ann.get("inferred", False):
+                s = ann.get("score", 0.0)
+                if s > max_score:
+                    max_score = s
+                has_inferred = True
+        if has_inferred:
+            self._frame_confidence[filename] = max_score
+        else:
+            self._frame_confidence.pop(filename, None)
+        self._update_frame_list_item(self.current_frame_idx)
+
     def _rebuild_frame_confidence(self):
         """Rebuild _frame_confidence dict from stored annotation scores."""
         self._frame_confidence.clear()
@@ -5679,6 +5770,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._coco.approve_annotation(ann.ann_id)
             ann.inferred = False
             self.preview.update()
+            self._recalc_current_frame_confidence()
             self._update_ann_stats()
             self.status_bar.showMessage(f"Annotation {ann.ann_id} approved")
 
@@ -8430,6 +8522,12 @@ class SAM2AnnotatorWindow(QMainWindow):
             self._project_dir, "behavior_classifier", "model", run_name
         )
 
+        rot_idx = self.combo_cls_aug_rotation.currentIndex()
+        aug_rotation = {0: 0, 1: 15, 2: 180}.get(rot_idx, 0)
+
+        patience_val = self.spin_cls_patience.value()
+        early_stop = patience_val < self.spin_cls_epochs.value()
+
         config = {
             "composite_paths": composite_paths,
             "labels": label_indices,
@@ -8438,9 +8536,11 @@ class SAM2AnnotatorWindow(QMainWindow):
             "lr": self.spin_cls_lr.value(),
             "batch_size": self.spin_cls_batch.value(),
             "val_split": self.spin_cls_val.value(),
-            "augment": self.chk_cls_augment.isChecked(),
+            "augment": aug_rotation > 0,
+            "aug_rotation": aug_rotation,
             "freeze_backbone": self.chk_cls_freeze.isChecked(),
-            "early_stopping": self.chk_cls_plateau.isChecked(),
+            "early_stopping": early_stop,
+            "patience": patience_val,
             "backbone": self.combo_cls_backbone.currentText(),
             "output_dir": output_dir,
         }

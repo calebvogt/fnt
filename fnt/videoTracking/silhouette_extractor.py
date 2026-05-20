@@ -285,39 +285,76 @@ def generate_composite(
     mask_crops: List[Optional[np.ndarray]],
     output_size: Tuple[int, int] = (128, 128),
     contour_thickness: int = 1,
+    bboxes: Optional[List[Optional[Tuple[int, int, int, int]]]] = None,
 ) -> np.ndarray:
     """Generate a blue-to-red time-colored contour composite on black background.
 
-    Draws the contour outline of each frame's silhouette, tinted from
-    blue (oldest) to red (newest). Later contours draw on top of earlier
-    ones so the most recent posture is most visible.
+    Draws contours at native resolution, pads to square (preserving aspect
+    ratio), then resizes to ``output_size``.
 
     Args:
         mask_crops: List of 2D boolean mask arrays (one per frame).
             None entries are skipped.
-        output_size: (height, width) of the output composite image.
+        output_size: (height, width) of the final square output image.
         contour_thickness: Pixel thickness of contour lines.
+        bboxes: Optional per-frame bounding boxes (x1, y1, x2, y2) used to
+            spatially align crops of different sizes onto a common canvas.
+            When None, all crops are assumed to be the same size (e.g. from
+            a union-bbox crop).
 
     Returns:
         RGB uint8 numpy array of shape (H, W, 3).
     """
-    h, w = output_size
-    composite = np.zeros((h, w, 3), dtype=np.uint8)
+    out_h, out_w = output_size
+    valid = [(i, m) for i, m in enumerate(mask_crops) if m is not None]
+    if not valid:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
-    valid_masks = [(i, m) for i, m in enumerate(mask_crops) if m is not None]
-    if not valid_masks:
-        return composite
+    if bboxes is not None:
+        valid_bboxes = [bboxes[i] for i, _ in valid if bboxes[i] is not None]
+        if valid_bboxes:
+            ux1 = min(int(b[0]) for b in valid_bboxes)
+            uy1 = min(int(b[1]) for b in valid_bboxes)
+            ux2 = max(int(b[2]) for b in valid_bboxes)
+            uy2 = max(int(b[3]) for b in valid_bboxes)
+            canvas_h = max(1, uy2 - uy1)
+            canvas_w = max(1, ux2 - ux1)
+        else:
+            first_m = valid[0][1]
+            canvas_h, canvas_w = first_m.shape[:2]
+            ux1, uy1 = 0, 0
+    else:
+        first_m = valid[0][1]
+        canvas_h, canvas_w = first_m.shape[:2]
+        ux1, uy1 = 0, 0
 
+    composite = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     n_total = len(mask_crops)
 
-    for i, mask in valid_masks:
-        resized = cv2.resize(
-            mask.astype(np.uint8) * 255, (w, h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+    for i, mask in valid:
+        if bboxes is not None and bboxes[i] is not None:
+            bx1 = int(bboxes[i][0]) - ux1
+            by1 = int(bboxes[i][1]) - uy1
+            placed = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+            mh, mw = mask.shape[:2]
+            end_y = min(by1 + mh, canvas_h)
+            end_x = min(bx1 + mw, canvas_w)
+            src_h = end_y - by1
+            src_w = end_x - bx1
+            if src_h > 0 and src_w > 0:
+                placed[by1:end_y, bx1:end_x] = mask[:src_h, :src_w].astype(np.uint8) * 255
+        else:
+            mh, mw = mask.shape[:2]
+            if mh == canvas_h and mw == canvas_w:
+                placed = mask.astype(np.uint8) * 255
+            else:
+                placed = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+                end_y = min(mh, canvas_h)
+                end_x = min(mw, canvas_w)
+                placed[:end_y, :end_x] = mask[:end_y, :end_x].astype(np.uint8) * 255
 
         contours, _ = cv2.findContours(
-            resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            placed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
         )
         if not contours:
             continue
@@ -330,7 +367,16 @@ def generate_composite(
 
         cv2.drawContours(composite, contours, -1, color, contour_thickness)
 
-    return composite
+    max_dim = max(canvas_h, canvas_w)
+    padded = np.zeros((max_dim, max_dim, 3), dtype=np.uint8)
+    y_off = (max_dim - canvas_h) // 2
+    x_off = (max_dim - canvas_w) // 2
+    padded[y_off:y_off + canvas_h, x_off:x_off + canvas_w] = composite
+
+    if max_dim != out_h or max_dim != out_w:
+        padded = cv2.resize(padded, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+    return padded
 
 
 def generate_composite_from_h5(
@@ -340,5 +386,12 @@ def generate_composite_from_h5(
     output_size: Tuple[int, int] = (128, 128),
 ) -> np.ndarray:
     """Convenience: load a clip from HDF5 and generate its composite image."""
-    mask_crops, _, _ = load_silhouette_clip(h5_path, start_frame, clip_length)
-    return generate_composite(mask_crops, output_size)
+    mask_crops, _, bboxes_arr = load_silhouette_clip(h5_path, start_frame, clip_length)
+    bbox_list: List[Optional[Tuple[int, int, int, int]]] = []
+    for i, crop in enumerate(mask_crops):
+        if crop is not None and not np.any(np.isnan(bboxes_arr[i])):
+            b = bboxes_arr[i]
+            bbox_list.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
+        else:
+            bbox_list.append(None)
+    return generate_composite(mask_crops, output_size, bboxes=bbox_list)
