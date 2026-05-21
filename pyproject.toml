@@ -49,6 +49,8 @@ dependencies = [
     "segmentation-models-pytorch>=0.3.4",
     # USB serial communication for FED devices
     "pyserial",
+    # SAM2 — AI-assisted mask annotation
+    "sam2 @ git+https://github.com/facebookresearch/sam2.git",
 ]
 
 [project.optional-dependencies]
@@ -63,15 +65,14 @@ rfid = [
 ]
 tracking = [
     "torchvision>=0.20.1",
-    # segment-anything and SAM-2 must be installed separately:
-    #   pip install git+https://github.com/facebookresearch/sam2.git
+    "pycocotools>=2.0.6",
 ]
 all = [
     "fnt[imaging,tracking]",
 ]
 
 [project.scripts]
-fnt-gui = "fnt.gui_pyqt:main"
+fnt = "fnt.gui_pyqt:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"

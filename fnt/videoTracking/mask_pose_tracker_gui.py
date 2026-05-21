@@ -842,13 +842,16 @@ class MaskPoseTrackerGUI(QMainWindow):
             )
             return
         
-        # Check default SAM_models directory
-        default_dir = Path(__file__).parent.parent.parent / "SAM_models"
-        
+        # Check LocalModels directory (and legacy SAM_models)
+        from .sam2_checkpoint_manager import LOCAL_MODELS_DIR
+        default_dir = LOCAL_MODELS_DIR
+        legacy_dir = Path(__file__).parent.parent.parent / "SAM_models"
+
         # Check if any checkpoints exist
         existing_checkpoints = []
-        if default_dir.exists():
-            existing_checkpoints = list(default_dir.glob("sam2*.pt"))
+        for check_dir in [default_dir, legacy_dir]:
+            if check_dir.exists():
+                existing_checkpoints.extend(check_dir.glob("sam2*.pt"))
         
         if not existing_checkpoints:
             # Create custom dialog with proper button labels
@@ -856,7 +859,7 @@ class MaskPoseTrackerGUI(QMainWindow):
             msg.setIcon(QMessageBox.Question)
             msg.setWindowTitle("SAM 2 Checkpoint Required")
             msg.setText("The Mask Tracker requires a SAM 2 model checkpoint.")
-            msg.setInformativeText("Would you like to download one now?\n\n(Models will be saved to SAM_models folder for future use)")
+            msg.setInformativeText("Would you like to download one now?\n\n(Models will be saved to LocalModels/ folder for future use)")
             
             download_btn = msg.addButton("Download", QMessageBox.AcceptRole)
             browse_btn = msg.addButton("Browse", QMessageBox.ActionRole)

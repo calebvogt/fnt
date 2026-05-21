@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-SLEAP ROI Analysis Tool
+ROI Analysis Tool
 
-Post-processing tool for SLEAP tracking data with ROI (Region of Interest) analysis.
-Analyzes animal position within defined regions and generates occupancy statistics.
+Post-processing tool for tracking data with ROI (Region of Interest) analysis.
+Supports both SLEAP pose estimation data and Mask Tracker Tool (MTT) instance
+segmentation data. Analyzes animal position within defined regions and generates
+occupancy statistics.
 
 Workflow:
-1. Select videos + corresponding CSV files (predictions.analysis.csv)
+1. Select videos + corresponding CSV files (auto-detects SLEAP or MTT data)
 2. Set tracking area (optional) - exclude areas outside arena
 3. Draw ROIs (Open Field Test, Light-Dark Box light area only, Custom)
-4. Select keypoints for analysis
+4. Select keypoints/objects for analysis
 5. Process batch - generate occupancy data, summary stats, and tracked videos
 
 Features:
+- Auto-detection of SLEAP (.predictions.analysis.csv) and MTT (trajectories_detailed.csv)
 - Flexible ROI definition (polygon-based)
 - Multiple ROI types (OFT outer/center, LDB light area, custom)
-- Per-keypoint analysis
+- Per-keypoint/object analysis
 - Occupancy timeseries and summary statistics
 - Video rendering with ROI overlays
 
@@ -60,12 +63,39 @@ except ImportError:
     print("Warning: pandas not available")
 
 
+def _get_mtt_object_names(detailed_csv_path: str, df: pd.DataFrame) -> Dict[int, str]:
+    """Derive object column names from the pivot-format trajectories.csv or fallback to labels."""
+    mtt_dir = os.path.dirname(detailed_csv_path)
+    pivot_csv = os.path.join(mtt_dir, "trajectories.csv")
+
+    if os.path.exists(pivot_csv):
+        try:
+            pivot_df = pd.read_csv(pivot_csv, nrows=0)
+            obj_cols = [c for c in pivot_df.columns if c not in ("frame", "time")]
+            if obj_cols:
+                obj_ids = sorted(df["object_id"].unique())
+                if len(obj_cols) == len(obj_ids):
+                    return {oid: name for oid, name in zip(obj_ids, obj_cols)}
+        except Exception:
+            pass
+
+    class_counters: Dict[str, int] = {}
+    obj_col_names: Dict[int, str] = {}
+    for oid in sorted(df["object_id"].unique()):
+        label = int(df.loc[df["object_id"] == oid, "label"].iloc[0])
+        class_name = f"object{label}"
+        class_counters[class_name] = class_counters.get(class_name, 0) + 1
+        obj_col_names[oid] = f"{class_name}_{class_counters[class_name]}"
+    return obj_col_names
+
+
 class VideoROIConfig:
     """Configuration for a single video's ROI analysis."""
-    
-    def __init__(self, video_path: str, csv_path: str):
+
+    def __init__(self, video_path: str, csv_path: str, data_source: str = "sleap"):
         self.video_path = video_path
         self.csv_path = csv_path
+        self.data_source = data_source  # "sleap", "mtt", or "st"
         self.tracking_area = []  # List of (x, y) polygon points
         self.tracking_area_set = False
         self.rois = []  # List of (roi_name, polygon_points) tuples - ORDER MATTERS for priority
@@ -143,6 +173,7 @@ class VideoROIConfig:
         return {
             'video_path': self.video_path,
             'csv_path': self.csv_path,
+            'data_source': self.data_source,
             'tracking_area': self.tracking_area,
             'tracking_area_set': self.tracking_area_set,
             'rois': [(name, polygon) for name, polygon in self.rois],
@@ -174,6 +205,7 @@ class VideoROIConfig:
     def from_config_dict(self, config_dict: dict):
         """Load configuration from dictionary."""
         # Only restore ROI-related settings, not file paths
+        self.data_source = config_dict.get('data_source', 'sleap')
         self.tracking_area = config_dict.get('tracking_area', [])
         self.tracking_area_set = config_dict.get('tracking_area_set', False)
         self.rois = [(name, polygon) for name, polygon in config_dict.get('rois', [])]
@@ -303,25 +335,74 @@ class ROIProcessor(QThread):
         except Exception as e:
             self.status.emit(f"Warning: Error clearing existing outputs: {str(e)}")
     
+    def _load_mtt_as_sleap_format(self, config: VideoROIConfig) -> pd.DataFrame:
+        """Load MTT trajectories_detailed.csv and pivot into SLEAP-like {obj}.x / {obj}.y format."""
+        df_raw = pd.read_csv(config.csv_path)
+
+        obj_col_names = getattr(config, '_mtt_obj_col_names', None)
+        if obj_col_names is None:
+            obj_col_names = _get_mtt_object_names(config.csv_path, df_raw)
+
+        max_frame = int(df_raw["frame"].max())
+        result = pd.DataFrame({"frame_idx": range(max_frame + 1)})
+
+        for oid, col_name in obj_col_names.items():
+            sub = df_raw.loc[df_raw["object_id"] == oid, ["frame", "x", "y"]].copy()
+            x_map = {int(r["frame"]): r["x"] for _, r in sub.iterrows()}
+            y_map = {int(r["frame"]): r["y"] for _, r in sub.iterrows()}
+            result[f"{col_name}.x"] = result["frame_idx"].map(x_map)
+            result[f"{col_name}.y"] = result["frame_idx"].map(y_map)
+
+        return result
+
+    def _load_st_as_sleap_format(self, config: VideoROIConfig) -> pd.DataFrame:
+        """Load SimpleTracker _positionCoordinates.csv and rename to SLEAP-like {obj}.x / {obj}.y."""
+        df = pd.read_csv(config.csv_path)
+
+        rename = {}
+        if "frame" in df.columns:
+            rename["frame"] = "frame_idx"
+
+        import re
+        for col in df.columns:
+            m = re.match(r"object_(\d+)_x$", col)
+            if m:
+                idx = m.group(1)
+                name = f"object_{idx}"
+                rename[col] = f"{name}.x"
+                y_col = f"object_{idx}_y"
+                if y_col in df.columns:
+                    rename[y_col] = f"{name}.y"
+
+        df = df.rename(columns=rename)
+
+        keep = [c for c in df.columns if c == "frame_idx" or c.endswith(".x") or c.endswith(".y")]
+        return df[keep]
+
     def run(self):
         """Process all videos."""
         total_videos = len(self.video_configs)
         successful = 0
         failed = 0
-        
+
         for video_idx, config in enumerate(self.video_configs):
             if self.cancelled:
                 break
-            
+
             self.status.emit(f"Processing video {video_idx + 1}/{total_videos}: {os.path.basename(config.video_path)}")
-            
+
             try:
                 # Handle overwrite: delete all existing output files EXCEPT JSON config
                 if config.overwrite_files:
                     self.clear_existing_outputs(config)
-                
+
                 # Load tracking data
-                df = pd.read_csv(config.csv_path)
+                if config.data_source == "mtt":
+                    df = self._load_mtt_as_sleap_format(config)
+                elif config.data_source == "st":
+                    df = self._load_st_as_sleap_format(config)
+                else:
+                    df = pd.read_csv(config.csv_path)
                 
                 # STEP 1: Filter by tracking area (remove points outside - DELETE them)
                 df = self.filter_by_tracking_area(df, config)
@@ -1115,36 +1196,35 @@ class ROIProcessor(QThread):
                 keypoint_name = col[:-2]  # Remove '.x'
                 all_keypoints.append(keypoint_name)
         
-        # Automatically detect skeleton edges based on proximity in first valid frame
-        skeleton_edges = self.detect_skeleton_edges(df, all_keypoints)
-        
+        # Automatically detect skeleton edges (SLEAP only — MTT has centroids, not body parts)
+        skeleton_edges = [] if config.data_source in ("mtt", "st") else self.detect_skeleton_edges(df, all_keypoints)
+
         # Initialize trail history for tracked keypoints (if trails enabled)
-        trail_history = {}  # {(keypoint, track_id): [(x, y), (x, y), ...]}
-        if config.show_track_trail and config.has_tracks:
+        # For MTT: each "keypoint" is already a unique object, so use keypoint name as track key
+        is_mtt = config.data_source in ("mtt", "st")
+        trail_enabled = config.show_track_trail and (config.has_tracks or is_mtt)
+        trail_history = {}
+        if trail_enabled:
             for keypoint in config.selected_keypoints:
-                trail_history[keypoint] = {}  # Will store {track_id: [positions]}
-        
+                trail_history[keypoint] = {}
+
         # Check if CSV has frame_idx column, otherwise use index
         if 'frame_idx' in df.columns:
-            # Create a lookup dictionary: frame_number -> row_index
-            # Use enumerate to get actual position, not pandas index
             frame_to_row = {int(row['frame_idx']): idx for idx, row in enumerate(df.to_dict('records'))}
         elif 'frame' in df.columns:
             frame_to_row = {int(row['frame']): idx for idx, row in enumerate(df.to_dict('records'))}
         else:
-            # Assume CSV rows match video frames sequentially
             frame_to_row = {idx: idx for idx in range(len(df))}
-        
+
         video_frame_number = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # Emit progress update
-            if video_frame_number % 10 == 0:  # Update every 10 frames to avoid flooding
+
+            if video_frame_number % 10 == 0:
                 self.progress.emit(video_idx, video_frame_number, total_video_frames)
-            
+
             # Draw ROIs (if enabled)
             if config.show_rois:
                 for roi_name, roi_polygon in config.rois:
@@ -1156,72 +1236,65 @@ class ROIProcessor(QThread):
                         color = (0, 255, 255)  # Yellow
                     else:
                         color = (0, 255, 0)  # Green default
-                    
+
                     pts = np.array(roi_polygon, dtype=np.int32)
                     cv2.polylines(frame, [pts], True, color, 2)
-                    
-                    # Add label
+
                     if len(roi_polygon) > 0:
-                        cv2.putText(frame, roi_name, tuple(roi_polygon[0]), 
+                        cv2.putText(frame, roi_name, tuple(roi_polygon[0]),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
+
             # Draw tracking area (if enabled)
             if config.show_tracking_area and config.tracking_area_set and config.tracking_area:
                 pts = np.array(config.tracking_area, dtype=np.int32)
                 cv2.polylines(frame, [pts], True, (255, 0, 255), 2)  # Magenta
-            
+
             # Draw keypoints - look up the correct row based on frame number
             if video_frame_number in frame_to_row:
                 row_idx = frame_to_row[video_frame_number]
                 row = df.iloc[row_idx]
-                
-                # Determine which keypoints to display
+
                 if config.show_all_keypoints:
                     keypoints_to_show = all_keypoints
                 else:
                     keypoints_to_show = config.selected_keypoints
-                
-                # Store keypoint positions for edge drawing
+
                 keypoint_positions = {}
-                
-                # Get track ID if available
+
+                # Get track ID if available (SLEAP multi-animal)
                 track_id = None
-                if config.has_tracks and 'track' in df.columns:
+                if not is_mtt and config.has_tracks and 'track' in df.columns:
                     track_id = row['track']
                     if pd.notna(track_id):
-                        # Extract numeric part from track ID (e.g., 'track_0' -> 0)
                         if isinstance(track_id, str) and track_id.startswith('track_'):
                             track_id = int(track_id.split('_')[1])
                         else:
                             track_id = int(track_id)
-                
-                # First pass: collect keypoint positions
-                # Note: Points outside tracking area are already NaN from filtering step
+
                 for keypoint in keypoints_to_show:
                     x_col = f"{keypoint}.x"
                     y_col = f"{keypoint}.y"
-                    
+
                     if x_col in df.columns and y_col in df.columns:
                         x = row[x_col]
                         y = row[y_col]
-                        
-                        # If valid (not NaN), include it
+
                         if not pd.isna(x) and not pd.isna(y):
                             pos = (int(x), int(y))
                             keypoint_positions[keypoint] = pos
-                            
-                            # Update trail history for this keypoint and track
-                            if config.show_track_trail and config.has_tracks and track_id is not None:
-                                if keypoint in trail_history:
-                                    if track_id not in trail_history[keypoint]:
-                                        trail_history[keypoint][track_id] = []
-                                    trail_history[keypoint][track_id].append(pos)
-                                    # Keep only last N frames
-                                    if len(trail_history[keypoint][track_id]) > config.track_trail_length:
-                                        trail_history[keypoint][track_id].pop(0)
-                
+
+                            # Update trail history
+                            if trail_enabled and keypoint in trail_history:
+                                tid = keypoints_to_show.index(keypoint) if is_mtt else track_id
+                                if tid is not None:
+                                    if tid not in trail_history[keypoint]:
+                                        trail_history[keypoint][tid] = []
+                                    trail_history[keypoint][tid].append(pos)
+                                    if len(trail_history[keypoint][tid]) > config.track_trail_length:
+                                        trail_history[keypoint][tid].pop(0)
+
                 # Draw trails FIRST (behind everything)
-                if config.show_track_trail and config.has_tracks:
+                if trail_enabled:
                     for keypoint in config.selected_keypoints:
                         if keypoint in trail_history:
                             for tid, positions in trail_history[keypoint].items():
@@ -1261,30 +1334,36 @@ class ROIProcessor(QThread):
                         
                         # Draw label if enabled
                         if config.show_keypoint_labels:
-                            cv2.putText(frame, keypoint, (x + 10, y), 
+                            cv2.putText(frame, keypoint, (x + 10, y),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                
-                # Draw track label LAST (on top of everything)
-                if config.show_track_labels and config.has_tracks and track_id is not None:
-                    # Find a representative keypoint position for label (use first selected keypoint)
+
+                # Draw track/object labels LAST (on top of everything)
+                if config.show_track_labels and is_mtt:
+                    for keypoint in config.selected_keypoints:
+                        if keypoint in keypoint_positions:
+                            x, y = keypoint_positions[keypoint]
+                            label = keypoint
+                            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                            cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
+                                        (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
+                            cv2.putText(frame, label, (x, y - 8),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                elif config.show_track_labels and config.has_tracks and track_id is not None:
                     if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
                         x, y = keypoint_positions[config.selected_keypoints[0]]
-                        # Draw track ID label with background
                         label = f"Track {track_id}"
                         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        # Draw background rectangle
-                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10), 
+                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
                                     (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                        # Draw text
-                        cv2.putText(frame, label, (x, y - 10), 
+                        cv2.putText(frame, label, (x, y - 10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
+
             out.write(frame)
             video_frame_number += 1
-        
+
         cap.release()
         out.release()
-    
+
     def create_data_view_video(self, config: VideoROIConfig, occupancy_df: pd.DataFrame, df: pd.DataFrame, video_idx: int):
         """Create video with video on left (with all overlays) and live statistics panel on right.
         
@@ -1325,15 +1404,17 @@ class ROIProcessor(QThread):
                 keypoint_name = col[:-2]  # Remove '.x'
                 all_keypoints.append(keypoint_name)
         
-        # Detect skeleton edges
-        skeleton_edges = self.detect_skeleton_edges(df, all_keypoints)
-        
+        # Detect skeleton edges (SLEAP only)
+        skeleton_edges = [] if config.data_source in ("mtt", "st") else self.detect_skeleton_edges(df, all_keypoints)
+
         # Initialize trail history for tracked keypoints (if trails enabled)
-        trail_history = {}  # {keypoint: {track_id: [(x, y), ...]}}
-        if config.show_track_trail and config.has_tracks:
+        is_mtt = config.data_source in ("mtt", "st")
+        trail_enabled = config.show_track_trail and (config.has_tracks or is_mtt)
+        trail_history = {}
+        if trail_enabled:
             for keypoint in config.selected_keypoints:
-                trail_history[keypoint] = {}  # Will store {track_id: [positions]}
-        
+                trail_history[keypoint] = {}
+
         # Get selected keypoints and ROI names
         keypoints_to_track = config.selected_keypoints if config.selected_keypoints else []
         roi_names = config.get_roi_names()
@@ -1411,43 +1492,40 @@ class ROIProcessor(QThread):
                 # Store keypoint positions for edge drawing
                 keypoint_positions = {}
                 
-                # Get track ID if available
+                # Get track ID if available (SLEAP multi-animal)
                 track_id = None
-                if config.has_tracks and 'track' in df.columns:
+                if not is_mtt and config.has_tracks and 'track' in df.columns:
                     track_id = row['track']
                     if pd.notna(track_id):
-                        # Extract numeric part from track ID (e.g., 'track_0' -> 0)
                         if isinstance(track_id, str) and track_id.startswith('track_'):
                             track_id = int(track_id.split('_')[1])
                         else:
                             track_id = int(track_id)
-                
+
                 # First pass: collect keypoint positions
                 for keypoint in keypoints_to_show:
                     x_col = f"{keypoint}.x"
                     y_col = f"{keypoint}.y"
-                    
+
                     if x_col in df.columns and y_col in df.columns:
                         x = row[x_col]
                         y = row[y_col]
-                        
-                        # If valid (not NaN), include it
+
                         if not pd.isna(x) and not pd.isna(y):
                             pos = (int(x), int(y))
                             keypoint_positions[keypoint] = pos
-                            
-                            # Update trail history for this keypoint and track
-                            if config.show_track_trail and config.has_tracks and track_id is not None:
-                                if keypoint in trail_history:
-                                    if track_id not in trail_history[keypoint]:
-                                        trail_history[keypoint][track_id] = []
-                                    trail_history[keypoint][track_id].append(pos)
-                                    # Keep only last N frames
-                                    if len(trail_history[keypoint][track_id]) > config.track_trail_length:
-                                        trail_history[keypoint][track_id].pop(0)
-                
+
+                            if trail_enabled and keypoint in trail_history:
+                                tid = keypoints_to_show.index(keypoint) if is_mtt else track_id
+                                if tid is not None:
+                                    if tid not in trail_history[keypoint]:
+                                        trail_history[keypoint][tid] = []
+                                    trail_history[keypoint][tid].append(pos)
+                                    if len(trail_history[keypoint][tid]) > config.track_trail_length:
+                                        trail_history[keypoint][tid].pop(0)
+
                 # Draw trails FIRST (behind everything)
-                if config.show_track_trail and config.has_tracks:
+                if trail_enabled:
                     for keypoint in config.selected_keypoints:
                         if keypoint in trail_history:
                             for tid, positions in trail_history[keypoint].items():
@@ -1490,21 +1568,27 @@ class ROIProcessor(QThread):
                             cv2.putText(frame, keypoint, (x + 10, y), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 
-                # Draw track label LAST (on top of everything)
-                if config.show_track_labels and config.has_tracks and track_id is not None:
-                    # Find a representative keypoint position for label (use first selected keypoint)
+                # Draw track/object labels LAST (on top of everything)
+                if config.show_track_labels and is_mtt:
+                    for keypoint in config.selected_keypoints:
+                        if keypoint in keypoint_positions:
+                            x, y = keypoint_positions[keypoint]
+                            label = keypoint
+                            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                            cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
+                                        (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
+                            cv2.putText(frame, label, (x, y - 8),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                elif config.show_track_labels and config.has_tracks and track_id is not None:
                     if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
                         x, y = keypoint_positions[config.selected_keypoints[0]]
-                        # Draw track ID label with background
                         label = f"Track {track_id}"
                         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        # Draw background rectangle
-                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10), 
+                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
                                     (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                        # Draw text
-                        cv2.putText(frame, label, (x, y - 10), 
+                        cv2.putText(frame, label, (x, y - 10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
+
             # ===== UPDATE CUMULATIVE STATISTICS =====
             if video_frame_number < len(occupancy_df):
                 occ_row = occupancy_df.iloc[video_frame_number]
@@ -1642,11 +1726,11 @@ class ROIProcessor(QThread):
 
 
 class ROIToolGUI(QMainWindow):
-    """Main GUI for SLEAP ROI Analysis Tool."""
-    
+    """Main GUI for ROI Analysis Tool (supports SLEAP, Mask Tracker, and Simple Tracker data)."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SLEAP ROI Analysis Tool - FieldNeuroToolbox")
+        self.setWindowTitle("ROI Analysis Tool - FieldNeuroToolbox")
         self.setGeometry(100, 100, 1400, 900)
         
         # State
@@ -1677,78 +1761,121 @@ class ROIToolGUI(QMainWindow):
         
         # Apply dark theme
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2b2b2b;
-            }
-            QWidget {
-                background-color: #2b2b2b;
-                color: #cccccc;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 3px;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-            QPushButton:disabled {
-                background-color: #3f3f3f;
-                color: #888888;
-            }
+            QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
+            QWidget { background-color: #1e1e1e; color: #d4d4d4; }
             QGroupBox {
-                font-weight: bold;
-                border: 2px solid #3f3f3f;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 15px;
-                font-size: 13px;
+                font-weight: bold; font-size: 11px;
+                border: 1px solid #333333;
+                border-radius: 6px; margin-top: 8px; padding-top: 8px;
+                padding-bottom: 4px; color: #e0e0e0;
+                background-color: #252526;
             }
             QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
+                subcontrol-origin: margin; left: 10px; padding: 0 6px;
+                background-color: #252526;
             }
-            QLabel {
-                color: #cccccc;
-                font-size: 11px;
+            QPushButton {
+                background-color: #0078d4; color: white; border: none;
+                padding: 5px 12px; border-radius: 4px;
+                font-weight: 600; font-size: 11px;
             }
+            QPushButton:hover { background-color: #1a8ae8; }
+            QPushButton:pressed { background-color: #005a9e; }
+            QPushButton:disabled { background-color: #333333; color: #666666; }
+            QLabel { color: #d4d4d4; background-color: transparent; font-size: 11px; }
+            QSpinBox, QDoubleSpinBox {
+                background-color: #2d2d30; color: #d4d4d4;
+                border: 1px solid #3f3f46; border-radius: 4px;
+                padding: 3px 6px; min-height: 18px;
+            }
+            QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #0078d4; }
+            QSpinBox::up-button, QSpinBox::down-button,
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                background-color: #444444; border: none; width: 18px;
+            }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover { background-color: #555555; }
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #555555; }
+            QComboBox {
+                background-color: #2d2d30; color: #d4d4d4;
+                border: 1px solid #3f3f46; border-radius: 4px;
+                padding: 3px 8px; min-height: 18px;
+            }
+            QComboBox:focus { border: 1px solid #0078d4; }
+            QComboBox::drop-down {
+                border: none; width: 20px;
+                background-color: #333333; border-radius: 0 4px 4px 0;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2d2d30; color: #d4d4d4;
+                border: 1px solid #3f3f46; selection-background-color: #0078d4;
+            }
+            QSlider::groove:horizontal {
+                border: none; height: 4px; border-radius: 2px;
+                background-color: #3f3f46;
+            }
+            QSlider::handle:horizontal {
+                background-color: #0078d4; width: 14px; height: 14px;
+                margin: -5px 0; border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover { background-color: #1a8ae8; }
+            QSlider::sub-page:horizontal { background-color: #0078d4; border-radius: 2px; }
+            QSlider::groove:horizontal:disabled { background-color: #2d2d30; }
+            QSlider::handle:horizontal:disabled { background-color: #555555; }
+            QSlider::sub-page:horizontal:disabled { background-color: #3f3f46; }
             QListWidget {
-                background-color: #1e1e1e;
-                border: 1px solid #3f3f3f;
-                border-radius: 3px;
-                padding: 5px;
+                background-color: #1e1e1e; color: #d4d4d4;
+                border: 1px solid #333333; border-radius: 4px;
             }
-            QListWidget::item:selected {
-                background-color: #0078d4;
-            }
+            QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #2d2d30; }
+            QListWidget::item:selected { background-color: #0078d4; border-radius: 2px; }
+            QListWidget::item:hover { background-color: #2d2d30; }
             QTableWidget {
-                background-color: #1e1e1e;
-                border: 1px solid #3f3f3f;
-                border-radius: 3px;
+                background-color: #1e1e1e; color: #d4d4d4;
+                border: 1px solid #333333; gridline-color: #2d2d30;
             }
-            QTableWidget::item:selected {
-                background-color: #0078d4;
+            QTableWidget::item { padding: 4px; }
+            QTableWidget::item:selected { background-color: #0078d4; }
+            QHeaderView::section {
+                background-color: #252526; color: #d4d4d4;
+                border: 1px solid #333333; padding: 4px;
             }
-            QCheckBox {
-                color: #cccccc;
-                spacing: 8px;
+            QCheckBox { color: #d4d4d4; spacing: 8px; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px; border: 2px solid #555; border-radius: 3px;
+                background-color: #2d2d30;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0078d4; border-color: #0078d4;
+                image: none;
             }
             QProgressBar {
-                border: 1px solid #3f3f3f;
-                border-radius: 3px;
-                text-align: center;
-                background-color: #1e1e1e;
+                border: 1px solid #3f3f46; border-radius: 4px;
+                background-color: #2d2d30; text-align: center;
+                color: #d4d4d4; min-height: 16px;
             }
-            QProgressBar::chunk {
-                background-color: #0078d4;
+            QProgressBar::chunk { background-color: #0078d4; border-radius: 3px; }
+            QScrollBar:vertical {
+                background-color: transparent; width: 8px; border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555; border-radius: 4px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background-color: #777777; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+            QScrollBar:horizontal {
+                background-color: transparent; height: 8px; border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #555555; border-radius: 4px; min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover { background-color: #777777; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+            QToolTip {
+                background-color: #2d2d30; color: #d4d4d4;
+                border: 1px solid #3f3f46; border-radius: 4px;
+                padding: 4px 8px; font-size: 11px;
             }
         """)
         
@@ -1773,7 +1900,7 @@ class ROIToolGUI(QMainWindow):
         panel.setLayout(layout)
         
         # Title
-        title = QLabel("SLEAP ROI Analysis Tool")
+        title = QLabel("ROI Analysis Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setStyleSheet("color: #0078d4; margin: 10px;")
         layout.addWidget(title)
@@ -2143,7 +2270,7 @@ class ROIToolGUI(QMainWindow):
         
         self.queue_list = QListWidget()
         self.queue_list.setMaximumHeight(150)
-        self.queue_list.setStyleSheet("background-color: #2d2d2d; border: 1px solid #3f3f3f;")
+        self.queue_list.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333333;")
         layout.addWidget(self.queue_list)
         
         # Processing buttons
@@ -2182,7 +2309,7 @@ class ROIToolGUI(QMainWindow):
         
         # Preview frame
         self.preview_label = QLabel()
-        self.preview_label.setStyleSheet("border: 2px solid #3f3f3f; background-color: #1e1e1e;")
+        self.preview_label.setStyleSheet("border: 2px solid #333333; background-color: #1e1e1e;")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(800, 600)
         self.preview_label.mousePressEvent = self.on_preview_click
@@ -2197,92 +2324,157 @@ class ROIToolGUI(QMainWindow):
         return panel
     
     # === Video Selection Methods ===
-    
+
+    def _detect_data_sources(self, video_path: Path) -> Dict[str, str]:
+        """Detect available data sources (SLEAP, MTT, ST) for a video.
+
+        Returns dict mapping data_source -> csv_path for each found source.
+        """
+        folder = video_path.parent
+        stem = video_path.stem
+        sources = {}
+
+        # Check for SLEAP predictions.analysis.csv
+        csv_pattern = video_path.name.replace(video_path.suffix, '.*.predictions.analysis.csv')
+        csv_files = list(folder.glob(csv_pattern))
+        if csv_files:
+            sources["sleap"] = str(csv_files[0])
+
+        # Check for MTT trajectories_detailed.csv
+        mtt_dir = folder / f"{stem}_MaskTracker"
+        mtt_csv = mtt_dir / "trajectories_detailed.csv"
+        if mtt_csv.exists():
+            sources["mtt"] = str(mtt_csv)
+
+        # Check for SimpleTracker _positionCoordinates.csv (both old and new folder names)
+        for suffix in ("_SimpleTracker", "_FNT_SimpleTracker_analysis"):
+            st_dir = folder / f"{stem}{suffix}"
+            st_csv = st_dir / f"{stem}_positionCoordinates.csv"
+            if st_csv.exists():
+                sources["st"] = str(st_csv)
+                break
+
+        return sources
+
+    def _add_video_config(self, video_path: str, csv_path: str, data_source: str) -> bool:
+        """Create a VideoROIConfig and add it to the list. Returns True if added."""
+        config = VideoROIConfig(video_path, csv_path, data_source=data_source)
+        self.video_configs.append(config)
+
+        tag = {"sleap": "[SLEAP]", "mtt": "[MTT]", "st": "[ST]"}.get(data_source, "[?]")
+        item = QListWidgetItem(f"○ {tag} {os.path.basename(video_path)}")
+        self.video_list.addItem(item)
+        return True
+
+    def _prompt_data_source(self, video_name: str, sources: Dict[str, str]) -> Optional[str]:
+        """Ask user which data source to use when multiple are available."""
+        items = []
+        keys = []
+        if "sleap" in sources:
+            items.append("SLEAP (pose estimation)")
+            keys.append("sleap")
+        if "mtt" in sources:
+            items.append("Mask Tracker (instance segmentation)")
+            keys.append("mtt")
+        if "st" in sources:
+            items.append("Simple Tracker (blob detection)")
+            keys.append("st")
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Data Source",
+            f"Multiple data sources found for:\n{video_name}\n\nSelect data source:",
+            items, 0, False,
+        )
+        if not ok:
+            return None
+        return keys[items.index(choice)]
+
     def add_folder(self):
-        """Add folder with videos and CSV files."""
+        """Add folder with videos and CSV files (SLEAP and/or MTT)."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Videos and CSVs")
         if not folder:
             return
-        
-        # Find video files
+
         video_files = []
         for ext in ['.mp4', '.avi', '.mov']:
             video_files.extend(list(Path(folder).glob(f'*{ext}')))
-        
+
         if not video_files:
             QMessageBox.warning(self, "No Videos", "No video files found in selected folder")
             return
-        
-        # Match videos with CSV files
+
         added = 0
         for video_path in video_files:
-            # Look for corresponding predictions.analysis.csv
-            csv_pattern = str(video_path).replace('.mp4', '.*.predictions.analysis.csv')
-            csv_files = list(Path(folder).glob(os.path.basename(csv_pattern)))
-            
-            if csv_files:
-                csv_path = str(csv_files[0])
-                config = VideoROIConfig(str(video_path), csv_path)
-                self.video_configs.append(config)
-                
-                item = QListWidgetItem(f"○ {os.path.basename(str(video_path))}")
-                self.video_list.addItem(item)
+            sources = self._detect_data_sources(video_path)
+            if not sources:
+                continue
+
+            if len(sources) == 1:
+                ds = next(iter(sources))
+                self._add_video_config(str(video_path), sources[ds], ds)
                 added += 1
-        
+            else:
+                ds = self._prompt_data_source(video_path.name, sources)
+                if ds:
+                    self._add_video_config(str(video_path), sources[ds], ds)
+                    added += 1
+
         if added > 0:
             self.video_list.setCurrentRow(0)
             self.btn_prev.setEnabled(True)
             self.btn_next.setEnabled(True)
-            QMessageBox.information(self, "Videos Added", f"Added {added} video(s) with matching CSV files")
+            QMessageBox.information(self, "Videos Added", f"Added {added} video(s) with matching tracking data")
         else:
-            QMessageBox.warning(self, "No Matches", "No videos with matching .predictions.analysis.csv files found")
-    
+            QMessageBox.warning(self, "No Matches", "No videos with matching SLEAP or Mask Tracker data found")
+
     def add_videos(self):
-        """Add individual video files with their CSV files."""
+        """Add individual video files with their CSV files (SLEAP and/or MTT)."""
         video_files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Video File(s)",
             "",
             "Video Files (*.mp4 *.avi *.mov);;All Files (*)"
         )
-        
+
         if not video_files:
             return
-        
+
         added = 0
         skipped = 0
-        
-        for video_path in video_files:
-            video_path = Path(video_path)
-            folder = video_path.parent
-            
-            # Look for corresponding predictions.analysis.csv in the same folder
-            csv_pattern = str(video_path.name).replace(video_path.suffix, '.*.predictions.analysis.csv')
-            csv_files = list(folder.glob(csv_pattern))
-            
-            if csv_files:
-                csv_path = str(csv_files[0])
-                config = VideoROIConfig(str(video_path), csv_path)
-                self.video_configs.append(config)
-                
-                item = QListWidgetItem(f"○ {video_path.name}")
-                self.video_list.addItem(item)
+
+        for video_file in video_files:
+            video_path = Path(video_file)
+            sources = self._detect_data_sources(video_path)
+
+            if not sources:
+                skipped += 1
+                continue
+
+            if len(sources) == 1:
+                ds = next(iter(sources))
+                self._add_video_config(str(video_path), sources[ds], ds)
                 added += 1
             else:
-                skipped += 1
-        
+                ds = self._prompt_data_source(video_path.name, sources)
+                if ds:
+                    self._add_video_config(str(video_path), sources[ds], ds)
+                    added += 1
+                else:
+                    skipped += 1
+
         if added > 0:
             self.video_list.setCurrentRow(0)
             self.btn_prev.setEnabled(True)
             self.btn_next.setEnabled(True)
-            
-            message = f"Added {added} video(s) with matching CSV files"
+
+            message = f"Added {added} video(s) with matching tracking data"
             if skipped > 0:
-                message += f"\nSkipped {skipped} video(s) without matching .predictions.analysis.csv files"
+                message += f"\nSkipped {skipped} video(s) without matching data"
             QMessageBox.information(self, "Videos Added", message)
         else:
-            QMessageBox.warning(self, "No Matches", 
-                              f"None of the {len(video_files)} selected video(s) have matching .predictions.analysis.csv files")
+            QMessageBox.warning(self, "No Matches",
+                              f"None of the {len(video_files)} selected video(s) have matching SLEAP or Mask Tracker data")
     
     def clear_videos(self):
         """Clear all videos."""
@@ -2409,34 +2601,92 @@ class ROIToolGUI(QMainWindow):
     def load_keypoints_from_csv(self, config: VideoROIConfig):
         """Extract available keypoints from CSV columns."""
         try:
+            if config.data_source == "mtt":
+                self._load_keypoints_from_mtt_csv(config)
+                return
+            if config.data_source == "st":
+                self._load_keypoints_from_st_csv(config)
+                return
+
             df = pd.read_csv(config.csv_path, nrows=0)  # Just read headers
-            
+
             # Check if CSV has track column
             config.has_tracks = 'track' in df.columns
-            
+
             # Extract unique keypoint names from columns that have both .x and .y
-            # This filters out things like "instance.score" which only has .score
             keypoints = set()
             for col in df.columns:
                 if col.endswith('.x'):
                     keypoint = col[:-2]  # Remove '.x'
-                    # Check if corresponding .y column exists
                     if f"{keypoint}.y" in df.columns:
-                        # Filter out 'instance' and 'track' prefixes
                         if not keypoint.startswith('track') and keypoint != 'instance':
                             keypoints.add(keypoint)
-            
+
             config.available_keypoints = sorted(list(keypoints))
-            
+
             # Update keypoint checkboxes
             self.update_keypoint_checkboxes(config)
-            
+
             # Show/hide track options based on detection
             if hasattr(self, 'track_options_widget'):
                 self.track_options_widget.setVisible(config.has_tracks)
-            
+
         except Exception as e:
             QMessageBox.warning(self, "CSV Error", f"Could not read CSV: {str(e)}")
+
+    def _load_keypoints_from_mtt_csv(self, config: VideoROIConfig):
+        """Extract available object names from MTT trajectories_detailed.csv."""
+        try:
+            df = pd.read_csv(config.csv_path)
+
+            if 'object_id' not in df.columns or 'x' not in df.columns:
+                QMessageBox.warning(self, "CSV Error",
+                                    "MTT CSV does not have expected columns (object_id, x, y)")
+                return
+
+            # Try to get object names from the pivot-format trajectories.csv (has proper names)
+            obj_col_names = self._get_mtt_object_names(config.csv_path, df)
+
+            config.has_tracks = len(obj_col_names) > 1
+            config.available_keypoints = sorted(obj_col_names.values())
+            config._mtt_obj_col_names = obj_col_names
+
+            self.update_keypoint_checkboxes(config)
+
+            if hasattr(self, 'track_options_widget'):
+                self.track_options_widget.setVisible(config.has_tracks)
+
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Error", f"Could not read MTT CSV: {str(e)}")
+
+    def _load_keypoints_from_st_csv(self, config: VideoROIConfig):
+        """Extract available object names from SimpleTracker _positionCoordinates.csv."""
+        try:
+            import re
+            df = pd.read_csv(config.csv_path, nrows=0)
+
+            keypoints = []
+            for col in df.columns:
+                m = re.match(r"object_(\d+)_x$", col)
+                if m:
+                    name = f"object_{m.group(1)}"
+                    if f"object_{m.group(1)}_y" in df.columns:
+                        keypoints.append(name)
+
+            config.has_tracks = len(keypoints) > 1
+            config.available_keypoints = sorted(keypoints)
+
+            self.update_keypoint_checkboxes(config)
+
+            if hasattr(self, 'track_options_widget'):
+                self.track_options_widget.setVisible(config.has_tracks)
+
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Error", f"Could not read SimpleTracker CSV: {str(e)}")
+
+    @staticmethod
+    def _get_mtt_object_names(detailed_csv_path: str, df: pd.DataFrame) -> Dict[int, str]:
+        return _get_mtt_object_names(detailed_csv_path, df)
     
     def try_load_config(self, config: VideoROIConfig):
         """Try to load existing ROI configuration from roiAnalysis folder."""

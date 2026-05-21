@@ -226,10 +226,8 @@ class FNTMainWindow(QMainWindow):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         
-        # Create tabs - Original order
+        # Create tabs
         self.create_video_tab()
-        self.create_video_tracking_tab()
-        self.create_sleap_tab()
         self.create_uwb_tab()
         self.create_usv_tab()
         self.create_rfid_tab()
@@ -331,32 +329,45 @@ class FNTMainWindow(QMainWindow):
         return scroll, layout
 
     def create_video_tab(self):
-        """Create the video processing tab"""
+        """Create the video tab with processing, tracking, and scoring tools"""
         tab, layout = self._make_scrollable_tab("Video")
-        
+
         # Description
-        desc = QLabel("Tools for video file processing and manipulation")
+        desc = QLabel("Video processing, tracking, and behavioral analysis tools")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # Video processing group
         group = QGroupBox("Video Processing Tools")
         group_layout = QGridLayout()
-        
-        # Create buttons with descriptions
+
         buttons = [
             ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
             ("Video Trim and Crop", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
         ]
-        
+
         self.create_button_grid(group_layout, buttons)
         group.setLayout(group_layout)
         layout.addWidget(group)
 
+        # FNT Tracking Tools group
+        tracking_group = QGroupBox("FNT Tracking Tools")
+        tracking_layout = QGridLayout()
+
+        tracking_buttons = [
+            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
+            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
+        ]
+
+        self.create_button_grid(tracking_layout, tracking_buttons)
+        tracking_group.setLayout(tracking_layout)
+        layout.addWidget(tracking_group)
+
         # Behavioral scoring group
-        scoring_group = QGroupBox("Behavioral Scoring")
+        scoring_group = QGroupBox("Behavior Scoring")
         scoring_group_layout = QGridLayout()
 
         scoring_buttons = [
@@ -367,45 +378,6 @@ class FNTMainWindow(QMainWindow):
         scoring_group.setLayout(scoring_group_layout)
         layout.addWidget(scoring_group)
 
-        layout.addStretch()
-
-    def create_sleap_tab(self):
-        """Create the SLEAP processing tab"""
-        tab, layout = self._make_scrollable_tab("SLEAP")
-        
-        # Description
-        desc = QLabel("SLEAP pose estimation pipeline tools")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # SLEAP processing group
-        group = QGroupBox("SLEAP Analysis Pipeline")
-        group_layout = QGridLayout()
-        
-        buttons = [
-            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
-            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
-            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
-            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        # SLEAP post-processing group
-        post_group = QGroupBox("SLEAP Post-Processing")
-        post_layout = QGridLayout()
-        
-        post_buttons = [
-            ("ROI Tool", "Define ROIs and analyze spatial occupancy", self.run_sleap_roi_tool),
-        ]
-        
-        self.create_button_grid(post_layout, post_buttons)
-        post_group.setLayout(post_layout)
-        layout.addWidget(post_group)
-        
         layout.addStretch()
 
     def create_usv_tab(self):
@@ -472,43 +444,6 @@ class FNTMainWindow(QMainWindow):
         
         layout.addStretch()
 
-    def create_video_tracking_tab(self):
-        """Create the video tracking tab"""
-        tab, layout = self._make_scrollable_tab("Video Tracking")
-        
-        # Description
-        desc = QLabel("Interactive tracking using SAM (Segment Anything Model) for behavioral tests")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # Tracking tools group
-        group = QGroupBox("Tracking Tools")
-        group_layout = QGridLayout()
-
-        buttons = [
-            ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
-            ("Mask Tracker", "SAM on every frame - extract rich pose features for behavioral clustering (requires GPU)", self.run_mask_pose_tracker),
-        ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        # Info box
-        info_label = QLabel(
-            "<b>Note:</b> Video tracking requires SAM model checkpoint.<br>"
-            "Download from: <a href='https://github.com/facebookresearch/segment-anything#model-checkpoints'>"
-            "github.com/facebookresearch/segment-anything</a><br><br>"
-            "<b>Workflow:</b> Select video → Click on animal → Draw ROI → Track automatically"
-        )
-        info_label.setTextFormat(Qt.RichText)
-        info_label.setOpenExternalLinks(True)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 10px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        
-        layout.addStretch()
 
     def create_rfid_tab(self):
         """Create the RFID processing tab"""
@@ -660,41 +595,68 @@ class FNTMainWindow(QMainWindow):
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab, layout = self._make_scrollable_tab("Utilities")
-        
+
         # Description
-        desc = QLabel("General utilities and information")
+        desc = QLabel("General utilities, external tool integrations, and information")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
-        
+
         # General Utilities group
         general_group = QGroupBox("General Utilities")
         general_layout = QGridLayout()
-        
+
         general_buttons = [
             ("File Splitter", "Split large files to meet GitHub's 50MB limit", self.run_file_splitter),
-            ("GitHub Data Transfer", "Copy CSVs/TXT/JSON to GitHub repo, auto-split large files", self.run_github_csv_transfer),
+            ("Data Transfer", "Copy data files to a destination folder, auto-split large files", self.run_github_csv_transfer),
         ]
-        
+
         self.create_button_grid(general_layout, general_buttons)
         general_group.setLayout(general_layout)
         layout.addWidget(general_group)
-        
-        # Utilities & Information group
-        group = QGroupBox("Utilities & Information")
-        group_layout = QGridLayout()
-        
-        buttons = [
+
+        # SLEAP Utilities group
+        sleap_group = QGroupBox("SLEAP Utilities")
+        sleap_layout = QGridLayout()
+
+        sleap_buttons = [
+            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
+            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
+            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
+        ]
+
+        self.create_button_grid(sleap_layout, sleap_buttons)
+        sleap_group.setLayout(sleap_layout)
+        layout.addWidget(sleap_group)
+
+        # LabGym Utilities group
+        labgym_group = QGroupBox("LabGym Utilities")
+        labgym_layout = QGridLayout()
+
+        labgym_buttons = [
+            ("Generate Training Images", "Extract frames from videos for LabGym training datasets", self.run_generate_training_images),
+        ]
+
+        self.create_button_grid(labgym_layout, labgym_buttons)
+        labgym_group.setLayout(labgym_layout)
+        layout.addWidget(labgym_group)
+
+        # Information group
+        info_group = QGroupBox("Information")
+        info_layout = QGridLayout()
+
+        info_buttons = [
             ("About FNT", "About FieldNeuroToolbox", self.show_about),
             ("Check Dependencies", "Verify required software is installed", self.check_dependencies),
             ("Open Documentation", "Open FNT documentation", self.open_documentation),
             ("Report Issue", "Report a bug or request a feature", self.report_issue),
         ]
-        
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
+
+        self.create_button_grid(info_layout, info_buttons)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
         layout.addStretch()
 
     def create_button_grid(self, layout, buttons):
@@ -847,18 +809,38 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
     
-    def run_sleap_roi_tool(self):
-        """Launch SLEAP ROI Analysis Tool"""
+    def run_roi_tool(self):
+        """Launch ROI Analysis Tool (supports SLEAP, Mask Tracker, and Simple Tracker data)"""
         try:
             from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
-            
-            # Create and show the ROI tool window
+
             self.roi_tool_window = ROIToolGUI()
             self.roi_tool_window.show()
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
-    
+
+    def run_sam2_annotator(self):
+        """Launch SAM2 Annotator tool"""
+        try:
+            from fnt.videoTracking.sam2_annotator_pyqt import SAM2AnnotatorWindow
+            self.sam2_annotator_window = SAM2AnnotatorWindow()
+            self.sam2_annotator_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch SAM2 Annotator: {str(e)}")
+
+
+    # LabGym Methods
+    def run_generate_training_images(self):
+        """Launch Generate Training Images tool"""
+        try:
+            from fnt.labgym.generate_training_images_pyqt import GenerateTrainingImagesWindow
+
+            self.generate_training_images_window = GenerateTrainingImagesWindow()
+            self.generate_training_images_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch Generate Training Images: {str(e)}")
+
     # USV Processing Methods
     def run_classic_audio_detector(self):
         """Launch Classic Audio Detector - DSP-based detection and labeling"""
@@ -1015,7 +997,7 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"File splitter failed: {str(e)}")
     
     def run_github_csv_transfer(self):
-        """Launch GitHub Data Transfer tool for copying data files to a GitHub repo"""
+        """Launch Data Transfer tool for copying data files to a destination folder"""
         try:
             from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
 
@@ -1023,7 +1005,7 @@ class FNTMainWindow(QMainWindow):
             self.github_csv_transfer_window = GitHubCSVTransferWindow()
             self.github_csv_transfer_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"GitHub Data Transfer failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Data Transfer failed: {str(e)}")
     
     # Doric WiFP Processing Methods
     def run_doric_processor(self):

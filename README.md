@@ -3,7 +3,9 @@
 
 Preprocessing and analysis toolbox for neurobehavioral data.
 
-Authored by Caleb C. Vogt, PhD in collaboration with Claude.
+Authored by Caleb C. Vogt, PhD in extensive collaboration with Anthropic's Claude (especially Opus 4.6). 
+
+This is a broad-based toolbox, with many different kinds of tools within it. The Video Tracking tools in particular were inspired/influenced by my experience using various academic softwares, including SLEAP, DeepLabCut, idTracker, UMATracker, and LabGym. Without exposure to these other softwares, I would not have been able to intuit the specific style of workflow utilized in the various FNT tracking tools (Simple Tracker and Mask Tracker).
 
 ## Pre-requisites
 - Git

@@ -7,9 +7,16 @@ Automatically converts output to CSV format.
 """
 
 import os
+import re
 import subprocess
 import glob
+import threading
+import time
 from datetime import datetime
+
+# Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
+# that rich/tqdm emit when they think they are writing to a terminal.
+_ANSI_RE = re.compile(r'\x1b[\[\(][0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
     QFileDialog, QMessageBox, QGroupBox, QTextEdit, QCheckBox,
@@ -52,7 +59,75 @@ class InferenceWorker(QThread):
         if self._current_process:
             self._current_process.terminate()
         self.progress.emit("\n⚠️ Stop requested by user...")
-        
+
+    @staticmethod
+    def _strip_ansi(text):
+        """Remove ANSI escape codes (colors, cursor moves) from text."""
+        return _ANSI_RE.sub('', text)
+
+    @staticmethod
+    def _is_progress_line(text):
+        """Return True if *text* looks like a SLEAP progress-bar update.
+
+        SLEAP progress lines look like:
+            Predicting...  ━━━  8%  1420/18000  ETA: 0:06:23  Elapsed: 0:00:32  43.4 FPS
+        They always contain a fraction (N/M) and at least one timing keyword.
+        """
+        return ('/' in text
+                and any(kw in text for kw in ('ETA:', 'Elapsed:', 'FPS', 'Predicting')))
+
+    def _read_stream(self, stream):
+        """Read lines from *stream*, routing each to the correct GUI signal.
+
+        * Lines that match SLEAP's progress-bar pattern are sent to
+          ``progress_update`` (replaces the last line in the log).
+        * Everything else (INFO messages, warnings, etc.) is sent to
+          ``progress`` (appends a new line).
+
+        Progress-bar updates are **throttled** to at most 2/second so the
+        QTextEdit can keep up.  ANSI escape codes are stripped before any
+        text reaches the GUI.
+        """
+        last_update_time = 0.0
+        progress_started = False
+        UPDATE_INTERVAL = 0.5          # seconds between GUI refreshes
+
+        try:
+            for raw_line in iter(stream.readline, ''):
+                if self._stop_requested:
+                    break
+
+                # A single readline() may contain \r-separated sub-segments
+                # (rich sometimes puts cursor-control + content + \r + … + \n).
+                segments = raw_line.split('\r')
+
+                for segment in segments:
+                    clean = self._strip_ansi(segment).strip()
+                    if not clean:
+                        continue
+
+                    if self._is_progress_line(clean):
+                        now = time.time()
+                        if not progress_started:
+                            # First progress line — append so there is a line
+                            # to overwrite on subsequent updates.
+                            self.progress.emit(clean)
+                            progress_started = True
+                            last_update_time = now
+                        elif now - last_update_time >= UPDATE_INTERVAL:
+                            self.progress_update.emit(clean)
+                            last_update_time = now
+                        # else: throttled — silently skip this update
+                    else:
+                        self.progress.emit(clean)
+                        # If a non-progress line appears after progress was
+                        # running, reset so the next progress phase starts
+                        # with a fresh append.
+                        if progress_started:
+                            progress_started = False
+        except Exception:
+            pass
+
     def run(self):
         try:
             total_processed = 0
@@ -242,44 +317,55 @@ class InferenceWorker(QThread):
         
         self.progress.emit(f"\n🔁 Running inference on: {os.path.basename(video_file)}")
         
-        # Build full command with conda run
+        # Build full command with conda run.
+        # --no-capture-output tells conda not to buffer the child process output,
+        # so lines flow through to our pipe immediately.
         if self.conda_env:
-            full_cmd = ["conda", "run", "-n", self.conda_env] + cmd
+            full_cmd = ["conda", "run", "--no-capture-output", "-n", self.conda_env] + cmd
             self.progress.emit(f"Environment: {self.conda_env}")
         else:
             full_cmd = cmd
             self.progress.emit("Warning: No conda environment specified")
-        
+
         self.progress.emit(f"Command: {' '.join(full_cmd)}\n")
-        
+
+        # PYTHONUNBUFFERED — prevents Python from buffering SLEAP's output.
+        # FORCE_COLOR      — makes rich render its progress bar (it would
+        #                    suppress it entirely on a non-TTY pipe).
+        # COLUMNS          — tells rich the "terminal" width for formatting.
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["FORCE_COLOR"] = "1"
+        env["COLUMNS"] = "120"
+
         try:
             self.progress.emit("🔄 Running SLEAP inference...\n")
 
+            # stdout and stderr are read in separate threads so neither
+            # pipe blocks the other.
             process = subprocess.Popen(
                 full_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 shell=True,
                 bufsize=1,
+                env=env,
             )
             self._current_process = process
 
-            for raw_line in process.stdout:
-                if self._stop_requested:
-                    process.terminate()
-                    break
-                # SLEAP uses \r for progress bar updates
-                segments = raw_line.rstrip('\n').split('\r')
-                for i, segment in enumerate(segments):
-                    segment = segment.strip()
-                    if not segment:
-                        continue
-                    if i > 0 or raw_line.startswith('\r'):
-                        self.progress_update.emit(segment)
-                    else:
-                        self.progress.emit(segment)
+            # stderr thread — rich progress bar + INFO log lines go here
+            stderr_thread = threading.Thread(
+                target=self._read_stream,
+                args=(process.stderr,),
+                daemon=True,
+            )
+            stderr_thread.start()
 
+            # stdout — normal print() output, if any
+            self._read_stream(process.stdout)
+
+            stderr_thread.join(timeout=30)
             process.wait()
             self._current_process = None
 
@@ -769,8 +855,15 @@ class VideoInferenceWindow(QWidget):
         )
 
     def log_update(self, message):
-        """Replace the last line in the log (for progress bar updates)"""
+        """Replace the last line in the log (for progress bar updates).
+        If the log is empty, falls back to appending instead."""
+        doc = self.log_output.document()
+        if doc.blockCount() <= 1:
+            # Nothing to replace — just append
+            self.log(message)
+            return
         cursor = self.log_output.textCursor()
+        # Move to end, select entire last line, replace it
         cursor.movePosition(cursor.End)
         cursor.select(cursor.LineUnderCursor)
         cursor.removeSelectedText()

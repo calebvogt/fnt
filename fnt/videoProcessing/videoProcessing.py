@@ -125,25 +125,24 @@ class VideoProcessorWorker(QThread):
             pass
         return False
 
-    def _move_to_failed(self, video_file, parent_dir):
-        """Move a failed video file to proc_failed/ directory."""
-        failed_dir = os.path.join(parent_dir, "proc_failed")
+    def _copy_to_failed(self, video_file, parent_dir):
+        """Copy a failed video file to proc_failed_copies/ directory."""
+        failed_dir = os.path.join(parent_dir, "proc_failed_copies")
         os.makedirs(failed_dir, exist_ok=True)
 
         dest_path = os.path.join(failed_dir, os.path.basename(video_file))
 
-        # If already exists in proc_failed/ from a previous run, remove the old copy
         if os.path.exists(dest_path):
             os.remove(dest_path)
 
         try:
-            shutil.move(video_file, dest_path)
+            shutil.copy2(video_file, dest_path)
             self.progress_update.emit(
-                f"⚠️ Moved failed video to proc_failed/: {os.path.basename(video_file)}"
+                f"⚠️ Copied failed video to proc_failed_copies/: {os.path.basename(video_file)}"
             )
         except Exception as e:
             self.progress_update.emit(
-                f"⚠️ Could not move {os.path.basename(video_file)} to proc_failed/: {str(e)}"
+                f"⚠️ Could not copy {os.path.basename(video_file)} to proc_failed_copies/: {str(e)}"
             )
 
     def run(self):
@@ -213,7 +212,7 @@ class VideoProcessorWorker(QThread):
                     processed_count += 1
                 elif not self.should_stop:
                     failed_count += 1
-                    self._move_to_failed(video_file, parent_dir)
+                    self._copy_to_failed(video_file, parent_dir)
 
             # Build summary
             if self.should_stop:
@@ -228,7 +227,7 @@ class VideoProcessorWorker(QThread):
                 success = False
 
             if failed_count > 0:
-                parts.append(f"{failed_count} failed (moved to proc_failed/)")
+                parts.append(f"{failed_count} failed (copied to proc_failed_copies/)")
                 success = False
 
             if skipped_count > 0:
