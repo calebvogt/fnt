@@ -1337,12 +1337,32 @@ class InferenceWorker(QThread):
                 result["video_path"] = video_path
 
                 if behavior_rows:
+                    per_obj_first = {}
+                    for row in behavior_rows:
+                        oid = row["object_id"]
+                        if oid not in per_obj_first:
+                            per_obj_first[oid] = row
+                    backfill = []
+                    for oid, first_row in per_obj_first.items():
+                        first_frame = first_row["frame"]
+                        for fi in range(first_frame):
+                            backfill.append({
+                                "frame": fi,
+                                "object_id": oid,
+                                "behavior": first_row["behavior"],
+                                "confidence": first_row["confidence"],
+                                "gap": first_row["gap"],
+                            })
+                    if backfill:
+                        behavior_rows = backfill + behavior_rows
+
                     self._apply_min_bout_filter(behavior_rows, self.min_bout)
 
                     import csv
                     out_dir = result.get("output_dir", "")
                     beh_csv = os.path.join(out_dir, "behavior_predictions.csv")
                     fieldnames = ["frame", "object_id", "behavior", "confidence", "gap"]
+                    behavior_rows.sort(key=lambda r: (r["object_id"], r["frame"]))
                     with open(beh_csv, "w", newline="") as f:
                         w = csv.DictWriter(f, fieldnames=fieldnames)
                         w.writeheader()
@@ -8361,6 +8381,7 @@ class SAM2AnnotatorWindow(QMainWindow):
             [item.data(Qt.UserRole) for item in selected if item.data(Qt.UserRole) is not None],
             reverse=True,
         )
+        next_row = min(indices) if indices else 0
         for idx in indices:
             if 0 <= idx < len(self._batch_clips):
                 clip = self._batch_clips[idx]
@@ -8400,6 +8421,12 @@ class SAM2AnnotatorWindow(QMainWindow):
             item.setForeground(color)
             item.setData(Qt.UserRole, idx)
             self.list_clip_queue.addItem(item)
+
+        if self.list_clip_queue.count() > 0:
+            select_row = min(next_row, self.list_clip_queue.count() - 1)
+            self.list_clip_queue.setCurrentRow(select_row)
+        else:
+            self.preview.setPixmap(QPixmap())
 
         self._refresh_cls_annotation_stats()
 
