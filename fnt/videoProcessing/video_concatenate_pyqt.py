@@ -94,6 +94,70 @@ def _preprocess_ocr_crop(crop_img, engine="easyocr"):
     return binary
 
 
+# ---------------------------------------------------------------------------
+# Timestamp format definitions for format-aware OCR post-processing
+# ---------------------------------------------------------------------------
+# Each entry maps a human-readable label to the digit-group layout.
+# "groups" is a list of (num_digits, separator_after) tuples.
+# The parser strips all non-digit chars from the raw OCR text, checks that
+# the total digit count matches, then re-inserts the correct separators.
+TIMESTAMP_FORMATS = {
+    "YYYY/MM/DD HH:MM:SS": {
+        "groups": [(4, "-"), (2, "-"), (2, "T"), (2, ":"), (2, ":"), (2, "")],
+        "total_digits": 14,
+    },
+    "MM/DD/YYYY HH:MM:SS": {
+        "groups": [(2, "/"), (2, "/"), (4, " "), (2, ":"), (2, ":"), (2, "")],
+        "total_digits": 14,
+    },
+    "DD/MM/YYYY HH:MM:SS": {
+        "groups": [(2, "/"), (2, "/"), (4, " "), (2, ":"), (2, ":"), (2, "")],
+        "total_digits": 14,
+    },
+    "YYYY/MM/DD HH:MM": {
+        "groups": [(4, "-"), (2, "-"), (2, "T"), (2, ":"), (2, "")],
+        "total_digits": 12,
+    },
+}
+
+
+def _parse_timestamp_by_format(raw_text, fmt_key=None):
+    """Parse a raw OCR string into a formatted timestamp.
+
+    If *fmt_key* is given and matches a key in TIMESTAMP_FORMATS, the
+    parser extracts **only the digits** from the raw OCR output and
+    re-formats them according to the expected layout.  This makes the
+    result immune to separator confusion (``/`` vs ``.`` vs ``:``).
+
+    Falls back to a flexible regex if no format is specified or if the
+    digit count doesn't match.
+
+    Returns the formatted string, or empty string on failure.
+    """
+    # --- Format-aware path: extract digits, re-insert separators ---
+    if fmt_key and fmt_key in TIMESTAMP_FORMATS:
+        fmt = TIMESTAMP_FORMATS[fmt_key]
+        digits = _re.sub(r'\D', '', raw_text)
+        if len(digits) == fmt["total_digits"]:
+            parts = []
+            pos = 0
+            for n_digits, sep in fmt["groups"]:
+                parts.append(digits[pos:pos + n_digits])
+                parts.append(sep)
+                pos += n_digits
+            return "".join(parts)
+        # If digit count is off (e.g. OCR dropped/added a digit),
+        # fall through to the regex fallback.
+
+    # --- Regex fallback (separator-agnostic) ---
+    m = _re.search(
+        r'(\d{4})[/\-.\s](\d{2})[/\-.\s](\d{2})[/\-.\s]*(\d{2})[:\-.\s](\d{2})[:\-.\s](\d{2})',
+        raw_text)
+    if m:
+        return "{}-{}-{}T{}:{}:{}".format(*m.groups())
+    return ""
+
+
 class ConcatenationWorker(QThread):
     """Worker thread for video concatenation to avoid blocking the GUI"""
     progress_update = pyqtSignal(str)  # status message
@@ -109,7 +173,9 @@ class ConcatenationWorker(QThread):
                  enable_preprocessing=False, preprocess_settings=None,
                  enable_chunking=False, chunk_duration_minutes=60,
                  enable_ocr=False, ocr_roi=None, ocr_source_resolution=None,
-                 ocr_engine="easyocr", ocr_decoder="greedy"):
+                 ocr_engine="easyocr", ocr_decoder="greedy",
+                 ocr_timestamp_format=None,
+                 ocr_sample_interval_sec=1):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
@@ -128,6 +194,8 @@ class ConcatenationWorker(QThread):
         self.ocr_source_resolution = ocr_source_resolution  # (w, h) of the video the ROI was drawn on
         self.ocr_engine = ocr_engine                    # "easyocr" or "tesseract"
         self.ocr_decoder = ocr_decoder                  # "greedy" or "beamsearch" (EasyOCR only)
+        self.ocr_timestamp_format = ocr_timestamp_format  # key from TIMESTAMP_FORMATS or None
+        self.ocr_sample_interval_sec = ocr_sample_interval_sec  # seconds between OCR samples
         # Mutex/condition for blocking the worker until the user responds
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
@@ -1123,7 +1191,13 @@ class ConcatenationWorker(QThread):
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        sample_interval = max(1, int(fps))  # ~1 sample per second
+        sample_interval = max(1, int(fps * self.ocr_sample_interval_sec))
+
+        est_samples = total_frames // sample_interval if sample_interval else 0
+        self.progress_update.emit(
+            f"   Sampling every {self.ocr_sample_interval_sec}s "
+            f"({sample_interval} frames @ {fps:.1f} fps, "
+            f"~{est_samples} samples)")
 
         rx, ry, rw, rh = roi
 
@@ -1156,7 +1230,7 @@ class ConcatenationWorker(QThread):
             except Exception:
                 raw_text = ""
 
-            parsed = self._parse_timestamp(raw_text)
+            parsed = _parse_timestamp_by_format(raw_text, self.ocr_timestamp_format)
             results.append((frame_idx, raw_text, parsed))
             if parsed:
                 success_count += 1
@@ -1182,20 +1256,6 @@ class ConcatenationWorker(QThread):
         self.progress_update.emit(
             f"✅ OCR complete: {os.path.basename(csv_path)}  "
             f"({total_samples} samples, {rate:.0f}% parsed)")
-
-    @staticmethod
-    def _parse_timestamp(raw_text):
-        """Try to parse a raw OCR string into an ISO-8601 datetime.
-
-        Returns the parsed string or empty string on failure.
-        """
-        # YYYY/MM/DD HH:MM:SS  or  YYYY-MM-DD HH:MM:SS  or  YYYY.MM.DD ...
-        m = _re.search(
-            r'(\d{4})[/\-.](\d{2})[/\-.](\d{2})\s*(\d{2})[:\-.](\d{2})[:\-.](\d{2})',
-            raw_text)
-        if m:
-            return "{}-{}-{}T{}:{}:{}".format(*m.groups())
-        return ""
 
     # ------------------------------------------------------------------
     # Incremental failure recovery helpers
@@ -1658,6 +1718,7 @@ class OCRRoiSelector(QDialog):
         self._total_frames = 0
         self._ocr_engine = ocr_engine      # "easyocr" or "tesseract"
         self._ocr_decoder = ocr_decoder    # "greedy" or "beamsearch"
+        self.timestamp_format = None       # key from TIMESTAMP_FORMATS or None
 
         self.setWindowTitle("Select OCR Timestamp Region")
         self.setMinimumSize(750, 550)
@@ -1696,20 +1757,76 @@ class OCRRoiSelector(QDialog):
         self.frame_label.roi_changed.connect(self._on_roi_changed)
         layout.addWidget(self.frame_label, stretch=1)
 
-        # Info labels
+        # Info label
         self.roi_info = QLabel("ROI: not set — click and drag on the frame above")
         self.roi_info.setStyleSheet("margin-top: 4px;")
         layout.addWidget(self.roi_info)
 
-        self.ocr_preview = QLabel("OCR Preview: —")
-        layout.addWidget(self.ocr_preview)
+        # --- Timestamp format row ---
+        fmt_row = QHBoxLayout()
+
+        self.fmt_check = QCheckBox("Expected timestamp format:")
+        self.fmt_check.setChecked(True)
+        self.fmt_check.setToolTip(
+            "When enabled, the OCR post-processor extracts only the\n"
+            "digit characters from the raw OCR output and re-inserts\n"
+            "the correct separators based on the expected format.\n\n"
+            "This eliminates separator confusion (e.g. OCR reading\n"
+            "'.' instead of ':') — only the digits matter.\n\n"
+            "Uncheck for free-form OCR output without reformatting.")
+        self.fmt_check.toggled.connect(self._on_fmt_toggled)
+        fmt_row.addWidget(self.fmt_check)
+
+        self.fmt_combo = QComboBox()
+        for label in TIMESTAMP_FORMATS:
+            self.fmt_combo.addItem(label, label)
+        self.fmt_combo.setToolTip(
+            "Select the timestamp format burned into your DVR video.\n"
+            "The separators (/ : - .) don't matter — the parser only\n"
+            "uses the digit positions and group ordering.")
+        self.fmt_combo.setFixedWidth(220)
+        self.fmt_combo.setStyleSheet(
+            "QComboBox { background-color: #3c3c3c; border: 1px solid #555; "
+            "color: #cccccc; padding: 3px 6px; }"
+            "QComboBox QAbstractItemView { background-color: #3c3c3c; "
+            "color: #cccccc; selection-background-color: #0078d4; }")
+        fmt_row.addWidget(self.fmt_combo)
+        fmt_row.addStretch()
+
+        layout.addLayout(fmt_row)
+
+        # --- OCR preview row: processed image + text result ---
+        preview_row = QHBoxLayout()
+
+        self.processed_img_label = QLabel()
+        self.processed_img_label.setFixedHeight(50)
+        self.processed_img_label.setMinimumWidth(150)
+        self.processed_img_label.setAlignment(Qt.AlignCenter)
+        self.processed_img_label.setStyleSheet(
+            "border: 1px solid #555; background-color: #1e1e1e; padding: 2px;")
+        self.processed_img_label.setToolTip(
+            "This shows the preprocessed ROI image that is fed to the\n"
+            "OCR engine. For EasyOCR this is a grayscale upscale;\n"
+            "for Tesseract this is a binarised (black & white) image.")
+        preview_row.addWidget(self.processed_img_label)
+
+        preview_text_col = QVBoxLayout()
+        self.ocr_raw_label = QLabel("Raw OCR: —")
+        self.ocr_raw_label.setStyleSheet("color: #999999;")
+        preview_text_col.addWidget(self.ocr_raw_label)
+
+        self.ocr_parsed_label = QLabel("Parsed: —")
+        preview_text_col.addWidget(self.ocr_parsed_label)
+
+        preview_row.addLayout(preview_text_col, stretch=1)
+        layout.addLayout(preview_row)
 
         # Buttons
         btn_row = QHBoxLayout()
 
         random_btn = QPushButton("Show Random Frame")
         random_btn.setToolTip(
-            "Load a random frame from the first video.\n"
+            "Load a random frame from any video in the folder set.\n"
             "Use this if the timestamp text is not visible on the\n"
             "default first frame (e.g. camera was off at the start).")
         random_btn.clicked.connect(self._show_random_frame)
@@ -1734,6 +1851,10 @@ class OCRRoiSelector(QDialog):
         btn_row.addWidget(cancel_btn)
 
         layout.addLayout(btn_row)
+
+    def _on_fmt_toggled(self, checked):
+        """Enable/disable the format combo when the checkbox is toggled."""
+        self.fmt_combo.setEnabled(checked)
 
     # ------------------------------------------------------------------
     # Frame loading
@@ -1828,25 +1949,44 @@ class OCRRoiSelector(QDialog):
     # OCR preview
     # ------------------------------------------------------------------
     def _preview_ocr(self):
+        import cv2
+
         if self._current_frame is None or self.roi_video_coords is None:
-            self.ocr_preview.setText("OCR Preview: draw an ROI first")
+            self.ocr_raw_label.setText("Raw OCR: draw an ROI first")
+            self.ocr_parsed_label.setText("Parsed: —")
             return
 
         vx, vy, vw, vh = self.roi_video_coords
         crop = self._current_frame[vy:vy + vh, vx:vx + vw]
         if crop.size == 0:
-            self.ocr_preview.setText("OCR Preview: ROI is empty")
+            self.ocr_raw_label.setText("Raw OCR: ROI is empty")
+            self.ocr_parsed_label.setText("Parsed: —")
             return
 
         processed = _preprocess_ocr_crop(crop, engine=self._ocr_engine)
 
+        # --- Display the processed image ---
+        disp = processed.copy()
+        if len(disp.shape) == 2:
+            # Grayscale → RGB for QImage
+            disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2RGB)
+        # Scale to fit the preview label (max height 46px, preserving aspect)
+        ph, pw = disp.shape[:2]
+        target_h = 46
+        scale = target_h / ph
+        disp = cv2.resize(disp, (int(pw * scale), target_h),
+                           interpolation=cv2.INTER_AREA)
+        qimg = QImage(disp.data, disp.shape[1], disp.shape[0],
+                       disp.shape[1] * 3, QImage.Format_RGB888)
+        self.processed_img_label.setPixmap(QPixmap.fromImage(qimg))
+        self.processed_img_label.setFixedWidth(disp.shape[1] + 4)
+
+        # --- Run OCR ---
         try:
             if self._ocr_engine == "easyocr":
                 import easyocr
-                # Ensure model dir exists
                 _EASYOCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
                 _ensure_gitignore_entry(_FNT_REPO_ROOT, "LocalModels/")
-                # Lazy-init a lightweight reader for preview
                 if not hasattr(self, "_easyocr_reader"):
                     use_gpu = False
                     try:
@@ -1863,26 +2003,46 @@ class OCRRoiSelector(QDialog):
                     processed, detail=0,
                     decoder=self._ocr_decoder,
                     paragraph=True)
-                text = " ".join(results).strip()
+                raw_text = " ".join(results).strip()
             else:
                 import pytesseract
                 config = "--psm 7 -c tessedit_char_whitelist=0123456789/:-.  "
-                text = pytesseract.image_to_string(
+                raw_text = pytesseract.image_to_string(
                     processed, config=config).strip()
 
-            self.ocr_preview.setText(f'OCR Preview: "{text}"')
-            if text:
-                self.ocr_preview.setStyleSheet("color: #00cc66;")
+            # Show raw OCR text
+            self.ocr_raw_label.setText(f'Raw OCR: "{raw_text}"')
+            self.ocr_raw_label.setStyleSheet(
+                "color: #00cc66;" if raw_text else "color: #ff6666;")
+
+            # Parse with format if enabled
+            fmt_key = None
+            if self.fmt_check.isChecked():
+                fmt_key = self.fmt_combo.currentData()
+            parsed = _parse_timestamp_by_format(raw_text, fmt_key)
+            self.timestamp_format = fmt_key  # store for caller
+
+            if parsed:
+                self.ocr_parsed_label.setText(f'Parsed: "{parsed}"')
+                self.ocr_parsed_label.setStyleSheet("color: #00cc66;")
             else:
-                self.ocr_preview.setStyleSheet("color: #ff6666;")
+                digits = _re.sub(r'\D', '', raw_text)
+                expected = TIMESTAMP_FORMATS[fmt_key]["total_digits"] if fmt_key else "?"
+                self.ocr_parsed_label.setText(
+                    f'Parsed: FAILED — got {len(digits)} digits '
+                    f'(expected {expected})')
+                self.ocr_parsed_label.setStyleSheet("color: #ff6666;")
+
         except ImportError:
             pkg = "easyocr" if self._ocr_engine == "easyocr" else "pytesseract"
-            self.ocr_preview.setText(
-                f"OCR Preview: {pkg} not installed (pip install {pkg})")
-            self.ocr_preview.setStyleSheet("color: #ff6666;")
+            self.ocr_raw_label.setText(
+                f"Raw OCR: {pkg} not installed (pip install {pkg})")
+            self.ocr_raw_label.setStyleSheet("color: #ff6666;")
+            self.ocr_parsed_label.setText("Parsed: —")
         except Exception as e:
-            self.ocr_preview.setText(f"OCR Preview: Error — {e}")
-            self.ocr_preview.setStyleSheet("color: #ff6666;")
+            self.ocr_raw_label.setText(f"Raw OCR: Error — {e}")
+            self.ocr_raw_label.setStyleSheet("color: #ff6666;")
+            self.ocr_parsed_label.setText("Parsed: —")
 
     @classmethod
     def find_video_files(cls, directories, sort_order="default"):
@@ -2486,6 +2646,50 @@ class VideoConcatenationGUI(QMainWindow):
         ocr_settings_row.addStretch()
         ocr_inner_layout.addLayout(ocr_settings_row)
 
+        # OCR sample rate row
+        ocr_rate_row = QHBoxLayout()
+
+        ocr_rate_label = QLabel("Sample interval (sec):")
+        ocr_rate_label.setStyleSheet("color: #cccccc;")
+        ocr_rate_row.addWidget(ocr_rate_label)
+
+        self.ocr_sample_interval_spin = QSpinBox()
+        self.ocr_sample_interval_spin.setRange(1, 300)
+        self.ocr_sample_interval_spin.setValue(1)
+        self.ocr_sample_interval_spin.setSuffix("s")
+        self.ocr_sample_interval_spin.setFixedWidth(80)
+        self.ocr_sample_interval_spin.setToolTip(
+            "How often to sample a frame for OCR (in seconds).\n\n"
+            "1s (default): reads every unique timestamp — DVR clocks\n"
+            "typically update once per second, so this captures every\n"
+            "change. Best for precise frame-to-timestamp mapping.\n\n"
+            "5–10s: good for long recordings where you just need\n"
+            "periodic timestamp references. Much faster to process.\n\n"
+            "30–60s: very fast, useful for rough time alignment of\n"
+            "multi-hour recordings.\n\n"
+            "The actual frame skip is calculated from the video's\n"
+            "real FPS, so this works regardless of preprocessing\n"
+            "frame rate settings.")
+        ocr_rate_row.addWidget(self.ocr_sample_interval_spin)
+
+        ocr_rate_info = QLabel("")
+        ocr_rate_info.setStyleSheet("color: #999999; font-style: italic;")
+        self._ocr_rate_info_label = ocr_rate_info
+
+        def _update_rate_info(val):
+            if val == 1:
+                ocr_rate_info.setText("every timestamp change")
+            else:
+                samples_per_hour = 3600 // val
+                ocr_rate_info.setText(f"~{samples_per_hour} samples/hour")
+
+        self.ocr_sample_interval_spin.valueChanged.connect(_update_rate_info)
+        _update_rate_info(1)
+        ocr_rate_row.addWidget(ocr_rate_info)
+
+        ocr_rate_row.addStretch()
+        ocr_inner_layout.addLayout(ocr_rate_row)
+
         # ROI info + redraw row
         ocr_roi_row = QHBoxLayout()
 
@@ -2512,6 +2716,7 @@ class VideoConcatenationGUI(QMainWindow):
         # Instance state for OCR
         self._ocr_roi = None               # (x, y, w, h) in video coords
         self._ocr_source_resolution = None  # (w, h) of the video the ROI was drawn on
+        self._ocr_timestamp_format = None  # key from TIMESTAMP_FORMATS or None
 
     def toggle_advanced_options(self):
         """Toggle visibility of advanced options"""
@@ -2679,6 +2884,7 @@ class VideoConcatenationGUI(QMainWindow):
         if dialog.exec_() == QDialog.Accepted and dialog.roi_video_coords is not None:
             self._ocr_roi = dialog.roi_video_coords
             self._ocr_source_resolution = dialog.video_size
+            self._ocr_timestamp_format = dialog.timestamp_format
             vx, vy, vw, vh = self._ocr_roi
             self.ocr_roi_label.setText(
                 f"ROI: ({vx}, {vy}) to ({vx + vw}, {vy + vh})  [{vw} x {vh} px]")
@@ -2867,8 +3073,11 @@ class VideoConcatenationGUI(QMainWindow):
             vx, vy, vw, vh = self._ocr_roi
             engine_label = self.ocr_engine_combo.currentText()
             decoder_label = self.ocr_decoder_combo.currentText() if ocr_engine == "easyocr" else "N/A"
+            fmt_label = self._ocr_timestamp_format or "auto-detect"
+            interval = self.ocr_sample_interval_spin.value()
             self.log_message(
                 f"OCR: enabled — {engine_label}, decoder={decoder_label}, "
+                f"sample every {interval}s, format={fmt_label}, "
                 f"ROI ({vx},{vy}) to ({vx+vw},{vy+vh})")
         else:
             self.log_message("OCR: off")
@@ -2884,7 +3093,9 @@ class VideoConcatenationGUI(QMainWindow):
             ocr_roi=self._ocr_roi,
             ocr_source_resolution=self._ocr_source_resolution,
             ocr_engine=ocr_engine,
-            ocr_decoder=ocr_decoder)
+            ocr_decoder=ocr_decoder,
+            ocr_timestamp_format=self._ocr_timestamp_format,
+            ocr_sample_interval_sec=self.ocr_sample_interval_spin.value())
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
