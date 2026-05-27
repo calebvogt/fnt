@@ -13,6 +13,7 @@ import glob
 import csv
 import random
 import re as _re
+from datetime import datetime as _datetime, timedelta as _timedelta
 from pathlib import Path
 
 try:
@@ -123,7 +124,7 @@ def _preprocess_ocr_crop(crop_img, engine="easyocr",
 # the total digit count matches, then re-inserts the correct separators.
 TIMESTAMP_FORMATS = {
     "YYYY/MM/DD HH:MM:SS": {
-        "groups": [(4, "-"), (2, "-"), (2, "T"), (2, ":"), (2, ":"), (2, "")],
+        "groups": [(4, "/"), (2, "/"), (2, " "), (2, ":"), (2, ":"), (2, "")],
         "total_digits": 14,
     },
     "MM/DD/YYYY HH:MM:SS": {
@@ -135,7 +136,7 @@ TIMESTAMP_FORMATS = {
         "total_digits": 14,
     },
     "YYYY/MM/DD HH:MM": {
-        "groups": [(4, "-"), (2, "-"), (2, "T"), (2, ":"), (2, "")],
+        "groups": [(4, "/"), (2, "/"), (2, " "), (2, ":"), (2, "")],
         "total_digits": 12,
     },
 }
@@ -174,8 +175,174 @@ def _parse_timestamp_by_format(raw_text, fmt_key=None):
         r'(\d{4})[/\-.\s](\d{2})[/\-.\s](\d{2})[/\-.\s]*(\d{2})[:\-.\s](\d{2})[:\-.\s](\d{2})',
         raw_text)
     if m:
-        return "{}-{}-{}T{}:{}:{}".format(*m.groups())
+        return "{}/{}/{} {}:{}:{}".format(*m.groups())
     return ""
+
+
+def _temporal_consistency_check(results, sample_interval_sec=1, max_jump_sec=None):
+    """Detect and correct temporally inconsistent OCR timestamps.
+
+    Parameters
+    ----------
+    results : list of (frame_idx, raw_text, parsed_str)
+        The OCR results in frame order.
+    sample_interval_sec : int
+        Expected real-world seconds between consecutive samples.
+    max_jump_sec : float or None
+        Maximum allowable jump between adjacent timestamps.  Defaults to
+        ``5 × sample_interval_sec`` — generous enough to tolerate minor
+        jitter while catching gross OCR errors (year/month digit flips).
+
+    Returns
+    -------
+    corrected : list of (frame_idx, raw_text, parsed_str, corrected_str)
+        A copy of *results* with an extra element per row.  *corrected_str*
+        equals *parsed_str* when no correction was needed, or the
+        interpolated replacement when the original was flagged.
+    n_corrected : int
+        Number of timestamps that were replaced.
+    """
+    if max_jump_sec is None:
+        max_jump_sec = max(5 * sample_interval_sec, 10)
+
+    # Datetime parse helpers — handle the two human-readable layouts we emit
+    _DT_FMTS = [
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+    ]
+
+    def _to_dt(s):
+        """Try to parse a formatted timestamp string into a datetime."""
+        if not s:
+            return None
+        for fmt in _DT_FMTS:
+            try:
+                return _datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _from_dt(dt, ref_fmt_str):
+        """Format a datetime back to the same layout as *ref_fmt_str*."""
+        # Detect which format the reference used by trying all known formats
+        for fmt in _DT_FMTS:
+            try:
+                _datetime.strptime(ref_fmt_str, fmt)
+                return dt.strftime(fmt)
+            except ValueError:
+                continue
+        # Fallback — use the first format
+        return dt.strftime(_DT_FMTS[0])
+
+    n = len(results)
+    if n < 3:
+        # Not enough data to do meaningful consistency checks
+        return [(r[0], r[1], r[2], r[2]) for r in results], 0
+
+    # Build parallel datetime array
+    dts = [_to_dt(r[2]) for r in results]
+
+    # Pass 1: Identify outlier indices.
+    # An outlier is a parsed timestamp that jumps by more than max_jump_sec
+    # from BOTH its predecessor and successor (if they exist and parsed OK).
+    outlier = [False] * n
+    for i in range(n):
+        if dts[i] is None:
+            continue  # unparsed — nothing to correct
+
+        # Find nearest valid predecessor
+        prev_dt = None
+        prev_gap = 0  # how many samples back
+        for j in range(i - 1, -1, -1):
+            prev_gap = i - j
+            if dts[j] is not None and not outlier[j]:
+                prev_dt = dts[j]
+                break
+
+        # Find nearest valid successor
+        next_dt = None
+        next_gap = 0
+        for j in range(i + 1, n):
+            next_gap = j - i
+            if dts[j] is not None:
+                next_dt = dts[j]
+                break
+
+        # Check jump from predecessor
+        bad_prev = False
+        if prev_dt is not None:
+            expected_delta = _timedelta(seconds=sample_interval_sec * prev_gap)
+            actual_delta = abs((dts[i] - prev_dt).total_seconds())
+            if actual_delta > max_jump_sec * prev_gap:
+                bad_prev = True
+
+        # Check jump to successor
+        bad_next = False
+        if next_dt is not None:
+            actual_delta = abs((next_dt - dts[i]).total_seconds())
+            if actual_delta > max_jump_sec * next_gap:
+                bad_next = True
+
+        # Only flag if jump is bad relative to BOTH neighbors (or only one
+        # neighbor exists and it's bad).  This avoids flagging the valid
+        # timestamps around a genuine time gap.
+        if prev_dt is None and next_dt is None:
+            continue
+        if prev_dt is not None and next_dt is not None:
+            if bad_prev and bad_next:
+                outlier[i] = True
+        elif prev_dt is not None and bad_prev:
+            # Only predecessor available — be cautious, flag it
+            outlier[i] = True
+        elif next_dt is not None and bad_next:
+            outlier[i] = True
+
+    # Pass 2: Interpolate corrections for outliers using nearest good neighbors
+    corrected = []
+    n_corrected = 0
+    for i in range(n):
+        frame_idx, raw_text, parsed = results[i]
+        if not outlier[i]:
+            corrected.append((frame_idx, raw_text, parsed, parsed))
+            continue
+
+        # Find nearest valid predecessor & successor for interpolation
+        prev_dt, prev_idx = None, None
+        for j in range(i - 1, -1, -1):
+            if dts[j] is not None and not outlier[j]:
+                prev_dt, prev_idx = dts[j], j
+                break
+        next_dt, next_idx = None, None
+        for j in range(i + 1, n):
+            if dts[j] is not None and not outlier[j]:
+                next_dt, next_idx = dts[j], j
+                break
+
+        interp_dt = None
+        ref_fmt = parsed  # for formatting the output
+
+        if prev_dt is not None and next_dt is not None:
+            # Linear interpolation between neighbors
+            total_span = (next_dt - prev_dt).total_seconds()
+            frac = (i - prev_idx) / (next_idx - prev_idx)
+            interp_dt = prev_dt + _timedelta(seconds=total_span * frac)
+        elif prev_dt is not None:
+            gap = i - prev_idx
+            interp_dt = prev_dt + _timedelta(seconds=sample_interval_sec * gap)
+        elif next_dt is not None:
+            gap = next_idx - i
+            interp_dt = next_dt - _timedelta(seconds=sample_interval_sec * gap)
+
+        if interp_dt is not None:
+            corrected_str = _from_dt(interp_dt, ref_fmt)
+            corrected.append((frame_idx, raw_text, parsed, corrected_str))
+            n_corrected += 1
+        else:
+            corrected.append((frame_idx, raw_text, parsed, parsed))
+
+    return corrected, n_corrected
 
 
 class ConcatenationWorker(QThread):
@@ -1288,17 +1455,35 @@ class ConcatenationWorker(QThread):
 
         cap.release()
 
-        # Write CSV
+        # ----- Temporal consistency check -----
+        if len(results) >= 3:
+            self.progress_update.emit("  🔍 Running temporal consistency check...")
+            corrected_results, n_fixed = _temporal_consistency_check(
+                results, sample_interval_sec=self.ocr_sample_interval_sec)
+            if n_fixed > 0:
+                self.progress_update.emit(
+                    f"  ⚠️ Corrected {n_fixed} temporally inconsistent "
+                    f"timestamp(s) via interpolation")
+        else:
+            corrected_results = [
+                (r[0], r[1], r[2], r[2]) for r in results]
+            n_fixed = 0
+
+        # Write CSV (includes corrected column)
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_number", "timestamp_raw", "timestamp_parsed"])
-            writer.writerows(results)
+            writer.writerow([
+                "frame_number", "timestamp_raw",
+                "timestamp_parsed", "timestamp_corrected"])
+            writer.writerows(corrected_results)
 
-        total_samples = len(results)
+        total_samples = len(corrected_results)
         rate = (success_count / total_samples * 100) if total_samples > 0 else 0
+        correction_note = (
+            f", {n_fixed} corrected" if n_fixed > 0 else "")
         self.progress_update.emit(
             f"✅ OCR complete: {os.path.basename(csv_path)}  "
-            f"({total_samples} samples, {rate:.0f}% parsed)")
+            f"({total_samples} samples, {rate:.0f}% parsed{correction_note})")
 
     # ------------------------------------------------------------------
     # Incremental failure recovery helpers
@@ -2772,8 +2957,10 @@ class VideoConcatenationGUI(QMainWindow):
         self.ocr_roi_label.setStyleSheet("color: #999999;")
         ocr_roi_row.addWidget(self.ocr_roi_label, stretch=1)
 
-        self.ocr_redraw_btn = QPushButton("Redraw ROI")
-        self.ocr_redraw_btn.setToolTip("Open the ROI selector to redraw the OCR region")
+        self.ocr_redraw_btn = QPushButton("Select ROI")
+        self.ocr_redraw_btn.setToolTip(
+            "Open the ROI selector to draw/redraw the OCR region.\n"
+            "Configure OCR engine and speed settings above first.")
         self.ocr_redraw_btn.clicked.connect(self._open_roi_selector)
         self.ocr_redraw_btn.setStyleSheet(
             "background-color: #3f3f3f; color: #cccccc; padding: 4px 12px;")
@@ -2853,9 +3040,9 @@ class VideoConcatenationGUI(QMainWindow):
                 self.ocr_check.setChecked(False)
                 return
 
-        # Show the OCR settings + open ROI selector
+        # Show the OCR settings panel — user can configure engine, decoder,
+        # sample rate, then click "Select ROI" when ready.
         self.ocr_frame.setVisible(True)
-        self._open_roi_selector()
 
     def _check_easyocr_available(self):
         """Check if easyocr is importable; offer to install if missing.
@@ -2966,12 +3153,12 @@ class VideoConcatenationGUI(QMainWindow):
             self.ocr_roi_label.setText(
                 f"ROI: ({vx}, {vy}) to ({vx + vw}, {vy + vh})  [{vw} x {vh} px]")
             self.ocr_roi_label.setStyleSheet("color: #00cc66;")
+            self.ocr_redraw_btn.setText("Redraw ROI")
             self.ocr_frame.setVisible(True)
         else:
-            # User cancelled — uncheck if no ROI was previously set
-            if self._ocr_roi is None:
-                self.ocr_check.setChecked(False)
-            self.ocr_frame.setVisible(self._ocr_roi is not None)
+            # User cancelled — keep settings visible if OCR is checked
+            if self._ocr_roi is None and not self.ocr_check.isChecked():
+                self.ocr_frame.setVisible(False)
     
     def create_control_buttons(self, layout):
         """Create control buttons section"""
