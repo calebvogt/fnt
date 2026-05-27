@@ -55,20 +55,27 @@ def _ensure_gitignore_entry(repo_root: Path, entry: str):
         gitignore.write_text(f"{entry}\n")
 
 
-def _preprocess_ocr_crop(crop_img, engine="easyocr"):
+def _preprocess_ocr_crop(crop_img, engine="easyocr",
+                          text_color="light_on_dark"):
     """Preprocess a cropped ROI image for OCR.
 
-    For EasyOCR (neural-network based):
-        grayscale → 3x upscale
-        EasyOCR handles contrast/binarisation internally; feeding it a
-        hard binary image destroys detail the network needs.
+    Both engines receive: grayscale → 3x upscale → binarise → ensure
+    dark-text-on-white-background → pad with white border.
 
-    For Tesseract (rule-based):
-        grayscale → 3x upscale → adaptive threshold → auto-invert
-        Tesseract works best with clean dark-on-white binary text.
+    Parameters
+    ----------
+    crop_img : numpy array
+        The raw ROI crop (BGR or grayscale).
+    engine : str
+        ``"easyocr"`` uses Otsu threshold; ``"tesseract"`` uses adaptive
+        Gaussian threshold.
+    text_color : str
+        ``"light_on_dark"`` — bright text on a dark background (most DVRs).
+        ``"dark_on_light"`` — dark text on a bright background.
+        Used to deterministically invert the image so the output is
+        always dark-text-on-white for the OCR engine.
     """
     import cv2
-    import numpy as np
 
     if len(crop_img.shape) == 3:
         gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
@@ -79,17 +86,30 @@ def _preprocess_ocr_crop(crop_img, engine="easyocr"):
     gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
 
     if engine == "easyocr":
-        # EasyOCR works best with a clean grayscale upscale
-        return gray
+        # Light Gaussian blur to reduce compression noise
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        # Otsu threshold — clean global binarisation
+        _, binary = cv2.threshold(gray, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        # Adaptive threshold — handles uneven illumination
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 10)
 
-    # Tesseract: binarise for optimal rule-based recognition
-    binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10)
-
-    # If background is mostly dark (white text on dark), invert for Tesseract
-    if np.mean(binary) < 128:
+    # Ensure dark text on white background.
+    # After thresholding, light-on-dark text produces a mostly-black
+    # image with white text → invert.  Dark-on-light is already correct.
+    if text_color == "light_on_dark":
+        # White text was thresholded to white (255) on black (0).
+        # Invert so text becomes dark on white background.
         binary = cv2.bitwise_not(binary)
+
+    # Add white border padding — helps OCR engines detect text edges
+    pad = 20
+    binary = cv2.copyMakeBorder(
+        binary, pad, pad, pad, pad,
+        cv2.BORDER_CONSTANT, value=255)
 
     return binary
 
@@ -175,7 +195,8 @@ class ConcatenationWorker(QThread):
                  enable_ocr=False, ocr_roi=None, ocr_source_resolution=None,
                  ocr_engine="easyocr", ocr_decoder="greedy",
                  ocr_timestamp_format=None,
-                 ocr_sample_interval_sec=1):
+                 ocr_sample_interval_sec=1,
+                 ocr_text_color="light_on_dark"):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
@@ -196,6 +217,7 @@ class ConcatenationWorker(QThread):
         self.ocr_decoder = ocr_decoder                  # "greedy" or "beamsearch" (EasyOCR only)
         self.ocr_timestamp_format = ocr_timestamp_format  # key from TIMESTAMP_FORMATS or None
         self.ocr_sample_interval_sec = ocr_sample_interval_sec  # seconds between OCR samples
+        self.ocr_text_color = ocr_text_color              # "light_on_dark" or "dark_on_light"
         # Mutex/condition for blocking the worker until the user responds
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
@@ -435,6 +457,13 @@ class ConcatenationWorker(QThread):
                 "-fflags", "+genpts",
                 "-vsync", "vfr",
             ]
+            # If chunking is enabled, force keyframes at chunk boundaries
+            # so the segment muxer can split cleanly without re-encoding.
+            if self.enable_chunking and self.chunk_duration_minutes > 0:
+                chunk_sec = self.chunk_duration_minutes * 60
+                command.extend([
+                    "-force_key_frames", f"expr:gte(t,n_forced*{chunk_sec})",
+                ])
             if remove_audio:
                 command.append("-an")
             else:
@@ -455,8 +484,14 @@ class ConcatenationWorker(QThread):
                 "-fflags", "+genpts",
                 "-vsync", "vfr",
                 "-an",
-                output_file
             ]
+            # Force keyframes at chunk boundaries if chunking is enabled
+            if self.enable_chunking and self.chunk_duration_minutes > 0:
+                chunk_sec = self.chunk_duration_minutes * 60
+                command.extend([
+                    "-force_key_frames", f"expr:gte(t,n_forced*{chunk_sec})",
+                ])
+            command.append(output_file)
 
         process = subprocess.Popen(
             command,
@@ -1001,8 +1036,8 @@ class ConcatenationWorker(QThread):
             "-c", "copy",
             "-f", "segment",
             "-segment_time", str(chunk_seconds),
+            "-segment_start_number", "1",
             "-reset_timestamps", "1",
-            "-break_non_keyframes", "1",
             chunk_pattern
         ]
 
@@ -1147,15 +1182,21 @@ class ConcatenationWorker(QThread):
     def _ocr_read_text(self, processed_img):
         """Run OCR on a preprocessed image and return the raw text string."""
         if self.ocr_engine == "easyocr":
-            # Let EasyOCR read without allowlist for best accuracy on
-            # timestamps — allowlist forces the model to map ambiguous
-            # features to restricted chars and *reduces* accuracy.
-            # paragraph=True merges nearby text boxes into one line.
+            # The ROI is already tightly cropped to the timestamp, so we
+            # tune CRAFT detection to treat the whole image as one text
+            # region rather than splitting it into sub-boxes:
+            #   - width_ths=2.0: merge boxes within 2× char width
+            #   - text_threshold=0.3: lower confidence for text detection
+            #   - low_text=0.3: lower threshold for text boundary
+            #   - paragraph=True: merge into single output string
             results = self._easyocr_reader.readtext(
                 processed_img,
                 detail=0,
                 decoder=self.ocr_decoder,
                 paragraph=True,
+                width_ths=2.0,
+                text_threshold=0.3,
+                low_text=0.3,
             )
             return " ".join(results).strip()
         else:
@@ -1223,7 +1264,9 @@ class ConcatenationWorker(QThread):
                 frame_idx += sample_interval
                 continue
 
-            processed = _preprocess_ocr_crop(crop, engine=self.ocr_engine)
+            processed = _preprocess_ocr_crop(
+                crop, engine=self.ocr_engine,
+                text_color=self.ocr_text_color)
 
             try:
                 raw_text = self._ocr_read_text(processed)
@@ -1719,6 +1762,7 @@ class OCRRoiSelector(QDialog):
         self._ocr_engine = ocr_engine      # "easyocr" or "tesseract"
         self._ocr_decoder = ocr_decoder    # "greedy" or "beamsearch"
         self.timestamp_format = None       # key from TIMESTAMP_FORMATS or None
+        self.text_color = "light_on_dark"  # default; updated from combo on preview/accept
 
         self.setWindowTitle("Select OCR Timestamp Region")
         self.setMinimumSize(750, 550)
@@ -1791,6 +1835,31 @@ class OCRRoiSelector(QDialog):
             "QComboBox QAbstractItemView { background-color: #3c3c3c; "
             "color: #cccccc; selection-background-color: #0078d4; }")
         fmt_row.addWidget(self.fmt_combo)
+
+        fmt_row.addSpacing(20)
+
+        text_color_label = QLabel("Text color:")
+        text_color_label.setStyleSheet("color: #cccccc;")
+        fmt_row.addWidget(text_color_label)
+
+        self.text_color_combo = QComboBox()
+        self.text_color_combo.addItem("Light on dark", "light_on_dark")
+        self.text_color_combo.addItem("Dark on light", "dark_on_light")
+        self.text_color_combo.setToolTip(
+            "Select the appearance of the timestamp text in the video.\n\n"
+            "Light on dark: white/bright text on a dark background\n"
+            "(most common for DVR/NVR overlays).\n\n"
+            "Dark on light: dark text on a bright background.\n\n"
+            "This tells the preprocessor how to produce a clean\n"
+            "dark-text-on-white image for the OCR engine.")
+        self.text_color_combo.setFixedWidth(140)
+        self.text_color_combo.setStyleSheet(
+            "QComboBox { background-color: #3c3c3c; border: 1px solid #555; "
+            "color: #cccccc; padding: 3px 6px; }"
+            "QComboBox QAbstractItemView { background-color: #3c3c3c; "
+            "color: #cccccc; selection-background-color: #0078d4; }")
+        fmt_row.addWidget(self.text_color_combo)
+
         fmt_row.addStretch()
 
         layout.addLayout(fmt_row)
@@ -1806,8 +1875,9 @@ class OCRRoiSelector(QDialog):
             "border: 1px solid #555; background-color: #1e1e1e; padding: 2px;")
         self.processed_img_label.setToolTip(
             "This shows the preprocessed ROI image that is fed to the\n"
-            "OCR engine. For EasyOCR this is a grayscale upscale;\n"
-            "for Tesseract this is a binarised (black & white) image.")
+            "OCR engine. The image is binarised (black & white) with\n"
+            "dark text on a white background — this is what the OCR\n"
+            "engine actually sees.")
         preview_row.addWidget(self.processed_img_label)
 
         preview_text_col = QVBoxLayout()
@@ -1963,7 +2033,9 @@ class OCRRoiSelector(QDialog):
             self.ocr_parsed_label.setText("Parsed: —")
             return
 
-        processed = _preprocess_ocr_crop(crop, engine=self._ocr_engine)
+        text_color = self.text_color_combo.currentData()
+        processed = _preprocess_ocr_crop(
+            crop, engine=self._ocr_engine, text_color=text_color)
 
         # --- Display the processed image ---
         disp = processed.copy()
@@ -2002,7 +2074,10 @@ class OCRRoiSelector(QDialog):
                 results = self._easyocr_reader.readtext(
                     processed, detail=0,
                     decoder=self._ocr_decoder,
-                    paragraph=True)
+                    paragraph=True,
+                    width_ths=2.0,
+                    text_threshold=0.3,
+                    low_text=0.3)
                 raw_text = " ".join(results).strip()
             else:
                 import pytesseract
@@ -2561,7 +2636,7 @@ class VideoConcatenationGUI(QMainWindow):
 
         chunk_info = QLabel(
             "ℹ️ Chunks are numbered sequentially "
-            "(e.g. _part000, _part001, ...)")
+            "(e.g. _part001, _part002, ...)")
         chunk_info.setStyleSheet("color: #999999; font-style: italic;")
         chunk_info.setWordWrap(True)
         chunk_grid.addWidget(chunk_info, 1, 0, 1, 2)
@@ -2717,6 +2792,7 @@ class VideoConcatenationGUI(QMainWindow):
         self._ocr_roi = None               # (x, y, w, h) in video coords
         self._ocr_source_resolution = None  # (w, h) of the video the ROI was drawn on
         self._ocr_timestamp_format = None  # key from TIMESTAMP_FORMATS or None
+        self._ocr_text_color = "light_on_dark"  # "light_on_dark" or "dark_on_light"
 
     def toggle_advanced_options(self):
         """Toggle visibility of advanced options"""
@@ -2885,6 +2961,7 @@ class VideoConcatenationGUI(QMainWindow):
             self._ocr_roi = dialog.roi_video_coords
             self._ocr_source_resolution = dialog.video_size
             self._ocr_timestamp_format = dialog.timestamp_format
+            self._ocr_text_color = dialog.text_color_combo.currentData()
             vx, vy, vw, vh = self._ocr_roi
             self.ocr_roi_label.setText(
                 f"ROI: ({vx}, {vy}) to ({vx + vw}, {vy + vh})  [{vw} x {vh} px]")
@@ -3095,7 +3172,8 @@ class VideoConcatenationGUI(QMainWindow):
             ocr_engine=ocr_engine,
             ocr_decoder=ocr_decoder,
             ocr_timestamp_format=self._ocr_timestamp_format,
-            ocr_sample_interval_sec=self.ocr_sample_interval_spin.value())
+            ocr_sample_interval_sec=self.ocr_sample_interval_spin.value(),
+            ocr_text_color=self._ocr_text_color)
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
