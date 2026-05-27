@@ -681,6 +681,19 @@ class ConcatenationWorker(QThread):
             command.extend(["-movflags", "+faststart"])
             command.append(output_file)
 
+        # Track which chunks have already had OCR run on them so that
+        # _post_concat can skip them.
+        self._ocr_completed_chunks = set()
+
+        # For inline chunking + OCR: monitor the output directory so we
+        # can run OCR on each chunk the moment FFmpeg finalises it.
+        ocr_inline = (chunking and self.enable_ocr
+                      and self.ocr_roi is not None)
+        if ocr_inline:
+            chunk_base_name, chunk_ext = os.path.splitext(output_file)
+            chunk_dir = os.path.dirname(output_file)
+            known_chunks = set()  # chunk paths we've already seen
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -705,7 +718,41 @@ class ConcatenationWorker(QThread):
                 if len(last_lines) > 20:
                     last_lines.pop(0)
 
+            # --- Inline OCR: check for newly completed chunks ---
+            if ocr_inline:
+                current_chunks = set(sorted(glob.glob(
+                    os.path.join(chunk_dir,
+                                 f"{os.path.basename(chunk_base_name)}"
+                                 f"_part*{chunk_ext}"))))
+                new_chunks = current_chunks - known_chunks
+                if new_chunks and known_chunks:
+                    # A new chunk appeared → the *previous* chunks in
+                    # known_chunks that haven't been OCR'd yet are now
+                    # finalised.  Run OCR on them.
+                    ready = sorted(known_chunks - self._ocr_completed_chunks)
+                    for chunk_path in ready:
+                        if self.should_stop:
+                            break
+                        self.progress_update.emit(
+                            f"🔎 Running OCR on completed chunk: "
+                            f"{os.path.basename(chunk_path)}")
+                        self._run_ocr_pass(chunk_path)
+                        self._ocr_completed_chunks.add(chunk_path)
+                known_chunks = current_chunks
+
         process.wait()
+
+        # --- Inline OCR: process the final chunk ---
+        if ocr_inline and known_chunks:
+            remaining = sorted(known_chunks - self._ocr_completed_chunks)
+            for chunk_path in remaining:
+                if self.should_stop:
+                    break
+                self.progress_update.emit(
+                    f"🔎 Running OCR on final chunk: "
+                    f"{os.path.basename(chunk_path)}")
+                self._run_ocr_pass(chunk_path)
+                self._ocr_completed_chunks.add(chunk_path)
 
         try:
             os.remove(list_file)
@@ -1194,11 +1241,15 @@ class ConcatenationWorker(QThread):
                 if fallback_chunks:
                     output_files = fallback_chunks
 
-        # OCR if enabled
+        # OCR if enabled — skip chunks already processed inline during
+        # encoding (tracked in self._ocr_completed_chunks).
         if self.enable_ocr and self.ocr_roi is not None:
+            already_done = getattr(self, "_ocr_completed_chunks", set())
             for vf in output_files:
                 if self.should_stop:
                     break
+                if vf in already_done:
+                    continue
                 self._run_ocr_pass(vf)
 
         return output_files
