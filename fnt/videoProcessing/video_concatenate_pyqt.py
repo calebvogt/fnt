@@ -55,11 +55,17 @@ def _ensure_gitignore_entry(repo_root: Path, entry: str):
         gitignore.write_text(f"{entry}\n")
 
 
-def _preprocess_ocr_crop(crop_img):
-    """Preprocess a cropped ROI image for OCR (EasyOCR or Tesseract).
+def _preprocess_ocr_crop(crop_img, engine="easyocr"):
+    """Preprocess a cropped ROI image for OCR.
 
-    Steps: grayscale → 3x upscale → adaptive threshold → auto-invert
-    so that text is always dark-on-white (optimal for OCR engines).
+    For EasyOCR (neural-network based):
+        grayscale → 3x upscale
+        EasyOCR handles contrast/binarisation internally; feeding it a
+        hard binary image destroys detail the network needs.
+
+    For Tesseract (rule-based):
+        grayscale → 3x upscale → adaptive threshold → auto-invert
+        Tesseract works best with clean dark-on-white binary text.
     """
     import cv2
     import numpy as np
@@ -72,6 +78,11 @@ def _preprocess_ocr_crop(crop_img):
     h, w = gray.shape
     gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
 
+    if engine == "easyocr":
+        # EasyOCR works best with a clean grayscale upscale
+        return gray
+
+    # Tesseract: binarise for optimal rule-based recognition
     binary = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 31, 10)
@@ -1068,11 +1079,15 @@ class ConcatenationWorker(QThread):
     def _ocr_read_text(self, processed_img):
         """Run OCR on a preprocessed image and return the raw text string."""
         if self.ocr_engine == "easyocr":
+            # Let EasyOCR read without allowlist for best accuracy on
+            # timestamps — allowlist forces the model to map ambiguous
+            # features to restricted chars and *reduces* accuracy.
+            # paragraph=True merges nearby text boxes into one line.
             results = self._easyocr_reader.readtext(
                 processed_img,
                 detail=0,
                 decoder=self.ocr_decoder,
-                allowlist="0123456789/:-. ",
+                paragraph=True,
             )
             return " ".join(results).strip()
         else:
@@ -1134,7 +1149,7 @@ class ConcatenationWorker(QThread):
                 frame_idx += sample_interval
                 continue
 
-            processed = _preprocess_ocr_crop(crop)
+            processed = _preprocess_ocr_crop(crop, engine=self.ocr_engine)
 
             try:
                 raw_text = self._ocr_read_text(processed)
@@ -1723,15 +1738,18 @@ class OCRRoiSelector(QDialog):
     # ------------------------------------------------------------------
     # Frame loading
     # ------------------------------------------------------------------
-    def _load_frame(self, frame_idx=0):
-        """Load a frame from the first video file and display it."""
+    def _load_frame(self, frame_idx=0, video_index=0):
+        """Load a frame from the specified video file and display it."""
         import cv2
 
         if not self.video_files:
             return
-        cap = cv2.VideoCapture(self.video_files[0])
+        video_index = max(0, min(video_index, len(self.video_files) - 1))
+        video_path = self.video_files[video_index]
+        cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            self.roi_info.setText("Error: could not open video file")
+            self.roi_info.setText(
+                f"Error: could not open {os.path.basename(video_path)}")
             return
 
         self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1775,9 +1793,21 @@ class OCRRoiSelector(QDialog):
         self.adjustSize()
 
     def _show_random_frame(self):
-        if self._total_frames > 1:
-            idx = random.randint(0, self._total_frames - 1)
-            self._load_frame(idx)
+        """Load a random frame from a random video in the folder set."""
+        if not self.video_files:
+            return
+        vid_idx = random.randint(0, len(self.video_files) - 1)
+        # We need to probe this video's frame count
+        import cv2
+        cap = cv2.VideoCapture(self.video_files[vid_idx])
+        if not cap.isOpened():
+            # Fallback to first video frame 0
+            self._load_frame(0, video_index=0)
+            return
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        frame_idx = random.randint(0, max(0, total - 1)) if total > 0 else 0
+        self._load_frame(frame_idx, video_index=vid_idx)
 
     # ------------------------------------------------------------------
     # ROI handling
@@ -1808,7 +1838,7 @@ class OCRRoiSelector(QDialog):
             self.ocr_preview.setText("OCR Preview: ROI is empty")
             return
 
-        processed = _preprocess_ocr_crop(crop)
+        processed = _preprocess_ocr_crop(crop, engine=self._ocr_engine)
 
         try:
             if self._ocr_engine == "easyocr":
@@ -1832,7 +1862,7 @@ class OCRRoiSelector(QDialog):
                 results = self._easyocr_reader.readtext(
                     processed, detail=0,
                     decoder=self._ocr_decoder,
-                    allowlist="0123456789/:-. ")
+                    paragraph=True)
                 text = " ".join(results).strip()
             else:
                 import pytesseract
