@@ -687,12 +687,21 @@ class ConcatenationWorker(QThread):
 
         # For inline chunking + OCR: monitor the output directory so we
         # can run OCR on each chunk the moment FFmpeg finalises it.
+        # We throttle the glob check to avoid hammering the filesystem
+        # (especially on network drives) — check every ~30 seconds of
+        # wall-clock time rather than on every FFmpeg output line.
+        import time as _time
         ocr_inline = (chunking and self.enable_ocr
                       and self.ocr_roi is not None)
         if ocr_inline:
             chunk_base_name, chunk_ext = os.path.splitext(output_file)
             chunk_dir = os.path.dirname(output_file)
-            known_chunks = set()  # chunk paths we've already seen
+            chunk_glob_pattern = os.path.join(
+                chunk_dir,
+                f"{os.path.basename(chunk_base_name)}_part*{chunk_ext}")
+            known_chunks = set()       # chunk paths we've already seen
+            _last_glob_time = _time.monotonic()
+            _GLOB_INTERVAL = 30        # seconds between filesystem checks
 
         process = subprocess.Popen(
             command,
@@ -718,32 +727,37 @@ class ConcatenationWorker(QThread):
                 if len(last_lines) > 20:
                     last_lines.pop(0)
 
-            # --- Inline OCR: check for newly completed chunks ---
+            # --- Inline OCR: periodically check for newly completed chunks ---
             if ocr_inline:
-                current_chunks = set(sorted(glob.glob(
-                    os.path.join(chunk_dir,
-                                 f"{os.path.basename(chunk_base_name)}"
-                                 f"_part*{chunk_ext}"))))
-                new_chunks = current_chunks - known_chunks
-                if new_chunks and known_chunks:
-                    # A new chunk appeared → the *previous* chunks in
-                    # known_chunks that haven't been OCR'd yet are now
-                    # finalised.  Run OCR on them.
-                    ready = sorted(known_chunks - self._ocr_completed_chunks)
-                    for chunk_path in ready:
-                        if self.should_stop:
-                            break
-                        self.progress_update.emit(
-                            f"🔎 Running OCR on completed chunk: "
-                            f"{os.path.basename(chunk_path)}")
-                        self._run_ocr_pass(chunk_path)
-                        self._ocr_completed_chunks.add(chunk_path)
-                known_chunks = current_chunks
+                now = _time.monotonic()
+                if now - _last_glob_time >= _GLOB_INTERVAL:
+                    _last_glob_time = now
+                    current_chunks = set(glob.glob(chunk_glob_pattern))
+                    new_chunks = current_chunks - known_chunks
+                    if new_chunks and known_chunks:
+                        # A new chunk appeared → the *previous* chunks in
+                        # known_chunks that haven't been OCR'd are finalised.
+                        ready = sorted(
+                            known_chunks - self._ocr_completed_chunks)
+                        for chunk_path in ready:
+                            if self.should_stop:
+                                break
+                            self.progress_update.emit(
+                                f"🔎 Running OCR on completed chunk: "
+                                f"{os.path.basename(chunk_path)}")
+                            self._run_ocr_pass(chunk_path)
+                            self._ocr_completed_chunks.add(chunk_path)
+                    known_chunks = current_chunks
 
         process.wait()
+        success = process.returncode == 0
 
-        # --- Inline OCR: process the final chunk ---
-        if ocr_inline and known_chunks:
+        # --- Inline OCR: process the final chunk (only if FFmpeg succeeded,
+        #     otherwise the last chunk file is incomplete/corrupt) ---
+        if ocr_inline and success:
+            # One final glob to catch any chunks written since the last check
+            current_chunks = set(glob.glob(chunk_glob_pattern))
+            known_chunks |= current_chunks
             remaining = sorted(known_chunks - self._ocr_completed_chunks)
             for chunk_path in remaining:
                 if self.should_stop:
@@ -759,7 +773,7 @@ class ConcatenationWorker(QThread):
         except Exception:
             pass
 
-        return process.returncode == 0, last_lines
+        return success, last_lines
 
     # ------------------------------------------------------------------
     # Fast per-file decode test
