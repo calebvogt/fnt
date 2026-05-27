@@ -10,6 +10,9 @@ import os
 import sys
 import subprocess
 import glob
+import csv
+import random
+import re as _re
 from pathlib import Path
 
 try:
@@ -17,15 +20,66 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox,
         QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit,
-        QComboBox, QSpinBox, QCheckBox
+        QComboBox, QSpinBox, QCheckBox, QDialog, QSizePolicy
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QRect
+    from PyQt5.QtGui import QFont, QImage, QPixmap, QPainter, QPen, QColor
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
     print("PyQt5 not available. Please install with: pip install PyQt5")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# LocalModels directory (shared with SAM2 checkpoint manager)
+# ---------------------------------------------------------------------------
+_FNT_REPO_ROOT = Path(__file__).parent.parent.parent
+_LOCAL_MODELS_DIR = _FNT_REPO_ROOT / "LocalModels"
+_EASYOCR_MODEL_DIR = _LOCAL_MODELS_DIR / "easyocr"
+
+
+def _ensure_gitignore_entry(repo_root: Path, entry: str):
+    """Add an entry to .gitignore if it doesn't already exist."""
+    gitignore = repo_root / ".gitignore"
+    if gitignore.exists():
+        content = gitignore.read_text()
+        if entry in content:
+            return
+        if not content.endswith("\n"):
+            content += "\n"
+        content += f"{entry}\n"
+        gitignore.write_text(content)
+    else:
+        gitignore.write_text(f"{entry}\n")
+
+
+def _preprocess_ocr_crop(crop_img):
+    """Preprocess a cropped ROI image for OCR (EasyOCR or Tesseract).
+
+    Steps: grayscale → 3x upscale → adaptive threshold → auto-invert
+    so that text is always dark-on-white (optimal for OCR engines).
+    """
+    import cv2
+    import numpy as np
+
+    if len(crop_img.shape) == 3:
+        gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop_img.copy()
+
+    h, w = gray.shape
+    gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10)
+
+    # If background is mostly dark (white text on dark), invert for Tesseract
+    if np.mean(binary) < 128:
+        binary = cv2.bitwise_not(binary)
+
+    return binary
 
 
 class ConcatenationWorker(QThread):
@@ -41,7 +95,9 @@ class ConcatenationWorker(QThread):
 
     def __init__(self, input_dirs, output_filename, sort_order="default", instance_id=1,
                  enable_preprocessing=False, preprocess_settings=None,
-                 enable_chunking=False, chunk_duration_minutes=30):
+                 enable_chunking=False, chunk_duration_minutes=60,
+                 enable_ocr=False, ocr_roi=None, ocr_source_resolution=None,
+                 ocr_engine="easyocr", ocr_decoder="greedy"):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
@@ -54,6 +110,12 @@ class ConcatenationWorker(QThread):
         # Chunking settings
         self.enable_chunking = enable_chunking
         self.chunk_duration_minutes = chunk_duration_minutes
+        # OCR settings
+        self.enable_ocr = enable_ocr
+        self.ocr_roi = ocr_roi                          # (x, y, w, h) in source video coords
+        self.ocr_source_resolution = ocr_source_resolution  # (w, h) of the video the ROI was drawn on
+        self.ocr_engine = ocr_engine                    # "easyocr" or "tesseract"
+        self.ocr_decoder = ocr_decoder                  # "greedy" or "beamsearch" (EasyOCR only)
         # Mutex/condition for blocking the worker until the user responds
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
@@ -266,8 +328,10 @@ class ConcatenationWorker(QThread):
 
             if resolution == "1080p":
                 width, height = 1920, 1080
-            else:
+            elif resolution == "720p":
                 width, height = 1280, 720
+            else:  # 480p
+                width, height = 854, 480
 
             video_filters = [f"fps={frame_rate}"]
             video_filters.append(
@@ -759,8 +823,7 @@ class ConcatenationWorker(QThread):
 
             if ok:
                 self.progress_update.emit(f"✅ Successfully created: {os.path.basename(output_file)}")
-                if self.enable_chunking and self.chunk_duration_minutes > 0:
-                    self._chunk_output(output_file)
+                final_files = self._post_concat(output_file)
                 self._cleanup_repaired(repaired_map)
                 return True
 
@@ -779,8 +842,8 @@ class ConcatenationWorker(QThread):
                 video_files, folder_path, output_file, repaired_map,
                 initial_last_lines=last_lines)
             self._cleanup_repaired(repaired_map)
-            if success and self.enable_chunking and self.chunk_duration_minutes > 0:
-                self._chunk_output(output_file)
+            if success:
+                self._post_concat(output_file)
             return success
 
         except Exception as e:
@@ -788,6 +851,28 @@ class ConcatenationWorker(QThread):
             import traceback
             traceback.print_exc()
             return False
+
+    def _post_concat(self, output_file):
+        """Run chunking and/or OCR on a successfully concatenated output file.
+
+        Returns the list of final output video files.
+        """
+        output_files = [output_file]
+
+        # Chunk if enabled
+        if self.enable_chunking and self.chunk_duration_minutes > 0:
+            chunks = self._chunk_output(output_file)
+            if chunks:
+                output_files = chunks
+
+        # OCR if enabled
+        if self.enable_ocr and self.ocr_roi is not None:
+            for vf in output_files:
+                if self.should_stop:
+                    break
+                self._run_ocr_pass(vf)
+
+        return output_files
 
     def _cleanup_repaired(self, repaired_map):
         """Remove any temporary repaired video files."""
@@ -802,12 +887,16 @@ class ConcatenationWorker(QThread):
     # Chunking helper
     # ------------------------------------------------------------------
     def _chunk_output(self, output_file):
-        """Split the concatenated output into time-based chunks using stream copy."""
+        """Split the concatenated output into time-based chunks using stream copy.
+
+        Returns a list of chunk file paths on success, or an empty list if
+        chunking was skipped or failed (the original file is preserved).
+        """
         duration = self._get_duration(output_file)
         if duration is None:
             self.progress_update.emit(
                 "⚠️ Could not determine video duration. Skipping chunking.")
-            return
+            return []
 
         chunk_seconds = self.chunk_duration_minutes * 60
 
@@ -815,7 +904,7 @@ class ConcatenationWorker(QThread):
             self.progress_update.emit(
                 f"Video duration ({duration:.0f}s) is shorter than chunk size "
                 f"({self.chunk_duration_minutes} min). No chunking needed.")
-            return
+            return []
 
         num_chunks = int(duration // chunk_seconds) + (
             1 if duration % chunk_seconds > 0 else 0)
@@ -847,7 +936,7 @@ class ConcatenationWorker(QThread):
         for line in process.stdout:
             if self.should_stop:
                 process.terminate()
-                return
+                return []
             line = line.strip()
             if line:
                 self.ffmpeg_output.emit(line)
@@ -871,9 +960,226 @@ class ConcatenationWorker(QThread):
                     f"Removed full file: {os.path.basename(output_file)}")
             except Exception:
                 pass
+            return chunks
         else:
             self.progress_update.emit(
                 "⚠️ Chunking failed. Full concatenated file preserved.")
+            return []
+
+    # ------------------------------------------------------------------
+    # OCR timestamp extraction
+    # ------------------------------------------------------------------
+    def _map_roi_to_output(self, video_file):
+        """Map the ROI from source-video coordinates to output-video coordinates.
+
+        When preprocessing changes the resolution, the ROI drawn on the
+        original frame must be transformed to match the output layout
+        (scale + letterbox padding).  Returns (x, y, w, h) in output coords.
+        """
+        import cv2
+
+        if self.ocr_roi is None:
+            return None
+        rx, ry, rw, rh = self.ocr_roi
+
+        if not self.enable_preprocessing or self.ocr_source_resolution is None:
+            return self.ocr_roi  # no resolution change
+
+        src_w, src_h = self.ocr_source_resolution
+
+        # Determine target resolution from preprocessing settings
+        ps = self.preprocess_settings
+        res = ps.get("resolution", "1080p")
+        if res == "1080p":
+            tgt_w, tgt_h = 1920, 1080
+        elif res == "720p":
+            tgt_w, tgt_h = 1280, 720
+        else:
+            tgt_w, tgt_h = 854, 480
+
+        # Same transform as the ffmpeg scale+pad filter
+        scale = min(tgt_w / src_w, tgt_h / src_h)
+        scaled_w = int(src_w * scale)
+        scaled_h = int(src_h * scale)
+        pad_x = (tgt_w - scaled_w) // 2
+        pad_y = (tgt_h - scaled_h) // 2
+
+        ox = int(rx * scale) + pad_x
+        oy = int(ry * scale) + pad_y
+        ow = int(rw * scale)
+        oh = int(rh * scale)
+        return (ox, oy, ow, oh)
+
+    def _init_ocr_engine(self):
+        """Lazily initialise the OCR engine.  Called once per worker run.
+
+        For EasyOCR this creates an ``easyocr.Reader`` stored in
+        ``self._easyocr_reader``.  For Tesseract it simply verifies
+        that ``pytesseract`` is importable.
+        """
+        if self.ocr_engine == "easyocr":
+            try:
+                import easyocr  # noqa: F811
+            except ImportError:
+                self.progress_update.emit(
+                    "⚠️ easyocr not installed — skipping OCR.  "
+                    "Install with:  pip install easyocr")
+                return False
+
+            # Ensure LocalModels/easyocr folder exists + .gitignore entry
+            _EASYOCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            _ensure_gitignore_entry(_FNT_REPO_ROOT, "LocalModels/")
+
+            use_gpu = False
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    use_gpu = True
+            except ImportError:
+                pass
+
+            self.progress_update.emit(
+                f"🔤 Initialising EasyOCR (GPU={'yes' if use_gpu else 'no'}, "
+                f"decoder={self.ocr_decoder})...")
+            self._easyocr_reader = easyocr.Reader(
+                ["en"],
+                gpu=use_gpu,
+                model_storage_directory=str(_EASYOCR_MODEL_DIR),
+                verbose=False,
+            )
+            return True
+
+        else:  # tesseract
+            try:
+                import pytesseract  # noqa: F811
+                pytesseract.get_tesseract_version()
+            except ImportError:
+                self.progress_update.emit(
+                    "⚠️ pytesseract not installed — skipping OCR.  "
+                    "Install with:  pip install pytesseract")
+                return False
+            except Exception:
+                self.progress_update.emit(
+                    "⚠️ Tesseract binary not found on system — skipping OCR.")
+                return False
+            return True
+
+    def _ocr_read_text(self, processed_img):
+        """Run OCR on a preprocessed image and return the raw text string."""
+        if self.ocr_engine == "easyocr":
+            results = self._easyocr_reader.readtext(
+                processed_img,
+                detail=0,
+                decoder=self.ocr_decoder,
+                allowlist="0123456789/:-. ",
+            )
+            return " ".join(results).strip()
+        else:
+            import pytesseract
+            config = "--psm 7 -c tessedit_char_whitelist=0123456789/:-.  "
+            return pytesseract.image_to_string(
+                processed_img, config=config).strip()
+
+    def _run_ocr_pass(self, video_file):
+        """Run OCR on sampled frames and write a timestamp CSV alongside the video."""
+        import cv2
+
+        # Lazy-init the engine on first call
+        if not hasattr(self, "_ocr_engine_ready"):
+            self._ocr_engine_ready = self._init_ocr_engine()
+        if not self._ocr_engine_ready:
+            return
+
+        roi = self._map_roi_to_output(video_file)
+        if roi is None:
+            self.progress_update.emit("⚠️ No OCR ROI set — skipping OCR.")
+            return
+
+        engine_label = "EasyOCR" if self.ocr_engine == "easyocr" else "Tesseract"
+        self.progress_update.emit(
+            f"🔎 OCR pass ({engine_label}): {os.path.basename(video_file)}")
+
+        cap = cv2.VideoCapture(video_file)
+        if not cap.isOpened():
+            self.progress_update.emit(
+                f"⚠️ Could not open video for OCR: {os.path.basename(video_file)}")
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        sample_interval = max(1, int(fps))  # ~1 sample per second
+
+        rx, ry, rw, rh = roi
+
+        csv_path = os.path.splitext(video_file)[0] + "_timestamps.csv"
+        results = []
+        success_count = 0
+        frame_idx = 0
+
+        while frame_idx < total_frames:
+            if self.should_stop:
+                cap.release()
+                return
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                frame_idx += sample_interval
+                continue
+
+            # Crop & preprocess
+            crop = frame[ry:ry + rh, rx:rx + rw]
+            if crop.size == 0:
+                frame_idx += sample_interval
+                continue
+
+            processed = _preprocess_ocr_crop(crop)
+
+            try:
+                raw_text = self._ocr_read_text(processed)
+            except Exception:
+                raw_text = ""
+
+            parsed = self._parse_timestamp(raw_text)
+            results.append((frame_idx, raw_text, parsed))
+            if parsed:
+                success_count += 1
+
+            # Progress every 200 samples
+            if len(results) % 200 == 0:
+                self.progress_update.emit(
+                    f"  OCR: {len(results)} samples  "
+                    f"(frame {frame_idx}/{total_frames})")
+
+            frame_idx += sample_interval
+
+        cap.release()
+
+        # Write CSV
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_number", "timestamp_raw", "timestamp_parsed"])
+            writer.writerows(results)
+
+        total_samples = len(results)
+        rate = (success_count / total_samples * 100) if total_samples > 0 else 0
+        self.progress_update.emit(
+            f"✅ OCR complete: {os.path.basename(csv_path)}  "
+            f"({total_samples} samples, {rate:.0f}% parsed)")
+
+    @staticmethod
+    def _parse_timestamp(raw_text):
+        """Try to parse a raw OCR string into an ISO-8601 datetime.
+
+        Returns the parsed string or empty string on failure.
+        """
+        # YYYY/MM/DD HH:MM:SS  or  YYYY-MM-DD HH:MM:SS  or  YYYY.MM.DD ...
+        m = _re.search(
+            r'(\d{4})[/\-.](\d{2})[/\-.](\d{2})\s*(\d{2})[:\-.](\d{2})[:\-.](\d{2})',
+            raw_text)
+        if m:
+            return "{}-{}-{}T{}:{}:{}".format(*m.groups())
+        return ""
 
     # ------------------------------------------------------------------
     # Incremental failure recovery helpers
@@ -1266,6 +1572,297 @@ class ConcatenationWorker(QThread):
             self._cleanup_temp_dir(temp_dir)
 
 
+# ======================================================================
+# OCR ROI Selection Dialog
+# ======================================================================
+
+class FrameLabel(QLabel):
+    """QLabel subclass that allows drawing a rectangle via mouse drag."""
+    roi_changed = pyqtSignal(tuple)  # (x, y, w, h) in display coordinates
+
+    def __init__(self):
+        super().__init__()
+        self._start = None
+        self._current = None
+        self.roi_rect = None  # (x, y, w, h) in display coords
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._start = event.pos()
+            self._current = event.pos()
+            self.roi_rect = None
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._start is not None:
+            self._current = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._start is not None:
+            end = event.pos()
+            x1, y1 = min(self._start.x(), end.x()), min(self._start.y(), end.y())
+            x2, y2 = max(self._start.x(), end.x()), max(self._start.y(), end.y())
+            w, h = x2 - x1, y2 - y1
+            if w > 5 and h > 5:
+                self.roi_rect = (x1, y1, w, h)
+                self.roi_changed.emit(self.roi_rect)
+            self._start = None
+            self._current = None
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        pen = QPen(QColor(0, 120, 212), 2, Qt.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(QColor(0, 120, 212, 40))
+        if self._start is not None and self._current is not None:
+            painter.drawRect(QRect(self._start, self._current).normalized())
+        elif self.roi_rect is not None:
+            x, y, w, h = self.roi_rect
+            painter.drawRect(x, y, w, h)
+        painter.end()
+
+
+class OCRRoiSelector(QDialog):
+    """Dialog for selecting the OCR ROI region on a video frame."""
+
+    VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".MP4", ".mkv", ".flv", ".wmv", ".m4v")
+
+    def __init__(self, video_files, parent=None, ocr_engine="easyocr",
+                 ocr_decoder="greedy"):
+        super().__init__(parent)
+        self.video_files = video_files
+        self.video_size = None       # (width, height) of the actual video
+        self.display_scale = 1.0
+        self.roi_video_coords = None  # (x, y, w, h) in video pixel coordinates
+        self._current_frame = None    # numpy array (BGR)
+        self._total_frames = 0
+        self._ocr_engine = ocr_engine      # "easyocr" or "tesseract"
+        self._ocr_decoder = ocr_decoder    # "greedy" or "beamsearch"
+
+        self.setWindowTitle("Select OCR Timestamp Region")
+        self.setMinimumSize(750, 550)
+        self.setStyleSheet("""
+            QDialog { background-color: #2b2b2b; color: #cccccc; }
+            QLabel { color: #cccccc; background-color: transparent; }
+            QPushButton {
+                background-color: #0078d4; color: white; border: none;
+                padding: 8px 16px; border-radius: 4px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #106ebe; }
+            QPushButton:disabled { background-color: #3f3f3f; color: #888888; }
+        """)
+        self._build_ui()
+        self._load_frame(frame_idx=0)
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        instr = QLabel(
+            "Draw a rectangle around the timestamp text in the video frame below.\n"
+            "The OCR engine will read text from this region for every output video.")
+        instr.setWordWrap(True)
+        instr.setStyleSheet("color: #999999; margin-bottom: 6px;")
+        layout.addWidget(instr)
+
+        # Frame display
+        self.frame_label = FrameLabel()
+        self.frame_label.setAlignment(Qt.AlignCenter)
+        self.frame_label.setMinimumSize(640, 360)
+        self.frame_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.frame_label.roi_changed.connect(self._on_roi_changed)
+        layout.addWidget(self.frame_label, stretch=1)
+
+        # Info labels
+        self.roi_info = QLabel("ROI: not set — click and drag on the frame above")
+        self.roi_info.setStyleSheet("margin-top: 4px;")
+        layout.addWidget(self.roi_info)
+
+        self.ocr_preview = QLabel("OCR Preview: —")
+        layout.addWidget(self.ocr_preview)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+
+        random_btn = QPushButton("Show Random Frame")
+        random_btn.setToolTip(
+            "Load a random frame from the first video.\n"
+            "Use this if the timestamp text is not visible on the\n"
+            "default first frame (e.g. camera was off at the start).")
+        random_btn.clicked.connect(self._show_random_frame)
+        btn_row.addWidget(random_btn)
+
+        preview_btn = QPushButton("Preview OCR")
+        preview_btn.setToolTip(
+            "Run OCR on the current ROI to verify it reads correctly\n"
+            "before committing to the full video pass.")
+        preview_btn.clicked.connect(self._preview_ocr)
+        btn_row.addWidget(preview_btn)
+
+        btn_row.addStretch()
+
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.ok_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # Frame loading
+    # ------------------------------------------------------------------
+    def _load_frame(self, frame_idx=0):
+        """Load a frame from the first video file and display it."""
+        import cv2
+
+        if not self.video_files:
+            return
+        cap = cv2.VideoCapture(self.video_files[0])
+        if not cap.isOpened():
+            self.roi_info.setText("Error: could not open video file")
+            return
+
+        self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_idx = max(0, min(frame_idx, self._total_frames - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            self.roi_info.setText("Error: could not read frame")
+            return
+
+        self._current_frame = frame
+        h, w = frame.shape[:2]
+        self.video_size = (w, h)
+
+        # Scale to fit dialog
+        max_w, max_h = 950, 560
+        self.display_scale = min(max_w / w, max_h / h, 1.0)
+        disp_w = int(w * self.display_scale)
+        disp_h = int(h * self.display_scale)
+
+        display = cv2.resize(frame, (disp_w, disp_h))
+        display = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        qimg = QImage(display.data, disp_w, disp_h,
+                       disp_w * 3, QImage.Format_RGB888)
+        self.frame_label.setPixmap(QPixmap.fromImage(qimg))
+        self.frame_label.setFixedSize(disp_w, disp_h)
+
+        # Preserve existing ROI across frame changes if possible
+        if self.roi_video_coords is not None:
+            vx, vy, vw, vh = self.roi_video_coords
+            dx = int(vx * self.display_scale)
+            dy = int(vy * self.display_scale)
+            dw = int(vw * self.display_scale)
+            dh = int(vh * self.display_scale)
+            self.frame_label.roi_rect = (dx, dy, dw, dh)
+        else:
+            self.frame_label.roi_rect = None
+
+        self.frame_label.update()
+        self.adjustSize()
+
+    def _show_random_frame(self):
+        if self._total_frames > 1:
+            idx = random.randint(0, self._total_frames - 1)
+            self._load_frame(idx)
+
+    # ------------------------------------------------------------------
+    # ROI handling
+    # ------------------------------------------------------------------
+    def _on_roi_changed(self, display_roi):
+        dx, dy, dw, dh = display_roi
+        s = self.display_scale
+        vx, vy = int(dx / s), int(dy / s)
+        vw, vh = int(dw / s), int(dh / s)
+        self.roi_video_coords = (vx, vy, vw, vh)
+        self.ok_btn.setEnabled(True)
+        vid_w, vid_h = self.video_size
+        self.roi_info.setText(
+            f"ROI: ({vx}, {vy}) to ({vx + vw}, {vy + vh})  "
+            f"[{vw} x {vh} px]   (video: {vid_w} x {vid_h})")
+
+    # ------------------------------------------------------------------
+    # OCR preview
+    # ------------------------------------------------------------------
+    def _preview_ocr(self):
+        if self._current_frame is None or self.roi_video_coords is None:
+            self.ocr_preview.setText("OCR Preview: draw an ROI first")
+            return
+
+        vx, vy, vw, vh = self.roi_video_coords
+        crop = self._current_frame[vy:vy + vh, vx:vx + vw]
+        if crop.size == 0:
+            self.ocr_preview.setText("OCR Preview: ROI is empty")
+            return
+
+        processed = _preprocess_ocr_crop(crop)
+
+        try:
+            if self._ocr_engine == "easyocr":
+                import easyocr
+                # Ensure model dir exists
+                _EASYOCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+                _ensure_gitignore_entry(_FNT_REPO_ROOT, "LocalModels/")
+                # Lazy-init a lightweight reader for preview
+                if not hasattr(self, "_easyocr_reader"):
+                    use_gpu = False
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            use_gpu = True
+                    except ImportError:
+                        pass
+                    self._easyocr_reader = easyocr.Reader(
+                        ["en"], gpu=use_gpu,
+                        model_storage_directory=str(_EASYOCR_MODEL_DIR),
+                        verbose=False)
+                results = self._easyocr_reader.readtext(
+                    processed, detail=0,
+                    decoder=self._ocr_decoder,
+                    allowlist="0123456789/:-. ")
+                text = " ".join(results).strip()
+            else:
+                import pytesseract
+                config = "--psm 7 -c tessedit_char_whitelist=0123456789/:-.  "
+                text = pytesseract.image_to_string(
+                    processed, config=config).strip()
+
+            self.ocr_preview.setText(f'OCR Preview: "{text}"')
+            if text:
+                self.ocr_preview.setStyleSheet("color: #00cc66;")
+            else:
+                self.ocr_preview.setStyleSheet("color: #ff6666;")
+        except ImportError:
+            pkg = "easyocr" if self._ocr_engine == "easyocr" else "pytesseract"
+            self.ocr_preview.setText(
+                f"OCR Preview: {pkg} not installed (pip install {pkg})")
+            self.ocr_preview.setStyleSheet("color: #ff6666;")
+        except Exception as e:
+            self.ocr_preview.setText(f"OCR Preview: Error — {e}")
+            self.ocr_preview.setStyleSheet("color: #ff6666;")
+
+    @classmethod
+    def find_video_files(cls, directories, sort_order="default"):
+        """Find all video files in the given directories."""
+        files = set()
+        for d in directories:
+            for ext in cls.VIDEO_EXTENSIONS:
+                files.update(glob.glob(os.path.join(d, f"*{ext}")))
+        return sorted(files)
+
+
 class VideoConcatenationGUI(QMainWindow):
     """Main GUI window for video concatenation"""
     
@@ -1349,23 +1946,62 @@ class VideoConcatenationGUI(QMainWindow):
                 background-color: #1e1e1e;
                 color: #cccccc;
             }
-            QSpinBox::up-button, QSpinBox::down-button {
+            QSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 20px;
                 background-color: #3f3f3f;
-                border: 1px solid #3f3f3f;
+                border: 1px solid #555555;
+                border-bottom: none;
+                border-top-right-radius: 3px;
+            }
+            QSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 20px;
+                background-color: #3f3f3f;
+                border: 1px solid #555555;
+                border-top: none;
+                border-bottom-right-radius: 3px;
+            }
+            QSpinBox::up-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-bottom: 6px solid #ffffff;
+                width: 0;
+                height: 0;
+            }
+            QSpinBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid #ffffff;
+                width: 0;
+                height: 0;
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {
                 background-color: #0078d4;
             }
             QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 22px;
                 border: none;
                 background-color: #3f3f3f;
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }
+            QComboBox::drop-down:hover {
+                background-color: #0078d4;
             }
             QComboBox::down-arrow {
                 image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid #cccccc;
-                margin-right: 5px;
+                border-left: 6px solid transparent;
+                border-right: 6px solid transparent;
+                border-top: 7px solid #ffffff;
+                width: 0;
+                height: 0;
             }
             QComboBox QAbstractItemView {
                 background-color: #1e1e1e;
@@ -1506,7 +2142,10 @@ class VideoConcatenationGUI(QMainWindow):
         self.output_filename_edit.setText("concatenated_output.mp4")
         self.output_filename_edit.setPlaceholderText("Enter output filename...")
         self.output_filename_edit.setToolTip(
-            "Filename for the concatenated video (saved in concatenated_output/ subfolder)")
+            "Filename for the concatenated output video.\n\n"
+            "The file is saved in a 'concatenated_output/' subfolder within\n"
+            "each selected input directory. If a file with this name already\n"
+            "exists, a numbered suffix is added automatically.")
         basic_grid.addWidget(self.output_filename_edit, 0, 1)
 
         info_label = QLabel("💡 Files saved in concatenated_output/ subfolder")
@@ -1523,10 +2162,15 @@ class VideoConcatenationGUI(QMainWindow):
         ])
         self.sort_order_combo.setCurrentIndex(0)
         self.sort_order_combo.setToolTip(
-            "How to order videos for concatenation:\n"
-            "• Default: Standard alphabetical sorting\n"
-            "• ViewTron DVR: Handles ViewTron naming "
-            "(YYYYMMDDHHMMSS, then YYYYMMDDHHMMSS(001), etc.)")
+            "How to order videos before concatenation.\n\n"
+            " - Default (Alphabetical): Standard alphabetical sorting by\n"
+            "   filename. Works for most naming conventions.\n\n"
+            " - ViewTron DVR (Chronological): Parses ViewTron's timestamp-\n"
+            "   based naming convention (Base_YYYYMMDDHHMMSS.ext, then\n"
+            "   Base_YYYYMMDDHHMMSS(001).ext for continuation files) and\n"
+            "   sorts in true chronological order.\n\n"
+            "The sort order is preserved in the final output and in\n"
+            "chunk numbering when chunking is enabled.")
         basic_grid.addWidget(self.sort_order_combo, 1, 1)
 
         sort_info_label = QLabel("ℹ️ Choose ViewTron for DVR recordings")
@@ -1581,32 +2225,56 @@ class VideoConcatenationGUI(QMainWindow):
         pp_grid.addWidget(QLabel("Frame Rate (fps):"), 0, 0)
         self.pp_frame_rate_spin = QSpinBox()
         self.pp_frame_rate_spin.setRange(1, 120)
-        self.pp_frame_rate_spin.setValue(30)
-        self.pp_frame_rate_spin.setToolTip("Target frame rate for output video")
+        self.pp_frame_rate_spin.setValue(20)
+        self.pp_frame_rate_spin.setToolTip(
+            "Target frame rate for the output video.\n\n"
+            "Lowering the frame rate is one of the most effective ways to reduce\n"
+            "total file size and speed up downstream processing (e.g. tracking),\n"
+            "since fewer frames means less data to process per second of video.\n\n"
+            "For behavioral tracking, 15-20 fps is often sufficient. The original\n"
+            "DVR frame rate (often 25-30 fps) can be safely reduced without\n"
+            "losing meaningful behavioral events.")
         pp_grid.addWidget(self.pp_frame_rate_spin, 0, 1)
 
         # Resolution
         pp_grid.addWidget(QLabel("Resolution:"), 1, 0)
         self.pp_resolution_combo = QComboBox()
         self.pp_resolution_combo.addItems([
-            "1080p (1920x1080)", "720p (1280x720)"
+            "1080p (1920x1080)", "720p (1280x720)", "480p (854x480)"
         ])
         self.pp_resolution_combo.setCurrentText("1080p (1920x1080)")
-        self.pp_resolution_combo.setToolTip("Target output resolution")
+        self.pp_resolution_combo.setToolTip(
+            "Target output resolution. Videos are scaled to fit within this\n"
+            "frame size while preserving aspect ratio (letterboxed if needed).\n\n"
+            "Higher resolution preserves spatial detail that is important for\n"
+            "accurate pose estimation and tracking. For most tracking workflows,\n"
+            "reducing frame rate has a larger impact on processing speed than\n"
+            "reducing resolution, so prefer keeping resolution high.\n\n"
+            " - 1080p: Best spatial detail, largest files\n"
+            " - 720p: Good balance of detail and file size\n"
+            " - 480p: Smallest files, may lose fine detail")
         pp_grid.addWidget(self.pp_resolution_combo, 1, 1)
 
         # Grayscale
         self.pp_grayscale_check = QCheckBox("Convert to Grayscale")
         self.pp_grayscale_check.setChecked(True)
         self.pp_grayscale_check.setToolTip(
-            "Convert videos to grayscale to reduce file size")
+            "Convert videos to single-channel grayscale.\n\n"
+            "Reduces file size by ~30-50%% compared to color. Most tracking\n"
+            "and pose estimation models work equally well on grayscale video.\n"
+            "Recommended for IR/night-vision DVR footage which is already\n"
+            "effectively grayscale.")
         pp_grid.addWidget(self.pp_grayscale_check, 2, 0, 1, 2)
 
         # Remove audio
         self.pp_remove_audio_check = QCheckBox("Remove Audio")
         self.pp_remove_audio_check.setChecked(True)
         self.pp_remove_audio_check.setToolTip(
-            "Remove audio track from videos to reduce file size")
+            "Strip the audio track from the output video.\n\n"
+            "Recommended for behavioral analysis workflows where audio is not\n"
+            "needed. Reduces file size slightly and avoids audio sync issues\n"
+            "that can occur when concatenating clips with different audio\n"
+            "formats or sample rates.")
         pp_grid.addWidget(self.pp_remove_audio_check, 3, 0, 1, 2)
 
         # Video Codec
@@ -1617,8 +2285,14 @@ class VideoConcatenationGUI(QMainWindow):
         ])
         self.pp_codec_combo.setCurrentText("libx265 (H.265/HEVC)")
         self.pp_codec_combo.setToolTip(
-            "Video codec: H.265 offers better compression but slower encoding; "
-            "H.264 is more compatible")
+            "Video compression codec.\n\n"
+            " - H.265 (HEVC): ~30-50%% smaller files than H.264 at the same\n"
+            "   visual quality. Slower to encode but produces significantly\n"
+            "   smaller output. Best when storage is a concern.\n\n"
+            " - H.264 (AVC): Faster to encode and more widely compatible\n"
+            "   with older software/hardware. Produces larger files.\n\n"
+            "Both codecs are lossily compressed — the CRF setting below\n"
+            "controls the quality/size tradeoff within the chosen codec.")
         pp_grid.addWidget(self.pp_codec_combo, 4, 1)
 
         # Speed Preset
@@ -1630,8 +2304,18 @@ class VideoConcatenationGUI(QMainWindow):
         ])
         self.pp_preset_combo.setCurrentText("ultrafast")
         self.pp_preset_combo.setToolTip(
-            "Encoding speed: ultrafast = fastest encoding but larger files; "
-            "slower = better compression but takes longer")
+            "Controls the encoding speed vs. compression efficiency tradeoff.\n\n"
+            "All presets produce the SAME visual quality at a given CRF value.\n"
+            "Slower presets spend more CPU time finding better compression,\n"
+            "resulting in smaller files — but the video looks identical.\n\n"
+            " - ultrafast: ~5x faster encoding, files ~2x larger\n"
+            " - veryfast/fast: Good middle ground\n"
+            " - medium: FFmpeg default, balanced\n"
+            " - slow/veryslow: Best compression, smallest files,\n"
+            "   but encoding takes significantly longer\n\n"
+            "Recommendation: Use 'ultrafast' when processing many hours of\n"
+            "DVR footage and storage is not a bottleneck. Use 'medium' or\n"
+            "'slow' when you need to minimize file sizes for long-term storage.")
         pp_grid.addWidget(self.pp_preset_combo, 5, 1)
 
         # CRF Quality
@@ -1643,8 +2327,20 @@ class VideoConcatenationGUI(QMainWindow):
         ])
         self.pp_crf_combo.setCurrentText("20 (Good)")
         self.pp_crf_combo.setToolTip(
-            "Lower values = better quality but larger file size. "
-            "CRF 15 is near-lossless.")
+            "Constant Rate Factor — controls visual quality vs. file size.\n\n"
+            "CRF is a logarithmic scale where lower = better quality:\n"
+            " - 10: Near-lossless. Very large files. Only needed if you plan\n"
+            "   to re-encode the output again later.\n"
+            " - 15: Visually indistinguishable from the original for most\n"
+            "   content. Good for archival.\n"
+            " - 20: Slight quality loss on close inspection but excellent\n"
+            "   for tracking and analysis. Recommended default.\n"
+            " - 25: Noticeable softening. Still usable for tracking but\n"
+            "   fine details (whiskers, paw digits) may be lost.\n"
+            " - 30: Significant compression artifacts. Only use when\n"
+            "   minimizing file size is the top priority.\n\n"
+            "NOTE: CRF interacts with the speed preset — a slower preset at\n"
+            "the same CRF produces smaller files with identical quality.")
         pp_grid.addWidget(self.pp_crf_combo, 6, 1)
 
         advanced_layout.addWidget(self.preprocess_frame)
@@ -1659,8 +2355,12 @@ class VideoConcatenationGUI(QMainWindow):
         self.chunk_check = QCheckBox("Enable Chunking")
         self.chunk_check.setChecked(False)
         self.chunk_check.setToolTip(
-            "Split the concatenated output into smaller time-based chunks. "
-            "Chunk files are numbered sequentially to preserve sort order.")
+            "Split the concatenated output into smaller time-based chunks.\n\n"
+            "Useful when the full concatenation would produce a very large\n"
+            "single file (e.g. 24 hours of DVR footage). Chunks are split\n"
+            "using stream copy (no re-encoding) so this step is nearly\n"
+            "instant. Chunk files are numbered sequentially to preserve\n"
+            "the original chronological sort order.")
         self.chunk_check.toggled.connect(self._toggle_chunking)
         advanced_layout.addWidget(self.chunk_check)
 
@@ -1674,10 +2374,15 @@ class VideoConcatenationGUI(QMainWindow):
         chunk_grid.addWidget(QLabel("Chunk Duration (min):"), 0, 0)
         self.chunk_duration_spin = QSpinBox()
         self.chunk_duration_spin.setRange(1, 1440)
-        self.chunk_duration_spin.setValue(30)
+        self.chunk_duration_spin.setValue(60)
         self.chunk_duration_spin.setToolTip(
-            "Duration of each chunk in minutes (e.g. 30 or 60). "
-            "The last chunk may be shorter.")
+            "Duration of each chunk in minutes.\n\n"
+            "Common values:\n"
+            " - 30 min: Manageable file sizes, easy to review\n"
+            " - 60 min: Good balance for long recordings\n"
+            " - 120+ min: Fewer files, larger per chunk\n\n"
+            "The last chunk may be shorter than the specified duration\n"
+            "if the total video length is not evenly divisible.")
         chunk_grid.addWidget(self.chunk_duration_spin, 0, 1)
 
         chunk_info = QLabel(
@@ -1689,10 +2394,110 @@ class VideoConcatenationGUI(QMainWindow):
 
         advanced_layout.addWidget(self.chunk_frame)
 
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet(
+            "background-color: #3f3f3f; border: none; max-height: 1px;")
+        advanced_layout.addWidget(sep2)
+
+        # ---- OCR section ----
+        self.ocr_check = QCheckBox("Enable OCR Timestamp Export")
+        self.ocr_check.setChecked(False)
+        self.ocr_check.setToolTip(
+            "Extract burned-in timestamps from the output video using OCR.\n\n"
+            "Many DVR/NVR systems overlay a date-time stamp directly on the\n"
+            "video (e.g. '2026/04/29 13:36:16'). This option reads that text\n"
+            "from a user-defined region and exports a CSV file alongside each\n"
+            "output video mapping frame numbers to timestamps.\n\n"
+            "EasyOCR (default) is a pure-Python neural-network OCR engine\n"
+            "that requires no external system binaries. Models (~30 MB) are\n"
+            "auto-downloaded to the LocalModels/ folder on first use.\n\n"
+            "Tesseract is a classic OCR engine that requires both the\n"
+            "pytesseract Python package and the Tesseract binary.\n\n"
+            "When enabled you will be asked to draw a rectangle around the\n"
+            "timestamp region on a sample video frame.")
+        self.ocr_check.toggled.connect(self._toggle_ocr)
+        advanced_layout.addWidget(self.ocr_check)
+
+        self.ocr_frame = QFrame()
+        self.ocr_frame.setVisible(False)
+        self.ocr_frame.setStyleSheet(
+            "QFrame { border: none; padding: 0px; margin-left: 20px; }")
+        ocr_inner_layout = QVBoxLayout()
+        self.ocr_frame.setLayout(ocr_inner_layout)
+
+        # OCR engine + decoder row
+        ocr_settings_row = QHBoxLayout()
+
+        ocr_engine_label = QLabel("OCR Engine:")
+        ocr_engine_label.setStyleSheet("color: #cccccc;")
+        ocr_settings_row.addWidget(ocr_engine_label)
+
+        self.ocr_engine_combo = QComboBox()
+        self.ocr_engine_combo.addItem("EasyOCR (Recommended)", "easyocr")
+        self.ocr_engine_combo.addItem("Tesseract", "tesseract")
+        self.ocr_engine_combo.setToolTip(
+            "EasyOCR: Pure-Python neural-network OCR. No system binaries\n"
+            "needed — just pip install easyocr. Models are downloaded\n"
+            "automatically to LocalModels/easyocr/ on first use (~30 MB).\n"
+            "Uses GPU automatically if available (PyTorch + CUDA).\n\n"
+            "Tesseract: Classic rule-based OCR engine. Requires both the\n"
+            "pytesseract Python package AND the Tesseract-OCR system binary\n"
+            "installed separately (brew/apt/Windows installer).")
+        self.ocr_engine_combo.setFixedWidth(200)
+        self.ocr_engine_combo.currentIndexChanged.connect(
+            self._on_ocr_engine_changed)
+        ocr_settings_row.addWidget(self.ocr_engine_combo)
+
+        ocr_settings_row.addSpacing(12)
+
+        self.ocr_decoder_label = QLabel("Speed:")
+        self.ocr_decoder_label.setStyleSheet("color: #cccccc;")
+        ocr_settings_row.addWidget(self.ocr_decoder_label)
+
+        self.ocr_decoder_combo = QComboBox()
+        self.ocr_decoder_combo.addItem("Fast (Greedy)", "greedy")
+        self.ocr_decoder_combo.addItem("Accurate (Beam Search)", "beamsearch")
+        self.ocr_decoder_combo.setToolTip(
+            "Controls the EasyOCR text decoder strategy.\n\n"
+            "Fast (Greedy): Picks the best character at each step.\n"
+            "Very fast, usually sufficient for clean DVR timestamps.\n\n"
+            "Accurate (Beam Search): Considers multiple candidate\n"
+            "sequences and picks the overall best. Slower but may\n"
+            "improve accuracy on noisy or low-resolution text.")
+        self.ocr_decoder_combo.setFixedWidth(180)
+        ocr_settings_row.addWidget(self.ocr_decoder_combo)
+
+        ocr_settings_row.addStretch()
+        ocr_inner_layout.addLayout(ocr_settings_row)
+
+        # ROI info + redraw row
+        ocr_roi_row = QHBoxLayout()
+
+        self.ocr_roi_label = QLabel("ROI: not set")
+        self.ocr_roi_label.setStyleSheet("color: #999999;")
+        ocr_roi_row.addWidget(self.ocr_roi_label, stretch=1)
+
+        self.ocr_redraw_btn = QPushButton("Redraw ROI")
+        self.ocr_redraw_btn.setToolTip("Open the ROI selector to redraw the OCR region")
+        self.ocr_redraw_btn.clicked.connect(self._open_roi_selector)
+        self.ocr_redraw_btn.setStyleSheet(
+            "background-color: #3f3f3f; color: #cccccc; padding: 4px 12px;")
+        ocr_roi_row.addWidget(self.ocr_redraw_btn)
+
+        ocr_inner_layout.addLayout(ocr_roi_row)
+
+        advanced_layout.addWidget(self.ocr_frame)
+
         group_layout.addWidget(self.advanced_frame)
 
         group.setLayout(group_layout)
         layout.addWidget(group)
+
+        # Instance state for OCR
+        self._ocr_roi = None               # (x, y, w, h) in video coords
+        self._ocr_source_resolution = None  # (w, h) of the video the ROI was drawn on
 
     def toggle_advanced_options(self):
         """Toggle visibility of advanced options"""
@@ -1710,6 +2515,166 @@ class VideoConcatenationGUI(QMainWindow):
     def _toggle_chunking(self, checked):
         """Enable/disable chunking controls based on checkbox state"""
         self.chunk_frame.setEnabled(checked)
+
+    def _on_ocr_engine_changed(self, index):
+        """Show/hide the decoder dropdown based on OCR engine selection."""
+        engine = self.ocr_engine_combo.currentData()
+        is_easyocr = (engine == "easyocr")
+        self.ocr_decoder_label.setVisible(is_easyocr)
+        self.ocr_decoder_combo.setVisible(is_easyocr)
+
+    def _toggle_ocr(self, checked):
+        """Handle OCR checkbox toggle — check deps and open ROI selector."""
+        if not checked:
+            self.ocr_frame.setVisible(False)
+            return
+
+        # Must have directories selected to load a sample frame
+        if not self.selected_dirs:
+            QMessageBox.warning(
+                self, "No Directories Selected",
+                "Please add at least one input directory first so a video\n"
+                "frame can be loaded for OCR region selection.")
+            self.ocr_check.setChecked(False)
+            return
+
+        # Find video files
+        video_files = OCRRoiSelector.find_video_files(self.selected_dirs)
+        if not video_files:
+            QMessageBox.warning(
+                self, "No Videos Found",
+                "No video files were found in the selected directories.")
+            self.ocr_check.setChecked(False)
+            return
+
+        # Check OCR engine availability
+        engine = self.ocr_engine_combo.currentData()
+        if engine == "easyocr":
+            if not self._check_easyocr_available():
+                self.ocr_check.setChecked(False)
+                return
+        else:
+            if not self._check_tesseract_available():
+                self.ocr_check.setChecked(False)
+                return
+
+        # Show the OCR settings + open ROI selector
+        self.ocr_frame.setVisible(True)
+        self._open_roi_selector()
+
+    def _check_easyocr_available(self):
+        """Check if easyocr is importable; offer to install if missing.
+        Returns True if available (or just installed)."""
+        try:
+            import easyocr  # noqa: F401
+            return True
+        except ImportError:
+            reply = QMessageBox.question(
+                self, "EasyOCR Not Installed",
+                "The easyocr package is required for OCR.\n\n"
+                "Would you like to install it now?\n"
+                "(pip install easyocr — this may take a minute)\n\n"
+                "Note: EasyOCR models (~30 MB) will be downloaded\n"
+                "to LocalModels/easyocr/ on first use.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.Yes:
+                return self._pip_install_package("easyocr")
+            return False
+
+    def _check_tesseract_available(self):
+        """Check pytesseract package + Tesseract binary.
+        Returns True if both are available."""
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            return True
+        except ImportError:
+            QMessageBox.warning(
+                self, "pytesseract Not Installed",
+                "The pytesseract Python package is required for OCR.\n\n"
+                "Install with:  pip install pytesseract\n\n"
+                "You also need the Tesseract OCR binary installed on\n"
+                "your system (tesseract-ocr).")
+            return False
+        except Exception:
+            QMessageBox.warning(
+                self, "Tesseract Not Found",
+                "The Tesseract OCR binary was not found on your system.\n\n"
+                "Install Tesseract:\n"
+                "  Windows: download from github.com/UB-Mannheim/tesseract\n"
+                "  macOS:   brew install tesseract\n"
+                "  Linux:   sudo apt install tesseract-ocr")
+            return False
+
+    def _pip_install_package(self, package_name):
+        """Attempt to pip-install a package. Returns True on success."""
+        import subprocess as _sp
+        self.log_message(f"Installing {package_name}...")
+        try:
+            proc = _sp.run(
+                [sys.executable, "-m", "pip", "install", package_name],
+                capture_output=True, text=True, timeout=300)
+            if proc.returncode == 0:
+                self.log_message(f"✅ {package_name} installed successfully.")
+                QMessageBox.information(
+                    self, "Installation Complete",
+                    f"{package_name} was installed successfully.")
+                return True
+            else:
+                self.log_message(f"❌ Failed to install {package_name}:")
+                self.log_message(proc.stderr[-500:] if proc.stderr else "(no output)")
+                QMessageBox.warning(
+                    self, "Installation Failed",
+                    f"Could not install {package_name}.\n\n"
+                    f"Try manually:  pip install {package_name}\n\n"
+                    f"Error: {proc.stderr[-200:] if proc.stderr else 'unknown'}")
+                return False
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Installation Error",
+                f"Error running pip: {e}")
+            return False
+
+    def _open_roi_selector(self):
+        """Open the OCR ROI selection dialog."""
+        video_files = OCRRoiSelector.find_video_files(self.selected_dirs)
+        if not video_files:
+            QMessageBox.warning(self, "No Videos",
+                                "No video files found in selected directories.")
+            return
+
+        try:
+            import cv2
+        except ImportError:
+            QMessageBox.warning(
+                self, "OpenCV Not Installed",
+                "OpenCV (cv2) is required for OCR frame preview.\n"
+                "Install with:  pip install opencv-python")
+            self.ocr_check.setChecked(False)
+            return
+
+        engine = self.ocr_engine_combo.currentData()
+        decoder = self.ocr_decoder_combo.currentData()
+        dialog = OCRRoiSelector(video_files, parent=self,
+                                ocr_engine=engine, ocr_decoder=decoder)
+        # If we already have an ROI, pre-populate it
+        if self._ocr_roi is not None:
+            dialog.roi_video_coords = self._ocr_roi
+            dialog.ok_btn.setEnabled(True)
+
+        if dialog.exec_() == QDialog.Accepted and dialog.roi_video_coords is not None:
+            self._ocr_roi = dialog.roi_video_coords
+            self._ocr_source_resolution = dialog.video_size
+            vx, vy, vw, vh = self._ocr_roi
+            self.ocr_roi_label.setText(
+                f"ROI: ({vx}, {vy}) to ({vx + vw}, {vy + vh})  [{vw} x {vh} px]")
+            self.ocr_roi_label.setStyleSheet("color: #00cc66;")
+            self.ocr_frame.setVisible(True)
+        else:
+            # User cancelled — uncheck if no ROI was previously set
+            if self._ocr_roi is None:
+                self.ocr_check.setChecked(False)
+            self.ocr_frame.setVisible(self._ocr_roi is not None)
     
     def create_control_buttons(self, layout):
         """Create control buttons section"""
@@ -1880,13 +2845,32 @@ class VideoConcatenationGUI(QMainWindow):
         else:
             self.log_message("Chunking: off")
 
+        # OCR settings
+        enable_ocr = self.ocr_check.isChecked() and self._ocr_roi is not None
+        ocr_engine = self.ocr_engine_combo.currentData()
+        ocr_decoder = self.ocr_decoder_combo.currentData()
+        if enable_ocr:
+            vx, vy, vw, vh = self._ocr_roi
+            engine_label = self.ocr_engine_combo.currentText()
+            decoder_label = self.ocr_decoder_combo.currentText() if ocr_engine == "easyocr" else "N/A"
+            self.log_message(
+                f"OCR: enabled — {engine_label}, decoder={decoder_label}, "
+                f"ROI ({vx},{vy}) to ({vx+vw},{vy+vh})")
+        else:
+            self.log_message("OCR: off")
+
         # Start worker thread
         self.worker = ConcatenationWorker(
             self.selected_dirs, output_filename, sort_order, self.instance_id,
             enable_preprocessing=enable_preprocessing,
             preprocess_settings=preprocess_settings,
             enable_chunking=enable_chunking,
-            chunk_duration_minutes=chunk_duration_minutes)
+            chunk_duration_minutes=chunk_duration_minutes,
+            enable_ocr=enable_ocr,
+            ocr_roi=self._ocr_roi,
+            ocr_source_resolution=self._ocr_source_resolution,
+            ocr_engine=ocr_engine,
+            ocr_decoder=ocr_decoder)
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)

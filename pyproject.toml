@@ -64,8 +64,11 @@ tracking = [
     "torchvision>=0.20.1",
     "pycocotools>=2.0.6",
 ]
+ocr = [
+    "easyocr",
+]
 all = [
-    "fnt[imaging,tracking]",
+    "fnt[imaging,tracking,ocr]",
 ]
 
 [project.scripts]
