@@ -14,10 +14,10 @@ from pathlib import Path
 
 try:
     from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-        QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox, 
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox,
         QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit,
-        QComboBox
+        QComboBox, QSpinBox, QCheckBox
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition
     from PyQt5.QtGui import QFont
@@ -39,13 +39,21 @@ class ConcatenationWorker(QThread):
     # GUI must call worker.respond_to_prompt("skip", "move", or "cancel").
     user_decision_needed = pyqtSignal(str, list)  # message, list of full file paths
 
-    def __init__(self, input_dirs, output_filename, sort_order="default", instance_id=1):
+    def __init__(self, input_dirs, output_filename, sort_order="default", instance_id=1,
+                 enable_preprocessing=False, preprocess_settings=None,
+                 enable_chunking=False, chunk_duration_minutes=30):
         super().__init__()
         self.input_dirs = input_dirs
         self.output_filename = output_filename
         self.sort_order = sort_order
         self.instance_id = instance_id
         self.should_stop = False
+        # Preprocessing settings
+        self.enable_preprocessing = enable_preprocessing
+        self.preprocess_settings = preprocess_settings or {}
+        # Chunking settings
+        self.enable_chunking = enable_chunking
+        self.chunk_duration_minutes = chunk_duration_minutes
         # Mutex/condition for blocking the worker until the user responds
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
@@ -246,22 +254,65 @@ class ConcatenationWorker(QThread):
                 rel_path = os.path.basename(video)
                 fp.write(f"file '{rel_path}'\n")
 
-        command = [
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_file,
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-            "-fflags", "+genpts",
-            "-vsync", "vfr",
-            "-an",
-            output_file
-        ]
+        if self.enable_preprocessing:
+            ps = self.preprocess_settings
+            codec = ps.get("codec", "libx264")
+            preset = ps.get("preset", "ultrafast")
+            crf = ps.get("crf", 20)
+            frame_rate = ps.get("frame_rate", 30)
+            grayscale = ps.get("grayscale", False)
+            remove_audio = ps.get("remove_audio", True)
+            resolution = ps.get("resolution", "1080p")
+
+            if resolution == "1080p":
+                width, height = 1920, 1080
+            else:
+                width, height = 1280, 720
+
+            video_filters = [f"fps={frame_rate}"]
+            video_filters.append(
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame")
+            video_filters.append(
+                f"pad={width}:{height}:-1:-1:color=black")
+            if grayscale:
+                video_filters.append("format=gray")
+
+            command = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", list_file,
+                "-c:v", codec,
+                "-preset", preset,
+                "-crf", str(crf),
+                "-pix_fmt", "yuv420p",
+                "-vf", ",".join(video_filters),
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "10000000",
+                "-fflags", "+genpts",
+                "-vsync", "vfr",
+            ]
+            if remove_audio:
+                command.append("-an")
+            else:
+                command.extend(["-c:a", "aac", "-b:a", "128k"])
+            command.append(output_file)
+        else:
+            command = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                "-fflags", "+genpts",
+                "-vsync", "vfr",
+                "-an",
+                output_file
+            ]
 
         process = subprocess.Popen(
             command,
@@ -609,87 +660,97 @@ class ConcatenationWorker(QThread):
             else:
                 self.progress_update.emit(f"✅ All {len(video_files)} files passed validation.")
 
-            # --- Resolution consistency check ---
-            self.progress_update.emit("Checking resolution consistency across files...")
-            resolution_map = {}  # (width, height) -> [filepath, ...]
-            for vf in video_files:
-                if self.should_stop:
-                    self._cleanup_repaired(repaired_map)
-                    return False
-                res = self._get_video_resolution(vf)
-                if res is not None:
-                    resolution_map.setdefault(res, []).append(vf)
-
-            if len(resolution_map) > 1:
-                # Mixed resolutions detected — report clearly
-                self.progress_update.emit("=" * 50)
+            # --- Resolution consistency check (skip when preprocessing normalizes resolution) ---
+            if self.enable_preprocessing:
+                ps = self.preprocess_settings
+                res_label = ps.get("resolution", "1080p")
                 self.progress_update.emit(
-                    f"⚠️ MIXED RESOLUTIONS DETECTED — {len(resolution_map)} "
-                    f"different resolutions found:")
-                for (w, h), files in sorted(resolution_map.items(),
-                                            key=lambda x: len(x[1]), reverse=True):
+                    f"✅ Preprocessing enabled — all files will be scaled to {res_label}. "
+                    f"Skipping resolution consistency check.")
+            else:
+                self.progress_update.emit("Checking resolution consistency across files...")
+                resolution_map = {}  # (width, height) -> [filepath, ...]
+                for vf in video_files:
+                    if self.should_stop:
+                        self._cleanup_repaired(repaired_map)
+                        return False
+                    res = self._get_video_resolution(vf)
+                    if res is not None:
+                        resolution_map.setdefault(res, []).append(vf)
+
+                if len(resolution_map) > 1:
+                    # Mixed resolutions detected — report clearly
+                    self.progress_update.emit("=" * 50)
                     self.progress_update.emit(
-                        f"   {w}x{h}: {len(files)} file(s)")
-                    # Show up to 5 example filenames for each resolution
-                    for f in files[:5]:
+                        f"⚠️ MIXED RESOLUTIONS DETECTED — {len(resolution_map)} "
+                        f"different resolutions found:")
+                    for (w, h), files in sorted(resolution_map.items(),
+                                                key=lambda x: len(x[1]), reverse=True):
                         self.progress_update.emit(
-                            f"      • {os.path.basename(f)}")
-                    if len(files) > 5:
-                        self.progress_update.emit(
-                            f"      ... and {len(files) - 5} more")
+                            f"   {w}x{h}: {len(files)} file(s)")
+                        # Show up to 5 example filenames for each resolution
+                        for f in files[:5]:
+                            self.progress_update.emit(
+                                f"      • {os.path.basename(f)}")
+                        if len(files) > 5:
+                            self.progress_update.emit(
+                                f"      ... and {len(files) - 5} more")
 
-                self.progress_update.emit("")
-                self.progress_update.emit(
-                    "FFmpeg's concat demuxer requires all files to have the same "
-                    "resolution. Please re-run the FNT Video PreProcessing Tool "
-                    "on these files with a consistent resolution setting.")
-                self.progress_update.emit("=" * 50)
-
-                # Find the minority resolution files (fewer files = likely the outliers)
-                sorted_res = sorted(resolution_map.items(),
-                                    key=lambda x: len(x[1]), reverse=True)
-                majority_res = sorted_res[0][0]
-                mismatched_files = []
-                for (w, h), files in sorted_res[1:]:
-                    mismatched_files.extend(files)
-
-                mismatch_msg = (
-                    f"{len(mismatched_files)} file(s) have a different resolution "
-                    f"than the majority ({majority_res[0]}x{majority_res[1]}). "
-                    f"These files need to be re-preprocessed."
-                )
-                action = self._ask_user_decision(mismatch_msg, mismatched_files)
-                if action == "cancel" or self.should_stop:
-                    self.progress_update.emit("❌ Concatenation cancelled — resolve resolution mismatch first.")
-                    self._cleanup_repaired(repaired_map)
-                    return False
-                # User chose skip or move — remove mismatched files
-                for mf in mismatched_files:
-                    verb = "Moved" if action == "move" else "Skipping"
+                    self.progress_update.emit("")
                     self.progress_update.emit(
-                        f"   {verb}: {os.path.basename(mf)}")
-                video_files = [vf for vf in video_files if vf not in set(mismatched_files)]
+                        "FFmpeg's concat demuxer requires all files to have the same "
+                        "resolution. Please re-run the FNT Video PreProcessing Tool "
+                        "on these files with a consistent resolution setting, or "
+                        "enable preprocessing in the Advanced Options.")
+                    self.progress_update.emit("=" * 50)
 
-                if not video_files:
-                    self.progress_update.emit("❌ No files remain after removing mismatched resolutions.")
-                    self._cleanup_repaired(repaired_map)
-                    return False
+                    # Find the minority resolution files (fewer files = likely the outliers)
+                    sorted_res = sorted(resolution_map.items(),
+                                        key=lambda x: len(x[1]), reverse=True)
+                    majority_res = sorted_res[0][0]
+                    mismatched_files = []
+                    for (w, h), files in sorted_res[1:]:
+                        mismatched_files.extend(files)
 
-                self.progress_update.emit(
-                    f"Continuing with {len(video_files)} file(s) at {majority_res[0]}x{majority_res[1]}")
-            elif len(resolution_map) == 1:
-                res = list(resolution_map.keys())[0]
-                self.progress_update.emit(
-                    f"✅ All files have consistent resolution: {res[0]}x{res[1]}")
-            # else: couldn't determine resolution — proceed anyway
+                    mismatch_msg = (
+                        f"{len(mismatched_files)} file(s) have a different resolution "
+                        f"than the majority ({majority_res[0]}x{majority_res[1]}). "
+                        f"These files need to be re-preprocessed."
+                    )
+                    action = self._ask_user_decision(mismatch_msg, mismatched_files)
+                    if action == "cancel" or self.should_stop:
+                        self.progress_update.emit("❌ Concatenation cancelled — resolve resolution mismatch first.")
+                        self._cleanup_repaired(repaired_map)
+                        return False
+                    # User chose skip or move — remove mismatched files
+                    for mf in mismatched_files:
+                        verb = "Moved" if action == "move" else "Skipping"
+                        self.progress_update.emit(
+                            f"   {verb}: {os.path.basename(mf)}")
+                    video_files = [vf for vf in video_files if vf not in set(mismatched_files)]
+
+                    if not video_files:
+                        self.progress_update.emit("❌ No files remain after removing mismatched resolutions.")
+                        self._cleanup_repaired(repaired_map)
+                        return False
+
+                    self.progress_update.emit(
+                        f"Continuing with {len(video_files)} file(s) at {majority_res[0]}x{majority_res[1]}")
+                elif len(resolution_map) == 1:
+                    res = list(resolution_map.keys())[0]
+                    self.progress_update.emit(
+                        f"✅ All files have consistent resolution: {res[0]}x{res[1]}")
+                # else: couldn't determine resolution — proceed anyway
 
             # --- Phase 2: Attempt full concatenation ---
-            output_file = os.path.join(folder_path, self.output_filename)
+            output_dir = os.path.join(folder_path, "concatenated_output")
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, self.output_filename)
             if os.path.exists(output_file):
                 counter = 1
                 base_name, ext = os.path.splitext(self.output_filename)
                 while os.path.exists(output_file):
-                    output_file = os.path.join(folder_path, f"{base_name}_{counter}{ext}")
+                    output_file = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
                     counter += 1
                 self.progress_update.emit(f"Output file exists, using: {os.path.basename(output_file)}")
 
@@ -698,6 +759,8 @@ class ConcatenationWorker(QThread):
 
             if ok:
                 self.progress_update.emit(f"✅ Successfully created: {os.path.basename(output_file)}")
+                if self.enable_chunking and self.chunk_duration_minutes > 0:
+                    self._chunk_output(output_file)
                 self._cleanup_repaired(repaired_map)
                 return True
 
@@ -716,6 +779,8 @@ class ConcatenationWorker(QThread):
                 video_files, folder_path, output_file, repaired_map,
                 initial_last_lines=last_lines)
             self._cleanup_repaired(repaired_map)
+            if success and self.enable_chunking and self.chunk_duration_minutes > 0:
+                self._chunk_output(output_file)
             return success
 
         except Exception as e:
@@ -732,6 +797,83 @@ class ConcatenationWorker(QThread):
                     os.remove(repaired)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Chunking helper
+    # ------------------------------------------------------------------
+    def _chunk_output(self, output_file):
+        """Split the concatenated output into time-based chunks using stream copy."""
+        duration = self._get_duration(output_file)
+        if duration is None:
+            self.progress_update.emit(
+                "⚠️ Could not determine video duration. Skipping chunking.")
+            return
+
+        chunk_seconds = self.chunk_duration_minutes * 60
+
+        if duration <= chunk_seconds:
+            self.progress_update.emit(
+                f"Video duration ({duration:.0f}s) is shorter than chunk size "
+                f"({self.chunk_duration_minutes} min). No chunking needed.")
+            return
+
+        num_chunks = int(duration // chunk_seconds) + (
+            1 if duration % chunk_seconds > 0 else 0)
+        self.progress_update.emit(
+            f"Splitting into ~{num_chunks} chunks of "
+            f"{self.chunk_duration_minutes} minutes...")
+
+        base_name, ext = os.path.splitext(output_file)
+        chunk_pattern = f"{base_name}_part%03d{ext}"
+
+        command = [
+            "ffmpeg", "-y",
+            "-i", output_file,
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(chunk_seconds),
+            "-reset_timestamps", "1",
+            "-break_non_keyframes", "1",
+            chunk_pattern
+        ]
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        for line in process.stdout:
+            if self.should_stop:
+                process.terminate()
+                return
+            line = line.strip()
+            if line:
+                self.ffmpeg_output.emit(line)
+
+        process.wait()
+
+        if process.returncode == 0:
+            # Count and report chunks
+            chunk_dir = os.path.dirname(output_file)
+            chunk_base = os.path.basename(base_name)
+            chunks = sorted(
+                glob.glob(os.path.join(chunk_dir, f"{chunk_base}_part*{ext}")))
+            self.progress_update.emit(f"✅ Split into {len(chunks)} chunks:")
+            for chunk in chunks:
+                self.progress_update.emit(
+                    f"   📁 {os.path.basename(chunk)}")
+            # Remove the full concatenated file now that chunks exist
+            try:
+                os.remove(output_file)
+                self.progress_update.emit(
+                    f"Removed full file: {os.path.basename(output_file)}")
+            except Exception:
+                pass
+        else:
+            self.progress_update.emit(
+                "⚠️ Chunking failed. Full concatenated file preserved.")
 
     # ------------------------------------------------------------------
     # Incremental failure recovery helpers
@@ -1200,6 +1342,41 @@ class VideoConcatenationGUI(QMainWindow):
                 background-color: #1e1e1e;
                 color: #cccccc;
             }
+            QSpinBox, QComboBox {
+                padding: 5px;
+                border: 1px solid #3f3f3f;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+                color: #cccccc;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #3f3f3f;
+                border: 1px solid #3f3f3f;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #0078d4;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3f3f3f;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #cccccc;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                selection-background-color: #0078d4;
+                border: 1px solid #3f3f3f;
+            }
+            QCheckBox {
+                color: #cccccc;
+                spacing: 8px;
+            }
             QTextEdit {
                 background-color: #1e1e1e;
                 border: 1px solid #3f3f3f;
@@ -1315,40 +1492,224 @@ class VideoConcatenationGUI(QMainWindow):
         layout.addWidget(group)
     
     def create_output_options(self, layout):
-        """Create output filename options section"""
+        """Create output options section with advanced preprocessing and chunking"""
         group = QGroupBox("Output Options")
-        group_layout = QGridLayout()
-        
+        group_layout = QVBoxLayout()
+
+        # --- Basic options in a grid ---
+        basic_grid = QGridLayout()
+
         # Row 0: Output filename
-        group_layout.addWidget(QLabel("Output Filename:"), 0, 0)
-        
+        basic_grid.addWidget(QLabel("Output Filename:"), 0, 0)
+
         self.output_filename_edit = QLineEdit()
         self.output_filename_edit.setText("concatenated_output.mp4")
         self.output_filename_edit.setPlaceholderText("Enter output filename...")
-        self.output_filename_edit.setToolTip("Filename for the concatenated video (saved in each directory)")
-        group_layout.addWidget(self.output_filename_edit, 0, 1)
-        
-        info_label = QLabel("💡 Files saved in each selected directory")
+        self.output_filename_edit.setToolTip(
+            "Filename for the concatenated video (saved in concatenated_output/ subfolder)")
+        basic_grid.addWidget(self.output_filename_edit, 0, 1)
+
+        info_label = QLabel("💡 Files saved in concatenated_output/ subfolder")
         info_label.setStyleSheet("color: #999999; font-style: italic;")
-        group_layout.addWidget(info_label, 0, 2)
-        
+        basic_grid.addWidget(info_label, 0, 2)
+
         # Row 1: Sort order
-        group_layout.addWidget(QLabel("Sort Order:"), 1, 0)
-        
+        basic_grid.addWidget(QLabel("Sort Order:"), 1, 0)
+
         self.sort_order_combo = QComboBox()
-        self.sort_order_combo.addItems(["Default (Alphabetical)", "ViewTron DVR (Chronological)"])
+        self.sort_order_combo.addItems([
+            "Default (Alphabetical)",
+            "ViewTron DVR (Chronological)"
+        ])
         self.sort_order_combo.setCurrentIndex(0)
-        self.sort_order_combo.setToolTip("How to order videos for concatenation:\n• Default: Standard alphabetical sorting\n• ViewTron DVR: Handles ViewTron naming (YYYYMMDDHHMMSS, then YYYYMMDDHHMMSS(001), etc.)")
-        group_layout.addWidget(self.sort_order_combo, 1, 1)
-        
+        self.sort_order_combo.setToolTip(
+            "How to order videos for concatenation:\n"
+            "• Default: Standard alphabetical sorting\n"
+            "• ViewTron DVR: Handles ViewTron naming "
+            "(YYYYMMDDHHMMSS, then YYYYMMDDHHMMSS(001), etc.)")
+        basic_grid.addWidget(self.sort_order_combo, 1, 1)
+
         sort_info_label = QLabel("ℹ️ Choose ViewTron for DVR recordings")
         sort_info_label.setStyleSheet("color: #999999; font-style: italic;")
-        group_layout.addWidget(sort_info_label, 1, 2)
-        
-        group_layout.setColumnStretch(1, 1)
-        
+        basic_grid.addWidget(sort_info_label, 1, 2)
+
+        basic_grid.setColumnStretch(1, 1)
+        group_layout.addLayout(basic_grid)
+
+        # --- Advanced Options toggle button ---
+        self.advanced_btn = QPushButton("Show Advanced Options ▼")
+        self.advanced_btn.clicked.connect(self.toggle_advanced_options)
+        self.advanced_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3f3f3f;
+                color: #cccccc;
+                text-align: left;
+                padding-left: 10px;
+            }
+            QPushButton:hover {
+                background-color: #4f4f4f;
+            }
+        """)
+        group_layout.addWidget(self.advanced_btn)
+
+        # --- Advanced options frame (initially hidden) ---
+        self.advanced_frame = QFrame()
+        self.advanced_frame.setVisible(False)
+        self.advanced_frame.setStyleSheet(
+            "QFrame { border: 1px solid #3f3f3f; background-color: #1e1e1e; padding: 10px; }")
+        advanced_layout = QVBoxLayout()
+        self.advanced_frame.setLayout(advanced_layout)
+
+        # ---- Preprocessing section ----
+        self.preprocess_check = QCheckBox("Enable Preprocessing")
+        self.preprocess_check.setChecked(False)
+        self.preprocess_check.setToolTip(
+            "Apply preprocessing during concatenation (grayscale, FPS, resolution, "
+            "codec settings). Use this to go directly from raw DVR footage to a "
+            "processed concatenated output.")
+        self.preprocess_check.toggled.connect(self._toggle_preprocessing)
+        advanced_layout.addWidget(self.preprocess_check)
+
+        self.preprocess_frame = QFrame()
+        self.preprocess_frame.setEnabled(False)
+        self.preprocess_frame.setStyleSheet(
+            "QFrame { border: none; padding: 0px; margin-left: 20px; }")
+        pp_grid = QGridLayout()
+        self.preprocess_frame.setLayout(pp_grid)
+
+        # Frame Rate
+        pp_grid.addWidget(QLabel("Frame Rate (fps):"), 0, 0)
+        self.pp_frame_rate_spin = QSpinBox()
+        self.pp_frame_rate_spin.setRange(1, 120)
+        self.pp_frame_rate_spin.setValue(30)
+        self.pp_frame_rate_spin.setToolTip("Target frame rate for output video")
+        pp_grid.addWidget(self.pp_frame_rate_spin, 0, 1)
+
+        # Resolution
+        pp_grid.addWidget(QLabel("Resolution:"), 1, 0)
+        self.pp_resolution_combo = QComboBox()
+        self.pp_resolution_combo.addItems([
+            "1080p (1920x1080)", "720p (1280x720)"
+        ])
+        self.pp_resolution_combo.setCurrentText("1080p (1920x1080)")
+        self.pp_resolution_combo.setToolTip("Target output resolution")
+        pp_grid.addWidget(self.pp_resolution_combo, 1, 1)
+
+        # Grayscale
+        self.pp_grayscale_check = QCheckBox("Convert to Grayscale")
+        self.pp_grayscale_check.setChecked(True)
+        self.pp_grayscale_check.setToolTip(
+            "Convert videos to grayscale to reduce file size")
+        pp_grid.addWidget(self.pp_grayscale_check, 2, 0, 1, 2)
+
+        # Remove audio
+        self.pp_remove_audio_check = QCheckBox("Remove Audio")
+        self.pp_remove_audio_check.setChecked(True)
+        self.pp_remove_audio_check.setToolTip(
+            "Remove audio track from videos to reduce file size")
+        pp_grid.addWidget(self.pp_remove_audio_check, 3, 0, 1, 2)
+
+        # Video Codec
+        pp_grid.addWidget(QLabel("Video Codec:"), 4, 0)
+        self.pp_codec_combo = QComboBox()
+        self.pp_codec_combo.addItems([
+            "libx265 (H.265/HEVC)", "libx264 (H.264/AVC)"
+        ])
+        self.pp_codec_combo.setCurrentText("libx265 (H.265/HEVC)")
+        self.pp_codec_combo.setToolTip(
+            "Video codec: H.265 offers better compression but slower encoding; "
+            "H.264 is more compatible")
+        pp_grid.addWidget(self.pp_codec_combo, 4, 1)
+
+        # Speed Preset
+        pp_grid.addWidget(QLabel("Speed Preset:"), 5, 0)
+        self.pp_preset_combo = QComboBox()
+        self.pp_preset_combo.addItems([
+            "ultrafast", "superfast", "veryfast", "faster",
+            "fast", "medium", "slow", "slower", "veryslow"
+        ])
+        self.pp_preset_combo.setCurrentText("ultrafast")
+        self.pp_preset_combo.setToolTip(
+            "Encoding speed: ultrafast = fastest encoding but larger files; "
+            "slower = better compression but takes longer")
+        pp_grid.addWidget(self.pp_preset_combo, 5, 1)
+
+        # CRF Quality
+        pp_grid.addWidget(QLabel("CRF Quality:"), 6, 0)
+        self.pp_crf_combo = QComboBox()
+        self.pp_crf_combo.addItems([
+            "10 (Best)", "15 (High)", "20 (Good)",
+            "25 (Medium)", "30 (Low)"
+        ])
+        self.pp_crf_combo.setCurrentText("20 (Good)")
+        self.pp_crf_combo.setToolTip(
+            "Lower values = better quality but larger file size. "
+            "CRF 15 is near-lossless.")
+        pp_grid.addWidget(self.pp_crf_combo, 6, 1)
+
+        advanced_layout.addWidget(self.preprocess_frame)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("background-color: #3f3f3f; border: none; max-height: 1px;")
+        advanced_layout.addWidget(sep)
+
+        # ---- Chunking section ----
+        self.chunk_check = QCheckBox("Enable Chunking")
+        self.chunk_check.setChecked(False)
+        self.chunk_check.setToolTip(
+            "Split the concatenated output into smaller time-based chunks. "
+            "Chunk files are numbered sequentially to preserve sort order.")
+        self.chunk_check.toggled.connect(self._toggle_chunking)
+        advanced_layout.addWidget(self.chunk_check)
+
+        self.chunk_frame = QFrame()
+        self.chunk_frame.setEnabled(False)
+        self.chunk_frame.setStyleSheet(
+            "QFrame { border: none; padding: 0px; margin-left: 20px; }")
+        chunk_grid = QGridLayout()
+        self.chunk_frame.setLayout(chunk_grid)
+
+        chunk_grid.addWidget(QLabel("Chunk Duration (min):"), 0, 0)
+        self.chunk_duration_spin = QSpinBox()
+        self.chunk_duration_spin.setRange(1, 1440)
+        self.chunk_duration_spin.setValue(30)
+        self.chunk_duration_spin.setToolTip(
+            "Duration of each chunk in minutes (e.g. 30 or 60). "
+            "The last chunk may be shorter.")
+        chunk_grid.addWidget(self.chunk_duration_spin, 0, 1)
+
+        chunk_info = QLabel(
+            "ℹ️ Chunks are numbered sequentially "
+            "(e.g. _part000, _part001, ...)")
+        chunk_info.setStyleSheet("color: #999999; font-style: italic;")
+        chunk_info.setWordWrap(True)
+        chunk_grid.addWidget(chunk_info, 1, 0, 1, 2)
+
+        advanced_layout.addWidget(self.chunk_frame)
+
+        group_layout.addWidget(self.advanced_frame)
+
         group.setLayout(group_layout)
         layout.addWidget(group)
+
+    def toggle_advanced_options(self):
+        """Toggle visibility of advanced options"""
+        is_visible = self.advanced_frame.isVisible()
+        self.advanced_frame.setVisible(not is_visible)
+        if is_visible:
+            self.advanced_btn.setText("Show Advanced Options ▼")
+        else:
+            self.advanced_btn.setText("Hide Advanced Options ▲")
+
+    def _toggle_preprocessing(self, checked):
+        """Enable/disable preprocessing controls based on checkbox state"""
+        self.preprocess_frame.setEnabled(checked)
+
+    def _toggle_chunking(self, checked):
+        """Enable/disable chunking controls based on checkbox state"""
+        self.chunk_frame.setEnabled(checked)
     
     def create_control_buttons(self, layout):
         """Create control buttons section"""
@@ -1449,39 +1810,83 @@ class VideoConcatenationGUI(QMainWindow):
         if not self.selected_dirs:
             QMessageBox.warning(self, "Warning", "Please select at least one directory.")
             return
-        
+
         # Get output filename
         output_filename = self.output_filename_edit.text().strip()
         if not output_filename:
             QMessageBox.warning(self, "Warning", "Please enter an output filename.")
             return
-        
+
         # Ensure .mp4 extension
         if not output_filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             output_filename += '.mp4'
-        
+
         # Disable controls
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.add_dir_btn.setEnabled(False)
         self.clear_dirs_btn.setEnabled(False)
-        
+
         # Show progress bar
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        
+
         # Get sort order
         sort_order = "viewtron" if self.sort_order_combo.currentIndex() == 1 else "default"
-        
+
+        # Get preprocessing settings
+        enable_preprocessing = self.preprocess_check.isChecked()
+        preprocess_settings = None
+        if enable_preprocessing:
+            codec_text = self.pp_codec_combo.currentText()
+            codec = codec_text.split()[0]  # "libx265" or "libx264"
+            crf_text = self.pp_crf_combo.currentText()
+            crf = int(crf_text.split()[0])  # Extract number
+            resolution_text = self.pp_resolution_combo.currentText()
+            resolution = resolution_text.split()[0]  # "1080p" or "720p"
+            preprocess_settings = {
+                "frame_rate": self.pp_frame_rate_spin.value(),
+                "grayscale": self.pp_grayscale_check.isChecked(),
+                "remove_audio": self.pp_remove_audio_check.isChecked(),
+                "codec": codec,
+                "preset": self.pp_preset_combo.currentText(),
+                "crf": crf,
+                "resolution": resolution,
+            }
+
+        # Get chunking settings
+        enable_chunking = self.chunk_check.isChecked()
+        chunk_duration_minutes = self.chunk_duration_spin.value()
+
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
         self.log_message("Starting video concatenation...")
         self.log_message(f"Output filename: {output_filename}")
         self.log_message(f"Sort order: {self.sort_order_combo.currentText()}")
-        
+        if enable_preprocessing:
+            self.log_message(
+                f"Preprocessing: {preprocess_settings['frame_rate']} fps, "
+                f"{preprocess_settings['resolution']}, "
+                f"{preprocess_settings['codec']}, "
+                f"Preset: {preprocess_settings['preset']}, "
+                f"CRF: {preprocess_settings['crf']}, "
+                f"Grayscale: {preprocess_settings['grayscale']}, "
+                f"Remove Audio: {preprocess_settings['remove_audio']}")
+        else:
+            self.log_message("Preprocessing: off")
+        if enable_chunking:
+            self.log_message(f"Chunking: {chunk_duration_minutes} min per chunk")
+        else:
+            self.log_message("Chunking: off")
+
         # Start worker thread
-        self.worker = ConcatenationWorker(self.selected_dirs, output_filename, sort_order, self.instance_id)
+        self.worker = ConcatenationWorker(
+            self.selected_dirs, output_filename, sort_order, self.instance_id,
+            enable_preprocessing=enable_preprocessing,
+            preprocess_settings=preprocess_settings,
+            enable_chunking=enable_chunking,
+            chunk_duration_minutes=chunk_duration_minutes)
         self.worker.progress_update.connect(self.log_message)
         self.worker.folder_progress.connect(self.update_folder_progress)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
