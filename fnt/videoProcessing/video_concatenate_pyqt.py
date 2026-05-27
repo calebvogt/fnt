@@ -621,6 +621,10 @@ class ConcatenationWorker(QThread):
 
             command = [
                 "ffmpeg", "-y",
+                # Error resilience — DVR recordings often have minor
+                # corruption (bad timestamps, truncated frames) that
+                # should be tolerated rather than treated as fatal.
+                "-err_detect", "ignore_err",
                 "-f", "concat", "-safe", "0", "-i", list_file,
                 "-c:v", codec,
                 "-preset", preset,
@@ -629,7 +633,7 @@ class ConcatenationWorker(QThread):
                 "-vf", ",".join(video_filters),
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "10000000",
-                "-fflags", "+genpts",
+                "-fflags", "+genpts+discardcorrupt",
                 "-vsync", "vfr",
             ]
             if chunking:
@@ -643,6 +647,7 @@ class ConcatenationWorker(QThread):
         else:
             command = [
                 "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
@@ -651,7 +656,7 @@ class ConcatenationWorker(QThread):
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 "-avoid_negative_ts", "make_zero",
-                "-fflags", "+genpts",
+                "-fflags", "+genpts+discardcorrupt",
                 "-vsync", "vfr",
                 "-an",
             ]
