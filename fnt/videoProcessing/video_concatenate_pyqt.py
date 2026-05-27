@@ -22,8 +22,9 @@ try:
         QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit,
         QComboBox, QSpinBox, QCheckBox, QDialog, QSizePolicy
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QRect
-    from PyQt5.QtGui import QFont, QImage, QPixmap, QPainter, QPen, QColor
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QRect, QPointF
+    from PyQt5.QtGui import (QFont, QImage, QPixmap, QPainter, QPen, QColor,
+                              QBrush, QPolygonF)
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -1946,63 +1947,6 @@ class VideoConcatenationGUI(QMainWindow):
                 background-color: #1e1e1e;
                 color: #cccccc;
             }
-            QSpinBox::up-button {
-                subcontrol-origin: border;
-                subcontrol-position: top right;
-                width: 20px;
-                background-color: #3f3f3f;
-                border: 1px solid #555555;
-                border-bottom: none;
-                border-top-right-radius: 3px;
-            }
-            QSpinBox::down-button {
-                subcontrol-origin: border;
-                subcontrol-position: bottom right;
-                width: 20px;
-                background-color: #3f3f3f;
-                border: 1px solid #555555;
-                border-top: none;
-                border-bottom-right-radius: 3px;
-            }
-            QSpinBox::up-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-bottom: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #0078d4;
-            }
-            QComboBox::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: center right;
-                width: 22px;
-                border: none;
-                background-color: #3f3f3f;
-                border-top-right-radius: 3px;
-                border-bottom-right-radius: 3px;
-            }
-            QComboBox::drop-down:hover {
-                background-color: #0078d4;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 6px solid transparent;
-                border-right: 6px solid transparent;
-                border-top: 7px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
             QComboBox QAbstractItemView {
                 background-color: #1e1e1e;
                 color: #cccccc;
@@ -2038,6 +1982,44 @@ class VideoConcatenationGUI(QMainWindow):
             }
         """)
         
+        # Generate arrow PNGs at runtime for cross-platform QSpinBox/QComboBox
+        # arrows (CSS border-triangles don't render in Qt on Windows).
+        import tempfile
+        arrow_dir = tempfile.mkdtemp(prefix="fnt_concat_arrows_")
+        for name, points in [("up", [(0, 5), (4, 0), (8, 5)]),
+                              ("dn", [(0, 0), (4, 5), (8, 0)])]:
+            img = QImage(8, 6, QImage.Format_ARGB32)
+            img.fill(QColor(0, 0, 0, 0))
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setBrush(QBrush(QColor(255, 255, 255)))
+            p.setPen(Qt.NoPen)
+            poly = QPolygonF([QPointF(x, y) for x, y in points])
+            p.drawPolygon(poly)
+            p.end()
+            img.save(os.path.join(arrow_dir, f"{name}.png"))
+        _up = os.path.join(arrow_dir, "up.png").replace("\\", "/")
+        _dn = os.path.join(arrow_dir, "dn.png").replace("\\", "/")
+        self._arrow_style = (
+            "QSpinBox::up-button, QSpinBox::down-button {"
+            "  background-color: #3f3f3f; border: none; width: 16px;"
+            "}"
+            "QSpinBox::up-button:hover, QSpinBox::down-button:hover {"
+            "  background-color: #0078d4;"
+            "}"
+            f"QSpinBox::up-arrow {{ image: url({_up}); width: 8px; height: 6px; }}"
+            f"QSpinBox::down-arrow {{ image: url({_dn}); width: 8px; height: 6px; }}"
+            "QComboBox::drop-down {"
+            "  subcontrol-origin: padding; subcontrol-position: center right;"
+            "  width: 20px; border: none; background-color: #3f3f3f;"
+            "  border-top-right-radius: 3px; border-bottom-right-radius: 3px;"
+            "}"
+            "QComboBox::drop-down:hover { background-color: #0078d4; }"
+            f"QComboBox::down-arrow {{ image: url({_dn}); width: 8px; height: 6px; }}"
+        )
+        # Apply arrow style on top of the main stylesheet
+        self.setStyleSheet(self.styleSheet() + self._arrow_style)
+
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -2205,12 +2187,14 @@ class VideoConcatenationGUI(QMainWindow):
         self.advanced_frame.setLayout(advanced_layout)
 
         # ---- Preprocessing section ----
-        self.preprocess_check = QCheckBox("Enable Preprocessing")
+        self.preprocess_check = QCheckBox("Enable Advanced Output Options")
         self.preprocess_check.setChecked(False)
         self.preprocess_check.setToolTip(
-            "Apply preprocessing during concatenation (grayscale, FPS, resolution, "
-            "codec settings). Use this to go directly from raw DVR footage to a "
-            "processed concatenated output.")
+            "Configure output video settings (frame rate, resolution, grayscale,\n"
+            "codec, speed preset, quality). Use this to go directly from raw DVR\n"
+            "footage to a downsampled, processed concatenated output.\n\n"
+            "When disabled, videos are concatenated with default settings\n"
+            "(libx264, CRF 18, no resolution/FPS change).")
         self.preprocess_check.toggled.connect(self._toggle_preprocessing)
         advanced_layout.addWidget(self.preprocess_check)
 
@@ -2831,7 +2815,7 @@ class VideoConcatenationGUI(QMainWindow):
         self.log_message(f"Sort order: {self.sort_order_combo.currentText()}")
         if enable_preprocessing:
             self.log_message(
-                f"Preprocessing: {preprocess_settings['frame_rate']} fps, "
+                f"Output settings: {preprocess_settings['frame_rate']} fps, "
                 f"{preprocess_settings['resolution']}, "
                 f"{preprocess_settings['codec']}, "
                 f"Preset: {preprocess_settings['preset']}, "
@@ -2839,7 +2823,7 @@ class VideoConcatenationGUI(QMainWindow):
                 f"Grayscale: {preprocess_settings['grayscale']}, "
                 f"Remove Audio: {preprocess_settings['remove_audio']}")
         else:
-            self.log_message("Preprocessing: off")
+            self.log_message("Output settings: default (libx264, CRF 18)")
         if enable_chunking:
             self.log_message(f"Chunking: {chunk_duration_minutes} min per chunk")
         else:

@@ -48,6 +48,8 @@ dependencies = [
     "segmentation-models-pytorch>=0.3.4",
     # SAM2 — AI-assisted mask annotation
     "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+    # OCR — timestamp extraction from DVR video overlays
+    "easyocr",
 ]
 
 [project.optional-dependencies]
@@ -64,11 +66,8 @@ tracking = [
     "torchvision>=0.20.1",
     "pycocotools>=2.0.6",
 ]
-ocr = [
-    "easyocr",
-]
 all = [
-    "fnt[imaging,tracking,ocr]",
+    "fnt[imaging,tracking]",
 ]
 
 [project.scripts]
