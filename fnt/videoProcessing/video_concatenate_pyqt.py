@@ -578,12 +578,21 @@ class ConcatenationWorker(QThread):
     # ------------------------------------------------------------------
     def _run_ffmpeg_concat(self, video_files, folder_path, output_file):
         """Run the ffmpeg concat command on a list of video files.
-        Returns (success: bool, last_stderr_lines: list[str])."""
+
+        When chunking is enabled the segment muxer is used *inline* so that
+        chunk files are written directly — no intermediate mega-file is
+        created.
+
+        Returns (success: bool, last_stderr_lines: list[str]).
+        """
         list_file = os.path.join(folder_path, "concat_list.txt")
         with open(list_file, "w") as fp:
             for video in video_files:
                 rel_path = os.path.basename(video)
                 fp.write(f"file '{rel_path}'\n")
+
+        chunking = (self.enable_chunking and self.chunk_duration_minutes > 0)
+        chunk_sec = self.chunk_duration_minutes * 60 if chunking else 0
 
         if self.enable_preprocessing:
             ps = self.preprocess_settings
@@ -618,16 +627,12 @@ class ConcatenationWorker(QThread):
                 "-crf", str(crf),
                 "-pix_fmt", "yuv420p",
                 "-vf", ",".join(video_filters),
-                "-movflags", "+faststart",
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "10000000",
                 "-fflags", "+genpts",
                 "-vsync", "vfr",
             ]
-            # If chunking is enabled, force keyframes at chunk boundaries
-            # so the segment muxer can split cleanly without re-encoding.
-            if self.enable_chunking and self.chunk_duration_minutes > 0:
-                chunk_sec = self.chunk_duration_minutes * 60
+            if chunking:
                 command.extend([
                     "-force_key_frames", f"expr:gte(t,n_forced*{chunk_sec})",
                 ])
@@ -635,7 +640,6 @@ class ConcatenationWorker(QThread):
                 command.append("-an")
             else:
                 command.extend(["-c:a", "aac", "-b:a", "128k"])
-            command.append(output_file)
         else:
             command = [
                 "ffmpeg", "-y",
@@ -646,18 +650,35 @@ class ConcatenationWorker(QThread):
                 "-preset", "medium",
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
                 "-avoid_negative_ts", "make_zero",
                 "-fflags", "+genpts",
                 "-vsync", "vfr",
                 "-an",
             ]
-            # Force keyframes at chunk boundaries if chunking is enabled
-            if self.enable_chunking and self.chunk_duration_minutes > 0:
-                chunk_sec = self.chunk_duration_minutes * 60
+            if chunking:
                 command.extend([
                     "-force_key_frames", f"expr:gte(t,n_forced*{chunk_sec})",
                 ])
+
+        # --- Output: segment muxer (chunking) or single file ---
+        if chunking:
+            base_name, ext = os.path.splitext(output_file)
+            chunk_pattern = f"{base_name}_part%03d{ext}"
+            command.extend([
+                "-f", "segment",
+                "-segment_time", str(chunk_sec),
+                "-segment_start_number", "1",
+                "-reset_timestamps", "1",
+                chunk_pattern,
+            ])
+            if self.enable_preprocessing:
+                self.progress_update.emit(
+                    f"Encoding directly into {self.chunk_duration_minutes}-min chunks...")
+            else:
+                self.progress_update.emit(
+                    f"Concatenating directly into {self.chunk_duration_minutes}-min chunks...")
+        else:
+            command.extend(["-movflags", "+faststart"])
             command.append(output_file)
 
         process = subprocess.Popen(
@@ -1104,7 +1125,12 @@ class ConcatenationWorker(QThread):
             ok, last_lines = self._run_ffmpeg_concat(video_files, folder_path, output_file)
 
             if ok:
-                self.progress_update.emit(f"✅ Successfully created: {os.path.basename(output_file)}")
+                chunking = (self.enable_chunking
+                            and self.chunk_duration_minutes > 0)
+                if not chunking:
+                    self.progress_update.emit(
+                        f"✅ Successfully created: "
+                        f"{os.path.basename(output_file)}")
                 final_files = self._post_concat(output_file)
                 self._cleanup_repaired(repaired_map)
                 return True
@@ -1135,17 +1161,38 @@ class ConcatenationWorker(QThread):
             return False
 
     def _post_concat(self, output_file):
-        """Run chunking and/or OCR on a successfully concatenated output file.
+        """Discover chunk files (if chunking wrote them inline) and run OCR.
+
+        When chunking is enabled, the normal encode path writes chunks
+        directly via the segment muxer — no intermediate file exists.
+        This method discovers those chunk files.
+
+        For the incremental-recovery fallback (which produces a single
+        merged file), we fall back to ``_chunk_output`` to split it.
 
         Returns the list of final output video files.
         """
         output_files = [output_file]
 
-        # Chunk if enabled
         if self.enable_chunking and self.chunk_duration_minutes > 0:
-            chunks = self._chunk_output(output_file)
+            base_name, ext = os.path.splitext(output_file)
+            chunk_dir = os.path.dirname(output_file)
+            chunk_base = os.path.basename(base_name)
+            chunks = sorted(
+                glob.glob(os.path.join(chunk_dir, f"{chunk_base}_part*{ext}")))
             if chunks:
+                # Normal path: inline chunking already created the files
+                self.progress_update.emit(f"✅ Encoded {len(chunks)} chunks:")
+                for chunk in chunks:
+                    self.progress_update.emit(
+                        f"   📁 {os.path.basename(chunk)}")
                 output_files = chunks
+            elif os.path.exists(output_file):
+                # Recovery fallback: a single merged file was produced —
+                # split it now with stream copy (no re-encoding).
+                fallback_chunks = self._chunk_output(output_file)
+                if fallback_chunks:
+                    output_files = fallback_chunks
 
         # OCR if enabled
         if self.enable_ocr and self.ocr_roi is not None:
