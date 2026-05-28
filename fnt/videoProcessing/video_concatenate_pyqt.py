@@ -21,7 +21,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox,
         QProgressBar, QTextEdit, QGroupBox, QFrame, QScrollArea, QLineEdit,
-        QComboBox, QSpinBox, QCheckBox, QDialog, QSizePolicy
+        QComboBox, QSpinBox, QCheckBox, QDialog, QSizePolicy, QRadioButton
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QRect, QPointF
     from PyQt5.QtGui import (QFont, QImage, QPixmap, QPainter, QPen, QColor,
@@ -362,11 +362,14 @@ class ConcatenationWorker(QThread):
                  enable_ocr=False, ocr_roi=None, ocr_source_resolution=None,
                  ocr_engine="easyocr", ocr_decoder="greedy",
                  ocr_timestamp_format=None,
-                 ocr_sample_interval_sec=1,
+                 ocr_sample_interval_sec=60,
                  ocr_text_color="light_on_dark"):
         super().__init__()
         self.input_dirs = input_dirs
-        self.output_filename = output_filename
+        # output_filename can be a str (same name for all folders) or a
+        # dict mapping folder_path -> filename (per-folder naming).
+        self._output_filename_default = output_filename if isinstance(output_filename, str) else "concatenated_output.mp4"
+        self._output_filename_map = output_filename if isinstance(output_filename, dict) else {}
         self.sort_order = sort_order
         self.instance_id = instance_id
         self.should_stop = False
@@ -389,6 +392,11 @@ class ConcatenationWorker(QThread):
         self._decision_mutex = QMutex()
         self._decision_cond = QWaitCondition()
         self._decision_result = None  # "skip", "move", or "cancel"
+
+    def _get_output_filename(self, folder_path):
+        """Return the output filename for the given folder."""
+        return self._output_filename_map.get(
+            folder_path, self._output_filename_default)
 
     def stop(self):
         """Stop the processing"""
@@ -1147,10 +1155,11 @@ class ConcatenationWorker(QThread):
             # --- Phase 2: Attempt full concatenation ---
             output_dir = os.path.join(folder_path, "concatenated_output")
             os.makedirs(output_dir, exist_ok=True)
-            output_file = os.path.join(output_dir, self.output_filename)
+            folder_filename = self._get_output_filename(folder_path)
+            output_file = os.path.join(output_dir, folder_filename)
             if os.path.exists(output_file):
                 counter = 1
-                base_name, ext = os.path.splitext(self.output_filename)
+                base_name, ext = os.path.splitext(folder_filename)
                 while os.path.exists(output_file):
                     output_file = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
                     counter += 1
@@ -2414,9 +2423,129 @@ class OCRRoiSelector(QDialog):
         return sorted(files)
 
 
+class PerFolderNamingDialog(QDialog):
+    """Dialog for assigning custom output filenames to each folder."""
+
+    def __init__(self, folders, default_filename, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Output Filenames")
+        self.setMinimumWidth(600)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e2e; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; }
+            QLineEdit {
+                background-color: #2a2a3e; color: #e0e0e0;
+                border: 1px solid #555; border-radius: 3px; padding: 4px;
+            }
+            QPushButton {
+                background-color: #3a3a5e; color: #e0e0e0;
+                border: 1px solid #555; border-radius: 3px; padding: 6px 16px;
+            }
+            QPushButton:hover { background-color: #4a4a7e; }
+            QRadioButton { color: #e0e0e0; spacing: 6px; }
+            QRadioButton::indicator {
+                width: 14px; height: 14px;
+                border: 2px solid #888; border-radius: 8px;
+                background-color: #2a2a3e;
+            }
+            QRadioButton::indicator:checked {
+                background-color: #66b3ff; border-color: #66b3ff;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(
+            "You have multiple folders selected with chunking enabled.\n"
+            "Choose the same output name for all folders, or enter a\n"
+            "custom base name per folder (chunks will be appended as "
+            "_partXXX.mp4).")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # --- "Use same name" row ---
+        same_row = QHBoxLayout()
+        self._same_radio = QRadioButton("Use the same name for all folders:")
+        self._same_radio.setChecked(True)
+        self._same_radio.toggled.connect(self._toggle_mode)
+        same_row.addWidget(self._same_radio)
+
+        base, ext = os.path.splitext(default_filename)
+        self._same_edit = QLineEdit(base)
+        self._same_edit.setToolTip("Base filename (extension added automatically)")
+        same_row.addWidget(self._same_edit)
+
+        ext_label = QLabel(ext or ".mp4")
+        same_row.addWidget(ext_label)
+        layout.addLayout(same_row)
+
+        # --- "Custom per folder" section ---
+        custom_row = QHBoxLayout()
+        self._custom_radio = QRadioButton("Custom name per folder:")
+        custom_row.addWidget(self._custom_radio)
+        layout.addLayout(custom_row)
+
+        # Folder → line-edit grid
+        self._folder_edits = {}
+        grid = QGridLayout()
+        for i, folder in enumerate(folders):
+            folder_label = QLabel(os.path.basename(folder))
+            folder_label.setToolTip(folder)
+            grid.addWidget(folder_label, i, 0)
+
+            edit = QLineEdit(base)
+            edit.setEnabled(False)  # disabled until custom mode
+            grid.addWidget(edit, i, 1)
+
+            ext_lbl = QLabel(ext or ".mp4")
+            grid.addWidget(ext_lbl, i, 2)
+
+            self._folder_edits[folder] = edit
+
+        self._folder_grid_widget = QWidget()
+        self._folder_grid_widget.setLayout(grid)
+        layout.addWidget(self._folder_grid_widget)
+
+        # --- Buttons ---
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self._ext = ext or ".mp4"
+        self._folders = folders
+
+    def _toggle_mode(self, same_checked):
+        """Enable/disable the per-folder edits based on radio selection."""
+        self._same_edit.setEnabled(same_checked)
+        for edit in self._folder_edits.values():
+            edit.setEnabled(not same_checked)
+
+    def get_filename_map(self):
+        """Return a dict mapping folder_path -> filename (with extension).
+
+        If the user chose "same for all", returns a plain str instead.
+        """
+        if self._same_radio.isChecked():
+            name = self._same_edit.text().strip() or "concatenated_output"
+            return name + self._ext
+        # Per-folder mode
+        result = {}
+        for folder in self._folders:
+            edit = self._folder_edits[folder]
+            name = edit.text().strip() or "concatenated_output"
+            result[folder] = name + self._ext
+        return result
+
+
 class VideoConcatenationGUI(QMainWindow):
     """Main GUI window for video concatenation"""
-    
+
     # Class variable to track instance count
     instance_count = 0
     
@@ -3015,18 +3144,18 @@ class VideoConcatenationGUI(QMainWindow):
 
         self.ocr_sample_interval_spin = QSpinBox()
         self.ocr_sample_interval_spin.setRange(1, 300)
-        self.ocr_sample_interval_spin.setValue(1)
+        self.ocr_sample_interval_spin.setValue(60)
         self.ocr_sample_interval_spin.setSuffix("s")
         self.ocr_sample_interval_spin.setFixedWidth(80)
         self.ocr_sample_interval_spin.setToolTip(
             "How often to sample a frame for OCR (in seconds).\n\n"
-            "1s (default): reads every unique timestamp — DVR clocks\n"
-            "typically update once per second, so this captures every\n"
-            "change. Best for precise frame-to-timestamp mapping.\n\n"
-            "5–10s: good for long recordings where you just need\n"
-            "periodic timestamp references. Much faster to process.\n\n"
-            "30–60s: very fast, useful for rough time alignment of\n"
-            "multi-hour recordings.\n\n"
+            "60s (default): one sample per minute — fast and\n"
+            "sufficient for time-aligning multi-hour recordings.\n\n"
+            "5–10s: good when you need finer timestamp references\n"
+            "without full per-second density.\n\n"
+            "1s: reads every unique timestamp — DVR clocks update\n"
+            "once per second, so this captures every change. Best\n"
+            "for precise frame-to-timestamp mapping but slow.\n\n"
             "The actual frame skip is calculated from the video's\n"
             "real FPS, so this works regardless of preprocessing\n"
             "frame rate settings.")
@@ -3370,6 +3499,19 @@ class VideoConcatenationGUI(QMainWindow):
         if not output_filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             output_filename += '.mp4'
 
+        # Multi-folder + chunking: offer per-folder naming
+        enable_chunking = self.chunk_check.isChecked()
+        if len(self.selected_dirs) > 1 and enable_chunking:
+            dlg = PerFolderNamingDialog(
+                self.selected_dirs, output_filename, parent=self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            naming_result = dlg.get_filename_map()
+            if isinstance(naming_result, dict):
+                output_filename = naming_result  # per-folder dict
+            else:
+                output_filename = naming_result  # str — same for all
+
         # Disable controls
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -3403,15 +3545,20 @@ class VideoConcatenationGUI(QMainWindow):
                 "resolution": resolution,
             }
 
-        # Get chunking settings
-        enable_chunking = self.chunk_check.isChecked()
+        # Get chunking settings (enable_chunking already set above for the naming dialog)
         chunk_duration_minutes = self.chunk_duration_spin.value()
 
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
         self.log_message("Starting video concatenation...")
-        self.log_message(f"Output filename: {output_filename}")
+        if isinstance(output_filename, dict):
+            self.log_message("Output filenames (per folder):")
+            for folder, fname in output_filename.items():
+                self.log_message(
+                    f"  {os.path.basename(folder)} → {fname}")
+        else:
+            self.log_message(f"Output filename: {output_filename}")
         self.log_message(f"Sort order: {self.sort_order_combo.currentText()}")
         if enable_preprocessing:
             self.log_message(
