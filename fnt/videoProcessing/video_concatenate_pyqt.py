@@ -585,7 +585,7 @@ class ConcatenationWorker(QThread):
     # Core concat logic
     # ------------------------------------------------------------------
     def _run_ffmpeg_concat(self, video_files, folder_path, output_file,
-                           allow_chunking=True):
+                           allow_chunking=True, chunk_start_number=1):
         """Run the ffmpeg concat command on a list of video files.
 
         When chunking is enabled (and *allow_chunking* is True) the segment
@@ -690,7 +690,7 @@ class ConcatenationWorker(QThread):
             command.extend([
                 "-f", "segment",
                 "-segment_time", str(chunk_sec),
-                "-segment_start_number", "1",
+                "-segment_start_number", str(chunk_start_number),
                 "-reset_timestamps", "1",
                 chunk_pattern,
             ])
@@ -705,8 +705,10 @@ class ConcatenationWorker(QThread):
             command.append(output_file)
 
         # Track which chunks have already had OCR run on them so that
-        # _post_concat can skip them.
-        self._ocr_completed_chunks = set()
+        # _post_concat can skip them.  Use getattr to preserve the set
+        # across crash-resume calls (don't re-OCR already-processed chunks).
+        if not hasattr(self, "_ocr_completed_chunks"):
+            self._ocr_completed_chunks = set()
 
         # For inline chunking + OCR: monitor the output directory so we
         # can run OCR on each chunk the moment FFmpeg finalises it.
@@ -1165,7 +1167,7 @@ class ConcatenationWorker(QThread):
                         f"✅ All files have consistent resolution: {res[0]}x{res[1]}")
                 # else: couldn't determine resolution — proceed anyway
 
-            # --- Phase 2: Attempt full concatenation ---
+            # --- Phase 2: Concatenation (with crash-resume for chunking) ---
             output_dir = os.path.join(folder_path, "concatenated_output")
             os.makedirs(output_dir, exist_ok=True)
             folder_filename = self._get_output_filename(folder_path)
@@ -1178,39 +1180,154 @@ class ConcatenationWorker(QThread):
                     counter += 1
                 self.progress_update.emit(f"Output file exists, using: {os.path.basename(output_file)}")
 
-            self.progress_update.emit(f"Concatenating {len(video_files)} videos...")
-            ok, last_lines = self._run_ffmpeg_concat(video_files, folder_path, output_file)
+            chunking = (self.enable_chunking
+                        and self.chunk_duration_minutes > 0)
 
-            if ok:
-                chunking = (self.enable_chunking
-                            and self.chunk_duration_minutes > 0)
-                if not chunking:
+            self.progress_update.emit(f"Concatenating {len(video_files)} videos...")
+
+            if chunking:
+                # ------ Crash-resume loop for chunked encoding ------
+                # FFmpeg can segfault after hours of encoding (Windows
+                # 0xC0000005).  The completed chunks are valid — we just
+                # need to figure out which source files remain and restart
+                # with continued chunk numbering.
+                MAX_CRASH_RESUMES = 50
+                remaining_files = list(video_files)
+                chunk_start = 1
+                base_name_for_glob, ext_for_glob = os.path.splitext(output_file)
+                glob_pattern = os.path.join(
+                    output_dir,
+                    f"{os.path.basename(base_name_for_glob)}_part*{ext_for_glob}")
+
+                for attempt in range(MAX_CRASH_RESUMES):
+                    if self.should_stop:
+                        break
+                    if not remaining_files:
+                        break
+
+                    chunks_before = set(glob.glob(glob_pattern))
+
+                    ok, diag_lines = self._run_ffmpeg_concat(
+                        remaining_files, folder_path, output_file,
+                        chunk_start_number=chunk_start)
+
+                    if ok:
+                        break  # success
+
+                    # FFmpeg failed — check what happened
+                    chunks_after = set(glob.glob(glob_pattern))
+                    new_chunks = chunks_after - chunks_before
+                    all_chunks = sorted(chunks_after)
+
+                    if diag_lines:
+                        self.progress_update.emit(
+                            "FFmpeg diagnostic output:")
+                        for ln in diag_lines:
+                            self.progress_update.emit(f"  {ln}")
+
+                    if not new_chunks:
+                        # No progress at all — fall through to old recovery
+                        self.progress_update.emit(
+                            "❌ FFmpeg failed without producing any output.")
+                        break
+
+                    # Delete the last (incomplete) chunk — the segment muxer
+                    # was still writing to it when FFmpeg crashed.
+                    last_chunk = sorted(chunks_after)[-1]
+                    try:
+                        os.remove(last_chunk)
+                        self.progress_update.emit(
+                            f"   Removed incomplete chunk: "
+                            f"{os.path.basename(last_chunk)}")
+                    except Exception:
+                        pass
+                    complete_chunks = sorted(
+                        chunks_after - {last_chunk})
+
+                    # Determine which source files were consumed
+                    crash_file_idx = self._get_failure_file_index(
+                        remaining_files, diag_lines)
+
+                    if crash_file_idx is not None and crash_file_idx > 0:
+                        # Skip past the files that were fully encoded
+                        consumed = crash_file_idx
+                        remaining_files = remaining_files[consumed:]
+                        self.progress_update.emit(
+                            f"⚡ FFmpeg crashed (segfault). "
+                            f"{len(complete_chunks)} chunk(s) saved. "
+                            f"Consumed {consumed} source file(s). "
+                            f"Resuming with {len(remaining_files)} "
+                            f"remaining files...")
+                    else:
+                        # Can't determine position — estimate from chunk count
+                        # Each chunk ≈ chunk_duration_minutes of output video
+                        # Rough estimate: skip proportional source files
+                        self.progress_update.emit(
+                            f"⚡ FFmpeg crashed (segfault). "
+                            f"{len(complete_chunks)} chunk(s) saved. "
+                            f"Could not map failure to source file — "
+                            f"falling back to old recovery.")
+                        break
+
+                    # Count ALL completed chunks across all attempts
+                    all_complete = sorted(
+                        set(glob.glob(glob_pattern)))
+                    chunk_start = len(all_complete) + 1
+
+                    if not remaining_files:
+                        self.progress_update.emit(
+                            "✅ All source files consumed across "
+                            f"crash-resume attempts.")
+                        break
+
+                # Check final result
+                all_chunks = sorted(glob.glob(glob_pattern))
+                if all_chunks:
+                    if not chunking:
+                        self.progress_update.emit(
+                            f"✅ Successfully created: "
+                            f"{os.path.basename(output_file)}")
+                    final_files = self._post_concat(output_file)
+                    self._cleanup_repaired(repaired_map)
+                    return True
+                else:
+                    self.progress_update.emit(
+                        "❌ No output chunks were produced.")
+                    self._cleanup_repaired(repaired_map)
+                    return False
+
+            else:
+                # ------ Non-chunked: single output file ------
+                ok, last_lines = self._run_ffmpeg_concat(
+                    video_files, folder_path, output_file)
+
+                if ok:
                     self.progress_update.emit(
                         f"✅ Successfully created: "
                         f"{os.path.basename(output_file)}")
-                final_files = self._post_concat(output_file)
-                self._cleanup_repaired(repaired_map)
-                return True
+                    final_files = self._post_concat(output_file)
+                    self._cleanup_repaired(repaired_map)
+                    return True
 
-            # --- Phase 3: Incremental failure recovery ---
-            self.progress_update.emit("=" * 50)
-            self.progress_update.emit(
-                "❌ Full concatenation failed. "
-                "Starting incremental recovery...")
-
-            if last_lines:
+                # --- Phase 3: Incremental failure recovery ---
+                self.progress_update.emit("=" * 50)
                 self.progress_update.emit(
-                    "FFmpeg diagnostic output:")
-                for ln in last_lines:
-                    self.progress_update.emit(f"  {ln}")
+                    "❌ Full concatenation failed. "
+                    "Starting incremental recovery...")
 
-            success = self._incremental_concat_with_recovery(
-                video_files, folder_path, output_file, repaired_map,
-                initial_last_lines=last_lines)
-            self._cleanup_repaired(repaired_map)
-            if success:
-                self._post_concat(output_file)
-            return success
+                if last_lines:
+                    self.progress_update.emit(
+                        "FFmpeg diagnostic output:")
+                    for ln in last_lines:
+                        self.progress_update.emit(f"  {ln}")
+
+                success = self._incremental_concat_with_recovery(
+                    video_files, folder_path, output_file, repaired_map,
+                    initial_last_lines=last_lines)
+                self._cleanup_repaired(repaired_map)
+                if success:
+                    self._post_concat(output_file)
+                return success
 
         except Exception as e:
             self.progress_update.emit(f"❌ Error processing {folder_path}: {str(e)}")
