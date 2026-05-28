@@ -1248,20 +1248,31 @@ class ConcatenationWorker(QThread):
                     crash_file_idx = self._get_failure_file_index(
                         remaining_files, diag_lines)
 
-                    if crash_file_idx is not None and crash_file_idx > 0:
-                        # Skip past the files that were fully encoded
-                        consumed = crash_file_idx
-                        remaining_files = remaining_files[consumed:]
-                        self.progress_update.emit(
-                            f"⚡ FFmpeg crashed (segfault). "
-                            f"{len(complete_chunks)} chunk(s) saved. "
-                            f"Consumed {consumed} source file(s). "
-                            f"Resuming with {len(remaining_files)} "
-                            f"remaining files...")
+                    if crash_file_idx is not None and crash_file_idx >= 0:
+                        if crash_file_idx == 0:
+                            # Crash within the FIRST remaining file —
+                            # skip it entirely and resume from the next.
+                            skipped = remaining_files[0]
+                            remaining_files = remaining_files[1:]
+                            self.progress_update.emit(
+                                f"⚡ FFmpeg crashed (segfault) within "
+                                f"the first remaining file: "
+                                f"{os.path.basename(skipped)}. "
+                                f"{len(complete_chunks)} chunk(s) saved. "
+                                f"Skipping that file and resuming with "
+                                f"{len(remaining_files)} remaining files...")
+                        else:
+                            # Skip past the files that were fully encoded
+                            consumed = crash_file_idx
+                            remaining_files = remaining_files[consumed:]
+                            self.progress_update.emit(
+                                f"⚡ FFmpeg crashed (segfault). "
+                                f"{len(complete_chunks)} chunk(s) saved. "
+                                f"Consumed {consumed} source file(s). "
+                                f"Resuming with {len(remaining_files)} "
+                                f"remaining files...")
                     else:
-                        # Can't determine position — estimate from chunk count
-                        # Each chunk ≈ chunk_duration_minutes of output video
-                        # Rough estimate: skip proportional source files
+                        # Can't determine position — fall back
                         self.progress_update.emit(
                             f"⚡ FFmpeg crashed (segfault). "
                             f"{len(complete_chunks)} chunk(s) saved. "
