@@ -584,14 +584,15 @@ class ConcatenationWorker(QThread):
     # ------------------------------------------------------------------
     # Core concat logic
     # ------------------------------------------------------------------
-    def _run_ffmpeg_concat(self, video_files, folder_path, output_file):
+    def _run_ffmpeg_concat(self, video_files, folder_path, output_file,
+                           allow_chunking=True):
         """Run the ffmpeg concat command on a list of video files.
 
-        When chunking is enabled the segment muxer is used *inline* so that
-        chunk files are written directly — no intermediate mega-file is
-        created.
+        When chunking is enabled (and *allow_chunking* is True) the segment
+        muxer writes chunk files directly.  Pass ``allow_chunking=False``
+        from the recovery path so a single file is produced instead.
 
-        Returns (success: bool, last_stderr_lines: list[str]).
+        Returns (success: bool, diagnostic_lines: list[str]).
         """
         list_file = os.path.join(folder_path, "concat_list.txt")
         with open(list_file, "w") as fp:
@@ -599,7 +600,8 @@ class ConcatenationWorker(QThread):
                 rel_path = os.path.basename(video)
                 fp.write(f"file '{rel_path}'\n")
 
-        chunking = (self.enable_chunking and self.chunk_duration_minutes > 0)
+        chunking = (allow_chunking and self.enable_chunking
+                    and self.chunk_duration_minutes > 0)
         chunk_sec = self.chunk_duration_minutes * 60 if chunking else 0
 
         if self.enable_preprocessing:
@@ -730,8 +732,8 @@ class ConcatenationWorker(QThread):
             cwd=folder_path
         )
 
-        last_lines = []       # rolling buffer for failure diagnostics
-        error_lines = []      # non-progress lines (actual errors/warnings)
+        last_progress = []    # last few progress lines (how far did we get?)
+        last_lines = []       # rolling tail of ALL output
         for line in process.stdout:
             if self.should_stop:
                 process.terminate()
@@ -744,14 +746,12 @@ class ConcatenationWorker(QThread):
             if line:
                 self.ffmpeg_output.emit(line)
                 last_lines.append(line)
-                if len(last_lines) > 50:
+                if len(last_lines) > 80:
                     last_lines.pop(0)
-                # Capture non-progress lines separately — these contain
-                # the actual error messages that explain failures.
-                if not line.startswith("frame=") and not line.startswith("size="):
-                    error_lines.append(line)
-                    if len(error_lines) > 30:
-                        error_lines.pop(0)
+                if line.startswith("frame="):
+                    last_progress.append(line)
+                    if len(last_progress) > 3:
+                        last_progress.pop(0)
 
             # --- Inline OCR: periodically check for newly completed chunks ---
             if ocr_inline:
@@ -799,10 +799,21 @@ class ConcatenationWorker(QThread):
         except Exception:
             pass
 
-        # Prefer error_lines for diagnostics (actual errors, not progress);
-        # fall back to last_lines if nothing non-progress was captured.
-        diagnostic_lines = error_lines if error_lines else last_lines
-        return success, diagnostic_lines
+        # Build diagnostic output: last progress lines (for failure-point
+        # mapping) + meaningful tail (for the actual error message).
+        _NOISE_PREFIXES = ("x265 [info]", "x265 [warning]", "[libx265",
+                           "Metadata:", "encoder ", "Side data:",
+                           "cpb: bitrate", "Output #0", "Stream #0",
+                           "Input #0")
+        tail = [ln for ln in last_lines
+                if not any(ln.lstrip().startswith(p) for p in _NOISE_PREFIXES)
+                and not ln.startswith("frame=")]
+        tail = tail[-20:]
+        diagnostic = last_progress + tail
+        if not success:
+            diagnostic.append(
+                f"[FFmpeg exit code: {process.returncode}]")
+        return success, diagnostic
 
     # ------------------------------------------------------------------
     # Fast per-file decode test
@@ -1187,8 +1198,8 @@ class ConcatenationWorker(QThread):
 
             if last_lines:
                 self.progress_update.emit(
-                    "FFmpeg error/warning output:")
-                for ln in last_lines[-15:]:
+                    "FFmpeg diagnostic output:")
+                for ln in last_lines:
                     self.progress_update.emit(f"  {ln}")
 
             success = self._incremental_concat_with_recovery(
@@ -1801,7 +1812,8 @@ class ConcatenationWorker(QThread):
                         f"{len(remaining)} files remaining, "
                         f"{len(segments)} segment(s) completed")
                     ok, last_lines = self._run_ffmpeg_concat(
-                        remaining, folder_path, segment_output)
+                        remaining, folder_path, segment_output,
+                        allow_chunking=False)
 
                 if ok:
                     segments.append(segment_output)
@@ -1811,8 +1823,8 @@ class ConcatenationWorker(QThread):
                 # ------ Failure: salvage → identify → repair → continue ------
                 if last_lines:
                     self.progress_update.emit(
-                        "FFmpeg error/warning output:")
-                    for ln in last_lines[-15:]:
+                        "FFmpeg diagnostic output:")
+                    for ln in last_lines:
                         self.progress_update.emit(f"  {ln}")
 
                 # Step A: Determine failure file index within 'remaining'
@@ -1854,7 +1866,8 @@ class ConcatenationWorker(QThread):
                             prefix_out = os.path.join(
                                 temp_dir, f"prefix_{len(segments):03d}.mp4")
                             ok_p, _ = self._run_ffmpeg_concat(
-                                prefix_files, folder_path, prefix_out)
+                                prefix_files, folder_path, prefix_out,
+                                allow_chunking=False)
                             if ok_p:
                                 segments.append(prefix_out)
                                 self.progress_update.emit(
