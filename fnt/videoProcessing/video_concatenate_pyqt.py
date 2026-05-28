@@ -627,7 +627,6 @@ class ConcatenationWorker(QThread):
                 # VLC plays them fine; these flags make FFmpeg equally
                 # tolerant during re-encoding.
                 "-err_detect", "ignore_err",
-                "-ec", "deblock:guess_mvs:favor_inter",
                 "-analyzeduration", "200M",
                 "-probesize", "200M",
                 "-f", "concat", "-safe", "0", "-i", list_file,
@@ -653,7 +652,6 @@ class ConcatenationWorker(QThread):
             command = [
                 "ffmpeg", "-y",
                 "-err_detect", "ignore_err",
-                "-ec", "deblock:guess_mvs:favor_inter",
                 "-analyzeduration", "200M",
                 "-probesize", "200M",
                 "-f", "concat",
@@ -1061,62 +1059,8 @@ class ConcatenationWorker(QThread):
 
             self.progress_update.emit(f"Found {len(video_files)} video file(s)")
 
-            # --- Phase 1: Validate each video with ffprobe ---
-            self.progress_update.emit("Validating video files with ffprobe...")
-            bad_files = []
-            for i, vf in enumerate(video_files):
-                if self.should_stop:
-                    return False
-                ok, info = self._probe_video(vf)
-                if not ok:
-                    bad_files.append((i, vf, info))
-                    self.progress_update.emit(
-                        f"  ⚠️ [{i+1}/{len(video_files)}] PROBLEM: {os.path.basename(vf)}")
-                    self.progress_update.emit(f"     Error: {info}")
-                elif i % 50 == 0 or i == len(video_files) - 1:
-                    self.progress_update.emit(
-                        f"  ✓ Validated {i+1}/{len(video_files)} files...")
-
-            # Attempt to repair any bad files found by ffprobe
-            repaired_map = {}  # original_path -> repaired_path
-            if bad_files:
-                self.progress_update.emit(
-                    f"Found {len(bad_files)} problematic file(s). Attempting repairs...")
-                for idx, filepath, error_info in bad_files:
-                    if self.should_stop:
-                        return False
-                    repaired = self._try_repair_video(filepath, folder_path)
-                    if repaired:
-                        repaired_map[filepath] = repaired
-
-                # Swap repaired files into the list
-                for i, vf in enumerate(video_files):
-                    if vf in repaired_map:
-                        video_files[i] = repaired_map[vf]
-
-                # Any files that couldn't be repaired — ask user what to do
-                unrepairable = [vf for _, vf, _ in bad_files if vf not in repaired_map]
-                if unrepairable:
-                    action = self._ask_user_decision(
-                        f"{len(unrepairable)} file(s) could not be repaired.",
-                        unrepairable  # full paths — GUI shows basenames, can move files
-                    )
-                    if action == "cancel" or self.should_stop:
-                        self.progress_update.emit("❌ Concatenation cancelled by user.")
-                        self._cleanup_repaired(repaired_map)
-                        return False
-                    # User chose skip or move (move already handled by GUI)
-                    for uf in unrepairable:
-                        verb = "Moved" if action == "move" else "Skipping"
-                        self.progress_update.emit(f"   {verb}: {os.path.basename(uf)}")
-                    video_files = [vf for vf in video_files if vf not in unrepairable]
-
-                if not video_files:
-                    self.progress_update.emit("❌ No valid video files remain after validation.")
-                    self._cleanup_repaired(repaired_map)
-                    return False
-            else:
-                self.progress_update.emit(f"✅ All {len(video_files)} files passed validation.")
+            # Repair map for incremental recovery (files repaired on-the-fly)
+            repaired_map = {}
 
             # --- Resolution consistency check (skip when preprocessing normalizes resolution) ---
             if self.enable_preprocessing:
