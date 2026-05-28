@@ -621,10 +621,15 @@ class ConcatenationWorker(QThread):
 
             command = [
                 "ffmpeg", "-y",
-                # Error resilience — DVR recordings often have minor
-                # corruption (bad timestamps, truncated frames) that
-                # should be tolerated rather than treated as fatal.
+                # ---- Maximum error resilience (match VLC tolerance) ----
+                # DVR recordings commonly have timestamp jumps, truncated
+                # frames, and minor container issues between segments.
+                # VLC plays them fine; these flags make FFmpeg equally
+                # tolerant during re-encoding.
                 "-err_detect", "ignore_err",
+                "-ec", "deblock:guess_mvs:favor_inter",
+                "-analyzeduration", "200M",
+                "-probesize", "200M",
                 "-f", "concat", "-safe", "0", "-i", list_file,
                 "-c:v", codec,
                 "-preset", preset,
@@ -633,7 +638,7 @@ class ConcatenationWorker(QThread):
                 "-vf", ",".join(video_filters),
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "10000000",
-                "-fflags", "+genpts+discardcorrupt",
+                "-fflags", "+genpts+discardcorrupt+igndts",
                 "-vsync", "vfr",
             ]
             if chunking:
@@ -648,6 +653,9 @@ class ConcatenationWorker(QThread):
             command = [
                 "ffmpeg", "-y",
                 "-err_detect", "ignore_err",
+                "-ec", "deblock:guess_mvs:favor_inter",
+                "-analyzeduration", "200M",
+                "-probesize", "200M",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
@@ -656,7 +664,7 @@ class ConcatenationWorker(QThread):
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 "-avoid_negative_ts", "make_zero",
-                "-fflags", "+genpts+discardcorrupt",
+                "-fflags", "+genpts+discardcorrupt+igndts",
                 "-vsync", "vfr",
                 "-an",
             ]
@@ -716,7 +724,8 @@ class ConcatenationWorker(QThread):
             cwd=folder_path
         )
 
-        last_lines = []
+        last_lines = []       # rolling buffer for failure diagnostics
+        error_lines = []      # non-progress lines (actual errors/warnings)
         for line in process.stdout:
             if self.should_stop:
                 process.terminate()
@@ -729,8 +738,14 @@ class ConcatenationWorker(QThread):
             if line:
                 self.ffmpeg_output.emit(line)
                 last_lines.append(line)
-                if len(last_lines) > 20:
+                if len(last_lines) > 50:
                     last_lines.pop(0)
+                # Capture non-progress lines separately — these contain
+                # the actual error messages that explain failures.
+                if not line.startswith("frame=") and not line.startswith("size="):
+                    error_lines.append(line)
+                    if len(error_lines) > 30:
+                        error_lines.pop(0)
 
             # --- Inline OCR: periodically check for newly completed chunks ---
             if ocr_inline:
@@ -778,7 +793,10 @@ class ConcatenationWorker(QThread):
         except Exception:
             pass
 
-        return success, last_lines
+        # Prefer error_lines for diagnostics (actual errors, not progress);
+        # fall back to last_lines if nothing non-progress was captured.
+        diagnostic_lines = error_lines if error_lines else last_lines
+        return success, diagnostic_lines
 
     # ------------------------------------------------------------------
     # Fast per-file decode test
@@ -894,37 +912,54 @@ class ConcatenationWorker(QThread):
         return estimated_idx
 
     def _find_bad_videos_fast(self, video_files, folder_path, last_ffmpeg_lines):
-        """Quickly identify problematic video(s) after a concat failure.
+        """Identify the problematic video after a concat failure.
 
         Strategy:
         1.  Parse the last ffmpeg output to map failure to a file index.
-        2.  Decode-test a small window of files around the estimated failure.
-        3.  If no estimate is possible, decode-test ALL files.
+        2.  Decode-test only the estimated failure file (and its immediate
+            neighbor, since concat failures often occur at file boundaries).
+        3.  If no file is detectably corrupt, blame the estimated failure
+            file anyway — the issue is likely a container/timestamp
+            discontinuity that only manifests during concatenation, not
+            within a single-file decode test.
 
         Returns a list of (index, filepath, error) tuples for bad files.
         """
         total = len(video_files)
         bad_files = []
 
-        estimated_idx = self._get_failure_file_index(video_files, last_ffmpeg_lines)
+        estimated_idx = self._get_failure_file_index(
+            video_files, last_ffmpeg_lines)
 
-        # ------ Decode-test files around the estimated point ------
-        if estimated_idx is not None:
-            # Test a window: 3 files before through 3 files after the estimate
-            window_start = max(0, estimated_idx - 3)
-            window_end = min(total, estimated_idx + 4)
-            test_indices = set(range(window_start, window_end))
+        if estimated_idx is None:
+            # No estimate at all — test just the first file as a last resort
             self.progress_update.emit(
-                f"🔍 Decode-testing files #{window_start+1}–#{window_end} "
-                f"(window around estimated failure point)...")
-        else:
-            # No estimate — test all files
-            test_indices = set(range(total))
+                "🔍 No frame/time estimate available. "
+                "Testing first file only...")
+            vf = video_files[0]
             self.progress_update.emit(
-                f"🔍 No frame/time estimate available. "
-                f"Decode-testing all {total} files...")
+                f"  Testing [1/{total}]: {os.path.basename(vf)}...")
+            ok, err = self._decode_test_video(vf)
+            if not ok:
+                bad_files.append((0, vf, err))
+            else:
+                # Blame it anyway — skip so concat can continue
+                bad_files.append((
+                    0, vf,
+                    "concat failure (file decodes OK individually)"))
+            return bad_files
 
-        for i in sorted(test_indices):
+        # Decode-test only the failure file and its immediate neighbor
+        test_indices = [estimated_idx]
+        if estimated_idx + 1 < total:
+            test_indices.append(estimated_idx + 1)
+
+        self.progress_update.emit(
+            f"🔍 Decode-testing file #{estimated_idx + 1}"
+            + (f" and #{estimated_idx + 2}" if len(test_indices) > 1 else "")
+            + f" (around failure point)...")
+
+        for i in test_indices:
             if self.should_stop:
                 return bad_files
             vf = video_files[i]
@@ -936,30 +971,20 @@ class ConcatenationWorker(QThread):
                 self.progress_update.emit(
                     f"  ❌ FAILED: {os.path.basename(vf)}")
                 self.progress_update.emit(f"     Error: {err}")
-            # Progress for long scans
-            elif len(test_indices) > 30 and i % 20 == 0:
-                self.progress_update.emit(
-                    f"  ✓ {i+1}/{total} passed...")
 
-        # If windowed scan found nothing, expand to full scan
-        if not bad_files and estimated_idx is not None:
+        # If neither file is individually corrupt, the failure is likely
+        # a container/timestamp discontinuity at the file boundary.
+        # Blame the estimated failure file so recovery can skip past it.
+        if not bad_files:
+            vf = video_files[estimated_idx]
             self.progress_update.emit(
-                "⚠️ Windowed scan found no issues. "
-                "Expanding to full decode test of all files...")
-            for i in range(total):
-                if self.should_stop:
-                    return bad_files
-                if i in test_indices:
-                    continue  # Already tested
-                vf = video_files[i]
-                self.progress_update.emit(
-                    f"  Testing [{i+1}/{total}]: {os.path.basename(vf)}...")
-                ok, err = self._decode_test_video(vf)
-                if not ok:
-                    bad_files.append((i, vf, err))
-                    self.progress_update.emit(
-                        f"  ❌ FAILED: {os.path.basename(vf)}")
-                    self.progress_update.emit(f"     Error: {err}")
+                f"  ⚠️ No individual file corruption detected. "
+                f"Failure is likely at the file boundary — "
+                f"flagging #{estimated_idx + 1}: {os.path.basename(vf)}")
+            bad_files.append((
+                estimated_idx, vf,
+                "concat failure at file boundary "
+                "(file decodes OK individually)"))
 
         return bad_files
 
@@ -1208,8 +1233,9 @@ class ConcatenationWorker(QThread):
                 "Starting incremental recovery...")
 
             if last_lines:
-                self.progress_update.emit("Last FFmpeg output before failure:")
-                for ln in last_lines[-5:]:
+                self.progress_update.emit(
+                    "FFmpeg error/warning output:")
+                for ln in last_lines[-15:]:
                     self.progress_update.emit(f"  {ln}")
 
             success = self._incremental_concat_with_recovery(
@@ -1830,6 +1856,11 @@ class ConcatenationWorker(QThread):
                     break
 
                 # ------ Failure: salvage → identify → repair → continue ------
+                if last_lines:
+                    self.progress_update.emit(
+                        "FFmpeg error/warning output:")
+                    for ln in last_lines[-15:]:
+                        self.progress_update.emit(f"  {ln}")
 
                 # Step A: Determine failure file index within 'remaining'
                 failure_idx = self._get_failure_file_index(
@@ -1915,6 +1946,14 @@ class ConcatenationWorker(QThread):
                     for idx, filepath, err in detected_bad:
                         if self.should_stop:
                             return False
+                        # Skip repair for boundary failures — the file
+                        # decodes fine individually; re-muxing won't help.
+                        if "decodes OK individually" in err:
+                            self.progress_update.emit(
+                                f"   ⏭️ Skipping repair (boundary issue): "
+                                f"{os.path.basename(filepath)}")
+                            bad_indices.add(idx)
+                            continue
                         repaired = self._try_repair_video(
                             filepath, folder_path)
                         if repaired:
