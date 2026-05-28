@@ -13,6 +13,7 @@ import glob
 import csv
 import random
 import re as _re
+import shutil
 from datetime import datetime as _datetime, timedelta as _timedelta
 from pathlib import Path
 
@@ -582,29 +583,301 @@ class ConcatenationWorker(QThread):
             self.finished.emit(False, f"Error during processing: {str(e)}")
 
     # ------------------------------------------------------------------
+    # Per-file pre-transcoding (crash-resilient encoding)
+    # ------------------------------------------------------------------
+    def _pretranscode_sources(self, video_files, folder_path):
+        """Pre-transcode each source file individually for crash resilience.
+
+        The concat demuxer can cause FFmpeg/x265 to segfault at DVR file
+        boundaries when all files are fed through a single encoder process.
+        By transcoding each file independently (identical to what the
+        Video PreProcessing Tool does), we isolate failures to individual
+        files.  The caller then concatenates the clean intermediate files
+        using stream copy, which cannot crash.
+
+        Returns *(temp_dir, temp_files)* where *temp_files* is an ordered
+        list of paths.  Already-transcoded temp files (from a previous
+        interrupted attempt) are reused when the source file list matches.
+        """
+        import time as _time
+
+        ps = self.preprocess_settings
+        codec = ps.get("codec", "libx264")
+        preset = ps.get("preset", "ultrafast")
+        crf = ps.get("crf", 20)
+        frame_rate = ps.get("frame_rate", 30)
+        grayscale = ps.get("grayscale", False)
+        remove_audio = ps.get("remove_audio", True)
+        resolution = ps.get("resolution", "1080p")
+
+        if resolution == "1080p":
+            width, height = 1920, 1080
+        elif resolution == "720p":
+            width, height = 1280, 720
+        else:
+            width, height = 854, 480
+
+        video_filters = [f"fps={frame_rate}"]
+        video_filters.append(
+            f"scale={width}:{height}:"
+            f"force_original_aspect_ratio=decrease:eval=frame")
+        video_filters.append(
+            f"pad={width}:{height}:-1:-1:color=black")
+        if grayscale:
+            video_filters.append("format=gray")
+        vf_str = ",".join(video_filters)
+
+        # Frequent keyframes so the segment muxer (stream-copy phase)
+        # can cut close to the desired chunk boundary.  Every 2 seconds
+        # gives < 2 s error on a 60-minute chunk — negligible.
+        gop = max(1, int(frame_rate * 2))
+
+        output_dir = os.path.join(folder_path, "concatenated_output")
+        temp_dir = os.path.join(output_dir, "_transcode_tmp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # ---- Manifest check for resume support ----
+        # If the temp dir is from a previous run with a different file
+        # list, clear it and start fresh.  Otherwise reuse completed
+        # temp files to avoid re-transcoding after an interruption.
+        manifest_path = os.path.join(temp_dir, "_manifest.txt")
+        expected_manifest = "\n".join(
+            os.path.abspath(f) for f in video_files)
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r") as mf:
+                    old_manifest = mf.read().strip()
+            except Exception:
+                old_manifest = ""
+            if old_manifest != expected_manifest.strip():
+                self.progress_update.emit(
+                    "Source file list changed — clearing previous "
+                    "temp transcodes...")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                os.makedirs(temp_dir, exist_ok=True)
+        with open(manifest_path, "w") as mf:
+            mf.write(expected_manifest)
+
+        temp_files = []
+        total = len(video_files)
+        failed_files = []
+
+        self.progress_update.emit(
+            f"Pre-transcoding {total} source file(s) individually "
+            f"(crash-resilient mode)...")
+
+        for i, src in enumerate(video_files):
+            if self.should_stop:
+                return temp_dir, []
+
+            basename = os.path.basename(src)
+            temp_out = os.path.join(temp_dir, f"tmp_{i:04d}.mp4")
+
+            # Resume support — skip files already transcoded successfully
+            if os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                self.progress_update.emit(
+                    f"   [{i+1}/{total}] Already transcoded: {basename}")
+                temp_files.append(temp_out)
+                continue
+
+            self.progress_update.emit(
+                f"   [{i+1}/{total}] Transcoding: {basename}")
+            t0 = _time.monotonic()
+
+            cmd = [
+                "ffmpeg", "-y", "-nostdin",
+                "-v", "warning", "-stats",
+                # Input-level error resilience
+                "-err_detect", "ignore_err",
+                "-analyzeduration", "200M",
+                "-probesize", "200M",
+                "-fflags", "+genpts+discardcorrupt",
+                "-i", src,
+                "-c:v", codec,
+                "-preset", preset,
+                "-crf", str(crf),
+                "-pix_fmt", "yuv420p",
+                "-vf", vf_str,
+                "-g", str(gop),
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "10000000",
+                "-vsync", "vfr",
+                "-movflags", "+faststart",
+            ]
+            if remove_audio:
+                cmd.append("-an")
+            else:
+                cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+            cmd.append(temp_out)
+
+            ok = self._run_single_transcode(cmd, temp_out, basename)
+
+            if not ok:
+                self.progress_update.emit(
+                    f"   ⚠️ Retrying: {basename}")
+                try:
+                    if os.path.exists(temp_out):
+                        os.remove(temp_out)
+                except Exception:
+                    pass
+                ok = self._run_single_transcode(cmd, temp_out, basename)
+
+            elapsed = _time.monotonic() - t0
+            if ok:
+                temp_files.append(temp_out)
+                self.progress_update.emit(
+                    f"   [{i+1}/{total}] ✅ Done ({elapsed:.0f}s)")
+            else:
+                failed_files.append(basename)
+                self.progress_update.emit(
+                    f"   [{i+1}/{total}] ❌ Failed after retry: "
+                    f"{basename}")
+                try:
+                    if os.path.exists(temp_out):
+                        os.remove(temp_out)
+                except Exception:
+                    pass
+
+        if failed_files:
+            self.progress_update.emit(
+                f"⚠️ {len(failed_files)} file(s) failed "
+                f"pre-transcoding: " + ", ".join(failed_files[:10]))
+        self.progress_update.emit(
+            f"Pre-transcoding complete: {len(temp_files)}/{total} "
+            f"file(s) ready.")
+        return temp_dir, temp_files
+
+    def _run_single_transcode(self, cmd, output_file, display_name):
+        """Run a single FFmpeg transcode with stall detection.
+
+        Identical to the per-file processing in the Video PreProcessing
+        Tool: one file in, one file out.  Returns True on success.
+        """
+        import time as _time
+        import threading
+        import queue as _queue
+
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        line_q = _queue.Queue()
+
+        def _reader():
+            try:
+                for ln in process.stdout:
+                    line_q.put(ln)
+            except Exception:
+                pass
+            finally:
+                line_q.put(None)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        last_progress_time = _time.time()
+        stall_timeout = 120  # 2 minutes — matches PreProcessing Tool
+
+        while True:
+            if self.should_stop:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                return False
+
+            try:
+                line = line_q.get(timeout=1.0)
+            except _queue.Empty:
+                if process.poll() is not None:
+                    break
+                if _time.time() - last_progress_time > stall_timeout:
+                    self.progress_update.emit(
+                        f"   ⚠️ FFmpeg stalled for {stall_timeout}s "
+                        f"on {display_name} — killing")
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return False
+                continue
+
+            if line is None:
+                break
+
+            line = line.strip()
+            if line:
+                self.ffmpeg_output.emit(line)
+                last_progress_time = _time.time()
+
+        process.wait()
+
+        if process.returncode != 0:
+            self.progress_update.emit(
+                f"   ⚠️ FFmpeg exit code {process.returncode} "
+                f"for {display_name}")
+            try:
+                if os.path.exists(output_file):
+                    os.remove(output_file)
+            except Exception:
+                pass
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
     # Core concat logic
     # ------------------------------------------------------------------
     def _run_ffmpeg_concat(self, video_files, folder_path, output_file,
-                           allow_chunking=True, chunk_start_number=1):
+                           allow_chunking=True, chunk_start_number=1,
+                           stream_copy=False):
         """Run the ffmpeg concat command on a list of video files.
 
         When chunking is enabled (and *allow_chunking* is True) the segment
         muxer writes chunk files directly.  Pass ``allow_chunking=False``
         from the recovery path so a single file is produced instead.
 
+        When *stream_copy* is True the files have already been transcoded
+        individually and just need to be concatenated via packet copy — no
+        decoding or encoding takes place, so this step is fast and cannot
+        crash from corrupt frame data.
+
         Returns (success: bool, diagnostic_lines: list[str]).
         """
         list_file = os.path.join(folder_path, "concat_list.txt")
         with open(list_file, "w") as fp:
             for video in video_files:
-                rel_path = os.path.basename(video)
-                fp.write(f"file '{rel_path}'\n")
+                if stream_copy:
+                    # Pre-transcoded temp files live in a sub-directory —
+                    # use absolute paths (forward slashes for FFmpeg).
+                    abs_path = os.path.abspath(video).replace("\\", "/")
+                    fp.write(f"file '{abs_path}'\n")
+                else:
+                    rel_path = os.path.basename(video)
+                    fp.write(f"file '{rel_path}'\n")
 
         chunking = (allow_chunking and self.enable_chunking
                     and self.chunk_duration_minutes > 0)
         chunk_sec = self.chunk_duration_minutes * 60 if chunking else 0
 
-        if self.enable_preprocessing:
+        if stream_copy:
+            # Pre-transcoded files — just copy packets, no re-encoding.
+            # This is fast and cannot crash from corrupt frame data.
+            command = [
+                "ffmpeg", "-y", "-nostdin",
+                "-v", "warning", "-stats",
+                "-f", "concat", "-safe", "0", "-i", list_file,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-fflags", "+genpts",
+            ]
+        elif self.enable_preprocessing:
             ps = self.preprocess_settings
             codec = ps.get("codec", "libx264")
             preset = ps.get("preset", "ultrafast")
@@ -694,7 +967,12 @@ class ConcatenationWorker(QThread):
                 "-reset_timestamps", "1",
                 chunk_pattern,
             ])
-            if self.enable_preprocessing:
+            if stream_copy:
+                self.progress_update.emit(
+                    f"Concatenating pre-transcoded files into "
+                    f"{self.chunk_duration_minutes}-min chunks "
+                    f"(stream copy — fast)...")
+            elif self.enable_preprocessing:
                 self.progress_update.emit(
                     f"Encoding directly into {self.chunk_duration_minutes}-min chunks...")
             else:
@@ -1185,14 +1463,43 @@ class ConcatenationWorker(QThread):
 
             self.progress_update.emit(f"Concatenating {len(video_files)} videos...")
 
+            # ---- Pre-transcode for crash resilience ----
+            # When preprocessing is enabled, transcode each source file
+            # individually first (like the PreProcessing Tool does).
+            # This avoids the concat-demuxer segfaults at DVR file
+            # boundaries.  The clean temp files are then concatenated
+            # via stream copy (fast, crash-proof).
+            stream_copy = False
+            temp_dir = None
+            if self.enable_preprocessing:
+                temp_dir, transcoded_files = \
+                    self._pretranscode_sources(video_files, folder_path)
+                if self.should_stop:
+                    self._cleanup_repaired(repaired_map)
+                    return False
+                if not transcoded_files:
+                    self.progress_update.emit(
+                        "❌ All files failed pre-transcoding.")
+                    self._cleanup_repaired(repaired_map)
+                    return False
+                if len(transcoded_files) < len(video_files):
+                    self.progress_update.emit(
+                        f"⚠️ {len(video_files) - len(transcoded_files)} "
+                        f"file(s) failed — proceeding with "
+                        f"{len(transcoded_files)} file(s).")
+                concat_source_files = transcoded_files
+                stream_copy = True
+            else:
+                concat_source_files = video_files
+
             if chunking:
                 # ------ Crash-resume loop for chunked encoding ------
-                # FFmpeg can segfault after hours of encoding (Windows
-                # 0xC0000005).  The completed chunks are valid — we just
-                # need to figure out which source files remain and restart
-                # with continued chunk numbering.
+                # For stream-copy mode this should never crash, but the
+                # loop is kept as a safety net.  For non-preprocessed
+                # (direct encode) mode, FFmpeg can segfault after hours
+                # of encoding (Windows 0xC0000005).
                 MAX_CRASH_RESUMES = 50
-                remaining_files = list(video_files)
+                remaining_files = list(concat_source_files)
                 chunk_start = 1
                 base_name_for_glob, ext_for_glob = os.path.splitext(output_file)
                 glob_pattern = os.path.join(
@@ -1209,7 +1516,8 @@ class ConcatenationWorker(QThread):
 
                     ok, diag_lines = self._run_ffmpeg_concat(
                         remaining_files, folder_path, output_file,
-                        chunk_start_number=chunk_start)
+                        chunk_start_number=chunk_start,
+                        stream_copy=stream_copy)
 
                     if ok:
                         break  # success
@@ -1300,6 +1608,11 @@ class ConcatenationWorker(QThread):
                             f"{os.path.basename(output_file)}")
                     final_files = self._post_concat(output_file)
                     self._cleanup_repaired(repaired_map)
+                    # Clean up temp transcodes after successful concat
+                    if temp_dir and os.path.isdir(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        self.progress_update.emit(
+                            "🧹 Cleaned up temporary transcode files.")
                     return True
                 else:
                     self.progress_update.emit(
@@ -1310,7 +1623,8 @@ class ConcatenationWorker(QThread):
             else:
                 # ------ Non-chunked: single output file ------
                 ok, last_lines = self._run_ffmpeg_concat(
-                    video_files, folder_path, output_file)
+                    concat_source_files, folder_path, output_file,
+                    stream_copy=stream_copy)
 
                 if ok:
                     self.progress_update.emit(
@@ -1318,6 +1632,10 @@ class ConcatenationWorker(QThread):
                         f"{os.path.basename(output_file)}")
                     final_files = self._post_concat(output_file)
                     self._cleanup_repaired(repaired_map)
+                    if temp_dir and os.path.isdir(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        self.progress_update.emit(
+                            "🧹 Cleaned up temporary transcode files.")
                     return True
 
                 # --- Phase 3: Incremental failure recovery ---
