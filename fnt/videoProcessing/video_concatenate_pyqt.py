@@ -631,11 +631,11 @@ class ConcatenationWorker(QThread):
 
             command = [
                 "ffmpeg", "-y",
+                # Only show warnings/errors — suppresses x265 encoder
+                # init spam that drowns out actual error messages.
+                "-v", "warning",
+                "-stats",  # still show progress (frame=...) lines
                 # ---- Maximum error resilience (match VLC tolerance) ----
-                # DVR recordings commonly have timestamp jumps, truncated
-                # frames, and minor container issues between segments.
-                # VLC plays them fine; these flags make FFmpeg equally
-                # tolerant during re-encoding.
                 "-err_detect", "ignore_err",
                 "-analyzeduration", "200M",
                 "-probesize", "200M",
@@ -661,6 +661,8 @@ class ConcatenationWorker(QThread):
         else:
             command = [
                 "ffmpeg", "-y",
+                "-v", "warning",
+                "-stats",
                 "-err_detect", "ignore_err",
                 "-analyzeduration", "200M",
                 "-probesize", "200M",
