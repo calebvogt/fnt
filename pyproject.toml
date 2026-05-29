@@ -50,6 +50,8 @@ dependencies = [
     "sam2 @ git+https://github.com/facebookresearch/sam2.git",
     # OCR — timestamp extraction from DVR video overlays
     "easyocr",
+    # Timezone handling
+    "pytz",
 ]
 
 [project.optional-dependencies]
