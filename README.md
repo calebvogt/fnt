@@ -59,7 +59,7 @@ After installation, launch the FieldNeuroToolbox GUI:
 
 ```bash
 conda activate fnt
-fnt-gui
+fnt
 ```
 
 ## Updating
@@ -71,7 +71,7 @@ cd path/to/fnt
 git pull
 ```
 
-That's it — the updated code is immediately available the next time you run `fnt-gui`.
+That's it — the updated code is immediately available the next time you run `fnt`.
 
 **Note:** If the update includes changes to `pyproject.toml` (e.g., new dependencies), you will need to re-run the install:
 
@@ -79,6 +79,57 @@ That's it — the updated code is immediately available the next time you run `f
 conda activate fnt
 pip install -e .
 ```
+
+## Tools
+
+The GUI is organized into tabbed categories. Each tool launches in its own window and can run in parallel with others.
+
+### Video
+
+- **Video PreProcessing** — Batch video preprocessing: downsampling, re-encoding, format conversion, frame rate adjustment, grayscale conversion, CLAHE enhancement, and audio removal. Supports customizable quality, resolution, codec, and encoding presets.
+- **Video Trim and Crop** — Interactive video trimming and cropping with batch processing. Set start position, duration, and draw crop regions with per-video configuration.
+- **Video Concatenation** — Concatenate multiple videos within directories using FFmpeg with progress tracking.
+- **Behavior Scoring Studio** — Manual behavioral annotation with ethogram definition, custom behavior categories with keyboard shortcuts, video playback controls, timeline visualization, and CSV/JSON export.
+- **Simple Tracker** — Fast CPU-only tracking using background subtraction (MOG2) for static camera setups. Multi-object centroid tracking with Hungarian matching, single-animal mode, and batch processing with CSVs, plots, and tracked video output.
+- **Mask Tracker (SAM2)** — Instance segmentation annotation and training. Annotate frames with manual or AI-assisted masks using SAM2, then train Mask R-CNN models for automated tracking. Generates bounding boxes, instance masks, and trajectory data.
+- **ROI Tool** — Post-processing tool for tracking data (SLEAP or Mask Tracker). Define regions of interest, analyze spatial occupancy, and generate occupancy timeseries and summary statistics. Supports Open Field Test, Light-Dark Box, and custom ROI configurations.
+- **SLEAP Inference** — Run SLEAP pose estimation inference with optional tracking on videos. Supports top-down and bottom-up models with configurable tracking parameters.
+- **SLEAP File Conversion** — Batch convert SLEAP `.slp` prediction files to CSV and HDF5 analysis formats.
+- **SLEAP Re-tracking** — Re-run tracking on existing SLEAP predictions without re-running inference.
+- **SLEAP Video Rendering** — Create tracked videos from existing `.slp` files without re-running inference.
+- **LabGym Training Image Generator** — Extract frames from videos for LabGym training datasets with configurable frame interval and sampling methods.
+
+### USV (Ultrasonic Vocalization)
+
+- **Classic Audio Detector (CAD)** — DSP-based USV detection and labeling. Load audio files, apply signal processing for peak detection, perform manual ground-truthing, and train Random Forest classifiers for automated labeling. Spectrogram-based UI with waveform display.
+- **Deep Audio Detector (DAD)** — YOLO-based ML model training and inference for USV detection. Project-based workflow: create projects, load audio, label manually, train YOLO models, and run inference with spectrogram visualization.
+- **Mask Audio Detector (MAD)** — Pixel-level segmentation-based USV detection. Paint-based annotation of spectrograms with brush/eraser tools, U-Net model training, and blob-review inference workflow.
+- **USV Heterodyne Processing** — Batch heterodyne processing for ultrasonic recordings. Mixes audio with a 40 kHz carrier and band-pass filters to shift ultrasonic content to the audible range.
+- **Audio Trimming** — Trim audio files with spectrogram visualization and frequency filtering.
+- **WAV Compression** — Compress WAV files for storage using FLAC or other codecs with batch processing.
+
+### UWB (Ultra-Wideband)
+
+- **UWB PreProcessing** — Preprocess and export UWB tracking data from UWB receivers. Parse proprietary database formats, extract position/time data, handle timezone conversions, and export to CSV.
+
+### RFID
+
+- **RFID Preprocessing** — Universal RFID preprocessing pipeline: raw data to movement bouts, GBI (group-by-individual) matrices, social networks, edgelists, displacement detection, and Hinde index calculation. Configurable zone templates.
+
+### WiFP (Wireless Fiber Photometry)
+
+- **Process .doric Files** — Batch process Doric `.doric` (HDF5) fiber photometry files. Auto-detect 470 nm signal and 405/415 nm isosbestic channels, calculate ΔF/F with isosbestic correction, synchronize with behavior video timestamps, and export CSV and combined overlay video.
+- **Explore .doric Structure** — View the internal HDF5 structure of `.doric` files to inspect datasets, groups, and metadata.
+
+### Imaging
+
+- **CZI Viewer** — View and process Zeiss CZI multi-channel microscopy images. False-color channels, adjust brightness/contrast/gamma/sharpness, background subtraction, annotations, and export to PNG/TIFF.
+- **Image Quantification** — Cell counting and colocalization analysis for CZI images. Multi-channel particle detection with watershed separation, colocalization metrics, ROI-based density measurement, and CSV export.
+
+### Utilities
+
+- **File Splitter** — Split large files to meet GitHub's 50 MB limit. Smart CSV splitting (row-based, preserves headers) or binary splitting.
+- **Data Transfer** — Copy data files to a destination folder with optional auto-splitting, recursive directory traversal, preserved folder structure, and optional file curation via tree-view explorer.
 
 ## Notes
 - Package dependencies are listed in pyproject.toml
