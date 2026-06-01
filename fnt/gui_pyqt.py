@@ -270,10 +270,19 @@ class FNTMainWindow(QMainWindow):
         
         # Subtitle with timestamp
         import time as _time
-        _this_file = os.path.abspath(__file__)
-        _mtime = os.path.getmtime(_this_file)
-        _ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(_mtime))
-        subtitle = QLabel(f"Updated: {_ts}  |  Donaldson Lab, U. Colorado Boulder")
+        try:
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller executable
+                ts_str = "Release Build  |  "
+            else:
+                _this_file = os.path.abspath(__file__)
+                _mtime = os.path.getmtime(_this_file)
+                _ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(_mtime))
+                ts_str = f"Updated: {_ts}  |  "
+        except Exception:
+            ts_str = ""
+            
+        subtitle = QLabel(f"{ts_str}Donaldson Lab, U. Colorado Boulder")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")

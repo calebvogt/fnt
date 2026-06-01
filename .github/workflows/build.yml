@@ -71,11 +71,11 @@ jobs:
           cd dist
           zip -r ../fnt-gui-macos.zip fnt-gui
 
-      - name: Zip the output (Linux)
+      - name: Package the output (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd dist
-          zip -r ../fnt-gui-linux.zip fnt-gui
+          tar -czf ../fnt-gui-linux.tar.gz fnt-gui
 
       - name: Upload Artifact (Windows)
         if: matrix.os == 'windows-latest'
@@ -97,6 +97,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: fnt-gui-linux
-          path: fnt-gui-linux.zip
+          name: fnt-gui-linux-tarball
+          path: fnt-gui-linux.tar.gz
           retention-days: 5
