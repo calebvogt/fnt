@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 authors = [
     {name = "Caleb Vogt", email = "vogtneuroscience@gmail.com"},
 ]
@@ -20,7 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
@@ -47,7 +46,7 @@ dependencies = [
     "torch>=2.5.1",
     "segmentation-models-pytorch>=0.3.4",
     # SAM2 — AI-assisted mask annotation
-    "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
     # OCR — timestamp extraction from DVR video overlays
     "easyocr",
     # Timezone handling
