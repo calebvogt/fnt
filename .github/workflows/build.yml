@@ -63,40 +63,40 @@ jobs:
       - name: Zip the output (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          Compress-Archive -Path dist\fnt-gui -DestinationPath fnt-gui-windows.zip
+          Compress-Archive -Path dist\fnt -DestinationPath fnt-windows.zip
 
       - name: Zip the output (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           cd dist
-          zip -r ../fnt-gui-macos.zip fnt-gui
+          zip -r ../fnt-macos.zip fnt
 
       - name: Package the output (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd dist
-          tar -czf ../fnt-gui-linux.tar.gz fnt-gui
+          tar -czf ../fnt-linux.tar.gz fnt
 
       - name: Upload Artifact (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: fnt-gui-windows
-          path: fnt-gui-windows.zip
+          name: fnt-windows
+          path: fnt-windows.zip
           retention-days: 5
 
       - name: Upload Artifact (macOS)
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: fnt-gui-macos
-          path: fnt-gui-macos.zip
+          name: fnt-macos
+          path: fnt-macos.zip
           retention-days: 5
 
       - name: Upload Artifact (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: fnt-gui-linux-tarball
-          path: fnt-gui-linux.tar.gz
+          name: fnt-linux-tarball
+          path: fnt-linux.tar.gz
           retention-days: 5
