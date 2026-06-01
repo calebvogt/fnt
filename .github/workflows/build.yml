@@ -97,6 +97,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: fnt-linux-tarball
+          name: fnt-linux
           path: fnt-linux.tar.gz
           retention-days: 5
