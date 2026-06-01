@@ -34,6 +34,15 @@ except ImportError:
     sys.exit(1)
 
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
 class WorkerThread(QThread):
     """Worker thread for running functions without blocking the GUI"""
     finished = pyqtSignal(bool, str)  # success, message
@@ -67,16 +76,10 @@ class FNTMainWindow(QMainWindow):
         self.setGeometry(100, 100, 1100, 780)
         self.setMinimumSize(850, 650)
         
-        # Set window icon (check multiple possible locations)
-        icon_paths = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
-            os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
-        ]
-        
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-                break
+        # Set window icon
+        icon_path = resource_path(os.path.join('icons', 'fnt_icon.ico'))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -245,18 +248,13 @@ class FNTMainWindow(QMainWindow):
         
         # Logo/Icon on the left
         logo_label = QLabel()
-        icon_paths = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
-            os.path.join(os.path.dirname(__file__), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
-        ]
+        icon_path = resource_path(os.path.join('icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'))
         
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                pixmap = QPixmap(icon_path)
-                # Scale to reasonable size while maintaining aspect ratio
-                scaled_pixmap = pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                logo_label.setPixmap(scaled_pixmap)
-                break
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path)
+            # Scale to reasonable size while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
         
         logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addWidget(logo_label)
@@ -1490,16 +1488,10 @@ def main():
     app.setApplicationVersion("1.0")
     app.setOrganizationName("FNT")
     
-    # Set application icon (check multiple possible locations)
-    icon_paths = [
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
-        os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
-    ]
-    
-    for icon_path in icon_paths:
-        if os.path.exists(icon_path):
-            app.setWindowIcon(QIcon(icon_path))
-            break
+    # Set application icon
+    icon_path = resource_path(os.path.join('icons', 'fnt_icon.ico'))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
     # Create and show main window
     window = FNTMainWindow()

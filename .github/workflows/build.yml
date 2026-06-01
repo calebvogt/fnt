@@ -1,0 +1,79 @@
+name: Build Standalone Executables
+
+on:
+  push:
+    branches:
+      - feature/standalone-build
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # We can build for Windows and Mac. Linux can be added if needed: ubuntu-latest
+        os: [windows-latest, macos-latest]
+      # Don't cancel other matrix jobs if one fails
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyInstaller
+          # Install PyTorch with CPU-only to save space if needed, or omit index-url to get default
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          # Install our package
+          pip install -e .
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyInstaller
+          # Default torch install for Mac is already CPU/Metal
+          pip install torch torchvision
+          pip install -e .
+
+      - name: Build executable with PyInstaller
+        run: |
+          pyinstaller fnt.spec
+
+      - name: Zip the output (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          Compress-Archive -Path dist\fnt-gui -DestinationPath fnt-gui-windows.zip
+
+      - name: Zip the output (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd dist
+          zip -r ../fnt-gui-macos.zip fnt-gui
+
+      - name: Upload Artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnt-gui-windows
+          path: fnt-gui-windows.zip
+          retention-days: 5
+
+      - name: Upload Artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnt-gui-macos
+          path: fnt-gui-macos.zip
+          retention-days: 5
