@@ -15,10 +15,10 @@ This is a broad-based toolbox, with many different kinds of tools within it. The
 
 ## Windows Installation
 
-Clone the fnt GitHub repo and install the package in editable mode. **Python 3.11 is required** (3.12+ is not compatible due to dependency constraints):
+Clone the fnt GitHub repo and install the package in editable mode. **Python 3.12 or newer is required** (3.13 recommended; the codebase uses Python 3.12+ syntax):
 
 ```bash
-conda create --name fnt python=3.11
+conda create --name fnt python=3.13
 conda activate fnt
 cd path\to\fnt
 pip install -e .
@@ -47,7 +47,7 @@ You should see `CUDA available: True` and your GPU name.
 Open terminal:
 
 ```bash
-conda create --name fnt python=3.11
+conda create --name fnt python=3.13
 conda activate fnt
 cd path/to/fnt
 pip install -e .
