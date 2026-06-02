@@ -17,6 +17,8 @@ import sys
 import os
 from pathlib import Path
 import webbrowser
+import urllib.request
+import json
 
 # Set platform-specific environment variables for better Linux/Wayland support
 if sys.platform == "linux":
@@ -49,6 +51,15 @@ from datetime import datetime
 from .fed3.fed_widgets import FEDTabWidget
 
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
 class WorkerThread(QThread):
     """Worker thread for running functions without blocking the GUI"""
     finished = pyqtSignal(bool, str)  # success, message
@@ -72,6 +83,41 @@ class WorkerThread(QThread):
             self.finished.emit(False, f"{self.func_name} failed: {str(e)}")
 
 
+class UpdateCheckerThread(QThread):
+    update_available = pyqtSignal(str, str) # version, url
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/calebvogt/fnt/releases/latest",
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                latest_tag = data.get("tag_name", "")
+                
+                if latest_tag.startswith("v"):
+                    latest_version = latest_tag[1:]
+                else:
+                    latest_version = latest_tag
+                
+                # Simple semver parsing
+                def parse_version(v):
+                    return [int(x) for x in str(v).split('.') if x.isdigit()]
+                    
+                cur = parse_version(self.current_version)
+                latest = parse_version(latest_version)
+                
+                if latest > cur and len(latest) > 0:
+                    self.update_available.emit(latest_tag, data.get("html_url", ""))
+        except Exception:
+            pass # Fail silently if no internet or API error
+
+
 class FNTMainWindow(QMainWindow):
     """Main PyQt GUI window for FieldNeuroToolbox"""
     
@@ -79,23 +125,46 @@ class FNTMainWindow(QMainWindow):
         super().__init__()
         self.current_worker = None
         self.init_ui()
+        
+        # Start update check
+        self.update_thread = UpdateCheckerThread(self.version)
+        self.update_thread.update_available.connect(self.show_update_dialog)
+        self.update_thread.start()
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("FieldNeuroToolbox (FNT) v1.0")
+        # Load version dynamically
+        self.version = "unknown"
+        
+        try:
+            # 1. Try reading directly from pyproject.toml (for developers running from source)
+            import tomllib
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent.parent
+            toml_path = project_root / 'pyproject.toml'
+            if toml_path.exists():
+                with open(toml_path, "rb") as f:
+                    data = tomllib.load(f)
+                    self.version = data.get('project', {}).get('version', 'unknown')
+        except Exception:
+            pass
+            
+        if self.version == "unknown":
+            # 2. Fall back to package metadata (used by PyInstaller executables)
+            try:
+                from importlib.metadata import version
+                self.version = version("fnt")
+            except Exception:
+                pass
+            
+        self.setWindowTitle(f"FieldNeuroToolbox (FNT) v{self.version}")
         self.setGeometry(100, 100, 1100, 780)
         self.setMinimumSize(850, 650)
         
-        # Set window icon (check multiple possible locations)
-        icon_paths = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
-            os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
-        ]
-        
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-                break
+        # Set window icon
+        icon_path = resource_path(os.path.join('icons', 'fnt_icon.ico'))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -244,6 +313,17 @@ class FNTMainWindow(QMainWindow):
         # Center the window
         self.center_window()
     
+    def show_update_dialog(self, version, url):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Update Available")
+        msg.setText(f"A new version of FieldNeuroToolbox ({version}) is available!\n\nWould you like to go to the releases page to download it?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        
+        if msg.exec_() == QMessageBox.Yes:
+            import webbrowser
+            webbrowser.open(url)
+
     def center_window(self):
         """Center the window on the screen"""
         screen = QApplication.desktop().screenGeometry()
@@ -264,18 +344,13 @@ class FNTMainWindow(QMainWindow):
         
         # Logo/Icon on the left
         logo_label = QLabel()
-        icon_paths = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
-            os.path.join(os.path.dirname(__file__), 'icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'),
-        ]
+        icon_path = resource_path(os.path.join('icons', 'ChatGPT Image Oct 29, 2025, 12_21_19 PM.png'))
         
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                pixmap = QPixmap(icon_path)
-                # Scale to reasonable size while maintaining aspect ratio
-                scaled_pixmap = pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                logo_label.setPixmap(scaled_pixmap)
-                break
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path)
+            # Scale to reasonable size while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
         
         logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addWidget(logo_label)
@@ -291,10 +366,19 @@ class FNTMainWindow(QMainWindow):
         
         # Subtitle with timestamp
         import time as _time
-        _this_file = os.path.abspath(__file__)
-        _mtime = os.path.getmtime(_this_file)
-        _ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(_mtime))
-        subtitle = QLabel(f"Updated: {_ts}  |  Donaldson Lab, U. Colorado Boulder")
+        try:
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller executable
+                ts_str = "Release Build  |  "
+            else:
+                _this_file = os.path.abspath(__file__)
+                _mtime = os.path.getmtime(_this_file)
+                _ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(_mtime))
+                ts_str = f"Updated: {_ts}  |  "
+        except Exception:
+            ts_str = ""
+            
+        subtitle = QLabel(f"{ts_str}Donaldson Lab, U. Colorado Boulder")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
         subtitle.setStyleSheet("color: #999999; font-style: italic; background-color: transparent;")
@@ -1477,19 +1561,18 @@ def main():
     
     # Set application properties
     app.setApplicationName("FieldNeuroToolbox")
-    app.setApplicationVersion("1.0")
+    try:
+        from importlib.metadata import version
+        app_version = version("fnt")
+    except Exception:
+        app_version = "unknown"
+    app.setApplicationVersion(app_version)
     app.setOrganizationName("FNT")
     
-    # Set application icon (check multiple possible locations)
-    icon_paths = [
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icons', 'fnt_icon.ico'),
-        os.path.join(os.path.dirname(__file__), 'icons', 'fnt_icon.ico'),
-    ]
-    
-    for icon_path in icon_paths:
-        if os.path.exists(icon_path):
-            app.setWindowIcon(QIcon(icon_path))
-            break
+    # Set application icon
+    icon_path = resource_path(os.path.join('icons', 'fnt_icon.ico'))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
     # Create and show main window
     window = FNTMainWindow()
