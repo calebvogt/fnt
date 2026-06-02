@@ -17,6 +17,8 @@ import sys
 import os
 from pathlib import Path
 import webbrowser
+import urllib.request
+import json
 
 try:
     from PyQt5.QtWidgets import (
@@ -62,6 +64,41 @@ class WorkerThread(QThread):
             self.finished.emit(False, f"{self.func_name} failed: {str(e)}")
 
 
+class UpdateCheckerThread(QThread):
+    update_available = pyqtSignal(str, str) # version, url
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/calebvogt/fnt/releases/latest",
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                latest_tag = data.get("tag_name", "")
+                
+                if latest_tag.startswith("v"):
+                    latest_version = latest_tag[1:]
+                else:
+                    latest_version = latest_tag
+                
+                # Simple semver parsing
+                def parse_version(v):
+                    return [int(x) for x in str(v).split('.') if x.isdigit()]
+                    
+                cur = parse_version(self.current_version)
+                latest = parse_version(latest_version)
+                
+                if latest > cur and len(latest) > 0:
+                    self.update_available.emit(latest_tag, data.get("html_url", ""))
+        except Exception:
+            pass # Fail silently if no internet or API error
+
+
 class FNTMainWindow(QMainWindow):
     """Main PyQt GUI window for FieldNeuroToolbox"""
     
@@ -69,15 +106,37 @@ class FNTMainWindow(QMainWindow):
         super().__init__()
         self.current_worker = None
         self.init_ui()
+        
+        # Start update check
+        self.update_thread = UpdateCheckerThread(self.version)
+        self.update_thread.update_available.connect(self.show_update_dialog)
+        self.update_thread.start()
     
     def init_ui(self):
         """Initialize the user interface"""
         # Load version dynamically
+        self.version = "unknown"
+        
         try:
-            from importlib.metadata import version
-            self.version = version("fnt")
+            # 1. Try reading directly from pyproject.toml (for developers running from source)
+            import tomllib
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent.parent
+            toml_path = project_root / 'pyproject.toml'
+            if toml_path.exists():
+                with open(toml_path, "rb") as f:
+                    data = tomllib.load(f)
+                    self.version = data.get('project', {}).get('version', 'unknown')
         except Exception:
-            self.version = "unknown"
+            pass
+            
+        if self.version == "unknown":
+            # 2. Fall back to package metadata (used by PyInstaller executables)
+            try:
+                from importlib.metadata import version
+                self.version = version("fnt")
+            except Exception:
+                pass
             
         self.setWindowTitle(f"FieldNeuroToolbox (FNT) v{self.version}")
         self.setGeometry(100, 100, 1100, 780)
@@ -235,6 +294,17 @@ class FNTMainWindow(QMainWindow):
         # Center the window
         self.center_window()
     
+    def show_update_dialog(self, version, url):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Update Available")
+        msg.setText(f"A new version of FieldNeuroToolbox ({version}) is available!\n\nWould you like to go to the releases page to download it?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        
+        if msg.exec_() == QMessageBox.Yes:
+            import webbrowser
+            webbrowser.open(url)
+
     def center_window(self):
         """Center the window on the screen"""
         screen = QApplication.desktop().screenGeometry()
