@@ -6,12 +6,65 @@ on:
       - main
     tags:
       - 'v*'
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
+  bump_version:
+    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new_tag: ${{ steps.bump.outputs.new_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bump Version
+        id: bump
+        run: |
+          python -c "
+          import sys, os
+          with open('pyproject.toml', 'r') as f:
+              lines = f.readlines()
+          new_version = None
+          for i, line in enumerate(lines):
+              if line.startswith('version = '):
+                  v = line.split('=')[1].strip().strip('\"').strip(\"'\")
+                  parts = v.split('.')
+                  parts[-1] = str(int(parts[-1]) + 1)
+                  new_version = '.'.join(parts)
+                  lines[i] = f'version = \"{new_version}\"\n'
+                  break
+          if not new_version:
+              sys.exit('Version not found')
+          with open('pyproject.toml', 'w') as f:
+              f.writelines(lines)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'new_tag=v{new_version}\n')
+          "
+
+      - name: Commit and Tag
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add pyproject.toml
+          git commit -m "Bump version to ${{ steps.bump.outputs.new_tag }} [skip ci]"
+          git tag ${{ steps.bump.outputs.new_tag }}
+          git push origin main
+          git push origin ${{ steps.bump.outputs.new_tag }}
+
   build:
     name: Build on ${{ matrix.os }}
+    needs: bump_version
+    if: always() && (needs.bump_version.result == 'success' || needs.bump_version.result == 'skipped')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -21,6 +74,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump_version.outputs.new_tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -98,9 +153,9 @@ jobs:
           retention-days: 5
 
   release:
-    needs: build
+    needs: [bump_version, build]
+    if: always() && (needs.build.result == 'success') && (needs.bump_version.outputs.new_tag != '' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
@@ -122,6 +177,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.bump_version.outputs.new_tag || github.ref_name }}
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
