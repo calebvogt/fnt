@@ -48,7 +48,7 @@ except ImportError:
 
 import threading
 from datetime import datetime
-from .fed3.fed_widgets import FEDTabWidget
+from fnt.fed3.fed_widgets import FEDTabWidget
 
 
 def resource_path(relative_path):

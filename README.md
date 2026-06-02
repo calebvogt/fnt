@@ -8,23 +8,20 @@ This is a broad-based toolbox, with many different kinds of tools within it. The
 
 ## Getting Started
 
-### Pre-requisites
-
-- Git
-- Anaconda
-- ffmpeg (and the bin file saved to your system PATH)
-- GitHub Desktop (suggested)
-
 ### Standalone Executables (Recommended)
 
-The easiest way to use FieldNeuroToolbox is by downloading the pre-built standalone executable for your operating system. You do not need to install Python or conda to use this version.
+The easiest way to use FieldNeuroToolbox is by downloading the pre-built standalone executable for your operating system. **You do not need to install Python or Anaconda to use this version.**
+
+**Requirements for the Executable:**
+
+- **ffmpeg**: Must be installed and added to your system PATH for video processing features to work.
 
 1. Navigate to the **Releases** page on the GitHub repository.
 2. Download the latest release `.zip` or `.tar.gz` for your operating system (Windows, macOS, or Linux).
 3. Extract the downloaded archive.
 4. Run the extracted `fnt` executable to launch the GUI.
 
-_Note: For GPU acceleration in SAM-based video tracking, you will need an NVIDIA GPU with CUDA drivers installed on your system. If you want full control over your Python environment or want to modify the code, see the Development Installation section at the bottom._
+_Note: For GPU acceleration in SAM-based video tracking, you will need an NVIDIA GPU with CUDA drivers installed on your system. If you want full control over your Python environment or want to modify the code, see the [Development Installation](#development-installation) section at the bottom._
 
 ## Tools
 
@@ -72,18 +69,25 @@ The GUI is organized into tabbed categories. Each tool launches in its own windo
 - **CZI Viewer** — View and process Zeiss CZI multi-channel microscopy images. False-color channels, adjust brightness/contrast/gamma/sharpness, background subtraction, annotations, and export to PNG/TIFF.
 - **Image Quantification** — Cell counting and colocalization analysis for CZI images. Multi-channel particle detection with watershed separation, colocalization metrics, ROI-based density measurement, and CSV export.
 
+### FED3
+
+- **FED Sync & Tracking** — Interface for managing Feeding Experimentation Device (FED3) data over serial connections. Add devices, configure auto-sync schedules, and visualize pellet retrieval data over time with real-time plots.
+
 ### Utilities
 
 - **File Splitter** — Split large files to meet GitHub's 50 MB limit. Smart CSV splitting (row-based, preserves headers) or binary splitting.
 - **Data Transfer** — Copy data files to a destination folder with optional auto-splitting, recursive directory traversal, preserved folder structure, and optional file curation via tree-view explorer.
 
-## Notes
-
-- Package dependencies are listed in pyproject.toml
-
 ## Development Installation
 
 If you intend to modify the code or prefer managing your own Python environment, use this method.
+
+### Prerequisites
+
+- Git
+- Anaconda or Miniconda
+- ffmpeg (installed and added to your system PATH)
+- Package dependencies are listed in `pyproject.toml`
 
 ### Windows Installation
 
