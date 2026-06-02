@@ -29,6 +29,7 @@ dependencies = [
     "pandas",
     "scipy",
     "matplotlib",
+    "pytz",
     # GUI
     "PyQt5",
     # I/O
@@ -45,6 +46,8 @@ dependencies = [
     # MAD (Mask Audio Detector) — U-Net segmentation
     "torch>=2.5.1",
     "segmentation-models-pytorch>=0.3.4",
+    # USB serial communication for FED devices
+    "pyserial",
     # SAM2 — AI-assisted mask annotation
     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
     # OCR — timestamp extraction from DVR video overlays

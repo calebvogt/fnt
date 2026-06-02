@@ -18,12 +18,23 @@ import os
 from pathlib import Path
 import webbrowser
 
+# Set platform-specific environment variables for better Linux/Wayland support
+if sys.platform == "linux":
+    # On GNOME/Wayland, Qt needs an explicit hint. 
+    # If the user hasn't forced X11, we try to use Wayland.
+    if os.environ.get('XDG_SESSION_TYPE') == 'wayland' or os.environ.get('WAYLAND_DISPLAY'):
+        if 'QT_QPA_PLATFORM' not in os.environ:
+            # Set to 'wayland' explicitly to satisfy GNOME's warning.
+            # If wayland fails, Qt will usually log an error and we can advise the user.
+            os.environ['QT_QPA_PLATFORM'] = 'wayland'
+
 try:
     from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
-        QHBoxLayout, QGridLayout, QPushButton, QLabel, QStatusBar, 
-        QMessageBox, QGroupBox, QTextEdit, QSplitter, QFrame,
-        QScrollArea, QSizePolicy, QFileDialog, QInputDialog
+            QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
+            QHBoxLayout, QGridLayout, QPushButton, QLabel, QStatusBar, 
+            QMessageBox, QGroupBox, QTextEdit, QSplitter, QFrame,
+            QScrollArea, QSizePolicy, QFileDialog, QInputDialog,
+            QComboBox, QSpinBox, QLineEdit, QCheckBox
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap
@@ -32,6 +43,10 @@ except ImportError:
     PYQT_AVAILABLE = False
     print("PyQt5 not available. Please install with: pip install PyQt5")
     sys.exit(1)
+
+import threading
+from datetime import datetime
+from .fed3.fed_widgets import FEDTabWidget
 
 
 class WorkerThread(QThread):
@@ -47,8 +62,12 @@ class WorkerThread(QThread):
     def run(self):
         try:
             self.status_update.emit(f"Running {self.func_name}...")
-            self.func()
-            self.finished.emit(True, f"{self.func_name} completed successfully")
+            # If the function returns values, we might want to capture them
+            result = self.func()
+            if isinstance(result, tuple) and len(result) == 2:
+                self.finished.emit(result[0], result[1])
+            else:
+                self.finished.emit(True, f"{self.func_name} completed successfully")
         except Exception as e:
             self.finished.emit(False, f"{self.func_name} failed: {str(e)}")
 
@@ -468,38 +487,9 @@ class FNTMainWindow(QMainWindow):
             )
     
     def create_fed_tab(self):
-        """Create the FED processing tab"""
-        tab, layout = self._make_scrollable_tab("FED")
-        
-        # Description
-        desc = QLabel("Feeding Experimentation Device (FED) data analysis")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-        
-        # FED processing group
-        group = QGroupBox("FED Analysis Tools")
-        group_layout = QGridLayout()
-        
-        # Placeholder for future FED tools
-        info_label = QLabel(
-            "<b>Coming Soon:</b> FED data analysis tools will be added here.<br><br>"
-            "Planned features:<br>"
-            "• FED data import and preprocessing<br>"
-            "• Feeding pattern analysis<br>"
-            "• Circadian rhythm visualization<br>"
-            "• Multi-device synchronization<br>"
-            "• Integration with behavioral data"
-        )
-        info_label.setTextFormat(Qt.RichText)
-        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 20px; border: 1px solid #3f3f3f; border-radius: 4px; margin: 10px;")
-        info_label.setWordWrap(True)
-        group_layout.addWidget(info_label, 0, 0)
-        
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-        
-        layout.addStretch()
+        """Create the FED processing tab using modular widget"""
+        self.fed_tab = FEDTabWidget(parent=self, worker_class=WorkerThread)
+        self.tabs.addTab(self.fed_tab, "FED")
 
     def create_wifp_tab(self):
         """Create the WiFP (Wireless Fiber Photometry) processing tab"""
