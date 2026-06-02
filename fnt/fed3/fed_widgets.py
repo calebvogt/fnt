@@ -651,22 +651,75 @@ class FEDTabWidget(QWidget):
 
             dev_name = device['name_edit'].text().strip() or device['box'].title()
             device['events'] = [] # Reset events for fresh plot
+            device['tracking_start_time'] = datetime.now()
+            device['stats'] = {'left': 0, 'right': 0, 'pellet': 0}
             
+            # Load existing history from log file if it exists
+            log_file = device['log_file']
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, 'r', newline='') as f:
+                        reader = csv.reader(f)
+                        header = next(reader, None) # Skip header
+                        for row in reader:
+                            if len(row) >= 6 and row[1] == dev_name:
+                                ts_str = row[0]
+                                try:
+                                    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
+                                except ValueError:
+                                    try:
+                                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                                    except ValueError:
+                                        continue
+                                
+                                event_type = row[2]
+                                if event_type == "Pellet":
+                                    device['events'].append(ts)
+                                
+                                try:
+                                    device['stats']['left'] = int(row[3])
+                                    device['stats']['right'] = int(row[4])
+                                    device['stats']['pellet'] = int(row[5])
+                                except ValueError:
+                                    pass
+                    self.update_fed_view_counts(device)
+                except Exception as e:
+                    self.fed_log.append_log(f"Error loading CSV history: {e}", False)
+
             worker = Fed3TrackerWorker(port, dev_name)
             worker.line_received.connect(lambda d, l: self.on_tracker_line(d, l, device))
             worker.error_received.connect(lambda d, l: self.fed_log.append_log(f"{d}: {l}", False))
+            worker.finished.connect(lambda d=device: self.handle_tracker_finished(d))
             device['tracker_worker'] = worker
             worker.start()
             
             device['is_tracking'] = True
             self.fed_log.append_log(f"Started tracking on {port} for {dev_name}")
+            self.update_plot()
         else:
             worker = device.get('tracker_worker')
             if worker:
                 worker.stop()
                 device['tracker_worker'] = None
             device['is_tracking'] = False
+            device['events'] = []
+            device['stats'] = {'left': 0, 'right': 0, 'pellet': 0}
+            self.update_fed_view_counts(device)
             self.fed_log.append_log(f"Stopped tracking for {device['box'].title()}")
+            self.update_plot()
+
+    def handle_tracker_finished(self, device):
+        if device.get('is_tracking', False):
+            # Worker terminated unexpectedly (e.g. error or disconnection)
+            self.toggle_tracking(False, device)
+            
+            # Check if any other device is still tracking
+            any_tracking = any(d.get('is_tracking', False) for d in self.fed_devices)
+            if not any_tracking and self.track_all_btn.isChecked():
+                self.track_all_btn.blockSignals(True)
+                self.track_all_btn.setChecked(False)
+                self.track_all_btn.setText("Start Tracking")
+                self.track_all_btn.blockSignals(False)
 
     def get_current_plot_device(self):
         idx = self.plot_filter_combo.currentIndex()
@@ -738,6 +791,9 @@ class FEDTabWidget(QWidget):
                 self.fed_log.append_log(f"CSV Write Error: {e}", False)
 
     def update_plot(self):
+        from datetime import timedelta
+        from matplotlib.ticker import MaxNLocator
+
         self.ax.clear()
         self.ax.set_title("Pellets retrieved", color='white')
         self.ax.set_xlabel("Time", color='white')
@@ -755,8 +811,9 @@ class FEDTabWidget(QWidget):
         
         for dev in devices_to_plot:
             events = dev.get('events', [])
+            dev_name = dev['name_edit'].text().strip() or dev['box'].title()
+            
             if events:
-                dev_name = dev['name_edit'].text().strip() or dev['box'].title()
                 times = mdates.date2num(events)
                 counts = list(range(1, len(events) + 1))
                 
@@ -764,6 +821,20 @@ class FEDTabWidget(QWidget):
                     min_time = events[0]
                 if max_time is None or events[-1] > max_time:
                     max_time = events[-1]
+                
+                self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
+                plotted_something = True
+            elif dev.get('is_tracking') and dev.get('tracking_start_time'):
+                start_t = dev['tracking_start_time']
+                end_t = max(datetime.now(), start_t + timedelta(minutes=5))
+                times = mdates.date2num([start_t, end_t])
+                counts = [0, 0]
+                
+                if min_time is None or start_t < min_time:
+                    min_time = start_t
+                if max_time is None or end_t > max_time:
+                    max_time = end_t
+                
                 self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
                 plotted_something = True
         
@@ -776,7 +847,6 @@ class FEDTabWidget(QWidget):
             
             # Shade dark cycle (19:00 to 07:00)
             if min_time and max_time:
-                from datetime import timedelta
                 current_shade_start = min_time.replace(hour=19, minute=0, second=0, microsecond=0)
                 if min_time.hour < 19:
                     current_shade_start -= timedelta(days=1)
@@ -793,6 +863,31 @@ class FEDTabWidget(QWidget):
             self.ax.xaxis.set_major_locator(locator)
             self.ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
             self.ax.autoscale_view()
+            
+            # Overwrite autoscaled limits with safer bounds to prevent zero-range formatting errors
+            if min_time and max_time:
+                if (max_time - min_time).total_seconds() < 300:
+                    mid = min_time + (max_time - min_time) / 2
+                    min_t_plot = mid - timedelta(minutes=2.5)
+                    max_t_plot = mid + timedelta(minutes=2.5)
+                else:
+                    min_t_plot = min_time
+                    max_t_plot = max_time
+                self.ax.set_xlim(mdates.date2num(min_t_plot), mdates.date2num(max_t_plot))
+            
+            # Configure integer ticks on y-axis
+            self.ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+            
+            max_y = 0
+            for dev in devices_to_plot:
+                events = dev.get('events', [])
+                if events:
+                    max_y = max(max_y, len(events))
+            if max_y == 0:
+                self.ax.set_ylim(0, 10)
+            else:
+                self.ax.set_ylim(bottom=0)
+                
             self.figure.autofmt_xdate()
             self.figure.tight_layout(pad=1.5)
             self.canvas.draw()
@@ -851,6 +946,7 @@ class FEDTabWidget(QWidget):
             self.fed_devices.remove(device)
         self.update_remove_buttons()
         self.update_fed_view_combo()
+        self.update_plot()
 
     def update_remove_buttons(self):
         enable = len(self.fed_devices) > 1
