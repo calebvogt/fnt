@@ -11,6 +11,7 @@ hiddenimports += ['scipy.special.cython_special', 'sklearn.utils._typedefs']
 
 datas = []
 datas += [('icons', 'icons')]
+datas += [('fnt/fed3/fed3_image.svg', 'fnt/fed3')]
 datas += collect_data_files('ultralytics')
 datas += collect_data_files('sam2')
 datas += collect_data_files('segmentation_models_pytorch')

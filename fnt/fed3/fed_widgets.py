@@ -150,7 +150,13 @@ class FEDSvgView(QWidget):
         super().__init__(parent)
         self.setStyleSheet("background-color: transparent;")
         if QSvgWidget:
-            svg_path = os.path.join(os.path.dirname(__file__), "fed3_image.svg")
+            import sys
+            try:
+                base_path = sys._MEIPASS
+                svg_path = os.path.join(base_path, "fnt", "fed3", "fed3_image.svg")
+            except Exception:
+                svg_path = os.path.join(os.path.dirname(__file__), "fed3_image.svg")
+                
             self.svg_widget = QSvgWidget(svg_path, self)
         else:
             self.svg_widget = QLabel("SVG Support Missing", self)
