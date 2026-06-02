@@ -586,8 +586,53 @@ class FNTMainWindow(QMainWindow):
     
     def create_fed_tab(self):
         """Create the FED processing tab using modular widget"""
-        self.fed_tab = FEDTabWidget(parent=self, worker_class=WorkerThread)
-        self.tabs.addTab(self.fed_tab, "FED")
+        tab, layout = self._make_scrollable_tab("FED")
+        
+        # Description
+        desc = QLabel("FED tracking and processing tools")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        # FED processing group
+        group = QGroupBox("FED Tools")
+        group_layout = QGridLayout()
+
+        buttons = [
+            ("FED Processing Tool",
+             "Universal FED tool for monitoring and managing devices",
+             self.run_fed_processing),
+        ]
+
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+
+        layout.addStretch()
+
+    def run_fed_processing(self):
+        """Launch FED Processing Tool"""
+        try:
+            self.fed_window = QMainWindow()
+            self.fed_window.setWindowTitle("FED Processing Tool")
+            self.fed_window.resize(1000, 800)
+            self.fed_window.setStyleSheet(self.styleSheet())
+            
+            # Wrap FEDTabWidget in a container with margins to match other FNT windows
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(10, 10, 10, 10)
+            
+            fed_widget = FEDTabWidget(parent=self.fed_window, worker_class=WorkerThread)
+            container_layout.addWidget(fed_widget)
+            
+            self.fed_window.setCentralWidget(container)
+            self.fed_window.show()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to launch FED tool: {str(e)}"
+            )
 
     def create_wifp_tab(self):
         """Create the WiFP (Wireless Fiber Photometry) processing tab"""
