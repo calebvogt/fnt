@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 from datetime import datetime
 from PyQt5.QtWidgets import (
@@ -7,13 +8,13 @@ from PyQt5.QtWidgets import (
     QComboBox, QSpinBox, QLineEdit, QFrame, QFileDialog, QTabWidget,
     QLayout
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, QRect, QPoint, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, QRect, QRectF, QPoint, QSize
 from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QBrush
 
 try:
-    from PyQt5.QtSvg import QSvgWidget
+    from PyQt5.QtSvg import QSvgRenderer
 except ImportError:
-    QSvgWidget = None
+    QSvgRenderer = None
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -113,116 +114,120 @@ class FlowLayout(QLayout):
 
         return y + lineHeight - rect.y()
 
-class OverlayLabel(QLabel):
-    def __init__(self, text, parent=None, is_circle=False):
-        super().__init__(text, parent)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self._bg_color = QColor(0, 0, 0, 150)
-        self._radius = 0
-        self.is_circle = is_circle
+class _CounterData:
+    """Lightweight data holder that mimics the old OverlayLabel API."""
+    def __init__(self, text="0"):
+        self._text = text
 
-    def set_bg_color(self, r, g, b, a):
-        self._bg_color = QColor(r, g, b, a)
-        self.update()
+    def text(self):
+        return self._text
 
-    def set_radius(self, r):
-        self._radius = r
-        self.update()
+    def setText(self, text):
+        self._text = str(text)
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(self._bg_color))
-        rect = self.rect()
-        if self.is_circle:
-            painter.drawEllipse(rect)
-        else:
-            painter.drawRoundedRect(rect, self._radius, self._radius)
-        
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(self.font())
-        painter.drawText(rect, Qt.AlignCenter, self.text())
-        painter.end()
 
 class FEDSvgView(QWidget):
+    """Renders the FED3 SVG and paints overlay counters directly — no child
+    widgets, so there are no background-fill / white-corner issues."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background-color: transparent;")
-        if QSvgWidget:
-            import sys
+
+        # Load SVG via QSvgRenderer
+        self._renderer = None
+        if QSvgRenderer is not None:
             try:
                 base_path = sys._MEIPASS
                 svg_path = os.path.join(base_path, "fnt", "fed3", "fed3_image.svg")
             except Exception:
                 svg_path = os.path.join(os.path.dirname(__file__), "fed3_image.svg")
-                
-            self.svg_widget = QSvgWidget(svg_path, self)
-        else:
-            self.svg_widget = QLabel("SVG Support Missing", self)
-            
-        self.left_counter = OverlayLabel("0", self.svg_widget, is_circle=True)
-        self.right_counter = OverlayLabel("0", self.svg_widget, is_circle=True)
-        self.pellet_counter = OverlayLabel("0", self.svg_widget, is_circle=False)
-        
-        for counter in (self.left_counter, self.right_counter, self.pellet_counter):
-            counter.setAlignment(Qt.AlignCenter)
+            self._renderer = QSvgRenderer(svg_path)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+        # Counter data objects (public API matches old OverlayLabel)
+        self.left_counter = _CounterData("0")
+        self.right_counter = _CounterData("0")
+        self.pellet_counter = _CounterData("0")
+
+        # Flash state
+        self._flash_colors = {}  # counter_name -> QColor
+
+    # ------------------------------------------------------------------
+    def flash_counter(self, counter_name):
+        self._flash_colors[counter_name] = QColor(76, 175, 80, 180)
+        self.update()
+        QTimer.singleShot(200, lambda: self._end_flash(counter_name))
+
+    def _end_flash(self, counter_name):
+        self._flash_colors.pop(counter_name, None)
+        self.update()
+
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
         w = self.width()
         h = self.height()
-        
-        # SVG aspect ratio from fed3_image.svg viewBox
+
+        # --- SVG aspect-fit ---
         svg_aspect = 163.67577 / 116.04688
         widget_aspect = w / h if h > 0 else 1
-        
+
         if widget_aspect > svg_aspect:
-            # Widget is wider than SVG. Height is limiting.
             new_h = h
             new_w = int(h * svg_aspect)
         else:
-            # Widget is taller than SVG. Width is limiting.
             new_w = w
             new_h = int(w / svg_aspect)
-            
-        x_offset = (w - new_w) // 2
-        y_offset = (h - new_h) // 2
-        
-        self.svg_widget.setGeometry(x_offset, y_offset, new_w, new_h)
-        
-        # Dynamic sizes based on SVG proportions
+
+        x_off = (w - new_w) // 2
+        y_off = (h - new_h) // 2
+        svg_rect = QRectF(x_off, y_off, new_w, new_h)
+
+        if self._renderer:
+            self._renderer.render(painter, svg_rect)
+
+        # --- Overlay sizes ---
         poke_radius = int(new_w * 0.0953)
         poke_diam = poke_radius * 2
         pellet_w = int(new_w * 0.1772)
         pellet_h = int(new_h * 0.1677)
 
-        self.left_counter.setFixedSize(poke_diam, poke_diam)
-        self.right_counter.setFixedSize(poke_diam, poke_diam)
-        self.pellet_counter.setFixedSize(pellet_w, pellet_h)
+        default_bg = QColor(0, 0, 0, 150)
 
-        self.left_counter.set_radius(poke_radius)
-        self.right_counter.set_radius(poke_radius)
-        self.pellet_counter.set_radius(4)
+        # Helper to draw one overlay
+        def draw_overlay(cx, cy, ow, oh, is_circle, counter_name, counter_data, radius=0):
+            bg = self._flash_colors.get(counter_name, default_bg)
+            rect = QRect(x_off + cx, y_off + cy, ow, oh)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(bg))
+            if is_circle:
+                painter.drawEllipse(rect)
+            else:
+                painter.drawRoundedRect(rect, radius, radius)
+            painter.setPen(QColor(255, 255, 255))
+            font_size = max(10, int(poke_radius * 0.65))
+            painter.setFont(QFont("Arial", font_size, QFont.Bold))
+            painter.drawText(rect, Qt.AlignCenter, counter_data.text())
 
-        left_right_style = f"background-color: transparent; font-size: {max(10, int(poke_radius*0.8))}px; font-weight: bold;"
-        pellet_style = f"background-color: transparent; font-size: {max(10, int(pellet_h*0.5))}px; font-weight: bold;color: white;"
-        
-        self.left_counter.setStyleSheet(left_right_style)
-        self.right_counter.setStyleSheet(left_right_style)
-        self.pellet_counter.setStyleSheet(pellet_style)
-        
-        # Positions based on raw SVG geometry centers/corners.
-        # Coordinates are relative to svg_widget.
-        self.left_counter.move(int(new_w * 0.2501) - poke_radius, int(new_h * 0.6444) - poke_radius)
-        self.right_counter.move(int(new_w * 0.7488) - poke_radius, int(new_h * 0.6426) - poke_radius)
-        self.pellet_counter.move(int(new_w * 0.4108), int(new_h * 0.6095))
-        
-    def flash_counter(self, counter_name):
-        counter = getattr(self, f"{counter_name}_counter")
-        counter.set_bg_color(76, 175, 80, 180)
-        QTimer.singleShot(200, lambda: counter.set_bg_color(0, 0, 0, 150))
-        
+        # Left poke
+        lx = int(new_w * 0.2501) - poke_radius
+        ly = int(new_h * 0.6444) - poke_radius
+        draw_overlay(lx, ly, poke_diam, poke_diam, True, "left", self.left_counter)
+
+        # Right poke
+        rx = int(new_w * 0.7488) - poke_radius
+        ry = int(new_h * 0.6426) - poke_radius
+        draw_overlay(rx, ry, poke_diam, poke_diam, True, "right", self.right_counter)
+
+        # Pellet
+        px = int(new_w * 0.4108)
+        py = int(new_h * 0.6095)
+        draw_overlay(px, py, pellet_w, pellet_h, False, "pellet", self.pellet_counter, radius=4)
+
+        painter.end()
+
+    # ------------------------------------------------------------------
     def sizeHint(self):
         return QSize(350, 200)
 
@@ -400,18 +405,18 @@ class FEDTabWidget(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
-        main_widget = QWidget()
-        self.layout = QVBoxLayout(main_widget)
+        self._scroll_content = QWidget()
+        self.layout = QVBoxLayout(self._scroll_content)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
         
-        scroll.setWidget(main_widget)
-        main_layout.addWidget(scroll)
+        self._scroll.setWidget(self._scroll_content)
+        main_layout.addWidget(self._scroll)
 
         # --- Section 1: Plot View ---
         self.plot_tab = QWidget()
@@ -423,11 +428,25 @@ class FEDTabWidget(QWidget):
         self.plot_filter_combo.currentTextChanged.connect(lambda: self.update_plot())
         self.plot_layout.addWidget(self.plot_filter_combo)
 
+        # Placeholder shown when no data has been collected
+        self.plot_placeholder = QLabel(
+            "No pellet data collected yet.\n"
+            "The activity graph will appear here once tracking begins."
+        )
+        self.plot_placeholder.setAlignment(Qt.AlignCenter)
+        self.plot_placeholder.setFont(QFont("Arial", 11))
+        self.plot_placeholder.setStyleSheet(
+            "color: #888888; padding: 40px; "
+            "background-color: #1e1e1e; border: 1px dashed #444444; border-radius: 6px;"
+        )
+        self.plot_layout.addWidget(self.plot_placeholder)
+
         # Matplotlib visualization
         self.figure = Figure(figsize=(5, 3))
         self.figure.patch.set_facecolor('#2b2b2b')
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setMinimumHeight(300)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ax = self.figure.add_subplot(111)
         self.ax.set_facecolor('#1e1e1e')
         self.ax.tick_params(colors='white')
@@ -441,6 +460,7 @@ class FEDTabWidget(QWidget):
         for spine in self.ax.spines.values():
             spine.set_edgecolor('#444444')
         self.plot_layout.addWidget(self.canvas)
+        self.canvas.setVisible(False)
         self.plot_layout.addStretch()
 
         # --- Section 2: FED3 View ---
@@ -510,11 +530,11 @@ class FEDTabWidget(QWidget):
         # Add the unifying sections sequentially
         self.layout.addWidget(self.plot_tab)
         
-        divider = QFrame()
-        divider.setFrameShape(QFrame.HLine)
-        divider.setFrameShadow(QFrame.Sunken)
-        divider.setStyleSheet("background-color: #444444; margin: 10px 0px;")
-        self.layout.addWidget(divider)
+        self.plot_divider = QFrame()
+        self.plot_divider.setFrameShape(QFrame.HLine)
+        self.plot_divider.setFrameShadow(QFrame.Sunken)
+        self.plot_divider.setStyleSheet("background-color: #444444; margin: 10px 0px;")
+        self.layout.addWidget(self.plot_divider)
         
         self.layout.addWidget(self.fed_view_tab)
         self.layout.addStretch()
@@ -533,6 +553,7 @@ class FEDTabWidget(QWidget):
 
         # Initial device
         self.create_device_widget()
+
 
     def get_global_interval_ms(self):
         unit = self.global_unit_combo.currentText()
@@ -722,6 +743,8 @@ class FEDTabWidget(QWidget):
         self.ax.set_xlabel("Time", color='white')
         self.ax.set_ylabel("Cumulative Pellets", color='white')
         self.ax.tick_params(colors='white')
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor('#444444')
         
         plotted_something = False
         min_time = None
@@ -743,6 +766,10 @@ class FEDTabWidget(QWidget):
                     max_time = events[-1]
                 self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
                 plotted_something = True
+        
+        # Toggle between placeholder and canvas
+        self.plot_placeholder.setVisible(not plotted_something)
+        self.canvas.setVisible(plotted_something)
                 
         if plotted_something:
             self.ax.legend(facecolor='#2b2b2b', edgecolor='#444444', labelcolor='white')
@@ -761,10 +788,14 @@ class FEDTabWidget(QWidget):
                                     color='gray', alpha=0.3, zorder=0)
                     current_shade_start += timedelta(days=1)
             
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-        self.figure.autofmt_xdate()
-        self.figure.tight_layout(pad=1.5)
-        self.canvas.draw()
+            # Auto-scale x-axis so ticks adapt as the time range grows
+            locator = mdates.AutoDateLocator()
+            self.ax.xaxis.set_major_locator(locator)
+            self.ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
+            self.ax.autoscale_view()
+            self.figure.autofmt_xdate()
+            self.figure.tight_layout(pad=1.5)
+            self.canvas.draw()
 
     def update_fed_view_combo(self):
         current_plot_idx = self.plot_filter_combo.currentIndex()
@@ -785,6 +816,7 @@ class FEDTabWidget(QWidget):
         device['svg_view'].left_counter.setText(str(device['stats']['left']))
         device['svg_view'].right_counter.setText(str(device['stats']['right']))
         device['svg_view'].pellet_counter.setText(str(device['stats']['pellet']))
+        device['svg_view'].update()  # trigger repaint since counters are painted directly
 
     def handle_scan_finished(self, valid_ports):
         for dev in self.fed_devices:
