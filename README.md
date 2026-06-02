@@ -1,3 +1,5 @@
+[![build](https://github.com/calebvogt/fnt/actions/workflows/build.yml/badge.svg)](https://github.com/calebvogt/fnt/actions/workflows/build.yml)
+
 # FieldNeuroToolbox (fnt)
 
 Preprocessing and analysis toolbox for neurobehavioral data.

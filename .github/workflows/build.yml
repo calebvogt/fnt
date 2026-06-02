@@ -179,5 +179,6 @@ jobs:
         with:
           tag_name: ${{ needs.bump_version.outputs.new_tag || github.ref_name }}
           files: release-assets/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
