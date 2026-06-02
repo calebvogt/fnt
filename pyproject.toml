@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnt"
-version = "0.1.1"
+version = "0.2.0"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
 license = {text = "MIT"}

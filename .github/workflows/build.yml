@@ -3,7 +3,9 @@ name: Build Standalone Executables
 on:
   push:
     branches:
-      - feature/standalone-build
+      - main
+    tags:
+      - 'v*'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -13,9 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # We can build for Windows, Mac, and Linux
         os: [windows-latest, macos-latest, ubuntu-latest]
-      # Don't cancel other matrix jobs if one fails
       fail-fast: false
 
     steps:
@@ -33,9 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install PyInstaller
-          # Install PyTorch with CPU-only to save space if needed, or omit index-url to get default
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          # Install our package
           pip install -e .
 
       - name: Install dependencies (macOS)
@@ -43,7 +41,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install PyInstaller
-          # Default torch install for Mac is already CPU/Metal
           pip install torch torchvision
           pip install -e .
 
@@ -52,7 +49,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install PyInstaller
-          # Install PyTorch with CPU-only to save space
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
 
@@ -100,3 +96,32 @@ jobs:
           name: fnt-linux
           path: fnt-linux.tar.gz
           retention-days: 5
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fnt-windows
+          path: release-assets
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fnt-macos
+          path: release-assets
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fnt-linux
+          path: release-assets
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

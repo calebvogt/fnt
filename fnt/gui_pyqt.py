@@ -72,7 +72,14 @@ class FNTMainWindow(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("FieldNeuroToolbox (FNT) v1.0")
+        # Load version dynamically
+        try:
+            from importlib.metadata import version
+            self.version = version("fnt")
+        except Exception:
+            self.version = "unknown"
+            
+        self.setWindowTitle(f"FieldNeuroToolbox (FNT) v{self.version}")
         self.setGeometry(100, 100, 1100, 780)
         self.setMinimumSize(850, 650)
         
@@ -1494,7 +1501,12 @@ def main():
     
     # Set application properties
     app.setApplicationName("FieldNeuroToolbox")
-    app.setApplicationVersion("1.0")
+    try:
+        from importlib.metadata import version
+        app_version = version("fnt")
+    except Exception:
+        app_version = "unknown"
+    app.setApplicationVersion(app_version)
     app.setOrganizationName("FNT")
     
     # Set application icon
