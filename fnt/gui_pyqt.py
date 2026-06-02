@@ -92,11 +92,17 @@ class UpdateCheckerThread(QThread):
 
     def run(self):
         try:
+            import ssl
+            import re
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
             req = urllib.request.Request(
                 "https://api.github.com/repos/calebvogt/fnt/releases/latest",
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, timeout=5, context=ctx) as response:
                 data = json.loads(response.read().decode())
                 latest_tag = data.get("tag_name", "")
                 
@@ -107,15 +113,22 @@ class UpdateCheckerThread(QThread):
                 
                 # Simple semver parsing
                 def parse_version(v):
-                    return [int(x) for x in str(v).split('.') if x.isdigit()]
+                    parts = []
+                    for x in str(v).split('.'):
+                        match = re.search(r'\d+', x)
+                        if match:
+                            parts.append(int(match.group()))
+                        else:
+                            parts.append(0)
+                    return parts
                     
                 cur = parse_version(self.current_version)
                 latest = parse_version(latest_version)
                 
                 if latest > cur and len(latest) > 0:
                     self.update_available.emit(latest_tag, data.get("html_url", ""))
-        except Exception:
-            pass # Fail silently if no internet or API error
+        except Exception as e:
+            print(f"Update check failed: {e}")
 
 
 class FNTMainWindow(QMainWindow):
@@ -128,7 +141,7 @@ class FNTMainWindow(QMainWindow):
         
         # Start update check
         self.update_thread = UpdateCheckerThread(self.version)
-        self.update_thread.update_available.connect(self.show_update_dialog)
+        self.update_thread.update_available.connect(self.show_update_link)
         self.update_thread.start()
     
     def init_ui(self):
@@ -307,22 +320,23 @@ class FNTMainWindow(QMainWindow):
         
         # Status bar
         self.status_bar = QStatusBar()
+        self.status_bar.setSizeGripEnabled(False)
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready - FieldNeuroToolbox initialized")
+        
+        self.update_label = QLabel()
+        self.update_label.setOpenExternalLinks(True)
+        self.update_label.setContentsMargins(0, 0, 10, 0)
+        self.update_label.hide()
+        self.status_bar.addPermanentWidget(self.update_label)
         
         # Center the window
         self.center_window()
     
-    def show_update_dialog(self, version, url):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Update Available")
-        msg.setText(f"A new version of FieldNeuroToolbox ({version}) is available!\n\nWould you like to go to the releases page to download it?")
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.Yes)
-        
-        if msg.exec_() == QMessageBox.Yes:
-            import webbrowser
-            webbrowser.open(url)
+    def show_update_link(self, version, url):
+        link_text = f'<a href="{url}" style="color: #ffaa00; font-weight: bold; text-decoration: none;">New update available: {version}! Click here to download.</a>'
+        self.update_label.setText(link_text)
+        self.update_label.show()
 
     def center_window(self):
         """Center the window on the screen"""
@@ -369,7 +383,7 @@ class FNTMainWindow(QMainWindow):
         try:
             if getattr(sys, 'frozen', False):
                 # Running as PyInstaller executable
-                ts_str = "Release Build  |  "
+                ts_str = f"Release Build v{self.version}  |  "
             else:
                 _this_file = os.path.abspath(__file__)
                 _mtime = os.path.getmtime(_this_file)
