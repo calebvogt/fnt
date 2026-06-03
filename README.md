@@ -78,6 +78,9 @@ The GUI is organized into tabbed categories. Each tool launches in its own windo
 
 - **FED Sync & Tracking** — Interface for managing Feeding Experimentation Device (FED3) data over serial connections. Add devices, configure auto-sync schedules, and visualize pellet retrieval data over time with real-time plots.
 
+> [!IMPORTANT]
+> To use FED3 devices with FNT, you must first install the [compatible sketch](https://github.com/samuel-garmany/fnt-fed3) on your FED3 device.
+
 ### Utilities
 
 - **File Splitter** — Split large files to meet GitHub's 50 MB limit. Smart CSV splitting (row-based, preserves headers) or binary splitting.
