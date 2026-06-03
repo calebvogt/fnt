@@ -22,6 +22,9 @@ The easiest way to use FieldNeuroToolbox is by downloading the pre-built standal
 2. Download the latest release `.zip` or `.tar.gz` for your operating system (Windows, macOS, or Linux).
 3. Extract the downloaded archive.
 4. Run the extracted `fnt` executable to launch the GUI.
+   * **macOS Security Permission:** Since the executable is unsigned, macOS will block it initially. When this happens, go to **System Settings** > **Privacy & Security**, scroll down, and click **"Open Anyway"** to run it.
+   * **Windows SmartScreen:** When launching, you may see a "Windows protected your PC" warning. Click **"More info"** and then select **"Run anyway"** to allow the application to launch.
+
 
 _Note: For GPU acceleration in SAM-based video tracking, you will need an NVIDIA GPU with CUDA drivers installed on your system. If you want full control over your Python environment or want to modify the code, see the [Development Installation](#development-installation) section at the bottom._
 
