@@ -263,6 +263,10 @@ class Fed3TrackerWorker(QThread):
 class PortScannerWorker(QThread):
     finished_scan = pyqtSignal(list)
 
+    def __init__(self, active_ports=None):
+        super().__init__()
+        self.active_ports = active_ports or []
+
     def run(self):
         import serial
         from serial.tools import list_ports
@@ -270,9 +274,25 @@ class PortScannerWorker(QThread):
         from concurrent.futures import ThreadPoolExecutor
 
         ports = list(list_ports.comports())
+        active_ports = getattr(self, 'active_ports', [])
 
         def check_port(p):
             dev = p.device
+            desc = getattr(p, "description", "") or ""
+            mfg = getattr(p, "manufacturer", "") or ""
+
+            is_candidate = False
+            for k in ("acm", "usb", "arduino", "feather", "cdc", "com"):
+                if k in dev.lower() or k in desc.lower() or k in mfg.lower():
+                    is_candidate = True
+                    break
+
+            if not is_candidate:
+                return None
+
+            if dev in active_ports:
+                return (dev, "Active")
+
             try:
                 ser = serial.Serial()
                 ser.port = dev
@@ -286,10 +306,13 @@ class PortScannerWorker(QThread):
                 response = ser.read_all().decode('utf-8', errors='ignore')
                 ser.close()
                 if "PONG_FED3" in response:
-                    return dev
-            except Exception:
-                pass
-            return None
+                    return (dev, "FED3 Active")
+            except Exception as e:
+                err_str = str(e)
+                if "busy" in err_str.lower() or "already open" in err_str.lower() or "permission denied" in err_str.lower():
+                    return (dev, "Busy/In Use")
+
+            return (dev, "Unresponsive")
 
         # Check ports in parallel to avoid long UI hangs
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -297,6 +320,7 @@ class PortScannerWorker(QThread):
 
         valid_ports = [r for r in results if r is not None]
         self.finished_scan.emit(valid_ports)
+
 
 
 class CollapsibleLogBox(QWidget):
@@ -566,7 +590,7 @@ class FEDTabWidget(QWidget):
         seconds = max(1, value * mult)
         return int(seconds * 1000)
 
-    def create_device_widget(self):
+    def create_device_widget(self, checked=False, refresh=True):
         idx = len(self.fed_devices) + 1
         box = QGroupBox(f"Device {idx}")
         box_layout = QGridLayout()
@@ -634,12 +658,15 @@ class FEDTabWidget(QWidget):
         self.fed_devices.append(device)
         self.update_remove_buttons()
         self.update_fed_view_combo()
-        self.refresh_all_ports()
+        if refresh:
+            self.refresh_all_ports()
         return device
 
     def toggle_tracking(self, checked, device):
         if checked:
-            port = device['port_combo'].currentText()
+            port = device['port_combo'].currentData() or device['port_combo'].currentText()
+            if port and " (" in port:
+                port = port.split(" (")[0]
             if not port:
                 self.fed_log.append_log("No port selected for tracking.", False)
                 device['is_tracking'] = False
@@ -914,16 +941,66 @@ class FEDTabWidget(QWidget):
         device['svg_view'].update()  # trigger repaint since counters are painted directly
 
     def handle_scan_finished(self, valid_ports):
-        for dev in self.fed_devices:
+        # 1. Identify all detected raw port names
+        detected_ports = []
+        if valid_ports:
+            detected_ports = [port_info[0] for port_info in valid_ports]
+
+        # 2. Collect current selections from existing devices
+        # We want to preserve existing valid selections
+        assigned_ports = {} # device_index -> port_name
+        used_ports = set()
+        
+        for i, dev in enumerate(self.fed_devices):
             combo = dev['port_combo']
-            current = combo.currentText()
+            current = combo.currentData() or combo.currentText()
+            if current and " (" in current:
+                current = current.split(" (")[0]
+            if current in detected_ports:
+                assigned_ports[i] = current
+                used_ports.add(current)
+
+        # 3. For any device that does not have a valid selection, assign an unused port
+        for i, dev in enumerate(self.fed_devices):
+            if i not in assigned_ports:
+                for p in detected_ports:
+                    if p not in used_ports:
+                        assigned_ports[i] = p
+                        used_ports.add(p)
+                        break
+
+        # 4. If there are still detected ports that haven't been assigned,
+        # auto-create new devices and assign them
+        for p in detected_ports:
+            if p not in used_ports:
+                new_dev = self.create_device_widget(refresh=False)
+                new_dev_idx = len(self.fed_devices) - 1
+                assigned_ports[new_dev_idx] = p
+                used_ports.add(p)
+
+        # 5. Populate the comboboxes for all devices and set their selections
+        for i, dev in enumerate(self.fed_devices):
+            combo = dev['port_combo']
             combo.clear()
+            
             if valid_ports:
-                for p in valid_ports:
-                    combo.addItem(p)
-                idx = combo.findText(current)
+                for port_info in valid_ports:
+                    port_name, status = port_info
+                    display_text = f"{port_name} ({status})"
+                    combo.addItem(display_text, userData=port_name)
+                
+                # Set selection to the assigned port
+                assigned = assigned_ports.get(i)
+                idx = -1
+                if assigned:
+                    for item_idx in range(combo.count()):
+                        if combo.itemData(item_idx) == assigned:
+                            idx = item_idx
+                            break
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
+                else:
+                    combo.setCurrentIndex(0)
             else:
                 # Fallback or just empty
                 combo.addItem("No FED3 found")
@@ -957,7 +1034,9 @@ class FEDTabWidget(QWidget):
         if device.get('is_syncing'):
             return
             
-        port = device['port_combo'].currentText() or None
+        port = device['port_combo'].currentData() or device['port_combo'].currentText() or None
+        if port and " (" in port:
+            port = port.split(" (")[0]
         dev_name = device['name_edit'].text().strip() or device['box'].title()
         
         if self.main_window:
@@ -1004,7 +1083,9 @@ class FEDTabWidget(QWidget):
             if device.get('is_syncing'):
                 continue
                 
-            port = device['port_combo'].currentText() or None
+            port = device['port_combo'].currentData() or device['port_combo'].currentText() or None
+            if port and " (" in port:
+                port = port.split(" (")[0]
             dev_name = device['name_edit'].text().strip() or device['box'].title()
             
             worker = device.get('tracker_worker')
@@ -1035,12 +1116,21 @@ class FEDTabWidget(QWidget):
         if hasattr(self, '_global_scanner') and self._global_scanner is not None and self._global_scanner.isRunning():
             return
             
+        active_ports = []
+        for dev in self.fed_devices:
+            p = dev['port_combo'].currentData() or dev['port_combo'].currentText()
+            if p:
+                if " (" in p:
+                    p = p.split(" (")[0]
+                if dev.get('is_tracking') or dev.get('is_syncing'):
+                    active_ports.append(p)
+            
         for dev in self.fed_devices:
             dev['port_combo'].clear()
             dev['port_combo'].addItem("Scanning...")
             dev['port_combo'].setEnabled(False)
             
-        self._global_scanner = PortScannerWorker()
+        self._global_scanner = PortScannerWorker(active_ports)
         self._global_scanner.finished_scan.connect(self.scan_finished_signal.emit)
         self._global_scanner.start()
 
