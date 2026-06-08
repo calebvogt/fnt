@@ -261,15 +261,17 @@ class Fed3TrackerWorker(QThread):
 
 
 class PortScannerWorker(QThread):
-    finished_scan = pyqtSignal(list)
+    finished_scan = pyqtSignal(list, list)
 
     def run(self):
         import serial
         from serial.tools import list_ports
         import time
         from concurrent.futures import ThreadPoolExecutor
+        from . import fed_comms
 
         ports = list(list_ports.comports())
+        candidate_ports = [p for p in ports if fed_comms.is_candidate_port(p)]
 
         def check_port(p):
             dev = p.device
@@ -293,10 +295,11 @@ class PortScannerWorker(QThread):
 
         # Check ports in parallel to avoid long UI hangs
         with ThreadPoolExecutor(max_workers=10) as executor:
-            results = executor.map(check_port, ports)
+            results = executor.map(check_port, candidate_ports)
 
         valid_ports = [r for r in results if r is not None]
-        self.finished_scan.emit(valid_ports)
+        candidate_devs = [p.device for p in candidate_ports]
+        self.finished_scan.emit(valid_ports, candidate_devs)
 
 
 class CollapsibleLogBox(QWidget):
@@ -390,7 +393,7 @@ class CollapsibleLogBox(QWidget):
 
 class FEDTabWidget(QWidget):
     """Modular widget for the FED processing tab."""
-    scan_finished_signal = pyqtSignal(list)
+    scan_finished_signal = pyqtSignal(list, list)
     
     def __init__(self, parent=None, worker_class=None):
         super().__init__(parent)
@@ -604,9 +607,6 @@ class FEDTabWidget(QWidget):
         svg_layout.addWidget(svg_view)
         
         self.fed_view_layout.addWidget(svg_container)
-        
-        name_edit.textChanged.connect(lambda t: svg_title.setText(t.strip() or f"Device {idx}"))
-        name_edit.textChanged.connect(lambda _: self.update_fed_view_combo())
 
         device = {
             'box': box,
@@ -625,6 +625,13 @@ class FEDTabWidget(QWidget):
             'events': [],
             'stats': {'left': 0, 'right': 0, 'pellet': 0}
         }
+        
+        name_edit.textChanged.connect(
+            lambda t, d=device: d['svg_title'].setText(
+                t.strip() or f"Device {self.fed_devices.index(d) + 1 if d in self.fed_devices else len(self.fed_devices) + 1}"
+            )
+        )
+        name_edit.textChanged.connect(lambda _: self.update_fed_view_combo())
         
         remove_btn.clicked.connect(lambda: self.remove_device(device))
         timer.timeout.connect(lambda: self.do_device_sync(device))
@@ -913,19 +920,20 @@ class FEDTabWidget(QWidget):
         device['svg_view'].pellet_counter.setText(str(device['stats']['pellet']))
         device['svg_view'].update()  # trigger repaint since counters are painted directly
 
-    def handle_scan_finished(self, valid_ports):
+    def handle_scan_finished(self, valid_ports, candidate_ports=None):
         for dev in self.fed_devices:
             combo = dev['port_combo']
             current = combo.currentText()
             combo.clear()
-            if valid_ports:
-                for p in valid_ports:
+            
+            ports_to_add = valid_ports if valid_ports else (candidate_ports or [])
+            if ports_to_add:
+                for p in ports_to_add:
                     combo.addItem(p)
                 idx = combo.findText(current)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
             else:
-                # Fallback or just empty
                 combo.addItem("No FED3 found")
             combo.setEnabled(True)
 
@@ -944,9 +952,15 @@ class FEDTabWidget(QWidget):
             
         if device in self.fed_devices:
             self.fed_devices.remove(device)
+        self.reorganize_device_indices()
         self.update_remove_buttons()
         self.update_fed_view_combo()
         self.update_plot()
+
+    def reorganize_device_indices(self):
+        for i, dev in enumerate(self.fed_devices, start=1):
+            dev['box'].setTitle(f"Device {i}")
+            dev['svg_title'].setText(dev['name_edit'].text().strip() or f"Device {i}")
 
     def update_remove_buttons(self):
         enable = len(self.fed_devices) > 1

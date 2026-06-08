@@ -8,6 +8,47 @@ import threading
 from datetime import datetime
 
 
+def is_candidate_port(p):
+    """Check if a serial port is a potential candidate for a FED3 device.
+
+    Filters out known unresponsive or unrelated ports (e.g. Bluetooth,
+    motherboard serial ports, Intel AMT SOL) while keeping USB/ACM/CDC devices.
+    """
+    dev = getattr(p, "device", "") or ""
+    desc = getattr(p, "description", "") or ""
+    hwid = getattr(p, "hwid", "") or ""
+    
+    dev_lower = dev.lower()
+    desc_lower = desc.lower()
+    hwid_lower = hwid.lower()
+    
+    # 1. Exclude Bluetooth ports
+    if "bluetooth" in desc_lower or "bth" in hwid_lower or "bluetooth" in dev_lower or "rfcomm" in dev_lower:
+        return False
+        
+    # 2. Exclude standard motherboard / legacy / physical COM ports
+    if "communications port" in desc_lower or "standard serial port" in desc_lower:
+        return False
+    if hwid_lower.startswith("acpi"):
+        return False
+    if "/dev/ttys" in dev_lower:
+        return False
+        
+    # 3. Exclude Intel Active Management Technology / SOL
+    if "intel" in desc_lower and ("active management" in desc_lower or "sol" in desc_lower):
+        return False
+        
+    # 4. Include ports that have explicit USB / ACM / CDC / Arduino / Feather / Adafruit keywords
+    if any(k in dev or k in desc or k in hwid for k in ("ACM", "ttyACM", "USB", "Arduino", "Feather", "Adafruit", "CDC")):
+        return True
+        
+    # 5. Include any port with a valid USB Vendor ID
+    if getattr(p, "vid", None) is not None:
+        return True
+        
+    return False
+
+
 class Fed3Tracker:
     def __init__(self, port, baud=115200):
         self.port = port
@@ -69,7 +110,7 @@ def list_serial_ports():
     """
     try:
         from serial.tools import list_ports
-        return [p.device for p in list_ports.comports()]
+        return [p.device for p in list_ports.comports() if is_candidate_port(p)]
     except Exception:
         return []
 
@@ -113,9 +154,12 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
 
     # Auto-detect port if not provided
     if port is None:
-        ports = list(list_ports.comports())
+        ports = [p for p in list_ports.comports() if is_candidate_port(p)]
         if not ports:
-            return False, "No serial ports detected"
+            # Fallback to all ports if no candidate matches
+            ports = list(list_ports.comports())
+            if not ports:
+                return False, "No serial ports detected"
         candidate = None
         for p in ports:
             dev = getattr(p, "device", "")
