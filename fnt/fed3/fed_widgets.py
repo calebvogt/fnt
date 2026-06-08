@@ -184,7 +184,7 @@ class FEDSvgView(QWidget):
         y_off = (h - new_h) // 2
         svg_rect = QRectF(x_off, y_off, new_w, new_h)
 
-        if self._renderer:
+        if self._renderer and self._renderer.isValid():
             self._renderer.render(painter, svg_rect)
 
         # --- Overlay sizes ---
@@ -291,7 +291,7 @@ class PortScannerWorker(QThread):
             if not is_candidate:
                 return None
 
-            if dev in active_ports:
+            if dev in self.active_ports:
                 return (dev, "Active")
 
             try:
