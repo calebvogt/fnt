@@ -114,7 +114,7 @@ jobs:
       - name: Zip the output (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          Compress-Archive -Path dist\fnt -DestinationPath fnt-windows.zip
+          Compress-Archive -Path dist\fnt.exe -DestinationPath fnt-windows.zip
 
       - name: Zip the output (macOS)
         if: matrix.os == 'macos-latest'
