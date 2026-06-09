@@ -455,8 +455,8 @@ class FNTMainWindow(QMainWindow):
         tracking_layout = QGridLayout()
 
         tracking_buttons = [
-            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
             ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
             ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
         ]
 
@@ -964,13 +964,13 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
 
     def run_sam2_annotator(self):
-        """Launch SAM2 Annotator tool"""
+        """Launch Mask Tracker Tool"""
         try:
-            from fnt.videoTracking.sam2_annotator_pyqt import SAM2AnnotatorWindow
-            self.sam2_annotator_window = SAM2AnnotatorWindow()
-            self.sam2_annotator_window.show()
+            from fnt.videoTracking.mask_tracker_gui import MaskTrackerWindow
+            self.mask_tracker_window = MaskTrackerWindow()
+            self.mask_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch SAM2 Annotator: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to launch Mask Tracker: {str(e)}")
 
 
     # LabGym Methods
