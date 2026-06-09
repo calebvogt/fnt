@@ -949,13 +949,29 @@ class FEDTabWidget(QWidget):
     def handle_scan_finished(self, valid_ports, candidate_ports=None):
         for dev in self.fed_devices:
             combo = dev['port_combo']
+            current = combo.currentData() or combo.currentText()
+            if current and " (" in current:
+                current = current.split(" (")[0]
             combo.clear()
             
             ports_to_add = valid_ports if valid_ports else (candidate_ports or [])
             if ports_to_add:
                 for p in ports_to_add:
-                    combo.addItem(p)
-                idx = combo.findText(current)
+                    if isinstance(p, (list, tuple)) and len(p) == 2:
+                        port_name, status = p
+                        display_text = f"{port_name} ({status})"
+                        combo.addItem(display_text, userData=port_name)
+                    else:
+                        port_name = str(p)
+                        combo.addItem(port_name, userData=port_name)
+                
+                # Restore previous selection
+                idx = -1
+                if current:
+                    for item_idx in range(combo.count()):
+                        if combo.itemData(item_idx) == current or combo.itemText(item_idx) == current:
+                            idx = item_idx
+                            break
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
                 else:
