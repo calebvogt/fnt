@@ -4549,10 +4549,17 @@ class MaskTrackerWindow(QMainWindow):
         self.chk_track_masks = QCheckBox("Generate mask overlays (slower)")
         self.chk_track_masks.setChecked(False)
         self.chk_track_masks.setToolTip(
-            "When enabled, the model also predicts pixel-level masks for each\n"
-            "detection and draws them on the annotated video. ~2x slower.\n"
-            "When disabled, uses bounding boxes only — faster and sufficient\n"
-            "for tracking since centroids are computed from box centers."
+            "Controls whether the model predicts pixel-level masks.\n\n"
+            "ON: the model generates a silhouette mask for each detection.\n"
+            "  • Centroids are computed from mask pixels (more accurate).\n"
+            "  • Contour outlines are drawn on the tracked video.\n"
+            "  • mask_area in the CSV reflects actual pixel area.\n"
+            "  • ~2x slower for Mask R-CNN models.\n\n"
+            "OFF: only bounding boxes are used.\n"
+            "  • Centroids are computed from box centers.\n"
+            "  • Rectangles are drawn on the tracked video.\n"
+            "  • mask_area in the CSV reflects box area.\n"
+            "  • Faster inference."
         )
         ctrl_vbox.addWidget(self.chk_track_masks)
 
@@ -9201,7 +9208,10 @@ class MaskTrackerWindow(QMainWindow):
                     self.chk_track_masks.setChecked(True)
                     self.chk_track_masks.setEnabled(False)
                     self.chk_track_masks.setToolTip(
-                        "Masks are always enabled for YOLO models (no speed penalty)."
+                        "Masks are always enabled for YOLO models (no speed penalty).\n\n"
+                        "Centroids are computed from mask pixels, contour outlines\n"
+                        "are drawn on the tracked video, and mask_area in the CSV\n"
+                        "reflects actual pixel area."
                     )
                 else:
                     max_sz = cfg.get("max_size", 800)
@@ -9215,10 +9225,17 @@ class MaskTrackerWindow(QMainWindow):
                     # Mask R-CNN: user can choose (masks add ~48% cost)
                     self.chk_track_masks.setEnabled(True)
                     self.chk_track_masks.setToolTip(
-                        "When enabled, the model also predicts pixel-level masks for each\n"
-                        "detection and draws them on the annotated video. ~2x slower.\n"
-                        "When disabled, uses bounding boxes only — faster and sufficient\n"
-                        "for tracking since centroids are computed from box centers."
+                        "Controls whether the model predicts pixel-level masks.\n\n"
+                        "ON: the model generates a silhouette mask for each detection.\n"
+                        "  • Centroids are computed from mask pixels (more accurate).\n"
+                        "  • Contour outlines are drawn on the tracked video.\n"
+                        "  • mask_area in the CSV reflects actual pixel area.\n"
+                        "  • ~2x slower for Mask R-CNN models.\n\n"
+                        "OFF: only bounding boxes are used.\n"
+                        "  • Centroids are computed from box centers.\n"
+                        "  • Rectangles are drawn on the tracked video.\n"
+                        "  • mask_area in the CSV reflects box area.\n"
+                        "  • Faster inference."
                     )
             except Exception:
                 self.lbl_track_model_info.setText(f"Path: {run_dir}")
