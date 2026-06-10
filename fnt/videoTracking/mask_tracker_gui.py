@@ -4383,30 +4383,6 @@ class MaskTrackerWindow(QMainWindow):
         row_res.addWidget(self.combo_track_resolution)
         settings_vbox.addLayout(row_res)
 
-        self.chk_track_masks = QCheckBox("Generate mask overlays (slower)")
-        self.chk_track_masks.setChecked(False)
-        self.chk_track_masks.setToolTip(
-            "When enabled, the model also predicts pixel-level masks for each\n"
-            "detection and draws them on the annotated video. ~2x slower.\n"
-            "When disabled, uses bounding boxes only — faster and sufficient\n"
-            "for tracking since centroids are computed from box centers."
-        )
-        settings_vbox.addWidget(self.chk_track_masks)
-
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("Device:"))
-        self.combo_track_device = QComboBox()
-        self.combo_track_device.addItems(["CPU", "Auto", "CUDA (GPU)", "MPS (Apple Silicon)"])
-        self.combo_track_device.setToolTip(
-            "Hardware device for inference.\n"
-            "CPU: recommended for Apple Silicon Macs (~5x faster than MPS for detection).\n"
-            "Auto: uses CUDA if available, otherwise CPU.\n"
-            "CUDA: NVIDIA GPU (fastest when available).\n"
-            "MPS: Apple Silicon GPU via Metal (slower than CPU for detection models)."
-        )
-        row4.addWidget(self.combo_track_device)
-        settings_vbox.addLayout(row4)
-
         settings_group.setLayout(settings_vbox)
         layout.addWidget(settings_group)
 
@@ -4555,6 +4531,30 @@ class MaskTrackerWindow(QMainWindow):
         ctrl_group = QGroupBox("Run Inference")
         ctrl_vbox = QVBoxLayout()
         ctrl_vbox.setSpacing(4)
+
+        row_device = QHBoxLayout()
+        row_device.addWidget(QLabel("Device:"))
+        self.combo_track_device = QComboBox()
+        self.combo_track_device.addItems(["CPU", "Auto", "CUDA (GPU)", "MPS (Apple Silicon)"])
+        self.combo_track_device.setToolTip(
+            "Hardware device for inference.\n"
+            "CPU: recommended for Apple Silicon Macs (~5x faster than MPS for detection).\n"
+            "Auto: uses CUDA if available, otherwise CPU.\n"
+            "CUDA: NVIDIA GPU (fastest when available).\n"
+            "MPS: Apple Silicon GPU via Metal (slower than CPU for detection models)."
+        )
+        row_device.addWidget(self.combo_track_device)
+        ctrl_vbox.addLayout(row_device)
+
+        self.chk_track_masks = QCheckBox("Generate mask overlays (slower)")
+        self.chk_track_masks.setChecked(False)
+        self.chk_track_masks.setToolTip(
+            "When enabled, the model also predicts pixel-level masks for each\n"
+            "detection and draws them on the annotated video. ~2x slower.\n"
+            "When disabled, uses bounding boxes only — faster and sufficient\n"
+            "for tracking since centroids are computed from box centers."
+        )
+        ctrl_vbox.addWidget(self.chk_track_masks)
 
         self.chk_create_tracked_video = QCheckBox("Create tracked video")
         self.chk_create_tracked_video.setChecked(True)
