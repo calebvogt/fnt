@@ -15,7 +15,7 @@ Workflow:
 5. Process batch - generate occupancy data, summary stats, and tracked videos
 
 Features:
-- Auto-detection of SLEAP (.predictions.analysis.csv) and MTT (trajectories_detailed.csv)
+- Auto-detection of SLEAP (.predictions.analysis.csv) and MTT (trajectories.csv)
 - Flexible ROI definition (polygon-based)
 - Multiple ROI types (OFT outer/center, LDB light area, custom)
 - Per-keypoint/object analysis
@@ -42,10 +42,11 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
-    QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog, QSpinBox
+    QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog, QSpinBox,
+    QSplitter, QSlider
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QColor, QPolygon
 
 # Check for required dependencies
 try:
@@ -63,24 +64,17 @@ except ImportError:
     print("Warning: pandas not available")
 
 
-def _get_mtt_object_names(detailed_csv_path: str, df: pd.DataFrame) -> Dict[int, str]:
-    """Derive object column names from the pivot-format trajectories.csv or fallback to labels."""
-    mtt_dir = os.path.dirname(detailed_csv_path)
-    pivot_csv = os.path.join(mtt_dir, "trajectories.csv")
-
-    if os.path.exists(pivot_csv):
-        try:
-            pivot_df = pd.read_csv(pivot_csv, nrows=0)
-            obj_cols = [c for c in pivot_df.columns if c not in ("frame", "time")]
-            if obj_cols:
-                obj_ids = sorted(df["object_id"].unique())
-                if len(obj_cols) == len(obj_ids):
-                    return {oid: name for oid, name in zip(obj_ids, obj_cols)}
-        except Exception:
-            pass
+def _get_mtt_object_names(csv_path: str, df: pd.DataFrame) -> Dict[int, str]:
+    """Derive object column names from the object_name column, or fallback to labels."""
+    if "object_name" in df.columns:
+        obj_col_names: Dict[int, str] = {}
+        for oid in sorted(df["object_id"].unique()):
+            name = df.loc[df["object_id"] == oid, "object_name"].iloc[0]
+            obj_col_names[oid] = str(name)
+        return obj_col_names
 
     class_counters: Dict[str, int] = {}
-    obj_col_names: Dict[int, str] = {}
+    obj_col_names = {}
     for oid in sorted(df["object_id"].unique()):
         label = int(df.loc[df["object_id"] == oid, "label"].iloc[0])
         class_name = f"object{label}"
@@ -127,11 +121,11 @@ class VideoROIConfig:
         self.show_rois = True  # Default
         self.show_all_keypoints = True  # Default - changed to True
         self.show_edges = True  # Default
-        self.show_keypoint_labels = False  # Default
-        self.show_track_labels = False  # Default - show track IDs on video
-        self.show_track_trail = False  # Default - show trail behind tracked keypoints
-        self.track_trail_length = 30  # Default trail length in frames
-        self.save_data_view = False  # Default - video + live statistics panel
+        self.show_keypoint_labels = True
+        self.show_track_labels = True
+        self.show_track_trail = True
+        self.track_trail_length = 30
+        self.save_data_view = True
         self.overwrite_files = True  # Default
         self.has_tracks = False  # Detected from CSV
     
@@ -199,7 +193,8 @@ class VideoROIConfig:
             'show_track_trail': self.show_track_trail,
             'track_trail_length': self.track_trail_length,
             'save_data_view': self.save_data_view,
-            'overwrite_files': self.overwrite_files
+            'overwrite_files': self.overwrite_files,
+            'selected_keypoints': self.selected_keypoints
         }
     
     def from_config_dict(self, config_dict: dict):
@@ -221,17 +216,20 @@ class VideoROIConfig:
         self.save_roi_summary = config_dict.get('save_roi_summary', True)
         self.save_config = config_dict.get('save_config', True)
         self.save_tracking_plots = config_dict.get('save_tracking_plots', True)
-        self.create_tracked_video = config_dict.get('create_tracked_video', False)
+        self.create_tracked_video = config_dict.get('create_tracked_video', True)
         self.show_tracking_area = config_dict.get('show_tracking_area', True)
         self.show_rois = config_dict.get('show_rois', True)
-        self.show_all_keypoints = config_dict.get('show_all_keypoints', False)
+        self.show_all_keypoints = config_dict.get('show_all_keypoints', True)
         self.show_edges = config_dict.get('show_edges', True)
-        self.show_keypoint_labels = config_dict.get('show_keypoint_labels', False)
-        self.show_track_labels = config_dict.get('show_track_labels', False)
-        self.show_track_trail = config_dict.get('show_track_trail', False)
+        self.show_keypoint_labels = config_dict.get('show_keypoint_labels', True)
+        self.show_track_labels = config_dict.get('show_track_labels', True)
+        self.show_track_trail = config_dict.get('show_track_trail', True)
         self.track_trail_length = config_dict.get('track_trail_length', 30)
-        self.save_data_view = config_dict.get('save_data_view', False)
+        self.save_data_view = config_dict.get('save_data_view', True)
         self.overwrite_files = config_dict.get('overwrite_files', True)
+        saved_kps = config_dict.get('selected_keypoints', [])
+        if saved_kps:
+            self.selected_keypoints = saved_kps
 
 
 class ROIProcessor(QThread):
@@ -242,101 +240,89 @@ class ROIProcessor(QThread):
     video_finished = pyqtSignal(int, bool, str)  # video_idx, success, message
     all_finished = pyqtSignal(bool, str)
     
-    def __init__(self, video_configs: List[VideoROIConfig]):
+    def __init__(self, video_configs: List[VideoROIConfig], output_mode: str = "new"):
         super().__init__()
         self.video_configs = video_configs
+        self.output_mode = output_mode  # "source" = data source folder, "new" = new roiAnalysis folder
         self.cancelled = False
     
-    def get_output_path(self, video_path: str, csv_path: str, suffix: str) -> str:
-        """
-        Generate output path inside a video-specific roiAnalysis folder.
-        
-        Example:
-            video_path: 'C:/data/F9039_PreOFT.mp4'
-            csv_path: 'F9039_PreOFT.mp4.251106_125759.predictions.analysis.csv'
-            suffix: '_roiOccupancy_bodyCenter.csv'
-            output: 'C:/data/F9039_PreOFT.mp4_roiAnalysis/F9039_PreOFT.mp4.251106_125759_roiOccupancy_bodyCenter.csv'
-        
-        Args:
-            video_path: Path to the video file
-            csv_path: Path to the tracking CSV file
-            suffix: Suffix to append (e.g., '_roiOccupancy_bodyCenter.csv')
-            
-        Returns:
-            Output path inside roiAnalysis folder with tracking session identifier
-        """
-        # Extract the base video filename (e.g., 'F9039_PreOFT.mp4')
+    def get_output_path(self, video_path: str, csv_path: str, suffix: str,
+                        data_source: str = "sleap") -> str:
+        """Generate output path for ROI analysis results."""
         video_base = os.path.basename(video_path)
+        video_stem = os.path.splitext(video_base)[0]
         csv_base = os.path.basename(csv_path)
         video_dir = os.path.dirname(video_path)
-        
-        # Create roiAnalysis folder name
-        analysis_folder = f"{video_base}_roiAnalysis"
-        analysis_folder_path = os.path.join(video_dir, analysis_folder)
-        
-        # Create the folder if it doesn't exist
+
+        if self.output_mode == "source" and data_source in ("mtt", "st"):
+            # Store in the data source folder (e.g. MaskTracker or SimpleTracker folder)
+            analysis_folder_path = os.path.dirname(csv_path)
+        else:
+            # New folder next to the video
+            if data_source == "sleap":
+                analysis_folder = f"{video_stem}_roiAnalysis_SLEAP"
+            else:
+                analysis_folder = f"{video_stem}_roiAnalysis"
+            analysis_folder_path = os.path.join(video_dir, analysis_folder)
+
         os.makedirs(analysis_folder_path, exist_ok=True)
-        
-        # Check if CSV has the pattern: video_name.DATETIME.predictions.analysis.csv
+
+        # Build output filename with datetime from SLEAP CSV if available
         if csv_base.startswith(video_base):
-            # Extract the datetime part between video name and '.predictions'
-            # e.g., from 'F9039_PreOFT.mp4.251106_125759.predictions.analysis.csv'
-            # extract '.251106_125759'
-            after_video = csv_base[len(video_base):]  # '.251106_125759.predictions.analysis.csv'
-            
+            after_video = csv_base[len(video_base):]
             if '.predictions' in after_video:
-                datetime_part = after_video.split('.predictions')[0]  # '.251106_125759'
-                
-                # Build output path with datetime included inside roiAnalysis folder
-                output_name = f"{video_base}{datetime_part}{suffix}"
+                datetime_part = after_video.split('.predictions')[0]
+                output_name = f"{video_stem}{datetime_part}{suffix}"
                 return os.path.join(analysis_folder_path, output_name)
-        
-        # Fallback: if pattern doesn't match, use simple replacement
-        output_name = video_base.replace('.mp4', suffix)
+
+        output_name = f"{video_stem}{suffix}"
         return os.path.join(analysis_folder_path, output_name)
     
     def clear_existing_outputs(self, config: VideoROIConfig):
         """
-        Clear all existing output files for this video including the JSON config.
-        Since we're re-analyzing, everything gets regenerated with fresh data.
-        
-        Deletes: All files in the analysis folder (CSV, PNG, tracked videos, JSON)
+        Clear existing ROI analysis output files for this video.
+        Only deletes roi-prefixed files when output goes to a shared folder (source mode).
         """
         try:
             video_base = os.path.basename(config.video_path)
+            video_stem = os.path.splitext(video_base)[0]
             video_dir = os.path.dirname(config.video_path)
-            
-            # Get roiAnalysis folder path
-            analysis_folder = f"{video_base}_roiAnalysis"
-            analysis_folder_path = os.path.join(video_dir, analysis_folder)
-            
+
+            if self.output_mode == "source" and config.data_source in ("mtt", "st"):
+                analysis_folder_path = os.path.dirname(config.csv_path)
+            else:
+                if config.data_source == "sleap":
+                    analysis_folder = f"{video_stem}_roiAnalysis_SLEAP"
+                else:
+                    analysis_folder = f"{video_stem}_roiAnalysis"
+                analysis_folder_path = os.path.join(video_dir, analysis_folder)
+
             if not os.path.exists(analysis_folder_path):
-                return  # Nothing to clear
-            
-            # Delete all files in the analysis folder
+                return
+
             files_deleted = 0
             for filename in os.listdir(analysis_folder_path):
                 file_path = os.path.join(analysis_folder_path, filename)
-                
-                # Skip if it's a directory
                 if os.path.isdir(file_path):
                     continue
-                
-                # Delete all files (CSV, PNG, MP4, JSON, etc.)
+                # In source mode, only delete roi-related files
+                if self.output_mode == "source":
+                    if not any(tag in filename for tag in ("_roi", "_roiAnalysis")):
+                        continue
                 try:
                     os.remove(file_path)
                     files_deleted += 1
                 except Exception as e:
                     self.status.emit(f"Warning: Could not delete {filename}: {str(e)}")
-            
+
             if files_deleted > 0:
                 self.status.emit(f"✓ Cleared {files_deleted} existing output file(s) from analysis folder")
-        
+
         except Exception as e:
             self.status.emit(f"Warning: Error clearing existing outputs: {str(e)}")
     
     def _load_mtt_as_sleap_format(self, config: VideoROIConfig) -> pd.DataFrame:
-        """Load MTT trajectories_detailed.csv and pivot into SLEAP-like {obj}.x / {obj}.y format."""
+        """Load MTT trajectories.csv and pivot into SLEAP-like {obj}.x / {obj}.y format."""
         df_raw = pd.read_csv(config.csv_path)
 
         obj_col_names = getattr(config, '_mtt_obj_col_names', None)
@@ -417,7 +403,7 @@ class ROIProcessor(QThread):
                 # STEP 3: Save tracked coordinates (all keypoints, filtered and interpolated)
                 if config.save_position_coords:
                     coordinates_df = self.save_tracked_coordinates(df)
-                    coordinates_path = self.get_output_path(config.video_path, config.csv_path, '_roiPositionCoordinates.csv')
+                    coordinates_path = self.get_output_path(config.video_path, config.csv_path, '_roiPositionCoordinates.csv', config.data_source)
                     coordinates_df.to_csv(coordinates_path, index=False)
                 
                 # Process occupancy
@@ -427,7 +413,7 @@ class ROIProcessor(QThread):
                 if config.save_roi_occupancy:
                     for keypoint in config.selected_keypoints:
                         keypoint_occupancy = occupancy_df[['frame', f'{keypoint}_region']].copy()
-                        occupancy_path = self.get_output_path(config.video_path, config.csv_path, f'_roiOccupancy_{keypoint}.csv')
+                        occupancy_path = self.get_output_path(config.video_path, config.csv_path, f'_roiOccupancy_{keypoint}.csv', config.data_source)
                         keypoint_occupancy.to_csv(occupancy_path, index=False)
                 
                 # Calculate and save summary statistics - combined file for all keypoints (if requested)
@@ -439,12 +425,12 @@ class ROIProcessor(QThread):
                     
                     # Combine all keypoint summaries into a single DataFrame
                     combined_summary = pd.concat(all_summaries, ignore_index=True)
-                    summary_path = self.get_output_path(config.video_path, config.csv_path, '_roiSummary.csv')
+                    summary_path = self.get_output_path(config.video_path, config.csv_path, '_roiSummary.csv', config.data_source)
                     combined_summary.to_csv(summary_path, index=False)
                 
                 # Save configuration file for reproducibility (if requested)
                 if config.save_config:
-                    config_path = self.get_output_path(config.video_path, config.csv_path, '_roiConfig.json')
+                    config_path = self.get_output_path(config.video_path, config.csv_path, '_roiConfig.json', config.data_source)
                     with open(config_path, 'w') as f:
                         json.dump(config.to_config_dict(), f, indent=2)
                     self.status.emit(f"Saved ROI configuration to: {os.path.basename(config_path)}")
@@ -1063,8 +1049,8 @@ class ROIProcessor(QThread):
                 plt.tight_layout()
                 
                 # Save plot
-                output_path = self.get_output_path(config.video_path, config.csv_path, 
-                                                   f'_roiTrackingPlot_{keypoint}.png')
+                output_path = self.get_output_path(config.video_path, config.csv_path,
+                                                   f'_roiTrackingPlot_{keypoint}.png', config.data_source)
                 self.status.emit(f"Saving plot to: {output_path}")
                 fig.savefig(output_path, dpi=150, bbox_inches='tight')
                 plt.close(fig)
@@ -1180,7 +1166,7 @@ class ROIProcessor(QThread):
         total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         # Output path with tracking session identifier
-        output_path = self.get_output_path(config.video_path, config.csv_path, '_roiTracked.mp4')
+        output_path = self.get_output_path(config.video_path, config.csv_path, '_roiTracked.mp4', config.data_source)
         
         # Video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -1337,27 +1323,6 @@ class ROIProcessor(QThread):
                             cv2.putText(frame, keypoint, (x + 10, y),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-                # Draw track/object labels LAST (on top of everything)
-                if config.show_track_labels and is_mtt:
-                    for keypoint in config.selected_keypoints:
-                        if keypoint in keypoint_positions:
-                            x, y = keypoint_positions[keypoint]
-                            label = keypoint
-                            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                            cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
-                                        (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                            cv2.putText(frame, label, (x, y - 8),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                elif config.show_track_labels and config.has_tracks and track_id is not None:
-                    if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
-                        x, y = keypoint_positions[config.selected_keypoints[0]]
-                        label = f"Track {track_id}"
-                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
-                                    (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                        cv2.putText(frame, label, (x, y - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
             out.write(frame)
             video_frame_number += 1
 
@@ -1391,7 +1356,7 @@ class ROIProcessor(QThread):
         output_height = video_height
         
         # Output path - use tracked video name since it replaces it
-        output_path = self.get_output_path(config.video_path, config.csv_path, '_roiTracked.mp4')
+        output_path = self.get_output_path(config.video_path, config.csv_path, '_roiTracked.mp4', config.data_source)
         
         # Video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -1568,26 +1533,6 @@ class ROIProcessor(QThread):
                             cv2.putText(frame, keypoint, (x + 10, y), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 
-                # Draw track/object labels LAST (on top of everything)
-                if config.show_track_labels and is_mtt:
-                    for keypoint in config.selected_keypoints:
-                        if keypoint in keypoint_positions:
-                            x, y = keypoint_positions[keypoint]
-                            label = keypoint
-                            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                            cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
-                                        (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                            cv2.putText(frame, label, (x, y - 8),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                elif config.show_track_labels and config.has_tracks and track_id is not None:
-                    if config.selected_keypoints and config.selected_keypoints[0] in keypoint_positions:
-                        x, y = keypoint_positions[config.selected_keypoints[0]]
-                        label = f"Track {track_id}"
-                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                        cv2.rectangle(frame, (x - 5, y - label_size[1] - 10),
-                                    (x + label_size[0] + 5, y - 5), (0, 0, 0), -1)
-                        cv2.putText(frame, label, (x, y - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             # ===== UPDATE CUMULATIVE STATISTICS =====
             if video_frame_number < len(occupancy_df):
@@ -1759,15 +1704,58 @@ class ROIToolGUI(QMainWindow):
     def init_ui(self):
         """Initialize the user interface."""
         
+        # Generate checkmark icon for checkboxes
+        import tempfile
+        _chk = QPixmap(14, 14)
+        _chk.fill(Qt.transparent)
+        _p = QPainter(_chk)
+        _p.setRenderHint(QPainter.Antialiasing)
+        _pen = QPen(QColor("#ffffff"), 2)
+        _pen.setCapStyle(Qt.RoundCap)
+        _pen.setJoinStyle(Qt.RoundJoin)
+        _p.setPen(_pen)
+        _p.drawLine(3, 7, 6, 10)
+        _p.drawLine(6, 10, 11, 4)
+        _p.end()
+        self._chk_path = os.path.join(tempfile.gettempdir(), "fnt_roi_check.png")
+        _chk.save(self._chk_path)
+        _chk_uri = self._chk_path.replace("\\", "/")
+
+        # Generate down-arrow icon for combobox / spinbox
+        _darr = QPixmap(10, 10)
+        _darr.fill(Qt.transparent)
+        _pa = QPainter(_darr)
+        _pa.setRenderHint(QPainter.Antialiasing)
+        _pa.setPen(Qt.NoPen)
+        _pa.setBrush(QColor("#ffffff"))
+        _pa.drawPolygon(QPolygon([QPoint(1, 3), QPoint(9, 3), QPoint(5, 8)]))
+        _pa.end()
+        self._darr_path = os.path.join(tempfile.gettempdir(), "fnt_roi_downarrow.png")
+        _darr.save(self._darr_path)
+        _darr_uri = self._darr_path.replace("\\", "/")
+
+        # Generate up-arrow icon for spinbox
+        _uarr = QPixmap(10, 10)
+        _uarr.fill(Qt.transparent)
+        _pa2 = QPainter(_uarr)
+        _pa2.setRenderHint(QPainter.Antialiasing)
+        _pa2.setPen(Qt.NoPen)
+        _pa2.setBrush(QColor("#ffffff"))
+        _pa2.drawPolygon(QPolygon([QPoint(1, 7), QPoint(9, 7), QPoint(5, 2)]))
+        _pa2.end()
+        self._uarr_path = os.path.join(tempfile.gettempdir(), "fnt_roi_uparrow.png")
+        _uarr.save(self._uarr_path)
+        _uarr_uri = self._uarr_path.replace("\\", "/")
+
         # Apply dark theme
-        self.setStyleSheet("""
+        QApplication.instance().setStyleSheet("""
             QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
             QWidget { background-color: #1e1e1e; color: #d4d4d4; }
             QGroupBox {
                 font-weight: bold; font-size: 11px;
                 border: 1px solid #333333;
-                border-radius: 6px; margin-top: 8px; padding-top: 8px;
-                padding-bottom: 4px; color: #e0e0e0;
+                border-radius: 6px; margin-top: 6px; padding-top: 6px;
+                padding-bottom: 2px; color: #e0e0e0;
                 background-color: #252526;
             }
             QGroupBox::title {
@@ -1791,10 +1779,16 @@ class ROIToolGUI(QMainWindow):
             QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #0078d4; }
             QSpinBox::up-button, QSpinBox::down-button,
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                background-color: #444444; border: none; width: 18px;
+                background-color: #0078d4; border: none; width: 18px;
             }
-            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover { background-color: #555555; }
-            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #555555; }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover { background-color: #1a8ae8; }
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #1a8ae8; }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: url(%s); width: 10px; height: 10px;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: url(%s); width: 10px; height: 10px;
+            }
             QComboBox {
                 background-color: #2d2d30; color: #d4d4d4;
                 border: 1px solid #3f3f46; border-radius: 4px;
@@ -1803,7 +1797,10 @@ class ROIToolGUI(QMainWindow):
             QComboBox:focus { border: 1px solid #0078d4; }
             QComboBox::drop-down {
                 border: none; width: 20px;
-                background-color: #333333; border-radius: 0 4px 4px 0;
+                background-color: #0078d4; border-radius: 0 4px 4px 0;
+            }
+            QComboBox::down-arrow {
+                image: url(%s); width: 10px; height: 10px;
             }
             QComboBox QAbstractItemView {
                 background-color: #2d2d30; color: #d4d4d4;
@@ -1839,14 +1836,13 @@ class ROIToolGUI(QMainWindow):
                 background-color: #252526; color: #d4d4d4;
                 border: 1px solid #333333; padding: 4px;
             }
-            QCheckBox { color: #d4d4d4; spacing: 8px; }
+            QCheckBox { color: #d4d4d4; spacing: 6px; font-size: 11px; }
             QCheckBox::indicator {
-                width: 16px; height: 16px; border: 2px solid #555; border-radius: 3px;
+                width: 14px; height: 14px; border: 1px solid #555; border-radius: 3px;
                 background-color: #2d2d30;
             }
-            QCheckBox::indicator:checked {
-                background-color: #0078d4; border-color: #0078d4;
-                image: none;
+            QCheckBox::indicator:hover {
+                border-color: #2979ff;
             }
             QProgressBar {
                 border: 1px solid #3f3f46; border-radius: 4px;
@@ -1877,21 +1873,40 @@ class ROIToolGUI(QMainWindow):
                 border: 1px solid #3f3f46; border-radius: 4px;
                 padding: 4px 8px; font-size: 11px;
             }
-        """)
-        
-        # Main layout
+            QCheckBox::indicator:checked {
+                border-color: #2979ff;
+                background-color: #2979ff;
+                image: url(%s);
+            }
+            QSplitter::handle:horizontal {
+                background-color: #333333; width: 3px;
+            }
+            QSplitter::handle:horizontal:hover {
+                background-color: #0078d4;
+            }
+        """ % (_uarr_uri, _darr_uri, _darr_uri, _chk_uri))
+
+        # Main layout with resizable splitter
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left_panel = self.create_left_panel()
+        left_panel.setMinimumWidth(380)
+        splitter.addWidget(left_panel)
+
+        right_panel = self.create_right_panel()
+        splitter.addWidget(right_panel)
+
+        splitter.setSizes([420, 780])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(splitter)
         central_widget.setLayout(main_layout)
-        
-        # Left panel (controls)
-        left_panel = self.create_left_panel()
-        main_layout.addWidget(left_panel, stretch=2)
-        
-        # Right panel (preview)
-        right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel, stretch=3)
     
     def create_left_panel(self):
         """Create left control panel."""
@@ -1911,9 +1926,11 @@ class ROIToolGUI(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout()
+        scroll_layout.setSpacing(4)
+        scroll_layout.setContentsMargins(2, 2, 2, 2)
         scroll_widget.setLayout(scroll_layout)
         
-        # Section 1: Video + CSV Selection
+        # Section 1: Load Tracked Videos
         scroll_layout.addWidget(self.create_video_selection_section())
         
         # Section 2: Set Tracking Area
@@ -1939,8 +1956,10 @@ class ROIToolGUI(QMainWindow):
     
     def create_video_selection_section(self):
         """Create video selection section."""
-        group = QGroupBox("1. Video + CSV Selection")
+        group = QGroupBox("1. Load Tracked Videos")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
         # Buttons
         btn_layout = QHBoxLayout()
@@ -1961,6 +1980,7 @@ class ROIToolGUI(QMainWindow):
         list_layout = QHBoxLayout()
         
         self.video_list = QListWidget()
+        self.video_list.setMinimumHeight(120)
         self.video_list.currentRowChanged.connect(self.on_video_selected)
         list_layout.addWidget(self.video_list)
         
@@ -1994,12 +2014,14 @@ class ROIToolGUI(QMainWindow):
         """Create tracking area section."""
         group = QGroupBox("2. Set Tracking Area")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
         label = QLabel("Define arena boundary (optional)")
         label.setStyleSheet("color: #999999; font-style: italic;")
         layout.addWidget(label)
         
-        self.btn_set_tracking_area = QPushButton("✏️ Draw Tracking Area")
+        self.btn_set_tracking_area = QPushButton("Draw Tracking Area")
         self.btn_set_tracking_area.clicked.connect(self.start_tracking_area_drawing)
         self.btn_set_tracking_area.setEnabled(False)
         layout.addWidget(self.btn_set_tracking_area)
@@ -2026,24 +2048,21 @@ class ROIToolGUI(QMainWindow):
         """Create ROI drawing section."""
         group = QGroupBox("3. Draw ROIs")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
-        self.btn_oft = QPushButton("🔲 Open Field Test Layout")
-        self.btn_oft.clicked.connect(self.start_oft_drawing)
-        self.btn_oft.setEnabled(False)
-        layout.addWidget(self.btn_oft)
-        
-        self.btn_ldb = QPushButton("◐ Light-Dark Box Layout")
-        self.btn_ldb.clicked.connect(self.start_ldb_drawing)
-        self.btn_ldb.setEnabled(False)
-        layout.addWidget(self.btn_ldb)
-        
-        self.btn_custom = QPushButton("✏️ Custom ROI")
+        self.btn_custom = QPushButton("Custom ROI")
         self.btn_custom.clicked.connect(self.start_custom_roi_drawing)
         self.btn_custom.setEnabled(False)
         layout.addWidget(self.btn_custom)
-        
+
+        self.btn_roi_preset = QPushButton("Add ROI Preset...")
+        self.btn_roi_preset.clicked.connect(self._show_roi_preset_dialog)
+        self.btn_roi_preset.setEnabled(False)
+        layout.addWidget(self.btn_roi_preset)
+
         # Scale bar button
-        self.btn_scale_bar = QPushButton("📏 Set Scale Bar (optional)")
+        self.btn_scale_bar = QPushButton("Set Scale Bar (optional)")
         self.btn_scale_bar.clicked.connect(self.start_scale_bar_setting)
         self.btn_scale_bar.setEnabled(False)
         layout.addWidget(self.btn_scale_bar)
@@ -2064,8 +2083,8 @@ class ROIToolGUI(QMainWindow):
         self.roi_table.setColumnCount(1)
         self.roi_table.setHorizontalHeaderLabels(['ROI Name'])
         self.roi_table.horizontalHeader().setStretchLastSection(True)
-        self.roi_table.setMinimumHeight(200)
-        self.roi_table.setMaximumHeight(300)
+        self.roi_table.setMinimumHeight(100)
+        self.roi_table.setMaximumHeight(180)
         self.roi_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.roi_table.itemChanged.connect(self.on_roi_renamed)
         self.roi_table.itemSelectionChanged.connect(self.on_roi_selection_changed)
@@ -2113,6 +2132,8 @@ class ROIToolGUI(QMainWindow):
         """Create keypoint selection section."""
         group = QGroupBox("4. Select Keypoints for Analysis")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
         label = QLabel("Select which keypoints to track:")
         layout.addWidget(label)
@@ -2133,6 +2154,8 @@ class ROIToolGUI(QMainWindow):
         """Create analysis options section."""
         group = QGroupBox("5. Analysis Options")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
         # Interpolation checkbox
         self.chk_interpolate = QCheckBox("Interpolate missing keypoints")
@@ -2146,6 +2169,8 @@ class ROIToolGUI(QMainWindow):
         """Create processing section."""
         group = QGroupBox("6. Export and Processing")
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 10, 6, 4)
         
         # CSV export checkboxes
         self.chk_save_position_coords = QCheckBox("Save Position Coordinates CSV")
@@ -2202,7 +2227,7 @@ class ROIToolGUI(QMainWindow):
         video_options_layout.addWidget(self.chk_show_all_keypoints)
         
         self.chk_show_keypoint_labels = QCheckBox("Show keypoint labels")
-        self.chk_show_keypoint_labels.setChecked(False)
+        self.chk_show_keypoint_labels.setChecked(True)
         video_options_layout.addWidget(self.chk_show_keypoint_labels)
         
         self.chk_show_edges = QCheckBox("Draw skeleton edges between keypoints")
@@ -2218,15 +2243,10 @@ class ROIToolGUI(QMainWindow):
         track_label.setStyleSheet("color: #999999; font-style: italic; font-size: 10px;")
         track_options_layout.addWidget(track_label)
         
-        self.chk_show_track_labels = QCheckBox("Show track labels")
-        self.chk_show_track_labels.setChecked(False)
-        self.chk_show_track_labels.setToolTip("Show track ID numbers on video (requires track column in CSV)")
-        track_options_layout.addWidget(self.chk_show_track_labels)
-        
         # Trail length option
         trail_layout = QHBoxLayout()
         self.chk_show_track_trail = QCheckBox("Show track trail:")
-        self.chk_show_track_trail.setChecked(False)
+        self.chk_show_track_trail.setChecked(True)
         self.chk_show_track_trail.setToolTip("Draw trail showing path of tracked keypoints")
         trail_layout.addWidget(self.chk_show_track_trail)
         
@@ -2246,7 +2266,7 @@ class ROIToolGUI(QMainWindow):
         video_options_layout.addWidget(self.track_options_widget)
         
         self.chk_data_view = QCheckBox("Data view (video + live statistics panel)")
-        self.chk_data_view.setChecked(False)
+        self.chk_data_view.setChecked(True)
         video_options_layout.addWidget(self.chk_data_view)
         
         self.video_options_widget.setLayout(video_options_layout)
@@ -2258,10 +2278,25 @@ class ROIToolGUI(QMainWindow):
         layout.addWidget(self.chk_overwrite)
         
         # Add to Queue button
-        self.btn_add_to_queue = QPushButton("➕ Add Video to Queue")
+        self.btn_add_to_queue = QPushButton("Add Video to Queue")
         self.btn_add_to_queue.clicked.connect(self.add_current_video_to_queue)
         self.btn_add_to_queue.setEnabled(False)
         layout.addWidget(self.btn_add_to_queue)
+
+        # Apply config to all videos
+        self.btn_apply_all = QPushButton("Apply Configuration to All Videos")
+        self.btn_apply_all.setStyleSheet(
+            "QPushButton { background-color: #37474f; }"
+            "QPushButton:hover { background-color: #455a64; }"
+            "QPushButton:disabled { background-color: #333333; color: #666666; }"
+        )
+        self.btn_apply_all.setToolTip(
+            "Copy the current video's tracking area, ROIs, keypoints, and\n"
+            "export settings to all other loaded videos."
+        )
+        self.btn_apply_all.clicked.connect(self._apply_config_to_all)
+        self.btn_apply_all.setEnabled(False)
+        layout.addWidget(self.btn_apply_all)
         
         # Processing queue list
         queue_label = QLabel("Processing Queue:")
@@ -2275,12 +2310,17 @@ class ROIToolGUI(QMainWindow):
         
         # Processing buttons
         btn_layout = QHBoxLayout()
-        self.btn_process = QPushButton("▶️ Start Batch Processing")
+        self.btn_process = QPushButton("Start Batch Processing")
         self.btn_process.clicked.connect(self.start_processing)
         self.btn_process.setEnabled(False)
         btn_layout.addWidget(self.btn_process)
         
-        self.btn_cancel = QPushButton("⏹️ Cancel")
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setStyleSheet(
+            "QPushButton { background-color: #c62828; }"
+            "QPushButton:hover { background-color: #e53935; }"
+            "QPushButton:disabled { background-color: #333333; color: #666666; }"
+        )
         self.btn_cancel.clicked.connect(self.cancel_processing)
         self.btn_cancel.setEnabled(False)
         btn_layout.addWidget(self.btn_cancel)
@@ -2315,12 +2355,26 @@ class ROIToolGUI(QMainWindow):
         self.preview_label.mousePressEvent = self.on_preview_click
         layout.addWidget(self.preview_label)
         
+        # Frame scrubber
+        scrub_row = QHBoxLayout()
+        scrub_row.setSpacing(6)
+        self.slider_frame = QSlider(Qt.Horizontal)
+        self.slider_frame.setMinimum(0)
+        self.slider_frame.setMaximum(0)
+        self.slider_frame.valueChanged.connect(self._on_frame_scrub)
+        scrub_row.addWidget(self.slider_frame, 1)
+        self.lbl_frame_num = QLabel("0 / 0")
+        self.lbl_frame_num.setStyleSheet("color: #cccccc; font-size: 10px;")
+        self.lbl_frame_num.setMinimumWidth(80)
+        scrub_row.addWidget(self.lbl_frame_num)
+        layout.addLayout(scrub_row)
+
         # Instructions
         self.lbl_instructions = QLabel("Select a video to begin")
         self.lbl_instructions.setAlignment(Qt.AlignCenter)
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
         layout.addWidget(self.lbl_instructions)
-        
+
         return panel
     
     # === Video Selection Methods ===
@@ -2340,11 +2394,14 @@ class ROIToolGUI(QMainWindow):
         if csv_files:
             sources["sleap"] = str(csv_files[0])
 
-        # Check for MTT trajectories_detailed.csv
+        # Check for MTT trajectories.csv (new consolidated format, or legacy trajectories_detailed.csv)
         mtt_dir = folder / f"{stem}_MaskTracker"
-        mtt_csv = mtt_dir / "trajectories_detailed.csv"
+        mtt_csv = mtt_dir / "trajectories.csv"
+        mtt_csv_legacy = mtt_dir / "trajectories_detailed.csv"
         if mtt_csv.exists():
             sources["mtt"] = str(mtt_csv)
+        elif mtt_csv_legacy.exists():
+            sources["mtt"] = str(mtt_csv_legacy)
 
         # Check for SimpleTracker _positionCoordinates.csv (both old and new folder names)
         for suffix in ("_SimpleTracker", "_FNT_SimpleTracker_analysis"):
@@ -2390,6 +2447,61 @@ class ROIToolGUI(QMainWindow):
             return None
         return keys[items.index(choice)]
 
+    def _add_videos_batch(self, video_paths):
+        """Add multiple video files, prompting once for data source if ambiguous."""
+        entries = []
+        for vp in video_paths:
+            sources = self._detect_data_sources(Path(vp))
+            if sources:
+                entries.append((str(vp), sources))
+
+        if not entries:
+            return 0
+
+        multi = [e for e in entries if len(e[1]) > 1]
+        batch_choice = None
+        if len(multi) > 1:
+            common_keys = None
+            for _, sources in multi:
+                ks = set(sources.keys())
+                common_keys = ks if common_keys is None else common_keys & ks
+            if common_keys and len(common_keys) > 1:
+                names = {"sleap": "SLEAP", "mtt": "Mask Tracker", "st": "Simple Tracker"}
+                items = []
+                keys = []
+                for k in ("sleap", "mtt", "st"):
+                    if k in common_keys:
+                        items.append(names[k])
+                        keys.append(k)
+                choice, ok = QInputDialog.getItem(
+                    self,
+                    "Choose Data Source for All",
+                    f"{len(multi)} videos have multiple data sources.\n"
+                    "Use the same source for all of them?",
+                    items + ["Choose individually..."], 0, False,
+                )
+                if ok and choice != "Choose individually...":
+                    batch_choice = keys[items.index(choice)]
+
+        added = 0
+        for video_path, sources in entries:
+            if len(sources) == 1:
+                ds = next(iter(sources))
+            elif batch_choice and batch_choice in sources:
+                ds = batch_choice
+            else:
+                ds = self._prompt_data_source(os.path.basename(video_path), sources)
+                if not ds:
+                    continue
+            self._add_video_config(video_path, sources[ds], ds)
+            added += 1
+
+        if added > 0:
+            self.video_list.setCurrentRow(0)
+            self.btn_prev.setEnabled(True)
+            self.btn_next.setEnabled(True)
+        return added
+
     def add_folder(self):
         """Add folder with videos and CSV files (SLEAP and/or MTT)."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Videos and CSVs")
@@ -2404,26 +2516,8 @@ class ROIToolGUI(QMainWindow):
             QMessageBox.warning(self, "No Videos", "No video files found in selected folder")
             return
 
-        added = 0
-        for video_path in video_files:
-            sources = self._detect_data_sources(video_path)
-            if not sources:
-                continue
-
-            if len(sources) == 1:
-                ds = next(iter(sources))
-                self._add_video_config(str(video_path), sources[ds], ds)
-                added += 1
-            else:
-                ds = self._prompt_data_source(video_path.name, sources)
-                if ds:
-                    self._add_video_config(str(video_path), sources[ds], ds)
-                    added += 1
-
+        added = self._add_videos_batch([str(v) for v in video_files])
         if added > 0:
-            self.video_list.setCurrentRow(0)
-            self.btn_prev.setEnabled(True)
-            self.btn_next.setEnabled(True)
             QMessageBox.information(self, "Videos Added", f"Added {added} video(s) with matching tracking data")
         else:
             QMessageBox.warning(self, "No Matches", "No videos with matching SLEAP or Mask Tracker data found")
@@ -2440,34 +2534,9 @@ class ROIToolGUI(QMainWindow):
         if not video_files:
             return
 
-        added = 0
-        skipped = 0
-
-        for video_file in video_files:
-            video_path = Path(video_file)
-            sources = self._detect_data_sources(video_path)
-
-            if not sources:
-                skipped += 1
-                continue
-
-            if len(sources) == 1:
-                ds = next(iter(sources))
-                self._add_video_config(str(video_path), sources[ds], ds)
-                added += 1
-            else:
-                ds = self._prompt_data_source(video_path.name, sources)
-                if ds:
-                    self._add_video_config(str(video_path), sources[ds], ds)
-                    added += 1
-                else:
-                    skipped += 1
-
+        added = self._add_videos_batch(video_files)
+        skipped = len(video_files) - added
         if added > 0:
-            self.video_list.setCurrentRow(0)
-            self.btn_prev.setEnabled(True)
-            self.btn_next.setEnabled(True)
-
             message = f"Added {added} video(s) with matching tracking data"
             if skipped > 0:
                 message += f"\nSkipped {skipped} video(s) without matching data"
@@ -2518,14 +2587,27 @@ class ROIToolGUI(QMainWindow):
             if not cap.isOpened():
                 QMessageBox.critical(self, "Error", "Failed to open video")
                 return
-            
+
             ret, frame = cap.read()
             if ret:
                 config.first_frame = frame.copy()
                 config.height, config.width = frame.shape[:2]
                 config.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
+
             cap.release()
+
+        # Set up frame scrubber
+        total = config.total_frames or 0
+        self.slider_frame.blockSignals(True)
+        self.slider_frame.setMaximum(max(0, total - 1))
+        self.slider_frame.setValue(0)
+        self.slider_frame.blockSignals(False)
+        self.lbl_frame_num.setText(f"1 / {total}")
+
+        # Open a persistent capture for scrubbing
+        if self.preview_cap is not None:
+            self.preview_cap.release()
+        self.preview_cap = cv2.VideoCapture(config.video_path)
         
         # Try to load existing config file from roiAnalysis folder
         self.try_load_config(config)
@@ -2545,7 +2627,19 @@ class ROIToolGUI(QMainWindow):
         self.btn_skip_tracking_area.setEnabled(True)
         
         self.update_config_status()
-    
+
+    def _on_frame_scrub(self, value):
+        if self.preview_cap is None or not self.preview_cap.isOpened():
+            return
+        config = self.video_configs[self.current_config_idx]
+        self.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, value)
+        ret, frame = self.preview_cap.read()
+        if ret:
+            config.first_frame = frame.copy()
+            total = config.total_frames or 0
+            self.lbl_frame_num.setText(f"{value + 1} / {total}")
+            self.redraw_preview()
+
     def restore_video_ui_state(self, config: VideoROIConfig):
         """Restore UI state for the selected video."""
         # Restore tracking area status
@@ -2556,8 +2650,7 @@ class ROIToolGUI(QMainWindow):
             self.btn_clear_tracking_area.setEnabled(True)
         else:
             self.lbl_tracking_status.setText("")
-            self.btn_oft.setEnabled(False)
-            self.btn_ldb.setEnabled(False)
+            self.btn_roi_preset.setEnabled(False)
             self.btn_custom.setEnabled(False)
             self.btn_scale_bar.setEnabled(False)
             self.btn_skip_roi.setEnabled(False)
@@ -2581,22 +2674,6 @@ class ROIToolGUI(QMainWindow):
         
         # Restore analysis and export settings (sections 5 & 6)
         self.load_ui_settings_from_config(config)
-    
-    def update_keypoint_checkboxes(self, config: VideoROIConfig):
-        """Update keypoint checkboxes to reflect current selection."""
-        # Find all checkboxes in the keypoint section
-        keypoint_group = None
-        for widget in self.findChildren(QGroupBox):
-            if widget.windowTitle() == "4. Select Keypoints for Analysis":
-                keypoint_group = widget
-                break
-        
-        if keypoint_group:
-            # Update checkbox states
-            for checkbox in keypoint_group.findChildren(QCheckBox):
-                keypoint_name = checkbox.text()
-                if keypoint_name in config.available_keypoints:
-                    checkbox.setChecked(keypoint_name in config.selected_keypoints)
     
     def load_keypoints_from_csv(self, config: VideoROIConfig):
         """Extract available keypoints from CSV columns."""
@@ -2635,7 +2712,7 @@ class ROIToolGUI(QMainWindow):
             QMessageBox.warning(self, "CSV Error", f"Could not read CSV: {str(e)}")
 
     def _load_keypoints_from_mtt_csv(self, config: VideoROIConfig):
-        """Extract available object names from MTT trajectories_detailed.csv."""
+        """Extract available object names from MTT trajectories.csv."""
         try:
             df = pd.read_csv(config.csv_path)
 
@@ -2644,7 +2721,6 @@ class ROIToolGUI(QMainWindow):
                                     "MTT CSV does not have expected columns (object_id, x, y)")
                 return
 
-            # Try to get object names from the pivot-format trajectories.csv (has proper names)
             obj_col_names = self._get_mtt_object_names(config.csv_path, df)
 
             config.has_tracks = len(obj_col_names) > 1
@@ -2691,41 +2767,50 @@ class ROIToolGUI(QMainWindow):
     def try_load_config(self, config: VideoROIConfig):
         """Try to load existing ROI configuration from roiAnalysis folder."""
         try:
-            # Build expected config file path
             video_base = os.path.basename(config.video_path)
-            csv_base = os.path.basename(config.csv_path)
+            video_stem = os.path.splitext(video_base)[0]
             video_dir = os.path.dirname(config.video_path)
-            
-            # Create roiAnalysis folder path
-            analysis_folder = f"{video_base}_roiAnalysis"
-            analysis_folder_path = os.path.join(video_dir, analysis_folder)
-            
-            # Check if folder exists
-            if not os.path.exists(analysis_folder_path):
-                return  # No existing config
-            
-            # Look for ANY config file ending with _roiConfig.json
-            # This allows loading configs even if the CSV timestamp changed after re-tracking
-            config_path = None
-            for filename in os.listdir(analysis_folder_path):
-                if filename.endswith('_roiConfig.json'):
-                    config_path = os.path.join(analysis_folder_path, filename)
-                    break  # Use the first config file found
-            
-            if config_path and os.path.exists(config_path):
-                # Load config
-                with open(config_path, 'r') as f:
-                    config_dict = json.load(f)
-                
-                # Apply config to VideoROIConfig
-                config.from_config_dict(config_dict)
-                
-                # Show message to user
-                self.lbl_instructions.setText(f"✓ Loaded existing ROI configuration from previous analysis")
-                self.lbl_instructions.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: bold; margin: 10px;")
-                        
+
+            # Search candidate folders (new naming, SLEAP variant, old naming, source folder)
+            candidates = [
+                os.path.join(video_dir, f"{video_stem}_roiAnalysis"),
+                os.path.join(video_dir, f"{video_stem}_roiAnalysis_SLEAP"),
+                os.path.join(video_dir, f"{video_base}_roiAnalysis"),
+                os.path.dirname(config.csv_path),
+            ]
+
+            for folder in candidates:
+                if not os.path.isdir(folder):
+                    continue
+                for filename in os.listdir(folder):
+                    if filename.endswith('_roiConfig.json'):
+                        config_path = os.path.join(folder, filename)
+                        reply = QMessageBox.question(
+                            self, "Load Previous Configuration",
+                            f"A previous ROI configuration was found for:\n"
+                            f"{video_base}\n\n"
+                            f"Load the previous tracking area, ROIs, and scale bar settings?",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                        if reply != QMessageBox.Yes:
+                            return
+                        with open(config_path, 'r') as f:
+                            config_dict = json.load(f)
+                        # Restore only spatial settings (tracking area, ROIs, scale bar, keypoints)
+                        config.tracking_area = config_dict.get('tracking_area', [])
+                        config.tracking_area_set = config_dict.get('tracking_area_set', False)
+                        config.rois = [(n, p) for n, p in config_dict.get('rois', [])]
+                        config.scale_bar_set = config_dict.get('scale_bar_set', False)
+                        config.scale_bar_pixels = config_dict.get('scale_bar_pixels', None)
+                        config.scale_bar_cm = config_dict.get('scale_bar_cm', None)
+                        config.pixels_per_cm = config_dict.get('pixels_per_cm', None)
+                        saved_kps = config_dict.get('selected_keypoints', [])
+                        if saved_kps:
+                            config.selected_keypoints = saved_kps
+                        self.lbl_instructions.setText("✓ Loaded previous ROI configuration")
+                        self.lbl_instructions.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: bold; margin: 10px;")
+                        return
+
         except Exception as e:
-            # Silently fail - don't bother user if config can't be loaded
             print(f"Could not load config: {str(e)}")
     
     def update_keypoint_checkboxes(self, config: VideoROIConfig):
@@ -2733,15 +2818,24 @@ class ROIToolGUI(QMainWindow):
         # Clear existing
         for i in reversed(range(self.keypoint_layout.count())):
             self.keypoint_layout.itemAt(i).widget().setParent(None)
-        
+
         self.keypoint_checkboxes.clear()
-        
-        # Create checkboxes
+
+        # Auto-select if only one keypoint available and none selected yet
+        if len(config.available_keypoints) == 1 and not config.selected_keypoints:
+            config.selected_keypoints = list(config.available_keypoints)
+
+        # Create checkboxes (connect signals after all are built to avoid
+        # on_keypoint_selection_changed reading a partially-built list)
         for keypoint in config.available_keypoints:
             chk = QCheckBox(keypoint)
-            chk.stateChanged.connect(self.on_keypoint_selection_changed)
+            if keypoint in config.selected_keypoints:
+                chk.setChecked(True)
             self.keypoint_layout.addWidget(chk)
             self.keypoint_checkboxes.append(chk)
+
+        for chk in self.keypoint_checkboxes:
+            chk.stateChanged.connect(self.on_keypoint_selection_changed)
     
     # === Tracking Area Methods ===
     
@@ -2769,19 +2863,38 @@ class ROIToolGUI(QMainWindow):
             self.lbl_tracking_status.setText("✓ Tracking area skipped")
             self.lbl_tracking_status.setStyleSheet("color: #4caf50;")
             self.enable_roi_buttons()
+            self.update_config_status()
     
     # === ROI Drawing Methods ===
     
+    def _show_roi_preset_dialog(self):
+        items = ["Open Field Test (OFT)", "Light-Dark Box (LDB)"]
+        choice, ok = QInputDialog.getItem(
+            self, "Add ROI Preset",
+            "Select a preset layout to draw:",
+            items, 0, False,
+        )
+        if not ok:
+            return
+        if choice.startswith("Open Field"):
+            self.start_oft_drawing()
+        elif choice.startswith("Light-Dark"):
+            self.start_ldb_drawing()
+
     def start_oft_drawing(self):
         """Start OFT layout drawing."""
         self.drawing_mode = 'oft'
         self.current_polygon = []
-        self.last_roi_layout = 'oft'  # Track for scale bar default
-        self.lbl_instructions.setText("OFT STEP 1 of 2: Click 4 corners of the Open Field Test floor. Press ENTER when done.")
+        self.last_roi_layout = 'oft'
+        QMessageBox.information(
+            self, "OFT Step 1 of 2",
+            "Click the 4 corners of the Open Field Test floor.\n\n"
+            "Press ENTER when done.")
+        self.lbl_instructions.setText("OFT STEP 1 of 2: Click 4 corners. Press ENTER when done.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
-        
+
         # Disable other ROI buttons while drawing
-        self.btn_ldb.setEnabled(False)
+        self.btn_roi_preset.setEnabled(False)
         self.btn_custom.setEnabled(False)
         self.btn_scale_bar.setEnabled(False)
     
@@ -2789,12 +2902,16 @@ class ROIToolGUI(QMainWindow):
         """Start Light-Dark Box drawing."""
         self.drawing_mode = 'ldb_light'
         self.current_polygon = []
-        self.last_roi_layout = 'ldb'  # Track for scale bar default
-        self.lbl_instructions.setText("LDB STEP 1 of 2: Draw the LIGHT box area (polygon). Press ENTER when done.")
+        self.last_roi_layout = 'ldb'
+        QMessageBox.information(
+            self, "LDB Step 1 of 2",
+            "Draw the LIGHT box area (polygon).\n\n"
+            "Press ENTER when done.")
+        self.lbl_instructions.setText("LDB STEP 1 of 2: Draw LIGHT box. Press ENTER when done.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
-        
+
         # Disable other ROI buttons while drawing
-        self.btn_oft.setEnabled(False)
+        self.btn_roi_preset.setEnabled(False)
         self.btn_custom.setEnabled(False)
         self.btn_scale_bar.setEnabled(False)
     
@@ -2868,10 +2985,11 @@ class ROIToolGUI(QMainWindow):
             # Re-enable ROI buttons after completing OFT/LDB workflow with scale bar
             self.enable_roi_buttons()
             self.enable_keypoint_selection()
-        
+
         self.drawing_mode = None
         self.scale_bar_points = []
         self.redraw_preview()
+        self.update_config_status()
     
     def clear_rois(self):
         """Clear all ROIs for current video."""
@@ -2953,6 +3071,7 @@ class ROIToolGUI(QMainWindow):
             self.lbl_instructions.setText("Tracking area saved. Continue to draw ROIs.")
             self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             self.redraw_preview()
+            self.update_config_status()
             return
             
         elif self.drawing_mode == 'oft':
@@ -2971,9 +3090,14 @@ class ROIToolGUI(QMainWindow):
             self.drawing_mode = 'scale_bar'
             self.current_polygon = []
             self.scale_bar_points = []
-            self.lbl_instructions.setText("OFT STEP 2 of 2: Click two points to set scale bar, then enter the known distance in cm.")
-            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             self.redraw_preview()
+            QMessageBox.information(
+                self, "OFT Step 2 of 2",
+                "Now set the scale bar.\n\n"
+                "Click two points of a known distance, then enter\n"
+                "the real-world distance in cm.")
+            self.lbl_instructions.setText("OFT STEP 2 of 2: Click two points for scale bar.")
+            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             return
             
         elif self.drawing_mode == 'ldb_light':
@@ -2984,9 +3108,14 @@ class ROIToolGUI(QMainWindow):
             self.drawing_mode = 'scale_bar'
             self.current_polygon = []
             self.scale_bar_points = []
-            self.lbl_instructions.setText("LDB STEP 2 of 2: Click two points to set scale bar, then enter the known distance in cm.")
-            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             self.redraw_preview()
+            QMessageBox.information(
+                self, "LDB Step 2 of 2",
+                "Now set the scale bar.\n\n"
+                "Click two points of a known distance, then enter\n"
+                "the real-world distance in cm.")
+            self.lbl_instructions.setText("LDB STEP 2 of 2: Click two points for scale bar.")
+            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
             return
             
         elif self.drawing_mode == 'custom':
@@ -3002,6 +3131,7 @@ class ROIToolGUI(QMainWindow):
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
         self.enable_keypoint_selection()
         self.redraw_preview()
+        self.update_config_status()
     
     def cancel_current_drawing(self):
         """Cancel current drawing."""
@@ -3179,22 +3309,25 @@ class ROIToolGUI(QMainWindow):
         
         config.configured = has_tracking_area and has_keypoints
         
+        self.btn_apply_all.setEnabled(config.configured and len(self.video_configs) > 1)
+
         if config.configured:
             video_name = os.path.basename(config.video_path)
             self.lbl_config_status.setText(f"✓ Video {video_name} is ready for processing")
             self.lbl_config_status.setStyleSheet("color: #4caf50; font-weight: bold;")
-            
+
             # Update list item
             item = self.video_list.item(self.current_config_idx)
             if item:
-                item.setText(f"✓ {video_name}")
-            
+                tag = {"sleap": "[SLEAP]", "mtt": "[MTT]", "st": "[ST]"}.get(config.data_source, "[?]")
+                item.setText(f"✓ {tag} {os.path.basename(config.video_path)}")
+
             # Enable "Add to Queue" button if video is configured and not already in queue
             if self.current_config_idx not in self.processing_queue:
                 self.btn_add_to_queue.setEnabled(True)
             else:
                 self.btn_add_to_queue.setEnabled(False)
-            
+
             # Enable processing if all configured OR if queue has videos
             all_configured = all(c.configured for c in self.video_configs)
             self.btn_process.setEnabled(all_configured or len(self.processing_queue) > 0)
@@ -3205,8 +3338,7 @@ class ROIToolGUI(QMainWindow):
     
     def enable_roi_buttons(self):
         """Enable ROI drawing buttons."""
-        self.btn_oft.setEnabled(True)
-        self.btn_ldb.setEnabled(True)
+        self.btn_roi_preset.setEnabled(True)
         self.btn_custom.setEnabled(True)
         self.btn_scale_bar.setEnabled(True)
         self.btn_skip_roi.setEnabled(True)
@@ -3305,7 +3437,7 @@ class ROIToolGUI(QMainWindow):
         config.show_all_keypoints = self.chk_show_all_keypoints.isChecked()
         config.show_edges = self.chk_show_edges.isChecked()
         config.show_keypoint_labels = self.chk_show_keypoint_labels.isChecked()
-        config.show_track_labels = self.chk_show_track_labels.isChecked() if hasattr(self, 'chk_show_track_labels') else False
+        config.show_track_labels = False
         config.show_track_trail = self.chk_show_track_trail.isChecked() if hasattr(self, 'chk_show_track_trail') else False
         config.track_trail_length = self.spin_trail_length.value() if hasattr(self, 'spin_trail_length') else 30
         config.save_data_view = self.chk_data_view.isChecked()
@@ -3328,8 +3460,6 @@ class ROIToolGUI(QMainWindow):
         self.chk_show_all_keypoints.setChecked(config.show_all_keypoints)
         self.chk_show_edges.setChecked(config.show_edges)
         self.chk_show_keypoint_labels.setChecked(config.show_keypoint_labels)
-        if hasattr(self, 'chk_show_track_labels'):
-            self.chk_show_track_labels.setChecked(config.show_track_labels)
         if hasattr(self, 'chk_show_track_trail'):
             self.chk_show_track_trail.setChecked(config.show_track_trail)
         if hasattr(self, 'spin_trail_length'):
@@ -3337,6 +3467,55 @@ class ROIToolGUI(QMainWindow):
         self.chk_data_view.setChecked(config.save_data_view)
         self.chk_overwrite.setChecked(config.overwrite_files)
     
+    def _apply_config_to_all(self):
+        if not self.video_configs:
+            return
+        src = self.video_configs[self.current_config_idx]
+        self.save_ui_settings_to_config(src)
+        applied = 0
+        for i, dst in enumerate(self.video_configs):
+            if i == self.current_config_idx:
+                continue
+            dst.tracking_area = list(src.tracking_area)
+            dst.tracking_area_set = src.tracking_area_set
+            dst.rois = list(src.rois)
+            dst.selected_keypoints = list(src.selected_keypoints)
+            dst.scale_bar_set = src.scale_bar_set
+            if hasattr(src, "scale_bar_pixels"):
+                dst.scale_bar_pixels = src.scale_bar_pixels
+            if hasattr(src, "scale_bar_cm"):
+                dst.scale_bar_cm = src.scale_bar_cm
+            if hasattr(src, "scale_bar_ratio"):
+                dst.scale_bar_ratio = src.scale_bar_ratio
+            dst.interpolate_keypoints = src.interpolate_keypoints
+            dst.save_position_coords = src.save_position_coords
+            dst.save_roi_occupancy = src.save_roi_occupancy
+            dst.save_roi_summary = src.save_roi_summary
+            dst.save_config = src.save_config
+            dst.save_tracking_plots = src.save_tracking_plots
+            dst.create_tracked_video = src.create_tracked_video
+            dst.show_tracking_area = src.show_tracking_area
+            dst.show_rois = src.show_rois
+            dst.show_all_keypoints = src.show_all_keypoints
+            dst.show_edges = src.show_edges
+            dst.show_keypoint_labels = src.show_keypoint_labels
+            dst.show_track_labels = getattr(src, "show_track_labels", False)
+            dst.show_track_trail = getattr(src, "show_track_trail", False)
+            dst.track_trail_length = getattr(src, "track_trail_length", 30)
+            dst.save_data_view = src.save_data_view
+            dst.overwrite_files = src.overwrite_files
+            dst.configured = dst.tracking_area_set and len(dst.selected_keypoints) > 0
+            if dst.configured:
+                tag = {"sleap": "[SLEAP]", "mtt": "[MTT]", "st": "[ST]"}.get(dst.data_source, "[?]")
+                item = self.video_list.item(i)
+                if item:
+                    item.setText(f"✓ {tag} {os.path.basename(dst.video_path)}")
+            applied += 1
+        QMessageBox.information(
+            self, "Applied",
+            f"Configuration applied to {applied} other video(s)."
+        )
+
     def add_current_video_to_queue(self):
         """Add current video to processing queue and navigate to next."""
         if not self.video_configs:
@@ -3407,14 +3586,38 @@ class ROIToolGUI(QMainWindow):
                 QMessageBox.warning(self, "Not Ready", "Not all videos are configured")
                 return
         
+        # Determine output location
+        has_sleap = any(c.data_source == "sleap" for c in videos_to_process)
+        has_source_folder = any(c.data_source in ("mtt", "st") for c in videos_to_process)
+
+        output_mode = "new"
+        if has_source_folder:
+            items = [
+                "New folder (recommended)" if has_sleap else "New folder",
+                "Data source folder (e.g. MaskTracker/SimpleTracker folder)",
+            ]
+            choice, ok = QInputDialog.getItem(
+                self, "Output Location",
+                "Where should ROI analysis outputs be saved?",
+                items, 1 if not has_sleap else 0, False,
+            )
+            if not ok:
+                return
+            if "Data source" in choice:
+                output_mode = "source"
+
         self.btn_process.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.btn_add_to_queue.setEnabled(False)
-        
-        # Note: Settings are now stored per-video in the VideoROIConfig objects
-        # No need to pass global settings to ROIProcessor
-        
-        self.processor = ROIProcessor(videos_to_process)
+
+        # Mark all queue items as pending
+        for i in range(self.queue_list.count()):
+            item = self.queue_list.item(i)
+            text = item.text().lstrip("○● ✓✔✘ ")
+            item.setText(f"○ {text}")
+            item.setForeground(QColor("#999999"))
+
+        self.processor = ROIProcessor(videos_to_process, output_mode=output_mode)
         self.processor.progress.connect(self.update_progress)
         self.processor.status.connect(self.update_status)
         self.processor.video_finished.connect(self.on_video_finished)
@@ -3433,18 +3636,26 @@ class ROIToolGUI(QMainWindow):
             total_videos = len(self.processing_queue)
         else:
             total_videos = len(self.video_configs)
-        
+
         if total_videos > 0 and total_frames > 0:
             # Calculate progress for current video (0-1)
             video_progress = frame_idx / total_frames
-            
+
             # Calculate overall progress across all videos
             # Each video contributes (1/total_videos) to the total progress
             overall_progress = (video_idx / total_videos) + (video_progress / total_videos)
-            
+
             # Convert to percentage
             progress_percent = int(overall_progress * 100)
             self.progress_bar.setValue(progress_percent)
+
+        # Mark current video as running in the queue list
+        if video_idx < self.queue_list.count():
+            item = self.queue_list.item(video_idx)
+            text = item.text().lstrip("○● ✔✘ ")
+            if not item.text().startswith("●"):
+                item.setText(f"● {text}")
+                item.setForeground(QColor("#e8e857"))
     
     def update_status(self, message: str):
         """Update status label."""
@@ -3453,6 +3664,15 @@ class ROIToolGUI(QMainWindow):
     def on_video_finished(self, video_idx, success, message):
         """Handle video processing completion."""
         self.lbl_status.setText(message)
+        if video_idx < self.queue_list.count():
+            item = self.queue_list.item(video_idx)
+            text = item.text().lstrip("○● ✔✘ ")
+            if success:
+                item.setText(f"✔ {text}")
+                item.setForeground(QColor("#4ec94e"))
+            else:
+                item.setText(f"✘ {text}")
+                item.setForeground(QColor("#e05555"))
     
     def on_all_finished(self, success, message):
         """Handle all processing completion."""

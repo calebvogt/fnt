@@ -509,11 +509,22 @@ class MultiObjectTracker:
             "confidence": round(det["score"], 4),
         })
 
-    def get_trajectories(self) -> pd.DataFrame:
+    def get_trajectories(self, categories: Optional[Dict] = None) -> pd.DataFrame:
         if not self.records:
             return pd.DataFrame()
         df = pd.DataFrame(self.records)
         df = df.sort_values(["object_id", "frame"]).reset_index(drop=True)
+
+        if categories is not None:
+            cat_map = {int(k): v for k, v in categories.items()}
+            class_counters: Dict[str, int] = defaultdict(int)
+            obj_names: Dict[int, str] = {}
+            for oid in sorted(df["object_id"].unique()):
+                label = int(df.loc[df["object_id"] == oid, "label"].iloc[0])
+                class_name = cat_map.get(label, f"class{label}")
+                class_counters[class_name] += 1
+                obj_names[oid] = f"{class_name}_{class_counters[class_name]}"
+            df["object_name"] = df["object_id"].map(obj_names)
 
         for oid in df["object_id"].unique():
             mask = df["object_id"] == oid
@@ -525,52 +536,11 @@ class MultiObjectTracker:
             df.loc[mask, "vy"] = (dy / dt).round(2)
             df.loc[mask, "speed"] = (np.sqrt(dx**2 + dy**2) / dt).round(2)
 
-        return df
-
-
-def _pivot_trajectories(
-    df: pd.DataFrame,
-    categories: Dict,
-    total_frames: int,
-    fps: float,
-) -> pd.DataFrame:
-    """Pivot flat trajectory records into LabGym-style wide format.
-
-    Output columns: frame, time, then one column per tracked object named
-    ``{class}_{n}`` (e.g. vole_1, vole_2, port_1).  Each cell contains
-    ``(x, y)`` as a string, or empty if the object was not detected that frame.
-    """
-    if df.empty:
-        return pd.DataFrame({"frame": range(total_frames),
-                             "time": [round(i / fps, 4) for i in range(total_frames)]})
-
-    cat_map = {}
-    for k, v in categories.items():
-        cat_map[int(k)] = v
-
-    class_counters: Dict[str, int] = defaultdict(int)
-    obj_col_names: Dict[int, str] = {}
-    for oid in sorted(df["object_id"].unique()):
-        label = int(df.loc[df["object_id"] == oid, "label"].iloc[0])
-        class_name = cat_map.get(label, f"class{label}")
-        class_counters[class_name] += 1
-        obj_col_names[oid] = f"{class_name}_{class_counters[class_name]}"
-
-    all_frames = list(range(total_frames))
-    result = pd.DataFrame({
-        "frame": all_frames,
-        "time": [round(i / fps, 4) for i in all_frames],
-    })
-
-    for oid, col_name in obj_col_names.items():
-        sub = df.loc[df["object_id"] == oid, ["frame", "x", "y"]].copy()
-        coord_map = {
-            int(row["frame"]): f"({row['x']}, {row['y']})"
-            for _, row in sub.iterrows()
-        }
-        result[col_name] = result["frame"].map(coord_map).fillna("")
-
-    return result
+        col_order = ["frame", "time_s", "object_id", "object_name", "label",
+                     "x", "y", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+                     "mask_area", "confidence", "vx", "vy", "speed"]
+        col_order = [c for c in col_order if c in df.columns]
+        return df[col_order]
 
 
 def _draw_annotations(
@@ -646,6 +616,7 @@ def run_inference_on_video(
     should_stop: Optional[Callable] = None,
     frame_callback: Optional[Callable] = None,
     track_callback: Optional[Callable] = None,
+    create_tracked_video: bool = True,
 ) -> Dict:
     """Run full inference + tracking pipeline on a video.
 
@@ -705,8 +676,10 @@ def run_inference_on_video(
         os.makedirs(output_dir, exist_ok=True)
 
         annotated_path = os.path.join(output_dir, f"{video_stem}_annotated.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(annotated_path, fourcc, fps, (w, h))
+        writer = None
+        if create_tracked_video:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(annotated_path, fourcc, fps, (w, h))
 
         tracker = MultiObjectTracker(config)
         frame_idx = 0
@@ -739,13 +712,15 @@ def run_inference_on_video(
             if track_callback:
                 behavior_labels = track_callback(matched, frame_idx, fps)
 
-            annotated = _draw_annotations(
-                frame, matched, inference.categories,
-                behavior_labels=behavior_labels,
-            )
+            if writer or frame_callback:
+                annotated = _draw_annotations(
+                    frame, matched, inference.categories,
+                    behavior_labels=behavior_labels,
+                )
             t4 = time.time()
 
-            writer.write(annotated)
+            if writer:
+                writer.write(annotated)
             t5 = time.time()
 
             if frame_callback and (frame_idx % 3 == 0 or frame_idx == 0):
@@ -784,30 +759,29 @@ def run_inference_on_video(
                 t_last_log = now
 
         cap.release()
-        writer.release()
+        if writer:
+            writer.release()
 
         elapsed = time.time() - t_start
         fps_actual = frame_idx / elapsed if elapsed > 0 else 0
         print(f"[MTT Inference] Done: {frame_idx} frames in {elapsed:.1f}s ({fps_actual:.1f} fps)")
 
-        df_raw = tracker.get_trajectories()
+        df_raw = tracker.get_trajectories(categories=inference.categories)
 
         csv_path = os.path.join(output_dir, "trajectories.csv")
-        raw_csv_path = os.path.join(output_dir, "trajectories_detailed.csv")
 
         n_tracks = 0
         if not df_raw.empty:
-            df_pivot = _pivot_trajectories(df_raw, inference.categories, frame_idx, fps)
-            df_pivot.to_csv(csv_path, index=False)
-            df_raw.to_csv(raw_csv_path, index=False)
+            df_raw.to_csv(csv_path, index=False)
             n_tracks = df_raw["object_id"].nunique()
             print(f"[MTT Inference] {n_tracks} unique tracks written to {output_dir}/")
-        print(f"[MTT Inference] Annotated video: {annotated_path}")
+        if writer:
+            print(f"[MTT Inference] Annotated video: {annotated_path}")
 
         return {
             "output_dir": output_dir,
             "csv_path": csv_path,
-            "annotated_video": annotated_path,
+            "annotated_video": annotated_path if writer else None,
             "num_tracks": n_tracks,
             "total_frames": frame_idx,
         }
