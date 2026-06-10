@@ -4436,6 +4436,8 @@ class MaskTrackerWindow(QMainWindow):
         lbl_bcm = QLabel("Classifier model:")
         row_bcm.addWidget(lbl_bcm)
         self.combo_behavior_model = QComboBox()
+        self.combo_behavior_model.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_behavior_model.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.combo_behavior_model.setToolTip(
             "Select a trained behavior classifier model.\n"
             "Models are saved in action_classifier/model/ after training."
