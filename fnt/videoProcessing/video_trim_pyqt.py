@@ -117,25 +117,22 @@ class BatchTrimWorker(QThread):
             command = [
                 "ffmpeg",
                 "-y",
-                "-i", config.video_path,
                 "-ss", str(config.start_time),
-                "-to", str(end_time)
+                "-to", str(end_time),
+                "-i", config.video_path,
             ]
-            
+
             # Add crop filter if defined
             temp_mask_file = None
             if len(config.crop_polygon) >= 3:
                 temp_mask_file = self.create_mask(config)
-                
-                # Use movie filter to load mask and apply to every video frame
-                # Convert Windows path to forward slashes and escape properly for FFmpeg
-                mask_path = temp_mask_file.replace('\\', '/')
-                # On Windows, escape the colon in drive letters for movie filter
-                if len(mask_path) > 1 and mask_path[1] == ':':
-                    mask_path = mask_path[0] + '\\:' + mask_path[2:]
-                
+
+                # Use the mask as a second input instead of the movie= filter
+                # to avoid ffmpeg crashes (ACCESS_VIOLATION) on Windows
+                command.extend(["-i", temp_mask_file])
+
                 filter_complex = (
-                    f"movie='{mask_path}',scale={config.width}:{config.height}[mask];"
+                    f"[1:v]scale={config.width}:{config.height}[mask];"
                     f"[0:v][mask]alphamerge[vid_with_alpha];"
                     f"color=black:s={config.width}x{config.height}[black];"
                     f"[black][vid_with_alpha]overlay=format=auto"
@@ -858,10 +855,28 @@ class VideoTrimTool(QMainWindow):
         layout.addLayout(button_layout)
         
         # Output window
+        output_header_layout = QHBoxLayout()
         output_label = QLabel("FFmpeg Output:")
         output_label.setFont(QFont("Arial", 9, QFont.Bold))
-        layout.addWidget(output_label)
-        
+        output_header_layout.addWidget(output_label)
+        output_header_layout.addStretch()
+
+        self.btn_copy_logs = QPushButton("Copy Output Logs to Clipboard")
+        self.btn_copy_logs.clicked.connect(self.copy_logs_to_clipboard)
+        self.btn_copy_logs.setStyleSheet("""
+            QPushButton {
+                background-color: #3f3f3f;
+                color: #cccccc;
+                padding: 4px 10px;
+                font-size: 8pt;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+        """)
+        output_header_layout.addWidget(self.btn_copy_logs)
+        layout.addLayout(output_header_layout)
+
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setMinimumHeight(250)  # Increased from 150
@@ -1587,6 +1602,14 @@ class VideoTrimTool(QMainWindow):
         """Handle batch status update"""
         self.progress_label.setText(message)
     
+    def copy_logs_to_clipboard(self):
+        """Copy FFmpeg output logs to clipboard"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.output_text.toPlainText())
+        self.btn_copy_logs.setText("Copied!")
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(2000, lambda: self.btn_copy_logs.setText("Copy Output Logs to Clipboard"))
+
     def on_output_message(self, message):
         """Handle FFmpeg output message"""
         self.output_text.insertPlainText(message)
