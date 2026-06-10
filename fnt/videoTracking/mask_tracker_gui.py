@@ -1146,7 +1146,8 @@ class InferenceWorker(QThread):
     def __init__(self, video_paths, model_dir, config_dict,
                  classifier_dir=None, nc_threshold=0.5,
                  cls_window=15, show_preview=True,
-                 min_bout=5, uncertain_gap=0.10):
+                 min_bout=5, uncertain_gap=0.10,
+                 create_tracked_video=True):
         super().__init__()
         self.video_paths = list(video_paths)
         self.model_dir = model_dir
@@ -1157,6 +1158,7 @@ class InferenceWorker(QThread):
         self.show_preview = show_preview
         self.min_bout = min_bout
         self.uncertain_gap = uncertain_gap
+        self.create_tracked_video = create_tracked_video
         self._stop_flag = False
         self._pause_flag = False
 
@@ -1351,6 +1353,7 @@ class InferenceWorker(QThread):
                     should_stop=_check_stop,
                     frame_callback=_on_frame,
                     track_callback=_track_cb if cls_model else None,
+                    create_tracked_video=self.create_tracked_video,
                 )
                 result["video_path"] = video_path
 
@@ -4424,7 +4427,10 @@ class MaskTrackerWindow(QMainWindow):
         self.chk_behavior_cls.toggled.connect(self._on_behavior_cls_toggled)
         cls_vbox.addWidget(self.chk_behavior_cls)
 
-        self._behavior_cls_widgets = []
+        self._behavior_cls_container = QWidget()
+        cls_opts = QVBoxLayout()
+        cls_opts.setContentsMargins(0, 0, 0, 0)
+        cls_opts.setSpacing(4)
 
         row_bcm = QHBoxLayout()
         lbl_bcm = QLabel("Classifier model:")
@@ -4439,14 +4445,12 @@ class MaskTrackerWindow(QMainWindow):
         btn_refresh_cls.setToolTip("Rescan for trained classifier models.")
         btn_refresh_cls.clicked.connect(self._refresh_classifier_model_list)
         row_bcm.addWidget(btn_refresh_cls)
-        cls_vbox.addLayout(row_bcm)
-        self._behavior_cls_widgets.extend([lbl_bcm, self.combo_behavior_model, btn_refresh_cls])
+        cls_opts.addLayout(row_bcm)
 
         self.lbl_behavior_model_info = QLabel("No classifier model found")
         self.lbl_behavior_model_info.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_behavior_model_info.setWordWrap(True)
-        cls_vbox.addWidget(self.lbl_behavior_model_info)
-        self._behavior_cls_widgets.append(self.lbl_behavior_model_info)
+        cls_opts.addWidget(self.lbl_behavior_model_info)
 
         row_nc = QHBoxLayout()
         lbl_nc = QLabel("NC threshold:")
@@ -4468,8 +4472,7 @@ class MaskTrackerWindow(QMainWindow):
             "Higher: fewer predictions, but more reliable."
         )
         row_nc.addWidget(self.spin_nc_threshold)
-        cls_vbox.addLayout(row_nc)
-        self._behavior_cls_widgets.extend([lbl_nc, self.spin_nc_threshold])
+        cls_opts.addLayout(row_nc)
 
         row_win = QHBoxLayout()
         lbl_win = QLabel("Window size:")
@@ -4489,8 +4492,7 @@ class MaskTrackerWindow(QMainWindow):
         )
         row_win.addWidget(self.spin_cls_window)
         row_win.addWidget(QLabel("frames"))
-        cls_vbox.addLayout(row_win)
-        self._behavior_cls_widgets.extend([lbl_win, self.spin_cls_window])
+        cls_opts.addLayout(row_win)
 
         row_bout = QHBoxLayout()
         lbl_bout = QLabel("Min bout length:")
@@ -4512,8 +4514,7 @@ class MaskTrackerWindow(QMainWindow):
         )
         row_bout.addWidget(self.spin_min_bout)
         row_bout.addWidget(QLabel("frames"))
-        cls_vbox.addLayout(row_bout)
-        self._behavior_cls_widgets.extend([lbl_bout, self.spin_min_bout])
+        cls_opts.addLayout(row_bout)
 
         row_gap = QHBoxLayout()
         lbl_gap = QLabel("Uncertainty gap:")
@@ -4538,26 +4539,36 @@ class MaskTrackerWindow(QMainWindow):
             "0.20: stricter — requires a clear winner."
         )
         row_gap.addWidget(self.spin_uncertain_gap)
-        cls_vbox.addLayout(row_gap)
-        self._behavior_cls_widgets.extend([lbl_gap, self.spin_uncertain_gap])
+        cls_opts.addLayout(row_gap)
+
+        self._behavior_cls_container.setLayout(cls_opts)
+        cls_vbox.addWidget(self._behavior_cls_container)
 
         cls_group.setLayout(cls_vbox)
         layout.addWidget(cls_group)
 
-        self._on_behavior_cls_toggled(False)
+        self._behavior_cls_container.setVisible(False)
 
         # --- Run Inference ---
         ctrl_group = QGroupBox("Run Inference")
         ctrl_vbox = QVBoxLayout()
         ctrl_vbox.setSpacing(4)
 
+        self.chk_create_tracked_video = QCheckBox("Create tracked video")
+        self.chk_create_tracked_video.setChecked(True)
+        self.chk_create_tracked_video.setToolTip(
+            "Save an annotated video with tracking overlays.\n\n"
+            "ON: write an annotated .mp4 with bounding boxes / masks.\n"
+            "OFF: skip video output for faster processing (CSV only)."
+        )
+        ctrl_vbox.addWidget(self.chk_create_tracked_video)
+
         self.chk_inference_preview = QCheckBox("Show inference preview")
         self.chk_inference_preview.setChecked(True)
         self.chk_inference_preview.setToolTip(
             "Display annotated frames in the preview window during inference.\n\n"
             "ON: see live tracking + behavior overlays as videos are processed.\n"
-            "OFF: skip rendering to the preview window for faster processing.\n"
-            "The annotated video is always saved regardless of this setting."
+            "OFF: skip rendering to the preview window for faster processing."
         )
         ctrl_vbox.addWidget(self.chk_inference_preview)
 
@@ -4602,6 +4613,17 @@ class MaskTrackerWindow(QMainWindow):
         self.track_progress = QProgressBar()
         self.track_progress.setVisible(False)
         ctrl_vbox.addWidget(self.track_progress)
+
+        self.track_queue_progress = QProgressBar()
+        self.track_queue_progress.setStyleSheet(
+            "QProgressBar { border: 1px solid #555; border-radius: 3px; "
+            "background-color: #1a1a1a; height: 14px; text-align: center; "
+            "color: #ffffff; font-size: 10px; }"
+            "QProgressBar::chunk { background-color: #43a047; }"
+        )
+        self.track_queue_progress.setFormat("Queue: %v / %m videos")
+        self.track_queue_progress.setVisible(False)
+        ctrl_vbox.addWidget(self.track_queue_progress)
 
         ctrl_group.setLayout(ctrl_vbox)
         layout.addWidget(ctrl_group)
@@ -9207,10 +9229,7 @@ class MaskTrackerWindow(QMainWindow):
     # -- Behavior Classification helpers --
 
     def _on_behavior_cls_toggled(self, enabled: bool):
-        has_models = len(self._cls_model_dirs) > 0
-        effective = enabled and has_models
-        for w in self._behavior_cls_widgets:
-            w.setEnabled(effective)
+        self._behavior_cls_container.setVisible(enabled)
 
     def _refresh_classifier_model_list(self):
         self.combo_behavior_model.clear()
@@ -9256,8 +9275,6 @@ class MaskTrackerWindow(QMainWindow):
             )
             self.chk_behavior_cls.setChecked(False)
             self.chk_behavior_cls.setEnabled(False)
-            for w in self._behavior_cls_widgets:
-                w.setEnabled(False)
         else:
             self.chk_behavior_cls.setEnabled(True)
             last_idx = len(self._cls_model_dirs) - 1
@@ -9345,11 +9362,48 @@ class MaskTrackerWindow(QMainWindow):
                 "Existing Results Found",
                 f"The following video(s) already have MaskTracker output:\n\n"
                 f"{names}\n\n"
+                f"Overwriting will clear all contents in the MaskTracker "
+                f"output folder(s), including any ROI analysis saved there.\n\n"
                 f"Overwrite existing results?",
                 QMessageBox.Yes | QMessageBox.Cancel,
             )
             if reply != QMessageBox.Yes:
                 return
+
+            for vp in video_paths:
+                out_dir = Path(vp).parent / f"{Path(vp).stem}_MaskTracker"
+                if out_dir.is_dir():
+                    shutil.rmtree(out_dir)
+
+            roi_existing = []
+            for vp in video_paths:
+                stem = Path(vp).stem
+                parent = Path(vp).parent
+                for suffix in (f"{stem}_roiAnalysis", f"{stem}_roiAnalysis_SLEAP"):
+                    roi_dir = parent / suffix
+                    if roi_dir.is_dir() and any(roi_dir.iterdir()):
+                        roi_existing.append(os.path.basename(vp))
+                        break
+            if roi_existing:
+                roi_names = "\n".join(f"  • {n}" for n in roi_existing)
+                roi_reply = QMessageBox.question(
+                    self,
+                    "ROI Analysis Found",
+                    f"The following video(s) also have ROI analysis in a "
+                    f"separate folder based on the previous tracking data:\n\n"
+                    f"{roi_names}\n\n"
+                    f"Clear the previous ROI analysis?\n"
+                    f"(It will be invalid after re-tracking.)",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if roi_reply == QMessageBox.Yes:
+                    for vp in video_paths:
+                        stem = Path(vp).stem
+                        parent = Path(vp).parent
+                        for suffix in (f"{stem}_roiAnalysis", f"{stem}_roiAnalysis_SLEAP"):
+                            roi_dir = parent / suffix
+                            if roi_dir.is_dir():
+                                shutil.rmtree(roi_dir)
 
         combo_text = self.combo_track_device.currentText()
         if combo_text.startswith("Auto"):
@@ -9397,6 +9451,9 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_track_stop.setVisible(True)
         self.track_progress.setVisible(True)
         self.track_progress.setValue(0)
+        self.track_queue_progress.setMaximum(self._track_total_videos)
+        self.track_queue_progress.setValue(0)
+        self.track_queue_progress.setVisible(self._track_total_videos > 1)
         self.lbl_track_status.setText(
             f"Processing video 1 of {self._track_total_videos}: "
             f"{os.path.basename(video_paths[0])}"
@@ -9426,6 +9483,7 @@ class MaskTrackerWindow(QMainWindow):
             show_preview=self.chk_inference_preview.isChecked(),
             min_bout=self.spin_min_bout.value(),
             uncertain_gap=self.spin_uncertain_gap.value(),
+            create_tracked_video=self.chk_create_tracked_video.isChecked(),
         )
         self._inference_worker.progress.connect(self._on_tracking_progress)
         self._inference_worker.frame_ready.connect(self._on_tracking_frame)
@@ -9482,6 +9540,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_video_finished(self, result: dict):
         self._track_videos_done += 1
+        self.track_queue_progress.setValue(self._track_videos_done)
         video_name = os.path.basename(result.get("video_path", ""))
         n_tracks = result.get("num_tracks", 0)
         output_dir = result.get("output_dir", "")
@@ -9511,6 +9570,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_all_tracking_done(self):
         self.track_progress.setVisible(False)
+        self.track_queue_progress.setVisible(False)
         self.btn_start_tracking.setEnabled(True)
         self.btn_track_pause.setVisible(False)
         self.btn_track_stop.setVisible(False)
@@ -9554,6 +9614,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_tracking_error(self, msg: str):
         self.track_progress.setVisible(False)
+        self.track_queue_progress.setVisible(False)
         self.btn_start_tracking.setEnabled(True)
         self.btn_track_pause.setVisible(False)
         self.btn_track_stop.setVisible(False)
