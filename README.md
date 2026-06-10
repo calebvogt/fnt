@@ -22,7 +22,7 @@ The easiest way to use FieldNeuroToolbox is by downloading the pre-built standal
 2. Download the latest release `.zip` or `.tar.gz` for your operating system (Windows, macOS, or Linux).
 3. Extract the downloaded archive.
 4. Run the extracted `fnt` executable to launch the GUI.
-   * **macOS Security Permission:** Since the executable is unsigned, macOS will block it initially. When this happens, go to **System Settings** > **Privacy & Security**, scroll down, and click **"Open Anyway"** to run it.
+   * **macOS Security Permission:** Since the executable is unsigned, macOS Gatekeeper will block it. To fix this, open Terminal and run `xattr -cr path/to/fnt` on the extracted `fnt` file (you can drag it from Finder into Terminal to paste the path). This removes the quarantine attribute from the executable and all of its bundled dependencies.
    * **Windows SmartScreen:** When launching, you may see a "Windows protected your PC" warning. Click **"More info"** and then select **"Run anyway"** to allow the application to launch.
 
 
