@@ -954,16 +954,20 @@ class FEDTabWidget(QWidget):
                 current = current.split(" (")[0]
             combo.clear()
             
-            ports_to_add = valid_ports if valid_ports else (candidate_ports or [])
-            if ports_to_add:
-                for p in ports_to_add:
+            # Filter to only show verified FED3 devices or already active ports
+            ports_to_add = []
+            if valid_ports:
+                for p in valid_ports:
                     if isinstance(p, (list, tuple)) and len(p) == 2:
                         port_name, status = p
-                        display_text = f"{port_name} ({status})"
-                        combo.addItem(display_text, userData=port_name)
+                        if status in ("FED3 Active", "Active"):
+                            ports_to_add.append(port_name)
                     else:
-                        port_name = str(p)
-                        combo.addItem(port_name, userData=port_name)
+                        ports_to_add.append(str(p))
+            
+            if ports_to_add:
+                for port_name in ports_to_add:
+                    combo.addItem(port_name, userData=port_name)
                 
                 # Restore previous selection
                 idx = -1
