@@ -7,7 +7,7 @@ name = "fnt"
 version = "0.1.7"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-or-later"}
 requires-python = ">=3.12"
 authors = [
     {name = "Caleb Vogt", email = "vogtneuroscience@gmail.com"},
@@ -16,7 +16,7 @@ keywords = ["neuroscience", "behavior", "RFID", "USV", "imaging", "field-researc
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

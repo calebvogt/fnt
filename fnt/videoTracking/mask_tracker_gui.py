@@ -4950,11 +4950,60 @@ class MaskTrackerWindow(QMainWindow):
             os.rename(old, new)
         print(f"[MTT] Migrated behavior_classifier -> action_classifier")
 
+    def _migrate_model_folder_names(self):
+        """Check for YOLO model folders using old generic naming and offer to rename."""
+        models_root = os.path.join(self._project_dir, "models")
+        if not os.path.isdir(models_root):
+            return
+
+        to_rename = []
+        for entry in os.listdir(models_root):
+            if "_yolo_n=" not in entry:
+                continue
+            run_dir = os.path.join(models_root, entry)
+            config_path = os.path.join(run_dir, "training_config.json")
+            if not os.path.isfile(config_path):
+                continue
+            try:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                variant = cfg.get("model_variant", "")
+                if not variant or variant in entry:
+                    continue
+                new_name = entry.replace("_yolo_n=", f"_{variant}_n=")
+                new_path = os.path.join(models_root, new_name)
+                if not os.path.exists(new_path):
+                    to_rename.append((run_dir, new_path, entry, new_name))
+            except Exception:
+                continue
+
+        if not to_rename:
+            return
+
+        names = "\n".join(f"  • {old} → {new}" for _, _, old, new in to_rename)
+        reply = QMessageBox.question(
+            self,
+            "Update Model Folder Names",
+            f"The following model folder(s) use the old naming scheme "
+            f"and can be updated to include the model variant:\n\n"
+            f"{names}\n\n"
+            f"Update folder names?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            for old_path, new_path, old_name, new_name in to_rename:
+                try:
+                    os.rename(old_path, new_path)
+                    print(f"[MTT] Renamed model folder: {old_name} -> {new_name}")
+                except Exception as e:
+                    print(f"[MTT] Failed to rename {old_name}: {e}")
+
     def _load_project(self, config_path: str):
         with open(config_path) as f:
             cfg = json.load(f)
         self._project_dir = os.path.dirname(config_path)
         self._migrate_classifier_dir()
+        self._migrate_model_folder_names()
         self._cls_data_loaded = False
         self._project_config = cfg
 
@@ -6246,7 +6295,7 @@ class MaskTrackerWindow(QMainWindow):
             else:
                 model_variant = "yolo11n-seg"
             optimizer = self.combo_optimizer.currentText()
-            run_name = f"{timestamp}_yolo_n={n_train_images}"
+            run_name = f"{timestamp}_{model_variant}_n={n_train_images}"
 
             # Map augmentation config to Ultralytics online params
             aug_fliplr = 0.0
