@@ -5786,6 +5786,17 @@ class MaskTrackerWindow(QMainWindow):
     def _on_sam_toggle(self, checked: bool):
         """Toggle SAM2 AI labeling mode on/off via the button."""
         if checked:
+            if not getattr(self, '_sam_instructions_shown', False):
+                self._sam_instructions_shown = True
+                QMessageBox.information(
+                    self, "SAM Labeling Instructions",
+                    "Double-click on an object to add a mask point.\n"
+                    "Right-click to mark areas to exclude from the mask.\n"
+                    "Press Enter to accept the predicted mask.\n"
+                    "Press Escape or toggle the button off to cancel.\n\n"
+                    "You can add multiple positive/negative points\n"
+                    "before accepting to refine the prediction."
+                )
             self.preview.drawing_mode = "ai"
             self.preview.mode_changed.emit("AI-Assisted Mask")
         else:
