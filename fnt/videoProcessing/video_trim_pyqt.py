@@ -127,9 +127,10 @@ class BatchTrimWorker(QThread):
             if len(config.crop_polygon) >= 3:
                 temp_mask_file = self.create_mask(config)
 
-                # Use the mask as a second input instead of the movie= filter
-                # to avoid ffmpeg crashes (ACCESS_VIOLATION) on Windows
-                command.extend(["-i", temp_mask_file])
+                # Use the mask as a looping second input so every video frame
+                # has a corresponding mask frame (without -loop 1 the single-frame
+                # PNG input is exhausted immediately and ffmpeg crashes).
+                command.extend(["-loop", "1", "-i", temp_mask_file])
 
                 filter_complex = (
                     f"[1:v]scale={config.width}:{config.height}[mask];"
@@ -154,8 +155,9 @@ class BatchTrimWorker(QThread):
             # CRITICAL: Force exact frame count AND framerate if using mask
             if len(config.crop_polygon) >= 3:
                 command.extend([
-                    "-r", str(config.fps),  # Force output framerate to match input
-                    "-frames:v", str(expected_frames)
+                    "-r", str(config.fps),
+                    "-frames:v", str(expected_frames),
+                    "-shortest"
                 ])
             
             command.append(output_file)

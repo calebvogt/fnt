@@ -466,7 +466,7 @@ class AnnotationPreviewWidget(QWidget):
         delta = event.angleDelta().y()
         factor = 1.15 if delta > 0 else 1.0 / 1.15
         old_zoom = self._zoom
-        self._zoom = max(1.0, min(20.0, self._zoom * factor))
+        self._zoom = max(0.5, min(20.0, self._zoom * factor))
         if self._zoom == old_zoom:
             return
         mx, my = event.x(), event.y()
@@ -705,7 +705,7 @@ class AnnotationPreviewWidget(QWidget):
             self.zoom_changed.emit(self._zoom)
             self.update()
         elif event.key() == Qt.Key_Minus:
-            self._zoom = max(1.0, self._zoom / 1.2)
+            self._zoom = max(0.5, self._zoom / 1.2)
             self.zoom_changed.emit(self._zoom)
             self.update()
         elif event.key() == Qt.Key_0:
