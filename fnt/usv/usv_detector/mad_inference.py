@@ -82,23 +82,25 @@ def load_model(model_path: str, device: str = "auto"):
     """
     import torch
     try:
-        import segmentation_models_pytorch as smp
+        import segmentation_models_pytorch as smp  # noqa: F401 — presence check
     except Exception as e:
         raise RuntimeError(
             "segmentation_models_pytorch is required for MAD inference. "
             "Install with:\n    pip install segmentation-models-pytorch"
         ) from e
 
+    from .mad_training import build_model
+
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    # Older checkpoints predate selectable architectures — default to U-Net.
+    model_arch = ckpt.get('model_arch', 'unet')
     encoder_name = ckpt.get('encoder_name', 'resnet18')
     in_channels = int(ckpt.get('in_channels', 1))
     classes = int(ckpt.get('classes', 1))
 
-    model = smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights=None,
-        in_channels=in_channels,
-        classes=classes,
+    model = build_model(
+        model_arch, encoder_name, encoder_weights=None,
+        in_channels=in_channels, classes=classes,
     )
     model.load_state_dict(ckpt['state_dict'])
     resolved = _resolve_device(device)

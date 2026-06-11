@@ -31,7 +31,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QStatusBar, QTextEdit, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 from scipy import signal
 
@@ -87,16 +88,30 @@ class MADSpectrogramWidget(SpectrogramWidget):
     # Emitted once per paint stroke (on mouse release) so the main
     # window can auto-save the sibling PNG.
     stroke_committed = pyqtSignal()
+    # Emitted when SAM prompt points change so the main window can run a
+    # (debounced) SAM2 prediction off the UI thread.
+    sam_points_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.paint_mode: Optional[str] = None  # 'brush' | 'eraser' | None
+        self.paint_mode: Optional[str] = None  # 'brush' | 'eraser' | 'sam' | None
         self.brush_radius_px = 6              # in spec-pixel units
 
         self.mask: Optional[np.ndarray] = None
         self.n_freq_bins: Optional[int] = None
         self.n_time_frames: Optional[int] = None
         self.hop: Optional[int] = None
+        self.nperseg: Optional[int] = None
+        self.noverlap: Optional[int] = None
+        self.nfft: Optional[int] = None
+
+        # SAM2-assisted labeling state. Prompt points are stored in
+        # full-file spec-pixel coords (t_idx, f_idx); the proposed mask
+        # preview is a boolean crop placed at (t_off, f_off=0).
+        self._sam_pos_pts: List[tuple] = []
+        self._sam_neg_pts: List[tuple] = []
+        self._sam_preview: Optional[np.ndarray] = None
+        self._sam_preview_off: tuple = (0, 0)
 
         self._mask_dirty = False
         self._painting = False
@@ -119,6 +134,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
     def init_mask(self, audio_len: int, sample_rate: int,
                   nperseg: int, noverlap: int, nfft: int) -> None:
         self.hop = max(1, nperseg - noverlap)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nfft
         self.n_freq_bins = nfft // 2 + 1
         self.n_time_frames = max(
             1, (audio_len - nperseg) // self.hop + 1
@@ -127,6 +145,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
             (self.n_freq_bins, self.n_time_frames), dtype=np.uint8
         )
         self._mask_dirty = False
+        self.clear_sam_prompts()
         self.update()
 
     def set_mask(self, arr: np.ndarray) -> None:
@@ -184,11 +203,17 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
     # --- paint mode ----------------------------------------------------
     def set_paint_mode(self, mode: Optional[str]) -> None:
+        if self.paint_mode == 'sam' and mode != 'sam':
+            # Leaving SAM mode discards any in-progress prompt/preview.
+            self.clear_sam_prompts()
         self.paint_mode = mode
         if mode in ('brush', 'eraser'):
             # Hide the OS cursor — the paintEvent draws a brush-radius
             # circle instead, which doubles as a visual size indicator.
             self.setCursor(Qt.BlankCursor)
+        elif mode == 'sam':
+            self.setCursor(Qt.CrossCursor)
+            self._cursor_pos = None
         else:
             self.setCursor(Qt.ArrowCursor)
             self._cursor_pos = None
@@ -196,6 +221,121 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
     def set_brush_radius(self, r: int) -> None:
         self.brush_radius_px = max(1, int(r))
+
+    # --- SAM2-assisted labeling ---------------------------------------
+    def _visible_spec_bounds(self):
+        """Return (t_start, t_end, f_start, f_end) spec-pixel bounds for
+        the current view, or None if the mask grid isn't initialized."""
+        if (self.hop is None or self.n_time_frames is None or
+                self.n_freq_bins is None or self.sample_rate is None):
+            return None
+        t_start = int(self.view_start * self.sample_rate / self.hop)
+        t_end = int(self.view_end * self.sample_rate / self.hop) + 1
+        t_start = max(0, t_start)
+        t_end = min(self.n_time_frames, t_end)
+        nyq = self.sample_rate / 2.0
+        f_start = int(self.min_freq / nyq * self.n_freq_bins)
+        f_end = int(self.max_freq / nyq * self.n_freq_bins) + 1
+        f_start = max(0, f_start)
+        f_end = min(self.n_freq_bins, f_end)
+        return t_start, t_end, f_start, f_end
+
+    def render_sam_image(self):
+        """Render the visible time window as an RGB image on the project's
+        spec-pixel grid for SAM2.
+
+        Returns ``(rgb, t_off)`` where ``rgb`` is an ``(n_freq_bins, W, 3)``
+        uint8 array (row 0 = lowest frequency, i.e. NOT vertically flipped,
+        so it shares the orientation of ``self.mask``), and ``t_off`` is the
+        full-grid time-frame index of column 0. Returns ``None`` if no
+        spectrogram is available.
+
+        The segment starts exactly at ``t_off * hop`` so spectrogram column
+        ``j`` corresponds to full-grid frame ``t_off + j``; the mask SAM2
+        returns therefore drops straight onto ``self.mask``.
+        """
+        if (self.audio_data is None or self.mask is None or
+                self.nperseg is None or self.nfft is None):
+            return None
+        bounds = self._visible_spec_bounds()
+        if bounds is None:
+            return None
+        t_start, t_end, _f0, _f1 = bounds
+        if t_end <= t_start:
+            return None
+        start_sample = t_start * self.hop
+        end_sample = min(len(self.audio_data),
+                         (t_end - 1) * self.hop + self.nperseg)
+        segment = self.audio_data[start_sample:end_sample]
+        if len(segment) < self.nperseg:
+            return None
+        noverlap = min(self.noverlap, self.nperseg - 1)
+        _f, _t, Sxx = signal.spectrogram(
+            segment, fs=self.sample_rate, nperseg=self.nperseg,
+            noverlap=noverlap, nfft=self.nfft, window='hann',
+        )
+        spec_db = 10.0 * np.log10(Sxx + 1e-10)  # (n_freq_bins, ncols)
+        vmin = np.percentile(spec_db, 5)
+        vmax = np.percentile(spec_db, 99)
+        norm = np.clip((spec_db - vmin) / (vmax - vmin + 1e-10), 0, 1)
+        idx = (norm * 255).astype(np.uint8)
+        rgb = np.ascontiguousarray(self.colormap_lut[idx])  # row 0 = low freq
+        return rgb, t_start
+
+    def add_sam_point(self, pos, positive: bool) -> None:
+        """Record a SAM prompt point from a screen-space QPoint."""
+        spec_rect = self._get_spec_rect()
+        if not spec_rect.contains(pos):
+            return
+        idx = self._screen_to_spec_idx(pos.x(), pos.y(), spec_rect)
+        if idx is None:
+            return
+        (self._sam_pos_pts if positive else self._sam_neg_pts).append(idx)
+        self.sam_points_changed.emit()
+        self.update()
+
+    def get_sam_prompts(self):
+        """Return (positive_pts, negative_pts) in full-grid (t_idx, f_idx)."""
+        return list(self._sam_pos_pts), list(self._sam_neg_pts)
+
+    def has_sam_prompts(self) -> bool:
+        return bool(self._sam_pos_pts or self._sam_neg_pts)
+
+    def set_sam_preview(self, mask: Optional[np.ndarray], t_off: int) -> None:
+        """Store a SAM-proposed boolean mask crop for preview rendering."""
+        self._sam_preview = (mask.astype(bool, copy=False)
+                             if mask is not None else None)
+        self._sam_preview_off = (int(t_off), 0)
+        self.update()
+
+    def clear_sam_prompts(self) -> None:
+        self._sam_pos_pts = []
+        self._sam_neg_pts = []
+        self._sam_preview = None
+        self._sam_preview_off = (0, 0)
+        self.update()
+
+    def commit_sam_preview(self) -> bool:
+        """Burn the current SAM preview into ``self.mask`` as positives."""
+        if self._sam_preview is None or self.mask is None:
+            return False
+        t_off, f_off = self._sam_preview_off
+        pv = self._sam_preview
+        h, w = pv.shape
+        t0 = max(0, t_off)
+        t1 = min(self.n_time_frames, t_off + w)
+        f0 = max(0, f_off)
+        f1 = min(self.n_freq_bins, f_off + h)
+        if t1 <= t0 or f1 <= f0:
+            self.clear_sam_prompts()
+            return False
+        sub = pv[(f0 - f_off):(f1 - f_off), (t0 - t_off):(t1 - t_off)]
+        self.mask[f0:f1, t0:t1][sub] = MASK_POSITIVE
+        self._mask_dirty = True
+        self.clear_sam_prompts()
+        self.stroke_committed.emit()
+        self.update()
+        return True
 
     # --- coord mapping -------------------------------------------------
     def _screen_to_spec_idx(self, x, y, spec_rect):
@@ -243,6 +383,13 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
     # --- mouse events --------------------------------------------------
     def mousePressEvent(self, event):
+        if self.paint_mode == 'sam':
+            if event.button() == Qt.LeftButton:
+                self.add_sam_point(event.pos(), positive=True)
+                return
+            if event.button() == Qt.RightButton:
+                self.add_sam_point(event.pos(), positive=False)
+                return
         if (self.paint_mode in ('brush', 'eraser') and
                 event.button() == Qt.LeftButton):
             spec_rect = self._get_spec_rect()
@@ -373,6 +520,23 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     )
                     rgba[active, 3] = np.maximum(rgba[active, 3], cyan_alpha)
 
+        # SAM2 proposed-mask preview (green) — shown in every view mode so
+        # the user can judge the proposal before committing it.
+        if self._sam_preview is not None:
+            pt_off, pf_off = self._sam_preview_off
+            pv = self._sam_preview
+            ph, pw = pv.shape
+            ct0 = max(t_start, pt_off)
+            ct1 = min(t_end, pt_off + pw)
+            cf0 = max(f_start, pf_off)
+            cf1 = min(f_end, pf_off + ph)
+            if ct1 > ct0 and cf1 > cf0:
+                sub = pv[(cf0 - pf_off):(cf1 - pf_off),
+                         (ct0 - pt_off):(ct1 - pt_off)]
+                dst = rgba[(cf0 - f_start):(cf1 - f_start),
+                           (ct0 - t_start):(ct1 - t_start)]
+                dst[sub] = (0, 230, 0, int(self.mask_alpha * 255))
+
         rgba = np.flipud(rgba).copy()
         qimg = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
         scaled = qimg.scaled(
@@ -381,6 +545,30 @@ class MADSpectrogramWidget(SpectrogramWidget):
         )
         painter = QPainter(self)
         painter.drawImage(spec_rect.topLeft(), scaled)
+
+        # SAM prompt-point markers (green = positive, red = negative).
+        if self.paint_mode == 'sam' and (self._sam_pos_pts or
+                                         self._sam_neg_pts):
+            def _t_to_x(t):
+                frac = (t - t_start) / max(1, (t_end - t_start))
+                return spec_rect.left() + frac * spec_rect.width()
+
+            def _f_to_y(f):
+                frac = (f - f_start) / max(1, (f_end - f_start))
+                return spec_rect.bottom() - frac * spec_rect.height()
+
+            marks = ([(p, QColor(40, 255, 40)) for p in self._sam_pos_pts] +
+                     [(p, QColor(255, 60, 60)) for p in self._sam_neg_pts])
+            for (t_idx, f_idx), col in marks:
+                if not (t_start <= t_idx < t_end and f_start <= f_idx < f_end):
+                    continue
+                cx = _t_to_x(t_idx)
+                cy = _f_to_y(f_idx)
+                pen = QPen(QColor(0, 0, 0))
+                pen.setWidth(1)
+                painter.setPen(pen)
+                painter.setBrush(QBrush(col))
+                painter.drawEllipse(QRectF(cx - 4, cy - 4, 8, 8))
 
         # Draw highlighted predicted-blob bbox (if any) in bright green.
         if (self.pred_blobs and self.pred_highlight_idx is not None and
@@ -966,6 +1154,224 @@ class MADRunProgressDialog(QDialog):
 
 
 # ======================================================================
+# Embeddable run panel (inline training/inference progress + live plot)
+# ======================================================================
+class MADRunPanel(QWidget):
+    """Inline progress reporter embedded in the Mask / Inference tabs.
+
+    Exposes the same surface that ``_start_training`` / ``_start_inference``
+    drive on :class:`MADRunProgressDialog` (``set_stage`` / ``set_main`` /
+    ``set_sub`` / ``append`` / ``plot_batch`` / ``plot_epoch`` / ``mark_done``
+    + a ``cancel_requested`` signal), so those launchers work unchanged whether
+    the reporter is a modal dialog or this inline widget.
+    """
+
+    cancel_requested = pyqtSignal()
+    run_finished = pyqtSignal(bool)   # ok — lets the section re-enable its button
+
+    def __init__(self, parent=None, show_plot: bool = False):
+        super().__init__(parent)
+        self._show_plot = show_plot
+        self._plot = None
+        self._batches_x: list = []
+        self._batch_losses: list = []
+        self._val_epoch_x: list = []
+        self._val_losses: list = []
+        self._train_epoch_x: list = []
+        self._train_losses: list = []
+
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(3)
+
+        self.lbl_stage = QLabel("Idle.")
+        self.lbl_stage.setWordWrap(True)
+        self.lbl_stage.setStyleSheet("font-size: 10px;")
+        vbox.addWidget(self.lbl_stage)
+
+        self.pb_main = QProgressBar()
+        self.pb_main.setRange(0, 100)
+        self.pb_main.setTextVisible(False)
+        self.pb_main.setMaximumHeight(10)
+        vbox.addWidget(self.pb_main)
+
+        self.pb_sub = QProgressBar()
+        self.pb_sub.setRange(0, 100)
+        self.pb_sub.setTextVisible(False)
+        self.pb_sub.setMaximumHeight(8)
+        vbox.addWidget(self.pb_sub)
+
+        if show_plot:
+            self._init_loss_plot(vbox)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(110)
+        vbox.addWidget(self.log)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop)
+        vbox.addWidget(self.btn_stop)
+
+    def _init_loss_plot(self, parent_layout):
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import (
+                FigureCanvasQTAgg as FigureCanvas,
+            )
+        except Exception:
+            msg = QLabel("matplotlib not installed — live plot disabled.")
+            msg.setStyleSheet("color: #888888; font-size: 10px;")
+            parent_layout.addWidget(msg)
+            return
+        self._figure = Figure(figsize=(4.0, 2.2), tight_layout=True)
+        self._canvas = FigureCanvas(self._figure)
+        self._canvas.setMinimumHeight(170)
+        parent_layout.addWidget(self._canvas)
+        self._ax = self._figure.add_subplot(1, 1, 1)
+        self._ax.set_xlabel("Batch", fontsize=8)
+        self._ax.set_ylabel("Loss", fontsize=8)
+        self._ax.tick_params(labelsize=7)
+        self._ax.grid(alpha=0.3)
+        (self._line_batch,) = self._ax.plot(
+            [], [], color='#3b82f6', linewidth=0.9, alpha=0.75, label='batch')
+        (self._line_train,) = self._ax.plot(
+            [], [], color='#1d4ed8', marker='o', markersize=3,
+            linewidth=1.3, label='train')
+        (self._line_val,) = self._ax.plot(
+            [], [], color='#dc2626', marker='s', markersize=3,
+            linewidth=1.3, label='val')
+        self._ax.legend(loc='upper right', fontsize=7)
+        self._plot = True
+        self._canvas.draw_idle()
+
+    # --- run lifecycle -------------------------------------------------
+    def start_run(self):
+        """Reset state and arm the Stop button for a new run."""
+        self.log.clear()
+        self.btn_stop.setEnabled(True)
+        self.pb_main.setValue(0)
+        self.pb_sub.setValue(0)
+        for lst in (self._batches_x, self._batch_losses, self._val_epoch_x,
+                    self._val_losses, self._train_epoch_x, self._train_losses):
+            lst.clear()
+        if self._plot:
+            self._line_batch.set_data([], [])
+            self._line_train.set_data([], [])
+            self._line_val.set_data([], [])
+            self._redraw_plot()
+
+    # --- reporter API (GUI thread only) -------------------------------
+    def set_stage(self, text: str):
+        self.lbl_stage.setText(text)
+
+    def set_main(self, v, n):
+        n_i = max(1, int(n))
+        self.pb_main.setMaximum(n_i)
+        self.pb_main.setValue(int(max(0, min(v, n_i))))
+
+    def set_sub(self, v, n):
+        n_i = max(1, int(n))
+        self.pb_sub.setMaximum(n_i)
+        self.pb_sub.setValue(int(max(0, min(v, n_i))))
+
+    def append(self, text: str):
+        self.log.append(text)
+
+    def plot_batch(self, global_batch: int, loss: float):
+        if not self._plot:
+            return
+        self._batches_x.append(int(global_batch))
+        self._batch_losses.append(float(loss))
+        self._line_batch.set_data(self._batches_x, self._batch_losses)
+        self._redraw_plot()
+
+    def plot_epoch(self, global_batch: int, train_loss: float, val_loss: float):
+        if not self._plot:
+            return
+        self._train_epoch_x.append(int(global_batch))
+        self._train_losses.append(float(train_loss))
+        self._val_epoch_x.append(int(global_batch))
+        self._val_losses.append(float(val_loss))
+        self._line_train.set_data(self._train_epoch_x, self._train_losses)
+        self._line_val.set_data(self._val_epoch_x, self._val_losses)
+        self._redraw_plot()
+
+    def _redraw_plot(self):
+        if not self._plot:
+            return
+        try:
+            self._ax.relim()
+            self._ax.autoscale_view()
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def mark_done(self, ok: bool = True):
+        self.btn_stop.setEnabled(False)
+        self.run_finished.emit(bool(ok))
+
+    def _on_stop(self):
+        self.btn_stop.setEnabled(False)
+        self.lbl_stage.setText("Stopping…")
+        self.cancel_requested.emit()
+
+
+# ======================================================================
+# SAM2-assisted labeling worker threads
+# ======================================================================
+class MADSamLoadWorker(QThread):
+    """Loads the SAM2 image model off the UI thread (heavy torch import)."""
+    done_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, segmenter, parent=None):
+        super().__init__(parent)
+        self.segmenter = segmenter
+
+    def run(self):
+        try:
+            self.segmenter.load_model()
+            self.done_signal.emit()
+        except Exception as e:
+            import traceback
+            self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+class MADSamPredictWorker(QThread):
+    """Runs one SAM2 prediction. If ``image_rgb`` is given, the image
+    embedding is (re)computed first; otherwise the cached embedding from a
+    previous prediction is reused (fast path for adding more points)."""
+    done_signal = pyqtSignal(object, int)   # (bool mask or None, t_off)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, segmenter, image_rgb, pos_pts, neg_pts, t_off,
+                 parent=None):
+        super().__init__(parent)
+        self.segmenter = segmenter
+        self.image_rgb = image_rgb
+        self.pos_pts = pos_pts
+        self.neg_pts = neg_pts
+        self.t_off = t_off
+
+    def run(self):
+        try:
+            if self.image_rgb is not None:
+                self.segmenter.set_image(self.image_rgb)
+            if not self.pos_pts:
+                self.done_signal.emit(None, self.t_off)
+                return
+            mask, _score = self.segmenter.predict_mask(
+                self.pos_pts, self.neg_pts or None
+            )
+            self.done_signal.emit(mask, self.t_off)
+        except Exception as e:
+            import traceback
+            self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+# ======================================================================
 # Main window
 # ======================================================================
 class MADMainWindow(QMainWindow):
@@ -1003,6 +1409,17 @@ class MADMainWindow(QMainWindow):
         self._pred_wav_path: Optional[str] = None
         self._pred_idx: Optional[int] = None
 
+        # SAM2-assisted labeling state
+        self._sam_ckpt: Optional[str] = None
+        self._sam_cfg_name: Optional[str] = None
+        self._sam_segmenter = None
+        self._sam_ready = False
+        self._sam_load_worker: Optional[MADSamLoadWorker] = None
+        self._sam_predict_worker: Optional[MADSamPredictWorker] = None
+        self._sam_predict_pending = False
+        self._sam_img_sig = None
+        self._sam_last_t_off = None
+
         self._setup_menu_bar()
         self._build_ui()
         self._setup_shortcuts()
@@ -1021,30 +1438,48 @@ class MADMainWindow(QMainWindow):
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
-        # ---------- Left panel (scrollable) ----------
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # ---------- Left panel: workflow-stage tabs over a shared canvas ----
+        # Mask tab = label + train; Inference tab = run + blob review. Both
+        # act on the single spectrogram canvas in the right panel. (A future
+        # "Class" tab for call-type classification slots in here.)
         _fm = self.fontMetrics()
         _min_w = max(360, _fm.averageCharWidth() * 56 + 40)
         _max_w = max(460, _fm.averageCharWidth() * 74 + 40)
-        left_scroll.setMinimumWidth(_min_w)
-        left_scroll.setMaximumWidth(_max_w)
 
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(5, 5, 5, 5)
-        left_layout.setSpacing(8)
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setMinimumWidth(_min_w)
+        self.left_tabs.setMaximumWidth(_max_w)
+        self.left_tabs.currentChanged.connect(self._on_left_tab_changed)
 
-        self._create_project_section(left_layout)
-        self._create_training_data_section(left_layout)
-        self._create_paint_tools_section(left_layout)
-        self._create_view_section(left_layout)
-        self._create_review_section(left_layout)
+        def _make_tab(section_builders):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(5, 5, 5, 5)
+            page_layout.setSpacing(8)
+            for build in section_builders:
+                build(page_layout)
+            page_layout.addStretch()
+            scroll.setWidget(page)
+            return scroll
 
-        left_layout.addStretch()
-        left_scroll.setWidget(left_widget)
+        mask_tab = _make_tab([
+            self._create_project_section,
+            self._create_training_data_section,
+            self._create_paint_tools_section,
+            self._create_view_section,
+            self._create_training_section,
+        ])
+        inference_tab = _make_tab([
+            self._create_inference_section,
+            self._create_review_section,
+        ])
+        self.left_tabs.addTab(mask_tab, "Mask")
+        self.left_tabs.addTab(inference_tab, "Inference")
+        self._inference_tab_index = 1
 
         # ---------- Right panel ----------
         right_panel = QWidget()
@@ -1055,6 +1490,7 @@ class MADMainWindow(QMainWindow):
         self.spectrogram = MADSpectrogramWidget()
         self.spectrogram.zoom_requested.connect(self._on_wheel_zoom)
         self.spectrogram.stroke_committed.connect(self._on_stroke_committed)
+        self.spectrogram.sam_points_changed.connect(self._on_sam_points_changed)
         right_layout.addWidget(self.spectrogram, 1)
 
         self.waveform_overview = WaveformOverviewWidget()
@@ -1191,7 +1627,7 @@ class MADMainWindow(QMainWindow):
         controls_layout.addStretch()
         right_layout.addWidget(controls_bar)
 
-        main_layout.addWidget(left_scroll)
+        main_layout.addWidget(self.left_tabs)
         main_layout.addWidget(right_panel, 1)
 
         self.status_bar = QStatusBar()
@@ -1325,6 +1761,29 @@ class MADMainWindow(QMainWindow):
 
         vbox.addLayout(mode_row)
 
+        # SAM2-assisted labeling row.
+        sam_row = QHBoxLayout()
+        sam_row.setSpacing(2)
+        self.btn_sam = QPushButton("SAM (G)")
+        self.btn_sam.setToolTip(
+            "SAM2-assisted labeling — left-click a call to propose a mask,\n"
+            "right-click to add a negative point. Enter accepts, Esc clears.\n"
+            "Shortcut: G"
+        )
+        self.btn_sam.setCheckable(True)
+        self.btn_sam.clicked.connect(self._on_sam_clicked)
+        self.btn_sam.setEnabled(False)
+        sam_row.addWidget(self.btn_sam)
+
+        self.btn_sam_model = QPushButton("SAM2 Model…")
+        self.btn_sam_model.setToolTip(
+            "Download or select a SAM2 checkpoint for assisted labeling"
+        )
+        self.btn_sam_model.clicked.connect(self._on_sam_model_setup)
+        sam_row.addWidget(self.btn_sam_model)
+        sam_row.addStretch()
+        vbox.addLayout(sam_row)
+
         brush_row = QHBoxLayout()
         brush_row.setSpacing(2)
         brush_row.addWidget(QLabel("Brush radius:"))
@@ -1419,7 +1878,7 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.set_view_mode(mode)
 
     def _create_review_section(self, layout):
-        group = QGroupBox("5. Blob Review")
+        group = QGroupBox("Blob Review")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -1478,6 +1937,280 @@ class MADMainWindow(QMainWindow):
 
         group.setLayout(vbox)
         layout.addWidget(group)
+
+    def _create_training_section(self, layout):
+        from PyQt5.QtWidgets import QLineEdit
+        group = QGroupBox("5. Train Model")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+        form = QFormLayout()
+
+        self.combo_arch = QComboBox()
+        for label, key in (
+            ("U-Net (baseline)", "unet"),
+            ("U-Net++ (fine detail)", "unetpp"),
+            ("HRNet U-Net (crisp thin outlines)", "hrnet"),
+            ("MA-Net (attention)", "manet"),
+        ):
+            self.combo_arch.addItem(label, key)
+        self.combo_arch.setToolTip(
+            "Segmentation architecture (all semantic, via "
+            "segmentation_models_pytorch). HRNet keeps high-resolution\n"
+            "features for the finest USV contours; it uses its own encoder."
+        )
+        self.combo_arch.currentIndexChanged.connect(self._on_arch_changed)
+        form.addRow("Architecture:", self.combo_arch)
+
+        self.combo_train_encoder = QComboBox()
+        self.combo_train_encoder.addItems([
+            "resnet18", "resnet34", "resnet50",
+            "efficientnet-b0", "mobilenet_v2",
+        ])
+        form.addRow("Encoder:", self.combo_train_encoder)
+
+        self.spin_train_epochs = QSpinBox()
+        self.spin_train_epochs.setRange(1, 500)
+        self.spin_train_epochs.setValue(100)
+        form.addRow("Max epochs:", self.spin_train_epochs)
+
+        self.spin_train_patience = QSpinBox()
+        self.spin_train_patience.setRange(0, 200)
+        self.spin_train_patience.setValue(8)
+        self.spin_train_patience.setToolTip("0 = disable early stopping")
+        form.addRow("Early-stop patience:", self.spin_train_patience)
+
+        self.spin_train_batch = QSpinBox()
+        self.spin_train_batch.setRange(1, 64)
+        self.spin_train_batch.setValue(8)
+        form.addRow("Batch size:", self.spin_train_batch)
+
+        self.spin_train_lr = QDoubleSpinBox()
+        self.spin_train_lr.setDecimals(6)
+        self.spin_train_lr.setRange(1e-6, 1.0)
+        self.spin_train_lr.setSingleStep(1e-4)
+        self.spin_train_lr.setValue(1e-3)
+        form.addRow("Learning rate:", self.spin_train_lr)
+
+        self.spin_train_val = QDoubleSpinBox()
+        self.spin_train_val.setRange(0.0, 0.9)
+        self.spin_train_val.setSingleStep(0.05)
+        self.spin_train_val.setValue(0.20)
+        form.addRow("Validation fraction:", self.spin_train_val)
+
+        self.combo_train_device = QComboBox()
+        self.combo_train_device.addItems(["auto", "cuda", "mps", "cpu"])
+        form.addRow("Device:", self.combo_train_device)
+
+        self.txt_train_run = QLineEdit()
+        self.txt_train_run.setPlaceholderText("(auto: unet_YYYYMMDD_HHMMSS)")
+        form.addRow("Run name:", self.txt_train_run)
+
+        vbox.addLayout(form)
+
+        post_row = QHBoxLayout()
+        self.chk_post_inference = QCheckBox("Run inference after, on:")
+        self.chk_post_inference.setChecked(True)
+        self.combo_post_scope = QComboBox()
+        self.combo_post_scope.addItems(["current file", "all files"])
+        self.chk_post_inference.toggled.connect(self.combo_post_scope.setEnabled)
+        post_row.addWidget(self.chk_post_inference)
+        post_row.addWidget(self.combo_post_scope, 1)
+        vbox.addLayout(post_row)
+
+        self.btn_train = QPushButton("Train")
+        self.btn_train.setToolTip(
+            "Train on every file with painted labels. Only time regions you\n"
+            "have committed contribute supervision."
+        )
+        self.btn_train.clicked.connect(self._on_inline_train)
+        self.btn_train.setEnabled(False)
+        vbox.addWidget(self.btn_train)
+
+        self.train_panel = MADRunPanel(show_plot=True)
+        self.train_panel.run_finished.connect(
+            lambda ok: self.btn_train.setEnabled(self._project is not None)
+        )
+        self.train_panel.cancel_requested.connect(
+            lambda: self.status_bar.showMessage("Stopping training…")
+        )
+        vbox.addWidget(self.train_panel)
+
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
+    def _create_inference_section(self, layout):
+        from PyQt5.QtWidgets import QLineEdit
+        group = QGroupBox("Run Inference")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model:"))
+        self.txt_infer_model = QLineEdit()
+        self.txt_infer_model.setPlaceholderText("(latest trained run)")
+        model_row.addWidget(self.txt_infer_model, 1)
+        btn_browse = QPushButton("Browse…")
+        btn_browse.clicked.connect(self._pick_infer_model)
+        model_row.addWidget(btn_browse)
+        vbox.addLayout(model_row)
+
+        form = QFormLayout()
+        self.spin_infer_threshold = QDoubleSpinBox()
+        self.spin_infer_threshold.setRange(0.01, 0.99)
+        self.spin_infer_threshold.setSingleStep(0.05)
+        self.spin_infer_threshold.setValue(0.5)
+        form.addRow("Probability threshold:", self.spin_infer_threshold)
+
+        self.spin_infer_min_blob = QSpinBox()
+        self.spin_infer_min_blob.setRange(1, 10000)
+        self.spin_infer_min_blob.setValue(8)
+        form.addRow("Min blob pixels:", self.spin_infer_min_blob)
+
+        self.combo_infer_device = QComboBox()
+        self.combo_infer_device.addItems(["auto", "cuda", "mps", "cpu"])
+        form.addRow("Device:", self.combo_infer_device)
+        vbox.addLayout(form)
+
+        scope = QGroupBox("Scope")
+        sv = QVBoxLayout()
+        self.rb_infer_current = QRadioButton("Current file only")
+        self.rb_infer_current.setChecked(True)
+        self.rb_infer_all = QRadioButton("All files in project")
+        sv.addWidget(self.rb_infer_current)
+        sv.addWidget(self.rb_infer_all)
+        scope.setLayout(sv)
+        vbox.addWidget(scope)
+
+        self.chk_infer_save_mask = QCheckBox("Save prediction PNG")
+        self.chk_infer_save_mask.setChecked(True)
+        vbox.addWidget(self.chk_infer_save_mask)
+        self.chk_infer_save_csv = QCheckBox("Save blob CSV")
+        self.chk_infer_save_csv.setChecked(True)
+        vbox.addWidget(self.chk_infer_save_csv)
+        self.chk_infer_preserve = QCheckBox(
+            "Preserve painted labels (skip labeled time regions)"
+        )
+        self.chk_infer_preserve.setChecked(True)
+        vbox.addWidget(self.chk_infer_preserve)
+
+        self.btn_infer_run = QPushButton("Run Inference")
+        self.btn_infer_run.clicked.connect(self._on_inline_infer)
+        self.btn_infer_run.setEnabled(False)
+        vbox.addWidget(self.btn_infer_run)
+
+        self.infer_panel = MADRunPanel(show_plot=False)
+        self.infer_panel.run_finished.connect(
+            lambda ok: self.btn_infer_run.setEnabled(self._project is not None)
+        )
+        vbox.addWidget(self.infer_panel)
+
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
+    # --- inline training/inference handlers ---------------------------
+    def _on_left_tab_changed(self, _idx: int):
+        # No-op hook for now; review hotkeys gate on the active tab.
+        pass
+
+    def _on_arch_changed(self, _idx: int = 0):
+        # HRNet brings its own encoder, so the encoder picker is irrelevant.
+        is_hrnet = self.combo_arch.currentData() == "hrnet"
+        self.combo_train_encoder.setEnabled(not is_hrnet)
+
+    def _build_inline_train_config(self, labeled: List[str]):
+        from fnt.usv.usv_detector.mad_training import UNetTrainingConfig
+        sp = self._spec_params()
+        return UNetTrainingConfig(
+            project_dir=self._project.project_dir,
+            run_name=self.txt_train_run.text().strip(),
+            model_arch=self.combo_arch.currentData(),
+            encoder_name=self.combo_train_encoder.currentText(),
+            n_epochs=self.spin_train_epochs.value(),
+            early_stop_patience=self.spin_train_patience.value(),
+            batch_size=self.spin_train_batch.value(),
+            learning_rate=self.spin_train_lr.value(),
+            val_fraction=self.spin_train_val.value(),
+            device=self.combo_train_device.currentText(),
+            nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
+            db_min=sp['db_min'], db_max=sp['db_max'],
+            wav_paths=list(labeled),
+        )
+
+    def _on_inline_train(self):
+        if self._project is None:
+            QMessageBox.information(self, "No project", "Open a MAD project first.")
+            return
+        self._auto_save_mask_if_dirty()
+        labeled = self._labeled_wavs()
+        if not labeled:
+            QMessageBox.warning(
+                self, "No labels",
+                "No wav files have sibling _FNT_MAD_labels.png yet.\n"
+                "Paint or SAM-label some USV pixels first."
+            )
+            return
+        cfg = self._build_inline_train_config(labeled)
+        post_scope = None
+        if self.chk_post_inference.isChecked():
+            post_scope = ('current'
+                          if self.combo_post_scope.currentIndex() == 0 else 'all')
+        self.btn_train.setEnabled(False)
+        self.train_panel.start_run()
+        self._start_training(cfg, post_inference_scope=post_scope,
+                             reporter=self.train_panel)
+
+    def _default_model_path(self) -> Optional[str]:
+        if self._project and self._project.models:
+            last = self._project.models[-1]
+            return last.get('path') if isinstance(last, dict) else str(last)
+        return None
+
+    def _pick_infer_model(self):
+        root = (os.path.join(self._project.project_dir, 'models')
+                if self._project else os.path.expanduser("~"))
+        start = root if os.path.isdir(root) else os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select trained weights", start,
+            "PyTorch weights (*.pt *.pth);;All Files (*)"
+        )
+        if path:
+            self.txt_infer_model.setText(path)
+
+    def _on_inline_infer(self):
+        if self._project is None:
+            QMessageBox.information(self, "No project", "Open a MAD project first.")
+            return
+        if not self.audio_files:
+            QMessageBox.warning(self, "No files", "Project has no wav files.")
+            return
+        model = self.txt_infer_model.text().strip() or self._default_model_path()
+        if not model or not os.path.isfile(model):
+            QMessageBox.warning(
+                self, "Model missing",
+                "Train a model or select a valid weights.pt file first."
+            )
+            return
+        if self.rb_infer_current.isChecked():
+            current = (self.audio_files[self.current_file_idx]
+                       if self.audio_files else None)
+            wavs = [current] if current else []
+        else:
+            wavs = list(self.audio_files)
+        if not wavs:
+            return
+        from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
+        cfg = MADInferenceConfig(
+            model_path=model,
+            threshold=self.spin_infer_threshold.value(),
+            min_blob_pixels=self.spin_infer_min_blob.value(),
+            device=self.combo_infer_device.currentText(),
+            save_mask_png=self.chk_infer_save_mask.isChecked(),
+            save_blob_csv=self.chk_infer_save_csv.isChecked(),
+            preserve_labels=self.chk_infer_preserve.isChecked(),
+        )
+        self.btn_infer_run.setEnabled(False)
+        self.infer_panel.start_run()
+        self._start_inference(cfg, wavs, reporter=self.infer_panel)
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -1569,6 +2302,10 @@ class MADMainWindow(QMainWindow):
         make(Qt.Key_P, self._shortcut_prev_file)
         make(Qt.Key_B, self._shortcut_toggle_brush)
         make(Qt.Key_E, self._shortcut_toggle_eraser)
+        make(Qt.Key_G, self._shortcut_toggle_sam)
+        make(Qt.Key_Return, self._sam_accept)
+        make(Qt.Key_Enter, self._sam_accept)
+        make(Qt.Key_Escape, self._sam_clear)
         make(Qt.Key_Space, self._shortcut_toggle_playback)
         make("[", self._shortcut_brush_smaller)
         make("]", self._shortcut_brush_bigger)
@@ -1629,6 +2366,15 @@ class MADMainWindow(QMainWindow):
         self.btn_erase.setChecked(new_state)
         self._on_eraser_clicked(new_state)
 
+    def _shortcut_toggle_sam(self):
+        if self._focus_is_edit():
+            return
+        if not self.btn_sam.isEnabled():
+            return
+        new_state = not self.btn_sam.isChecked()
+        self.btn_sam.setChecked(new_state)
+        self._on_sam_clicked(new_state)
+
     def _shortcut_brush_smaller(self):
         if self._focus_is_edit():
             return
@@ -1651,6 +2397,10 @@ class MADMainWindow(QMainWindow):
 
     def _shortcut_review(self, status: str):
         if self._focus_is_edit():
+            return
+        # Blob review lives in the Inference tab — don't act from the Mask tab.
+        if (hasattr(self, 'left_tabs') and
+                self.left_tabs.currentIndex() != self._inference_tab_index):
             return
         if not self.btn_accept_blob.isEnabled():
             return
@@ -1759,6 +2509,9 @@ class MADMainWindow(QMainWindow):
         self.act_run_inference.setEnabled(True)
         self.act_load_pred.setEnabled(True)
         self.act_clear_pred.setEnabled(True)
+        self.btn_train.setEnabled(True)
+        self.btn_infer_run.setEnabled(True)
+        self.txt_infer_model.setText(self._default_model_path() or "")
         self._rescan_project_wavs()
         self._update_source_folders_label()
         self._update_model_info_label()
@@ -1797,6 +2550,8 @@ class MADMainWindow(QMainWindow):
         self.act_run_inference.setEnabled(False)
         self.act_load_pred.setEnabled(False)
         self.act_clear_pred.setEnabled(False)
+        self.btn_train.setEnabled(False)
+        self.btn_infer_run.setEnabled(False)
         self.spectrogram.mask = None
         self.spectrogram.set_audio_data(None, None)
         self.waveform_overview.set_audio_data(None, None)
@@ -2049,19 +2804,22 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     def _update_paint_buttons_enabled(self):
         has_audio = self.audio_data is not None
-        for btn in (self.btn_paint, self.btn_erase, self.btn_clear_mask):
+        for btn in (self.btn_paint, self.btn_erase, self.btn_clear_mask,
+                    self.btn_sam):
             btn.setEnabled(has_audio)
         self.spin_brush_radius.setEnabled(has_audio)
         self.btn_load_predictions.setEnabled(has_audio)
         if not has_audio:
             self.btn_paint.setChecked(False)
             self.btn_erase.setChecked(False)
+            self.btn_sam.setChecked(False)
             self.spectrogram.set_paint_mode(None)
             self.lbl_mask_status.setText("No mask")
 
     def _on_brush_clicked(self, checked: bool):
         if checked:
             self.btn_erase.setChecked(False)
+            self.btn_sam.setChecked(False)
             self.spectrogram.set_paint_mode('brush')
             self.status_bar.showMessage(
                 "Brush mode — left-click + drag over target pixels"
@@ -2073,6 +2831,7 @@ class MADMainWindow(QMainWindow):
     def _on_eraser_clicked(self, checked: bool):
         if checked:
             self.btn_paint.setChecked(False)
+            self.btn_sam.setChecked(False)
             self.spectrogram.set_paint_mode('eraser')
             self.status_bar.showMessage(
                 "Eraser mode — left-click + drag to clear painted pixels"
@@ -2080,6 +2839,174 @@ class MADMainWindow(QMainWindow):
         else:
             self.spectrogram.set_paint_mode(None)
             self.status_bar.showMessage("Paint mode off")
+
+    # ==================================================================
+    # SAM2-assisted labeling
+    # ==================================================================
+    def _on_sam_model_setup(self):
+        """Open the shared SAM2 checkpoint dialog and remember the choice."""
+        try:
+            from fnt.videoTracking.sam2_checkpoint_manager import (
+                get_sam2_checkpoint,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "SAM2 unavailable",
+                f"Could not load the SAM2 checkpoint manager:\n{e}"
+            )
+            return
+        ckpt_path, cfg_name = get_sam2_checkpoint(parent=self)
+        if not ckpt_path:
+            return
+        self._sam_ckpt = str(ckpt_path)
+        self._sam_cfg_name = cfg_name
+        # Force a fresh segmenter so the new checkpoint takes effect.
+        self._sam_segmenter = None
+        self._sam_ready = False
+        self._sam_img_sig = None
+        self.status_bar.showMessage(
+            f"SAM2 model selected: {Path(self._sam_ckpt).name}"
+        )
+
+    def _on_sam_clicked(self, checked: bool):
+        if not checked:
+            self.spectrogram.set_paint_mode(None)
+            self.status_bar.showMessage("SAM mode off")
+            return
+        if not self._ensure_sam_model():
+            self.btn_sam.setChecked(False)
+            return
+        self.btn_paint.setChecked(False)
+        self.btn_erase.setChecked(False)
+        self.spectrogram.set_paint_mode('sam')
+        self.status_bar.showMessage(
+            "SAM mode — left-click a call (right-click = negative), "
+            "Enter to accept, Esc to clear"
+        )
+
+    def _ensure_sam_model(self) -> bool:
+        """Make sure a SAM2 segmenter exists and is loading/loaded. Returns
+        False if the user has not chosen a checkpoint yet."""
+        if not self._sam_ckpt:
+            QMessageBox.information(
+                self, "SAM2 model needed",
+                "Choose a SAM2 checkpoint first (the 'SAM2 Model…' button)."
+            )
+            self._on_sam_model_setup()
+            if not self._sam_ckpt:
+                return False
+        if self._sam_segmenter is None:
+            try:
+                from fnt.videoTracking.mask_tracker_annotator import (
+                    SAM2ImageSegmenter,
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "SAM2 unavailable",
+                    f"Could not import the SAM2 backend:\n{e}\n\n"
+                    "Install the SAM2 dependencies (torch, sam2)."
+                )
+                return False
+            self._sam_segmenter = SAM2ImageSegmenter(
+                self._sam_ckpt, self._sam_cfg_name
+            )
+            self._sam_ready = False
+            self._sam_img_sig = None
+            self._sam_load_worker = MADSamLoadWorker(self._sam_segmenter, self)
+            self._sam_load_worker.done_signal.connect(self._on_sam_loaded)
+            self._sam_load_worker.error_signal.connect(self._on_sam_error)
+            self.status_bar.showMessage("Loading SAM2 model…")
+            self._sam_load_worker.start()
+        return True
+
+    def _on_sam_loaded(self):
+        self._sam_ready = True
+        self.status_bar.showMessage("SAM2 model ready — click a call to label")
+        # If the user already placed points while the model loaded, predict now.
+        if (self.spectrogram.paint_mode == 'sam' and
+                self.spectrogram.has_sam_prompts()):
+            self._run_sam_predict()
+
+    def _on_sam_error(self, msg: str):
+        self._sam_ready = False
+        self._sam_segmenter = None
+        self.spectrogram.set_paint_mode(None)
+        self.btn_sam.setChecked(False)
+        QMessageBox.critical(self, "SAM2 error", msg)
+
+    def _view_signature(self):
+        """Identity of the currently rendered SAM image — when this changes
+        the image embedding must be recomputed."""
+        sg = self.spectrogram
+        return (self.current_file_idx, round(sg.view_start, 4),
+                round(sg.view_end, 4), sg.min_freq, sg.max_freq)
+
+    def _on_sam_points_changed(self):
+        if self.spectrogram.paint_mode != 'sam':
+            return
+        if not self.spectrogram.has_sam_prompts():
+            self.spectrogram.set_sam_preview(None, 0)
+            return
+        self._run_sam_predict()
+
+    def _run_sam_predict(self):
+        if not self._sam_ready or self._sam_segmenter is None:
+            # Model still loading; the next point change will retry.
+            return
+        if self._sam_predict_worker is not None and \
+                self._sam_predict_worker.isRunning():
+            self._sam_predict_pending = True
+            return
+        pos_pts, neg_pts = self.spectrogram.get_sam_prompts()
+        if not pos_pts:
+            self.spectrogram.set_sam_preview(None, 0)
+            return
+        sig = self._view_signature()
+        reuse = (sig == self._sam_img_sig and self._sam_last_t_off is not None)
+        if reuse:
+            # View hasn't moved — reuse the cached embedding, skip rendering.
+            image_rgb = None
+            t_off = self._sam_last_t_off
+        else:
+            rendered = self.spectrogram.render_sam_image()
+            if rendered is None:
+                return
+            image_rgb, t_off = rendered
+            self._sam_img_sig = sig
+            self._sam_last_t_off = t_off
+        # Convert prompts from full-grid (t, f) to crop coords (x=t-t_off, y=f).
+        pos_crop = [(int(t - t_off), int(f)) for (t, f) in pos_pts]
+        neg_crop = [(int(t - t_off), int(f)) for (t, f) in neg_pts]
+        self._sam_predict_worker = MADSamPredictWorker(
+            self._sam_segmenter, image_rgb, pos_crop, neg_crop, t_off, self
+        )
+        self._sam_predict_worker.done_signal.connect(self._on_sam_predicted)
+        self._sam_predict_worker.error_signal.connect(self._on_sam_error)
+        self._sam_predict_worker.start()
+
+    def _on_sam_predicted(self, mask, t_off: int):
+        if self.spectrogram.paint_mode == 'sam':
+            self.spectrogram.set_sam_preview(mask, t_off)
+        if self._sam_predict_pending:
+            self._sam_predict_pending = False
+            self._run_sam_predict()
+
+    def _sam_accept(self):
+        if self.spectrogram.paint_mode != 'sam':
+            return
+        if self.spectrogram.commit_sam_preview():
+            # The spectrogram image is unchanged, so the cached embedding
+            # stays valid for the next call on the same view.
+            self.lbl_mask_status.setText("SAM mask added (saved)")
+            self.status_bar.showMessage(
+                "SAM mask committed — click the next call"
+            )
+
+    def _sam_clear(self):
+        if self.spectrogram.paint_mode != 'sam':
+            return
+        self.spectrogram.clear_sam_prompts()
+        self.status_bar.showMessage("SAM prompts cleared")
 
     def _on_clear_clicked(self):
         if self.spectrogram.mask is None:
@@ -2369,8 +3296,14 @@ class MADMainWindow(QMainWindow):
                       if dlg.post_inference_requested() else None)
         self._start_training(cfg, post_inference_scope=post_scope)
 
-    def _start_training(self, cfg, post_inference_scope: Optional[str] = None):
-        progress = MADRunProgressDialog(self, "MAD Training", show_plot=True)
+    def _start_training(self, cfg, post_inference_scope: Optional[str] = None,
+                        reporter=None):
+        # ``reporter`` lets the inline Mask-tab panel reuse this launcher; when
+        # None we fall back to the standalone modal progress dialog.
+        owns_modal = reporter is None
+        progress = reporter or MADRunProgressDialog(
+            self, "MAD Training", show_plot=True
+        )
         progress.set_stage(
             f"Training U-Net ({cfg.encoder_name}, up to {cfg.n_epochs} epochs, "
             f"patience={cfg.early_stop_patience})…"
@@ -2453,7 +3386,8 @@ class MADMainWindow(QMainWindow):
                     if mpath not in paths:
                         models.append({
                             'name': Path(mpath).parent.name,
-                            'arch': cfg.encoder_name,
+                            'arch': getattr(cfg, 'model_arch', 'unet'),
+                            'encoder': cfg.encoder_name,
                             'path': mpath,
                             'date': _dt.now().isoformat(timespec='seconds'),
                             'best_val_loss': summary.get('best_val_loss'),
@@ -2466,6 +3400,11 @@ class MADMainWindow(QMainWindow):
                         except Exception:
                             pass
                         self._update_model_info_label()
+                    # Point the Inference tab at the freshly trained model
+                    # unless the user has typed a custom path.
+                    if (hasattr(self, 'txt_infer_model') and
+                            not self.txt_infer_model.text().strip()):
+                        self.txt_infer_model.setText(mpath)
 
             # Post-training inference chain (on the just-saved weights).
             if post_inference_scope and summary.get('model_path'):
@@ -2485,7 +3424,8 @@ class MADMainWindow(QMainWindow):
         worker.error_signal.connect(on_error)
         progress.cancel_requested.connect(worker.request_stop)
         worker.start()
-        progress.exec_()
+        if owns_modal:
+            progress.exec_()
 
     def _menu_run_inference(self):
         if self._project is None:
@@ -2546,8 +3486,9 @@ class MADMainWindow(QMainWindow):
         )
         self._start_inference(cfg, wavs)
 
-    def _start_inference(self, cfg, wav_paths: List[str]):
-        progress = MADRunProgressDialog(self, "MAD Inference")
+    def _start_inference(self, cfg, wav_paths: List[str], reporter=None):
+        owns_modal = reporter is None
+        progress = reporter or MADRunProgressDialog(self, "MAD Inference")
         progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
         progress.append(f"Model: {cfg.model_path}")
         progress.append(f"Threshold: {cfg.threshold}  "
@@ -2595,7 +3536,8 @@ class MADMainWindow(QMainWindow):
         worker.error_signal.connect(on_error)
         progress.cancel_requested.connect(worker.request_stop)
         worker.start()
-        progress.exec_()
+        if owns_modal:
+            progress.exec_()
 
     # ==================================================================
     # Blob review
