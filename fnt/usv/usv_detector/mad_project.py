@@ -59,12 +59,23 @@ class MADProjectConfig:
     # Inference.
     mask_threshold: float = 0.5
 
+    # Call-type classes the user has confirmed (metadata on each saved
+    # training example; the segmentation model itself stays binary). The
+    # class dialog defaults to ``last_class`` so repeat-Enter reuses it.
+    classes: List[str] = field(default_factory=lambda: ["USV"])
+    last_class: str = "USV"
+
     # Model history: list of {name, arch, n_positive_pixels, n_negative_pixels, path, date}.
     models: List[Dict] = field(default_factory=list)
 
     schema_version: int = 1
 
     # ------------------------------------------------------------------
+    @property
+    def training_data_dir(self) -> str:
+        """Self-contained per-call example store, shared across model runs."""
+        return os.path.join(self.project_dir, 'models', 'training_data')
+
     def save(self, path: Optional[str] = None) -> None:
         """Save config to ``<project_dir>/mad_project_info.json``."""
         if path is None:
@@ -100,6 +111,7 @@ def create_mad_project(
     """Create a new MAD project directory and write its config."""
     os.makedirs(project_dir, exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'models', 'training_data'), exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'datasets'), exist_ok=True)
 
     if config is None:

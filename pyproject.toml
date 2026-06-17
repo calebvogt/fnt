@@ -54,6 +54,12 @@ dependencies = [
     "easyocr",
     # Timezone handling
     "pytz",
+    # MuseStudio — Muse S Athena EEG/fNIRS streaming over BLE -> LSL.
+    # OpenMuse is reverse-engineered/experimental (esp. fNIRS); not affiliated with InteraXon.
+    "OpenMuse @ git+https://github.com/DominiqueMakowski/OpenMuse.git",
+    "mne-lsl",        # LSL bindings (bundles liblsl on macOS); also pulled by OpenMuse
+    "bleak",          # BLE backend (macOS CoreBluetooth, no dongle required)
+    "pyqtgraph",      # fast live multichannel scrolling at 256 Hz
 ]
 
 [project.optional-dependencies]

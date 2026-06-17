@@ -57,6 +57,10 @@ class UNetTrainingConfig:
     tile_freq_bins: int = 512
     tile_overlap_fraction: float = 0.25
 
+    # Self-contained per-call example store the model trains from. When set,
+    # training reads patches from here instead of (WAV + sibling-PNG) pairs.
+    training_data_dir: str = ""
+
     wav_paths: List[str] = field(default_factory=list)
 
     def resolve_run_dir(self) -> str:
@@ -172,18 +176,15 @@ def train_unet(
             "Install with:\n    pip install segmentation-models-pytorch"
         ) from e
 
-    from .mad_dataset import collect_training_tiles
+    from .mad_examples import collect_training_examples
 
-    # ---- collect tiles ----
+    # ---- collect tiles from the self-contained example store ----
     if progress:
         progress(0, cfg.n_epochs, {'status': 'collecting_tiles'})
-    specs, targets, weights = collect_training_tiles(
-        cfg.wav_paths,
-        nperseg=cfg.nperseg, noverlap=cfg.noverlap, nfft=cfg.nfft,
-        db_min=cfg.db_min, db_max=cfg.db_max,
+    specs, targets, weights = collect_training_examples(
+        cfg.training_data_dir,
         tile_time_frames=cfg.tile_time_frames,
         tile_freq_bins=cfg.tile_freq_bins,
-        overlap_fraction=cfg.tile_overlap_fraction,
         progress=(
             lambda i, n, name: progress(0, cfg.n_epochs, {
                 'status': 'collecting_tiles', 'file_i': i,
@@ -195,8 +196,8 @@ def train_unet(
     n_total = specs.shape[0]
     if n_total == 0:
         raise RuntimeError(
-            "No labeled tiles found. Paint at least one positive pixel in "
-            "one or more files before training."
+            "No confirmed training examples found. Label and confirm at least "
+            "one call (Enter) before training."
         )
 
     # ---- train/val split ----

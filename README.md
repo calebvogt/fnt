@@ -33,7 +33,7 @@ If you intend to modify the code or prefer managing your own Python environment,
 
 ### Prerequisites
 
-- Git
+- **Git** — must be available on the command line (on your system PATH). Installing **GitHub Desktop alone is not sufficient**, because it bundles its own git that is not exposed to the terminal. The easiest fix is to install git into the conda environment with `conda install git` (included in the steps below).
 - Anaconda or Miniconda
 - ffmpeg (installed and added to your system PATH)
 - Package dependencies are listed in `pyproject.toml`
@@ -46,9 +46,12 @@ Clone the fnt GitHub repo and install the package in editable mode. **Python 3.1
 git clone https://github.com/calebvogt/fnt.git
 conda create --name fnt python=3.13
 conda activate fnt
+conda install git -y
 cd path\to\fnt
 pip install -e .
 ```
+
+> **Note:** `conda install git` ensures a command-line git is available inside the environment. This is required because one dependency (SAM2) is installed directly from GitHub and pip needs `git` on the PATH to clone it. If git is missing you will see `ERROR: Cannot find command 'git'` during install.
 
 #### GPU Support for Video Tracking (Recommended)
 
@@ -77,6 +80,7 @@ Open terminal:
 git clone https://github.com/calebvogt/fnt.git
 conda create --name fnt python=3.13
 conda activate fnt
+conda install git -y
 cd path/to/fnt
 pip install -e .
 ```

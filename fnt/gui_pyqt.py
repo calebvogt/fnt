@@ -310,12 +310,13 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs
         self.create_video_tab()
-        self.create_uwb_tab()
         self.create_usv_tab()
+        self.create_uwb_tab()
         self.create_rfid_tab()
         self.create_fed_tab()
         self.create_wifp_tab()
         self.create_imaging_tab()
+        self.create_musestudio_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -508,8 +509,8 @@ class FNTMainWindow(QMainWindow):
 
         analysis_buttons = [
             ("Classic Audio Detector", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
-            ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
             ("Mask Audio Detector", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
+            ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
         ]
 
         self.create_button_grid(analysis_layout, analysis_buttons)
@@ -734,6 +735,68 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(info_group)
 
         layout.addStretch()
+
+    def create_musestudio_tab(self):
+        """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
+        tab, layout = self._make_scrollable_tab("MuseStudio")
+
+        desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        group = QGroupBox("MuseStudio")
+        group_layout = QGridLayout()
+        buttons = [
+            ("Open MuseStudio",
+             "Connect to a Muse S Athena over Bluetooth, live-plot EEG/fNIRS, and record to CSV",
+             self.run_musestudio),
+        ]
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+
+        info_group = QGroupBox("About MuseStudio")
+        info_layout = QVBoxLayout()
+        info_label = QLabel(
+            "<b>MuseStudio</b> connects directly to a Muse S Athena headband over "
+            "Bluetooth LE (no phone or dongle on a modern Mac) using "
+            "<a href='https://github.com/DominiqueMakowski/OpenMuse'>OpenMuse</a>.<br><br>"
+            "• Live scrolling plots of EEG (256 Hz) and fNIRS (64 Hz)<br>"
+            "• Records each stream to CSV in a timestamped session folder<br><br>"
+            "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
+            "and experimental, and is not affiliated with InteraXon.<br><br>"
+            "Requires the optional <code>muse</code> dependencies: "
+            "<code>pip install -e \".[muse]\"</code>"
+        )
+        info_label.setWordWrap(True)
+        info_label.setOpenExternalLinks(True)
+        info_label.setStyleSheet("color: #cccccc; padding: 10px;")
+        info_layout.addWidget(info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+
+    def run_musestudio(self):
+        """Launch the MuseStudio window"""
+        try:
+            from fnt.musestudio.musestudio_pyqt import MuseStudioWindow
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "MuseStudio dependencies missing",
+                "MuseStudio requires the optional 'muse' dependencies "
+                "(OpenMuse, mne-lsl, bleak, pyqtgraph).\n\n"
+                "Install them with:\n    pip install -e \".[muse]\"\n\n"
+                f"Import error: {str(e)}",
+            )
+            return
+        try:
+            self.musestudio_window = MuseStudioWindow()
+            self.musestudio_window.setStyleSheet(self.styleSheet())
+            self.musestudio_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"MuseStudio failed: {str(e)}")
 
     def create_utilities_tab(self):
         """Create the utilities tab"""

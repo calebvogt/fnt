@@ -19,7 +19,6 @@ import numpy as np
 
 from .mad_dataset import compute_full_spec_image
 from .mad_labels import (
-    committed_columns, load_mask_png, mask_sibling_path,
     pred_csv_sibling_path, pred_mask_sibling_path, save_mask_png,
 )
 from .spectrogram import load_audio
@@ -40,11 +39,13 @@ class MADInferenceConfig:
     save_mask_png: bool = True
     save_blob_csv: bool = True
     # If True (default), the probability mask is zeroed out in any time
-    # column that already contains a user-painted label. Those time
-    # regions are treated as 'owned' by the human annotator, so inference
-    # never overwrites manual work. Committed columns come from
-    # :func:`fnt.usv.usv_detector.mad_labels.committed_columns`.
+    # column that already contains a confirmed call for this file (rebuilt
+    # from the example store via
+    # :func:`fnt.usv.usv_detector.mad_examples.reconstruct_file_mask`), so
+    # inference never overwrites human-confirmed annotations.
     preserve_labels: bool = True
+    # Example store used to look up confirmed labels for preserve_labels.
+    training_data_dir: str = ""
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -359,31 +360,21 @@ def run_inference_on_file(
         progress=(lambda i, n: progress('infer', i, n)) if progress else None,
     )
 
-    # Preserve user-painted labels: zero out the probability mask in any
-    # time column that already has a committed manual label. Predictions
-    # never overwrite manual annotations.
-    if cfg.preserve_labels:
-        label_png = mask_sibling_path(wav_path)
-        if Path(label_png).exists():
-            try:
-                user_mask = load_mask_png(label_png)
-                # Normalise to fit the prob mask's (f, t) layout.
-                if user_mask.shape == prob.shape:
-                    committed = committed_columns(user_mask)
-                elif user_mask.T.shape == prob.shape:
-                    committed = committed_columns(user_mask.T)
-                else:
-                    # Sizes mismatch (rare — spec params differ) — just
-                    # align on the overlap along the time axis.
-                    t_len = min(user_mask.shape[1], prob.shape[1])
-                    crop = user_mask[:, :t_len]
-                    committed = np.zeros(prob.shape[1], dtype=bool)
-                    committed[:t_len] = (crop == 1).any(axis=0)
-                if committed.any():
-                    prob[:, committed] = 0.0
-            except Exception:
-                # Don't let a bad label PNG block inference.
-                pass
+    # Preserve confirmed labels: zero out the probability mask in any time
+    # column that already contains a human-confirmed call for this file, so
+    # predictions never overwrite confirmed annotations.
+    if cfg.preserve_labels and cfg.training_data_dir:
+        try:
+            from .mad_examples import reconstruct_file_mask
+            user_mask = reconstruct_file_mask(
+                cfg.training_data_dir, Path(wav_path).name, prob.shape
+            )
+            cols = (user_mask > 0).any(axis=0)
+            if cols.any():
+                prob[:, cols] = 0.0
+        except Exception:
+            # Don't let a label-store hiccup block inference.
+            pass
 
     if progress:
         progress('blobs', 0, 1)

@@ -23,8 +23,12 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, QRectF, pyqtSignal
-from PyQt5.QtGui import QImage, QKeySequence, QPainter, QPen, QColor, QBrush
+from PyQt5.QtCore import (
+    Qt, QSettings, QThread, QTimer, QRectF, QPointF, pyqtSignal,
+)
+from PyQt5.QtGui import (
+    QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
+)
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
@@ -38,7 +42,7 @@ from scipy import signal
 
 from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
 from fnt.usv.usv_detector.mad_labels import (
-    committed_columns, pred_csv_sibling_path, pred_mask_sibling_path,
+    pred_csv_sibling_path, pred_mask_sibling_path,
 )
 from fnt.usv.usv_detector.mad_project import (
     MADProjectConfig, PROJECT_INFO_FILENAME, create_mad_project,
@@ -58,6 +62,12 @@ try:
     PILImage.MAX_IMAGE_PIXELS = None
 except Exception:
     HAS_PIL = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
 
 
 RECENT_PROJECTS_KEY = "mad/recent_projects"
@@ -91,13 +101,22 @@ class MADSpectrogramWidget(SpectrogramWidget):
     # Emitted when SAM prompt points change so the main window can run a
     # (debounced) SAM2 prediction off the UI thread.
     sam_points_changed = pyqtSignal()
+    # Emitted when the scroll wheel changes the brush radius (paint modes),
+    # so the main window can keep its brush-radius spin box in sync.
+    brush_radius_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.paint_mode: Optional[str] = None  # 'brush' | 'eraser' | 'sam' | None
         self.brush_radius_px = 6              # in spec-pixel units
 
+        # Confirmed positives for the current file (uint8 {0,1}), rebuilt on
+        # load from the saved example store. Rendered magenta.
         self.mask: Optional[np.ndarray] = None
+        # Pending (unconfirmed) mask being built by brush / eraser / SAM
+        # (uint8 {0,1}). Rendered pale-yellow fill + outline until the user
+        # confirms it with Enter.
+        self._pending: Optional[np.ndarray] = None
         self.n_freq_bins: Optional[int] = None
         self.n_time_frames: Optional[int] = None
         self.hop: Optional[int] = None
@@ -105,17 +124,16 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self.noverlap: Optional[int] = None
         self.nfft: Optional[int] = None
 
-        # SAM2-assisted labeling state. Prompt points are stored in
-        # full-file spec-pixel coords (t_idx, f_idx); the proposed mask
-        # preview is a boolean crop placed at (t_off, f_off=0).
+        # SAM2 prompt points, in full-file spec-pixel coords (t_idx, f_idx).
+        # The SAM proposal is written into ``self._pending``.
         self._sam_pos_pts: List[tuple] = []
         self._sam_neg_pts: List[tuple] = []
-        self._sam_preview: Optional[np.ndarray] = None
-        self._sam_preview_off: tuple = (0, 0)
 
         self._mask_dirty = False
         self._painting = False
         self._last_paint_idx: Optional[tuple] = None
+        # Accumulated wheel delta for slow, fine brush-radius adjustment.
+        self._wheel_accum = 0
 
         # Cursor preview: screen-space last mouse pos for drawing the
         # brush-radius circle around the cursor in paint mode.
@@ -144,11 +162,13 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self.mask = np.zeros(
             (self.n_freq_bins, self.n_time_frames), dtype=np.uint8
         )
+        self._pending = np.zeros_like(self.mask)
         self._mask_dirty = False
         self.clear_sam_prompts()
         self.update()
 
     def set_mask(self, arr: np.ndarray) -> None:
+        """Replace the confirmed mask (e.g. reconstructed from examples)."""
         if (self.n_freq_bins is None or self.n_time_frames is None):
             self.mask = arr.copy()
             return
@@ -161,6 +181,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
             w = min(arr.shape[1], want_shape[1])
             padded[:h, :w] = arr[:h, :w]
             self.mask = padded
+        self._pending = np.zeros_like(self.mask)
         self._mask_dirty = False
         self.update()
 
@@ -204,7 +225,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
     # --- paint mode ----------------------------------------------------
     def set_paint_mode(self, mode: Optional[str]) -> None:
         if self.paint_mode == 'sam' and mode != 'sam':
-            # Leaving SAM mode discards any in-progress prompt/preview.
+            # Leaving SAM mode drops the prompt points but keeps the pending
+            # mask, so the SAM proposal can be refined with the brush.
             self.clear_sam_prompts()
         self.paint_mode = mode
         if mode in ('brush', 'eraser'):
@@ -302,38 +324,56 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return bool(self._sam_pos_pts or self._sam_neg_pts)
 
     def set_sam_preview(self, mask: Optional[np.ndarray], t_off: int) -> None:
-        """Store a SAM-proposed boolean mask crop for preview rendering."""
-        self._sam_preview = (mask.astype(bool, copy=False)
-                             if mask is not None else None)
-        self._sam_preview_off = (int(t_off), 0)
+        """Write a SAM-proposed boolean mask crop into the pending buffer
+        (replacing it), or clear pending when ``mask`` is None."""
+        if self._pending is None:
+            return
+        self._pending[:] = 0
+        if mask is not None:
+            pv = np.asarray(mask) > 0
+            h, w = pv.shape
+            t0 = max(0, int(t_off))
+            t1 = min(self.n_time_frames, int(t_off) + w)
+            f0, f1 = 0, min(self.n_freq_bins, h)
+            if t1 > t0 and f1 > f0:
+                sub = pv[(f0):(f1), (t0 - int(t_off)):(t1 - int(t_off))]
+                self._pending[f0:f1, t0:t1][sub] = 1
         self.update()
 
     def clear_sam_prompts(self) -> None:
+        """Clear SAM prompt points only (pending mask is preserved)."""
         self._sam_pos_pts = []
         self._sam_neg_pts = []
-        self._sam_preview = None
-        self._sam_preview_off = (0, 0)
         self.update()
 
-    def commit_sam_preview(self) -> bool:
-        """Burn the current SAM preview into ``self.mask`` as positives."""
-        if self._sam_preview is None or self.mask is None:
+    # --- pending mask lifecycle ---------------------------------------
+    def has_pending(self) -> bool:
+        return self._pending is not None and bool(self._pending.any())
+
+    def get_pending(self) -> Optional[np.ndarray]:
+        return self._pending
+
+    def clear_pending(self) -> None:
+        if self._pending is not None:
+            self._pending[:] = 0
+        self.update()
+
+    def pending_bbox(self):
+        """Return (f0, f1, t0, t1) [half-open] of pending pixels, or None."""
+        if self._pending is None or not self._pending.any():
+            return None
+        fs = np.where(self._pending.any(axis=1))[0]
+        ts = np.where(self._pending.any(axis=0))[0]
+        return int(fs[0]), int(fs[-1]) + 1, int(ts[0]), int(ts[-1]) + 1
+
+    def confirm_pending(self) -> bool:
+        """Merge the pending mask into the confirmed buffer and clear pending."""
+        if self.mask is None or self._pending is None or not self._pending.any():
             return False
-        t_off, f_off = self._sam_preview_off
-        pv = self._sam_preview
-        h, w = pv.shape
-        t0 = max(0, t_off)
-        t1 = min(self.n_time_frames, t_off + w)
-        f0 = max(0, f_off)
-        f1 = min(self.n_freq_bins, f_off + h)
-        if t1 <= t0 or f1 <= f0:
-            self.clear_sam_prompts()
-            return False
-        sub = pv[(f0 - f_off):(f1 - f_off), (t0 - t_off):(t1 - t_off)]
-        self.mask[f0:f1, t0:t1][sub] = MASK_POSITIVE
-        self._mask_dirty = True
-        self.clear_sam_prompts()
-        self.stroke_committed.emit()
+        self.mask[self._pending > 0] = MASK_POSITIVE
+        self._pending[:] = 0
+        self._sam_pos_pts = []
+        self._sam_neg_pts = []
         self.update()
         return True
 
@@ -351,9 +391,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return t_idx, f_idx
 
     def _stamp(self, t_idx: int, f_idx: int) -> None:
-        if self.mask is None:
+        # Brush/eraser edit the PENDING mask (confirmed via Enter), not the
+        # confirmed buffer.
+        if self._pending is None:
             return
-        value = MASK_POSITIVE if self.paint_mode == 'brush' else MASK_UNLABELED
+        value = 1 if self.paint_mode == 'brush' else 0
         r = self.brush_radius_px
         t0 = max(0, t_idx - r)
         t1 = min(self.n_time_frames, t_idx + r + 1)
@@ -365,8 +407,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
             np.arange(t0, t1), np.arange(f0, f1), indexing='xy'
         )
         disk = (tt - t_idx) ** 2 + (ff - f_idx) ** 2 <= r ** 2
-        self.mask[f0:f1, t0:t1][disk] = value
-        self._mask_dirty = True
+        self._pending[f0:f1, t0:t1][disk] = value
 
     def _stamp_line(self, a_idx, b_idx):
         """Stamp a line of brush dots between two spec-pixel coords."""
@@ -439,6 +480,28 @@ class MADSpectrogramWidget(SpectrogramWidget):
             self.update()
         super().leaveEvent(event)
 
+    def wheelEvent(self, event):
+        # In paint modes the wheel fine-tunes the brush radius instead of
+        # zooming. One notch (120 units) = ±1 px, accumulated so trackpads
+        # adjust at the same slow rate — easy to tune mid-stroke.
+        if self.paint_mode in ('brush', 'eraser'):
+            self._wheel_accum += event.angleDelta().y()
+            changed = False
+            while self._wheel_accum >= 120:
+                self._wheel_accum -= 120
+                self.brush_radius_px = min(64, self.brush_radius_px + 1)
+                changed = True
+            while self._wheel_accum <= -120:
+                self._wheel_accum += 120
+                self.brush_radius_px = max(1, self.brush_radius_px - 1)
+                changed = True
+            if changed:
+                self.brush_radius_changed.emit(self.brush_radius_px)
+                self.update()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     # --- overlay render -----------------------------------------------
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -468,37 +531,23 @@ class MADSpectrogramWidget(SpectrogramWidget):
         w = t_end - t_start
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
+        pend_view = (self._pending[f_start:f_end, t_start:t_end] > 0
+                     if self._pending is not None else None)
         if self.view_mode == 'mask_only':
-            # Solid dark fill so the spec doesn't show through; then
-            # render positives/negatives at near-full alpha.
+            # Solid dark fill so the spec doesn't show through.
             rgba[:] = (32, 32, 32, 255)
             view_mask = self.mask[f_start:f_end, t_start:t_end]
-            pos = view_mask == MASK_POSITIVE
-            rgba[pos] = (255, 0, 220, 255)
-            # Certified negatives derived from committed columns.
-            committed = committed_columns(self.mask)
-            committed_slice = committed[t_start:t_end]
-            neg_full = np.broadcast_to(
-                committed_slice[np.newaxis, :], view_mask.shape
-            ) & (view_mask == MASK_UNLABELED)
-            rgba[neg_full] = (255, 220, 0, 200)
+            rgba[view_mask == MASK_POSITIVE] = (255, 0, 220, 255)
+            if pend_view is not None:
+                rgba[pend_view] = (255, 230, 90, 255)
         elif self.view_mode == 'overlay':
             view_mask = self.mask[f_start:f_end, t_start:t_end]
-            pos = view_mask == MASK_POSITIVE
             pos_alpha = int(self.mask_alpha * 255)
-            rgba[pos] = (255, 0, 220, pos_alpha)
-            # Yellow tint over committed columns (derived, not stored).
-            committed = committed_columns(self.mask)
-            committed_slice = committed[t_start:t_end]
-            neg_alpha = max(0, pos_alpha - 90)
-            if committed_slice.any():
-                col_idx = np.where(committed_slice)[0]
-                for c in col_idx:
-                    # Dim yellow strip over full freq range of the view.
-                    # Skip pixels that already got painted magenta.
-                    strip = rgba[:, c, :]
-                    not_painted = strip[:, 3] == 0
-                    strip[not_painted] = (255, 220, 0, neg_alpha)
+            # Confirmed positives = magenta.
+            rgba[view_mask == MASK_POSITIVE] = (255, 0, 220, pos_alpha)
+            # Pending (unconfirmed) = pale-yellow fill (outline drawn below).
+            if pend_view is not None:
+                rgba[pend_view] = (255, 230, 90, max(60, pos_alpha - 50))
         # else: 'spec' — leave rgba all-zero so only the spec shows.
 
         # Predicted blob mask shading (cyan, low alpha) if present.
@@ -520,23 +569,6 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     )
                     rgba[active, 3] = np.maximum(rgba[active, 3], cyan_alpha)
 
-        # SAM2 proposed-mask preview (green) — shown in every view mode so
-        # the user can judge the proposal before committing it.
-        if self._sam_preview is not None:
-            pt_off, pf_off = self._sam_preview_off
-            pv = self._sam_preview
-            ph, pw = pv.shape
-            ct0 = max(t_start, pt_off)
-            ct1 = min(t_end, pt_off + pw)
-            cf0 = max(f_start, pf_off)
-            cf1 = min(f_end, pf_off + ph)
-            if ct1 > ct0 and cf1 > cf0:
-                sub = pv[(cf0 - pf_off):(cf1 - pf_off),
-                         (ct0 - pt_off):(ct1 - pt_off)]
-                dst = rgba[(cf0 - f_start):(cf1 - f_start),
-                           (ct0 - t_start):(ct1 - t_start)]
-                dst[sub] = (0, 230, 0, int(self.mask_alpha * 255))
-
         rgba = np.flipud(rgba).copy()
         qimg = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
         scaled = qimg.scaled(
@@ -546,17 +578,40 @@ class MADSpectrogramWidget(SpectrogramWidget):
         painter = QPainter(self)
         painter.drawImage(spec_rect.topLeft(), scaled)
 
+        def _t_to_x(t):
+            frac = (t - t_start) / max(1, (t_end - t_start))
+            return spec_rect.left() + frac * spec_rect.width()
+
+        def _f_to_y(f):
+            frac = (f - f_start) / max(1, (f_end - f_start))
+            return spec_rect.bottom() - frac * spec_rect.height()
+
+        # Thin yellow outline tracing the closed pending mask (MT-style).
+        if (HAS_CV2 and self._pending is not None and pend_view is not None
+                and pend_view.any()):
+            cnts, _ = cv2.findContours(
+                pend_view.astype(np.uint8), cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            pen = QPen(QColor(255, 225, 60))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            for cnt in cnts:
+                if len(cnt) < 2:
+                    continue
+                poly = QPolygonF()
+                for pt in cnt[:, 0, :]:
+                    # contour coords are in the visible slice (x=col, y=row)
+                    poly.append(QPointF(
+                        _t_to_x(t_start + int(pt[0])),
+                        _f_to_y(f_start + int(pt[1])),
+                    ))
+                painter.drawPolygon(poly)
+
         # SAM prompt-point markers (green = positive, red = negative).
         if self.paint_mode == 'sam' and (self._sam_pos_pts or
                                          self._sam_neg_pts):
-            def _t_to_x(t):
-                frac = (t - t_start) / max(1, (t_end - t_start))
-                return spec_rect.left() + frac * spec_rect.width()
-
-            def _f_to_y(f):
-                frac = (f - f_start) / max(1, (f_end - f_start))
-                return spec_rect.bottom() - frac * spec_rect.height()
-
             marks = ([(p, QColor(40, 255, 40)) for p in self._sam_pos_pts] +
                      [(p, QColor(255, 60, 60)) for p in self._sam_neg_pts])
             for (t_idx, f_idx), col in marks:
@@ -1438,6 +1493,11 @@ class MADMainWindow(QMainWindow):
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
+        # Live training graph — created before the tabs so the Train section
+        # can wire its signals; it's placed in the right preview area below and
+        # only shown while training runs (mirrors Mask Tracker).
+        self.train_panel = MADRunPanel(show_plot=True)
+
         # ---------- Left panel: workflow-stage tabs over a shared canvas ----
         # Mask tab = label + train; Inference tab = run + blob review. Both
         # act on the single spectrogram canvas in the right panel. (A future
@@ -1470,7 +1530,6 @@ class MADMainWindow(QMainWindow):
             self._create_project_section,
             self._create_training_data_section,
             self._create_paint_tools_section,
-            self._create_view_section,
             self._create_training_section,
         ])
         inference_tab = _make_tab([
@@ -1491,7 +1550,15 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.zoom_requested.connect(self._on_wheel_zoom)
         self.spectrogram.stroke_committed.connect(self._on_stroke_committed)
         self.spectrogram.sam_points_changed.connect(self._on_sam_points_changed)
+        self.spectrogram.brush_radius_changed.connect(
+            self._on_brush_radius_scrolled
+        )
         right_layout.addWidget(self.spectrogram, 1)
+
+        # Live training graph occupies the same area as the spectrogram while
+        # a run is active (hidden otherwise).
+        self.train_panel.setVisible(False)
+        right_layout.addWidget(self.train_panel, 1)
 
         self.waveform_overview = WaveformOverviewWidget()
         self.waveform_overview.view_changed.connect(self._on_overview_clicked)
@@ -1499,6 +1566,7 @@ class MADMainWindow(QMainWindow):
 
         # Scrollbar + pan row
         scroll_bar_row = QWidget()
+        self._scroll_bar_row = scroll_bar_row
         scroll_layout = QHBoxLayout(scroll_bar_row)
         scroll_layout.setContentsMargins(5, 2, 5, 2)
         scroll_layout.setSpacing(2)
@@ -1526,6 +1594,7 @@ class MADMainWindow(QMainWindow):
 
         # Controls row
         controls_bar = QWidget()
+        self._controls_bar = controls_bar
         controls_layout = QHBoxLayout(controls_bar)
         controls_layout.setContentsMargins(5, 2, 5, 2)
         controls_layout.setSpacing(4)
@@ -1726,16 +1795,35 @@ class MADMainWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_paint_tools_section(self, layout):
-        group = QGroupBox("3. Paint Tools")
+        group = QGroupBox("3. Labeling Tools")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
+
+        # SAM2-assisted labeling is the primary tool — listed first.
+        sam_row = QHBoxLayout()
+        sam_row.setSpacing(2)
+        self.btn_sam = QPushButton("SAM Labeling (G)")
+        self.btn_sam.setToolTip(
+            "SAM2-assisted labeling — left-click a call to propose a mask,\n"
+            "right-click to add a negative point. Enter accepts, Esc clears.\n"
+            "First use offers any SAM2 models in LocalModels/, or downloads "
+            "one.\nShortcut: G"
+        )
+        self.btn_sam.setCheckable(True)
+        self.btn_sam.clicked.connect(self._on_sam_clicked)
+        self.btn_sam.setEnabled(False)
+        sam_row.addWidget(self.btn_sam)
+        sam_row.addStretch()
+        vbox.addLayout(sam_row)
 
         mode_row = QHBoxLayout()
         mode_row.setSpacing(2)
 
-        self.btn_paint = QPushButton("Brush (B)")
+        self.btn_paint = QPushButton("Manual Labeling (B)")
         self.btn_paint.setToolTip(
-            "Paint target USV pixels (left-click + drag)\n"
+            "Manually paint target USV pixels with the brush "
+            "(left-click + drag).\n"
+            "Scroll the wheel over the spectrogram to fine-tune brush size.\n"
             "Shortcut: B"
         )
         self.btn_paint.setCheckable(True)
@@ -1745,7 +1833,7 @@ class MADMainWindow(QMainWindow):
 
         self.btn_erase = QPushButton("Eraser (E)")
         self.btn_erase.setToolTip(
-            "Erase painted pixels\n"
+            "Erase painted pixels (scroll to resize)\n"
             "Shortcut: E"
         )
         self.btn_erase.setCheckable(True)
@@ -1760,29 +1848,6 @@ class MADMainWindow(QMainWindow):
         mode_row.addWidget(self.btn_clear_mask)
 
         vbox.addLayout(mode_row)
-
-        # SAM2-assisted labeling row.
-        sam_row = QHBoxLayout()
-        sam_row.setSpacing(2)
-        self.btn_sam = QPushButton("SAM (G)")
-        self.btn_sam.setToolTip(
-            "SAM2-assisted labeling — left-click a call to propose a mask,\n"
-            "right-click to add a negative point. Enter accepts, Esc clears.\n"
-            "Shortcut: G"
-        )
-        self.btn_sam.setCheckable(True)
-        self.btn_sam.clicked.connect(self._on_sam_clicked)
-        self.btn_sam.setEnabled(False)
-        sam_row.addWidget(self.btn_sam)
-
-        self.btn_sam_model = QPushButton("SAM2 Model…")
-        self.btn_sam_model.setToolTip(
-            "Download or select a SAM2 checkpoint for assisted labeling"
-        )
-        self.btn_sam_model.clicked.connect(self._on_sam_model_setup)
-        sam_row.addWidget(self.btn_sam_model)
-        sam_row.addStretch()
-        vbox.addLayout(sam_row)
 
         brush_row = QHBoxLayout()
         brush_row.setSpacing(2)
@@ -1811,31 +1876,17 @@ class MADMainWindow(QMainWindow):
         )
         vbox.addWidget(self.lbl_mask_status)
 
-        hint = QLabel(
-            "Connected painted regions define 'committed' time bands;\n"
-            "any unpainted pixel inside those bands becomes certified negative."
-        )
-        hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
-
-        group.setLayout(vbox)
-        layout.addWidget(group)
-
-    def _create_view_section(self, layout):
-        group = QGroupBox("4. Mask View")
-        vbox = QVBoxLayout()
-        vbox.setSpacing(4)
-
-        row = QHBoxLayout()
-        row.setSpacing(2)
+        # --- View mode (merged in from the former "Mask View" section) ---
+        view_row = QHBoxLayout()
+        view_row.setSpacing(2)
+        view_row.addWidget(QLabel("View:"))
         self.btn_view_spec = QPushButton("Spec")
         self.btn_view_spec.setCheckable(True)
         self.btn_view_spec.setToolTip("Spectrogram only — hide mask overlay")
         self.btn_view_spec.clicked.connect(
             lambda: self._set_view_mode('spec')
         )
-        row.addWidget(self.btn_view_spec)
+        view_row.addWidget(self.btn_view_spec)
 
         self.btn_view_overlay = QPushButton("Spec + Mask")
         self.btn_view_overlay.setCheckable(True)
@@ -1846,23 +1897,25 @@ class MADMainWindow(QMainWindow):
         self.btn_view_overlay.clicked.connect(
             lambda: self._set_view_mode('overlay')
         )
-        row.addWidget(self.btn_view_overlay)
+        view_row.addWidget(self.btn_view_overlay)
 
-        self.btn_view_mask = QPushButton("Mask Only")
+        self.btn_view_mask = QPushButton("Mask (M)")
         self.btn_view_mask.setCheckable(True)
         self.btn_view_mask.setToolTip(
-            "Hide spectrogram — show paint + committed-band negatives only"
+            "Hide spectrogram — show confirmed + pending masks only\n"
+            "Shortcut: M (toggles back to Spec + Mask)"
         )
         self.btn_view_mask.clicked.connect(
             lambda: self._set_view_mode('mask_only')
         )
-        row.addWidget(self.btn_view_mask)
-
-        vbox.addLayout(row)
+        view_row.addWidget(self.btn_view_mask)
+        view_row.addStretch()
+        vbox.addLayout(view_row)
 
         hint = QLabel(
-            "Magenta = positives you painted · Yellow = certified\n"
-            "negatives (columns inside committed bands) · Cyan = predicted"
+            "Yellow = pending (Enter to confirm, pick a class) · Magenta = "
+            "confirmed call · Cyan = model prediction. Confirmed calls save as "
+            "self-contained training examples."
         )
         hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
         hint.setWordWrap(True)
@@ -1940,7 +1993,7 @@ class MADMainWindow(QMainWindow):
 
     def _create_training_section(self, layout):
         from PyQt5.QtWidgets import QLineEdit
-        group = QGroupBox("5. Train Model")
+        group = QGroupBox("4. Train Model")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
         form = QFormLayout()
@@ -2019,21 +2072,20 @@ class MADMainWindow(QMainWindow):
 
         self.btn_train = QPushButton("Train")
         self.btn_train.setToolTip(
-            "Train on every file with painted labels. Only time regions you\n"
-            "have committed contribute supervision."
+            "Train on every confirmed call. The live loss graph appears in the\n"
+            "spectrogram area while training runs."
         )
         self.btn_train.clicked.connect(self._on_inline_train)
         self.btn_train.setEnabled(False)
         vbox.addWidget(self.btn_train)
 
-        self.train_panel = MADRunPanel(show_plot=True)
-        self.train_panel.run_finished.connect(
-            lambda ok: self.btn_train.setEnabled(self._project is not None)
-        )
+        # The live training graph (self.train_panel) lives in the right-hand
+        # preview area (built in _build_ui) and is only shown while training
+        # runs — mirroring Mask Tracker. Here we just wire its signals.
+        self.train_panel.run_finished.connect(self._on_training_finished)
         self.train_panel.cancel_requested.connect(
             lambda: self.status_bar.showMessage("Stopping training…")
         )
-        vbox.addWidget(self.train_panel)
 
         group.setLayout(vbox)
         layout.addWidget(group)
@@ -2117,7 +2169,7 @@ class MADMainWindow(QMainWindow):
         is_hrnet = self.combo_arch.currentData() == "hrnet"
         self.combo_train_encoder.setEnabled(not is_hrnet)
 
-    def _build_inline_train_config(self, labeled: List[str]):
+    def _build_inline_train_config(self):
         from fnt.usv.usv_detector.mad_training import UNetTrainingConfig
         sp = self._spec_params()
         return UNetTrainingConfig(
@@ -2133,31 +2185,45 @@ class MADMainWindow(QMainWindow):
             device=self.combo_train_device.currentText(),
             nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
             db_min=sp['db_min'], db_max=sp['db_max'],
-            wav_paths=list(labeled),
+            training_data_dir=self._project.training_data_dir,
         )
 
     def _on_inline_train(self):
         if self._project is None:
             QMessageBox.information(self, "No project", "Open a MAD project first.")
             return
-        self._auto_save_mask_if_dirty()
-        labeled = self._labeled_wavs()
-        if not labeled:
+        from fnt.usv.usv_detector.mad_examples import count_examples
+        n_examples = count_examples(self._project.training_data_dir)
+        if n_examples == 0:
             QMessageBox.warning(
-                self, "No labels",
-                "No wav files have sibling _FNT_MAD_labels.png yet.\n"
-                "Paint or SAM-label some USV pixels first."
+                self, "No training examples",
+                "No confirmed calls yet. Label a call (brush or SAM) and press "
+                "Enter to confirm it before training."
             )
             return
-        cfg = self._build_inline_train_config(labeled)
+        cfg = self._build_inline_train_config()
         post_scope = None
         if self.chk_post_inference.isChecked():
             post_scope = ('current'
                           if self.combo_post_scope.currentIndex() == 0 else 'all')
         self.btn_train.setEnabled(False)
+        self._set_training_view(True)
         self.train_panel.start_run()
         self._start_training(cfg, post_inference_scope=post_scope,
                              reporter=self.train_panel)
+
+    def _set_training_view(self, active: bool):
+        """Swap the right-hand preview between the spectrogram and the live
+        training graph (mirrors Mask Tracker: the graph replaces the preview
+        while a run is active)."""
+        self.train_panel.setVisible(active)
+        for w in (self.spectrogram, self.waveform_overview,
+                  self._scroll_bar_row, self._controls_bar):
+            w.setVisible(not active)
+
+    def _on_training_finished(self, ok: bool):
+        self.btn_train.setEnabled(self._project is not None)
+        self._set_training_view(False)
 
     def _default_model_path(self) -> Optional[str]:
         if self._project and self._project.models:
@@ -2207,6 +2273,7 @@ class MADMainWindow(QMainWindow):
             save_mask_png=self.chk_infer_save_mask.isChecked(),
             save_blob_csv=self.chk_infer_save_csv.isChecked(),
             preserve_labels=self.chk_infer_preserve.isChecked(),
+            training_data_dir=self._project.training_data_dir,
         )
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()
@@ -2302,10 +2369,11 @@ class MADMainWindow(QMainWindow):
         make(Qt.Key_P, self._shortcut_prev_file)
         make(Qt.Key_B, self._shortcut_toggle_brush)
         make(Qt.Key_E, self._shortcut_toggle_eraser)
+        make(Qt.Key_M, self._shortcut_mask_view)
         make(Qt.Key_G, self._shortcut_toggle_sam)
-        make(Qt.Key_Return, self._sam_accept)
-        make(Qt.Key_Enter, self._sam_accept)
-        make(Qt.Key_Escape, self._sam_clear)
+        make(Qt.Key_Return, self._confirm_pending)
+        make(Qt.Key_Enter, self._confirm_pending)
+        make(Qt.Key_Escape, self._clear_pending)
         make(Qt.Key_Space, self._shortcut_toggle_playback)
         make("[", self._shortcut_brush_smaller)
         make("]", self._shortcut_brush_bigger)
@@ -2366,6 +2434,14 @@ class MADMainWindow(QMainWindow):
         self.btn_erase.setChecked(new_state)
         self._on_eraser_clicked(new_state)
 
+    def _shortcut_mask_view(self):
+        # M toggles the Mask-only view (back to Spec + Mask).
+        if self._focus_is_edit():
+            return
+        mode = ('overlay' if self.spectrogram.view_mode == 'mask_only'
+                else 'mask_only')
+        self._set_view_mode(mode)
+
     def _shortcut_toggle_sam(self):
         if self._focus_is_edit():
             return
@@ -2421,13 +2497,22 @@ class MADMainWindow(QMainWindow):
         )
         if not parent_dir:
             return
+        # Re-prompt for a different name as long as the target folder exists,
+        # pre-filling a sensible non-colliding suggestion. The user can keep
+        # editing or Cancel out entirely.
         project_dir = os.path.join(parent_dir, name)
-        if os.path.exists(project_dir):
-            QMessageBox.warning(
-                self, "Project exists",
-                f"A directory named '{name}' already exists in:\n{parent_dir}"
+        while os.path.exists(project_dir):
+            suggestion = self._suggest_project_name(parent_dir, name)
+            new_name, ok = QInputDialog.getText(
+                self, "Project name already exists",
+                f"A project folder named '{name}' already exists in:\n"
+                f"{parent_dir}\n\nEnter a different project name:",
+                text=suggestion,
             )
-            return
+            if not ok or not new_name.strip():
+                return
+            name = new_name.strip()
+            project_dir = os.path.join(parent_dir, name)
         try:
             cfg = create_mad_project(project_dir)
         except Exception as e:
@@ -2437,6 +2522,22 @@ class MADMainWindow(QMainWindow):
         self._activate_project(cfg)
         self._remember_recent(project_dir)
         self.status_bar.showMessage(f"Created project: {project_dir}")
+
+    @staticmethod
+    def _suggest_project_name(parent_dir: str, base: str) -> str:
+        """Return the first ``base``-derived name with no existing folder in
+        ``parent_dir``. A trailing number is incremented (``mad_v1`` →
+        ``mad_v2``); otherwise ``_v2``, ``_v3``… is appended."""
+        import re
+        m = re.match(r'^(.*?)(\d+)$', base)
+        if m:
+            stem, start = m.group(1), int(m.group(2)) + 1
+        else:
+            stem, start = f"{base}_v", 2
+        n = start
+        while os.path.exists(os.path.join(parent_dir, f"{stem}{n}")):
+            n += 1
+        return f"{stem}{n}"
 
     def _menu_open_project(self):
         config_path, _ = QFileDialog.getOpenFileName(
@@ -2707,6 +2808,9 @@ class MADMainWindow(QMainWindow):
             self.waveform_overview.set_audio_data(
                 self.audio_data, self.sample_rate
             )
+            self.waveform_overview.set_view_range(
+                self.spectrogram.view_start, self.spectrogram.view_end
+            )
             self._init_or_load_mask_for_current_file()
             self._sync_scrollbar_from_view()
             if self._project is not None:
@@ -2734,8 +2838,8 @@ class MADMainWindow(QMainWindow):
         self._update_playback_buttons_enabled()
 
     def _init_or_load_mask_for_current_file(self):
-        """Initialize an empty mask at the project's spec-pixel resolution,
-        then overwrite it from the sibling PNG if one exists."""
+        """Initialize the spec-pixel grid, then rebuild the confirmed mask for
+        this file from the saved example store (no sibling PNG / WAV needed)."""
         if (self._project is None or self.audio_data is None or
                 self.sample_rate is None):
             return
@@ -2745,59 +2849,38 @@ class MADMainWindow(QMainWindow):
             sample_rate=self.sample_rate,
             nperseg=cfg.nperseg, noverlap=cfg.noverlap, nfft=cfg.nfft,
         )
-        wav_path = self.audio_files[self.current_file_idx]
-        png_path = _mask_sibling_path(wav_path)
-        if os.path.isfile(png_path):
-            try:
-                arr = _load_mask_png(png_path)
-                self.spectrogram.set_mask(arr)
-                self.lbl_mask_status.setText(
-                    f"Loaded: {os.path.basename(png_path)}"
-                )
-            except Exception as e:
-                self.lbl_mask_status.setText(f"Load failed: {e}")
+        from fnt.usv.usv_detector.mad_examples import reconstruct_file_mask
+        wav_name = os.path.basename(self.audio_files[self.current_file_idx])
+        grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
+        try:
+            confirmed = reconstruct_file_mask(cfg.training_data_dir, wav_name, grid)
+        except Exception:
+            confirmed = None
+        if confirmed is not None and confirmed.any():
+            self.spectrogram.set_mask(confirmed)
+            self.lbl_mask_status.setText(
+                f"Loaded confirmed calls for {wav_name}"
+            )
         else:
             self.lbl_mask_status.setText(
-                "Empty mask — start painting to label"
+                "No labels yet — paint or SAM a call, then Enter to confirm"
             )
 
     def _save_current_mask(self):
-        if (self._project is None or not self.audio_files or
-                self.spectrogram.mask is None):
-            return
-        if not HAS_PIL:
-            QMessageBox.critical(
-                self, "PIL missing",
-                "Pillow is required to save MAD masks. Install with:\n"
-                "    pip install pillow"
-            )
-            return
-        wav_path = self.audio_files[self.current_file_idx]
-        png_path = _mask_sibling_path(wav_path)
-        try:
-            _save_mask_png(png_path, self.spectrogram.mask)
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
-            return
-        self.spectrogram._mask_dirty = False
-        self.lbl_mask_status.setText(f"Saved: {os.path.basename(png_path)}")
-        self.status_bar.showMessage(f"Saved mask → {png_path}")
+        # Labels are now saved per-call as training examples on confirm (Enter);
+        # there is no per-file mask to write. Kept so the Ctrl+S menu/no-ops.
+        self.status_bar.showMessage(
+            "Labels are saved automatically when you confirm a call (Enter)."
+        )
 
     def _auto_save_mask_if_dirty(self):
-        if (self._project is None or not self.audio_files or
-                self.spectrogram.mask is None or
-                not self.spectrogram.is_mask_dirty() or
-                not HAS_PIL):
-            return
-        try:
-            self._save_current_mask()
-        except Exception:
-            pass
+        # No-op: confirmed calls persist as examples at confirm time.
+        return
 
     def _on_stroke_committed(self):
-        """A paint stroke just ended — persist the mask to its sibling
-        PNG so the user never has to click Save explicitly."""
-        self._auto_save_mask_if_dirty()
+        # A brush stroke just ended; nothing to persist until the user
+        # confirms the pending mask with Enter.
+        return
 
     # ==================================================================
     # Paint tools
@@ -2843,30 +2926,69 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     # SAM2-assisted labeling
     # ==================================================================
-    def _on_sam_model_setup(self):
-        """Open the shared SAM2 checkpoint dialog and remember the choice."""
+    def _pick_sam_checkpoint(self) -> bool:
+        """Choose a SAM2 checkpoint, mirroring Mask Tracker.
+
+        Offers any checkpoints already present in ``LocalModels/`` (plus the
+        download option); if none are found, prompts to download one (saved
+        to ``LocalModels/``). Sets ``self._sam_ckpt`` / ``self._sam_cfg_name``
+        and returns True on success.
+        """
         try:
             from fnt.videoTracking.sam2_checkpoint_manager import (
-                get_sam2_checkpoint,
+                SAM2_CHECKPOINTS, LOCAL_MODELS_DIR, _LEGACY_DIRS,
+                _find_existing_checkpoints,
             )
         except Exception as e:
             QMessageBox.critical(
                 self, "SAM2 unavailable",
                 f"Could not load the SAM2 checkpoint manager:\n{e}"
             )
-            return
+            return False
+
+        found = _find_existing_checkpoints(LOCAL_MODELS_DIR, *_LEGACY_DIRS)
+        if found:
+            names = list(found.keys())
+            descriptions = [
+                f"{n} ({SAM2_CHECKPOINTS.get(n, {}).get('size_mb', '?')} MB)"
+                for n in names
+            ]
+            download_label = "Download additional model…"
+            descriptions.append(download_label)
+            choice, ok = QInputDialog.getItem(
+                self, "Select SAM2 Model",
+                "Found existing SAM2 model(s) in LocalModels. Select one:",
+                descriptions, 0, False,
+            )
+            if not ok:
+                return False
+            if choice == download_label:
+                return self._download_sam_checkpoint()
+            name = names[descriptions.index(choice)]
+            self._sam_ckpt = str(found[name])
+            self._sam_cfg_name = SAM2_CHECKPOINTS.get(name, {}).get("config")
+            return True
+
+        reply = QMessageBox.question(
+            self, "SAM2 Model Required",
+            "No SAM2 model found in LocalModels. Download one?\n\n"
+            "(Requires the sam2 package:\n"
+            "  pip install git+https://github.com/facebookresearch/sam2.git)",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            return self._download_sam_checkpoint()
+        return False
+
+    def _download_sam_checkpoint(self) -> bool:
+        """Open the shared SAM2 download dialog (saves to LocalModels)."""
+        from fnt.videoTracking.sam2_checkpoint_manager import get_sam2_checkpoint
         ckpt_path, cfg_name = get_sam2_checkpoint(parent=self)
         if not ckpt_path:
-            return
+            return False
         self._sam_ckpt = str(ckpt_path)
         self._sam_cfg_name = cfg_name
-        # Force a fresh segmenter so the new checkpoint takes effect.
-        self._sam_segmenter = None
-        self._sam_ready = False
-        self._sam_img_sig = None
-        self.status_bar.showMessage(
-            f"SAM2 model selected: {Path(self._sam_ckpt).name}"
-        )
+        return True
 
     def _on_sam_clicked(self, checked: bool):
         if not checked:
@@ -2886,14 +3008,11 @@ class MADMainWindow(QMainWindow):
 
     def _ensure_sam_model(self) -> bool:
         """Make sure a SAM2 segmenter exists and is loading/loaded. Returns
-        False if the user has not chosen a checkpoint yet."""
+        False if the user declined to choose/download a checkpoint."""
+        if self._sam_segmenter is not None:
+            return True  # already created (loading or loaded)
         if not self._sam_ckpt:
-            QMessageBox.information(
-                self, "SAM2 model needed",
-                "Choose a SAM2 checkpoint first (the 'SAM2 Model…' button)."
-            )
-            self._on_sam_model_setup()
-            if not self._sam_ckpt:
+            if not self._pick_sam_checkpoint():
                 return False
         if self._sam_segmenter is None:
             try:
@@ -2991,35 +3110,128 @@ class MADMainWindow(QMainWindow):
             self._sam_predict_pending = False
             self._run_sam_predict()
 
-    def _sam_accept(self):
-        if self.spectrogram.paint_mode != 'sam':
+    def _confirm_pending(self):
+        """Enter — confirm the pending mask (manual or SAM): ask for a class,
+        save it as a self-contained training example, then merge it into the
+        confirmed buffer."""
+        sg = self.spectrogram
+        if not sg.has_pending() or self._project is None or \
+                self.audio_data is None:
             return
-        if self.spectrogram.commit_sam_preview():
-            # The spectrogram image is unchanged, so the cached embedding
-            # stays valid for the next call on the same view.
-            self.lbl_mask_status.setText("SAM mask added (saved)")
-            self.status_bar.showMessage(
-                "SAM mask committed — click the next call"
-            )
+        classes = list(self._project.classes) or ["USV"]
+        last = self._project.last_class or classes[0]
+        if last not in classes:
+            classes = [last] + classes
+        cur_idx = classes.index(last)
+        name, ok = QInputDialog.getItem(
+            self, "Confirm call", "Call type (Enter to reuse):",
+            classes, cur_idx, True,
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name not in self._project.classes:
+            self._project.classes.append(name)
+        self._project.last_class = name
+        try:
+            self._save_pending_as_example(name)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed",
+                                 f"Could not save training example:\n{e}")
+            return
+        try:
+            self._project.save()
+        except Exception:
+            pass
+        sg.confirm_pending()
+        self.lbl_mask_status.setText(f"Confirmed call — class '{name}'")
+        self.status_bar.showMessage(
+            f"Saved training example (class '{name}') — label the next call"
+        )
 
-    def _sam_clear(self):
-        if self.spectrogram.paint_mode != 'sam':
+    def _save_pending_as_example(self, class_name: str) -> None:
+        from datetime import datetime
+        from scipy import signal as _signal
+        from fnt.usv.usv_detector.mad_dataset import spec_to_image
+        from fnt.usv.usv_detector.mad_examples import save_example
+
+        sg = self.spectrogram
+        cfg = self._project
+        bbox = sg.pending_bbox()
+        if bbox is None:
             return
-        self.spectrogram.clear_sam_prompts()
-        self.status_bar.showMessage("SAM prompts cleared")
+        f0, f1, t0, t1 = bbox
+        hop = sg.hop
+        nperseg, nfft = cfg.nperseg, cfg.nfft
+        n_time, n_freq = sg.n_time_frames, sg.n_freq_bins
+        sr = self.sample_rate
+        margin = 64  # ~quarter tile of time-frame context around the call
+        pt0 = max(0, t0 - margin)
+        pt1 = min(n_time, t1 + margin)
+
+        start_sample = pt0 * hop
+        end_sample = min(len(self.audio_data), (pt1 - 1) * hop + nperseg)
+        segment = self.audio_data[start_sample:end_sample]
+        if len(segment) < nperseg:
+            raise RuntimeError("call window too short to compute a patch")
+        noverlap = min(cfg.noverlap, nperseg - 1)
+        _f, _t, Sxx = _signal.spectrogram(
+            segment, fs=sr, nperseg=nperseg, noverlap=noverlap,
+            nfft=nfft, window='hann',
+        )
+        spec_db = 10.0 * np.log10(Sxx + 1e-10)
+        spec_patch = spec_to_image(spec_db, cfg.db_min, cfg.db_max)
+        W = spec_patch.shape[1]
+
+        # Target = all confirmed positives ∪ this pending mask, within the
+        # patch window — so adjacent confirmed calls aren't marked negative.
+        combined = np.maximum(sg.mask, sg.get_pending())
+        mask_patch = np.zeros((n_freq, W), dtype=np.uint8)
+        src = combined[:, pt0:min(n_time, pt0 + W)]
+        mask_patch[:, :src.shape[1]] = src[:n_freq, :]
+
+        df = (sr / 2.0) / (nfft // 2)   # Hz per freq bin
+        dt = hop / float(sr)            # seconds per time frame
+        wav_name = os.path.basename(self.audio_files[self.current_file_idx])
+        meta = {
+            'class': class_name,
+            'source_wav': wav_name,
+            'patch_t_off': int(pt0), 'patch_f_off': 0,
+            't_start_s': round(t0 * dt, 6), 't_stop_s': round(t1 * dt, 6),
+            'patch_t0_s': round(pt0 * dt, 6), 'patch_t1_s': round(pt1 * dt, 6),
+            'f_low_hz': round(f0 * df, 2), 'f_high_hz': round(f1 * df, 2),
+            'patch_t_frames': int(W), 'f_bins': int(n_freq),
+            'nperseg': nperseg, 'noverlap': cfg.noverlap, 'nfft': nfft,
+            'sample_rate': int(sr),
+            'db_min': cfg.db_min, 'db_max': cfg.db_max,
+            'created': datetime.now().isoformat(timespec='seconds'),
+        }
+        save_example(cfg.training_data_dir, spec_patch, mask_patch, meta)
+
+    def _clear_pending(self):
+        sg = self.spectrogram
+        if sg.has_pending() or sg.has_sam_prompts():
+            sg.clear_pending()
+            sg.clear_sam_prompts()
+            self.status_bar.showMessage("Pending mask cleared")
 
     def _on_clear_clicked(self):
-        if self.spectrogram.mask is None:
+        # Discards the in-progress pending mask. Confirmed calls are saved
+        # examples and are not affected (delete them in the training_data
+        # folder if needed).
+        if not self.spectrogram.has_pending():
+            self.status_bar.showMessage("Nothing pending to clear.")
             return
-        reply = QMessageBox.question(
-            self, "Clear mask",
-            "Erase all paint on the current file?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
-        self.spectrogram.clear_mask()
-        self.lbl_mask_status.setText("Mask cleared (unsaved)")
+        self.spectrogram.clear_pending()
+        self.spectrogram.clear_sam_prompts()
+        self.lbl_mask_status.setText("Pending mask cleared")
+
+    def _on_brush_radius_scrolled(self, value: int):
+        # Reflect a wheel-driven radius change in the spin box without
+        # re-triggering set_brush_radius (the widget already applied it).
+        self.spin_brush_radius.blockSignals(True)
+        self.spin_brush_radius.setValue(value)
+        self.spin_brush_radius.blockSignals(False)
 
     # ==================================================================
     # Spectrogram view controls
@@ -3132,6 +3344,11 @@ class MADMainWindow(QMainWindow):
         else:
             self.spectrogram.spec_image = None
         self.spectrogram.update()
+        # Keep the overview's viewport highlight in sync with the zoom window
+        # (single chokepoint — every zoom/pan path routes through here).
+        self.waveform_overview.set_view_range(
+            self.spectrogram.view_start, self.spectrogram.view_end
+        )
 
     # ==================================================================
     # Playback (mirrors CAD/DAD)
@@ -3274,27 +3491,10 @@ class MADMainWindow(QMainWindow):
         )
 
     def _menu_run_training(self):
-        if self._project is None:
-            QMessageBox.information(self, "No project", "Open a MAD project first.")
-            return
-        self._auto_save_mask_if_dirty()
-        labeled = self._labeled_wavs()
-        if not labeled:
-            QMessageBox.warning(
-                self, "No labels",
-                "No wav files have sibling _FNT_MAD_labels.png yet.\n"
-                "Paint some USV pixels on at least one file first."
-            )
-            return
-        dlg = RunTrainingDialog(
-            self, self._project.project_dir, labeled, self._spec_params(),
-        )
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        cfg = dlg.build_config()
-        post_scope = (dlg.post_inference_scope()
-                      if dlg.post_inference_requested() else None)
-        self._start_training(cfg, post_inference_scope=post_scope)
+        # Training lives inline in the Mask tab — route the menu/shortcut there
+        # so there's a single code path using the current architecture/params.
+        self.left_tabs.setCurrentIndex(0)
+        self._on_inline_train()
 
     def _start_training(self, cfg, post_inference_scope: Optional[str] = None,
                         reporter=None):
@@ -3483,6 +3683,8 @@ class MADMainWindow(QMainWindow):
             save_mask_png=True,
             save_blob_csv=True,
             preserve_labels=True,
+            training_data_dir=(self._project.training_data_dir
+                               if self._project else ""),
         )
         self._start_inference(cfg, wavs)
 
