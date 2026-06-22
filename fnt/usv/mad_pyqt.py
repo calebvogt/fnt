@@ -1147,7 +1147,7 @@ class RunTrainingDialog(QDialog):
 
         self.spin_patience = QSpinBox()
         self.spin_patience.setRange(0, 200)
-        self.spin_patience.setValue(8)
+        self.spin_patience.setValue(20)
         self.spin_patience.setSingleStep(10)
         self.spin_patience.setToolTip(
             "Stop training when validation loss fails to improve for this "
@@ -2211,7 +2211,7 @@ class MADMainWindow(QMainWindow):
         layout.addWidget(group)
 
     def _create_training_data_section(self, layout):
-        group = QGroupBox("1. Add Audio Recordings")
+        group = QGroupBox("1. Project Audio")
         self._grp_training_data = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
@@ -2295,12 +2295,12 @@ class MADMainWindow(QMainWindow):
         # SAM2-assisted labeling is the primary tool — listed first.
         sam_row = QHBoxLayout()
         sam_row.setSpacing(2)
-        self.btn_sam = QPushButton("SAM Labeling (G)")
+        self.btn_sam = QPushButton("SAM Labeling (S)")
         self.btn_sam.setToolTip(
             "SAM2-assisted labeling — left-click a call to propose a mask,\n"
             "right-click to add a negative point. Enter accepts, Esc clears.\n"
             "First use offers any SAM2 models in LocalModels/, or downloads "
-            "one.\nShortcut: G"
+            "one.\nShortcut: S"
         )
         self.btn_sam.setCheckable(True)
         self.btn_sam.setStyleSheet(self._ACTIVE_TOOL_QSS)
@@ -2471,7 +2471,7 @@ class MADMainWindow(QMainWindow):
 
         self.spin_train_patience = QSpinBox()
         self.spin_train_patience.setRange(0, 200)
-        self.spin_train_patience.setValue(8)
+        self.spin_train_patience.setValue(20)
         self.spin_train_patience.setSingleStep(10)
         self.spin_train_patience.setToolTip(
             "<b>Early-stop patience</b>: stop if validation loss doesn't improve "
@@ -2556,6 +2556,15 @@ class MADMainWindow(QMainWindow):
         self.btn_train.clicked.connect(self._on_inline_train)
         self.btn_train.setEnabled(False)
         vbox.addWidget(self.btn_train)
+
+        self.btn_quick_infer = QPushButton("Run Inference (I)")
+        self.btn_quick_infer.setToolTip(
+            "Run inference on the current file using the latest trained model.\n"
+            "Produces h5 predictions only (no CSV). Shortcut: I"
+        )
+        self.btn_quick_infer.clicked.connect(self._quick_inference_current_file)
+        self.btn_quick_infer.setEnabled(False)
+        vbox.addWidget(self.btn_quick_infer)
 
         # Inline post-training inference progress (replaces the old popup) —
         # shown below the Train button only while auto-inference runs.
@@ -2702,10 +2711,9 @@ class MADMainWindow(QMainWindow):
         s = {}
         nav = QHBoxLayout()
         nav.setSpacing(2)
-        s['prev'] = QPushButton("Back (B)")
+        s['prev'] = QPushButton("Back")
         s['prev'].setToolTip(
-            "Go to the previous prediction (centers + white-highlights it).\n"
-            "Shortcut: B")
+            "Go to the previous prediction (centers + white-highlights it).")
         s['prev'].clicked.connect(self._pred_prev)
         nav.addWidget(s['prev'])
         s['nav_lbl'] = QLabel("0/0 predictions")
@@ -2735,10 +2743,10 @@ class MADMainWindow(QMainWindow):
         s['reject'].setStyleSheet(self._review_btn_qss("#8a2c2c", "#a83636"))
         s['reject'].clicked.connect(self._reject_current_pred)
         row.addWidget(s['reject'])
-        s['skip'] = QPushButton("Skip (S)")
+        s['skip'] = QPushButton("Skip")
         s['skip'].setToolTip(
             "Leave this prediction pending and advance to the next one (no "
-            "decision recorded).<br>Shortcut: S")
+            "decision recorded).")
         s['skip'].setStyleSheet(self._review_btn_qss("#5a5a5a", "#6a6a6a"))
         s['skip'].clicked.connect(self._skip_current_pred)
         row.addWidget(s['skip'])
@@ -2938,6 +2946,7 @@ class MADMainWindow(QMainWindow):
             self.spectrogram._selected_ann_idx = None
             self.spectrogram.update()
             return
+        self._dismiss_training_view()
         data = current.data(0, Qt.UserRole)
         if not data:
             return
@@ -3371,6 +3380,7 @@ class MADMainWindow(QMainWindow):
         self._pred_review_idx = 0 if n_added > 0 else None
         self._refresh_annotation_list()
         self._update_pred_review_widgets()
+        self._update_file_list_counts()
         if n_added:
             self._jump_to_pred(0)
             self._log(f"Loaded {n_added} prediction(s) for "
@@ -3710,9 +3720,15 @@ class MADMainWindow(QMainWindow):
                   self._scroll_bar_row, self._controls_bar):
             w.setVisible(not active)
 
+    def _dismiss_training_view(self):
+        """Hide the training graph if it's still showing (user clicked a file
+        or detection after training finished)."""
+        if self.train_panel.isVisible():
+            self._set_training_view(False)
+
     def _on_training_finished(self, ok: bool):
         self.btn_train.setEnabled(bool(self.audio_files))
-        self._set_training_view(False)
+        self.btn_quick_infer.setEnabled(self._latest_model_path() is not None)
 
     def _default_model_path(self) -> Optional[str]:
         if self._project and self._project.models:
@@ -4039,11 +4055,11 @@ class MADMainWindow(QMainWindow):
         # instead of QShortcuts, so they work even when a scrollbar, list, or
         # button holds focus and would otherwise swallow the arrow key. Up/Down
         # are fully dedicated to zoom; B/N navigate predictions instead.
-        make(Qt.Key_B, self._shortcut_pred_prev)   # Back through predictions
+        make(Qt.Key_B, self._shortcut_toggle_brush)   # Brush tool
         make(Qt.Key_N, self._shortcut_pred_next)   # Next prediction
         make(Qt.Key_E, self._shortcut_toggle_eraser)
         make(Qt.Key_M, self._shortcut_mask_view)
-        make(Qt.Key_G, self._shortcut_toggle_sam)
+        make(Qt.Key_S, self._shortcut_toggle_sam)
         make(Qt.Key_U, self._undo_last)
         make(Qt.Key_Return, self._confirm_pending)
         make(Qt.Key_Enter, self._confirm_pending)
@@ -4055,7 +4071,6 @@ class MADMainWindow(QMainWindow):
         make("D", self._delete_selected_annotation)
         make("A", lambda: self._shortcut_review('accepted'))
         make("R", lambda: self._shortcut_review('rejected'))
-        make("S", lambda: self._shortcut_review('skipped'))
         make("+", self._shortcut_speed_up)
         make("=", self._shortcut_speed_up)
         make("-", self._shortcut_speed_down)
@@ -4386,6 +4401,7 @@ class MADMainWindow(QMainWindow):
         self.act_load_pred.setEnabled(True)
         self.act_clear_pred.setEnabled(True)
         self.btn_train.setEnabled(True)
+        self.btn_quick_infer.setEnabled(self._latest_model_path() is not None)
         self.btn_infer_run.setEnabled(True)
         self._set_train_sections_enabled(True)
         if self.audio_files:
@@ -4596,6 +4612,17 @@ class MADMainWindow(QMainWindow):
                     pred_counts[os.path.basename(fp)] = n_pending
         except Exception:
             pass
+        # Count in-memory prediction annotations (covers h5-only inference
+        # previews where no CSV exists).
+        if hasattr(self, 'spectrogram') and self.audio_files:
+            cur_wav = os.path.basename(
+                self.audio_files[self.current_file_idx])
+            n_mem = sum(1 for a in self.spectrogram.annotations
+                        if a.get('status') == 'prediction')
+            if n_mem > 0 and cur_wav not in pred_counts:
+                pred_counts[cur_wav] = n_mem
+            elif n_mem > 0:
+                pred_counts[cur_wav] = max(pred_counts[cur_wav], n_mem)
         self.file_list.blockSignals(True)
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
@@ -4648,6 +4675,7 @@ class MADMainWindow(QMainWindow):
     def _on_file_selected(self, row: int):
         if 0 <= row < len(self.audio_files):
             if row != self.current_file_idx:
+                self._dismiss_training_view()
                 self._auto_save_mask_if_dirty()
                 self.current_file_idx = row
                 self._load_current_file()
@@ -4667,9 +4695,16 @@ class MADMainWindow(QMainWindow):
             return
         rows = sorted({self.file_list.row(item) for item in sel}, reverse=True)
         n = len(rows)
+        in_project = (self._project is not None and
+                      hasattr(self._project, 'recordings_dir'))
+        if in_project:
+            msg = (f"This will remove {n} file(s) from the project and "
+                   f"delete them from the recordings folder.\nAre you sure?")
+        else:
+            msg = (f"This will remove {n} file(s) from the list.\n"
+                   f"Are you sure?")
         reply = QMessageBox.question(
-            self, "Remove Files",
-            f"This will remove {n} file(s) from the list.\nAre you sure?",
+            self, "Remove Files", msg,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -4681,10 +4716,24 @@ class MADMainWindow(QMainWindow):
         for r in rows:
             del self.audio_files[r]
         if self._project is not None:
+            rec_dir = self._project.recordings_dir
             proj_set = set(removed_paths)
             self._project.audio_files = [
                 p for p in self._project.audio_files if p not in proj_set
             ]
+            for rp in removed_paths:
+                if os.path.normpath(os.path.dirname(rp)) == os.path.normpath(rec_dir):
+                    try:
+                        os.remove(rp)
+                    except OSError:
+                        pass
+                    try:
+                        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+                        h5 = masks_sibling_path(rp)
+                        if os.path.isfile(h5):
+                            os.remove(h5)
+                    except OSError:
+                        pass
             try:
                 self._project.save()
             except Exception:

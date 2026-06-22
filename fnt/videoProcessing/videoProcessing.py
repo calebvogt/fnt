@@ -34,6 +34,7 @@ class VideoProcessorWorker(QThread):
     """Worker thread for video processing to avoid blocking the GUI"""
     progress_update = pyqtSignal(str)  # status message
     file_progress = pyqtSignal(int, int)  # current file, total files
+    results_update = pyqtSignal(int, int, int)  # completed, failed, skipped
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
@@ -201,6 +202,7 @@ class VideoProcessorWorker(QThread):
                         f"Skipping (already processed): {os.path.basename(video_file)}"
                     )
                     skipped_count += 1
+                    self.results_update.emit(processed_count, failed_count, skipped_count)
                     continue
 
                 self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
@@ -213,6 +215,7 @@ class VideoProcessorWorker(QThread):
                 elif not self.should_stop:
                     failed_count += 1
                     self._copy_to_failed(video_file, parent_dir)
+                self.results_update.emit(processed_count, failed_count, skipped_count)
 
             # Build summary
             if self.should_stop:
@@ -892,7 +895,12 @@ class VideoProcessingGUI(QMainWindow):
         # File progress
         self.file_progress_label = QLabel("Ready to start...")
         group_layout.addWidget(self.file_progress_label)
-        
+
+        self.results_label = QLabel("")
+        self.results_label.setStyleSheet("color: #999999;")
+        self.results_label.setVisible(False)
+        group_layout.addWidget(self.results_label)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         group_layout.addWidget(self.progress_bar)
@@ -1072,10 +1080,12 @@ class VideoProcessingGUI(QMainWindow):
         self.add_videos_btn.setEnabled(False)
         self.clear_dirs_btn.setEnabled(False)
         
-        # Show progress bar
+        # Show progress bar and reset results
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        
+        self.results_label.setText("")
+        self.results_label.setVisible(False)
+
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
@@ -1101,6 +1111,7 @@ class VideoProcessingGUI(QMainWindow):
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
+        self.worker.results_update.connect(self.update_results)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
         self.worker.finished.connect(self.processing_finished)
         self.worker.start()
@@ -1116,6 +1127,18 @@ class VideoProcessingGUI(QMainWindow):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         self.file_progress_label.setText(f"Processing file {current} of {total}")
+
+    def update_results(self, completed, failed, skipped):
+        """Update running tally of completed/failed/skipped videos"""
+        parts = []
+        if completed > 0:
+            parts.append(f"✅ {completed} completed")
+        if failed > 0:
+            parts.append(f"❌ {failed} failed")
+        if skipped > 0:
+            parts.append(f"⏭ {skipped} skipped")
+        self.results_label.setText("  |  ".join(parts))
+        self.results_label.setVisible(True)
     
     def log_message(self, message):
         """Add message to status log"""
