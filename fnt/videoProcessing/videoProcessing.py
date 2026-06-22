@@ -22,7 +22,7 @@ try:
         QFrame, QSizePolicy, QScrollArea
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPainterPath
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -391,7 +391,9 @@ class VideoProcessorWorker(QThread):
         
         # Build FFmpeg command with SLEAP-compatible settings
         cmd = [
-            "ffmpeg", "-y", "-nostdin",           # Overwrite output, disable interactive input
+            "ffmpeg", "-y", "-nostdin",
+            "-hwaccel", "none",
+            "-threads", "4",
             "-i", input_file,
             "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
             "-preset", self.preset,              # User-selected speed preset
@@ -464,8 +466,37 @@ class VideoProcessingGUI(QMainWindow):
         self.selected_dirs = []
         self.selected_videos = []
         self.worker = None
+        self._arrow_paths = self._create_arrow_images()
         self.init_ui()
     
+    @staticmethod
+    def _create_arrow_images():
+        """Create small arrow PNG files for stylesheet use (CSS border-triangles don't render on Windows Qt)."""
+        import tempfile
+        arrow_dir = os.path.join(tempfile.gettempdir(), "fnt_arrows")
+        os.makedirs(arrow_dir, exist_ok=True)
+        paths = {}
+        for name, points in [
+            ("up", [(2, 8), (6, 2), (10, 8)]),
+            ("down", [(2, 2), (6, 8), (10, 2)]),
+        ]:
+            path = os.path.join(arrow_dir, f"{name}.png")
+            if not os.path.exists(path):
+                pix = QPixmap(12, 10)
+                pix.fill(Qt.transparent)
+                p = QPainter(pix)
+                p.setRenderHint(QPainter.Antialiasing)
+                tri = QPainterPath()
+                tri.moveTo(points[0][0], points[0][1])
+                tri.lineTo(points[1][0], points[1][1])
+                tri.lineTo(points[2][0], points[2][1])
+                tri.closeSubpath()
+                p.fillPath(tri, QColor("#ffffff"))
+                p.end()
+                pix.save(path, "PNG")
+            paths[name] = path.replace("\\", "/")
+        return paths
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroToolbox")
@@ -473,16 +504,18 @@ class VideoProcessingGUI(QMainWindow):
         self.setMinimumSize(700, 600)
         
         # Set application style - Dark Mode
-        self.setStyleSheet("""
-            QMainWindow {
+        up_arrow = self._arrow_paths["up"]
+        down_arrow = self._arrow_paths["down"]
+        self.setStyleSheet(f"""
+            QMainWindow {{
                 background-color: #2b2b2b;
                 color: #cccccc;
-            }
-            QWidget {
+            }}
+            QWidget {{
                 background-color: #2b2b2b;
                 color: #cccccc;
-            }
-            QPushButton {
+            }}
+            QPushButton {{
                 background-color: #0078d4;
                 color: white;
                 border: none;
@@ -490,42 +523,42 @@ class VideoProcessingGUI(QMainWindow):
                 border-radius: 4px;
                 font-weight: bold;
                 min-height: 20px;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: #106ebe;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background-color: #005a9e;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 background-color: #3f3f3f;
                 color: #888888;
-            }
-            QGroupBox {
+            }}
+            QGroupBox {{
                 font-weight: bold;
                 border: 1px solid #3f3f3f;
                 border-radius: 4px;
                 margin-top: 10px;
                 padding-top: 8px;
                 color: #cccccc;
-            }
-            QGroupBox::title {
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px 0 5px;
-            }
-            QLabel {
+            }}
+            QLabel {{
                 color: #cccccc;
                 background-color: transparent;
-            }
-            QSpinBox, QComboBox {
+            }}
+            QSpinBox, QComboBox {{
                 padding: 5px;
                 border: 1px solid #3f3f3f;
                 border-radius: 3px;
                 background-color: #1e1e1e;
                 color: #cccccc;
-            }
-            QSpinBox::up-button {
+            }}
+            QSpinBox::up-button {{
                 subcontrol-origin: border;
                 subcontrol-position: top right;
                 width: 20px;
@@ -533,8 +566,8 @@ class VideoProcessingGUI(QMainWindow):
                 border: 1px solid #555555;
                 border-bottom: none;
                 border-top-right-radius: 3px;
-            }
-            QSpinBox::down-button {
+            }}
+            QSpinBox::down-button {{
                 subcontrol-origin: border;
                 subcontrol-position: bottom right;
                 width: 20px;
@@ -542,27 +575,21 @@ class VideoProcessingGUI(QMainWindow):
                 border: 1px solid #555555;
                 border-top: none;
                 border-bottom-right-radius: 3px;
-            }
-            QSpinBox::up-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-bottom: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+            }}
+            QSpinBox::up-arrow {{
+                image: url({up_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QSpinBox::down-arrow {{
+                image: url({down_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
                 background-color: #0078d4;
-            }
-            QComboBox::drop-down {
+            }}
+            QComboBox::drop-down {{
                 subcontrol-origin: padding;
                 subcontrol-position: center right;
                 width: 22px;
@@ -570,51 +597,48 @@ class VideoProcessingGUI(QMainWindow):
                 background-color: #3f3f3f;
                 border-top-right-radius: 3px;
                 border-bottom-right-radius: 3px;
-            }
-            QComboBox::drop-down:hover {
+            }}
+            QComboBox::drop-down:hover {{
                 background-color: #0078d4;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 6px solid transparent;
-                border-right: 6px solid transparent;
-                border-top: 7px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QComboBox QAbstractItemView {
+            }}
+            QComboBox::down-arrow {{
+                image: url({down_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QComboBox QAbstractItemView {{
                 background-color: #1e1e1e;
                 color: #cccccc;
                 selection-background-color: #0078d4;
                 border: 1px solid #3f3f3f;
-            }
-            QCheckBox {
+            }}
+            QCheckBox {{
                 color: #cccccc;
                 spacing: 8px;
-            }
-            QTextEdit {
+            }}
+            QTextEdit {{
                 background-color: #1e1e1e;
                 border: 1px solid #3f3f3f;
                 color: #cccccc;
-            }
-            QProgressBar {
+            }}
+            QProgressBar {{
                 border: 1px solid #3f3f3f;
                 border-radius: 3px;
                 text-align: center;
                 background-color: #1e1e1e;
                 color: #cccccc;
-            }
-            QProgressBar::chunk {
+            }}
+            QProgressBar::chunk {{
                 background-color: #0078d4;
-            }
-            QScrollArea {
+            }}
+            QScrollArea {{
                 border: none;
                 background-color: #2b2b2b;
-            }
-            QFrame {
+            }}
+            QFrame {{
                 background-color: #2b2b2b;
                 border-color: #3f3f3f;
-            }
+            }}
         """)
         
         # Create central widget and main layout

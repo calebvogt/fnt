@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog, QSpinBox,
-    QSplitter, QSlider
+    QSplitter, QSlider, QTextEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QColor, QPolygon
@@ -1891,13 +1891,13 @@ class ROIToolGUI(QMainWindow):
         splitter.setChildrenCollapsible(False)
 
         left_panel = self.create_left_panel()
-        left_panel.setMinimumWidth(380)
+        left_panel.setMinimumWidth(440)
         splitter.addWidget(left_panel)
 
         right_panel = self.create_right_panel()
         splitter.addWidget(right_panel)
 
-        splitter.setSizes([420, 780])
+        splitter.setSizes([480, 720])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
@@ -1970,7 +1970,13 @@ class ROIToolGUI(QMainWindow):
         self.btn_add_videos = QPushButton("🎬 Add Video(s)")
         self.btn_add_videos.clicked.connect(self.add_videos)
         btn_layout.addWidget(self.btn_add_videos)
-        
+
+        self.btn_remove_video = QPushButton("✕ Remove")
+        self.btn_remove_video.clicked.connect(self.remove_selected_video)
+        self.btn_remove_video.setEnabled(False)
+        self.btn_remove_video.setToolTip("Remove the selected video from the list")
+        btn_layout.addWidget(self.btn_remove_video)
+
         self.btn_clear_videos = QPushButton("🗑️ Clear All")
         self.btn_clear_videos.clicked.connect(self.clear_videos)
         btn_layout.addWidget(self.btn_clear_videos)
@@ -2304,17 +2310,17 @@ class ROIToolGUI(QMainWindow):
         layout.addWidget(queue_label)
         
         self.queue_list = QListWidget()
-        self.queue_list.setMaximumHeight(150)
+        self.queue_list.setMinimumHeight(80)
         self.queue_list.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333333;")
-        layout.addWidget(self.queue_list)
-        
+        layout.addWidget(self.queue_list, 1)
+
         # Processing buttons
         btn_layout = QHBoxLayout()
         self.btn_process = QPushButton("Start Batch Processing")
         self.btn_process.clicked.connect(self.start_processing)
         self.btn_process.setEnabled(False)
         btn_layout.addWidget(self.btn_process)
-        
+
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setStyleSheet(
             "QPushButton { background-color: #c62828; }"
@@ -2325,12 +2331,30 @@ class ROIToolGUI(QMainWindow):
         self.btn_cancel.setEnabled(False)
         btn_layout.addWidget(self.btn_cancel)
         layout.addLayout(btn_layout)
-        
+
         self.progress_bar = QProgressBar()
         layout.addWidget(self.progress_bar)
-        
+
         self.lbl_status = QLabel("Ready")
         layout.addWidget(self.lbl_status)
+
+        # Processing status log
+        log_label = QLabel("Processing Status Log:")
+        log_label.setStyleSheet("color: #999999; font-style: italic; font-size: 10px; margin-top: 5px;")
+        layout.addWidget(log_label)
+
+        self.processing_log = QTextEdit()
+        self.processing_log.setReadOnly(True)
+        self.processing_log.setMinimumHeight(100)
+        self.processing_log.setStyleSheet(
+            "background-color: #1a1a1a; border: 1px solid #333333; "
+            "color: #cccccc; font-family: monospace; font-size: 10px;"
+        )
+        layout.addWidget(self.processing_log, 1)
+
+        self.btn_copy_log = QPushButton("Copy Logs to Clipboard")
+        self.btn_copy_log.clicked.connect(self._copy_log_to_clipboard)
+        layout.addWidget(self.btn_copy_log)
         
         group.setLayout(layout)
         return group
@@ -2545,6 +2569,37 @@ class ROIToolGUI(QMainWindow):
             QMessageBox.warning(self, "No Matches",
                               f"None of the {len(video_files)} selected video(s) have matching SLEAP or Mask Tracker data")
     
+    def remove_selected_video(self):
+        """Remove the currently selected video from the list."""
+        if not self.video_configs:
+            return
+        idx = self.video_list.currentRow()
+        if idx < 0:
+            return
+
+        if idx in self.processing_queue:
+            queue_pos = self.processing_queue.index(idx)
+            self.processing_queue.remove(idx)
+            self.queue_list.takeItem(queue_pos)
+        self.processing_queue = [i - 1 if i > idx else i for i in self.processing_queue]
+
+        self.video_configs.pop(idx)
+        self.video_list.takeItem(idx)
+
+        if not self.video_configs:
+            self.current_config_idx = 0
+            self.preview_label.clear()
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            self.btn_add_to_queue.setEnabled(False)
+            self.btn_remove_video.setEnabled(False)
+            self.btn_process.setEnabled(len(self.processing_queue) > 0)
+            return
+
+        new_row = min(idx, len(self.video_configs) - 1)
+        self.video_list.setCurrentRow(new_row)
+        self.btn_process.setEnabled(len(self.processing_queue) > 0)
+
     def clear_videos(self):
         """Clear all videos."""
         self.video_configs.clear()
@@ -2555,6 +2610,7 @@ class ROIToolGUI(QMainWindow):
         self.preview_label.clear()
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(False)
+        self.btn_remove_video.setEnabled(False)
         self.btn_add_to_queue.setEnabled(False)
         self.btn_process.setEnabled(False)
     
@@ -3609,6 +3665,7 @@ class ROIToolGUI(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.btn_add_to_queue.setEnabled(False)
+        self.processing_log.clear()
 
         # Mark all queue items as pending
         for i in range(self.queue_list.count()):
@@ -3657,13 +3714,20 @@ class ROIToolGUI(QMainWindow):
                 item.setText(f"● {text}")
                 item.setForeground(QColor("#e8e857"))
     
+    def _copy_log_to_clipboard(self):
+        """Copy processing log to clipboard."""
+        QApplication.clipboard().setText(self.processing_log.toPlainText())
+        self.lbl_status.setText("Logs copied to clipboard")
+
     def update_status(self, message: str):
-        """Update status label."""
+        """Update status label and append to processing log."""
         self.lbl_status.setText(message)
+        self.processing_log.append(message)
     
     def on_video_finished(self, video_idx, success, message):
         """Handle video processing completion."""
         self.lbl_status.setText(message)
+        self.processing_log.append(message)
         if video_idx < self.queue_list.count():
             item = self.queue_list.item(video_idx)
             text = item.text().lstrip("○● ✔✘ ")
@@ -3679,14 +3743,15 @@ class ROIToolGUI(QMainWindow):
         self.btn_process.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.progress_bar.setValue(100 if success else 0)
-        
+        self.processing_log.append(message)
+
         # Clear the processing queue and queue list
         self.processing_queue.clear()
         self.queue_list.clear()
-        
+
         # Re-update config status to enable "Add to Queue" button if current video is configured
         self.update_config_status()
-        
+
         QMessageBox.information(self, "Complete", message)
 
 
