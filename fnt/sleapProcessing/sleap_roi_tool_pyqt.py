@@ -2616,6 +2616,7 @@ class ROIToolGUI(QMainWindow):
     
     def on_video_selected(self, row):
         """Handle video selection."""
+        self.btn_remove_video.setEnabled(row >= 0)
         if row >= 0 and row < len(self.video_configs):
             self.current_config_idx = row
             self.load_current_video()
@@ -3665,6 +3666,7 @@ class ROIToolGUI(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.btn_add_to_queue.setEnabled(False)
+        self.btn_remove_video.setEnabled(False)
         self.processing_log.clear()
 
         # Mark all queue items as pending
@@ -3742,6 +3744,7 @@ class ROIToolGUI(QMainWindow):
         """Handle all processing completion."""
         self.btn_process.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.btn_remove_video.setEnabled(self.video_list.currentRow() >= 0)
         self.progress_bar.setValue(100 if success else 0)
         self.processing_log.append(message)
 
