@@ -314,8 +314,8 @@ class FNTMainWindow(QMainWindow):
         self.create_uwb_tab()
         self.create_rfid_tab()
         self.create_fed_tab()
-        self.create_wifp_tab()
         self.create_imaging_tab()
+        self.create_wifp_tab()
         self.create_musestudio_tab()
         self.create_utilities_tab()
         
@@ -481,7 +481,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_usv_tab(self):
         """Create the USV processing tab"""
-        tab, layout = self._make_scrollable_tab("USV")
+        tab, layout = self._make_scrollable_tab("Audio")
 
         # Description
         desc = QLabel("Ultrasonic vocalization analysis tools")
@@ -508,9 +508,8 @@ class FNTMainWindow(QMainWindow):
         analysis_layout = QGridLayout()
 
         analysis_buttons = [
-            ("Classic Audio Detector", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
-            ("Mask Audio Detector", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
-            ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
+            ("Classic Audio Detector (CAD)", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
+            ("Mask Audio Detector (MAD)", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
         ]
 
         self.create_button_grid(analysis_layout, analysis_buttons)
@@ -738,7 +737,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_musestudio_tab(self):
         """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
-        tab, layout = self._make_scrollable_tab("MuseStudio")
+        tab, layout = self._make_scrollable_tab("EEG+fNIRS")
 
         desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
@@ -1058,16 +1057,6 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Classic Audio Detector failed: {str(e)}")
 
-    def run_deep_audio_detector(self):
-        """Launch Deep Audio Detector - ML model training and inference"""
-        try:
-            from fnt.usv.deep_audio_detector import DeepAudioDetectorWindow
-
-            self.dad_window = DeepAudioDetectorWindow()
-            self.dad_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Deep Audio Detector failed: {str(e)}")
-
     def run_mask_audio_detector(self):
         """Launch Mask Audio Detector - segmentation-based labeling, training, inference"""
         try:
@@ -1077,16 +1066,6 @@ class FNTMainWindow(QMainWindow):
             self.mad_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Mask Audio Detector failed: {str(e)}")
-
-    def run_usv_studio(self):
-        """Launch USV Studio - DEPRECATED, use Classic/Deep Audio Detector instead"""
-        try:
-            from fnt.usv.usv_studio_pyqt import USVStudioWindow
-
-            self.usv_studio_window = USVStudioWindow()
-            self.usv_studio_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"USV Studio failed: {str(e)}")
 
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""

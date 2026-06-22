@@ -2,7 +2,7 @@
 Shared audio visualization widgets for USV detection tools.
 
 Contains SpectrogramWidget and WaveformOverviewWidget, used by both
-the Classic Audio Detector and the Deep Audio Detector.
+the Classic Audio Detector and the Mask Audio Detector.
 """
 
 import math

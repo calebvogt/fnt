@@ -1,16 +1,9 @@
 """MAD (Mask Audio Detector) — full shell.
 
-PyQt5 entry point for mask-based segmentation labeling / training /
-inference. Parallels CAD/DAD in ergonomics:
-
-* Project scaffolding + file navigation + spectrogram view
-* Playback (Play/Stop, slow-down slider, Space)
-* CAD/DAD keyboard shortcuts (←/→ pan, ↑/↓ zoom, N/B file prev-next)
-* Brush / Eraser painting of pixel-level USV masks, with sibling-PNG
-  persistence (``<base>_FNT_MAD_labels.png``)
-
-Training (Phase 3) and blob-review inference (Phase 4) land later via
-the Predict menu.
+PyQt5 entry point for mask-based segmentation labeling, training, and
+inference. Two-tab architecture: Label & Train (build the project) and
+Inference (deploy a trained model). Per-wav h5 storage, project-free
+startup, CAD-style keyboard shortcuts.
 
 Run directly:
     python fnt/usv/mad_pyqt.py
@@ -1448,7 +1441,7 @@ class MADRunProgressDialog(QDialog):
 
     When ``show_plot=True`` (set by the training path), the dialog also
     embeds a live matplotlib canvas plotting per-batch training loss and
-    per-epoch validation loss — SLEAP / DAD style.
+    per-epoch validation loss — SLEAP style.
     """
 
     cancel_requested = pyqtSignal()
@@ -3824,7 +3817,7 @@ class MADMainWindow(QMainWindow):
         predict_menu.addAction(self.act_clear_pred)
 
     # ------------------------------------------------------------------
-    # Keyboard shortcuts (CAD/DAD parity)
+    # Keyboard shortcuts (CAD parity)
     # ------------------------------------------------------------------
     def _setup_shortcuts(self):
         def make(key, slot):
@@ -5425,7 +5418,7 @@ class MADMainWindow(QMainWindow):
         )
 
     # ==================================================================
-    # Playback (mirrors CAD/DAD)
+    # Playback (mirrors CAD)
     # ==================================================================
     def _update_playback_buttons_enabled(self):
         has_audio = self.audio_data is not None and HAS_SOUNDDEVICE

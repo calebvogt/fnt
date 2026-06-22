@@ -1650,8 +1650,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_accept.setObjectName("accept_btn")
         self.btn_accept.setToolTip(
             "Mark current detection as a valid USV call (A key).\n"
-            "Accepted calls are written to <wav>_FNT_CAD_detections.csv and can\n"
-            "later be imported into DAD for model training."
+            "Accepted calls are written to <wav>_FNT_CAD_detections.csv."
         )
         self.btn_accept.clicked.connect(self.accept_detection)
         self.btn_accept.setEnabled(False)
