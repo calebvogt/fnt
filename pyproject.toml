@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnt"
-version = "0.1.7"
+version = "0.1.8"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
