@@ -65,28 +65,20 @@ def save_example(
                      otherwise.
 
     Returns the example id.
+
+    New examples are written to the consolidated ``training_data.h5`` store;
+    legacy PNG/JSON triplets remain readable (see :func:`iter_examples`).
     """
-    _require_pil()
+    from . import fnt_mask_store as _ms
     d = Path(dataset_dir)
     d.mkdir(parents=True, exist_ok=True)
+    return _ms.td_save_example(_store_path(dataset_dir), spec_patch, mask_patch,
+                               meta, example_id)
 
-    if example_id is None:
-        stem = Path(str(meta.get("source_wav", "ex"))).stem
-        example_id = f"{stem}_{uuid.uuid4().hex[:10]}"
 
-    spec = np.asarray(spec_patch)
-    if spec.dtype != np.uint8:
-        spec = np.clip(spec, 0.0, 1.0)
-        spec = (spec * 255.0).round().astype(np.uint8)
-    mask = (np.asarray(mask_patch) > 0).astype(np.uint8) * 255
-
-    _PILImage.fromarray(spec, mode="L").save(d / f"{example_id}.png")
-    _PILImage.fromarray(mask, mode="L").save(d / f"{example_id}_mask.png")
-    meta = dict(meta)
-    meta["id"] = example_id
-    with open(d / f"{example_id}.json", "w") as f:
-        json.dump(meta, f, indent=2)
-    return example_id
+def _store_path(dataset_dir: str) -> str:
+    """Path to the consolidated HDF5 example store for a dataset dir."""
+    return str(Path(dataset_dir) / "training_data.h5")
 
 
 # ----------------------------------------------------------------------
@@ -97,11 +89,8 @@ def _load_png_gray(path: Path) -> np.ndarray:
     return np.asarray(_PILImage.open(path).convert("L"))
 
 
-def iter_examples(dataset_dir: str) -> Iterator[Dict]:
-    """Yield example dicts ``{meta, spec, mask}`` for every example on disk.
-
-    ``spec`` is float32 in [0, 1]; ``mask`` is float32 {0, 1}.
-    """
+def _iter_legacy_examples(dataset_dir: str) -> Iterator[Dict]:
+    """Yield examples from legacy PNG/JSON triplets (pre-h5 storage)."""
     d = Path(dataset_dir)
     if not d.is_dir():
         return
@@ -121,14 +110,34 @@ def iter_examples(dataset_dir: str) -> Iterator[Dict]:
         yield {"meta": meta, "spec": spec, "mask": mask}
 
 
+def iter_examples(dataset_dir: str) -> Iterator[Dict]:
+    """Yield example dicts ``{meta, spec, mask}`` from the consolidated h5 store
+    **and** any legacy PNG/JSON triplets (h5 wins on id collision).
+
+    ``spec`` is float32 in [0, 1]; ``mask`` is float32 {0, 1}.
+    """
+    from . import fnt_mask_store as _ms
+    seen = set()
+    for ex in _ms.td_iter_examples(_store_path(dataset_dir)):
+        seen.add(ex["meta"].get("id"))
+        yield ex
+    for ex in _iter_legacy_examples(dataset_dir):
+        if ex["meta"].get("id") not in seen:
+            yield ex
+
+
 def count_examples(dataset_dir: str) -> int:
+    from . import fnt_mask_store as _ms
+    n = _ms.td_count(_store_path(dataset_dir))
+    # add legacy triplets not already in the h5 (ids are unique uuids)
     d = Path(dataset_dir)
-    if not d.is_dir():
-        return 0
-    return sum(
-        1 for j in d.glob("*.json")
-        if (d / f"{j.stem}.png").is_file() and (d / f"{j.stem}_mask.png").is_file()
-    )
+    if d.is_dir():
+        n += sum(
+            1 for j in d.glob("*.json")
+            if (d / f"{j.stem}.png").is_file()
+            and (d / f"{j.stem}_mask.png").is_file()
+        )
+    return n
 
 
 def list_classes(dataset_dir: str) -> List[str]:
@@ -139,6 +148,151 @@ def list_classes(dataset_dir: str) -> List[str]:
         if c and c not in seen:
             seen.append(c)
     return seen
+
+
+# ----------------------------------------------------------------------
+# Edit / delete
+# ----------------------------------------------------------------------
+def delete_example(dataset_dir: str, example_id: str) -> None:
+    """Remove an example from the h5 store and/or its legacy triplet."""
+    from . import fnt_mask_store as _ms
+    _ms.td_delete(_store_path(dataset_dir), example_id)
+    d = Path(dataset_dir)
+    for suffix in (".png", "_mask.png", ".json"):
+        p = d / f"{example_id}{suffix}"
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def update_example_class(dataset_dir: str, example_id: str, new_class: str) -> None:
+    """Rewrite an example's class label (h5 store, else legacy sidecar)."""
+    from . import fnt_mask_store as _ms
+    sp = _store_path(dataset_dir)
+    if example_id in _ms.td_list_ids(sp):
+        _ms.td_update_class(sp, example_id, new_class)
+        return
+    p = Path(dataset_dir) / f"{example_id}.json"
+    if not p.is_file():
+        return
+    with open(p) as f:
+        meta = json.load(f)
+    meta["class"] = new_class
+    with open(p, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def update_example_mask(
+    dataset_dir: str, example_id: str, mask_patch: np.ndarray,
+    meta_updates: Optional[Dict] = None,
+) -> None:
+    """Overwrite an example's mask (h5 store, else legacy PNG) + merge metadata."""
+    from . import fnt_mask_store as _ms
+    sp = _store_path(dataset_dir)
+    if example_id in _ms.td_list_ids(sp):
+        _ms.td_update_mask(sp, example_id, mask_patch, meta_updates)
+        return
+    _require_pil()
+    d = Path(dataset_dir)
+    mask = (np.asarray(mask_patch) > 0).astype(np.uint8) * 255
+    _PILImage.fromarray(mask, mode="L").save(d / f"{example_id}_mask.png")
+    if meta_updates:
+        p = d / f"{example_id}.json"
+        meta = {}
+        if p.is_file():
+            with open(p) as f:
+                meta = json.load(f)
+        meta.update(meta_updates)
+        with open(p, "w") as f:
+            json.dump(meta, f, indent=2)
+
+
+# ----------------------------------------------------------------------
+# Legacy → HDF5 migration
+# ----------------------------------------------------------------------
+def has_legacy_examples(dataset_dir: str) -> bool:
+    """True if any legacy PNG/JSON example triplets are present."""
+    d = Path(dataset_dir)
+    if not d.is_dir():
+        return False
+    for j in d.glob("*.json"):
+        if (d / f"{j.stem}.png").is_file() and (d / f"{j.stem}_mask.png").is_file():
+            return True
+    return False
+
+
+def migrate_legacy_to_h5(dataset_dir: str) -> int:
+    """Move legacy triplets into ``training_data.h5`` and archive the originals
+    to ``legacy_pre_h5/``. Returns the number of examples migrated."""
+    from . import fnt_mask_store as _ms
+    import shutil
+    d = Path(dataset_dir)
+    if not d.is_dir():
+        return 0
+    sp = _store_path(dataset_dir)
+    archive = d / "legacy_pre_h5"
+    n = 0
+    for ex in list(_iter_legacy_examples(dataset_dir)):
+        meta = ex["meta"]
+        ex_id = meta.get("id")
+        try:
+            _ms.td_save_example(sp, ex["spec"], ex["mask"], meta, ex_id)
+            archive.mkdir(exist_ok=True)
+            for suffix in (".png", "_mask.png", ".json"):
+                p = d / f"{ex_id}{suffix}"
+                if p.exists():
+                    shutil.move(str(p), str(archive / p.name))
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+# ----------------------------------------------------------------------
+# Per-file annotations (one object per saved example)
+# ----------------------------------------------------------------------
+def iter_file_annotations(
+    dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
+):
+    """Yield one annotation dict per example belonging to ``wav_name``::
+
+        {id, category, f0, f1, t0, t1, mask}
+
+    where ``(f0,f1,t0,t1)`` is the half-open bbox on the full spec grid and
+    ``mask`` is the bool crop for that bbox. ``grid_shape`` is
+    ``(n_freq_bins, n_time_frames)`` used to clip to the current file grid.
+    """
+    n_freq, n_time = grid_shape
+    target = Path(str(wav_name)).name
+    for ex in iter_examples(dataset_dir):
+        meta = ex["meta"]
+        if Path(str(meta.get("source_wav", ""))).name != target:
+            continue
+        m = ex["mask"] > 0
+        if not m.any():
+            continue
+        t_off = int(meta.get("patch_t_off") or 0)
+        f_off = int(meta.get("patch_f_off") or 0)
+        fs = np.where(m.any(axis=1))[0]
+        ts = np.where(m.any(axis=0))[0]
+        lf0, lf1 = int(fs[0]), int(fs[-1]) + 1
+        lt0, lt1 = int(ts[0]), int(ts[-1]) + 1
+        # Full-grid bbox, clipped to grid.
+        f0 = max(0, f_off + lf0)
+        f1 = min(n_freq, f_off + lf1)
+        t0 = max(0, t_off + lt0)
+        t1 = min(n_time, t_off + lt1)
+        if f1 <= f0 or t1 <= t0:
+            continue
+        local = m[lf0:lf0 + (f1 - f0), lt0:lt0 + (t1 - t0)]
+        yield {
+            "id": meta.get("id", ex.get("meta", {}).get("id")),
+            "category": meta.get("class", ""),
+            "f0": f0, "f1": f1, "t0": t0, "t1": t1,
+            "mask": np.ascontiguousarray(local),
+        }
 
 
 # ----------------------------------------------------------------------
@@ -160,8 +314,8 @@ def reconstruct_file_mask(
         meta = ex["meta"]
         if Path(str(meta.get("source_wav", ""))).name != target:
             continue
-        t_off = int(meta.get("patch_t_off", 0))
-        f_off = int(meta.get("patch_f_off", 0))
+        t_off = int(meta.get("patch_t_off") or 0)
+        f_off = int(meta.get("patch_f_off") or 0)
         m = ex["mask"] > 0
         h, w = m.shape
         t0 = max(0, t_off)

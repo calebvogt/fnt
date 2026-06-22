@@ -36,6 +36,9 @@ class MADProjectConfig:
     project_dir: str = ""
     project_name: str = ""
     source_folders: List[str] = field(default_factory=list)
+    # Individually added .wav files (via "Add Files…") — persisted so they
+    # reappear when the project is reopened, alongside source_folders.
+    audio_files: List[str] = field(default_factory=list)
     last_opened_file: Optional[str] = None
 
     # Spectrogram parameters — must match between label, train, and inference.
@@ -76,6 +79,11 @@ class MADProjectConfig:
         """Self-contained per-call example store, shared across model runs."""
         return os.path.join(self.project_dir, 'models', 'training_data')
 
+    @property
+    def recordings_dir(self) -> str:
+        """Audio files copied into the project for portability."""
+        return os.path.join(self.project_dir, 'recordings')
+
     def save(self, path: Optional[str] = None) -> None:
         """Save config to ``<project_dir>/mad_project_info.json``."""
         if path is None:
@@ -113,6 +121,7 @@ def create_mad_project(
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models', 'training_data'), exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'datasets'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'recordings'), exist_ok=True)
 
     if config is None:
         config = MADProjectConfig()

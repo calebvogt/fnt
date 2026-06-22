@@ -429,6 +429,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.spectrogram.box_adjusted.connect(self.on_box_adjusted)
         self.spectrogram.drag_complete.connect(self.on_drag_complete)
         self.spectrogram.zoom_requested.connect(self.on_wheel_zoom)
+        self.spectrogram.mask_edited.connect(self.on_mask_edited)
         right_layout.addWidget(self.spectrogram, 1)
 
         # Waveform overview strip
@@ -1745,6 +1746,44 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         group_layout.addLayout(btn_row2)
 
+        # Mask editing (brush/eraser) — paint the exact call shape.
+        mask_row = QHBoxLayout()
+        mask_row.setSpacing(2)
+        self.btn_edit_mask = QPushButton("Edit Mask (M)")
+        self.btn_edit_mask.setCheckable(True)
+        self.btn_edit_mask.setStyleSheet(
+            "QPushButton:checked { background-color: #2d6cdf; color: white; "
+            "font-weight: bold; }")
+        self.btn_edit_mask.setToolTip(
+            "Paint the exact call shape with a brush (left-click) / erase "
+            "(right-click) on the selected detection. The mask gives tighter "
+            "DSP features and is saved to the sibling .h5 (and ports into MAD)."
+            "\nShortcut: M  ·  Enter/click again to finish.")
+        self.btn_edit_mask.clicked.connect(self._toggle_mask_edit)
+        self.btn_edit_mask.setEnabled(False)
+        mask_row.addWidget(self.btn_edit_mask)
+
+        self.btn_mask_eraser = QPushButton("Eraser")
+        self.btn_mask_eraser.setCheckable(True)
+        self.btn_mask_eraser.setToolTip("Toggle erase mode while editing a mask "
+                                        "(or hold right-click to erase).")
+        self.btn_mask_eraser.clicked.connect(
+            lambda checked: self.spectrogram.set_brush(eraser=checked))
+        self.btn_mask_eraser.setEnabled(False)
+        mask_row.addWidget(self.btn_mask_eraser)
+
+        mask_row.addWidget(QLabel("Brush:"))
+        self.spin_brush_radius = QSpinBox()
+        self.spin_brush_radius.setRange(1, 40)
+        self.spin_brush_radius.setValue(6)
+        self.spin_brush_radius.setFixedWidth(55)
+        self.spin_brush_radius.setToolTip("Brush radius in spectrogram pixels.")
+        self.spin_brush_radius.valueChanged.connect(
+            lambda v: self.spectrogram.set_brush(radius=v))
+        mask_row.addWidget(self.spin_brush_radius)
+        mask_row.addStretch()
+        group_layout.addLayout(mask_row)
+
         # Delete pending / Delete all labels
         delete_row = QHBoxLayout()
         delete_row.setSpacing(2)
@@ -2128,6 +2167,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
         sc_harmonic = QShortcut(QKeySequence(Qt.Key_H), self)
         sc_harmonic.setContext(Qt.ApplicationShortcut)
         sc_harmonic.activated.connect(self._shortcut_mark_harmonic)
+
+        # M = toggle mask edit (brush) on the current detection
+        sc_mask = QShortcut(QKeySequence(Qt.Key_M), self)
+        sc_mask.setContext(Qt.ApplicationShortcut)
+        sc_mask.activated.connect(self._shortcut_toggle_mask_edit)
 
         # V = toggle filter overlay
         sc_overlay = QShortcut(QKeySequence(Qt.Key_F), self)
@@ -2587,6 +2631,96 @@ class ClassicAudioDetectorWindow(QMainWindow):
             # First files being added — do full list build + load first file
             self._update_file_list()
 
+        # Offer to upgrade any older-format detection files to the new schema.
+        self._offer_format_migration()
+
+    _CAD_CSV_SUFFIXES = ['_FNT_CAD_detections', '_cad', '_usv_dsp',
+                         '_usv_rf', '_usv_detections']
+
+    def _find_sibling_csv(self, filepath):
+        base = Path(filepath).stem
+        parent = Path(filepath).parent
+        for suffix in self._CAD_CSV_SUFFIXES:
+            p = parent / f"{base}{suffix}.csv"
+            if p.exists():
+                return p, suffix.lstrip('_')
+        return None, None
+
+    def _offer_format_migration(self):
+        """Detect older-format detection CSVs (missing ``call_id``) and offer a
+        one-time bulk upgrade to the new schema, archiving the originals."""
+        if getattr(self, '_migration_prompted', False):
+            return
+        old = []
+        for fp in self.audio_files:
+            csv_path, source = self._find_sibling_csv(fp)
+            if csv_path is None:
+                continue
+            try:
+                cols = pd.read_csv(csv_path, nrows=0).columns
+            except Exception:
+                continue
+            if 'call_id' not in cols:
+                old.append((fp, csv_path, source))
+        if not old:
+            return
+        self._migration_prompted = True
+        reply = QMessageBox.question(
+            self, "Upgrade detection files?",
+            f"{len(old)} detection file(s) use an older format.\n\n"
+            "Upgrade them to the new CAD format now? This adds stable call ids "
+            "and harmonic-link columns. The originals are archived to a "
+            "'legacy_pre_h5' folder.\n\n"
+            "Strongly recommended — older files are not guaranteed to work with "
+            "this version.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes:
+            return
+        migrated, failed = 0, 0
+        for fp, csv_path, source in old:
+            try:
+                self._migrate_one_csv(csv_path, source)
+                migrated += 1
+            except Exception:
+                failed += 1
+        # Reload current file so the upgraded data is reflected.
+        self.all_detections.clear()
+        if self.audio_files and 0 <= self.current_file_idx < len(self.audio_files):
+            self._load_current_file()
+        msg = f"Upgraded {migrated} detection file(s)"
+        if failed:
+            msg += f" ({failed} failed)"
+        self.status_bar.showMessage(msg)
+        QMessageBox.information(self, "Upgrade complete", msg + ".")
+
+    def _migrate_one_csv(self, csv_path, source):
+        """Upgrade one old CSV in place, archiving the original."""
+        import shutil
+        df = pd.read_csv(csv_path)
+        if 'status' not in df.columns:
+            df['status'] = 'pending'
+        if 'is_harmonic' not in df.columns:
+            df['is_harmonic'] = False
+        legacy_harm = df['status'] == 'harmonic'
+        if legacy_harm.any():
+            df.loc[legacy_harm, 'is_harmonic'] = True
+            df.loc[legacy_harm, 'status'] = 'pending'
+        if 'call_group_id' not in df.columns:
+            df['call_group_id'] = range(len(df))
+        self._ensure_freq_bounds(df)
+        self._ensure_call_ids(df)
+        df['call_number'] = range(1, len(df) + 1)
+        id_to_num = dict(zip(df['call_id'].astype(int),
+                             df['call_number'].astype(int)))
+        df['harmonic_of_call_number'] = df['harmonic_of'].astype(int).map(
+            lambda c: id_to_num.get(int(c), '') if int(c) >= 0 else '')
+        # Archive the original, then write the upgraded CSV.
+        archive = csv_path.parent / 'legacy_pre_h5'
+        archive.mkdir(exist_ok=True)
+        shutil.move(str(csv_path), str(archive / csv_path.name))
+        out = csv_path.parent / f"{csv_path.stem}.csv"
+        df.to_csv(out, index=False)
+
     def _scan_existing_csvs(self):
         """Pre-scan for existing CSV detection files to show counts in file list."""
         # Track files whose CSVs use legacy CAD suffixes (``_cad``, ``_usv_dsp``)
@@ -2862,6 +2996,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.redo_stack.clear()
             self.btn_undo.setEnabled(False)
 
+            # Set up the per-call mask layer (grid + load sibling .h5 masks).
+            self._setup_mask_layer_for_file(filepath)
+
             self._update_display()
 
             # Auto-adjust FFT settings for sample rate on first load
@@ -2984,6 +3121,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
                         self.detections_df['call_group_id'] = range(len(self.detections_df))
                     # Handle legacy CSVs missing min_freq_hz/max_freq_hz
                     self._ensure_freq_bounds(self.detections_df)
+                    # Stable ids + harmonic links (derived from call_group_id
+                    # for older CSVs).
+                    self._ensure_call_ids(self.detections_df)
                     self.all_detections[filepath] = self.detections_df.copy()
                     # Track source suffix for correct auto-save naming
                     self.detection_sources[filepath] = suffix.lstrip('_')
@@ -2994,6 +3134,72 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         self.detections_df = None
         self.current_detection_idx = 0
+    @staticmethod
+    def _ensure_call_ids(df):
+        """Ensure stable harmonic-linking columns on a detections DataFrame.
+
+        Adds, if missing:
+          * ``call_id``     — stable per-file integer id (survives renumber /
+                              delete; harmonic links point at these, not at the
+                              reshuffled ``call_number``).
+          * ``harmonic_of`` — the fundamental's ``call_id`` (-1 = none).
+          * ``harmonic_rank`` — 1, 2, … overtone order within its group
+                              (0 = not a harmonic / no link).
+
+        For rows that already carry a ``call_group_id`` (DSP output) but no
+        explicit link, the fundamental is derived as the lowest-frequency
+        non-harmonic member of the group, and harmonics are ranked by frequency.
+        """
+        import numpy as _np
+        if df is None or len(df) == 0:
+            return df
+        n = len(df)
+        # --- stable call_id ---
+        if 'call_id' not in df.columns:
+            df['call_id'] = -1
+        ids = df['call_id'].fillna(-1).astype(int).tolist()
+        next_id = max([i for i in ids if i >= 0], default=-1) + 1
+        for k in range(n):
+            if ids[k] < 0:
+                ids[k] = next_id
+                next_id += 1
+        df['call_id'] = ids
+        # --- harmonic link columns ---
+        if 'harmonic_of' not in df.columns:
+            df['harmonic_of'] = -1
+        if 'harmonic_rank' not in df.columns:
+            df['harmonic_rank'] = 0
+        df['harmonic_of'] = df['harmonic_of'].fillna(-1).astype(int)
+        df['harmonic_rank'] = df['harmonic_rank'].fillna(0).astype(int)
+        if 'is_harmonic' not in df.columns:
+            return df
+        is_harm = df['is_harmonic'].fillna(False).astype(bool)
+        # Derive links from call_group_id for harmonics that lack one.
+        if 'call_group_id' in df.columns:
+            id_by_pos = df['call_id'].astype(int).tolist()
+            minf = (df['min_freq_hz'] if 'min_freq_hz' in df.columns
+                    else df.get('peak_freq_hz', pd.Series([0] * n))).fillna(0).tolist()
+            groups: Dict = {}
+            for pos, g in enumerate(df['call_group_id'].fillna(-1).astype(int).tolist()):
+                groups.setdefault(g, []).append(pos)
+            harm_of = df['harmonic_of'].tolist()
+            rank = df['harmonic_rank'].tolist()
+            for g, members in groups.items():
+                funds = [p for p in members if not is_harm.iloc[p]]
+                if not funds:
+                    continue
+                fund_pos = min(funds, key=lambda p: minf[p])
+                fund_id = id_by_pos[fund_pos]
+                harms = sorted([p for p in members if is_harm.iloc[p]],
+                               key=lambda p: minf[p])
+                for r, p in enumerate(harms, start=1):
+                    if harm_of[p] is None or int(harm_of[p]) < 0:
+                        harm_of[p] = fund_id
+                        rank[p] = r
+            df['harmonic_of'] = [int(x) if x is not None else -1 for x in harm_of]
+            df['harmonic_rank'] = [int(x) if x is not None else 0 for x in rank]
+        return df
+
     @staticmethod
     def _ensure_freq_bounds(df):
         """Ensure min_freq_hz and max_freq_hz columns exist. Compute from
@@ -3433,6 +3639,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                     self.detections_df.reset_index(drop=True, inplace=True)
                 else:
                     self.detections_df = new_df
+                # Stable ids + harmonic links (DSP groups → harmonic_of).
+                self._ensure_call_ids(self.detections_df)
 
             # Handle empty result — set to None if nothing left
             if self.detections_df is not None and len(self.detections_df) == 0:
@@ -3606,6 +3814,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 df['call_group_id'] = range(len(df))
             if 'source' not in df.columns:
                 df['source'] = 'dsp'
+            # Stable ids + harmonic links (derived from call_group_id).
+            self._ensure_call_ids(df)
             if 'call_number' not in df.columns:
                 df.insert(0, 'call_number', range(1, len(df) + 1))
 
@@ -3995,7 +4205,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self._update_detection_info_only()
 
     def on_drag_complete(self):
-        """Handle completion of box drag - save to CSV."""
+        """Handle completion of box drag - re-measure features, then save."""
+        # Geometry changed → refresh DSP features over the new box.
+        self._measure_manual_features(self.current_detection_idx)
         self._store_current_detections()
         self._update_button_counts()
         self._refresh_file_list_items()
@@ -4165,6 +4377,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.detections_df.at[self.current_detection_idx, 'duration_ms'] = (stop - start) * 1000
 
         self._update_detection_boxes()
+        self._schedule_measure(self.current_detection_idx)
 
     def on_freq_changed(self):
         """Handle frequency spinbox change."""
@@ -4178,6 +4391,25 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.detections_df.at[self.current_detection_idx, 'max_freq_hz'] = max_f
 
         self._update_detection_boxes()
+        self._schedule_measure(self.current_detection_idx)
+
+    def _schedule_measure(self, idx):
+        """Debounce DSP feature re-measurement after rapid spinbox edits."""
+        self._pending_measure_idx = idx
+        if not hasattr(self, '_measure_timer'):
+            self._measure_timer = QTimer(self)
+            self._measure_timer.setSingleShot(True)
+            self._measure_timer.timeout.connect(self._run_pending_measure)
+        self._measure_timer.start(350)
+
+    def _run_pending_measure(self):
+        idx = getattr(self, '_pending_measure_idx', None)
+        if idx is None:
+            return
+        self._measure_manual_features(idx)
+        self._store_current_detections()
+        if idx == self.current_detection_idx:
+            self._update_detection_info_only()
 
     # =========================================================================
     # Labeling Actions
@@ -4188,6 +4420,38 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.undo_stack.append(entry)
         self.redo_stack.clear()
         self.btn_undo.setEnabled(True)
+
+    # --- harmonic undo/redo helpers (capture status + harmonic link) ----
+    def _capture_harmonic_state(self, idx):
+        """Return (status, is_harmonic, harmonic_of, harmonic_rank,
+        call_group_id) for the row, used to build undo/redo records."""
+        df = self.detections_df
+        status = df.at[idx, 'status']
+        harm = bool(df.at[idx, 'is_harmonic']) if 'is_harmonic' in df.columns else False
+        of = int(df.at[idx, 'harmonic_of']) if 'harmonic_of' in df.columns else -1
+        rank = int(df.at[idx, 'harmonic_rank']) if 'harmonic_rank' in df.columns else 0
+        grp = int(df.at[idx, 'call_group_id']) if 'call_group_id' in df.columns else -1
+        return (status, harm, of, rank, grp)
+
+    @staticmethod
+    def _harmonic_undo_extra(action):
+        """Extract (harmonic_of, harmonic_rank, call_group_id) from a harmonic
+        undo/redo record, tolerating older 4-tuple records."""
+        of = int(action[4]) if len(action) > 4 else -1
+        rank = int(action[5]) if len(action) > 5 else 0
+        grp = int(action[6]) if len(action) > 6 else -1
+        return of, rank, grp
+
+    def _apply_harmonic_link(self, idx, of, rank, grp):
+        df = self.detections_df
+        if 'harmonic_of' not in df.columns:
+            df['harmonic_of'] = -1
+        if 'harmonic_rank' not in df.columns:
+            df['harmonic_rank'] = 0
+        df.at[idx, 'harmonic_of'] = int(of)
+        df.at[idx, 'harmonic_rank'] = int(rank)
+        if 'call_group_id' in df.columns and grp is not None and int(grp) >= 0:
+            df.at[idx, 'call_group_id'] = int(grp)
 
     def accept_detection(self):
         """Mark current detection as accepted (USV)."""
@@ -4223,18 +4487,96 @@ class ClassicAudioDetectorWindow(QMainWindow):
         """
         if self.detections_df is None:
             return
-        old_status = self.detections_df.at[self.current_detection_idx, 'status']
-        old_harmonic = self.detections_df.at[self.current_detection_idx, 'is_harmonic'] \
-            if 'is_harmonic' in self.detections_df.columns else False
-        self._push_undo(('harmonic', self.current_detection_idx, old_status, old_harmonic))
-        self.detections_df.at[self.current_detection_idx, 'status'] = 'accepted'
-        if 'is_harmonic' not in self.detections_df.columns:
-            self.detections_df['is_harmonic'] = False
-        self.detections_df.at[self.current_detection_idx, 'is_harmonic'] = True
+        self._ensure_call_ids(self.detections_df)
+        idx = self.current_detection_idx
+        # Panel: choose which fundamental this harmonic belongs to.
+        fund_pos = self._choose_fundamental(idx)
+        if fund_pos == 'cancel':
+            return
+        df = self.detections_df
+        old_status = df.at[idx, 'status']
+        old_harmonic = bool(df.at[idx, 'is_harmonic']) if 'is_harmonic' in df.columns else False
+        old_of = int(df.at[idx, 'harmonic_of']) if 'harmonic_of' in df.columns else -1
+        old_rank = int(df.at[idx, 'harmonic_rank']) if 'harmonic_rank' in df.columns else 0
+        old_group = (int(df.at[idx, 'call_group_id'])
+                     if 'call_group_id' in df.columns else -1)
+        self._push_undo(('harmonic', idx, old_status, old_harmonic,
+                         old_of, old_rank, old_group))
+        df.at[idx, 'status'] = 'accepted'
+        if 'is_harmonic' not in df.columns:
+            df['is_harmonic'] = False
+        df.at[idx, 'is_harmonic'] = True
+        if fund_pos is not None:
+            fund_id = int(df.at[fund_pos, 'call_id'])
+            fund_group = (int(df.at[fund_pos, 'call_group_id'])
+                          if 'call_group_id' in df.columns else fund_id)
+            df.at[idx, 'harmonic_of'] = fund_id
+            if 'call_group_id' in df.columns:
+                df.at[idx, 'call_group_id'] = fund_group
+            # Rank = position among this fundamental's harmonics by frequency.
+            same = df[(df['harmonic_of'] == fund_id) & (df['is_harmonic'])]
+            df.at[idx, 'harmonic_rank'] = int(len(same))
+            self.status_bar.showMessage(
+                f"Linked harmonic to fundamental call_id={fund_id}")
+        else:
+            df.at[idx, 'harmonic_of'] = -1
+            df.at[idx, 'harmonic_rank'] = 0
         self._store_current_detections()
         self._update_display()
         self._update_button_counts()
         self._auto_advance()
+
+    def _choose_fundamental(self, harm_idx):
+        """Open a panel to pick the fundamental for the harmonic at ``harm_idx``.
+
+        Returns the chosen fundamental's row position, ``None`` (mark harmonic
+        with no link), or the string ``'cancel'`` if the user cancels.
+        Candidates: non-harmonic, non-rejected calls that overlap in time and
+        sit below the harmonic in frequency; the nearest one below is
+        preselected.
+        """
+        df = self.detections_df
+        h = df.iloc[harm_idx]
+        h_t0, h_t1 = float(h['start_seconds']), float(h['stop_seconds'])
+        h_flo = float(h.get('min_freq_hz', 0))
+        cands = []
+        for pos in range(len(df)):
+            if pos == harm_idx:
+                continue
+            r = df.iloc[pos]
+            if bool(r.get('is_harmonic', False)):
+                continue
+            if str(r.get('status', 'pending')) == 'rejected':
+                continue
+            # time overlap
+            if float(r['stop_seconds']) < h_t0 or float(r['start_seconds']) > h_t1:
+                continue
+            r_fhi = float(r.get('max_freq_hz', 0))
+            below = r_fhi <= h_flo + 2000  # small tolerance
+            cands.append((pos, below, r_fhi))
+        # Prefer calls below the harmonic; among those, the highest (nearest).
+        cands.sort(key=lambda c: (0 if c[1] else 1, -c[2]))
+        labels = ["(none — mark harmonic without linking)"]
+        positions = [None]
+        for pos, below, _fhi in cands:
+            r = df.iloc[pos]
+            cn = int(r['call_id'])
+            labels.append(
+                f"call_id {cn}: {float(r['start_seconds']):.3f}–"
+                f"{float(r['stop_seconds']):.3f}s, "
+                f"{float(r.get('min_freq_hz', 0))/1000:.1f}–"
+                f"{float(r.get('max_freq_hz', 0))/1000:.1f} kHz"
+            )
+            positions.append(pos)
+        default_index = 1 if len(positions) > 1 else 0
+        choice, ok = QInputDialog.getItem(
+            self, "Link harmonic to its fundamental",
+            "Select the fundamental call this harmonic belongs to:",
+            labels, default_index, False,
+        )
+        if not ok:
+            return 'cancel'
+        return positions[labels.index(choice)]
 
     def skip_detection(self):
         """Skip to next detection by time without changing its status."""
@@ -4275,6 +4617,152 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_accept.setText(f"Accept {n_accepted} (A)")
         self.btn_reject.setText(f"Reject {n_rejected} (R)")
 
+    def _measure_manual_features(self, idx, mask=None, mask_offsets=None):
+        """Auto-measure DSP features over a manual/edited detection box.
+
+        Runs ``DSPDetector.characterize_region`` with the current DSP settings
+        so a hand-drawn or hand-edited call carries the same feature columns as
+        an automatic detection (peak/mean freq, bandwidth, power, SNR, tonality,
+        spectral entropy, peak_freq_N samples, sweep/jitter) — the data the
+        UMAP/classification pipeline needs. Geometry the user set is preserved.
+        When a per-call ``mask`` is supplied (Part 2b) features come from the
+        masked shape instead of the bounding box.
+        """
+        if (self.detections_df is None or self.audio_data is None or
+                self.sample_rate is None):
+            return
+        if not (0 <= idx < len(self.detections_df)):
+            return
+        row = self.detections_df.iloc[idx]
+        try:
+            from fnt.usv.usv_detector.config import USVDetectorConfig
+            from fnt.usv.usv_detector.dsp_detector import DSPDetector
+            cfg_dict = self._gather_dsp_config()
+            fields = USVDetectorConfig.__dataclass_fields__
+            cfg = USVDetectorConfig(**{k: v for k, v in cfg_dict.items()
+                                       if k in fields})
+            det = DSPDetector(cfg)
+            feats = det.characterize_region(
+                self.audio_data, self.sample_rate,
+                float(row['start_seconds']), float(row['stop_seconds']),
+                float(row['min_freq_hz']), float(row['max_freq_hz']),
+                mask=mask, mask_offsets=mask_offsets,
+            )
+        except Exception as e:
+            self.status_bar.showMessage(f"Feature measurement failed: {e}")
+            return
+        if not feats:
+            return
+        # Respect the Freq Samples toggle: drop peak_freq_N unless enabled.
+        if not self.chk_freq_samples.isChecked():
+            feats = {k: v for k, v in feats.items()
+                     if not k.startswith('peak_freq_') or k == 'peak_freq_hz'}
+        keep_geom = {'start_seconds', 'stop_seconds', 'min_freq_hz', 'max_freq_hz'}
+        for k, v in feats.items():
+            if k in keep_geom:
+                continue
+            self.detections_df.at[idx, k] = v
+        self.detections_df.at[idx, 'feature_source'] = (
+            'measured_mask' if mask is not None else 'measured')
+
+    # ------------------------------------------------------------------
+    # Per-call mask editing (brush/eraser) — CAD Part 2b
+    # ------------------------------------------------------------------
+    def _masks_h5_path(self, filepath=None):
+        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        if filepath is None:
+            if not self.audio_files or self.current_file_idx >= len(self.audio_files):
+                return None
+            filepath = self.audio_files[self.current_file_idx]
+        return masks_sibling_path(filepath)
+
+    def _setup_mask_layer_for_file(self, filepath):
+        """Tell the spectrogram the DSP grid and load any sibling .h5 masks."""
+        try:
+            cfg = self._gather_dsp_config()
+            self.spectrogram.set_spec_grid(
+                self.sample_rate, cfg.get('nperseg', 512),
+                cfg.get('noverlap', 384), cfg.get('nfft', 1024))
+            from fnt.usv.usv_detector.fnt_mask_store import read_all_call_masks
+            h5 = self._masks_h5_path(filepath)
+            masks = read_all_call_masks(h5) if h5 else {}
+            # h5 keys are strings; CSV call_id is int — coerce to int keys.
+            masks = {int(k): v for k, v in masks.items()}
+            self.spectrogram.set_call_masks(masks)
+        except Exception as e:
+            self.status_bar.showMessage(f"Mask layer setup failed: {e}")
+
+    def _shortcut_toggle_mask_edit(self):
+        if self.btn_edit_mask.isEnabled():
+            self.btn_edit_mask.toggle()
+            self._toggle_mask_edit(self.btn_edit_mask.isChecked())
+
+    def _toggle_mask_edit(self, checked):
+        if checked:
+            if (self.detections_df is None or self.audio_data is None or
+                    not (0 <= self.current_detection_idx < len(self.detections_df))):
+                self.btn_edit_mask.setChecked(False)
+                self.status_bar.showMessage("Select a detection to edit its mask.")
+                return
+            self._ensure_call_ids(self.detections_df)
+            cid = int(self.detections_df.at[self.current_detection_idx, 'call_id'])
+            self.spectrogram.set_brush(radius=self.spin_brush_radius.value(),
+                                       eraser=self.btn_mask_eraser.isChecked())
+            if not self.spectrogram.enter_mask_edit(cid):
+                self.btn_edit_mask.setChecked(False)
+                self.status_bar.showMessage("Mask grid unavailable for this file.")
+                return
+            self.btn_mask_eraser.setEnabled(True)
+            self.status_bar.showMessage(
+                "Mask edit — left-click paints, right-click erases. Press M / "
+                "click Edit Mask again to finish.")
+        else:
+            # Commit → triggers on_mask_edited (measure + save).
+            self.spectrogram.exit_mask_edit(commit=True)
+            self.btn_mask_eraser.setEnabled(False)
+            self.btn_mask_eraser.setChecked(False)
+            self.spectrogram.set_brush(eraser=False)
+            self.status_bar.showMessage("Mask saved.")
+
+    def on_mask_edited(self, call_id):
+        """A call's mask changed — re-measure features from it and persist."""
+        if self.detections_df is None:
+            return
+        try:
+            cid = int(call_id)
+        except Exception:
+            cid = call_id
+        matches = self.detections_df.index[
+            self.detections_df['call_id'].astype(int) == cid].tolist()
+        if not matches:
+            return
+        idx = matches[0]
+        info = self.spectrogram.call_masks.get(cid)
+        h5 = self._masks_h5_path()
+        try:
+            from fnt.usv.usv_detector import fnt_mask_store as ms
+            if info is not None and info['mask'].any():
+                if h5:
+                    g = self.spectrogram.spec_grid or {}
+                    ms.set_grid_attrs(
+                        h5, sample_rate=g.get('sample_rate'),
+                        nperseg=g.get('nperseg'), noverlap=g.get('noverlap'),
+                        nfft=g.get('nfft'), n_freq_bins=g.get('n_freq_bins'),
+                        n_time_frames=g.get('n_time_frames'))
+                    ms.write_call_mask(h5, cid, info['mask'],
+                                       info['f_off'], info['t_off'])
+                self._measure_manual_features(
+                    idx, mask=info['mask'],
+                    mask_offsets=(info['f_off'], info['t_off']))
+            else:
+                if h5:
+                    ms.delete_call_mask(h5, cid)
+                self._measure_manual_features(idx)
+        except Exception as e:
+            self.status_bar.showMessage(f"Mask save failed: {e}")
+        self._store_current_detections()
+        self._update_detection_boxes()
+
     def add_new_usv(self):
         """Add a new USV detection at view center."""
         if self.audio_data is None:
@@ -4308,7 +4796,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self.detections_df = pd.concat([self.detections_df, pd.DataFrame([new_row])],
                                            ignore_index=True)
 
+        # Assign a stable call_id (+ default harmonic columns) to the new row.
+        self._ensure_call_ids(self.detections_df)
         self.current_detection_idx = len(self.detections_df) - 1
+        # Auto-measure DSP features over the new manual box (Part 2a).
+        self._measure_manual_features(self.current_detection_idx)
         self._store_current_detections()
         self._update_display()
         self._update_ui_state()
@@ -4508,8 +5000,19 @@ class ClassicAudioDetectorWindow(QMainWindow):
         if self.detections_df is None or len(self.detections_df) == 0:
             return
 
+        # Stable ids + harmonic links must exist before we resolve references.
+        self._ensure_call_ids(self.detections_df)
         # Refresh call_number column before saving
         self.detections_df['call_number'] = range(1, len(self.detections_df) + 1)
+        # Resolve each harmonic's fundamental to a human-readable call_number
+        # (call_id is the stable link; call_number is for the reader).
+        id_to_num = dict(zip(self.detections_df['call_id'].astype(int),
+                             self.detections_df['call_number'].astype(int)))
+        self.detections_df['harmonic_of_call_number'] = (
+            self.detections_df['harmonic_of'].astype(int).map(
+                lambda cid: id_to_num.get(int(cid), '') if int(cid) >= 0 else ''
+            )
+        )
         # Ensure call_number is the first column
         cols = self.detections_df.columns.tolist()
         if 'call_number' in cols:
@@ -4732,6 +5235,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_skip.setEnabled(bool(has_det))
         self.btn_add_usv.setEnabled(bool(has_audio))
         self.btn_delete.setEnabled(bool(has_det))
+        # Mask editing needs a selected detection and the DSP grid.
+        self.btn_edit_mask.setEnabled(bool(has_det and self.spectrogram.spec_grid))
 
         has_pending = bool(has_det and (self.detections_df['status'] == 'pending').any())
         self.btn_delete_pending.setEnabled(has_pending)
@@ -4817,15 +5322,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 self._update_button_counts()
                 self.status_bar.showMessage(f"Undid label change on detection {idx + 1}")
         elif action[0] == 'harmonic':
-            _, idx, old_status, old_harmonic = action
+            idx = action[1]
+            old_status, old_harmonic = action[2], action[3]
+            old_of, old_rank, old_group = self._harmonic_undo_extra(action)
             if 0 <= idx < len(self.detections_df):
-                current_status = self.detections_df.at[idx, 'status']
-                current_harmonic = (self.detections_df.at[idx, 'is_harmonic']
-                                    if 'is_harmonic' in self.detections_df.columns else False)
+                cur = self._capture_harmonic_state(idx)
                 self.detections_df.at[idx, 'status'] = old_status
                 if 'is_harmonic' in self.detections_df.columns:
                     self.detections_df.at[idx, 'is_harmonic'] = old_harmonic
-                self.redo_stack.append(('harmonic', idx, current_status, current_harmonic))
+                self._apply_harmonic_link(idx, old_of, old_rank, old_group)
+                self.redo_stack.append(('harmonic', idx, *cur))
                 self.current_detection_idx = idx
                 self._store_current_detections()
                 self._update_display()
@@ -4869,16 +5375,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 self._update_button_counts()
                 self.status_bar.showMessage(f"Redid label change on detection {idx + 1}")
         elif action[0] == 'harmonic':
-            _, idx, new_status, new_harmonic = action
+            idx = action[1]
+            new_status, new_harmonic = action[2], action[3]
+            new_of, new_rank, new_group = self._harmonic_undo_extra(action)
             if 0 <= idx < len(self.detections_df):
-                current_status = self.detections_df.at[idx, 'status']
-                current_harmonic = (self.detections_df.at[idx, 'is_harmonic']
-                                    if 'is_harmonic' in self.detections_df.columns else False)
+                cur = self._capture_harmonic_state(idx)
                 self.detections_df.at[idx, 'status'] = new_status
                 if 'is_harmonic' not in self.detections_df.columns:
                     self.detections_df['is_harmonic'] = False
                 self.detections_df.at[idx, 'is_harmonic'] = new_harmonic
-                self.undo_stack.append(('harmonic', idx, current_status, current_harmonic))
+                self._apply_harmonic_link(idx, new_of, new_rank, new_group)
+                self.undo_stack.append(('harmonic', idx, *cur))
                 self.current_detection_idx = idx
                 self._store_current_detections()
                 self._update_display()

@@ -2,7 +2,7 @@
 
 Runs a trained U-Net checkpoint over full WAV files, stitches a
 per-pixel probability mask, thresholds it, extracts connected-component
-blobs, and writes sibling CSV + PNG artifacts next to each wav.
+blobs, and writes a sibling CSV + h5 probability map next to each wav.
 
 Heavy deps (``torch``, ``segmentation_models_pytorch``, ``scipy.ndimage``)
 are imported lazily inside the run functions so the module is safe to
@@ -18,9 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from .mad_dataset import compute_full_spec_image
-from .mad_labels import (
-    pred_csv_sibling_path, pred_mask_sibling_path, save_mask_png,
-)
+from .mad_labels import pred_csv_sibling_path
 from .spectrogram import load_audio
 
 
@@ -36,7 +34,6 @@ class MADInferenceConfig:
     tile_freq_bins: int = 512
     tile_overlap_fraction: float = 0.25
     device: str = "auto"
-    save_mask_png: bool = True
     save_blob_csv: bool = True
     # If True (default), the probability mask is zeroed out in any time
     # column that already contains a confirmed call for this file (rebuilt
@@ -381,22 +378,26 @@ def run_inference_on_file(
     blobs = extract_blobs(prob, threshold=cfg.threshold, min_blob_pixels=cfg.min_blob_pixels)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft, sr=sr)
 
-    mask_png = pred_mask_sibling_path(wav_path)
     csv_path = pred_csv_sibling_path(wav_path)
-
-    if cfg.save_mask_png:
-        # Save thresholded binary mask (0 or 255) for easy viewing.
-        binary = (prob >= cfg.threshold).astype(np.uint8) * 255
-        save_mask_png(mask_png, binary)
     if cfg.save_blob_csv:
         write_blob_csv(csv_path, rows)
+    h5_path = None
+    try:
+        from .fnt_mask_store import masks_sibling_path, write_prob, set_grid_attrs
+        h5_path = masks_sibling_path(wav_path)
+        set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
+                       noverlap=noverlap, nfft=nfft,
+                       n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
+        write_prob(h5_path, prob)
+    except Exception:
+        h5_path = None
     if progress:
         progress('blobs', 1, 1)
 
     return {
         'wav_path': wav_path,
-        'mask_png': mask_png if cfg.save_mask_png else None,
         'csv_path': csv_path if cfg.save_blob_csv else None,
+        'h5_path': h5_path,
         'n_blobs': len(rows),
         'prob_shape': list(prob.shape),
         'sample_rate': sr,

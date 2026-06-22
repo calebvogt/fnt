@@ -25,6 +25,7 @@ class SpectrogramWidget(QWidget):
     box_adjusted = pyqtSignal(int, float, float, float, float)
     drag_complete = pyqtSignal()  # Emitted when box drag is finished
     zoom_requested = pyqtSignal(float, float)  # factor, center_time
+    mask_edited = pyqtSignal(object)  # call_id whose mask just changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -78,6 +79,115 @@ class SpectrogramWidget(QWidget):
         self._filter_params = None
         self._raw_spec_db = None
         self._raw_spec_freqs = None
+
+        # --- per-call mask / brush layer (CAD Part 2b) ---
+        # Masks live on the DSP spectrogram grid (freq-bin x time-frame).
+        self.spec_grid = None          # {sample_rate, nperseg, noverlap, nfft,
+                                       #  n_freq_bins, n_time_frames}
+        self.call_masks = {}           # call_id -> {mask(bool crop), f_off, t_off}
+        self.mask_edit_active = False
+        self.mask_edit_call_id = None
+        self._edit_full_mask = None    # full-grid bool array while editing
+        self.brush_radius = 6          # in spec-grid pixels
+        self.eraser_mode = False
+        self._mask_painting = False
+        self._cursor_pos = None
+
+    # ------------------------------------------------------------------
+    # Per-call mask / brush layer (CAD Part 2b)
+    # ------------------------------------------------------------------
+    def set_spec_grid(self, sample_rate, nperseg, noverlap, nfft):
+        """Record the DSP spectrogram grid so masks map to (freq-bin, frame)."""
+        hop = max(1, nperseg - noverlap)
+        n_freq = nfft // 2 + 1
+        n_time = (max(0, len(self.audio_data) - nperseg) // hop + 1
+                  if self.audio_data is not None else 0)
+        self.spec_grid = {
+            'sample_rate': int(sample_rate), 'nperseg': int(nperseg),
+            'noverlap': int(noverlap), 'nfft': int(nfft),
+            'n_freq_bins': int(n_freq), 'n_time_frames': int(n_time),
+            'hop': hop,
+        }
+
+    def set_call_masks(self, masks: dict):
+        """Replace all stored per-call masks ({call_id: {mask, f_off, t_off}})."""
+        self.call_masks = dict(masks) if masks else {}
+        self.update()
+
+    def set_brush(self, radius=None, eraser=None):
+        if radius is not None:
+            self.brush_radius = int(radius)
+        if eraser is not None:
+            self.eraser_mode = bool(eraser)
+
+    def enter_mask_edit(self, call_id):
+        """Begin brushing the mask for ``call_id`` (loads any existing mask)."""
+        if self.spec_grid is None:
+            return False
+        self.mask_edit_active = True
+        self.mask_edit_call_id = call_id
+        n_freq = self.spec_grid['n_freq_bins']
+        n_time = self.spec_grid['n_time_frames']
+        full = np.zeros((n_freq, n_time), dtype=bool)
+        ex = self.call_masks.get(call_id)
+        if ex is not None:
+            m = ex['mask']; f0 = ex['f_off']; t0 = ex['t_off']
+            f1 = min(n_freq, f0 + m.shape[0]); t1 = min(n_time, t0 + m.shape[1])
+            full[f0:f1, t0:t1] = m[:f1 - f0, :t1 - t0]
+        self._edit_full_mask = full
+        self.setCursor(Qt.BlankCursor)
+        self.update()
+        return True
+
+    def exit_mask_edit(self, commit=True):
+        """Finish brushing; crop+store the mask and emit ``mask_edited``."""
+        cid = self.mask_edit_call_id
+        if commit and self._edit_full_mask is not None and cid is not None:
+            full = self._edit_full_mask
+            if full.any():
+                fs = np.where(full.any(axis=1))[0]
+                ts = np.where(full.any(axis=0))[0]
+                f0, f1 = int(fs[0]), int(fs[-1]) + 1
+                t0, t1 = int(ts[0]), int(ts[-1]) + 1
+                self.call_masks[cid] = {
+                    'mask': np.ascontiguousarray(full[f0:f1, t0:t1]),
+                    'f_off': f0, 't_off': t0,
+                }
+            else:
+                self.call_masks.pop(cid, None)
+            self.mask_edited.emit(cid)
+        self.mask_edit_active = False
+        self.mask_edit_call_id = None
+        self._edit_full_mask = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _xy_to_grid(self, pos, spec_rect):
+        """Screen point -> (f_bin, t_frame) on the DSP grid, or None."""
+        if self.spec_grid is None:
+            return None
+        t = self._x_to_time(pos.x(), spec_rect)
+        f = self._y_to_freq(pos.y(), spec_rect)
+        hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+        nfft = self.spec_grid['nfft']
+        t_frame = int(round(t * sr / hop))
+        f_bin = int(round(f / ((sr / 2.0) / (nfft // 2))))
+        n_freq = self.spec_grid['n_freq_bins']; n_time = self.spec_grid['n_time_frames']
+        if not (0 <= t_frame < n_time and 0 <= f_bin < n_freq):
+            return None
+        return f_bin, t_frame
+
+    def _stamp_brush(self, f_bin, t_frame):
+        """Paint/erase a disk of brush_radius into the in-progress mask."""
+        if self._edit_full_mask is None:
+            return
+        r = self.brush_radius
+        h, w = self._edit_full_mask.shape
+        f0 = max(0, f_bin - r); f1 = min(h, f_bin + r + 1)
+        t0 = max(0, t_frame - r); t1 = min(w, t_frame + r + 1)
+        ff, tt = np.ogrid[f0:f1, t0:t1]
+        disk = (ff - f_bin) ** 2 + (tt - t_frame) ** 2 <= r * r
+        self._edit_full_mask[f0:f1, t0:t1][disk] = (not self.eraser_mode)
 
     def set_colormap(self, name):
         """Set colormap by name and recompute spectrogram."""
@@ -199,6 +309,12 @@ class SpectrogramWidget(QWidget):
                 [0, 0, 0], [28, 28, 28], [57, 57, 57], [85, 85, 85],
                 [113, 113, 113], [142, 142, 142], [170, 170, 170], [198, 198, 198],
                 [227, 227, 227], [255, 255, 255],
+            ],
+            # Inverted grayscale: soft (low amplitude) = white, loud = dark.
+            'grayscale_inv': [
+                [255, 255, 255], [227, 227, 227], [198, 198, 198], [170, 170, 170],
+                [142, 142, 142], [113, 113, 113], [85, 85, 85], [57, 57, 57],
+                [28, 28, 28], [0, 0, 0],
             ],
         }
         colors = np.array(colormaps.get(name, colormaps['viridis']), dtype=np.float32)
@@ -425,6 +541,27 @@ class SpectrogramWidget(QWidget):
         )
         painter.drawImage(spec_rect.topLeft(), scaled_image)
 
+        # Draw per-call masks (under the boxes).
+        if self.call_masks and self.spec_grid is not None:
+            for det in self.detections:
+                cid = det.get('call_id')
+                ex = self.call_masks.get(cid) if cid is not None else None
+                if ex is not None and not (self.mask_edit_active
+                                           and cid == self.mask_edit_call_id):
+                    self._draw_mask(painter, ex['mask'], ex['f_off'],
+                                    ex['t_off'], spec_rect, QColor(80, 200, 255, 110))
+
+        # Draw the in-progress edited mask (brighter).
+        if self.mask_edit_active and self._edit_full_mask is not None:
+            full = self._edit_full_mask
+            if full.any():
+                fs = np.where(full.any(axis=1))[0]
+                ts = np.where(full.any(axis=0))[0]
+                f0, f1 = int(fs[0]), int(fs[-1]) + 1
+                t0, t1 = int(ts[0]), int(ts[-1]) + 1
+                self._draw_mask(painter, full[f0:f1, t0:t1], f0, t0,
+                                spec_rect, QColor(255, 220, 60, 150))
+
         # Draw detection boxes
         for i, det in enumerate(self.detections):
             self._draw_detection_box(painter, det, i, spec_rect)
@@ -432,6 +569,19 @@ class SpectrogramWidget(QWidget):
         # Draw temp box if drawing
         if self.is_drawing and self.draw_start and self.draw_current:
             self._draw_temp_box(painter, spec_rect)
+
+        # Brush cursor circle in mask-edit mode.
+        if (self.mask_edit_active and self._cursor_pos is not None
+                and spec_rect.contains(self._cursor_pos) and self.spec_grid):
+            hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+            # brush radius (grid frames) -> screen px via the time axis
+            px_per_frame = (self._time_to_x((hop * 1) / sr, spec_rect)
+                            - self._time_to_x(0, spec_rect))
+            rpx = max(3, abs(px_per_frame) * self.brush_radius)
+            painter.setPen(QPen(QColor(255, 80, 80) if self.eraser_mode
+                                else QColor(255, 255, 255), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(self._cursor_pos, int(rpx), int(rpx))
 
         # Draw playback position line
         if self.playback_position is not None:
@@ -442,6 +592,30 @@ class SpectrogramWidget(QWidget):
                                  int(x), int(spec_rect.bottom()))
 
         self._draw_axes(painter, spec_rect)
+
+    def _draw_mask(self, painter, mask, f_off, t_off, spec_rect, color):
+        """Render a cropped boolean mask (grid coords) as a translucent overlay."""
+        if mask is None or not mask.any() or self.spec_grid is None:
+            return
+        hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+        nfft = self.spec_grid['nfft']
+        freq_per_bin = (sr / 2.0) / (nfft // 2)
+        h, w = mask.shape
+        # Screen rect for the mask crop (freq grows up → flip rows).
+        x0 = self._time_to_x(t_off * hop / sr, spec_rect)
+        x1 = self._time_to_x((t_off + w) * hop / sr, spec_rect)
+        y_bottom = self._freq_to_y(f_off * freq_per_bin, spec_rect)
+        y_top = self._freq_to_y((f_off + h) * freq_per_bin, spec_rect)
+        if x1 <= x0 or y_bottom <= y_top:
+            return
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        sel = mask.astype(bool)
+        rgba[sel, 0] = color.red(); rgba[sel, 1] = color.green()
+        rgba[sel, 2] = color.blue(); rgba[sel, 3] = color.alpha()
+        rgba = rgba[::-1]  # flip so row 0 = highest freq (screen top)
+        rgba = np.ascontiguousarray(rgba)
+        img = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888)
+        painter.drawImage(QRectF(x0, y_top, x1 - x0, y_bottom - y_top), img)
 
     def _get_spec_rect(self):
         """Get spectrogram drawing area."""
@@ -728,11 +902,25 @@ class SpectrogramWidget(QWidget):
 
     def mousePressEvent(self, event):
         """Handle mouse press."""
-        if event.button() != Qt.LeftButton:
-            return
-
         spec_rect = self._get_spec_rect()
         pos = event.pos()
+
+        # Mask-brush mode intercepts painting (left = paint, right = erase).
+        if self.mask_edit_active and spec_rect.contains(pos):
+            if event.button() in (Qt.LeftButton, Qt.RightButton):
+                self._mask_painting = True
+                prev = self.eraser_mode
+                if event.button() == Qt.RightButton:
+                    self.eraser_mode = True
+                g = self._xy_to_grid(pos, spec_rect)
+                if g:
+                    self._stamp_brush(*g)
+                self.eraser_mode = prev
+                self.update()
+            return
+
+        if event.button() != Qt.LeftButton:
+            return
 
         if not spec_rect.contains(pos):
             return
@@ -775,6 +963,15 @@ class SpectrogramWidget(QWidget):
         spec_rect = self._get_spec_rect()
         pos = event.pos()
 
+        if self.mask_edit_active:
+            self._cursor_pos = pos
+            if self._mask_painting:
+                g = self._xy_to_grid(pos, spec_rect)
+                if g:
+                    self._stamp_brush(*g)
+            self.update()
+            return
+
         if self.is_drawing and self.draw_start:
             time_s = self._x_to_time(pos.x(), spec_rect)
             freq_hz = self._y_to_freq(pos.y(), spec_rect)
@@ -802,6 +999,10 @@ class SpectrogramWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
+        if self.mask_edit_active:
+            self._mask_painting = False
+            return
+
         if event.button() != Qt.LeftButton:
             return
 

@@ -63,8 +63,13 @@ class UNetTrainingConfig:
 
     wav_paths: List[str] = field(default_factory=list)
 
-    def resolve_run_dir(self) -> str:
-        name = self.run_name or datetime.now().strftime("unet_%Y%m%d_%H%M%S")
+    def resolve_run_dir(self, n_examples: int = 0) -> str:
+        if self.run_name:
+            name = self.run_name
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            arch = (self.model_arch or "unet").lower()
+            name = f"{ts}_{arch}_n={n_examples}"
         return str(Path(self.project_dir) / "models" / name)
 
 
@@ -231,7 +236,7 @@ def train_unet(
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
-    run_dir = Path(cfg.resolve_run_dir())
+    run_dir = Path(cfg.resolve_run_dir(n_examples=n_total))
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- train ----

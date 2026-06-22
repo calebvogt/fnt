@@ -1055,6 +1055,145 @@ class DSPDetector:
 
         return calls
 
+    def characterize_region(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        start_s: float,
+        stop_s: float,
+        min_freq_hz: float,
+        max_freq_hz: float,
+        mask: Optional[np.ndarray] = None,
+        mask_offsets: Optional[Tuple[int, int]] = None,
+    ) -> Dict:
+        """Measure DSP features for a user-defined region (manual box or mask).
+
+        Returns a feature dict comparable to a DSP detection — ``peak_freq_hz``,
+        ``mean_freq_hz``, ``freq_bandwidth_hz``, ``duration_ms``,
+        ``mean_power_db``, ``max_power_db``, ``snr_db``, ``tonality``,
+        ``spectral_entropy``, ``peak_freq_1..N``, and the contour features
+        (``mean_sweep_rate_khz_ms``, ``max_sweep_rate_khz_ms``,
+        ``contour_smoothness``) — so manually drawn/edited calls carry the same
+        data as automatic detections (used for UMAP / classification).
+
+        If ``mask`` (a bool array of the call shape, freq x time, cropped to the
+        box) and ``mask_offsets=(f_off, t_off)`` are supplied, features are
+        measured from the masked pixels; otherwise the full box rectangle is
+        used.
+        """
+        if audio is None or len(audio) == 0:
+            return {}
+        # Spectrogram of a padded slice around the region (keeps it cheap for
+        # interactive edits while preserving the DSP frequency grid).
+        pad = 0.05
+        s0 = max(0.0, start_s - pad)
+        s1 = min(len(audio) / sample_rate, stop_s + pad)
+        a0 = int(s0 * sample_rate)
+        a1 = max(a0 + self.config.nperseg + 1, int(s1 * sample_rate))
+        seg = audio[a0:a1]
+        if len(seg) < self.config.nperseg:
+            return {}
+        filtered = bandpass_filter(seg, sample_rate,
+                                   self.config.min_freq_hz, self.config.max_freq_hz)
+        frequencies, times, Sxx_db = compute_spectrogram_auto(
+            filtered, sample_rate,
+            nperseg=self.config.nperseg, noverlap=self.config.noverlap,
+            nfft=self.config.nfft, window=self.config.window_type,
+            min_freq=self.config.min_freq_hz, max_freq=self.config.max_freq_hz,
+            gpu_enabled=self.config.gpu_enabled, gpu_device=self.config.gpu_device,
+        )
+        times = times + s0  # local → absolute seconds
+
+        # Time/frequency index spans of the box within the slice.
+        t_sel = np.where((times >= start_s) & (times <= stop_s))[0]
+        if t_sel.size == 0:
+            t_sel = np.array([int(np.argmin(np.abs(times - 0.5 * (start_s + stop_s))))])
+        start_idx, end_idx = int(t_sel[0]), int(t_sel[-1])
+        f_sel = np.where((frequencies >= min_freq_hz) & (frequencies <= max_freq_hz))[0]
+        if f_sel.size == 0:
+            f_sel = np.array([int(np.argmin(np.abs(frequencies - 0.5 * (min_freq_hz + max_freq_hz))))])
+        f_lo, f_hi = int(f_sel[0]), int(f_sel[-1])
+
+        # Region mask. ``mask`` (when given) is a cropped boolean call shape on
+        # the FULL-FILE DSP grid with ``mask_offsets=(f_off, t_off)``; it is
+        # mapped into this slice by absolute time (freq bins are shared). If no
+        # mask is supplied the full box rectangle is used.
+        region_mask = np.zeros(Sxx_db.shape, dtype=bool)
+        used_mask = False
+        if mask is not None and mask_offsets is not None and np.asarray(mask).any():
+            m = np.asarray(mask) > 0
+            f_off, t_off = int(mask_offsets[0]), int(mask_offsets[1])
+            hop = self.config.nperseg - self.config.noverlap
+            # slice column for a full-grid frame = nearest time match
+            for j in range(m.shape[1]):
+                abs_t = (t_off + j) * hop / float(sample_rate)
+                col = int(np.argmin(np.abs(times - abs_t)))
+                rows = np.where(m[:, j])[0]
+                for i in rows:
+                    ff = f_off + i
+                    if 0 <= ff < region_mask.shape[0]:
+                        region_mask[ff, col] = True
+            used_mask = region_mask.any()
+        if not used_mask:
+            region_mask[f_lo:f_hi + 1, start_idx:end_idx + 1] = True
+        else:
+            # Tighten the analysis window to the mask's time/freq extent.
+            mr = np.where(region_mask.any(axis=1))[0]
+            mc = np.where(region_mask.any(axis=0))[0]
+            f_lo, f_hi = int(mr[0]), int(mr[-1])
+            start_idx, end_idx = int(mc[0]), int(mc[-1])
+
+        # --- base block (mirrors _detect_from_spectrogram) ---
+        region_spec = Sxx_db[:, start_idx:end_idx + 1].copy()
+        rmask_slice = region_mask[:, start_idx:end_idx + 1]
+        region_spec[~rmask_slice] = -100
+        peak_freq_hz = float(frequencies[np.unravel_index(
+            np.argmax(region_spec), region_spec.shape)[0]])
+        power_linear = 10 ** (region_spec / 10)
+        power_linear[region_spec < -99] = 0
+        total_power = float(np.sum(power_linear))
+        mean_freq_hz = (float(np.sum(frequencies[:, None] * power_linear) / total_power)
+                        if total_power > 0 else peak_freq_hz)
+        call_min_freq_hz = float(frequencies[f_lo])
+        call_max_freq_hz = float(frequencies[f_hi])
+        duration_ms = (stop_s - start_s) * 1000.0
+        valid = region_spec[region_spec > -99]
+        mean_power_db = float(np.mean(valid)) if valid.size else -100.0
+        max_power_db = float(np.max(region_spec))
+        noise_floor = estimate_noise_floor(Sxx_db, self.config.noise_percentile)
+        det_nf = noise_floor[f_lo:f_hi + 1]
+        snr_db = float(max_power_db - np.mean(det_nf)) if det_nf.size else 0.0
+
+        call = {
+            'start_seconds': float(start_s),
+            'stop_seconds': float(stop_s),
+            'min_freq_hz': call_min_freq_hz,
+            'max_freq_hz': call_max_freq_hz,
+            'peak_freq_hz': peak_freq_hz,
+            'mean_freq_hz': mean_freq_hz,
+            'freq_bandwidth_hz': call_max_freq_hz - call_min_freq_hz,
+            'duration_ms': duration_ms,
+            'mean_power_db': mean_power_db,
+            'max_power_db': max_power_db,
+            'snr_db': snr_db,
+            '_start_idx': start_idx,
+            '_end_idx': end_idx,
+        }
+        # tonality + spectral entropy (reuse detector method)
+        self._compute_spectral_features([call], frequencies, times, Sxx_db)
+        # band-limited peak-frequency samples
+        n_samples = getattr(self.config, 'freq_samples', 5) or 5
+        sample_cols = np.linspace(start_idx, end_idx, n_samples, dtype=int)
+        for i, c in enumerate(sample_cols, 1):
+            c = int(min(max(c, 0), Sxx_db.shape[1] - 1))
+            band = Sxx_db[f_lo:f_hi + 1, c]
+            call[f'peak_freq_{i}'] = float(frequencies[f_lo + int(np.argmax(band))])
+        call.pop('_start_idx', None)
+        call.pop('_end_idx', None)
+        # contour features (sweep/jitter) from the peak_freq_N samples
+        self._compute_contour_features([call])
+        return call
+
     def get_spectrogram(
         self,
         filepath: str
