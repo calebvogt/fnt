@@ -60,17 +60,43 @@ class Fed3Tracker:
     def start(self, callback):
         try:
             import serial
+            import os
             self.ser = serial.Serial(self.port, self.baud, timeout=1)
             time.sleep(2.0) # Allow device to reset/settle after opening
             self._running = True
             
             while self._running:
-                if self.ser.in_waiting > 0:
+                # Check if port still exists on the filesystem (works on Linux/macOS)
+                if self.port.startswith("/dev/") and not os.path.exists(self.port):
+                    callback("ERROR: Device disconnected (port disappeared)")
+                    self._running = False
+                    break
+
+                try:
+                    in_wait = self.ser.in_waiting
+                except Exception as e:
+                    callback(f"ERROR: Serial port error: {e}")
+                    self._running = False
+                    break
+
+                if in_wait > 0:
                     try:
-                        line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                        if line:
-                            callback(line)
-                    except Exception:
+                        line = self.ser.readline()
+                        if not line and in_wait > 0:
+                            # We expected bytes but got nothing, check if port still exists
+                            if self.port.startswith("/dev/") and not os.path.exists(self.port):
+                                callback("ERROR: Device disconnected")
+                                self._running = False
+                                break
+                        line_str = line.decode("utf-8", errors="ignore").strip()
+                        if line_str:
+                            callback(line_str)
+                    except Exception as e:
+                        if isinstance(e, (serial.SerialException, OSError)):
+                            callback(f"ERROR: Serial read error: {e}")
+                            self._running = False
+                            break
+                        # Otherwise pass for decoding or non-fatal errors
                         pass
                 else:
                     time.sleep(0.05)

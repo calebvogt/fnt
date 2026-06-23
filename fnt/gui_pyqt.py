@@ -1610,9 +1610,16 @@ def main():
     # with fonts that grow but layouts that don't, clipping control-panel
     # content that fits fine at 100% on macOS.
     try:
+        import os
+        os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
         from PyQt5.QtCore import Qt as _Qt
         QApplication.setAttribute(_Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(_Qt.AA_UseHighDpiPixmaps, True)
+        if hasattr(_Qt, 'HighDpiScaleFactorRoundingPolicy'):
+            try:
+                QApplication.setHighDpiScaleFactorRoundingPolicy(_Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+            except Exception:
+                pass
     except Exception:
         pass
 
