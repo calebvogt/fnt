@@ -56,6 +56,25 @@ class VideoProcessorWorker(QThread):
         self.instance_id = instance_id
         self.skip_already_processed = skip_already_processed
         self.should_stop = False
+        # Retry transient failures (e.g. network drops reading from a mapped
+        # network drive cause FFmpeg to crash mid-read). max_retries is the
+        # number of *extra* attempts after the first, so 2 == 3 attempts total.
+        self.max_retries = 2
+        self.retry_delay = 5  # seconds to wait before each retry
+
+    @staticmethod
+    def _describe_exit_code(code):
+        """Return a human-readable hint for common FFmpeg/Windows exit codes."""
+        known = {
+            3221225477: "0xC0000005 ACCESS_VIOLATION — FFmpeg crashed, often a "
+                        "transient read error from a network/mapped drive",
+            3221225781: "0xC0000135 — a required DLL was not found",
+            3221226505: "0xC0000409 STACK_BUFFER_OVERRUN",
+            -1073741819: "0xC0000005 ACCESS_VIOLATION (transient network read error?)",
+            1: "generic FFmpeg error (bad input, unreadable file, or write failure)",
+        }
+        hint = known.get(code)
+        return f"{code} ({hint})" if hint else str(code)
     
     def stop(self):
         """Stop the processing"""
@@ -148,6 +167,7 @@ class VideoProcessorWorker(QThread):
 
     def run(self):
         """Main processing function"""
+        import time
         try:
             processed_count = 0
             skipped_count = 0
@@ -207,13 +227,39 @@ class VideoProcessorWorker(QThread):
 
                 self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
 
-                # Process individual file
+                # Process individual file, retrying transient failures
                 parent_dir = os.path.dirname(video_file)
-                success = self.process_single_file(video_file, out_dir, file_index)
+                success = False
+                for attempt in range(1, self.max_retries + 2):  # 1..(max_retries+1)
+                    if self.should_stop:
+                        break
+                    if attempt > 1:
+                        self.progress_update.emit(
+                            f"🔁 Retry {attempt - 1}/{self.max_retries} for "
+                            f"{os.path.basename(video_file)} "
+                            f"(waiting {self.retry_delay}s first)…")
+                        # Sleep in short slices so Stop stays responsive
+                        for _ in range(self.retry_delay):
+                            if self.should_stop:
+                                break
+                            time.sleep(1)
+
+                    success = self.process_single_file(
+                        video_file, out_dir, file_index, attempt=attempt)
+                    if success:
+                        if attempt > 1:
+                            self.progress_update.emit(
+                                f"  ✔ Succeeded on retry {attempt - 1} for "
+                                f"{os.path.basename(video_file)}")
+                        break
+
                 if success:
                     processed_count += 1
                 elif not self.should_stop:
                     failed_count += 1
+                    self.progress_update.emit(
+                        f"❌ Giving up after {self.max_retries + 1} attempts: "
+                        f"{os.path.basename(video_file)}")
                     self._copy_to_failed(video_file, parent_dir)
                 self.results_update.emit(processed_count, failed_count, skipped_count)
 
@@ -252,7 +298,7 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"Error during processing: {str(e)}")
     
-    def process_single_file(self, video_file, out_dir, file_index):
+    def process_single_file(self, video_file, out_dir, file_index, attempt=1):
         """Process a single video file"""
         try:
             # Get filename and build output path
@@ -282,8 +328,12 @@ class VideoProcessorWorker(QThread):
             import time
             import threading
             import queue
+            from collections import deque
 
             line_queue = queue.Queue()
+            # Keep the last N FFmpeg output lines so we can surface the actual
+            # error in the Status Log on failure (the full FFmpeg log is huge).
+            recent_lines = deque(maxlen=20)
 
             def _reader():
                 """Read lines from process stdout and put them in the queue."""
@@ -340,6 +390,7 @@ class VideoProcessorWorker(QThread):
                 line = line.strip()
                 if line:
                     self.ffmpeg_output.emit(line)
+                    recent_lines.append(line)
                     last_progress_time = time.time()
 
             process.wait()
@@ -347,7 +398,16 @@ class VideoProcessorWorker(QThread):
 
             if not success:
                 self.progress_update.emit(
-                    f"❌ Failed (exit code {process.returncode}): {video_filename}")
+                    f"❌ Failed (exit code "
+                    f"{self._describe_exit_code(process.returncode)}): "
+                    f"{video_filename}")
+                # Surface the tail of FFmpeg's output so the failure is
+                # diagnosable from the Status Log without scrolling the full log.
+                if recent_lines:
+                    self.progress_update.emit("    ── last FFmpeg output ──")
+                    for ln in list(recent_lines)[-12:]:
+                        self.progress_update.emit(f"    │ {ln}")
+                    self.progress_update.emit("    ────────────────────────")
                 # Clean up partial output file
                 try:
                     if os.path.exists(output_file):
@@ -905,28 +965,33 @@ class VideoProcessingGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         group_layout.addWidget(self.progress_bar)
         
-        # Status log
-        status_label = QLabel("Status Log:")
-        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
-        group_layout.addWidget(status_label)
-        
-        self.status_log = QTextEdit()
-        self.status_log.setMaximumHeight(100)
-        self.status_log.setReadOnly(True)
-        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
-        group_layout.addWidget(self.status_log)
-        
-        # FFmpeg output log
+        # FFmpeg output log (shown above the status log)
         ffmpeg_label = QLabel("FFmpeg Output:")
         ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(ffmpeg_label)
-        
+
         self.ffmpeg_log = QTextEdit()
         self.ffmpeg_log.setMaximumHeight(150)
         self.ffmpeg_log.setReadOnly(True)
         self.ffmpeg_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
         group_layout.addWidget(self.ffmpeg_log)
-        
+
+        # Status log
+        status_label = QLabel("Status Log:")
+        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
+        group_layout.addWidget(status_label)
+
+        self.status_log = QTextEdit()
+        self.status_log.setMaximumHeight(100)
+        self.status_log.setReadOnly(True)
+        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
+        group_layout.addWidget(self.status_log)
+
+        # Copy status log to clipboard
+        self.copy_log_btn = QPushButton("Copy Status Log to Clipboard")
+        self.copy_log_btn.clicked.connect(self.copy_status_log)
+        group_layout.addWidget(self.copy_log_btn)
+
         group.setLayout(group_layout)
         layout.addWidget(group)
     
@@ -1148,6 +1213,15 @@ class VideoProcessingGUI(QMainWindow):
         cursor.movePosition(cursor.End)
         self.status_log.setTextCursor(cursor)
     
+    def copy_status_log(self):
+        """Copy the entire status log to the system clipboard"""
+        text = self.status_log.toPlainText()
+        QApplication.clipboard().setText(text)
+        # Brief visual confirmation on the button itself
+        original = "Copy Status Log to Clipboard"
+        self.copy_log_btn.setText("✅ Copied!")
+        QTimer.singleShot(1500, lambda: self.copy_log_btn.setText(original))
+
     def log_ffmpeg_output(self, output_line):
         """Add FFmpeg output to the FFmpeg log"""
         self.ffmpeg_log.append(output_line)

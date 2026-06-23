@@ -164,6 +164,129 @@ def list_call_ids(h5_path: str) -> List[str]:
         return list(grp.keys()) if grp is not None else []
 
 
+# ----------------------------------------------------------------------
+# Per-blob prediction-mask crops  (/pred_calls/<blob_id>)
+# ----------------------------------------------------------------------
+# These are the small, thresholded pixel masks for each predicted call,
+# carved out of the probability grid **once** at inference time. They let a
+# file's predictions be redrawn on switch by reading a few MB of crops instead
+# of decompressing the full-grid /prob map (~1 GB). MAD does not support
+# re-thresholding predictions after inference (re-run inference instead), so
+# the full /prob grid is no longer persisted — see MAD_README.md.
+PRED_GROUP = "pred_calls"
+
+
+def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
+    """Replace the stored prediction crops with ``crops`` (one file open).
+
+    Each crop is a dict ``{blob_id, mask, f_off, t_off}`` where ``mask`` is the
+    cropped binary (thresholded) blob and ``f_off``/``t_off`` are its top-left
+    offsets on the full spec grid. Also caches ``n_pred_blobs`` so file lists
+    can show the count without reading any crop.
+    """
+    _require_h5()
+    os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
+    with h5py.File(h5_path, "a") as f:
+        if PRED_GROUP in f:
+            del f[PRED_GROUP]
+        grp = f.require_group(PRED_GROUP)
+        for c in crops:
+            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
+            key = str(c["blob_id"])
+            ds = grp.create_dataset(key, data=m, compression="gzip",
+                                    compression_opts=4)
+            ds.attrs["f_off"] = int(c.get("f_off", 0))
+            ds.attrs["t_off"] = int(c.get("t_off", 0))
+        f.attrs["n_pred_blobs"] = int(len(crops))
+
+
+def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
+    """Return ``{blob_id: {mask(bool), f_off, t_off}}`` for every stored
+    prediction crop (cheap — only small per-blob arrays, never the grid)."""
+    _require_h5()
+    out: Dict[str, Dict] = {}
+    if not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        grp = f.get(PRED_GROUP)
+        if grp is None:
+            return out
+        for key in grp:
+            ds = grp[key]
+            out[key] = {
+                "mask": ds[()].astype(bool),
+                "f_off": int(ds.attrs.get("f_off", 0)),
+                "t_off": int(ds.attrs.get("t_off", 0)),
+            }
+    return out
+
+
+def has_pred_masks(h5_path: str) -> bool:
+    """True if the file holds per-blob prediction crops (cheap metadata read)."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return False
+    try:
+        with h5py.File(h5_path, "r") as f:
+            grp = f.get(PRED_GROUP)
+            return grp is not None and len(grp) > 0
+    except Exception:
+        return False
+
+
+def clear_pred_masks(h5_path: str) -> None:
+    """Delete all stored prediction crops (no-op if absent)."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    with h5py.File(h5_path, "a") as f:
+        if PRED_GROUP in f:
+            del f[PRED_GROUP]
+        if "n_pred_blobs" in f.attrs:
+            del f.attrs["n_pred_blobs"]
+
+
+def delete_prob(h5_path: str) -> None:
+    """Drop the legacy full-grid probability map and **reclaim the disk space**
+    (no-op if absent). MAD no longer writes /prob; this runs when migrating old
+    files to per-blob crops.
+
+    ``del f["prob"]`` only unlinks the dataset — HDF5 leaves the freed bytes as
+    unusable slack inside the file, so the ~1 GB grid would still occupy disk.
+    To actually shrink, we repack: copy every object **except** ``prob`` (and
+    the root attrs) into a fresh temp file, then atomically replace the original.
+    """
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    try:
+        with h5py.File(h5_path, "r") as f:
+            if "prob" not in f:
+                return
+            keys = [k for k in f.keys() if k != "prob"]
+        tmp = h5_path + ".repack.tmp"
+        with h5py.File(h5_path, "r") as src, h5py.File(tmp, "w") as dst:
+            for k, v in src.attrs.items():
+                dst.attrs[k] = v
+            for k in keys:
+                src.copy(k, dst, name=k)
+        os.replace(tmp, h5_path)
+    except Exception:
+        # Best-effort: if repack fails, fall back to a plain unlink so the file
+        # at least stops being read as a prob source.
+        try:
+            if os.path.isfile(h5_path + ".repack.tmp"):
+                os.remove(h5_path + ".repack.tmp")
+        except Exception:
+            pass
+        try:
+            with h5py.File(h5_path, "a") as f:
+                if "prob" in f:
+                    del f["prob"]
+        except Exception:
+            pass
+
+
 def write_prob(h5_path: str, prob: np.ndarray) -> None:
     """Store the full-grid probability map as float16 (for re-thresholding)."""
     _require_h5()
@@ -172,6 +295,9 @@ def write_prob(h5_path: str, prob: np.ndarray) -> None:
         if "prob" in f:
             del f["prob"]
         f.create_dataset("prob", data=p, compression="gzip", compression_opts=4)
+        # Stale blob count from a previous prob map; recomputed on demand.
+        if "n_pred_blobs" in f.attrs:
+            del f.attrs["n_pred_blobs"]
 
 
 def read_prob(h5_path: str) -> Optional[np.ndarray]:
@@ -183,6 +309,55 @@ def read_prob(h5_path: str) -> Optional[np.ndarray]:
         if "prob" not in f:
             return None
         return f["prob"][()].astype(np.float32)
+
+
+def has_prob(h5_path: str) -> bool:
+    """True if the file holds a probability map (cheap — no array read)."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return False
+    try:
+        with h5py.File(h5_path, "r") as f:
+            return "prob" in f
+    except Exception:
+        return False
+
+
+def get_prob_blob_count(h5_path: str) -> Optional[int]:
+    """Return the cached prediction-blob count for the prob map, or None if
+    it has not been computed yet.
+
+    This is a cheap metadata read (an HDF5 attribute) — it never decompresses
+    the probability grid, so it is safe to call for every file when populating
+    a file list. The count is populated lazily by :func:`set_prob_blob_count`
+    (at inference-write time, or the first time a file's predictions are
+    loaded), so opening a project does not have to scan multi-GB prob maps.
+    """
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return None
+    try:
+        with h5py.File(h5_path, "r") as f:
+            # The count is a root attr cached at write time. It stays valid even
+            # after the /prob grid is dropped (predictions now live as crops),
+            # so don't gate the read on /prob's presence.
+            v = f.attrs.get("n_pred_blobs")
+            return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def set_prob_blob_count(h5_path: str, n: int) -> None:
+    """Cache the prediction-blob count as a root attribute (cheap to read back
+    later). No-op if the file is missing."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    try:
+        with h5py.File(h5_path, "a") as f:
+            f.attrs["n_pred_blobs"] = int(n)
+    except Exception:
+        pass
 
 
 # ======================================================================
@@ -240,6 +415,33 @@ def td_iter_examples(h5_path: str) -> Iterator[Dict]:
             yield {"meta": meta, "spec": spec, "mask": mask}
 
 
+def td_iter_file_examples(h5_path: str, wav_name: str) -> Iterator[Dict]:
+    """Yield examples for a single wav file, skipping heavy array reads for
+    non-matching entries."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    with h5py.File(h5_path, "r") as f:
+        ex = f.get("examples")
+        if ex is None:
+            return
+        for key in ex:
+            g = ex[key]
+            try:
+                meta = json.loads(g.attrs.get("meta_json", "{}"))
+            except Exception:
+                continue
+            src = os.path.basename(str(meta.get("source_wav", "")))
+            if src != wav_name:
+                continue
+            try:
+                spec = g["spec"][()].astype(np.float32) / 255.0
+                mask = (g["mask"][()] > 0).astype(np.float32)
+            except Exception:
+                continue
+            yield {"meta": meta, "spec": spec, "mask": mask}
+
+
 def td_count(h5_path: str) -> int:
     _require_h5()
     if not os.path.isfile(h5_path):
@@ -247,6 +449,32 @@ def td_count(h5_path: str) -> int:
     with h5py.File(h5_path, "r") as f:
         ex = f.get("examples")
         return len(ex) if ex is not None else 0
+
+
+def td_count_by_source_wav(h5_path: str) -> Dict[str, int]:
+    """Return ``{wav_basename: n_examples}`` reading **only** each example's
+    metadata attribute — never decompressing the spec/mask arrays. Cheap enough
+    to call for a whole project when populating a file list."""
+    _require_h5()
+    out: Dict[str, int] = {}
+    if not os.path.isfile(h5_path):
+        return out
+    try:
+        with h5py.File(h5_path, "r") as f:
+            ex = f.get("examples")
+            if ex is None:
+                return out
+            for key in ex:
+                try:
+                    meta = json.loads(ex[key].attrs.get("meta_json", "{}"))
+                except Exception:
+                    continue
+                bn = os.path.basename(str(meta.get("source_wav", "")))
+                if bn:
+                    out[bn] = out.get(bn, 0) + 1
+    except Exception:
+        return out
+    return out
 
 
 def td_list_ids(h5_path: str) -> List[str]:
