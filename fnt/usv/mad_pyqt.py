@@ -2560,7 +2560,7 @@ class MADMainWindow(QMainWindow):
         # Row 1: the three drawing tools — SAM (primary), Brush, Eraser.
         tools_row = QHBoxLayout()
         tools_row.setSpacing(2)
-        self.btn_sam = QPushButton("SAM Labeling (S)")
+        self.btn_sam = QPushButton("SAM (S)")
         self.btn_sam.setToolTip(
             "SAM2-assisted labeling — left-click a call to propose a mask,\n"
             "right-click to add a negative point. Enter accepts, Esc clears.\n"
@@ -4918,14 +4918,14 @@ class MADMainWindow(QMainWindow):
     # --- deployment: file queue ---------------------------------------
     def _add_deploy_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add .wav files", os.path.expanduser("~"),
+            self, "Add .wav files", self._default_browse_dir(),
             "WAV files (*.wav);;All Files (*)"
         )
         self._append_deploy_files(paths)
 
     def _add_deploy_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Add folder of .wav files", os.path.expanduser("~")
+            self, "Add folder of .wav files", self._default_browse_dir()
         )
         if not folder:
             return
@@ -5486,10 +5486,21 @@ class MADMainWindow(QMainWindow):
             return
         self._close_project(silent=False)
 
+    def _default_browse_dir(self) -> str:
+        """Where Add Files / Add Folder dialogs should open. When a project is
+        open, default to its recordings folder (or the project root) so the user
+        lands at their data; otherwise the home directory."""
+        if self._project is not None:
+            for d in (getattr(self._project, 'recordings_dir', None),
+                      getattr(self._project, 'project_dir', None)):
+                if d and os.path.isdir(d):
+                    return d
+        return os.path.expanduser("~")
+
     def _menu_add_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self, "Add folder of .wav files (non-recursive)",
-            os.path.expanduser("~")
+            self._default_browse_dir()
         )
         if not folder:
             return
@@ -5690,7 +5701,7 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     def _add_audio_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Audio Files", os.path.expanduser("~"),
+            self, "Select Audio Files", self._default_browse_dir(),
             "WAV Files (*.wav *.WAV);;All Files (*.*)"
         )
         if not files:
