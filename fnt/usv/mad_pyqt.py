@@ -2030,8 +2030,41 @@ class MADSamPredictWorker(QThread):
 class MADMainWindow(QMainWindow):
     BASE_TITLE = "FNT Mask Audio Detector"
 
+    @staticmethod
+    def _apply_dark_theme():
+        """Force a consistent dark look on every OS/platform. Without this MAD
+        inherits the native theme — dark on macOS, light on Windows — so we pin
+        the Fusion style + a dark palette, which themes all standard widgets
+        (inputs, lists, menus, scrollbars) uniformly."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.setStyle("Fusion")
+        except Exception:
+            pass
+        from PyQt5.QtGui import QPalette
+        p = QPalette()
+        p.setColor(QPalette.Window, QColor(43, 43, 43))
+        p.setColor(QPalette.WindowText, QColor(220, 220, 220))
+        p.setColor(QPalette.Base, QColor(30, 30, 30))
+        p.setColor(QPalette.AlternateBase, QColor(43, 43, 43))
+        p.setColor(QPalette.ToolTipBase, QColor(30, 30, 30))
+        p.setColor(QPalette.ToolTipText, QColor(220, 220, 220))
+        p.setColor(QPalette.Text, QColor(220, 220, 220))
+        p.setColor(QPalette.Button, QColor(53, 53, 53))
+        p.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+        p.setColor(QPalette.BrightText, QColor(255, 80, 80))
+        p.setColor(QPalette.Link, QColor(0, 120, 212))
+        p.setColor(QPalette.Highlight, QColor(0, 120, 212))
+        p.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+            p.setColor(QPalette.Disabled, role, QColor(120, 120, 120))
+        app.setPalette(p)
+
     def __init__(self):
         super().__init__()
+        self._apply_dark_theme()
         self.setWindowTitle(self.BASE_TITLE)
         self.setMinimumSize(1100, 750)
         self.resize(1400, 900)
@@ -7778,6 +7811,7 @@ class MADMainWindow(QMainWindow):
 
 def main():
     app = QApplication.instance() or QApplication(sys.argv)
+    MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
     win.show()
     if QApplication.instance() is app:
