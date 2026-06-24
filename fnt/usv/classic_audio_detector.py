@@ -428,6 +428,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.spectrogram.detection_selected.connect(self.on_detection_selected)
         self.spectrogram.box_adjusted.connect(self.on_box_adjusted)
         self.spectrogram.drag_complete.connect(self.on_drag_complete)
+        self.spectrogram.sample_freq_adjusted.connect(self.on_sample_freq_adjusted)
+        self.spectrogram.sample_drag_complete.connect(self.on_sample_drag_complete)
         self.spectrogram.zoom_requested.connect(self.on_wheel_zoom)
         self.spectrogram.mask_edited.connect(self.on_mask_edited)
         right_layout.addWidget(self.spectrogram, 1)
@@ -1722,6 +1724,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.btn_reject_all_pending.clicked.connect(self.reject_all_pending)
         self.btn_reject_all_pending.setEnabled(False)
         batch_row.addWidget(self.btn_reject_all_pending)
+
+        self.chk_auto_advance = QCheckBox("Auto-advance")
+        self.chk_auto_advance.setChecked(True)
+        self.chk_auto_advance.setToolTip(
+            "When on, accepting/rejecting/skipping a call automatically jumps to\n"
+            "the next pending detection (default behavior).\n\n"
+            "When off, the selection stays on the current call after labeling so\n"
+            "you can fine-tune it (e.g. drag its frequency-sample dots); use the\n"
+            "(N) > / < (P) buttons to move between calls manually.")
+        batch_row.addWidget(self.chk_auto_advance)
 
         group_layout.addLayout(batch_row)
 
@@ -4212,6 +4224,71 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self._refresh_file_list_items()
         self._update_detection_boxes()
 
+    def on_sample_freq_adjusted(self, idx, dot_index, freq):
+        """Live update while a peak_freq sample dot is dragged.
+
+        Writes the new frequency into the detection and flags the box as
+        ``freq_samples_manual`` — decoupling it from automatic frequency
+        sampling so re-measuring the box won't overwrite the manual dots.
+        """
+        if self.detections_df is None or idx < 0 or idx >= len(self.detections_df):
+            return
+        col = f'peak_freq_{dot_index + 1}'
+        if col not in self.detections_df.columns:
+            return
+        self.detections_df.at[idx, col] = float(freq)
+        if 'freq_samples_manual' not in self.detections_df.columns:
+            self.detections_df['freq_samples_manual'] = False
+        self.detections_df.at[idx, 'freq_samples_manual'] = True
+        # Update the in-place widget copy so the dot tracks the cursor.
+        self.spectrogram.update_sample_freq(idx, dot_index, freq)
+
+    def on_sample_drag_complete(self, idx):
+        """Persist a finished sample-dot drag (no box re-measurement)."""
+        if self.detections_df is None or idx < 0 or idx >= len(self.detections_df):
+            return
+        # Sweep/jitter features are derived from the samples — refresh them
+        # from the now-manual dots so downstream data stays consistent.
+        self._recompute_contour_from_samples(idx)
+        self._store_current_detections()
+        if idx == self.current_detection_idx:
+            self._update_detection_info_only()
+        self._update_detection_boxes()
+
+    @staticmethod
+    def _is_manual_samples(val):
+        """Robustly coerce a ``freq_samples_manual`` cell to bool.
+
+        Guards against a hand-edited CSV where the value round-trips as the
+        string ``"False"`` (which ``bool()`` would treat as truthy).
+        """
+        if isinstance(val, str):
+            return val.strip().lower() in ('true', '1')
+        return bool(val) if not pd.isna(val) else False
+
+    def _recompute_contour_from_samples(self, idx):
+        """Recompute sweep-rate / contour-smoothness from the peak_freq_N dots."""
+        if self.detections_df is None or not (0 <= idx < len(self.detections_df)):
+            return
+        row = self.detections_df.iloc[idx]
+        call = {'duration_ms': float(row.get('duration_ms', 0) or 0)}
+        i = 1
+        while f'peak_freq_{i}' in self.detections_df.columns:
+            v = row.get(f'peak_freq_{i}')
+            if pd.isna(v):
+                break
+            call[f'peak_freq_{i}'] = float(v)
+            i += 1
+        try:
+            from fnt.usv.usv_detector.dsp_detector import DSPDetector
+            DSPDetector()._compute_contour_features([call])
+        except Exception:
+            return
+        for k in ('mean_sweep_rate_khz_ms', 'max_sweep_rate_khz_ms',
+                  'contour_smoothness'):
+            if k in call:
+                self.detections_df.at[idx, k] = call[k]
+
     def _update_detection_info_only(self):
         """Update detection info without changing view."""
         if self.detections_df is None or len(self.detections_df) == 0:
@@ -4263,6 +4340,8 @@ class ClassicAudioDetectorWindow(QMainWindow):
                 'max_freq_hz': max_freq,
                 'status': status,
             }
+            if 'freq_samples_manual' in row:
+                det['freq_samples_manual'] = self._is_manual_samples(row['freq_samples_manual'])
             # Pass through peak_freq_N contour columns only if freq sampling is enabled
             if self.chk_freq_samples.isChecked():
                 for col in row.index:
@@ -4656,6 +4735,17 @@ class ClassicAudioDetectorWindow(QMainWindow):
         if not self.chk_freq_samples.isChecked():
             feats = {k: v for k, v in feats.items()
                      if not k.startswith('peak_freq_') or k == 'peak_freq_hz'}
+        # If the user manually positioned this box's sample dots, keep them
+        # (and the contour features derived from them) — the box is decoupled
+        # from automatic frequency sampling.
+        manual = ('freq_samples_manual' in self.detections_df.columns
+                  and self._is_manual_samples(self.detections_df.at[idx, 'freq_samples_manual']))
+        if manual:
+            _contour = {'mean_sweep_rate_khz_ms', 'max_sweep_rate_khz_ms',
+                        'contour_smoothness'}
+            feats = {k: v for k, v in feats.items()
+                     if not (k.startswith('peak_freq_') and k != 'peak_freq_hz')
+                     and k not in _contour}
         keep_geom = {'start_seconds', 'stop_seconds', 'min_freq_hz', 'max_freq_hz'}
         for k, v in feats.items():
             if k in keep_geom:
@@ -4901,6 +4991,11 @@ class ClassicAudioDetectorWindow(QMainWindow):
         If ALL detections have been curated, prompts to move to next file.
         """
         if self.detections_df is None:
+            return
+
+        # Manual mode: stay on the current call so the user can fine-tune it
+        # (e.g. drag its frequency-sample dots) and advance with (N) > / < (P).
+        if not self.chk_auto_advance.isChecked():
             return
 
         current_time = self.detections_df.iloc[self.current_detection_idx]['start_seconds']

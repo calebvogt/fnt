@@ -234,6 +234,21 @@ def has_pred_masks(h5_path: str) -> bool:
         return False
 
 
+def delete_pred_mask(h5_path: str, blob_id) -> None:
+    """Remove one prediction crop by blob_id (no-op if absent). Used when a
+    prediction is *deleted* (vs rejected, which keeps its crop)."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    try:
+        with h5py.File(h5_path, "a") as f:
+            grp = f.get(PRED_GROUP)
+            if grp is not None and str(blob_id) in grp:
+                del grp[str(blob_id)]
+    except Exception:
+        pass
+
+
 def clear_pred_masks(h5_path: str) -> None:
     """Delete all stored prediction crops (no-op if absent)."""
     _require_h5()

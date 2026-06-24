@@ -140,6 +140,7 @@ def infer_probability_mask(
     overlap_fraction: float, device: str,
     batch_size: int = 4,
     progress: Optional[Callable[[int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> np.ndarray:
     """Tile-and-stitch inference over a full-file spectrogram image.
 
@@ -166,6 +167,8 @@ def infer_probability_mask(
     batch_i = 0
 
     for b0 in range(0, len(t_starts), batch_size):
+        if wait_if_paused is not None:
+            wait_if_paused()  # blocks here while the user has paused the run
         starts = t_starts[b0:b0 + batch_size]
         tiles = np.zeros((len(starts), 1, tile_freq_bins, tile_time_frames), dtype=np.float32)
         for k, t0 in enumerate(starts):
@@ -327,6 +330,7 @@ def run_inference_on_file(
     cfg: MADInferenceConfig,
     model=None, ckpt=None, device: Optional[str] = None,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> Dict:
     """Run inference on one wav, write sibling PNG + CSV, return summary.
 
@@ -368,6 +372,7 @@ def run_inference_on_file(
         overlap_fraction=cfg.tile_overlap_fraction,
         device=device,
         progress=(lambda i, n: progress('infer', i, n)) if progress else None,
+        wait_if_paused=wait_if_paused,
     )
 
     # Preserve confirmed labels: zero out the probability mask in any time
@@ -437,15 +442,20 @@ def run_inference_on_files(
     cfg: MADInferenceConfig,
     progress: Optional[Callable[[int, int, str, str, int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
     ``progress`` is invoked as ``(file_i, file_n, wav_name, stage, stage_i, stage_n)``.
+    ``wait_if_paused``, if given, is called between files and between inference
+    tiles; it should block while the run is paused and return on resume/stop.
     """
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     results: List[Dict] = []
     n = len(wav_paths)
     for i, wav in enumerate(wav_paths):
+        if wait_if_paused is not None:
+            wait_if_paused()
         if should_stop and should_stop():
             break
         name = Path(wav).name
@@ -456,6 +466,7 @@ def run_inference_on_files(
         try:
             summary = run_inference_on_file(
                 wav, cfg, model=model, ckpt=ckpt, device=device, progress=_inner,
+                wait_if_paused=wait_if_paused,
             )
             results.append(summary)
         except Exception as e:

@@ -26,6 +26,10 @@ class SpectrogramWidget(QWidget):
     drag_complete = pyqtSignal()  # Emitted when box drag is finished
     zoom_requested = pyqtSignal(float, float)  # factor, center_time
     mask_edited = pyqtSignal(object)  # call_id whose mask just changed
+    # Frequency-sample dot dragged: (det_idx, dot_index 0-based, new_freq_hz).
+    sample_freq_adjusted = pyqtSignal(int, int, float)
+    # A sample-dot drag finished (det_idx) — persist + refresh.
+    sample_drag_complete = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,6 +64,7 @@ class SpectrogramWidget(QWidget):
         self.drag_start = None
         self.drag_start_box = None
         self.drag_detection_idx = None
+        self.drag_dot_index = None  # which peak_freq sample dot is being dragged
 
         # Drawing new box
         self.is_drawing = False
@@ -379,6 +384,7 @@ class SpectrogramWidget(QWidget):
         if self.drag_mode is not None:
             self.drag_mode = None
             self.drag_detection_idx = None
+            self.drag_dot_index = None
             self.drag_start = None
             self.drag_start_box = None
         self.detections = detections
@@ -392,6 +398,12 @@ class SpectrogramWidget(QWidget):
             self.detections[idx]['stop_seconds'] = stop_s
             self.detections[idx]['min_freq_hz'] = min_freq
             self.detections[idx]['max_freq_hz'] = max_freq
+            self.update()
+
+    def update_sample_freq(self, idx, dot_index, freq):
+        """Update one peak_freq_N sample dot in place (used during dot drag)."""
+        if 0 <= idx < len(self.detections):
+            self.detections[idx][f'peak_freq_{dot_index + 1}'] = freq
             self.update()
 
     def set_view_range(self, start_s, end_s):
@@ -735,36 +747,56 @@ class SpectrogramWidget(QWidget):
         if status in ('accepted', 'pending') and det.get('peak_freq_1'):
             self._draw_freq_contour(painter, det, x1, x2, spec_rect)
 
-    def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
-        """Draw peak frequency sample dots and connecting lines."""
-        # Collect peak_freq_N values
+    def _collect_sample_freqs(self, det):
+        """Return the det's peak_freq_N sample values in order (skipping NaN)."""
         points = []
         i = 1
         while True:
-            key = f'peak_freq_{i}'
-            val = det.get(key)
+            val = det.get(f'peak_freq_{i}')
             if val is None:
                 break
-            if not (isinstance(val, (int, float)) and not math.isnan(val)):
-                i += 1
-                continue
-            points.append(val)
+            if isinstance(val, (int, float)) and not math.isnan(val):
+                points.append(val)
             i += 1
+        return points
 
-        if len(points) < 2:
-            return
+    def _sample_dot_coords(self, det, spec_rect):
+        """Screen (px, py) for each peak_freq_N dot, evenly spaced across the box.
 
+        Dots are positioned by index across the box width (the samples are
+        evenly distributed in time), so only the vertical position carries the
+        sampled frequency. Returns [] when there are fewer than 2 samples.
+        """
+        points = self._collect_sample_freqs(det)
         n = len(points)
-        # Evenly space dots horizontally across the box
-        dot_coords = []
+        if n < 2:
+            return []
+        x1 = self._time_to_x(det.get('start_seconds', 0), spec_rect)
+        x2 = self._time_to_x(det.get('stop_seconds', 0), spec_rect)
+        coords = []
         for j, freq in enumerate(points):
             t = j / (n - 1) if n > 1 else 0.5
             px = x1 + t * (x2 - x1)
             py = self._freq_to_y(freq, spec_rect)
-            dot_coords.append((px, py))
+            coords.append((px, py))
+        return coords
 
-        # Draw connecting lines (cyan)
-        pen = QPen(QColor(0, 220, 255, 200))
+    def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
+        """Draw peak frequency sample dots and connecting lines.
+
+        Manually adjusted samples (``freq_samples_manual``) are drawn in orange
+        to flag that the box is decoupled from automatic frequency sampling.
+        """
+        dot_coords = self._sample_dot_coords(det, spec_rect)
+        if len(dot_coords) < 2:
+            return
+
+        manual = bool(det.get('freq_samples_manual', False))
+        line_color = QColor(255, 170, 0, 200) if manual else QColor(0, 220, 255, 200)
+        dot_color = QColor(255, 170, 0, 235) if manual else QColor(0, 220, 255, 230)
+
+        # Draw connecting lines
+        pen = QPen(line_color)
         pen.setWidth(2)
         painter.setPen(pen)
         for j in range(len(dot_coords) - 1):
@@ -773,10 +805,11 @@ class SpectrogramWidget(QWidget):
                 int(dot_coords[j+1][0]), int(dot_coords[j+1][1])
             )
 
-        # Draw dots
-        painter.setBrush(QBrush(QColor(0, 220, 255, 230)))
+        # Draw dots — larger/grabbable on the selected, accepted box.
+        draggable = (det.get('status') == 'accepted')
+        painter.setBrush(QBrush(dot_color))
         painter.setPen(QPen(QColor(255, 255, 255), 1))
-        radius = 4
+        radius = 5 if draggable else 4
         for px, py in dot_coords:
             painter.drawEllipse(int(px - radius), int(py - radius), radius * 2, radius * 2)
 
@@ -936,6 +969,16 @@ class SpectrogramWidget(QWidget):
             self.detection_selected.emit(clicked_det)
             return
 
+        # Frequency-sample dot drag (selected + accepted box only). Checked
+        # before edges/move so a dot sitting on the box edge stays grabbable.
+        dot_det, dot_i = self._find_sample_dot_at_pos(pos, spec_rect)
+        if dot_det is not None:
+            self.drag_mode = 'sample_dot'
+            self.drag_detection_idx = dot_det
+            self.drag_dot_index = dot_i
+            self.drag_start = (time_s, freq_hz)
+            return
+
         # Now check edges/move on the SELECTED detection only
         edge, det_idx = self._find_edge_at_pos(pos, spec_rect)
 
@@ -980,6 +1023,11 @@ class SpectrogramWidget(QWidget):
         elif self.drag_mode:
             self._handle_drag(pos, spec_rect)
         else:
+            # A grabbable frequency-sample dot takes cursor priority.
+            dot_det, _ = self._find_sample_dot_at_pos(pos, spec_rect)
+            if dot_det is not None:
+                self.setCursor(Qt.SizeVerCursor)
+                return
             edge, _ = self._find_edge_at_pos(pos, spec_rect)
             if edge in ('resize_left', 'resize_right'):
                 self.setCursor(Qt.SizeHorCursor)
@@ -1006,7 +1054,9 @@ class SpectrogramWidget(QWidget):
         if event.button() != Qt.LeftButton:
             return
 
+        was_sample_drag = self.drag_mode == 'sample_dot'
         was_dragging = self.drag_mode is not None
+        drag_idx = self.drag_detection_idx
 
         if self.is_drawing and self.draw_start and self.draw_current:
             t1, f1 = self.draw_start
@@ -1020,11 +1070,15 @@ class SpectrogramWidget(QWidget):
         self.draw_current = None
         self.drag_mode = None
         self.drag_detection_idx = None
+        self.drag_dot_index = None
         self.drag_start_box = None
         self.update()
 
         # Notify parent that drag is complete (for saving)
-        if was_dragging:
+        if was_sample_drag:
+            # Sample-dot edits persist without re-measuring the box geometry.
+            self.sample_drag_complete.emit(drag_idx if drag_idx is not None else -1)
+        elif was_dragging:
             self.drag_complete.emit()
 
     def wheelEvent(self, event):
@@ -1111,6 +1165,30 @@ class SpectrogramWidget(QWidget):
 
         return None, None
 
+    def _find_sample_dot_at_pos(self, pos, spec_rect, threshold=8):
+        """Find a draggable peak_freq sample dot under the cursor.
+
+        Only the currently selected, ``accepted`` detection's dots are
+        grabbable — the user must accept a call before re-positioning its
+        frequency samples. Returns ``(det_idx, dot_index)`` or ``(None, None)``.
+        """
+        idx = self.current_detection_idx
+        if not (0 <= idx < len(self.detections)):
+            return None, None
+        det = self.detections[idx]
+        if det.get('status') != 'accepted':
+            return None, None
+        best = None
+        best_d2 = threshold * threshold
+        for dot_i, (px, py) in enumerate(self._sample_dot_coords(det, spec_rect)):
+            d2 = (pos.x() - px) ** 2 + (pos.y() - py) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = dot_i
+        if best is None:
+            return None, None
+        return idx, best
+
     def _find_detection_at_pos(self, pos, spec_rect):
         """Find detection at position (checks both x and y axes).
 
@@ -1146,6 +1224,15 @@ class SpectrogramWidget(QWidget):
         # Clamp to valid ranges
         time_s = max(0, min(time_s, self.total_duration))
         freq_hz = max(0, min(freq_hz, self.max_freq))
+
+        # Frequency-sample dot: vertical-only move, clamped to the box's band.
+        # (Horizontal positions stay evenly distributed across the box time span.)
+        if self.drag_mode == 'sample_dot':
+            min_f = det.get('min_freq_hz', self.min_freq)
+            max_f = det.get('max_freq_hz', self.max_freq)
+            f = max(min_f, min(freq_hz, max_f))
+            self.sample_freq_adjusted.emit(self.drag_detection_idx, self.drag_dot_index, f)
+            return
 
         start_s = det.get('start_seconds', 0)
         stop_s = det.get('stop_seconds', 0)
@@ -1216,6 +1303,7 @@ class WaveformOverviewWidget(QWidget):
         self.view_end = 1.0
         self._dragging = False
         self.detection_times = []  # List of (start_s, stop_s) for tick marks
+        self.status_marks = []  # List of (center_s, QColor) status-colored ticks
 
     def set_audio_data(self, audio_data, sample_rate):
         """Compute downsampled envelope for display."""
@@ -1245,6 +1333,16 @@ class WaveformOverviewWidget(QWidget):
             detection_times: List of (start_seconds, stop_seconds) tuples
         """
         self.detection_times = detection_times or []
+        self.update()
+
+    def set_status_marks(self, marks):
+        """Set status-colored tick marks along the overview strip.
+
+        Args:
+            marks: list of ``(center_seconds, QColor)`` — one tick per detection,
+                colored by labeling status (pending/accepted/rejected).
+        """
+        self.status_marks = marks or []
         self.update()
 
     def set_view_range(self, start, end):
@@ -1277,6 +1375,15 @@ class WaveformOverviewWidget(QWidget):
             painter.setPen(QPen(QColor(255, 200, 50, 180), 1))
             for start_s, stop_s in self.detection_times:
                 cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
+                painter.drawLine(cx, 0, cx, h)
+
+        # Draw status-colored tick marks (pending/accepted/rejected). One per
+        # detection at its center time, so the user can see where calls cluster
+        # along the whole file without zooming out.
+        if self.status_marks and self.total_duration > 0:
+            for cs, color in self.status_marks:
+                cx = int(cs / self.total_duration * w)
+                painter.setPen(QPen(color, 1))
                 painter.drawLine(cx, 0, cx, h)
 
         # Draw viewport highlight

@@ -51,8 +51,19 @@ The **CSV is canonical** for tabular output. Pixel data lives in HDF5 siblings.
 Per recording `<wav>`:
 
 - `<wav>_FNT_MAD_predictions.csv` — one row per predicted call: box (start/stop
-  s, min/max Hz), area, **score**, and review **status** (`pending` /
-  `accepted` / `rejected`).
+  s, min/max Hz), area, **score**, and review **status**:
+  - `pending` — not yet reviewed (shown yellow).
+  - `accepted` — confirmed by the user; in train mode also saved as a training
+    example (shown blue / removed from the pending queue).
+  - `rejected` — a **recorded** human "no": kept visible shaded **red** and
+    labeled "Reject" as an audit trail of what the labeler dismissed and why
+    (informs a later user of the accept criteria). Rejected masks are *not* used
+    as explicit negative training data — training only consumes accepted
+    examples — but the record is valuable for reproducibility.
+  - **Delete** removes a detection entirely and leaves no trace — its CSV row
+    and stored crop are both dropped (no `deleted` status is written). Use
+    Delete for genuine noise you don't want recorded; use Reject to record a
+    decision.
 - `<wav>_FNT_masks.h5` — pixel data:
   - `/calls/<id>` — confirmed (human-labeled) call mask crops.
   - `/pred_calls/<blob_id>` — **predicted call mask crops** (small,
