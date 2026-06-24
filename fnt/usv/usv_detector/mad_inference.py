@@ -2,7 +2,11 @@
 
 Runs a trained U-Net checkpoint over full WAV files, stitches a
 per-pixel probability mask, thresholds it, extracts connected-component
-blobs, and writes a sibling CSV + h5 probability map next to each wav.
+blobs, and writes a sibling CSV (blob boxes/scores) plus the small per-blob
+pixel-mask crops into the sibling ``_FNT_masks.h5``. The full-resolution
+probability grid is NOT persisted — MAD does not re-threshold after the fact
+(re-run inference to change the threshold), so storing ~1 GB/file just to
+re-derive call shapes on load is wasteful. See MAD_README.md.
 
 Heavy deps (``torch``, ``segmentation_models_pytorch``, ``scipy.ndimage``)
 are imported lazily inside the run functions so the module is safe to
@@ -136,6 +140,7 @@ def infer_probability_mask(
     overlap_fraction: float, device: str,
     batch_size: int = 4,
     progress: Optional[Callable[[int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> np.ndarray:
     """Tile-and-stitch inference over a full-file spectrogram image.
 
@@ -162,6 +167,8 @@ def infer_probability_mask(
     batch_i = 0
 
     for b0 in range(0, len(t_starts), batch_size):
+        if wait_if_paused is not None:
+            wait_if_paused()  # blocks here while the user has paused the run
         starts = t_starts[b0:b0 + batch_size]
         tiles = np.zeros((len(starts), 1, tile_freq_bins, tile_time_frames), dtype=np.float32)
         for k, t0 in enumerate(starts):
@@ -195,6 +202,7 @@ def infer_probability_mask(
 def extract_blobs(
     prob_mask: np.ndarray, threshold: float,
     min_blob_pixels: int = 8,
+    include_mask: bool = False,
 ) -> List[Dict]:
     """Return connected-component blobs from a thresholded prob mask.
 
@@ -204,6 +212,11 @@ def extract_blobs(
           'f_low': int, 'f_high_exclusive': int,
           'area_pixels': int, 'score': float,  # mean prob inside blob
         }
+
+    When ``include_mask`` is True, each blob also carries ``'mask'`` — the
+    cropped boolean pixel mask of that blob (shape
+    ``[f_high_exclusive - f_low, t_end_exclusive - t_start]``), so callers can
+    persist the exact call shape without re-thresholding the full grid later.
     """
     from scipy import ndimage as ndi
     binary = (prob_mask >= threshold).astype(np.uint8)
@@ -230,14 +243,17 @@ def extract_blobs(
             continue
         sub_probs = prob_mask[fs, ts]
         score = float(sub_probs[sub_mask].mean())
-        blobs.append({
+        blob = {
             't_start': int(ts.start),
             't_end_exclusive': int(ts.stop),
             'f_low': int(fs.start),
             'f_high_exclusive': int(fs.stop),
             'area_pixels': area,
             'score': score,
-        })
+        }
+        if include_mask:
+            blob['mask'] = np.ascontiguousarray(sub_mask)
+        blobs.append(blob)
     # Sort by time.
     blobs.sort(key=lambda b: (b['t_start'], b['f_low']))
     return blobs
@@ -314,6 +330,7 @@ def run_inference_on_file(
     cfg: MADInferenceConfig,
     model=None, ckpt=None, device: Optional[str] = None,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> Dict:
     """Run inference on one wav, write sibling PNG + CSV, return summary.
 
@@ -355,6 +372,7 @@ def run_inference_on_file(
         overlap_fraction=cfg.tile_overlap_fraction,
         device=device,
         progress=(lambda i, n: progress('infer', i, n)) if progress else None,
+        wait_if_paused=wait_if_paused,
     )
 
     # Preserve confirmed labels: zero out the probability mask in any time
@@ -375,20 +393,34 @@ def run_inference_on_file(
 
     if progress:
         progress('blobs', 0, 1)
-    blobs = extract_blobs(prob, threshold=cfg.threshold, min_blob_pixels=cfg.min_blob_pixels)
+    blobs = extract_blobs(prob, threshold=cfg.threshold,
+                          min_blob_pixels=cfg.min_blob_pixels, include_mask=True)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft, sr=sr)
 
     csv_path = pred_csv_sibling_path(wav_path)
     if cfg.save_blob_csv:
         write_blob_csv(csv_path, rows)
+    # Persist each blob's small cropped mask (NOT the multi-GB /prob grid):
+    # blob_id matches the CSV row's blob_id (both come from enumerate over the
+    # same time-sorted blob list). On file switch these few-MB crops are read
+    # directly, so predictions redraw without decompressing the full grid.
+    # MAD intentionally drops /prob — re-run inference to change the threshold.
     h5_path = None
     try:
-        from .fnt_mask_store import masks_sibling_path, write_prob, set_grid_attrs
+        from .fnt_mask_store import (masks_sibling_path, write_pred_masks,
+                                     set_grid_attrs, delete_prob)
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
                        n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
-        write_prob(h5_path, prob)
+        crops = [
+            {'blob_id': i, 'mask': b['mask'],
+             'f_off': b['f_low'], 't_off': b['t_start']}
+            for i, b in enumerate(blobs)
+        ]
+        write_pred_masks(h5_path, crops)
+        # Reclaim disk from any legacy full-grid prob map for this file.
+        delete_prob(h5_path)
     except Exception:
         h5_path = None
     if progress:
@@ -410,15 +442,20 @@ def run_inference_on_files(
     cfg: MADInferenceConfig,
     progress: Optional[Callable[[int, int, str, str, int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
     ``progress`` is invoked as ``(file_i, file_n, wav_name, stage, stage_i, stage_n)``.
+    ``wait_if_paused``, if given, is called between files and between inference
+    tiles; it should block while the run is paused and return on resume/stop.
     """
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     results: List[Dict] = []
     n = len(wav_paths)
     for i, wav in enumerate(wav_paths):
+        if wait_if_paused is not None:
+            wait_if_paused()
         if should_stop and should_stop():
             break
         name = Path(wav).name
@@ -429,6 +466,7 @@ def run_inference_on_files(
         try:
             summary = run_inference_on_file(
                 wav, cfg, model=model, ckpt=ckpt, device=device, progress=_inner,
+                wait_if_paused=wait_if_paused,
             )
             results.append(summary)
         except Exception as e:

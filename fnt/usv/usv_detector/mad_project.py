@@ -1,9 +1,8 @@
 """MAD (Mask Audio Detector) project configuration and directory layout.
 
-Parallels :mod:`fnt.usv.usv_detector.yolo_detector` but for semantic
-segmentation instead of bounding-box detection. A MAD project is a SLEAP-style
-self-contained directory. Pixel-level labels live as sibling PNGs next to
-each .wav (analogous to DAD's sibling CSVs).
+A MAD project is a self-contained directory. Pixel-level labels and training
+examples live in per-wav ``_FNT_masks.h5`` siblings and a consolidated
+``training_data.h5`` store under the project's ``models/training_data/``.
 """
 from __future__ import annotations
 

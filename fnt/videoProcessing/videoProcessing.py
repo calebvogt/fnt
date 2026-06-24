@@ -22,7 +22,7 @@ try:
         QFrame, QSizePolicy, QScrollArea
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPainterPath
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -34,6 +34,7 @@ class VideoProcessorWorker(QThread):
     """Worker thread for video processing to avoid blocking the GUI"""
     progress_update = pyqtSignal(str)  # status message
     file_progress = pyqtSignal(int, int)  # current file, total files
+    results_update = pyqtSignal(int, int, int)  # completed, failed, skipped
     ffmpeg_output = pyqtSignal(str)  # FFmpeg output lines
     finished = pyqtSignal(bool, str)  # success, final message
     
@@ -55,6 +56,25 @@ class VideoProcessorWorker(QThread):
         self.instance_id = instance_id
         self.skip_already_processed = skip_already_processed
         self.should_stop = False
+        # Retry transient failures (e.g. network drops reading from a mapped
+        # network drive cause FFmpeg to crash mid-read). max_retries is the
+        # number of *extra* attempts after the first, so 2 == 3 attempts total.
+        self.max_retries = 2
+        self.retry_delay = 5  # seconds to wait before each retry
+
+    @staticmethod
+    def _describe_exit_code(code):
+        """Return a human-readable hint for common FFmpeg/Windows exit codes."""
+        known = {
+            3221225477: "0xC0000005 ACCESS_VIOLATION — FFmpeg crashed, often a "
+                        "transient read error from a network/mapped drive",
+            3221225781: "0xC0000135 — a required DLL was not found",
+            3221226505: "0xC0000409 STACK_BUFFER_OVERRUN",
+            -1073741819: "0xC0000005 ACCESS_VIOLATION (transient network read error?)",
+            1: "generic FFmpeg error (bad input, unreadable file, or write failure)",
+        }
+        hint = known.get(code)
+        return f"{code} ({hint})" if hint else str(code)
     
     def stop(self):
         """Stop the processing"""
@@ -147,6 +167,7 @@ class VideoProcessorWorker(QThread):
 
     def run(self):
         """Main processing function"""
+        import time
         try:
             processed_count = 0
             skipped_count = 0
@@ -201,18 +222,46 @@ class VideoProcessorWorker(QThread):
                         f"Skipping (already processed): {os.path.basename(video_file)}"
                     )
                     skipped_count += 1
+                    self.results_update.emit(processed_count, failed_count, skipped_count)
                     continue
 
                 self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
 
-                # Process individual file
+                # Process individual file, retrying transient failures
                 parent_dir = os.path.dirname(video_file)
-                success = self.process_single_file(video_file, out_dir, file_index)
+                success = False
+                for attempt in range(1, self.max_retries + 2):  # 1..(max_retries+1)
+                    if self.should_stop:
+                        break
+                    if attempt > 1:
+                        self.progress_update.emit(
+                            f"🔁 Retry {attempt - 1}/{self.max_retries} for "
+                            f"{os.path.basename(video_file)} "
+                            f"(waiting {self.retry_delay}s first)…")
+                        # Sleep in short slices so Stop stays responsive
+                        for _ in range(self.retry_delay):
+                            if self.should_stop:
+                                break
+                            time.sleep(1)
+
+                    success = self.process_single_file(
+                        video_file, out_dir, file_index, attempt=attempt)
+                    if success:
+                        if attempt > 1:
+                            self.progress_update.emit(
+                                f"  ✔ Succeeded on retry {attempt - 1} for "
+                                f"{os.path.basename(video_file)}")
+                        break
+
                 if success:
                     processed_count += 1
                 elif not self.should_stop:
                     failed_count += 1
+                    self.progress_update.emit(
+                        f"❌ Giving up after {self.max_retries + 1} attempts: "
+                        f"{os.path.basename(video_file)}")
                     self._copy_to_failed(video_file, parent_dir)
+                self.results_update.emit(processed_count, failed_count, skipped_count)
 
             # Build summary
             if self.should_stop:
@@ -249,7 +298,7 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"Error during processing: {str(e)}")
     
-    def process_single_file(self, video_file, out_dir, file_index):
+    def process_single_file(self, video_file, out_dir, file_index, attempt=1):
         """Process a single video file"""
         try:
             # Get filename and build output path
@@ -279,8 +328,12 @@ class VideoProcessorWorker(QThread):
             import time
             import threading
             import queue
+            from collections import deque
 
             line_queue = queue.Queue()
+            # Keep the last N FFmpeg output lines so we can surface the actual
+            # error in the Status Log on failure (the full FFmpeg log is huge).
+            recent_lines = deque(maxlen=20)
 
             def _reader():
                 """Read lines from process stdout and put them in the queue."""
@@ -337,6 +390,7 @@ class VideoProcessorWorker(QThread):
                 line = line.strip()
                 if line:
                     self.ffmpeg_output.emit(line)
+                    recent_lines.append(line)
                     last_progress_time = time.time()
 
             process.wait()
@@ -344,7 +398,16 @@ class VideoProcessorWorker(QThread):
 
             if not success:
                 self.progress_update.emit(
-                    f"❌ Failed (exit code {process.returncode}): {video_filename}")
+                    f"❌ Failed (exit code "
+                    f"{self._describe_exit_code(process.returncode)}): "
+                    f"{video_filename}")
+                # Surface the tail of FFmpeg's output so the failure is
+                # diagnosable from the Status Log without scrolling the full log.
+                if recent_lines:
+                    self.progress_update.emit("    ── last FFmpeg output ──")
+                    for ln in list(recent_lines)[-12:]:
+                        self.progress_update.emit(f"    │ {ln}")
+                    self.progress_update.emit("    ────────────────────────")
                 # Clean up partial output file
                 try:
                     if os.path.exists(output_file):
@@ -391,7 +454,9 @@ class VideoProcessorWorker(QThread):
         
         # Build FFmpeg command with SLEAP-compatible settings
         cmd = [
-            "ffmpeg", "-y", "-nostdin",           # Overwrite output, disable interactive input
+            "ffmpeg", "-y", "-nostdin",
+            "-hwaccel", "none",
+            "-threads", "4",
             "-i", input_file,
             "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
             "-preset", self.preset,              # User-selected speed preset
@@ -464,8 +529,37 @@ class VideoProcessingGUI(QMainWindow):
         self.selected_dirs = []
         self.selected_videos = []
         self.worker = None
+        self._arrow_paths = self._create_arrow_images()
         self.init_ui()
     
+    @staticmethod
+    def _create_arrow_images():
+        """Create small arrow PNG files for stylesheet use (CSS border-triangles don't render on Windows Qt)."""
+        import tempfile
+        arrow_dir = os.path.join(tempfile.gettempdir(), "fnt_arrows")
+        os.makedirs(arrow_dir, exist_ok=True)
+        paths = {}
+        for name, points in [
+            ("up", [(2, 8), (6, 2), (10, 8)]),
+            ("down", [(2, 2), (6, 8), (10, 2)]),
+        ]:
+            path = os.path.join(arrow_dir, f"{name}.png")
+            if not os.path.exists(path):
+                pix = QPixmap(12, 10)
+                pix.fill(Qt.transparent)
+                p = QPainter(pix)
+                p.setRenderHint(QPainter.Antialiasing)
+                tri = QPainterPath()
+                tri.moveTo(points[0][0], points[0][1])
+                tri.lineTo(points[1][0], points[1][1])
+                tri.lineTo(points[2][0], points[2][1])
+                tri.closeSubpath()
+                p.fillPath(tri, QColor("#ffffff"))
+                p.end()
+                pix.save(path, "PNG")
+            paths[name] = path.replace("\\", "/")
+        return paths
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroToolbox")
@@ -473,16 +567,18 @@ class VideoProcessingGUI(QMainWindow):
         self.setMinimumSize(700, 600)
         
         # Set application style - Dark Mode
-        self.setStyleSheet("""
-            QMainWindow {
+        up_arrow = self._arrow_paths["up"]
+        down_arrow = self._arrow_paths["down"]
+        self.setStyleSheet(f"""
+            QMainWindow {{
                 background-color: #2b2b2b;
                 color: #cccccc;
-            }
-            QWidget {
+            }}
+            QWidget {{
                 background-color: #2b2b2b;
                 color: #cccccc;
-            }
-            QPushButton {
+            }}
+            QPushButton {{
                 background-color: #0078d4;
                 color: white;
                 border: none;
@@ -490,42 +586,42 @@ class VideoProcessingGUI(QMainWindow):
                 border-radius: 4px;
                 font-weight: bold;
                 min-height: 20px;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: #106ebe;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background-color: #005a9e;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 background-color: #3f3f3f;
                 color: #888888;
-            }
-            QGroupBox {
+            }}
+            QGroupBox {{
                 font-weight: bold;
                 border: 1px solid #3f3f3f;
                 border-radius: 4px;
                 margin-top: 10px;
                 padding-top: 8px;
                 color: #cccccc;
-            }
-            QGroupBox::title {
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px 0 5px;
-            }
-            QLabel {
+            }}
+            QLabel {{
                 color: #cccccc;
                 background-color: transparent;
-            }
-            QSpinBox, QComboBox {
+            }}
+            QSpinBox, QComboBox {{
                 padding: 5px;
                 border: 1px solid #3f3f3f;
                 border-radius: 3px;
                 background-color: #1e1e1e;
                 color: #cccccc;
-            }
-            QSpinBox::up-button {
+            }}
+            QSpinBox::up-button {{
                 subcontrol-origin: border;
                 subcontrol-position: top right;
                 width: 20px;
@@ -533,8 +629,8 @@ class VideoProcessingGUI(QMainWindow):
                 border: 1px solid #555555;
                 border-bottom: none;
                 border-top-right-radius: 3px;
-            }
-            QSpinBox::down-button {
+            }}
+            QSpinBox::down-button {{
                 subcontrol-origin: border;
                 subcontrol-position: bottom right;
                 width: 20px;
@@ -542,27 +638,21 @@ class VideoProcessingGUI(QMainWindow):
                 border: 1px solid #555555;
                 border-top: none;
                 border-bottom-right-radius: 3px;
-            }
-            QSpinBox::up-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-bottom: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 6px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+            }}
+            QSpinBox::up-arrow {{
+                image: url({up_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QSpinBox::down-arrow {{
+                image: url({down_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
                 background-color: #0078d4;
-            }
-            QComboBox::drop-down {
+            }}
+            QComboBox::drop-down {{
                 subcontrol-origin: padding;
                 subcontrol-position: center right;
                 width: 22px;
@@ -570,51 +660,48 @@ class VideoProcessingGUI(QMainWindow):
                 background-color: #3f3f3f;
                 border-top-right-radius: 3px;
                 border-bottom-right-radius: 3px;
-            }
-            QComboBox::drop-down:hover {
+            }}
+            QComboBox::drop-down:hover {{
                 background-color: #0078d4;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 6px solid transparent;
-                border-right: 6px solid transparent;
-                border-top: 7px solid #ffffff;
-                width: 0;
-                height: 0;
-            }
-            QComboBox QAbstractItemView {
+            }}
+            QComboBox::down-arrow {{
+                image: url({down_arrow});
+                width: 10px;
+                height: 8px;
+            }}
+            QComboBox QAbstractItemView {{
                 background-color: #1e1e1e;
                 color: #cccccc;
                 selection-background-color: #0078d4;
                 border: 1px solid #3f3f3f;
-            }
-            QCheckBox {
+            }}
+            QCheckBox {{
                 color: #cccccc;
                 spacing: 8px;
-            }
-            QTextEdit {
+            }}
+            QTextEdit {{
                 background-color: #1e1e1e;
                 border: 1px solid #3f3f3f;
                 color: #cccccc;
-            }
-            QProgressBar {
+            }}
+            QProgressBar {{
                 border: 1px solid #3f3f3f;
                 border-radius: 3px;
                 text-align: center;
                 background-color: #1e1e1e;
                 color: #cccccc;
-            }
-            QProgressBar::chunk {
+            }}
+            QProgressBar::chunk {{
                 background-color: #0078d4;
-            }
-            QScrollArea {
+            }}
+            QScrollArea {{
                 border: none;
                 background-color: #2b2b2b;
-            }
-            QFrame {
+            }}
+            QFrame {{
                 background-color: #2b2b2b;
                 border-color: #3f3f3f;
-            }
+            }}
         """)
         
         # Create central widget and main layout
@@ -868,33 +955,43 @@ class VideoProcessingGUI(QMainWindow):
         # File progress
         self.file_progress_label = QLabel("Ready to start...")
         group_layout.addWidget(self.file_progress_label)
-        
+
+        self.results_label = QLabel("")
+        self.results_label.setStyleSheet("color: #999999;")
+        self.results_label.setVisible(False)
+        group_layout.addWidget(self.results_label)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         group_layout.addWidget(self.progress_bar)
         
-        # Status log
-        status_label = QLabel("Status Log:")
-        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
-        group_layout.addWidget(status_label)
-        
-        self.status_log = QTextEdit()
-        self.status_log.setMaximumHeight(100)
-        self.status_log.setReadOnly(True)
-        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
-        group_layout.addWidget(self.status_log)
-        
-        # FFmpeg output log
+        # FFmpeg output log (shown above the status log)
         ffmpeg_label = QLabel("FFmpeg Output:")
         ffmpeg_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
         group_layout.addWidget(ffmpeg_label)
-        
+
         self.ffmpeg_log = QTextEdit()
         self.ffmpeg_log.setMaximumHeight(150)
         self.ffmpeg_log.setReadOnly(True)
         self.ffmpeg_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc; font-family: 'Courier New', monospace; font-size: 9px;")
         group_layout.addWidget(self.ffmpeg_log)
-        
+
+        # Status log
+        status_label = QLabel("Status Log:")
+        status_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #cccccc;")
+        group_layout.addWidget(status_label)
+
+        self.status_log = QTextEdit()
+        self.status_log.setMaximumHeight(100)
+        self.status_log.setReadOnly(True)
+        self.status_log.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3f3f3f; color: #cccccc;")
+        group_layout.addWidget(self.status_log)
+
+        # Copy status log to clipboard
+        self.copy_log_btn = QPushButton("Copy Status Log to Clipboard")
+        self.copy_log_btn.clicked.connect(self.copy_status_log)
+        group_layout.addWidget(self.copy_log_btn)
+
         group.setLayout(group_layout)
         layout.addWidget(group)
     
@@ -1048,10 +1145,12 @@ class VideoProcessingGUI(QMainWindow):
         self.add_videos_btn.setEnabled(False)
         self.clear_dirs_btn.setEnabled(False)
         
-        # Show progress bar
+        # Show progress bar and reset results
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        
+        self.results_label.setText("")
+        self.results_label.setVisible(False)
+
         # Clear logs
         self.status_log.clear()
         self.ffmpeg_log.clear()
@@ -1077,6 +1176,7 @@ class VideoProcessingGUI(QMainWindow):
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
+        self.worker.results_update.connect(self.update_results)
         self.worker.ffmpeg_output.connect(self.log_ffmpeg_output)
         self.worker.finished.connect(self.processing_finished)
         self.worker.start()
@@ -1092,6 +1192,18 @@ class VideoProcessingGUI(QMainWindow):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         self.file_progress_label.setText(f"Processing file {current} of {total}")
+
+    def update_results(self, completed, failed, skipped):
+        """Update running tally of completed/failed/skipped videos"""
+        parts = []
+        if completed > 0:
+            parts.append(f"✅ {completed} completed")
+        if failed > 0:
+            parts.append(f"❌ {failed} failed")
+        if skipped > 0:
+            parts.append(f"⏭ {skipped} skipped")
+        self.results_label.setText("  |  ".join(parts))
+        self.results_label.setVisible(True)
     
     def log_message(self, message):
         """Add message to status log"""
@@ -1101,6 +1213,15 @@ class VideoProcessingGUI(QMainWindow):
         cursor.movePosition(cursor.End)
         self.status_log.setTextCursor(cursor)
     
+    def copy_status_log(self):
+        """Copy the entire status log to the system clipboard"""
+        text = self.status_log.toPlainText()
+        QApplication.clipboard().setText(text)
+        # Brief visual confirmation on the button itself
+        original = "Copy Status Log to Clipboard"
+        self.copy_log_btn.setText("✅ Copied!")
+        QTimer.singleShot(1500, lambda: self.copy_log_btn.setText(original))
+
     def log_ffmpeg_output(self, output_line):
         """Add FFmpeg output to the FFmpeg log"""
         self.ffmpeg_log.append(output_line)

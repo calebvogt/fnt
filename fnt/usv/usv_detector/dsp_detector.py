@@ -1030,6 +1030,7 @@ class DSPDetector:
         Each value is the frequency of maximum amplitude at that time sample.
         """
         n_samples = getattr(self.config, 'freq_samples', 5)
+        n_freq = Sxx_db.shape[0]
 
         for call in calls:
             start_idx = call.get('_start_idx', 0)
@@ -1045,13 +1046,25 @@ class DSPDetector:
                     call[f'peak_freq_{i}'] = float('nan')
                 continue
 
+            # Band-limit the per-column argmax to the call's own frequency box.
+            # Sampling over the full (bandpassed) spectrum lets noise outside the
+            # call win the argmax — most visibly at the first/last samples, which
+            # sit on the weak-energy box edges. Restricting to [min_freq, max_freq]
+            # keeps every sample on the call's contour (mirrors characterize_region).
+            f_lo = int(np.searchsorted(
+                frequencies, call.get('min_freq_hz', frequencies[0]), side='left'))
+            f_hi = int(np.searchsorted(
+                frequencies, call.get('max_freq_hz', frequencies[-1]), side='right')) - 1
+            f_lo = max(0, min(f_lo, n_freq - 1))
+            f_hi = max(f_lo, min(f_hi, n_freq - 1))
+
             # Evenly-spaced indices across the call duration
             sample_indices = np.linspace(start_idx, end_idx, n_samples, dtype=int)
 
             for i, col_idx in enumerate(sample_indices, 1):
-                col_idx = min(col_idx, Sxx_db.shape[1] - 1)
-                peak_freq = frequencies[np.argmax(Sxx_db[:, col_idx])]
-                call[f'peak_freq_{i}'] = float(peak_freq)
+                col_idx = int(min(col_idx, Sxx_db.shape[1] - 1))
+                band = Sxx_db[f_lo:f_hi + 1, col_idx]
+                call[f'peak_freq_{i}'] = float(frequencies[f_lo + int(np.argmax(band))])
 
         return calls
 

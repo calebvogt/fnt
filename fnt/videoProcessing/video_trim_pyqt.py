@@ -114,9 +114,14 @@ class BatchTrimWorker(QThread):
             output_file = os.path.join(output_dir, config.output_filename)
             
             # Build FFmpeg command
+            # -hwaccel none: force software decoding to avoid GPU memory
+            #   contention when inference (e.g. mask tracker) is running
+            # -threads 4: cap CPU usage so ffmpeg doesn't starve other processes
             command = [
                 "ffmpeg",
                 "-y",
+                "-hwaccel", "none",
+                "-threads", "4",
                 "-ss", str(config.start_time),
                 "-to", str(end_time),
                 "-i", config.video_path,

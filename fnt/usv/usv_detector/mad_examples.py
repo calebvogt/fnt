@@ -140,6 +140,30 @@ def count_examples(dataset_dir: str) -> int:
     return n
 
 
+def count_by_source_wav(dataset_dir: str) -> Dict[str, int]:
+    """Return ``{wav_basename: n_confirmed_examples}`` cheaply (metadata only,
+    no spec/mask decompression). Combines the consolidated h5 store with any
+    legacy PNG/JSON triplets."""
+    from . import fnt_mask_store as _ms
+    out = dict(_ms.td_count_by_source_wav(_store_path(dataset_dir)))
+    d = Path(dataset_dir)
+    if d.is_dir():
+        for meta_path in d.glob("*.json"):
+            ex_id = meta_path.stem
+            if not (d / f"{ex_id}.png").is_file() or \
+                    not (d / f"{ex_id}_mask.png").is_file():
+                continue
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+            except Exception:
+                continue
+            bn = Path(str(meta.get("source_wav", ""))).name
+            if bn:
+                out[bn] = out.get(bn, 0) + 1
+    return out
+
+
 def list_classes(dataset_dir: str) -> List[str]:
     """Distinct class labels present in the example store (in first-seen order)."""
     seen: List[str] = []
@@ -253,20 +277,11 @@ def migrate_legacy_to_h5(dataset_dir: str) -> int:
 # ----------------------------------------------------------------------
 # Per-file annotations (one object per saved example)
 # ----------------------------------------------------------------------
-def iter_file_annotations(
-    dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
-):
-    """Yield one annotation dict per example belonging to ``wav_name``::
-
-        {id, category, f0, f1, t0, t1, mask}
-
-    where ``(f0,f1,t0,t1)`` is the half-open bbox on the full spec grid and
-    ``mask`` is the bool crop for that bbox. ``grid_shape`` is
-    ``(n_freq_bins, n_time_frames)`` used to clip to the current file grid.
-    """
+def _examples_to_annotations(examples, wav_name, grid_shape):
+    """Shared: convert example dicts into annotation dicts clipped to *grid_shape*."""
     n_freq, n_time = grid_shape
     target = Path(str(wav_name)).name
-    for ex in iter_examples(dataset_dir):
+    for ex in examples:
         meta = ex["meta"]
         if Path(str(meta.get("source_wav", ""))).name != target:
             continue
@@ -279,7 +294,6 @@ def iter_file_annotations(
         ts = np.where(m.any(axis=0))[0]
         lf0, lf1 = int(fs[0]), int(fs[-1]) + 1
         lt0, lt1 = int(ts[0]), int(ts[-1]) + 1
-        # Full-grid bbox, clipped to grid.
         f0 = max(0, f_off + lf0)
         f1 = min(n_freq, f_off + lf1)
         t0 = max(0, t_off + lt0)
@@ -293,6 +307,25 @@ def iter_file_annotations(
             "f0": f0, "f1": f1, "t0": t0, "t1": t1,
             "mask": np.ascontiguousarray(local),
         }
+
+
+def iter_file_annotations(
+    dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
+):
+    """Yield one annotation dict per example belonging to ``wav_name``.
+
+    Uses a fast path that skips heavy array reads for non-matching examples.
+    """
+    from . import fnt_mask_store as _ms
+    h5_path = _store_path(dataset_dir)
+    fast = list(_ms.td_iter_file_examples(h5_path, Path(str(wav_name)).name))
+    legacy = [ex for ex in _iter_legacy_examples(dataset_dir)
+              if Path(str(ex["meta"].get("source_wav", ""))).name
+              == Path(str(wav_name)).name]
+    seen = {ex["meta"].get("id") for ex in fast}
+    combined = fast + [ex for ex in legacy
+                       if ex["meta"].get("id") not in seen]
+    yield from _examples_to_annotations(combined, wav_name, grid_shape)
 
 
 # ----------------------------------------------------------------------
