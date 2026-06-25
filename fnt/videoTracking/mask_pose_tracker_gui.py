@@ -19,7 +19,7 @@ Features:
 - CSV export with behavioral metrics and pose features
 - Designed for UMAP clustering and behavioral motif discovery
 
-Author: FieldNeuroToolbox Contributors
+Author: FieldNeuroethologyToolbox Contributors
 """
 
 import sys
@@ -519,7 +519,7 @@ class MaskPoseTrackerGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mask Tracker - FieldNeuroToolbox")
+        self.setWindowTitle("Mask Tracker - FieldNeuroethologyToolbox")
         self.setGeometry(100, 100, 1200, 800)
         
         # State

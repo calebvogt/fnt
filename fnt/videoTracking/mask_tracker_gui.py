@@ -5,7 +5,7 @@ Two tabs:
   - Annotator: load videos, extract frames, annotate with manual/AI masks
   - Training: augment dataset and train a torchvision Mask R-CNN
 
-All code written from scratch for FieldNeuroToolbox.
+All code written from scratch for FieldNeuroethologyToolbox.
 """
 from __future__ import annotations
 

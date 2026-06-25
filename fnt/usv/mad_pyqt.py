@@ -1156,6 +1156,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
             painter.drawText(
                 spec_rect, Qt.AlignCenter, "Running inference…")
 
+        # Constant center reference line — a faint, dotted vertical line at the
+        # horizontal middle of the spectrogram. Auto-advance centers the
+        # selected call on this line, giving a fixed marker to read against.
+        cx_mid = int(spec_rect.center().x())
+        pen = QPen(QColor(255, 255, 255, 85))
+        pen.setStyle(Qt.DotLine)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(cx_mid, int(spec_rect.top()),
+                         cx_mid, int(spec_rect.bottom()))
+
         painter.end()
 
 
@@ -3139,6 +3151,7 @@ class MADMainWindow(QMainWindow):
         if delete_btn is not None:
             delete_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             row1.addWidget(delete_btn)
+            s['delete'] = delete_btn  # tracked so it enables with a selection
         for k in ('accept', 'reject'):
             s[k].setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         vbox.addLayout(row1)
@@ -3708,6 +3721,8 @@ class MADMainWindow(QMainWindow):
             s['next'].setEnabled(has_sel and pos < n - 1)
             for k in ('accept', 'reject', 'skip'):
                 s[k].setEnabled(has_sel)
+            if s.get('delete') is not None:
+                s['delete'].setEnabled(has_sel)
             s['accept_all'].setEnabled(has_pending)
             s['clear_all'].setEnabled(n > 0)
             s['nav_lbl'].setText(nav_text)

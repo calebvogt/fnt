@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video Tracking Module for FieldNeuroToolbox
+Video Tracking Module for FieldNeuroethologyToolbox
 
 Tracking tools for behavioral tests using SAM2 (Segment Anything Model 2),
 YOLOv11, and classical computer vision techniques.
@@ -14,7 +14,7 @@ class methods, so this module is safe to import without them installed.
 """
 
 __version__ = "0.1.0"
-__author__ = "FieldNeuroToolbox Contributors"
+__author__ = "FieldNeuroethologyToolbox Contributors"
 
 from pathlib import Path
 

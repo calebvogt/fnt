@@ -42,7 +42,7 @@ class MuseStudioWindow(QMainWindow):
         self.scan_thread = None
         self.output_dir = os.path.join(os.path.expanduser("~"), "Documents")
 
-        self.setWindowTitle("MuseStudio - FieldNeuroToolbox")
+        self.setWindowTitle("MuseStudio - FieldNeuroethologyToolbox")
         self.resize(1100, 750)
         self._init_ui()
 

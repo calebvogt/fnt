@@ -12,7 +12,7 @@ Key features:
 - Batch processing with per-video configuration
 - Comprehensive exports: CSVs, plots, tracked/data view video
 
-Author: FieldNeuroToolbox Contributors
+Author: FieldNeuroethologyToolbox Contributors
 """
 
 import sys
@@ -1648,7 +1648,7 @@ class SimpleTrackerGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Simple Tracker - FieldNeuroToolbox")
+        self.setWindowTitle("Simple Tracker - FieldNeuroethologyToolbox")
         self.setGeometry(100, 100, 1400, 900)
 
         # State

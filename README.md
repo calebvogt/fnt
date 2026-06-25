@@ -1,6 +1,6 @@
 [![build](https://github.com/calebvogt/fnt/actions/workflows/build.yml/badge.svg)](https://github.com/calebvogt/fnt/actions/workflows/build.yml)
 
-# FieldNeuroToolbox (fnt)
+# FieldNeuroethologyToolbox (fnt)
 
 Preprocessing and analysis toolbox for field and laboratory neurobehavioral data. This software is fully open source and made available freely to the research/hobbyist community. The software is released "as-is", and will continue to be updated as our own research needs evolve. Please open an issue for bugs or for feature requests! Thanks for checking us out! 
 
@@ -13,7 +13,7 @@ Subscribe for updates!
 
 ### Standalone Executables (Recommended)
 
-The easiest way to use FieldNeuroToolbox is by downloading the pre-built standalone executable for your operating system. **You do not need to install Python or Anaconda to use this version.**
+The easiest way to use FieldNeuroethologyToolbox is by downloading the pre-built standalone executable for your operating system. **You do not need to install Python or Anaconda to use this version.**
 
 **Requirements for the Executable:**
 
@@ -87,7 +87,7 @@ pip install -e .
 
 ### Launch the GUI
 
-After installation, launch the FieldNeuroToolbox GUI:
+After installation, launch the FieldNeuroethologyToolbox GUI:
 
 ```bash
 conda activate fnt

@@ -421,7 +421,7 @@ class VideoTrimTool(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Video Trim and Crop - FieldNeuroToolbox")
+        self.setWindowTitle("Video Trim and Crop - FieldNeuroethologyToolbox")
         self.setGeometry(100, 100, 1600, 950)  # Increased size to prevent cutoff
         
         # State

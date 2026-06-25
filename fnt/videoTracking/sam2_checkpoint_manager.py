@@ -7,7 +7,7 @@ Provides user-friendly dialogs for checkpoint management.
 All models are stored in ``LocalModels/`` at the FNT repo root
 (auto-added to .gitignore).
 
-Author: FieldNeuroToolbox Contributors
+Author: FieldNeuroethologyToolbox Contributors
 """
 
 import os

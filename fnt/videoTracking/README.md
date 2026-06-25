@@ -293,7 +293,7 @@ If you use this tracking module in your research, please cite:
 
 ```bibtex
 @software{fnt_video_tracking,
-  title = {FieldNeuroToolbox Video Tracking Module},
+  title = {FieldNeuroethologyToolbox Video Tracking Module},
   author = {Vogt, Caleb and Contributors},
   year = {2024},
   url = {https://github.com/calebvogt/fnt}
@@ -302,7 +302,7 @@ If you use this tracking module in your research, please cite:
 
 ## License
 
-Part of FieldNeuroToolbox. See main repository for license information.
+Part of FieldNeuroethologyToolbox. See main repository for license information.
 
 ## Support
 

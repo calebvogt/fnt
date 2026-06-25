@@ -5,7 +5,7 @@ SAM 2 Video Tracker
 Uses SAM 2 for multi-object video tracking with bounding box prompts.
 Supports tracking multiple objects simultaneously in a single pass.
 
-Author: FieldNeuroToolbox Contributors
+Author: FieldNeuroethologyToolbox Contributors
 """
 
 import numpy as np

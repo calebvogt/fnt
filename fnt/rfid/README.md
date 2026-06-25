@@ -1,6 +1,6 @@
 # RFID Preprocessing Module
 
-Universal RFID preprocessing tool for the FNT (FieldNeuroToolbox) package.
+Universal RFID preprocessing tool for the FNT (FieldNeuroethologyToolbox) package.
 
 ## Overview
 
@@ -267,7 +267,7 @@ config.output_dir = "/Users/caleb/Box/1_projects/2021_LID_TER/data/output_python
 
 ## License
 
-Part of the FieldNeuroToolbox (FNT) package.
+Part of the FieldNeuroethologyToolbox (FNT) package.
 
 ## Author
 

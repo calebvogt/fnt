@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Git File Splitter for FieldNeuroToolbox (FNT)
+Git File Splitter for FieldNeuroethologyToolbox (FNT)
 
 This module provides functionality to split large files into smaller chunks
 to comply with GitHub's 50MB file size limit. It also provides functionality
@@ -206,7 +206,7 @@ def select_info_file():
 
 def main():
     """Main function for command-line usage"""
-    print("🔧 Git File Splitter for FieldNeuroToolbox")
+    print("🔧 Git File Splitter for FieldNeuroethologyToolbox")
     print("=" * 50)
     
     if len(sys.argv) > 1:

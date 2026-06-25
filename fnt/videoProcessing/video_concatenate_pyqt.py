@@ -3023,7 +3023,7 @@ class VideoConcatenationGUI(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle(f"Video Concatenation Tool #{self.instance_id} - FieldNeuroToolbox")
+        self.setWindowTitle(f"Video Concatenation Tool #{self.instance_id} - FieldNeuroethologyToolbox")
         self.setGeometry(200 + (self.instance_id - 1) * 50, 200 + (self.instance_id - 1) * 50, 900, 700)
         self.setMinimumSize(700, 600)
         

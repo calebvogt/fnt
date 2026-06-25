@@ -22,7 +22,7 @@ Features:
 - Occupancy timeseries and summary statistics
 - Video rendering with ROI overlays
 
-Author: FieldNeuroToolbox Contributors
+Author: FieldNeuroethologyToolbox Contributors
 """
 
 import sys
@@ -1675,7 +1675,7 @@ class ROIToolGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ROI Analysis Tool - FieldNeuroToolbox")
+        self.setWindowTitle("ROI Analysis Tool - FieldNeuroethologyToolbox")
         self.setGeometry(100, 100, 1400, 900)
         
         # State
