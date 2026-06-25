@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QLayout, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
     QTimeEdit, QStackedWidget
 )
+from PyQt5.QtWidgets import QDialog, QCheckBox, QDialogButtonBox, QProgressDialog
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, QRect, QRectF, QPoint, QSize, QTime
 from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QBrush
 
@@ -24,6 +25,10 @@ from matplotlib.figure import Figure
 import matplotlib.dates as mdates
 
 from . import fed_comms
+from .fed_serial import Fed3TrackerWorker, PortScannerWorker
+from .fed_device import FedDevice
+from .fed_export import FedDownloadManager
+from .fed_plot import FedPlotManager
 
 
 class FlowLayout(QLayout):
@@ -130,7 +135,6 @@ class _CounterData:
 class FEDSvgView(QWidget):
     """Renders the FED3 SVG and paints overlay counters directly — no child
     widgets, so there are no background-fill / white-corner issues."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -243,95 +247,6 @@ class FEDSvgView(QWidget):
 
 
 
-class Fed3TrackerWorker(QThread):
-    line_received = pyqtSignal(str, str) # dev_name, line
-    error_received = pyqtSignal(str, str) # dev_name, error
-
-    def __init__(self, port, dev_name):
-        super().__init__()
-        self.port = port
-        self.dev_name = dev_name
-        self.tracker = fed_comms.Fed3Tracker(self.port)
-
-    def run(self):
-        def callback(line):
-            if line.startswith("ERROR:"):
-                self.error_received.emit(self.dev_name, line)
-            else:
-                self.line_received.emit(self.dev_name, line)
-        self.tracker.start(callback)
-
-    def stop(self):
-        self.tracker.stop()
-        self.quit()
-        self.wait()
-
-
-class PortScannerWorker(QThread):
-    finished_scan = pyqtSignal(list, list)
-
-    def __init__(self, active_ports=None):
-        super().__init__()
-        self.active_ports = active_ports or []
-
-    def run(self):
-        import serial
-        from serial.tools import list_ports
-        import time
-        from concurrent.futures import ThreadPoolExecutor
-        from . import fed_comms
-
-        ports = list(list_ports.comports())
-        # We only check candidate ports for active FED3 to prevent hangs on legacy/virtual ports
-        ping_ports = [p for p in ports if fed_comms.is_candidate_port(p)]
-
-        def check_port(p):
-            dev = p.device
-            desc = getattr(p, "description", "") or ""
-            mfg = getattr(p, "manufacturer", "") or ""
-
-            if dev in self.active_ports:
-                return (dev, "Active", None)
-
-            try:
-                ser = serial.Serial()
-                ser.port = dev
-                ser.baudrate = 115200
-                ser.timeout = 1.0
-                ser.open()
-                # Wait for board to process and reboot upon connection
-                time.sleep(2.0)
-                ser.write(b"PING\n")
-                time.sleep(0.2)
-                response = ser.read_all().decode('utf-8', errors='ignore')
-                ser.close()
-                if "PONG_FED3" in response:
-                    device_id = None
-                    if "ID:" in response:
-                        try:
-                            parts = response.split("ID:")
-                            if len(parts) > 1:
-                                raw_id = parts[1].strip().split()[0]
-                                device_id = "".join([c for c in raw_id if c.isdigit()])
-                        except Exception:
-                            pass
-                    return (dev, "FED3 Active", device_id)
-            except Exception as e:
-                err_str = str(e)
-                if "busy" in err_str.lower() or "already open" in err_str.lower() or "permission denied" in err_str.lower():
-                    return (dev, "Busy/In Use", None)
-
-            return (dev, "Unresponsive", None)
-
-        # Check ports in parallel to avoid long UI hangs
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            results = executor.map(check_port, ping_ports)
-
-        valid_ports = [r for r in results if r is not None]
-        # Return all system ports to allow selection of non-FED ports
-        all_devs = [p.device for p in ports]
-        self.finished_scan.emit(valid_ports, all_devs)
-
 
 
 class CollapsibleLogBox(QWidget):
@@ -340,6 +255,7 @@ class CollapsibleLogBox(QWidget):
 
     def __init__(self, title="FED Log", parent=None):
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
@@ -423,6 +339,136 @@ class CollapsibleLogBox(QWidget):
             self.command_input.clear()
 
 
+class FileSelectorDialog(QDialog):
+    def __init__(self, dev_name, files, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Select Files to Export - {dev_name}")
+        self.resize(400, 300)
+        self.setModal(True)
+        
+        layout = QVBoxLayout(self)
+        
+        label = QLabel("Select the CSV logs you want to offload from the device:")
+        layout.addWidget(label)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        self.checkboxes = []
+        for filename, size in files:
+            if size < 1024:
+                size_str = f"{size} B"
+            else:
+                size_str = f"{size / 1024:.1f} KB"
+            
+            cb = QCheckBox(f"{filename} ({size_str})")
+            cb.setProperty("filename", filename)
+            cb.setChecked(True)
+            scroll_layout.addWidget(cb)
+            self.checkboxes.append(cb)
+            
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        btn_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        clear_all_btn = QPushButton("Clear All")
+        select_all_btn.clicked.connect(self.select_all)
+        clear_all_btn.clicked.connect(self.clear_all)
+        btn_layout.addWidget(select_all_btn)
+        btn_layout.addWidget(clear_all_btn)
+        layout.addLayout(btn_layout)
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, Qt.Horizontal, self)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        
+    def select_all(self):
+        for cb in self.checkboxes:
+            cb.setChecked(True)
+            
+    def clear_all(self):
+        for cb in self.checkboxes:
+            cb.setChecked(False)
+            
+    def get_selected_files(self):
+        return [cb.property("filename") for cb in self.checkboxes if cb.isChecked()]
+
+
+class UnifiedFileSelectorDialog(QDialog):
+    def __init__(self, device_files_map, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Files to Export - FNT Bulk Export")
+        self.resize(500, 400)
+        self.setModal(True)
+        
+        layout = QVBoxLayout(self)
+        
+        label = QLabel("Select the CSV logs you want to offload from each device:")
+        layout.addWidget(label)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        self.checkboxes = []
+        
+        for dev_obj, files in device_files_map.items():
+            dev_name = dev_obj['name_edit'].text().strip() or dev_obj['box'].title()
+            
+            header = QLabel(f"<b>{dev_name}</b>")
+            scroll_layout.addWidget(header)
+            
+            for filename, size in files:
+                if size < 1024:
+                    size_str = f"{size} B"
+                else:
+                    size_str = f"{size / 1024:.1f} KB"
+                
+                cb = QCheckBox(f"  {filename} ({size_str})")
+                cb.setProperty("device", dev_obj)
+                cb.setProperty("filename", filename)
+                cb.setChecked(True)
+                scroll_layout.addWidget(cb)
+                self.checkboxes.append((dev_obj, filename, cb))
+                
+            scroll_layout.addSpacing(10)
+            
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        btn_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        clear_all_btn = QPushButton("Clear All")
+        select_all_btn.clicked.connect(self.select_all)
+        clear_all_btn.clicked.connect(self.clear_all)
+        btn_layout.addWidget(select_all_btn)
+        btn_layout.addWidget(clear_all_btn)
+        layout.addLayout(btn_layout)
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, Qt.Horizontal, self)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        
+    def select_all(self):
+        for _, _, cb in self.checkboxes:
+            cb.setChecked(True)
+            
+    def clear_all(self):
+        for _, _, cb in self.checkboxes:
+            cb.setChecked(False)
+            
+    def get_selected_files(self):
+        return [(dev, fname) for dev, fname, cb in self.checkboxes if cb.isChecked()]
+
+
 class FEDTabWidget(QWidget):
     """Modular widget for the FED processing tab."""
     scan_finished_signal = pyqtSignal(list, list)
@@ -447,6 +493,54 @@ class FEDTabWidget(QWidget):
                 os.makedirs(self.default_log_dir, exist_ok=True)
                 
         self.init_ui()
+        self.download_manager = FedDownloadManager(self)
+        self.plot_manager = FedPlotManager(self.canvas, self.ax, self.plot_placeholder)
+
+    def cleanup(self):
+        """Clean up all active serial connections, timers, and threads before exit."""
+        self.fed_log.append_log("Shutting down FED3 monitoring tab...")
+        
+        # 1. Stop all auto-reconnect/sync timers
+        if hasattr(self, 'reconnect_timer'):
+            self.reconnect_timer.stop()
+        if hasattr(self, 'sched_timer'):
+            self.sched_timer.stop()
+            
+        for device in self.fed_devices:
+            if 'timer' in device and device['timer']:
+                device['timer'].stop()
+            # Cancel download/list state machines and timers
+            if hasattr(self, 'download_manager') and self.download_manager:
+                self.download_manager.cancel_operations(device)
+
+        # 2. Stop and delete the global scanner if running
+        if hasattr(self, '_global_scanner') and self._global_scanner is not None:
+            if self._global_scanner.isRunning():
+                try:
+                    self._global_scanner.finished_scan.disconnect()
+                except Exception:
+                    pass
+                self._global_scanner.terminate()
+                self._global_scanner.wait()
+            self._global_scanner = None
+
+        # 3. Stop all device tracker workers
+        for device in self.fed_devices:
+            worker = device.get('tracker_worker')
+            if worker:
+                worker.stop()
+                device['tracker_worker'] = None
+
+        # 4. Stop any pending WorkerThread operations
+        if hasattr(self, '_active_workers'):
+            for worker in list(self._active_workers):
+                try:
+                    if worker.isRunning():
+                        worker.terminate()
+                        worker.wait()
+                except Exception:
+                    pass
+            self._active_workers.clear()
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -702,6 +796,19 @@ class FEDTabWidget(QWidget):
         # Initialize the scheduler group box
         self.init_scheduler()
 
+        # Initialize helper column widgets and layouts for wide view (prevents stretch & blank spaces)
+        self.left_col_widget = QWidget()
+        self.left_col_layout = QVBoxLayout(self.left_col_widget)
+        self.left_col_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_col_layout.setSpacing(15)
+        self.left_col_layout.addStretch()
+
+        self.right_col_widget = QWidget()
+        self.right_col_layout = QVBoxLayout(self.right_col_widget)
+        self.right_col_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_col_layout.setSpacing(15)
+        self.right_col_layout.addStretch()
+
         # Add the columns widget to the main layout (components added dynamically via adjust_responsive_layout)
         self.layout.addWidget(columns_widget)
         
@@ -719,7 +826,7 @@ class FEDTabWidget(QWidget):
 
         # Log box at bottom
         self.fed_log = CollapsibleLogBox("Serial Monitor")
-        self.layout.addWidget(self.fed_log)
+        main_layout.addWidget(self.fed_log)
 
         # Connections
         self.add_device_btn.clicked.connect(self.create_device_widget)
@@ -740,6 +847,11 @@ class FEDTabWidget(QWidget):
         # Start Auto Sync by default
         self.start_all_btn.setChecked(True)
  
+        # Auto-reconnection timer
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.timeout.connect(self.check_auto_reconnect)
+        self.reconnect_timer.start(2000) # Check every 2 seconds
+
         # Initial port scan on startup (auto-creates widgets for active devices when finished)
         self.refresh_all_ports()
 
@@ -1217,18 +1329,20 @@ class FEDTabWidget(QWidget):
             self.send_command_to_device(device, "FEED", "Dispense Pellet", confirm=False)
 
     def toggle_global_lights(self, checked):
+        btn = self.global_lights_toggle_btn
+        # Revert visually first so button doesn't change color/state before confirmation
+        btn.blockSignals(True)
+        btn.setChecked(not checked)
+        btn.blockSignals(False)
+
         if not self.confirm_action_if_tracking("Are you sure you want to toggle lights on all devices?"):
-            btn = self.global_lights_toggle_btn
-            btn.blockSignals(True)
-            btn.setChecked(not checked)
-            btn.blockSignals(False)
-            if checked:
-                btn.setText("Lights: OFF")
-            else:
-                btn.setText("Lights: ON")
             return
 
-        btn = self.global_lights_toggle_btn
+        # User confirmed, apply the state change and text at the same time
+        btn.blockSignals(True)
+        btn.setChecked(checked)
+        btn.blockSignals(False)
+
         if checked:
             btn.setText("Lights: ON")
         else:
@@ -1321,9 +1435,13 @@ class FEDTabWidget(QWidget):
         else:
             self.stop_scanning_animation()
 
-    def create_device_widget(self, checked=False, refresh=True):
-        idx = len(self.fed_devices) + 1
-        box = QGroupBox(f"Device {idx}")
+    def create_device_widget(self, checked=False, refresh=True, slot_num=None):
+        if slot_num is None:
+            existing_slots = {d['slot_num'] for d in self.fed_devices if 'slot_num' in d}
+            slot_num = 1
+            while slot_num in existing_slots:
+                slot_num += 1
+        box = QGroupBox(f"Device {slot_num}")
         box_layout = QGridLayout()
 
         # Define device fields
@@ -1443,7 +1561,7 @@ class FEDTabWidget(QWidget):
         svg_container = QWidget()
         svg_layout = QVBoxLayout(svg_container)
         svg_layout.setContentsMargins(0, 0, 0, 0)
-        svg_title = QLabel(f"Device {idx}")
+        svg_title = QLabel(f"Device {slot_num}")
         svg_title.setAlignment(Qt.AlignCenter)
         svg_title.setStyleSheet("font-weight: bold; font-size: 14px; color: white;")
         svg_view = FEDSvgView()
@@ -1453,38 +1571,48 @@ class FEDTabWidget(QWidget):
         
         self.fed_view_layout.addWidget(svg_container)
 
-        device = {
-            'box': box,
-            'name_edit': name_edit,
-            'port_combo': port_combo,
-            'remove_btn': remove_btn,
-            'mode_combo': mode_combo,
-            'apply_btn': apply_btn,
-            'fr_label': fr_label,
-            'ratio_spin': ratio_spin,
-            'timeout_label': timeout_label,
-            'timeout_spin': timeout_spin,
-            'timeout_unit_label': timeout_unit_label,
-            'last_sync_label': last_sync_label,
-            'feed_btn': feed_btn,
-            'lights_toggle_btn': lights_toggle_btn,
-            'reset_btn': reset_btn,
-            'export_btn': export_btn,
-            'timer': timer,
-            'svg_container': svg_container,
-            'svg_title': svg_title,
-            'svg_view': svg_view,
-            'is_syncing': False,
-            'is_tracking': False,
-            'tracker_worker': None,
-            'log_file': None,
-            'events': [],
-            'stats': {'left': 0, 'right': 0, 'pellet': 0}
-        }
+        device = FedDevice(
+            box=box,
+            slot_num=slot_num,
+            name_edit=name_edit,
+            port_combo=port_combo,
+            remove_btn=remove_btn,
+            mode_combo=mode_combo,
+            apply_btn=apply_btn,
+            fr_label=fr_label,
+            ratio_spin=ratio_spin,
+            timeout_label=timeout_label,
+            timeout_spin=timeout_spin,
+            timeout_unit_label=timeout_unit_label,
+            last_sync_label=last_sync_label,
+            feed_btn=feed_btn,
+            lights_toggle_btn=lights_toggle_btn,
+            reset_btn=reset_btn,
+            export_btn=export_btn,
+            timer=timer,
+            svg_container=svg_container,
+            svg_title=svg_title,
+            svg_view=svg_view,
+            is_syncing=False,
+            is_tracking=False,
+            tracker_worker=None,
+            log_file=None,
+            events=[],
+            file_list_pending=False,
+            file_list_buffer=[],
+            file_list_callback=None,
+            download_pending=False,
+            download_filename=None,
+            download_lines=[],
+            download_started=False,
+            download_waiting_crc=False,
+            download_callback=None,
+            stats={'left': 0, 'right': 0, 'pellet': 0}
+        )
         
         name_edit.textChanged.connect(
             lambda t, d=device: d['svg_title'].setText(
-                t.strip() or f"Device {self.fed_devices.index(d) + 1 if d in self.fed_devices else len(self.fed_devices) + 1}"
+                t.strip() or f"Device {d['slot_num']}"
             )
         )
         name_edit.textChanged.connect(lambda _: self.update_fed_view_combo())
@@ -1516,6 +1644,7 @@ class FEDTabWidget(QWidget):
         port_combo.setEnabled(False)
         self.devices_layout.addWidget(box)
         self.fed_devices.append(device)
+        self.reorganize_device_indices()
         self.update_remove_buttons()
         self.update_fed_view_combo()
         self.update_control_panels_enabled_state()
@@ -1523,59 +1652,11 @@ class FEDTabWidget(QWidget):
             self.refresh_all_ports()
         return device
 
-    def start_device_acquisition(self, device, port):
-        # Stop existing worker if running
-        worker = device.get('tracker_worker')
-        if worker:
-            try:
-                worker.stop()
-            except Exception:
-                pass
-            device['tracker_worker'] = None
-            
-        dev_name = device['name_edit'].text().strip() or device['box'].title()
-        
-        # Initialize tracking stats and file path as soon as connection is opened
-        device['is_tracking'] = True
-        device['svg_view'].is_tracking = True
-        device['events'] = []
-        device['stats'] = {'left': 0, 'right': 0, 'pellet': 0}
-        device['tracking_start_time'] = datetime.now()
-        
-        # Generate unique log file path in self.default_log_dir
-        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        clean_dev_name = "".join(c for c in dev_name if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_')
-        log_filename = f"{clean_dev_name}_{date_str}.csv"
-        device['log_file'] = os.path.join(self.default_log_dir, log_filename)
-        
-        # Write CSV header
-        try:
-            with open(device['log_file'], 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Device", "EventType", "LeftPokes", "RightPokes", "Pellets", "RawData"])
-        except Exception as e:
-            self.fed_log.append_log(f"Error creating default log file for {dev_name}: {e}", False)
-            
-        new_worker = Fed3TrackerWorker(port, dev_name)
-        new_worker.line_received.connect(lambda d, l: self.on_tracker_line(d, l, device))
-        new_worker.error_received.connect(lambda d, l: self.fed_log.append_log(f"{d}: {l}", False))
-        new_worker.finished.connect(lambda d=device: self.handle_tracker_finished(d))
-        device['tracker_worker'] = new_worker
-        
-        device['port_combo'].setEnabled(False)
-        new_worker.start()
-        
-        # Automatically start auto sync if checked
-        if self.start_all_btn.isChecked():
-            ms = self.get_global_interval_ms()
-            device['timer'].start(ms)
-            self.do_device_sync(device)
-        
-        self.update_fed_view_counts(device)
-        self.update_plot()
-        self.fed_log.append_log(f"Opened live visual monitoring on {port} for {dev_name}")
 
     def handle_tracker_finished(self, device):
+        dev_name = device['name_edit'].text().strip() or device['box'].title()
+        unexpected = device.get('has_connected', False) and device.get('tracker_worker') is not None
+        
         device['is_tracking'] = False
         device['svg_view'].is_tracking = False
         device['port_combo'].setEnabled(True)
@@ -1588,7 +1669,16 @@ class FEDTabWidget(QWidget):
             device['tracker_worker'] = None
         self.update_fed_view_counts(device)
         self.update_plot()
-        self.fed_log.append_log(f"Stopped live monitoring/worker for {device['box'].title()}")
+        
+        if unexpected:
+            device['has_connected'] = False
+            self.fed_log.append_log(f"[{dev_name}] WARNING: Device disconnected unexpectedly!", False)
+            if self.main_window:
+                self.main_window.statusBar().showMessage(f"WARNING: {dev_name} disconnected unexpectedly!", 5000)
+            device['box'].setStyleSheet("QGroupBox { border: 2px solid #ff4d4d; }")
+            device['box'].setToolTip("Device disconnected unexpectedly!")
+        else:
+            self.fed_log.append_log(f"Stopped live monitoring/worker for {dev_name}")
 
     def get_current_plot_device(self):
         idx = self.plot_filter_combo.currentIndex()
@@ -1597,11 +1687,17 @@ class FEDTabWidget(QWidget):
         return None
 
     def on_tracker_line(self, dev_name, line, device):
-        self.fed_log.append_log(f"[{dev_name}] {line}")
+        # 1. Delegate file list and download states to download_manager
+        if self.download_manager.handle_line(device, line):
+            return
+
+        stripped_line = line.strip()
+        # Regular line logging and plotting (only if not intercepted)
+        self.fed_log.append_log(f"[{dev_name}] {stripped_line}")
         
         event_type = "Other"
         updated_plot = False
-        parts = [p.strip().upper() for p in line.split(',')]
+        parts = [p.strip().upper() for p in stripped_line.split(',')]
         
         event_val = None
         for p in parts:
@@ -1610,7 +1706,7 @@ class FEDTabWidget(QWidget):
                 break
                 
         if not event_val:
-            line_upper = line.upper()
+            line_upper = stripped_line.upper()
             if "COUNT" not in line_upper:
                 if "PELLET" in line_upper:
                     event_val = "PELLET"
@@ -1642,127 +1738,10 @@ class FEDTabWidget(QWidget):
             if device.get('is_tracking'):
                 device['stats']['right'] += 1
                 self.update_fed_view_counts(device)
-                
-                
-        # Log to CSV
-        log_file = device.get('log_file')
-        if log_file and device.get('is_tracking'):
-            try:
-                with open(log_file, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                        dev_name,
-                        event_type,
-                        device['stats']['left'],
-                        device['stats']['right'],
-                        device['stats']['pellet'],
-                        line
-                    ])
-            except Exception as e:
-                self.fed_log.append_log(f"CSV Write Error: {e}", False)
 
     def update_plot(self):
-        from datetime import timedelta
-        from matplotlib.ticker import MaxNLocator
-
-        self.ax.clear()
-        self.ax.set_title("Pellets retrieved", color='white')
-        self.ax.set_xlabel("Time", color='white')
-        self.ax.set_ylabel("Cumulative Pellets", color='white')
-        self.ax.tick_params(colors='white')
-        for spine in self.ax.spines.values():
-            spine.set_edgecolor('#444444')
-        
-        plotted_something = False
-        min_time = None
-        max_time = None
-        
         target_dev = self.get_current_plot_device()
-        devices_to_plot = [target_dev] if target_dev else self.fed_devices
-        
-        for dev in devices_to_plot:
-            events = dev.get('events', [])
-            dev_name = dev['name_edit'].text().strip() or dev['box'].title()
-            
-            if events:
-                times = mdates.date2num(events)
-                counts = list(range(1, len(events) + 1))
-                
-                if min_time is None or events[0] < min_time:
-                    min_time = events[0]
-                if max_time is None or events[-1] > max_time:
-                    max_time = events[-1]
-                
-                self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
-                plotted_something = True
-            elif dev.get('is_tracking') and dev.get('tracking_start_time'):
-                start_t = dev['tracking_start_time']
-                end_t = max(datetime.now(), start_t + timedelta(minutes=5))
-                times = mdates.date2num([start_t, end_t])
-                counts = [0, 0]
-                
-                if min_time is None or start_t < min_time:
-                    min_time = start_t
-                if max_time is None or end_t > max_time:
-                    max_time = end_t
-                
-                self.ax.plot_date(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
-                plotted_something = True
-        
-        # Toggle between placeholder and canvas
-        self.plot_placeholder.setVisible(not plotted_something)
-        self.canvas.setVisible(plotted_something)
-                
-        if plotted_something:
-            self.ax.legend(facecolor='#2b2b2b', edgecolor='#444444', labelcolor='white')
-            
-            # Shade dark cycle (19:00 to 07:00)
-            if min_time and max_time:
-                current_shade_start = min_time.replace(hour=19, minute=0, second=0, microsecond=0)
-                if min_time.hour < 19:
-                    current_shade_start -= timedelta(days=1)
-                
-                while current_shade_start < max_time:
-                    shade_end = current_shade_start + timedelta(hours=12)
-                    self.ax.axvspan(mdates.date2num(current_shade_start), 
-                                    mdates.date2num(shade_end), 
-                                    color='gray', alpha=0.3, zorder=0)
-                    current_shade_start += timedelta(days=1)
-            
-            # Auto-scale x-axis so ticks adapt as the time range grows
-            locator = mdates.AutoDateLocator()
-            self.ax.xaxis.set_major_locator(locator)
-            self.ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
-            self.ax.autoscale_view()
-            
-            # Overwrite autoscaled limits with safer bounds to prevent zero-range formatting errors
-            if min_time and max_time:
-                if (max_time - min_time).total_seconds() < 300:
-                    mid = min_time + (max_time - min_time) / 2
-                    min_t_plot = mid - timedelta(minutes=2.5)
-                    max_t_plot = mid + timedelta(minutes=2.5)
-                else:
-                    min_t_plot = min_time
-                    max_t_plot = max_time
-                self.ax.set_xlim(mdates.date2num(min_t_plot), mdates.date2num(max_t_plot))
-            
-            # Configure integer ticks on y-axis
-            self.ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-            
-            max_y = 0
-            for dev in devices_to_plot:
-                events = dev.get('events', [])
-                if events:
-                    max_y = max(max_y, len(events))
-            if max_y == 0:
-                self.ax.set_ylim(0, 10)
-            else:
-                self.ax.set_ylim(bottom=0)
-                
-            self.figure.autofmt_xdate()
-            self.figure.tight_layout(pad=1.5)
-            self.canvas.draw()
+        self.plot_manager.update_plot(target_dev, self.fed_devices)
 
     def update_fed_view_combo(self):
         current_plot_idx = self.plot_filter_combo.currentIndex()
@@ -1800,6 +1779,7 @@ class FEDTabWidget(QWidget):
         device['svg_view'].update()  # trigger repaint since counters are painted directly
 
     def handle_scan_finished(self, valid_ports, candidate_ports=None):
+        self._global_scanner = None
         # Stop spinner animation
         if hasattr(self, '_spinner_timer'):
             self._spinner_timer.stop()
@@ -1808,11 +1788,15 @@ class FEDTabWidget(QWidget):
         if self.main_window:
             self.main_window.statusBar().showMessage("Ready")
 
-        # Clear any auto-populated names first so they can be freshly generated and unique
+        # Clear auto-populated names for active/matching devices first so they can be freshly generated and unique,
+        # but preserve names for disconnected/inactive devices so their historical data remains correctly labeled.
+        detected_ports = [p[0] for p in (valid_ports or [])]
         for dev in self.fed_devices:
-            name = dev['name_edit'].text().strip()
-            if name.startswith("FED "):
-                dev['name_edit'].clear()
+            port = dev['port_combo'].currentData() or dev['port_combo'].currentText()
+            if port in detected_ports:
+                name = dev['name_edit'].text().strip()
+                if name.startswith("FED "):
+                    dev['name_edit'].clear()
 
         # 1. Gather all active ports that are FED3 Active and extract device IDs
         active_fed_ports = []
@@ -1909,38 +1893,72 @@ class FEDTabWidget(QWidget):
         unassigned_fed_ports = [p for p in active_fed_ports if p not in assigned_ports]
         unassigned_fed_ports = [p for p in unassigned_fed_ports if p not in self.removed_ports]
 
+        self.fed_log.append_log(f"[Scan] Detected active FED3 ports: {active_fed_ports}")
+        self.fed_log.append_log(f"[Scan] Currently assigned ports: {assigned_ports}")
+        self.fed_log.append_log(f"[Scan] Unassigned FED3 ports: {unassigned_fed_ports}")
+        self.fed_log.append_log(f"[Scan] Discovered Port ID map: {self._port_to_id}")
+
         # First pass: try to assign ports to their matching slot indices (based on on-board ID)
         still_unassigned = []
         for port in unassigned_fed_ports:
             dev_id = self._port_to_id.get(port)
             matched = False
+            self.fed_log.append_log(f"[Scan] First pass: checking port {port} with dev_id '{dev_id}'")
             if dev_id:
                 try:
-                    slot_idx = int(dev_id) - 1
-                    if 0 <= slot_idx < len(self.fed_devices):
-                        target_dev = self.fed_devices[slot_idx]
+                    slot_num = int(dev_id)
+                    # Find target_dev with matching slot_num
+                    target_dev = None
+                    for dev in self.fed_devices:
+                        if dev.get('slot_num') == slot_num:
+                            target_dev = dev
+                            break
+                    
+                    if target_dev is None:
+                        self.fed_log.append_log(f"[Scan] No card for Slot {slot_num} exists. Creating card...")
+                        # Auto-create the card with the specific slot_num!
+                        target_dev = self.create_device_widget(refresh=False, slot_num=slot_num)
+                        # We must populate its port_combo box items
                         combo = target_dev['port_combo']
-                        curr = target_dev.get('saved_port', '')
-                        if not curr or curr in ("Scanning...", "No FED3 found", ""):
-                            # Slot is empty/unassigned, assign it!
-                            combo.blockSignals(True)
-                            idx = combo.findData(port)
-                            if idx >= 0:
-                                combo.setCurrentIndex(idx)
-                                assigned_ports.append(port)
-                                target_dev['saved_port'] = port
-                                matched = True
-                                # Auto-populate name with the device ID
-                                if not target_dev['name_edit'].text().strip():
-                                    target_dev['name_edit'].setText(get_unique_name(dev_id))
-                            combo.blockSignals(False)
+                        combo.blockSignals(True)
+                        combo.clear()
+                        if all_port_displays:
+                            for port_val, display_val in all_port_displays:
+                                combo.addItem(display_val, port_val)
+                        else:
+                            combo.addItem("No FED3 found")
+                        combo.setEnabled(True)
+                        combo.blockSignals(False)
+                    else:
+                        self.fed_log.append_log(f"[Scan] Found existing card for Slot {slot_num}")
+                    
+                    combo = target_dev['port_combo']
+                    curr = target_dev.get('saved_port', '')
+                    self.fed_log.append_log(f"[Scan] Slot {slot_num} current saved_port is '{curr}'")
+                    if not curr or curr in ("Scanning...", "No FED3 found", ""):
+                        # Slot is empty/unassigned, assign it!
+                        combo.blockSignals(True)
+                        idx = combo.findData(port)
+                        self.fed_log.append_log(f"[Scan] Matching index in combo: {idx}")
+                        if idx >= 0:
+                            combo.setCurrentIndex(idx)
+                            assigned_ports.append(port)
+                            target_dev['saved_port'] = port
+                            matched = True
+                            self.fed_log.append_log(f"[Scan] Successfully assigned {port} to Slot {slot_num}")
+                            # Auto-populate name with the device ID
+                            if not target_dev['name_edit'].text().strip():
+                                target_dev['name_edit'].setText(get_unique_name(dev_id))
+                        combo.blockSignals(False)
                 except ValueError:
+                    self.fed_log.append_log(f"[Scan] ID '{dev_id}' is not an integer")
                     pass
             if not matched:
                 still_unassigned.append(port)
 
         # Second pass: assign remaining ports to any available empty slots
         for port in still_unassigned:
+            self.fed_log.append_log(f"[Scan] Second pass: attempting to assign port {port}")
             assigned = False
             for dev in self.fed_devices:
                 combo = dev['port_combo']
@@ -1953,6 +1971,7 @@ class FEDTabWidget(QWidget):
                         assigned_ports.append(port)
                         dev['saved_port'] = port
                         assigned = True
+                        self.fed_log.append_log(f"[Scan] Assigned port {port} to empty existing Slot {dev.get('slot_num')}")
                         dev_id = self._port_to_id.get(port)
                         if dev_id and not dev['name_edit'].text().strip():
                             dev['name_edit'].setText(get_unique_name(dev_id))
@@ -1962,6 +1981,7 @@ class FEDTabWidget(QWidget):
             if not assigned:
                 # Create a new device widget
                 new_dev = self.create_device_widget(refresh=False)
+                self.fed_log.append_log(f"[Scan] Created new card for Slot {new_dev.get('slot_num')} to hold port {port}")
                 combo = new_dev['port_combo']
                 combo.blockSignals(True)
                 combo.clear()
@@ -1977,6 +1997,7 @@ class FEDTabWidget(QWidget):
                     combo.setCurrentIndex(idx)
                     assigned_ports.append(port)
                     new_dev['saved_port'] = port
+                    self.fed_log.append_log(f"[Scan] Assigned port {port} to new Slot {new_dev.get('slot_num')}")
                     dev_id = self._port_to_id.get(port)
                     if dev_id and not new_dev['name_edit'].text().strip():
                         new_dev['name_edit'].setText(get_unique_name(dev_id))
@@ -2008,9 +2029,11 @@ class FEDTabWidget(QWidget):
             worker = device.get('tracker_worker')
             if worker and worker.port == reverted_port and worker.isRunning():
                 return
-            self.start_device_acquisition(device, reverted_port)
+            self.on_port_changed(device, reverted_text, warn_id_mismatch=False)
 
     def on_port_changed(self, device, text, warn_id_mismatch=True):
+        device['box'].setStyleSheet("")
+        device['box'].setToolTip("")
         port = text.strip()
         if not port or port in ("Scanning...", "No FED3 found"):
             # Stop existing worker if running
@@ -2018,6 +2041,7 @@ class FEDTabWidget(QWidget):
             if worker:
                 worker.stop()
                 device['tracker_worker'] = None
+            device['has_connected'] = False  # User manually disconnected
             return
 
         # Check if current worker is already running on the same port
@@ -2048,8 +2072,8 @@ class FEDTabWidget(QWidget):
         # 2. Check if on-board ID matches the slot index
         if warn_id_mismatch and hasattr(self, '_port_to_id'):
             onboard_id = self._port_to_id.get(port)
-            slot_num = self.fed_devices.index(device) + 1
-            if onboard_id and str(onboard_id) != str(slot_num):
+            slot_num = device.get('slot_num')
+            if onboard_id and slot_num is not None and str(onboard_id) != str(slot_num):
                 reply = QMessageBox.question(
                     self,
                     "Device ID Mismatch",
@@ -2083,12 +2107,40 @@ class FEDTabWidget(QWidget):
             device['tracker_worker'] = None
 
         dev_name = device['name_edit'].text().strip() or device['box'].title()
+
+        # Ensure tracking stats are active
+        device['is_tracking'] = True
+        device['svg_view'].is_tracking = True
+        
+        if not device.get('events'):
+            device['events'] = []
+        if not device.get('stats'):
+            device['stats'] = {'left': 0, 'right': 0, 'pellet': 0}
+        if not device.get('tracking_start_time'):
+            device['tracking_start_time'] = datetime.now()
+        
+        # Host-side CSV file logging is disabled. On-device SD cards are the single source of truth.
+        pass
+
         new_worker = Fed3TrackerWorker(port, dev_name)
         new_worker.line_received.connect(lambda d, l: self.on_tracker_line(d, l, device))
         new_worker.error_received.connect(lambda d, l: self.fed_log.append_log(f"{d}: {l}", False))
         new_worker.finished.connect(lambda d=device: self.handle_tracker_finished(d))
+        
+        # Auto-sync time when the port is connected (after worker connection settles)
+        new_worker.connected.connect(lambda d=device: self.do_device_sync(d))
+        
         device['tracker_worker'] = new_worker
         new_worker.start()
+        device['has_connected'] = True  # Successfully initiated serial monitoring
+        
+        # Automatically start auto sync if checked
+        if self.start_all_btn.isChecked():
+            ms = self.get_global_interval_ms()
+            device['timer'].start(ms)
+
+        self.update_fed_view_counts(device)
+        self.update_plot()
         self.fed_log.append_log(f"Opened live visual monitoring on {port} for {dev_name}")
 
         # Update previous port property
@@ -2096,7 +2148,9 @@ class FEDTabWidget(QWidget):
 
 
     def remove_device(self, device):
-        if len(self.fed_devices) <= 1: return
+        if len(self.fed_devices) <= 1:
+            QMessageBox.warning(self, "Cannot Remove Device", "At least one device slot must remain active.")
+            return
         
         if not self.confirm_action_if_tracking("Are you sure you want to remove this device?"):
             return
@@ -2126,9 +2180,26 @@ class FEDTabWidget(QWidget):
         self.update_plot()
 
     def reorganize_device_indices(self):
-        for i, dev in enumerate(self.fed_devices, start=1):
-            dev['box'].setTitle(f"Device {i}")
-            dev['svg_title'].setText(dev['name_edit'].text().strip() or f"Device {i}")
+        # Sort the devices list by slot_num to keep everything sequential
+        self.fed_devices.sort(key=lambda d: d.get('slot_num', 0))
+        
+        # Update titles/labels based on slot_num
+        for dev in self.fed_devices:
+            s = dev.get('slot_num')
+            if s is not None:
+                dev['box'].setTitle(f"Device {s}")
+                dev['svg_title'].setText(dev['name_edit'].text().strip() or f"Device {s}")
+                
+        # Reorder widgets in the layouts to match the sorted order
+        for dev in self.fed_devices:
+            self.devices_layout.removeWidget(dev['box'])
+            if 'svg_container' in dev:
+                self.fed_view_layout.removeWidget(dev['svg_container'])
+                
+        for dev in self.fed_devices:
+            self.devices_layout.addWidget(dev['box'])
+            if 'svg_container' in dev:
+                self.fed_view_layout.addWidget(dev['svg_container'])
 
     def update_remove_buttons(self):
         enable = len(self.fed_devices) > 1
@@ -2185,18 +2256,21 @@ class FEDTabWidget(QWidget):
             btn.blockSignals(False)
             return
 
-        if confirm and not self.confirm_action_if_tracking("Are you sure you want to toggle lights on this device?"):
-            btn = device['lights_toggle_btn']
+        btn = device['lights_toggle_btn']
+        if confirm:
+            # Revert visually first so button doesn't change color/state before confirmation
             btn.blockSignals(True)
             btn.setChecked(not checked)
             btn.blockSignals(False)
-            if checked:
-                btn.setText("Lights: OFF")
-            else:
-                btn.setText("Lights: ON")
-            return
+            
+            if not self.confirm_action_if_tracking("Are you sure you want to toggle lights on this device?"):
+                return
+            
+            # User confirmed, apply the state change and text at the same time
+            btn.blockSignals(True)
+            btn.setChecked(checked)
+            btn.blockSignals(False)
 
-        btn = device['lights_toggle_btn']
         if checked:
             btn.setText("Lights: ON")
             self.send_command_to_device(device, "LIGHTS:ON", "Turn Lights ON", confirm=False)
@@ -2206,24 +2280,24 @@ class FEDTabWidget(QWidget):
 
     def send_command_to_device(self, device, command, action_name, confirm=True):
         if confirm and not self.confirm_action_if_tracking(f"Are you sure you want to send command '{action_name}' to this device?"):
-            return
+            return False
 
         if device.get('is_syncing'):
             self.fed_log.append_log(f"Device {device['name_edit'].text().strip() or device['box'].title()} is busy.", False)
-            return
+            return False
 
         port = device['port_combo'].currentData() or device['port_combo'].currentText() or None
         dev_name = device['name_edit'].text().strip() or device['box'].title()
         
         if not port:
             self.fed_log.append_log(f"[{dev_name}] No port selected.", False)
-            return
+            return False
 
         worker = device.get('tracker_worker')
         if worker and worker.isRunning():
             success, msg = worker.tracker.send_command(command)
             self.fed_log.append_log(f"[{dev_name}] {msg}", success)
-            return
+            return success
 
         device['is_syncing'] = True
         if self.main_window:
@@ -2245,6 +2319,7 @@ class FEDTabWidget(QWidget):
         thread_worker.finished.connect(on_finished)
         self._active_workers.append(thread_worker)
         thread_worker.start()
+        return True
 
     def update_mode_ui(self, device):
         mode = device['mode_combo'].currentText()
@@ -2404,10 +2479,47 @@ class FEDTabWidget(QWidget):
             dev['port_combo'].addItem("Scanning...")
             dev['port_combo'].setEnabled(False)
             
+        # Stop previous scanner if running
+        if hasattr(self, '_global_scanner') and self._global_scanner is not None:
+            if self._global_scanner.isRunning():
+                try:
+                    self._global_scanner.finished_scan.disconnect()
+                except Exception:
+                    pass
+                self._global_scanner.terminate()
+                self._global_scanner.wait()
+            self._global_scanner = None
+
         self._global_scanner = PortScannerWorker(active_ports)
         self._global_scanner.finished_scan.connect(self.scan_finished_signal.emit)
+        self._global_scanner.finished.connect(self._global_scanner.deleteLater)
         self._global_scanner.start()
         self.update_control_panels_enabled_state()
+
+    def check_auto_reconnect(self):
+        # Skip checking if scanner is currently active
+        try:
+            if hasattr(self, '_global_scanner') and self._global_scanner is not None and self._global_scanner.isRunning():
+                return
+        except RuntimeError:
+            # If the C++ object has been deleted (via deleteLater), reset reference
+            self._global_scanner = None
+            
+        # Get list of currently connected system ports (non-blocking query)
+        try:
+            from serial.tools import list_ports
+            available_ports = {p.device for p in list_ports.comports()}
+        except Exception:
+            return
+            
+        for dev in self.fed_devices:
+            # If the device was previously successfully connected but is now disconnected
+            if dev.get('has_connected') and not dev.get('is_tracking') and not dev.get('is_syncing'):
+                port = dev['port_combo'].currentData() or dev['port_combo'].currentText()
+                if port and port not in ("Scanning...", "No FED3 found", ""):
+                    if port in available_ports:
+                        self.fed_log.append_log(f"Auto-reconnect: Port {port} detected for {dev['box'].title()}. Re-opening port...", True)
+                        self.on_port_changed(dev, port, warn_id_mismatch=False)
 
     def toggle_auto_sync(self, checked):
         if checked:
@@ -2427,36 +2539,22 @@ class FEDTabWidget(QWidget):
         if confirm:
             reply = QMessageBox.question(
                 self,
-                "Reset Counters",
-                f"Are you sure you want to reset counters and clear the plot for {dev_name}?",
+                "New Trial & Reset",
+                f"Are you sure you want to reset counters, clear the plot, and start a new trial on {dev_name}?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
             if reply != QMessageBox.Yes:
                 return
                 
+        # Send the command to the physical device to reset counters and create new file on SD card
+        self.send_command_to_device(device, "NEW_TRIAL", "Reset & Start New Trial", confirm=False)
+        
         device['stats'] = {'left': 0, 'right': 0, 'pellet': 0}
         device['events'] = []
         self.update_fed_view_counts(device)
         self.update_plot()
-        
-        # Log RESET event to CSV
-        log_file = device.get('log_file')
-        if log_file and os.path.exists(log_file):
-            try:
-                with open(log_file, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                        dev_name,
-                        "RESET",
-                        0, 0, 0,
-                        "COUNTERS RESET BY USER"
-                    ])
-            except Exception as e:
-                self.fed_log.append_log(f"Error logging reset to CSV: {e}", False)
-                
-        self.fed_log.append_log(f"Reset counters for {dev_name}")
+        self.fed_log.append_log(f"Reset counters and started new trial for {dev_name}")
 
     def reset_all_counters(self):
         reply = QMessageBox.question(
@@ -2472,44 +2570,260 @@ class FEDTabWidget(QWidget):
             self.fed_log.append_log("Reset counters on all devices.", True)
 
     def export_device_log(self, device):
-        log_file = device.get('log_file')
-        if not log_file or not os.path.exists(log_file):
-            QMessageBox.warning(self, "Export Log", "No log file found for this device yet.")
+        worker = device.get('tracker_worker')
+        dev_name = device['name_edit'].text().strip() or device['box'].title()
+        if not worker or not worker.isRunning():
+            QMessageBox.warning(self, "Export Log", f"Device {dev_name} must be connected and actively tracked to list and export files.")
             return
             
-        dev_name = device['name_edit'].text().strip() or device['box'].title()
-        default_name = f"{dev_name}_export.csv"
-        dest_path, _ = QFileDialog.getSaveFileName(self, "Export Device Log", default_name, "CSV Files (*.csv)")
-        if dest_path:
-            try:
-                import shutil
-                shutil.copy2(log_file, dest_path)
-                self.fed_log.append_log(f"Exported log for {dev_name} to {dest_path}", True)
-                QMessageBox.information(self, "Export Successful", f"Successfully exported log to {dest_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Export Error", f"Failed to export log: {e}")
+        progress = QProgressDialog("Requesting files from device...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Listing Files")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        def on_canceled():
+            self.download_manager.cancel_operations(device)
+            self.fed_log.append_log(f"[{dev_name}] File listing canceled by user.")
+        progress.canceled.connect(on_canceled)
+        
+        def on_list_received(success, data):
+            progress.close()
+            if not success:
+                QMessageBox.critical(self, "List Files Error", f"Failed to get file list from {dev_name}: {data}")
+                return
+            if not data:
+                QMessageBox.information(self, "Export Log", f"No CSV logs found on the SD card of device {dev_name}.")
+                return
+            
+            dialog = FileSelectorDialog(dev_name, data, self)
+            if dialog.exec_() == QDialog.Accepted:
+                selected_files = dialog.get_selected_files()
+                if not selected_files:
+                    return
+                    
+                dest_dir = QFileDialog.getExistingDirectory(self, "Select Destination Folder to Save Logs")
+                if not dest_dir:
+                    return
+                    
+                total_files = len(selected_files)
+                progress_dl = QProgressDialog("", "Cancel", 0, total_files, self)
+                progress_dl.setWindowTitle("Downloading Files")
+                progress_dl.setWindowModality(Qt.WindowModal)
+                progress_dl.show()
+                
+                is_canceled = [False]
+                def on_dl_canceled():
+                    is_canceled[0] = True
+                    self.download_manager.cancel_operations(device)
+                    self.fed_log.append_log(f"[{dev_name}] File download canceled by user.")
+                progress_dl.canceled.connect(on_dl_canceled)
+                
+                def download_file_at(idx):
+                    if idx >= total_files:
+                        progress_dl.close()
+                        QMessageBox.information(self, "Export Complete", f"Successfully exported {total_files} file(s) to:\n{dest_dir}")
+                        return
+                        
+                    if is_canceled[0]:
+                        return
+                        
+                    filename = selected_files[idx]
+                    progress_dl.setLabelText(f"Downloading {filename} ({idx + 1}/{total_files})...")
+                    progress_dl.setValue(idx)
+                    
+                    def on_file_finished(success, data_lines, crc_str):
+                        if not success:
+                            progress_dl.close()
+                            QMessageBox.critical(self, "Download Error", f"Failed to download {filename}: {data_lines}")
+                            return
+                        
+                        import zlib
+                        content_bytes = "".join(data_lines).encode('utf-8')
+                        calculated_crc = zlib.crc32(content_bytes) & 0xffffffff
+                        calculated_crc_hex = f"{calculated_crc:X}"
+                        
+                        if calculated_crc_hex.upper() != crc_str.upper():
+                            progress_dl.close()
+                            QMessageBox.critical(
+                                self,
+                                "Integrity Error",
+                                f"CRC32 mismatch for {filename}!\nExpected: {crc_str.upper()}\nCalculated: {calculated_crc_hex}"
+                            )
+                            return
+                        
+                        dest_path = os.path.join(dest_dir, filename)
+                        try:
+                            with open(dest_path, 'wb') as f:
+                                f.write(content_bytes)
+                            self.fed_log.append_log(f"[{dev_name}] Exported {filename} successfully.")
+                        except Exception as e:
+                            progress_dl.close()
+                            QMessageBox.critical(self, "Write Error", f"Failed to write {filename} to disk: {e}")
+                            return
+                            
+                        download_file_at(idx + 1)
+                        
+                    self.download_manager.start_download(device, filename, on_file_finished)
+                    
+                    cmd_ok = self.send_command_to_device(device, f"GET_FILE:{filename}", f"Download {filename}", confirm=False)
+                    if not cmd_ok:
+                        progress_dl.close()
+                        self.download_manager.cancel_operations(device)
+                        QMessageBox.critical(self, "Download Error", f"Failed to send request for {filename}")
+                        
+                download_file_at(0)
+                
+        self.download_manager.start_file_list(device, on_list_received)
+        
+        success = self.send_command_to_device(device, "LIST_FILES", "List SD Files", confirm=False)
+        if not success:
+            progress.close()
+            self.download_manager.cancel_operations(device)
+            QMessageBox.critical(self, "Export Log", f"Failed to send command to device {dev_name}.")
 
     def export_all_logs(self):
-        active_logs = [d for d in self.fed_devices if d.get('log_file') and os.path.exists(d['log_file'])]
-        if not active_logs:
-            QMessageBox.warning(self, "Export Logs", "No active log files found to export.")
+        active_devices = [d for d in self.fed_devices if d.get('tracker_worker') and d['tracker_worker'].isRunning()]
+        if not active_devices:
+            QMessageBox.warning(self, "Bulk Export", "No connected and active devices found to export.")
             return
             
-        dest_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Export All Logs")
-        if dest_dir:
-            import shutil
-            success_count = 0
-            for d in active_logs:
-                try:
-                    src = d['log_file']
-                    filename = os.path.basename(src)
-                    dest = os.path.join(dest_dir, filename)
-                    shutil.copy2(src, dest)
-                    success_count += 1
-                except Exception as e:
-                    self.fed_log.append_log(f"Failed to export log for {d['box'].title()}: {e}", False)
-            if success_count > 0:
-                QMessageBox.information(self, "Export Successful", f"Successfully exported {success_count} log file(s) to {dest_dir}")
+        progress = QProgressDialog("Fetching file list from devices...", "Cancel", 0, len(active_devices), self)
+        progress.setWindowTitle("Bulk Export")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        device_files_map = {}
+        completed = [0]
+        is_canceled = [False]
+        
+        def on_canceled():
+            is_canceled[0] = True
+            for d in active_devices:
+                self.download_manager.cancel_operations(d)
+            self.fed_log.append_log("Bulk file listing canceled by user.")
+        progress.canceled.connect(on_canceled)
+        
+        def show_unified_export_dialog():
+            filtered_map = {k: v for k, v in device_files_map.items() if v}
+            if not filtered_map:
+                QMessageBox.information(self, "Bulk Export", "No CSV logs found on any of the connected devices.")
+                return
+                
+            dialog = UnifiedFileSelectorDialog(filtered_map, self)
+            if dialog.exec_() == QDialog.Accepted:
+                selected_items = dialog.get_selected_files()
+                if not selected_items:
+                    return
+                    
+                dest_dir = QFileDialog.getExistingDirectory(self, "Select Destination Folder to Save Logs")
+                if not dest_dir:
+                    return
+                    
+                total_files = len(selected_items)
+                progress_dl = QProgressDialog("", "Cancel", 0, total_files, self)
+                progress_dl.setWindowTitle("Bulk Download")
+                progress_dl.setWindowModality(Qt.WindowModal)
+                progress_dl.show()
+                
+                is_dl_canceled = [False]
+                def on_dl_canceled():
+                    is_dl_canceled[0] = True
+                    for d in active_devices:
+                        self.download_manager.cancel_operations(d)
+                    self.fed_log.append_log("Bulk file download canceled by user.")
+                progress_dl.canceled.connect(on_dl_canceled)
+                
+                def download_next_bulk_file(idx):
+                    if idx >= total_files:
+                        progress_dl.close()
+                        QMessageBox.information(self, "Export Complete", f"Successfully exported {total_files} file(s) in bulk to:\n{dest_dir}")
+                        return
+                        
+                    if is_dl_canceled[0]:
+                        return
+                        
+                    dev_obj, filename = selected_items[idx]
+                    dev_name = dev_obj['name_edit'].text().strip() or dev_obj['box'].title()
+                    
+                    progress_dl.setLabelText(f"Downloading {filename} from {dev_name} ({idx + 1}/{total_files})...")
+                    progress_dl.setValue(idx)
+                    
+                    def on_bulk_file_finished(success, data_lines, crc_str, d=dev_obj, fname=filename):
+                        if not success:
+                            progress_dl.close()
+                            QMessageBox.critical(self, "Download Error", f"Failed to download {fname} from {dev_name}: {data_lines}")
+                            return
+                            
+                        import zlib
+                        content_bytes = "".join(data_lines).encode('utf-8')
+                        calculated_crc = zlib.crc32(content_bytes) & 0xffffffff
+                        calculated_crc_hex = f"{calculated_crc:X}"
+                        
+                        if calculated_crc_hex.upper() != crc_str.upper():
+                            progress_dl.close()
+                            QMessageBox.critical(
+                                self,
+                                "Integrity Error",
+                                f"CRC32 mismatch for {fname} from {dev_name}!\nExpected: {crc_str.upper()}\nCalculated: {calculated_crc_hex}"
+                            )
+                            return
+                            
+                        dest_path = os.path.join(dest_dir, fname)
+                        try:
+                            with open(dest_path, 'wb') as f:
+                                f.write(content_bytes)
+                            self.fed_log.append_log(f"[{dev_name}] Exported {fname} successfully.")
+                        except Exception as e:
+                            progress_dl.close()
+                            QMessageBox.critical(self, "Write Error", f"Failed to write {fname} to disk: {e}")
+                            return
+                            
+                        download_next_bulk_file(idx + 1)
+                        
+                    self.download_manager.start_download(dev_obj, filename, on_bulk_file_finished)
+                    
+                    cmd_ok = self.send_command_to_device(dev_obj, f"GET_FILE:{filename}", f"Download {filename}", confirm=False)
+                    if not cmd_ok:
+                        progress_dl.close()
+                        self.download_manager.cancel_operations(dev_obj)
+                        QMessageBox.critical(self, "Download Error", f"Failed to send request for {filename} from {dev_name}")
+                        
+                download_next_bulk_file(0)
+ 
+        def query_device(idx):
+            if idx >= len(active_devices):
+                return
+            if is_canceled[0]:
+                return
+                
+            dev = active_devices[idx]
+            dev_name = dev['name_edit'].text().strip() or dev['box'].title()
+            progress.setLabelText(f"Requesting file list from {dev_name}...")
+            progress.setValue(idx)
+            
+            def on_list_received(success, data, d=dev):
+                if is_canceled[0]:
+                    return
+                if success:
+                    device_files_map[d] = data
+                else:
+                    self.fed_log.append_log(f"[{dev_name}] Failed to get file list: {data}", False)
+                    device_files_map[d] = []
+                    
+                completed[0] += 1
+                if completed[0] == len(active_devices):
+                    progress.close()
+                    show_unified_export_dialog()
+                else:
+                    query_device(completed[0])
+                    
+            self.download_manager.start_file_list(dev, on_list_received)
+            
+            success = self.send_command_to_device(dev, "LIST_FILES", "List SD Files", confirm=False)
+            if not success:
+                on_list_received(False, "Failed to send LIST_FILES command.")
+                
+        query_device(0)
 
     def sync_all(self):
         for dev in self.fed_devices:
@@ -2520,7 +2834,7 @@ class FEDTabWidget(QWidget):
         self.adjust_responsive_layout()
 
     def adjust_responsive_layout(self):
-        if not hasattr(self, 'columns_layout') or not hasattr(self, 'control_group') or not hasattr(self, 'scheduler_group') or not hasattr(self, 'devices_group'):
+        if not hasattr(self, 'columns_layout') or not hasattr(self, 'control_group') or not hasattr(self, 'scheduler_group') or not hasattr(self, 'devices_group') or not hasattr(self, 'left_col_widget') or not hasattr(self, 'right_col_widget'):
             return
             
         width = self.width()
@@ -2532,15 +2846,32 @@ class FEDTabWidget(QWidget):
             
         self.columns_layout.setProperty("is_narrow", is_narrow)
         
+        # Remove original group boxes and helper column widgets from the main grid
         self.columns_layout.removeWidget(self.control_group)
         self.columns_layout.removeWidget(self.scheduler_group)
         self.columns_layout.removeWidget(self.devices_group)
+        self.columns_layout.removeWidget(self.left_col_widget)
+        self.columns_layout.removeWidget(self.right_col_widget)
+        
+        # Also clean up their layouts to prevent conflicts and ensure correct parenting
+        self.left_col_layout.removeWidget(self.control_group)
+        self.left_col_layout.removeWidget(self.scheduler_group)
+        self.right_col_layout.removeWidget(self.devices_group)
         
         if is_narrow:
-            # Stacked single-column layout
+            # Hide the helper column widgets
+            self.left_col_widget.hide()
+            self.right_col_widget.hide()
+            
+            # Stacked single-column layout: add group boxes directly to the main grid
             self.columns_layout.addWidget(self.control_group, 0, 0)
             self.columns_layout.addWidget(self.scheduler_group, 1, 0)
             self.columns_layout.addWidget(self.devices_group, 2, 0)
+            
+            # Make sure widgets are shown
+            self.control_group.show()
+            self.scheduler_group.show()
+            self.devices_group.show()
             
             self.columns_layout.setColumnStretch(0, 1)
             self.columns_layout.setColumnStretch(1, 0)
@@ -2548,15 +2879,28 @@ class FEDTabWidget(QWidget):
             self.columns_layout.setRowStretch(1, 0)
             self.columns_layout.setRowStretch(2, 0)
         else:
-            # Side-by-side two-column layout
-            self.columns_layout.addWidget(self.control_group, 0, 0)
-            self.columns_layout.addWidget(self.scheduler_group, 1, 0)
-            self.columns_layout.addWidget(self.devices_group, 0, 1, 2, 1)
+            # Show the helper column widgets
+            self.left_col_widget.show()
+            self.right_col_widget.show()
+            
+            # Side-by-side layout: add group boxes to their respective column layouts
+            self.left_col_layout.insertWidget(0, self.control_group)
+            self.left_col_layout.insertWidget(1, self.scheduler_group)
+            self.right_col_layout.insertWidget(0, self.devices_group)
+            
+            # Make sure widgets are shown
+            self.control_group.show()
+            self.scheduler_group.show()
+            self.devices_group.show()
+            
+            # Add helper column widgets to the main grid side-by-side
+            self.columns_layout.addWidget(self.left_col_widget, 0, 0)
+            self.columns_layout.addWidget(self.right_col_widget, 0, 1)
             
             self.columns_layout.setColumnStretch(0, 1)
             self.columns_layout.setColumnStretch(1, 1)
             self.columns_layout.setRowStretch(0, 0)
-            self.columns_layout.setRowStretch(1, 1)
+            self.columns_layout.setRowStretch(1, 0)
             self.columns_layout.setRowStretch(2, 0)
             
         self.columns_layout.invalidate()

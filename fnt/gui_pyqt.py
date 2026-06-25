@@ -613,7 +613,20 @@ class FNTMainWindow(QMainWindow):
     def run_fed_processing(self):
         """Launch FED Processing Tool"""
         try:
-            self.fed_window = QMainWindow()
+            class FEDWindow(QMainWindow):
+                def __init__(self, parent=None):
+                    super().__init__(parent)
+                    self.fed_widget = None
+
+                def closeEvent(self, event):
+                    if self.fed_widget:
+                        try:
+                            self.fed_widget.cleanup()
+                        except Exception as e:
+                            print(f"Error cleaning up FED widget: {e}")
+                    event.accept()
+
+            self.fed_window = FEDWindow(self)
             self.fed_window.setWindowTitle("FED Processing Tool")
             self.fed_window.resize(1000, 800)
             self.fed_window.setStyleSheet(self.styleSheet())
@@ -624,6 +637,7 @@ class FNTMainWindow(QMainWindow):
             container_layout.setContentsMargins(10, 10, 10, 10)
             
             fed_widget = FEDTabWidget(parent=self.fed_window, worker_class=WorkerThread)
+            self.fed_window.fed_widget = fed_widget
             container_layout.addWidget(fed_widget)
             
             self.fed_window.setCentralWidget(container)
@@ -1572,6 +1586,13 @@ class FNTMainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close event"""
+        # Close the FED processing window if open (which will trigger its own closeEvent and cleanup)
+        if hasattr(self, 'fed_window') and self.fed_window is not None:
+            try:
+                self.fed_window.close()
+            except Exception:
+                pass
+
         if self.current_worker and self.current_worker.isRunning():
             reply = QMessageBox.question(
                 self, 'Close Application',
