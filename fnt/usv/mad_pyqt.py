@@ -2425,12 +2425,12 @@ class MADMainWindow(QMainWindow):
         controls_layout.addWidget(sep3)
 
         # Playback — Play toggles to Stop while audio is playing.
-        self.btn_play = QPushButton("Play")
+        self.btn_play = QPushButton("Play (Space)")
         self.btn_play.setToolTip("Play / stop the visible window (Space)")
         self.btn_play.clicked.connect(self._toggle_playback)
         controls_layout.addWidget(self.btn_play)
 
-        controls_layout.addWidget(QLabel("Speed:"))
+        controls_layout.addWidget(QLabel("Speed (+/-):"))
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
         self.slider_speed.setValue(len(self._speed_values) - 1)
@@ -2601,12 +2601,12 @@ class MADMainWindow(QMainWindow):
         # Row 1: the three drawing tools — SAM (primary), Brush, Eraser.
         tools_row = QHBoxLayout()
         tools_row.setSpacing(2)
-        self.btn_sam = QPushButton("SAM (S)")
+        self.btn_sam = QPushButton("SAM (M)")
         self.btn_sam.setToolTip(
             "SAM2-assisted labeling — left-click a call to propose a mask,\n"
             "right-click to add a negative point. Enter accepts, Esc clears.\n"
             "First use offers any SAM2 models in LocalModels/, or downloads "
-            "one.\nShortcut: S"
+            "one.\nShortcut: M"
         )
         self.btn_sam.setCheckable(True)
         self.btn_sam.setStyleSheet(self._ACTIVE_TOOL_QSS)
@@ -2702,7 +2702,7 @@ class MADMainWindow(QMainWindow):
         view_row = QHBoxLayout()
         view_row.setSpacing(2)
         view_row.addWidget(QLabel("View:"))
-        self.btn_view_cycle = QPushButton("Spec + Mask")
+        self.btn_view_cycle = QPushButton("Spec + Mask (V)")
         self.btn_view_cycle.setToolTip(
             "Cycle the preview: Spec + Mask → Spec only → Mask only.\n"
             "Shortcut: V")
@@ -2777,10 +2777,10 @@ class MADMainWindow(QMainWindow):
         self.btn_quick_infer.setEnabled(has_model)
 
     def _set_view_mode(self, mode: str):
-        labels = {'overlay': 'Spec + Mask', 'spec': 'Spec only',
-                  'mask_only': 'Mask only'}
+        labels = {'overlay': 'Spec + Mask (V)', 'spec': 'Spec only (V)',
+                  'mask_only': 'Mask only (V)'}
         if hasattr(self, 'btn_view_cycle'):
-            self.btn_view_cycle.setText(labels.get(mode, 'Spec + Mask'))
+            self.btn_view_cycle.setText(labels.get(mode, 'Spec + Mask (V)'))
         self.spectrogram.set_view_mode(mode)
 
     def _create_training_section(self, layout):
@@ -3159,10 +3159,10 @@ class MADMainWindow(QMainWindow):
         # Row 2: Skip (S) | Accept All | Clear All
         row2 = QHBoxLayout()
         row2.setSpacing(2)
-        s['skip'] = QPushButton("Skip (S)" if skip_shortcut else "Skip")
+        s['skip'] = QPushButton("Skip (S)")
         s['skip'].setToolTip(
             "Leave this prediction pending and advance to the next one (no "
-            "decision recorded)." + ("<br>Shortcut: S" if skip_shortcut else ""))
+            "decision recorded).<br>Shortcut: S")
         s['skip'].setStyleSheet(self._review_btn_qss("#5a5a5a", "#6a6a6a"))
         s['skip'].clicked.connect(self._skip_current_pred)
         row2.addWidget(s['skip'])
@@ -5418,8 +5418,8 @@ class MADMainWindow(QMainWindow):
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
         make(Qt.Key_E, self._shortcut_toggle_eraser)
-        # M (mask view) is retired — V cycles the view now (see below).
-        make(Qt.Key_S, self._shortcut_s_key)
+        make(Qt.Key_M, self._shortcut_toggle_sam)     # SAM labeling tool
+        make(Qt.Key_S, self._shortcut_skip)           # Skip current prediction
         make(Qt.Key_U, self._undo_last)
         # Cmd+Z (macOS) / Ctrl+Z (Windows/Linux) — undo the last review action.
         make(QKeySequence.Undo, self._undo_review_action)
@@ -5526,15 +5526,11 @@ class MADMainWindow(QMainWindow):
         self.btn_erase.setChecked(new_state)
         self._on_eraser_clicked(new_state)
 
-    def _shortcut_s_key(self):
-        """S is context-sensitive: on the Inference & Review tab it Skips the
-        current prediction; on the Label & Train tab it toggles SAM labeling."""
+    def _shortcut_skip(self):
+        """S skips the current prediction (review), in either tab."""
         if self._focus_is_edit():
             return
-        if self._review_mode == 'deploy':
-            self._skip_current_pred()
-        else:
-            self._shortcut_toggle_sam()
+        self._skip_current_pred()
 
     def _shortcut_toggle_sam(self):
         if self._focus_is_edit():
@@ -6275,7 +6271,7 @@ class MADMainWindow(QMainWindow):
             "a call, the spectrogram patch around it is used for training. Any "
             "unlabeled call in the same time window will be treated as negative "
             "(non-call) by the model, which can confuse training.<br><br>"
-            "2. <b>Use SAM (G) for fast labeling.</b> Click each call to "
+            "2. <b>Use SAM (M) for fast labeling.</b> Click each call to "
             "generate a mask, then press Enter to confirm them all at once.<br><br>"
             "3. <b>Use the Paint tool (P) for fine corrections</b> and the "
             "eraser (E) to remove false strokes.<br><br>"
@@ -7361,7 +7357,7 @@ class MADMainWindow(QMainWindow):
             segment = signal.resample(segment, n_output_samples).astype(np.float32)
             sd.play(segment, output_sr)
             self.is_playing = True
-            self.btn_play.setText("Stop")
+            self.btn_play.setText("Stop (Space)")
             import time as _time
             self._playback_start_time = _time.time()
             self._playback_start_s = start_s
@@ -7377,7 +7373,7 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         self.is_playing = False
-        self.btn_play.setText("Play")
+        self.btn_play.setText("Play (Space)")
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
