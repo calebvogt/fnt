@@ -3445,6 +3445,8 @@ class MADMainWindow(QMainWindow):
                 entries.append(ann)
         entries.sort(key=lambda a: a['t0'])
         n_confirmed, n_pred, n_rej = 0, 0, 0
+        ncols = tree.columnCount()
+        new_items = []
         for ann in entries:
             st = ann.get('status')
             is_pred = st == 'prediction'
@@ -3472,15 +3474,17 @@ class MADMainWindow(QMainWindow):
             color = (QColor(255, 230, 90) if is_pred
                      else QColor(255, 90, 90) if is_rej
                      else QColor(90, 160, 255))
-            for c in range(tree.columnCount()):
+            for c in range(ncols):
                 item.setForeground(c, color)
-            tree.addTopLevelItem(item)
+            new_items.append(item)
             if is_pred:
                 n_pred += 1
             elif is_rej:
                 n_rej += 1
             else:
                 n_confirmed += 1
+        if new_items:  # one batched insert is far faster than N addTopLevelItem
+            tree.addTopLevelItems(new_items)
         tree.setSortingEnabled(True)
         tree.blockSignals(False)
         parts = []
@@ -4639,6 +4643,15 @@ class MADMainWindow(QMainWindow):
         if self.chk_post_inference.isChecked():
             post_scope = ('current'
                           if self.combo_post_scope.currentIndex() == 0 else 'all')
+            # Post-training inference overwrites predictions on its target files.
+            # Confirm up front (before the long training run) so it can then run
+            # unattended; declining just skips the auto-inference, not training.
+            targets = ([self.audio_files[self.current_file_idx]]
+                       if post_scope == 'current' else list(self.audio_files))
+            if (self.audio_files and
+                    not self._confirm_overwrite_predictions(targets)):
+                post_scope = None
+                self._log("Post-training inference skipped (declined overwrite)")
         self._log(f"Train START — {n_examples} examples, arch="
                   f"{cfg.model_arch}, encoder={cfg.encoder_name}, "
                   f"epochs={cfg.n_epochs}, batch={cfg.batch_size}")
@@ -5126,6 +5139,36 @@ class MADMainWindow(QMainWindow):
             self._deploy_file_idx = row
             self._load_deploy_file(self.deploy_files[row])
 
+    def _confirm_overwrite_predictions(self, wavs) -> bool:
+        """If any of ``wavs`` already have predictions, warn that inference will
+        overwrite them (and discard accept/reject/delete decisions). Returns True
+        to proceed, False to cancel. No prompt when nothing would be overwritten."""
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, has_pred_masks,
+        )
+        existing = [w for w in wavs
+                    if os.path.isfile(pred_csv_sibling_path(w))
+                    or has_pred_masks(masks_sibling_path(w))]
+        if not existing:
+            return True
+        shown = "\n".join(f"   • {os.path.basename(w)}" for w in existing[:8])
+        more = (f"\n   …and {len(existing) - 8} more"
+                if len(existing) > 8 else "")
+        reply = QMessageBox.warning(
+            self, "Overwrite existing detections?",
+            f"{len(existing)} of {len(wavs)} file(s) already have detections "
+            f"from a previous inference run:\n\n{shown}{more}\n\n"
+            "Running inference will, for those files:\n"
+            "   • replace all current detections with fresh predictions, and\n"
+            "   • discard every Accept / Reject / Delete decision you've made "
+            "(each detection resets to pending).\n\n"
+            "Files with no prior detections are unaffected, and any labels you "
+            "painted in the Label & Train tab are preserved.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def _on_deploy_infer(self):
         model = self._selected_deploy_model_path() or self._default_model_path()
         if not model or not os.path.isfile(model):
@@ -5144,32 +5187,8 @@ class MADMainWindow(QMainWindow):
         # Warn before clobbering files that already hold detections from a prior
         # run — re-inferring rewrites their predictions and discards any review
         # decisions (accept/reject/delete) made on them.
-        from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, has_pred_masks,
-        )
-        existing = [w for w in wavs
-                    if os.path.isfile(pred_csv_sibling_path(w))
-                    or has_pred_masks(masks_sibling_path(w))]
-        if existing:
-            shown = "\n".join(f"   • {os.path.basename(w)}"
-                              for w in existing[:8])
-            more = (f"\n   …and {len(existing) - 8} more"
-                    if len(existing) > 8 else "")
-            reply = QMessageBox.warning(
-                self, "Overwrite existing detections?",
-                f"{len(existing)} of {len(wavs)} queued file(s) already have "
-                f"detections from a previous inference run:\n\n{shown}{more}\n\n"
-                "Continuing will, for those files:\n"
-                "   • replace all current detections with fresh predictions, and\n"
-                "   • discard every Accept / Reject / Delete decision you've "
-                "made (each detection resets to pending).\n\n"
-                "Files with no prior detections are unaffected, and any labels "
-                "you painted in the Label & Train tab are preserved.\n\n"
-                "Re-run inference and overwrite?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
+        if not self._confirm_overwrite_predictions(wavs):
+            return
         # One-time nudge if a GPU is present but PyTorch can't use it.
         self._show_gpu_setup_dialog(force=False)
         from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
@@ -5987,31 +6006,37 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         # --- assemble per-file totals ------------------------------------
+        # Minimize per-file I/O: this can run over a slow network drive, so do
+        # at most ONE sibling read per file. Confirmed counts already came from
+        # the single consolidated-store read above; the per-wav sibling example
+        # store only holds labels in no-project mode, so skip that open when a
+        # project is open.
+        from fnt.usv.usv_detector.mad_inference import read_blob_csv
+        in_project = self._project is not None
         cache: Dict[str, int] = {}
         for fp in self.audio_files:
             bn = os.path.basename(fp)
-            h5 = masks_sibling_path(fp)
             n_conf = confirmed.get(bn, 0)
-            # Confirmed labels can also live in the per-wav sibling store.
-            try:
-                for w, c in td_count_by_source_wav(h5).items():
-                    if w == bn:
-                        n_conf += c
-            except Exception:
-                pass
+            if not in_project:
+                try:
+                    for w, c in td_count_by_source_wav(
+                            masks_sibling_path(fp)).items():
+                        if w == bn:
+                            n_conf += c
+                except Exception:
+                    pass
             # Predictions: prefer the CSV (review tab); else the cached scalar.
             n_pred = 0
             csv_path = pred_csv_sibling_path(fp)
             if os.path.isfile(csv_path):
                 try:
-                    from fnt.usv.usv_detector.mad_inference import read_blob_csv
                     n_pred = sum(1 for r in read_blob_csv(csv_path)
                                  if r.get('status') not in ('rejected', 'deleted'))
                 except Exception:
                     n_pred = 0
             else:
                 try:
-                    n_pred = get_prob_blob_count(h5) or 0
+                    n_pred = get_prob_blob_count(masks_sibling_path(fp)) or 0
                 except Exception:
                     n_pred = 0
             total = n_conf + n_pred
@@ -6230,7 +6255,12 @@ class MADMainWindow(QMainWindow):
             unique.append(a)
         anns = unique
         self.spectrogram.set_annotations(anns)
-        n_pred = self._load_predictions_as_annotations() or 0
+        # _load_predictions_as_annotations refreshes the list itself when it adds
+        # predictions (returns an int); it returns None on its early-out paths
+        # (no predictions) without refreshing — only then do we refresh here, so
+        # the (potentially 800+ row) tree is rebuilt once per load, not twice.
+        result = self._load_predictions_as_annotations()
+        n_pred = result or 0
         if anns or n_pred:
             parts = []
             if anns:
@@ -6244,9 +6274,9 @@ class MADMainWindow(QMainWindow):
             self.lbl_mask_status.setText(
                 "No labels yet — paint or SAM calls, then Enter to confirm"
             )
-        self._refresh_annotation_list()
-        # Reconcile this file's list count now that its calls are loaded.
-        self._update_file_list_counts()
+        if result is None:
+            self._refresh_annotation_list()
+            self._update_file_list_counts()
 
     def _load_sibling_h5_annotations(self, wav_path, grid):
         """Load confirmed examples stored in the per-wav ``_FNT_masks.h5``
