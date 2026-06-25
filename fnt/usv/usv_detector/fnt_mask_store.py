@@ -61,8 +61,31 @@ def _require_h5():
 # ======================================================================
 # Per-wav sibling mask store  (<base>_FNT_masks.h5)
 # ======================================================================
+# Optional per-wav redirect for the mask store (see mad_labels for the CSV
+# equivalent). MAD points "browsed-in-place" files at a scratch h5 so their
+# masks/predictions don't litter the original recording folder. Empty by
+# default → unchanged behavior for CAD and graduated files.
+_MASK_PATH_OVERRIDES: Dict[str, str] = {}
+
+
+def set_mask_path_override(wav_path: str, h5_path: str) -> None:
+    _MASK_PATH_OVERRIDES[os.path.normpath(wav_path)] = h5_path
+
+
+def clear_mask_path_override(wav_path: str) -> None:
+    _MASK_PATH_OVERRIDES.pop(os.path.normpath(wav_path), None)
+
+
+def clear_all_mask_path_overrides() -> None:
+    _MASK_PATH_OVERRIDES.clear()
+
+
 def masks_sibling_path(wav_path: str) -> str:
-    """Return the ``<base>_FNT_masks.h5`` path next to ``wav_path``."""
+    """Return the ``<base>_FNT_masks.h5`` path for ``wav_path`` (an override
+    location if one is registered, else the sibling next to the wav)."""
+    ov = _MASK_PATH_OVERRIDES.get(os.path.normpath(wav_path))
+    if ov is not None:
+        return ov
     p = Path(wav_path)
     return str(p.with_name(p.stem + MASKS_SUFFIX))
 

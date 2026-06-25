@@ -76,6 +76,30 @@ Project-wide:
 
 - `models/training_data/training_data.h5` — every confirmed labeling example
   (spec patch + mask + metadata) used for training.
+- `.scratch/` — temporary masks/predictions for files you're **browsing in
+  place** but haven't accepted a call on yet. Wiped on close (see below).
+
+### Browse-in-place ingestion (finding calls in big recording sets)
+
+When recording 24/7 you may have hundreds of wavs and not know which contain
+USVs. Adding a folder to **Label & Train** does **not** copy those files into
+the project. Instead they're **browsed in place**:
+
+- Their masks/predictions are redirected to `<project>/.scratch/` (so the
+  original recording folders stay clean — no stray `.h5`/`.csv` siblings). This
+  redirect is implemented as a path override consulted by
+  `fnt_mask_store.masks_sibling_path` / `mad_labels.pred_csv_sibling_path`.
+- A file is **graduated** — copied into `recordings/`, with its scratch masks
+  moved alongside and the file recorded in the project — only when you **accept
+  a call** on it (hand-label + confirm, or change a prediction to accepted, via
+  `_ensure_wav_in_project`). Reject/pending/delete do **not** graduate a file.
+- On close, `.scratch/` is discarded, so files you never accepted leave no
+  trace. Browsing is **session-only**: reopening the project shows just the
+  graduated files; re-add the folder to keep searching.
+
+So you can point MAD at 500 raw recordings, run post-training inference, accept
+calls in the handful that have USVs, and only those few wavs (plus their masks)
+ever land in the project — no bulk copying of files you'll discard.
 
 ### Why we do NOT store the full probability grid
 

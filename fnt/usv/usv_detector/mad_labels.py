@@ -46,7 +46,30 @@ def mask_sibling_path(wav_path: str) -> str:
     return str(Path(wav_path).with_name(stem + LABEL_SUFFIX))
 
 
+# Optional per-wav redirect: maps a wav path → an alternate prediction-CSV
+# location. MAD uses this to send predictions for "browsed-in-place" files
+# (added but not yet labeled/accepted) to a scratch folder instead of next to
+# the original recording. Empty by default, so behavior is unchanged elsewhere.
+import os as _os
+_PRED_CSV_OVERRIDES: dict = {}
+
+
+def set_pred_csv_override(wav_path: str, csv_path: str) -> None:
+    _PRED_CSV_OVERRIDES[_os.path.normpath(wav_path)] = csv_path
+
+
+def clear_pred_csv_override(wav_path: str) -> None:
+    _PRED_CSV_OVERRIDES.pop(_os.path.normpath(wav_path), None)
+
+
+def clear_all_pred_csv_overrides() -> None:
+    _PRED_CSV_OVERRIDES.clear()
+
+
 def pred_csv_sibling_path(wav_path: str) -> str:
+    ov = _PRED_CSV_OVERRIDES.get(_os.path.normpath(wav_path))
+    if ov is not None:
+        return ov
     stem = Path(wav_path).stem
     return str(Path(wav_path).with_name(stem + PRED_SUFFIX))
 

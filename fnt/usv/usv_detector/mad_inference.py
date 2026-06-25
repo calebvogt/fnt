@@ -352,19 +352,24 @@ def run_inference_on_file(
     tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
     tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
 
+    import time as _time
     if progress:
         progress('spec', 0, 1)
+    _t_spec0 = _time.perf_counter()
     audio, sr = load_audio(wav_path)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
+    audio_dur = len(audio) / float(sr) if sr else 0.0
     spec = compute_full_spec_image(
         audio.astype(np.float32), sr,
         nperseg=nperseg, noverlap=noverlap, nfft=nfft,
         db_min=db_min, db_max=db_max,
     )
+    t_spec = _time.perf_counter() - _t_spec0
     if progress:
         progress('spec', 1, 1)
 
+    _t_inf0 = _time.perf_counter()
     prob = infer_probability_mask(
         model, spec,
         tile_freq_bins=tile_freq_bins,
@@ -374,6 +379,7 @@ def run_inference_on_file(
         progress=(lambda i, n: progress('infer', i, n)) if progress else None,
         wait_if_paused=wait_if_paused,
     )
+    t_infer = _time.perf_counter() - _t_inf0
 
     # Preserve confirmed labels: zero out the probability mask in any time
     # column that already contains a human-confirmed call for this file, so
@@ -393,6 +399,7 @@ def run_inference_on_file(
 
     if progress:
         progress('blobs', 0, 1)
+    _t_blob0 = _time.perf_counter()
     blobs = extract_blobs(prob, threshold=cfg.threshold,
                           min_blob_pixels=cfg.min_blob_pixels, include_mask=True)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft, sr=sr)
@@ -423,9 +430,14 @@ def run_inference_on_file(
         delete_prob(h5_path)
     except Exception:
         h5_path = None
+    t_blobs = _time.perf_counter() - _t_blob0
     if progress:
         progress('blobs', 1, 1)
 
+    total = t_spec + t_infer + t_blobs
+    # Realtime factor: seconds of audio scanned per wall-second of inference
+    # (the tile-scan stage). <1 means slower than realtime — typical on CPU.
+    rt_factor = (audio_dur / t_infer) if t_infer > 0 else 0.0
     return {
         'wav_path': wav_path,
         'csv_path': csv_path if cfg.save_blob_csv else None,
@@ -434,6 +446,15 @@ def run_inference_on_file(
         'prob_shape': list(prob.shape),
         'sample_rate': sr,
         'nperseg': nperseg, 'noverlap': noverlap, 'nfft': nfft,
+        'timing': {
+            'device': device,
+            'audio_dur_s': round(audio_dur, 1),
+            't_spec': round(t_spec, 2),
+            't_infer': round(t_infer, 2),
+            't_blobs': round(t_blobs, 2),
+            't_total': round(total, 2),
+            'realtime_factor': round(rt_factor, 2),
+        },
     }
 
 
@@ -443,14 +464,24 @@ def run_inference_on_files(
     progress: Optional[Callable[[int, int, str, str, int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     wait_if_paused: Optional[Callable[[], None]] = None,
+    on_device: Optional[Callable[[str], None]] = None,
+    on_file_done: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
     ``progress`` is invoked as ``(file_i, file_n, wav_name, stage, stage_i, stage_n)``.
     ``wait_if_paused``, if given, is called between files and between inference
     tiles; it should block while the run is paused and return on resume/stop.
+    ``on_device(device)`` is called once after the model loads; ``on_file_done``
+    is called with each file's summary (incl. timing) as it completes — both let
+    the GUI log device + per-file speed live.
     """
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
+    if on_device is not None:
+        try:
+            on_device(device)
+        except Exception:
+            pass
     results: List[Dict] = []
     n = len(wav_paths)
     for i, wav in enumerate(wav_paths):
@@ -471,4 +502,9 @@ def run_inference_on_files(
             results.append(summary)
         except Exception as e:
             results.append({'wav_path': wav, 'error': str(e)})
+        if on_file_done is not None:
+            try:
+                on_file_done(results[-1])
+            except Exception:
+                pass
     return results

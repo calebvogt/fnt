@@ -15,6 +15,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Quiet the noisy Hugging Face cache symlink warning on Windows (symlinks need
+# Developer Mode/admin; caching still works fine without them). Set before any
+# huggingface_hub import triggers the encoder/SAM2 download.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 import numpy as np
 from PyQt5.QtCore import (
     Qt, QEvent, QObject, QSettings, QThread, QTimer, QRectF, QPointF, pyqtSignal,
@@ -155,6 +160,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._last_paint_idx: Optional[tuple] = None
         # Accumulated wheel delta for slow, fine brush-radius adjustment.
         self._wheel_accum = 0
+        # Separate accumulator for scroll-wheel zoom (outside paint mode), so a
+        # touchpad's many small deltas step at the same measured rate as a mouse
+        # wheel notch (120 units = one zoom step) rather than over-zooming.
+        self._zoom_accum = 0
 
         # Cursor preview: screen-space last mouse pos for drawing the
         # brush-radius circle around the cursor in paint mode.
@@ -808,9 +817,25 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 self.update()
             event.accept()
             return
-        # Outside paint mode the wheel does nothing — zoom/pan is keyboard-only
-        # (↑/↓ zoom, ←/→ pan). Trackpad two-finger swipes were too easy to
-        # over-zoom and stall the render, so they're consumed here.
+        # Outside paint mode: scroll zooms the spectrogram, centered on the
+        # cursor. Deltas accumulate to one notch (120) per zoom step so a
+        # trackpad steps at the same measured rate as a mouse wheel instead of
+        # over-zooming (↑/↓ keys still zoom; ←/→ pan).
+        if self.total_duration <= 0:
+            event.accept()
+            return
+        spec_rect = self._get_spec_rect()
+        if not spec_rect.contains(event.pos()):
+            event.accept()
+            return
+        self._zoom_accum += event.angleDelta().y()
+        center_time = self._x_to_time(event.pos().x(), spec_rect)
+        while self._zoom_accum >= 120:      # scroll up → zoom in
+            self._zoom_accum -= 120
+            self.zoom_requested.emit(1.0 / 1.25, center_time)
+        while self._zoom_accum <= -120:     # scroll down → zoom out
+            self._zoom_accum += 120
+            self.zoom_requested.emit(1.25, center_time)
         event.accept()
 
     # --- overlay render -----------------------------------------------
@@ -1500,6 +1525,8 @@ class MADInferenceWorker(QThread):
     progress_signal = pyqtSignal(int, int, str, str, int, int)
     finished_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
+    device_signal = pyqtSignal(str)      # resolved compute device
+    file_done_signal = pyqtSignal(dict)  # per-file summary (incl. timing)
 
     def __init__(self, cfg, wav_paths: List[str], parent=None):
         super().__init__(parent)
@@ -1540,6 +1567,8 @@ class MADInferenceWorker(QThread):
                 progress=lambda *a: self.progress_signal.emit(*a),
                 should_stop=lambda: self._stop,
                 wait_if_paused=self._wait_if_paused,
+                on_device=lambda d: self.device_signal.emit(d),
+                on_file_done=lambda s: self.file_done_signal.emit(s),
             )
             self.finished_signal.emit(results)
         except Exception as e:
@@ -2313,8 +2342,8 @@ class MADMainWindow(QMainWindow):
         self.spin_view_window.setSuffix(" s")
         self.spin_view_window.setFixedWidth(80)
         self.spin_view_window.setToolTip(
-            "Time window duration (seconds). Use ↑/↓ to zoom; scroll-wheel "
-            "adjustment is disabled to avoid accidental over-zoom.")
+            "Time window duration (seconds). Zoom with ↑/↓ or by scrolling the "
+            "mouse wheel over the spectrogram (centered on the cursor).")
         self.spin_view_window.valueChanged.connect(self._on_view_window_changed)
         # Block trackpad-swipe / wheel from changing the time window or the
         # display frequency range (kept as a single shared filter).
@@ -3887,10 +3916,21 @@ class MADMainWindow(QMainWindow):
             if 0 <= nxt < len(self.audio_files):
                 self.file_list.setCurrentRow(nxt)
 
+    def _pred_csv_path(self, ann: dict):
+        """Resolve a prediction's CSV path from the *current* review wav, so it
+        stays correct even after the file graduates (scratch → recordings)."""
+        bid = ann.get('blob_id')
+        if bid is None:
+            return None
+        wav = self._active_review_wav_path()
+        if not wav:
+            return ann.get('csv_path')
+        return pred_csv_sibling_path(wav)
+
     def _remove_pred_csv_row(self, ann: dict):
         """Delete a prediction's row from its CSV entirely — Delete leaves no
         trace (the crop is dropped separately). Matched by blob_id."""
-        csv_path = ann.get('csv_path')
+        csv_path = self._pred_csv_path(ann)
         bid = ann.get('blob_id')
         if not csv_path or bid is None or not os.path.isfile(csv_path):
             return
@@ -3906,7 +3946,7 @@ class MADMainWindow(QMainWindow):
     def _write_pred_csv_status(self, ann: dict, status: str):
         """Persist an accept/reject decision to the prediction CSV (matched
         by blob_id). Works in both training and deploy modes."""
-        csv_path = ann.get('csv_path')
+        csv_path = self._pred_csv_path(ann)
         bid = ann.get('blob_id')
         if not csv_path or bid is None or not os.path.isfile(csv_path):
             return
@@ -4541,6 +4581,8 @@ class MADMainWindow(QMainWindow):
                 "Enter to confirm it before training."
             )
             return
+        # One-time nudge if a GPU is present but PyTorch can't use it.
+        self._show_gpu_setup_dialog(force=False)
         cfg = self._build_inline_train_config()
         post_scope = None
         if self.chk_post_inference.isChecked():
@@ -4731,6 +4773,7 @@ class MADMainWindow(QMainWindow):
             ]
             for rp in paths_to_remove:
                 if os.path.normpath(os.path.dirname(rp)) == os.path.normpath(rec_dir):
+                    # Graduated copy: delete the recordings file + its masks.
                     try:
                         os.remove(rp)
                     except OSError:
@@ -4742,6 +4785,10 @@ class MADMainWindow(QMainWindow):
                             os.remove(h5)
                     except OSError:
                         pass
+                else:
+                    # In-place browsed file: never touch the original; just drop
+                    # its scratch masks + path overrides.
+                    self._discard_inplace_scratch(rp)
             try:
                 self._project.save()
             except Exception:
@@ -4771,6 +4818,24 @@ class MADMainWindow(QMainWindow):
         n = len(paths_to_remove)
         self.status_bar.showMessage(f"Removed {n} file(s)")
         self._log(f"Cleaned up {n} file(s) from project")
+
+    def _discard_inplace_scratch(self, wav: str):
+        """Remove a browsed-in-place file's scratch masks/predictions and clear
+        its path overrides. Safety: only deletes files that live in a .scratch
+        folder, so an original recording's sibling can never be removed."""
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, clear_mask_path_override)
+        from fnt.usv.usv_detector.mad_labels import (
+            pred_csv_sibling_path, clear_pred_csv_override)
+        for p in (masks_sibling_path(wav), pred_csv_sibling_path(wav)):
+            try:
+                parent = os.path.basename(os.path.dirname(p))
+                if parent == '.scratch' and os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        clear_mask_path_override(wav)
+        clear_pred_csv_override(wav)
 
     def _default_model_path(self) -> Optional[str]:
         if self._project and self._project.models:
@@ -5054,6 +5119,8 @@ class MADMainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
+        # One-time nudge if a GPU is present but PyTorch can't use it.
+        self._show_gpu_setup_dialog(force=False)
         from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
         cfg = MADInferenceConfig(
             model_path=model,
@@ -5201,6 +5268,122 @@ class MADMainWindow(QMainWindow):
         self.act_clear_pred.triggered.connect(self._clear_predictions)
         self.act_clear_pred.setEnabled(False)
         predict_menu.addAction(self.act_clear_pred)
+
+        help_menu = menubar.addMenu("&Help")
+        act_gpu = QAction("Check &GPU / CUDA setup…", self)
+        act_gpu.setToolTip("Test whether training/inference can use your GPU")
+        act_gpu.triggered.connect(lambda: self._show_gpu_setup_dialog(force=True))
+        help_menu.addAction(act_gpu)
+
+    # ------------------------------------------------------------------
+    # GPU / CUDA readiness
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_nvidia_gpu() -> Optional[str]:
+        """Return an NVIDIA GPU name via nvidia-smi, or None if absent."""
+        import subprocess
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=6)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+        return None
+
+    def _gpu_status(self):
+        """Return ``(ready: bool, title, message)`` describing GPU readiness."""
+        try:
+            import torch
+        except Exception:
+            return (False, "PyTorch not found",
+                    "PyTorch isn't installed in this environment, so training "
+                    "and inference can't run at all. Install it (see the CUDA "
+                    "command below) in your 'fnt' conda env.")
+        ver = getattr(torch, '__version__', '?')
+        if torch.cuda.is_available():
+            try:
+                name = torch.cuda.get_device_name(0)
+            except Exception:
+                name = "CUDA GPU"
+            return (True, "GPU ready ✓",
+                    f"PyTorch {ver} can use your GPU:\n\n    {name}\n\n"
+                    "Training and inference will run on CUDA (Device = auto).")
+        nv = self._detect_nvidia_gpu()
+        import sys as _sys
+        pyver = f"{_sys.version_info.major}.{_sys.version_info.minor}"
+        cuda_cmd = (
+            "    conda activate fnt\n"
+            "    pip uninstall -y torch torchvision\n"
+            "    pip install torch torchvision --index-url "
+            "https://download.pytorch.org/whl/cu124\n")
+        guidance = (
+            "Get the EXACT command for your setup from:\n"
+            "    https://pytorch.org/get-started/locally/\n"
+            "(choose Stable · Windows · Pip · Python · your CUDA version)\n\n"
+            "Or run, in the 'fnt' env:\n\n" + cuda_cmd +
+            "\nNotes:\n"
+            f"  • Match the CUDA tag to what's offered — cu124/cu126 are current; "
+            "an old tag like cu121 may have no wheels (that's the\n"
+            "    'Could not find a version… (from versions: none)' error).\n"
+            "  • Double-check the URL host is exactly 'download.pytorch.org'.\n"
+            f"  • Your Python is {pyver}; the chosen torch must publish wheels "
+            "for it.\n"
+            "  • You only need a recent NVIDIA driver — not the full CUDA "
+            "Toolkit.\n"
+            "  • If the GPU install fails, get back to a working CPU setup with:"
+            "  pip install torch torchvision")
+        if nv:
+            return (False, "GPU present, but PyTorch is CPU-only",
+                    f"Detected NVIDIA GPU:\n\n    {nv}\n\n"
+                    f"…but the installed PyTorch ({ver}) is a CPU-only build, "
+                    "so training/inference run on the CPU (slow).\n\n"
+                    + guidance + "\n\nRestart MAD afterward and re-check here.")
+        return (False, "No NVIDIA GPU detected",
+                "No NVIDIA GPU was found (nvidia-smi isn't available), so "
+                "training/inference will use the CPU.\n\nIf this machine does "
+                "have an NVIDIA GPU, install its driver first, then a CUDA "
+                "build of PyTorch:\n\n" + guidance)
+
+    def _show_gpu_setup_dialog(self, force: bool = False):
+        """Show the GPU readiness dialog. When ``force`` is False it only shows
+        once per session and only when the GPU is NOT ready (used as a one-time
+        nudge before a CPU training/inference run)."""
+        ready, title, message = self._gpu_status()
+        if not force:
+            if ready or getattr(self, '_gpu_nudged', False):
+                return
+            # Only nudge when there's an actionable GPU sitting unused; if the
+            # machine genuinely has no NVIDIA GPU, CPU is expected — stay quiet.
+            if not self._detect_nvidia_gpu():
+                return
+            self._gpu_nudged = True
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(560)
+        v = QVBoxLayout(dlg)
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(message)
+        txt.setStyleSheet("font-family: monospace; font-size: 11px;")
+        v.addWidget(txt)
+        row = QHBoxLayout()
+        btn_copy = QPushButton("Copy commands")
+        def _copy():
+            cmds = "\n".join(l.strip() for l in message.splitlines()
+                             if l.strip().startswith(('conda ', 'pip ')))
+            QApplication.clipboard().setText(cmds or message)
+            self.status_bar.showMessage("Copied to clipboard")
+        btn_copy.clicked.connect(_copy)
+        row.addWidget(btn_copy)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        row.addWidget(bb)
+        v.addLayout(row)
+        dlg.exec_()
 
     # ------------------------------------------------------------------
     # Keyboard shortcuts (CAD parity)
@@ -5504,69 +5687,29 @@ class MADMainWindow(QMainWindow):
         )
         if not folder:
             return
-        # Persist the folder into the project (if one is open) so its wavs
-        # reappear on reopen; without a project they load for this session.
-        if self._project is not None and folder not in self._project.source_folders:
-            self._project.source_folders.append(folder)
-            try:
-                self._project.save()
-            except Exception:
-                pass
-            self._update_source_folders_label()
+        # Browse the folder in place for this session only — files are not
+        # copied or persisted; a file joins the project once a call is accepted
+        # on it. (Re-add the folder next session to keep browsing.)
         wavs = _list_wavs_in_folder(folder)
-        added = self._append_audio_paths(wavs)  # folder persists via source_folders
-        self.status_bar.showMessage(f"Added folder: {folder} (+{added} new wavs)")
+        added = self._append_audio_paths(wavs)
+        self.status_bar.showMessage(
+            f"Browsing folder in place: {folder} (+{added} wavs, "
+            f"not copied until you accept a call)")
 
     def _append_audio_paths(self, paths, persist_files: bool = False) -> int:
-        """Add new on-disk wav paths to the session list, load the current
-        file, and (optionally) persist them into the project's ``audio_files``.
-        When a project is open, files are copied into its recordings/ folder.
-        Returns the count actually added."""
+        """Add wav paths to the session list and browse them **in place** — when
+        a project is open, files are NOT copied into recordings/. Their masks and
+        predictions go to a scratch folder; a file is only copied in once a call
+        is accepted on it (see _ensure_wav_in_project). Returns the count added."""
         existing = set(self.audio_files)
         to_add = [p for p in paths
                   if p and p not in existing and os.path.isfile(p)]
         if not to_add:
             return 0
-        if self._project is not None:
-            import shutil
-            from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-            rdir = self._project.recordings_dir
-            os.makedirs(rdir, exist_ok=True)
-            copied = []
-            for src in to_add:
-                dest = os.path.join(rdir, os.path.basename(src))
-                if os.path.normpath(src) != os.path.normpath(dest):
-                    if not os.path.isfile(dest):
-                        try:
-                            shutil.copy2(src, dest)
-                        except Exception:
-                            copied.append(src)
-                            continue
-                    h5_src = masks_sibling_path(src)
-                    h5_dest = masks_sibling_path(dest)
-                    if os.path.isfile(h5_src) and not os.path.isfile(h5_dest):
-                        try:
-                            shutil.copy2(h5_src, h5_dest)
-                        except Exception:
-                            pass
-                    copied.append(dest)
-                else:
-                    copied.append(src)
-            to_add = copied
-        existing = set(self.audio_files)
-        to_add = [p for p in to_add if p not in existing]
-        if not to_add:
-            return 0
         self.audio_files.extend(to_add)
-        if self._project is not None:
-            have = set(self._project.audio_files)
-            self._project.audio_files.extend(
-                p for p in to_add if p not in have
-            )
-            try:
-                self._project.save()
-            except Exception:
-                pass
+        # Redirect each not-yet-graduated file's storage to scratch.
+        for p in to_add:
+            self._register_inplace_store(p)
         if self.current_file_idx >= len(self.audio_files):
             self.current_file_idx = 0
         self._refresh_file_list()
@@ -5598,21 +5741,11 @@ class MADMainWindow(QMainWindow):
         self._update_infer_run_enabled()
         self._set_train_sections_enabled(True)
         if self.audio_files:
-            rdir = cfg.recordings_dir
-            already_in_project = all(
-                os.path.normpath(p).startswith(
-                    os.path.normpath(cfg.project_dir))
-                for p in self.audio_files
-            )
-            if not already_in_project:
-                QMessageBox.information(
-                    self, "Audio files copied to project",
-                    f"Audio files will be copied into the project folder:\n\n"
-                    f"  {rdir}\n\n"
-                    "This makes the project fully portable — label masks "
-                    "(h5 files) are saved alongside the copies.",
-                )
-                self._copy_files_to_project()
+            # Files loaded before the project was opened are browsed in place —
+            # redirect their masks to scratch; they're copied into the project
+            # only when a call is accepted on them.
+            for p in self.audio_files:
+                self._register_inplace_store(p)
         self._offer_training_store_migration()
         self._refresh_deploy_models()
         self._rescan_project_wavs()
@@ -5655,6 +5788,8 @@ class MADMainWindow(QMainWindow):
             return
         # Save the current file's mask if dirty before tearing down.
         self._auto_save_mask_if_dirty()
+        # Discard scratch masks/predictions for files that were never accepted.
+        self._wipe_scratch()
         if not silent:
             self.status_bar.showMessage(
                 f"Closed project: {self._project.project_name}"
@@ -5716,17 +5851,15 @@ class MADMainWindow(QMainWindow):
     def _rescan_project_wavs(self) -> int:
         if self._project is None:
             return 0
-        import shutil
         rdir = self._project.recordings_dir
         os.makedirs(rdir, exist_ok=True)
-        # Gather candidate wavs from source folders + individually added files.
+        # Only *graduated* files load on open — those already in recordings/ (a
+        # file earns its place by having an accepted call). Browsing source
+        # folders is session-only; nothing is copied here.
         candidates: List[str] = []
-        for folder in self._project.source_folders:
-            candidates.extend(_list_wavs_in_folder(folder))
         for f in self._project.audio_files:
             if os.path.isfile(f):
                 candidates.append(f)
-        # Also pick up any wavs already in the recordings dir.
         candidates.extend(_list_wavs_in_folder(rdir))
         existing_basenames = {os.path.basename(p) for p in self.audio_files}
         added = 0
@@ -5734,14 +5867,7 @@ class MADMainWindow(QMainWindow):
             bn = os.path.basename(w)
             if bn in existing_basenames:
                 continue
-            dest = os.path.join(rdir, bn)
-            if os.path.normpath(w) != os.path.normpath(dest):
-                if not os.path.isfile(dest):
-                    try:
-                        shutil.copy2(w, dest)
-                    except Exception:
-                        dest = w
-            self.audio_files.append(dest)
+            self.audio_files.append(w)
             existing_basenames.add(bn)
             added += 1
 
@@ -5767,7 +5893,10 @@ class MADMainWindow(QMainWindow):
             self.file_list.blockSignals(False)
 
         if added and self._project is not None:
-            self._project.audio_files = list(self.audio_files)
+            # Persist only graduated files (those in recordings/); in-place
+            # browsed files are session-only and never written to the project.
+            self._project.audio_files = [
+                p for p in self.audio_files if self._is_graduated(p)]
             try:
                 self._project.save()
             except Exception:
@@ -5937,21 +6066,26 @@ class MADMainWindow(QMainWindow):
             return
         rows = sorted({self.file_list.row(item) for item in sel}, reverse=True)
         n = len(rows)
-        in_project = (self._project is not None and
-                      hasattr(self._project, 'recordings_dir'))
-        if in_project:
-            msg = (f"This will remove {n} file(s) from the project and "
-                   f"delete them from the recordings folder.\nAre you sure?")
-        else:
-            msg = (f"This will remove {n} file(s) from the list.\n"
-                   f"Are you sure?")
+        removed_paths = [self.audio_files[r] for r in rows]
+        # Graduated files (already in recordings/) are deleted from disk; files
+        # browsed in place are only dropped from the list — originals untouched.
+        n_graduated = sum(1 for p in removed_paths if self._is_graduated(p))
+        n_inplace = n - n_graduated
+        parts = []
+        if n_graduated:
+            parts.append(f"delete {n_graduated} from the recordings folder")
+        if n_inplace:
+            parts.append(f"drop {n_inplace} browsed file(s) from the list "
+                         f"(originals left untouched)")
+        msg = ("This will remove " + str(n) + " file(s):\n  • "
+               + "\n  • ".join(parts) + "\n\nAre you sure?") if parts else \
+              f"Remove {n} file(s) from the list?"
         reply = QMessageBox.question(
             self, "Remove Files", msg,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        removed_paths = [self.audio_files[r] for r in rows]
         self._remove_files_by_path(removed_paths)
 
     def _load_current_file(self):
@@ -6542,9 +6676,58 @@ class MADMainWindow(QMainWindow):
             td_save_example(h5_path, spec_patch, mask_patch, meta, ex_id)
         return ex_id
 
+    # --- browse-in-place / scratch storage ----------------------------
+    def _scratch_dir(self) -> str:
+        """Per-project scratch folder for masks/predictions of browsed-but-not-
+        yet-accepted files. Wiped on close — see _wipe_scratch."""
+        d = os.path.join(self._project.project_dir, '.scratch')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _is_graduated(self, wav: str) -> bool:
+        """True if ``wav`` lives in the project's recordings/ (it has 'earned'
+        its place by having an accepted call), or there is no project."""
+        if self._project is None:
+            return True
+        return (os.path.normpath(os.path.dirname(wav))
+                == os.path.normpath(self._project.recordings_dir))
+
+    def _scratch_key(self, wav: str) -> str:
+        import hashlib
+        h = hashlib.md5(os.path.normpath(wav).encode()).hexdigest()[:8]
+        return f"{os.path.splitext(os.path.basename(wav))[0]}_{h}"
+
+    def _register_inplace_store(self, wav: str):
+        """Redirect an in-place file's masks + predictions to scratch so the
+        original recording folder stays clean until the file is graduated."""
+        if self._project is None or self._is_graduated(wav):
+            return
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            set_mask_path_override, MASKS_SUFFIX)
+        from fnt.usv.usv_detector.mad_labels import (
+            set_pred_csv_override, PRED_SUFFIX)
+        key = self._scratch_key(wav)
+        sd = self._scratch_dir()
+        set_mask_path_override(wav, os.path.join(sd, key + MASKS_SUFFIX))
+        set_pred_csv_override(wav, os.path.join(sd, key + PRED_SUFFIX))
+
+    def _wipe_scratch(self):
+        """Discard all scratch masks/predictions and clear the path overrides —
+        files the user never accepted leave no trace."""
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            clear_all_mask_path_overrides)
+        from fnt.usv.usv_detector.mad_labels import clear_all_pred_csv_overrides
+        clear_all_mask_path_overrides()
+        clear_all_pred_csv_overrides()
+        if self._project is not None:
+            import shutil
+            shutil.rmtree(os.path.join(self._project.project_dir, '.scratch'),
+                          ignore_errors=True)
+
     def _ensure_wav_in_project(self):
-        """Copy the current WAV into the project's recordings/ folder if it
-        is not already there, and update self.audio_files to the copy path."""
+        """Graduate the current WAV: copy it into recordings/ (if not already
+        there), relocate any scratch masks/predictions to sit beside the copy,
+        repoint the file list, and record it in the project's persistent list."""
         if self._project is None or not self.audio_files:
             return
         import shutil
@@ -6553,16 +6736,44 @@ class MADMainWindow(QMainWindow):
         rdir = self._project.recordings_dir
         dest = os.path.join(rdir, os.path.basename(wav_path))
         if os.path.normpath(wav_path) == os.path.normpath(dest):
-            return
+            return  # already graduated
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, clear_mask_path_override)
+        from fnt.usv.usv_detector.mad_labels import (
+            pred_csv_sibling_path, clear_pred_csv_override)
         try:
             os.makedirs(rdir, exist_ok=True)
+            # Scratch store locations for the in-place original (via overrides).
+            old_h5 = masks_sibling_path(wav_path)
+            old_csv = pred_csv_sibling_path(wav_path)
             if not os.path.isfile(dest):
                 shutil.copy2(wav_path, dest)
+            # The copy is now graduated → it uses real siblings, not scratch.
+            clear_mask_path_override(wav_path)
+            clear_pred_csv_override(wav_path)
+            new_h5 = masks_sibling_path(dest)
+            new_csv = pred_csv_sibling_path(dest)
+            for src_p, dst_p in ((old_h5, new_h5), (old_csv, new_csv)):
+                if (os.path.isfile(src_p)
+                        and os.path.normpath(src_p) != os.path.normpath(dst_p)
+                        and not os.path.isfile(dst_p)):
+                    try:
+                        shutil.move(src_p, dst_p)
+                    except Exception:
+                        pass
             self.audio_files[idx] = dest
             item = self.file_list.item(idx)
             if item is not None:
                 item.setData(Qt.UserRole, dest)
                 item.setToolTip(dest)
+            # Record it in the project's persistent list (graduated files only).
+            if dest not in self._project.audio_files:
+                self._project.audio_files.append(dest)
+                try:
+                    self._project.save()
+                except Exception:
+                    pass
+            self._log(f"Graduated {os.path.basename(dest)} → recordings/")
         except Exception:
             pass
 
@@ -7258,6 +7469,14 @@ class MADMainWindow(QMainWindow):
 
         def on_progress(epoch: int, total: int, metrics: dict):
             status = metrics.get('status', '')
+            if status == 'device':
+                desc = metrics.get('device_desc', metrics.get('device', '?'))
+                req = metrics.get('requested', 'auto')
+                line = f"Training device: {desc}  (requested: {req})"
+                progress.set_stage(line)
+                progress.append(line)
+                self._log(line)
+                return
             if status == 'collecting_tiles':
                 progress.set_stage(
                     f"Collecting tiles from {metrics.get('file_name', '…')} "
@@ -7671,9 +7890,27 @@ class MADMainWindow(QMainWindow):
             'blobs': 'extracting detections',
         }
 
+        import time as _t
+        scan = {'fi': None, 't0': 0.0, 'i0': 0}
+
         def on_progress(file_i, file_n, wav_name, stage, si, sn):
             label = stage_labels.get(stage, stage)
-            detail = f"{label} {si}/{sn}" if stage == 'infer' else label
+            if stage == 'infer':
+                now = _t.time()
+                if scan['fi'] != file_i or si <= 1:
+                    scan['fi'] = file_i
+                    scan['t0'] = now
+                    scan['i0'] = si
+                rate = ''
+                dt = now - scan['t0']
+                di = si - scan['i0']
+                if dt > 1.0 and di > 0:
+                    r = di / dt
+                    eta = (sn - si) / r if r > 0 else 0
+                    rate = f"  (~{r:.1f}/s, ETA {eta:.0f}s)"
+                detail = f"{label} {si}/{sn}{rate}"
+            else:
+                detail = label
             progress.set_stage(
                 f"File {file_i + 1}/{file_n}: {wav_name} — {detail}"
             )
@@ -7710,10 +7947,25 @@ class MADMainWindow(QMainWindow):
                         self._set_deploy_item_state(wp, 'error')
                     else:
                         self._set_deploy_item_state(wp, 'done', r.get('n_blobs'))
+            # Aggregate timing across the batch (helps spot CPU vs GPU).
+            tt = [r['timing'] for r in results if r.get('timing')]
+            timing_line = ""
+            if tt:
+                tot_audio = sum(t.get('audio_dur_s', 0) for t in tt)
+                tot_scan = sum(t.get('t_infer', 0) for t in tt)
+                tot_wall = sum(t.get('t_total', 0) for t in tt)
+                rt = (tot_audio / tot_scan) if tot_scan > 0 else 0
+                dev = tt[0].get('device', '?')
+                timing_line = (
+                    f"\nTiming: {tot_audio:.0f}s audio scanned in "
+                    f"{tot_scan:.0f}s ({rt:.2f}× realtime on {dev}); "
+                    f"{tot_wall:.0f}s total wall.")
             progress.append(
                 f"\nFinished. {len(results)} file(s), "
-                f"{total} blob(s) total, {len(errors)} error(s)."
+                f"{total} blob(s) total, {len(errors)} error(s).{timing_line}"
             )
+            if timing_line:
+                self._log(timing_line.strip())
             for r in results[:20]:
                 if 'error' in r:
                     progress.append(f"  ERR {r.get('wav_path')}: {r['error']}")
@@ -7754,6 +8006,39 @@ class MADMainWindow(QMainWindow):
             progress.append("\nERROR:\n" + msg)
             progress.mark_done(ok=False)
 
+        def on_device(dev: str):
+            desc = dev
+            try:
+                import torch
+                if dev == 'cuda':
+                    desc = f"cuda — {torch.cuda.get_device_name(0)}"
+                elif dev == 'mps':
+                    desc = "mps — Apple GPU"
+                else:
+                    seen = bool(getattr(torch, 'cuda', None)
+                                and torch.cuda.is_available())
+                    desc = "cpu" if seen else "cpu (no CUDA GPU seen by PyTorch)"
+            except Exception:
+                pass
+            line = f"Inference device: {desc}  (requested: {cfg.device})"
+            progress.append(line)
+            self._log(line)
+
+        def on_file_done(summary: dict):
+            t = summary.get('timing')
+            name = os.path.basename(str(summary.get('wav_path', '')))
+            if not t:
+                return
+            line = (f"  {name}: {t.get('audio_dur_s')}s audio in "
+                    f"{t.get('t_total')}s  [spec {t.get('t_spec')}s · "
+                    f"scan {t.get('t_infer')}s · blobs {t.get('t_blobs')}s] "
+                    f"→ {t.get('realtime_factor')}× realtime on "
+                    f"{t.get('device')}")
+            progress.append(line)
+            self._log(line)
+
+        worker.device_signal.connect(on_device)
+        worker.file_done_signal.connect(on_file_done)
         worker.progress_signal.connect(on_progress)
         worker.finished_signal.connect(on_finished)
         worker.error_signal.connect(on_error)
@@ -7816,6 +8101,8 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     def closeEvent(self, event):
         self._auto_save_mask_if_dirty()
+        # Throw away scratch masks/predictions for un-accepted browsed files.
+        self._wipe_scratch()
         self._stop_playback()
         super().closeEvent(event)
 

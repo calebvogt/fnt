@@ -230,6 +230,25 @@ def train_unet(
 
     # ---- model ----
     device = _resolve_device(cfg.device)
+    # Report the resolved compute device so the session log makes it obvious
+    # whether training runs on GPU or CPU (and which GPU).
+    dev_desc = device
+    try:
+        if device == 'cuda':
+            dev_desc = f"cuda — {torch.cuda.get_device_name(0)}"
+        elif device == 'mps':
+            dev_desc = "mps — Apple GPU"
+        else:
+            cuda_seen = bool(getattr(torch, 'cuda', None)
+                             and torch.cuda.is_available())
+            dev_desc = ("cpu" if cuda_seen
+                        else "cpu (no CUDA GPU detected by PyTorch)")
+    except Exception:
+        pass
+    if progress:
+        progress(0, cfg.n_epochs, {'status': 'device', 'device': device,
+                                   'device_desc': dev_desc,
+                                   'requested': cfg.device})
     model = build_model(
         cfg.model_arch, cfg.encoder_name, cfg.encoder_weights,
         in_channels=1, classes=1,
