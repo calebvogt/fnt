@@ -424,20 +424,44 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
     def pending_components(self):
         """Connected components of the pending mask, as
-        ``(f0, f1, t0, t1, local_bool)`` tuples."""
-        if self._pending is None or not self._pending.any():
+        ``(f0, f1, t0, t1, local_bool)`` tuples.
+
+        The pending buffer spans the whole (huge) spectrogram grid, so labeling
+        it directly is very slow. Instead we bound the work to just the painted
+        region: the bbox comes from the stroke history (``_pending_stack``,
+        already tracked for undo) — no full-grid scan — and only that small crop
+        is labeled."""
+        p = self._pending
+        if p is None:
             return []
         from scipy import ndimage
-        lbl, n = ndimage.label(self._pending > 0)
+        if self._pending_stack:
+            fcat = np.concatenate([s[0] for s in self._pending_stack])
+            tcat = np.concatenate([s[1] for s in self._pending_stack])
+            bf0, bf1 = int(fcat.min()), int(fcat.max()) + 1
+            bt0, bt1 = int(tcat.min()), int(tcat.max()) + 1
+        else:
+            # No stroke history (shouldn't normally happen) — fall back to a
+            # full scan so behavior stays correct.
+            rows = np.where(p.any(axis=1))[0]
+            if rows.size == 0:
+                return []
+            cols = np.where(p.any(axis=0))[0]
+            bf0, bf1 = int(rows[0]), int(rows[-1]) + 1
+            bt0, bt1 = int(cols[0]), int(cols[-1]) + 1
+        sub = p[bf0:bf1, bt0:bt1] > 0
+        if not sub.any():
+            return []
+        lbl, n = ndimage.label(sub)
         out = []
-        for k in range(1, n + 1):
-            cc = lbl == k
-            fs = np.where(cc.any(axis=1))[0]
-            ts = np.where(cc.any(axis=0))[0]
-            f0, f1 = int(fs[0]), int(fs[-1]) + 1
-            t0, t1 = int(ts[0]), int(ts[-1]) + 1
-            out.append((f0, f1, t0, t1,
-                        np.ascontiguousarray(cc[f0:f1, t0:t1])))
+        for k, sl in enumerate(ndimage.find_objects(lbl), start=1):
+            if sl is None:
+                continue
+            fs, ts = sl  # slices within the crop
+            cc = lbl[fs, ts] == k
+            out.append((bf0 + fs.start, bf0 + fs.stop,
+                        bt0 + ts.start, bt0 + ts.stop,
+                        np.ascontiguousarray(cc)))
         return out
 
     def pending_bbox(self):
@@ -475,7 +499,17 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if not (0 <= idx < len(self.annotations)):
             return None
         ann = self.annotations.pop(idx)
-        self._rebuild_confirmed_mask()
+        # Clear only this annotation's region instead of zeroing the whole
+        # (multi-hundred-MB) grid and re-stamping every annotation. Then re-stamp
+        # any other annotation overlapping the cleared box so shared pixels stay.
+        if self.mask is not None and ann:
+            f0, f1, t0, t1 = ann['f0'], ann['f1'], ann['t0'], ann['t1']
+            self.mask[f0:f1, t0:t1] = 0
+            for other in self.annotations:
+                of0, of1, ot0, ot1 = (other['f0'], other['f1'],
+                                      other['t0'], other['t1'])
+                if of1 > f0 and of0 < f1 and ot1 > t0 and ot0 < t1:
+                    self.mask[of0:of1, ot0:ot1][other['mask']] = MASK_POSITIVE
         self.update()
         return ann
 
@@ -6971,6 +7005,30 @@ class MADMainWindow(QMainWindow):
         id_to_idx = {a.get('id'): i for i, a in enumerate(sg.annotations)}
         return [id_to_idx[x] for x in self._box_sel_ids if x in id_to_idx]
 
+    def _batch_remove_pred_persistence(self, anns):
+        """Remove the CSV rows + stored crops for many predictions in ONE CSV
+        write and ONE h5 open (vs once per item), for fast box-delete."""
+        wav = self._active_review_wav_path()
+        bids = {a.get('blob_id') for a in anns if a.get('blob_id') is not None}
+        if not wav or not bids:
+            return
+        csv_path = pred_csv_sibling_path(wav)
+        if os.path.isfile(csv_path):
+            try:
+                from fnt.usv.usv_detector.mad_inference import (
+                    read_blob_csv, write_blob_csv)
+                rows = [r for r in read_blob_csv(csv_path)
+                        if r.get('blob_id') not in bids]
+                write_blob_csv(csv_path, rows)
+            except Exception:
+                pass
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import (
+                masks_sibling_path, delete_pred_masks)
+            delete_pred_masks(masks_sibling_path(wav), bids)
+        except Exception:
+            pass
+
     def _apply_to_box_selection(self, action):
         """Apply accept/reject/delete to every box-selected detection at once.
         Returns True if a selection existed and was handled."""
@@ -6980,38 +7038,40 @@ class MADMainWindow(QMainWindow):
         self._snapshot_for_undo(f"{action.capitalize()} selection", crops=(action == 'delete'))
         sg = self.spectrogram
         n_done = 0
-        # Process high→low so earlier removals don't shift later indices.
-        for i in sorted(idxs, reverse=True):
-            if not (0 <= i < len(sg.annotations)):
-                continue
-            ann = sg.annotations[i]
-            st = ann.get('status')
-            is_pred = st == 'prediction'
-            is_rej = st == 'rejected'
-            if action == 'accept':
-                if is_pred:
-                    if self._review_mode == 'deploy':
-                        self._write_pred_csv_status(ann, 'accepted')
-                        ann['status'] = 'accepted'  # keep visible (blue)
-                    else:
-                        self._accept_prediction(i)
+        if action == 'delete':
+            # Batch the persistence (one CSV write + one h5 open), then drop the
+            # annotations without a per-item list refresh or full mask rebuild.
+            targets = [sg.annotations[i] for i in idxs
+                       if 0 <= i < len(sg.annotations)]
+            self._batch_remove_pred_persistence(targets)
+            for i in sorted(idxs, reverse=True):
+                if 0 <= i < len(sg.annotations):
+                    self._delete_annotation(i, refresh=False)
                     n_done += 1
-            elif action == 'reject':
-                if is_pred:
-                    # Recorded decision: keep visible (red), persist 'rejected'.
-                    self._write_pred_csv_status(ann, 'rejected')
-                    ann['status'] = 'rejected'
-                    n_done += 1
-            elif action == 'delete':
-                # Permanent removal, no trace (no-ops if no CSV row/crop).
-                self._remove_pred_csv_row(ann)
-                self._delete_pred_crop(ann)
-                self._delete_annotation(i)
-                n_done += 1
+        else:
+            # Process high→low so earlier removals don't shift later indices.
+            for i in sorted(idxs, reverse=True):
+                if not (0 <= i < len(sg.annotations)):
+                    continue
+                ann = sg.annotations[i]
+                is_pred = ann.get('status') == 'prediction'
+                if action == 'accept':
+                    if is_pred:
+                        if self._review_mode == 'deploy':
+                            self._write_pred_csv_status(ann, 'accepted')
+                            ann['status'] = 'accepted'  # keep visible (blue)
+                        else:
+                            self._accept_prediction(i)
+                        n_done += 1
+                elif action == 'reject':
+                    if is_pred:
+                        # Recorded decision: keep visible (red), persist it.
+                        self._write_pred_csv_status(ann, 'rejected')
+                        ann['status'] = 'rejected'
+                        n_done += 1
         self._box_sel_ids = []
         sg._selected_set = set()
         sg._selected_ann_idx = None
-        sg._rebuild_confirmed_mask()
         sg.update()
         self._pred_review_idx = None
         self._refresh_annotation_list()
@@ -7099,7 +7159,7 @@ class MADMainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _delete_annotation(self, ann_idx):
+    def _delete_annotation(self, ann_idx, refresh: bool = True):
         sg = self.spectrogram
         ann = sg.remove_annotation(ann_idx)
         if ann:
@@ -7120,7 +7180,8 @@ class MADMainWindow(QMainWindow):
                     td_delete(h5, aid)
                 except Exception:
                     pass
-        self._refresh_annotation_list()
+        if refresh:  # bulk callers refresh once at the end instead
+            self._refresh_annotation_list()
 
     def _on_annotation_edit_finished(self, ann_idx):
         sg = self.spectrogram

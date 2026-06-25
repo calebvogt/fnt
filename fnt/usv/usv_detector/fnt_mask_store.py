@@ -272,6 +272,28 @@ def delete_pred_mask(h5_path: str, blob_id) -> None:
         pass
 
 
+def delete_pred_masks(h5_path: str, blob_ids) -> None:
+    """Remove several prediction crops by blob_id in one file open (batch form
+    of :func:`delete_pred_mask`). Updates the cached ``n_pred_blobs`` count."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    want = {str(b) for b in blob_ids}
+    if not want:
+        return
+    try:
+        with h5py.File(h5_path, "a") as f:
+            grp = f.get(PRED_GROUP)
+            if grp is None:
+                return
+            for key in list(grp.keys()):
+                if key in want:
+                    del grp[key]
+            f.attrs["n_pred_blobs"] = int(len(grp))
+    except Exception:
+        pass
+
+
 def clear_pred_masks(h5_path: str) -> None:
     """Delete all stored prediction crops (no-op if absent)."""
     _require_h5()
