@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches:
-      - main
+      - FED
     tags:
       - "v*"
   workflow_dispatch:
