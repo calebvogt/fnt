@@ -1160,9 +1160,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # horizontal middle of the spectrogram. Auto-advance centers the
         # selected call on this line, giving a fixed marker to read against.
         cx_mid = int(spec_rect.center().x())
-        pen = QPen(QColor(255, 255, 255, 85))
-        pen.setStyle(Qt.DotLine)
-        pen.setWidth(1)
+        pen = QPen(QColor(255, 255, 255, 150))
+        pen.setStyle(Qt.DashLine)
+        pen.setWidth(2)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawLine(cx_mid, int(spec_rect.top()),
