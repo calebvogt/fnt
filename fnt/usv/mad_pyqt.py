@@ -3505,7 +3505,9 @@ class MADMainWindow(QMainWindow):
                 n = 0
         else:
             n = 0
-        self.btn_train.setText(f"Train ({n} examples)" if n else "Train")
+        self.btn_train.setText(
+            f"Train ({n} accepted label{'s' if n != 1 else ''})" if n
+            else "Train")
 
     def _on_annotation_list_selected(self, current, _previous=None):
         """Single-click in detections list: jump to the detection and highlight it."""
@@ -7058,18 +7060,15 @@ class MADMainWindow(QMainWindow):
         self._delete_annotation(sel)
         self._log("Deleted detection")
         self.status_bar.showMessage("Deleted detection (D)")
-        # Advance: to the next pending (auto-advance) or the item now at the
-        # vacated slot (manual), so the selection never gets stranded.
+        # Advance only when Auto-advance is ON (jump to the next pending). When
+        # OFF, stay put — don't move/recenter; just clear the now-stale
+        # selection so Back (B) / Next (N) drive navigation.
         if self._auto_advance and next_pending_id is not None:
             self._reselect_by_id(next_pending_id)
         else:
-            order2 = self._review_order()
-            if order2:
-                self._select_review_pos(min(pos if pos is not None else 0,
-                                            len(order2) - 1))
-            else:
-                self.spectrogram.update()
-                self._update_pred_review_widgets()
+            self.spectrogram._selected_ann_idx = None
+            self.spectrogram.update()
+            self._update_pred_review_widgets()
         if was_pending:
             self._reviewed_count += 1
             if not self._pred_indices():

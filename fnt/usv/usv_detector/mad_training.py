@@ -255,7 +255,15 @@ def train_unet(
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
-    run_dir = Path(cfg.resolve_run_dir(n_examples=n_total))
+    # Name the run by the number of accepted labels (confirmed calls), which is
+    # what the user tracks — not the tile count (long calls split into several
+    # tiles, so n_total > n_labels). The tile count is recorded in the summary.
+    try:
+        from .mad_examples import count_examples
+        n_labels = count_examples(cfg.training_data_dir) or n_total
+    except Exception:
+        n_labels = n_total
+    run_dir = Path(cfg.resolve_run_dir(n_examples=n_labels))
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- train ----
