@@ -899,7 +899,29 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
         h = f_end - f_start
         w = t_end - t_start
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+        # Zoom-out guard: when the view spans far more time frames than the
+        # spectrogram has on-screen pixels, building the overlay image at full
+        # frame resolution wastes hundreds of MB (and a flipud copy) on every
+        # repaint, then throws it away in the down-scale — the cause of the
+        # freeze past ~15 s. Instead we max-pool the per-pixel maps down to the
+        # display pixel width (max-pool, not stride-sample, so even 1-frame
+        # calls survive) and let Qt scale the small image back up. When zoomed
+        # in (w <= pixels) t_stride is 1 and this is a no-op.
+        spec_w_px = max(1, int(spec_rect.width()))
+        t_stride = max(1, w // spec_w_px)
+        overlays_visible = t_stride <= 4   # per-call outlines/labels readable?
+        if t_stride > 1:
+            _seg = np.arange(0, w, t_stride)
+            w_img = int(_seg.shape[0])
+
+            def _ds(a):
+                return np.maximum.reduceat(a, _seg, axis=1)
+        else:
+            w_img = w
+
+            def _ds(a):
+                return a
 
         pend_view = (self._pending[f_start:f_end, t_start:t_end] > 0
                      if self._pending is not None else None)
@@ -922,20 +944,26 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 sub = ann['mask'][mf0:mf0+mh, mt0:mt0+mw]
                 type_map[lf0:lf0+mh, lt0:lt0+mw][sub > 0] = code
 
+        # Down-pool the maps to render width, then colour the small image.
+        tm = _ds(type_map)
+        pv = (_ds(pend_view.astype(np.uint8)).astype(bool)
+              if pend_view is not None else None)
+        rgba = np.zeros((h, w_img, 4), dtype=np.uint8)
+
         if self.view_mode == 'mask_only':
             rgba[:] = (32, 32, 32, 255)
-            rgba[type_map == 1] = (40, 130, 255, 255)
-            rgba[type_map == 2] = (255, 230, 90, 255)
-            rgba[type_map == 3] = (255, 70, 70, 255)
-            if pend_view is not None:
-                rgba[pend_view] = (255, 230, 90, 255)
+            rgba[tm == 1] = (40, 200, 90, 255)
+            rgba[tm == 2] = (255, 230, 90, 255)
+            rgba[tm == 3] = (255, 70, 70, 255)
+            if pv is not None:
+                rgba[pv] = (255, 230, 90, 255)
         elif self.view_mode == 'overlay':
             pos_alpha = int(self.mask_alpha * 255)
-            rgba[type_map == 1] = (40, 130, 255, pos_alpha)
-            rgba[type_map == 2] = (255, 230, 90, max(60, pos_alpha - 50))
-            rgba[type_map == 3] = (255, 70, 70, max(60, pos_alpha - 50))
-            if pend_view is not None:
-                rgba[pend_view] = (255, 230, 90, max(60, pos_alpha - 50))
+            rgba[tm == 1] = (40, 200, 90, pos_alpha)
+            rgba[tm == 2] = (255, 230, 90, max(60, pos_alpha - 50))
+            rgba[tm == 3] = (255, 70, 70, max(60, pos_alpha - 50))
+            if pv is not None:
+                rgba[pv] = (255, 230, 90, max(60, pos_alpha - 50))
         # else: 'spec' — leave rgba all-zero so only the spec shows.
 
         # Predicted blob mask shading (cyan, low alpha) if present.
@@ -943,6 +971,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 self.pred_mask.shape == self.mask.shape):
             pview = self.pred_mask[f_start:f_end, t_start:t_end]
             if pview.size > 0:
+                pview = _ds(pview)
                 active = pview > 0
                 cyan_alpha = (pview[active] * 180).astype(np.uint8)
                 if active.any():
@@ -958,7 +987,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     rgba[active, 3] = np.maximum(rgba[active, 3], cyan_alpha)
 
         rgba = np.flipud(rgba).copy()
-        qimg = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        qimg = QImage(rgba.data, w_img, h, 4 * w_img,
+                      QImage.Format_RGBA8888).copy()
         scaled = qimg.scaled(
             int(spec_rect.width()), int(spec_rect.height()),
             Qt.IgnoreAspectRatio, Qt.FastTransformation,
@@ -974,15 +1004,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
             frac = (f - f_start) / max(1, (f_end - f_start))
             return spec_rect.bottom() - frac * spec_rect.height()
 
-        # Thin yellow outline tracing the closed pending mask (MT-style).
-        if (HAS_CV2 and self._pending is not None and pend_view is not None
-                and pend_view.any()):
+        # Dotted yellow outline tracing the actively-drawn (SAM/Paint) pending
+        # mask — dotted distinguishes it from inference predictions (solid
+        # yellow), so you can tell what you're labeling vs reviewing.
+        if (HAS_CV2 and overlays_visible and self._pending is not None
+                and pend_view is not None and pend_view.any()):
             cnts, _ = cv2.findContours(
                 pend_view.astype(np.uint8), cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
             pen = QPen(QColor(255, 225, 60))
             pen.setWidth(2)
+            pen.setStyle(Qt.DotLine)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             for cnt in cnts:
@@ -999,8 +1032,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
         # (SAM prompt clicks are not drawn — only the proposed mask is shown.)
 
-        # Accepted-annotation outlines + class labels (blue) above each mask.
-        if self.view_mode != 'spec' and self.annotations and HAS_CV2:
+        # Accepted-annotation outlines + class labels above each mask. Skipped
+        # when zoomed out so far each call is only a pixel or two wide — the
+        # outlines/labels would be illegible clutter and (pre-fix) very slow.
+        if (self.view_mode != 'spec' and self.annotations and HAS_CV2
+                and overlays_visible):
             for ai, ann in enumerate(self.annotations):
                 if ai == self._editing_ann_idx:
                     continue
@@ -1019,22 +1055,28 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     outline_color = QColor(255, 80, 80)
                     label_color = QColor(255, 110, 110)
                 else:
-                    outline_color = QColor(255, 225, 60) if is_pred else QColor(60, 150, 255)
-                    label_color = QColor(255, 230, 100) if is_pred else QColor(120, 200, 255)
+                    outline_color = (QColor(255, 225, 60) if is_pred
+                                     else QColor(60, 210, 110))   # green confirmed
+                    label_color = (QColor(255, 230, 100) if is_pred
+                                   else QColor(130, 235, 150))
                 # Thin outline around the mask contour.
                 lf0 = max(ann['f0'], f_start) - f_start
                 lf1 = min(ann['f1'], f_end) - f_start
                 lt0 = max(ann['t0'], t_start) - t_start
                 lt1 = min(ann['t1'], t_end) - t_start
                 if lf1 > lf0 and lt1 > lt0:
-                    view_ann = np.zeros((h, w), dtype=np.uint8)
+                    # Allocate only the call's bounding box (not the whole
+                    # view) — at wide zoom a full-view array per annotation was
+                    # gigabytes of allocations and the main source of freeze.
+                    bh, bw = lf1 - lf0, lt1 - lt0
+                    view_ann = np.zeros((bh, bw), dtype=np.uint8)
                     msk = ann['mask']
                     af0 = max(ann['f0'], f_start) - ann['f0']
-                    af1 = af0 + (lf1 - lf0)
+                    af1 = af0 + bh
                     at0 = max(ann['t0'], t_start) - ann['t0']
-                    at1 = at0 + (lt1 - lt0)
+                    at1 = at0 + bw
                     if af1 <= msk.shape[0] and at1 <= msk.shape[1]:
-                        view_ann[lf0:lf1, lt0:lt1] = msk[af0:af1, at0:at1].astype(np.uint8)
+                        view_ann[:, :] = msk[af0:af1, at0:at1].astype(np.uint8)
                     cnts, _ = cv2.findContours(
                         view_ann, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     pen = QPen(outline_color)
@@ -1046,9 +1088,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                             continue
                         poly = QPolygonF()
                         for pt in cnt[:, 0, :]:
+                            # contour coords are relative to the bbox crop
                             poly.append(QPointF(
-                                _t_to_x(t_start + int(pt[0])),
-                                _f_to_y(f_start + int(pt[1])),
+                                _t_to_x(t_start + lt0 + int(pt[0])),
+                                _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
                         painter.drawPolygon(poly)
                 # Class label centered horizontally over the mask, just above it.
@@ -1067,8 +1110,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 ly = _f_to_y(min(ann['f1'], f_end)) - 3
                 painter.drawText(QPointF(lx, ly), label)
 
-            # White highlight outline on the selected annotation(s) — the
-            # single click-selected one plus any rubber-band multi-selection.
+        # White highlight outline on the selected annotation(s) — the single
+        # click-selected one plus any rubber-band multi-selection. Drawn even
+        # when zoomed out (per-call overlays hidden) so the selection stays
+        # visible; bbox-sized alloc keeps it cheap.
+        if self.view_mode != 'spec' and HAS_CV2 and self.annotations:
             highlight = set(self._selected_set)
             if self._selected_ann_idx is not None:
                 highlight.add(self._selected_ann_idx)
@@ -1084,14 +1130,15 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 lt0 = max(sa['t0'], t_start) - t_start
                 lt1 = min(sa['t1'], t_end) - t_start
                 if lf1 > lf0 and lt1 > lt0:
-                    view_sel = np.zeros((h, w), dtype=np.uint8)
+                    bh, bw = lf1 - lf0, lt1 - lt0
+                    view_sel = np.zeros((bh, bw), dtype=np.uint8)
                     smsk = sa['mask']
                     sf0 = max(sa['f0'], f_start) - sa['f0']
-                    sf1 = sf0 + (lf1 - lf0)
+                    sf1 = sf0 + bh
                     st0 = max(sa['t0'], t_start) - sa['t0']
-                    st1 = st0 + (lt1 - lt0)
+                    st1 = st0 + bw
                     if sf1 <= smsk.shape[0] and st1 <= smsk.shape[1]:
-                        view_sel[lf0:lf1, lt0:lt1] = smsk[sf0:sf1, st0:st1].astype(np.uint8)
+                        view_sel[:, :] = smsk[sf0:sf1, st0:st1].astype(np.uint8)
                     scnts, _ = cv2.findContours(
                         view_sel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     pen = QPen(QColor(255, 255, 255))
@@ -1104,8 +1151,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         poly = QPolygonF()
                         for pt in cnt[:, 0, :]:
                             poly.append(QPointF(
-                                _t_to_x(t_start + int(pt[0])),
-                                _f_to_y(f_start + int(pt[1])),
+                                _t_to_x(t_start + lt0 + int(pt[0])),
+                                _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
                         painter.drawPolygon(poly)
 
@@ -2765,9 +2812,9 @@ class MADMainWindow(QMainWindow):
         vbox.addLayout(view_row)
 
         hint = QLabel(
-            "Yellow = pending / prediction (Enter to confirm, pick a class) · "
-            "Blue = confirmed call. Confirmed calls save as self-contained "
-            "training examples."
+            "Yellow = pending (solid = prediction, dotted = you're drawing; "
+            "Enter to confirm) · Green = confirmed · Red = rejected. Confirmed "
+            "calls save as self-contained training examples."
         )
         hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
         hint.setWordWrap(True)
@@ -3079,7 +3126,7 @@ class MADMainWindow(QMainWindow):
         self.annotation_list = QTreeWidget()
         self.annotation_list.setMaximumHeight(200)
         self.annotation_list.setToolTip(
-            "Detections for the current file. Blue = confirmed, "
+            "Detections for the current file. Green = confirmed, "
             "Yellow = prediction (pending review). Click to jump."
         )
         cols = ["", "Time", "Class", "Dur", "kHz", "Px", "Score"]
@@ -3498,7 +3545,7 @@ class MADMainWindow(QMainWindow):
             item.setData(0, Qt.UserRole, (cur_wav, t0, ann.get('id', ''), kind))
             color = (QColor(255, 230, 90) if is_pred
                      else QColor(255, 90, 90) if is_rej
-                     else QColor(90, 160, 255))
+                     else QColor(80, 210, 120))   # green confirmed
             for c in range(ncols):
                 item.setForeground(c, color)
             new_items.append(item)
@@ -3545,7 +3592,7 @@ class MADMainWindow(QMainWindow):
         dt = hop / float(sr)
         pending = QColor(255, 225, 60)
         rejected = QColor(255, 80, 80)
-        confirmed = QColor(60, 150, 255)
+        confirmed = QColor(60, 210, 110)   # green
         marks = []
         for ann in self.spectrogram.annotations:
             st = ann.get('status')
@@ -4553,7 +4600,7 @@ class MADMainWindow(QMainWindow):
         self.deploy_annotation_list = QTreeWidget()
         self.deploy_annotation_list.setMaximumHeight(200)
         self.deploy_annotation_list.setToolTip(
-            "Detections for the current file. Blue = confirmed, "
+            "Detections for the current file. Green = confirmed, "
             "Yellow = prediction (pending review). Click to jump."
         )
         cols = ["", "Time", "Class", "Dur", "kHz", "Px", "Score"]
@@ -6779,11 +6826,24 @@ class MADMainWindow(QMainWindow):
                 pass
         sg.clear_pending()
         self._refresh_annotation_list()
+        self._deactivate_labeling_tools()  # turn off SAM/Paint/Eraser on confirm
         self.lbl_mask_status.setText(f"Confirmed {saved} call(s) — '{name}'")
         self.status_bar.showMessage(
             f"Saved {saved} example(s) (class '{name}') — label the next batch"
         )
         self._log(f"Confirmed {saved} call(s) as '{name}' (Enter)")
+
+    def _deactivate_labeling_tools(self):
+        """Turn off whichever labeling tool (SAM / Paint / Eraser) is active and
+        drop any SAM prompt points — called after confirming a batch of masks."""
+        for btn in (self.btn_paint, self.btn_erase, self.btn_sam):
+            if btn.isChecked():
+                btn.setChecked(False)
+        self.spectrogram.set_paint_mode(None)
+        try:
+            self.spectrogram.clear_sam_prompts()
+        except Exception:
+            pass
 
     def _show_first_label_info(self):
         """One-time dialog explaining that confirming labels creates .h5 files
