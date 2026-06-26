@@ -895,7 +895,13 @@ class FEDTabWidget(QWidget):
             self.apply_device_mode(device, confirm=False)
 
     def on_sched_time_type_changed(self, idx):
-        self.sched_time_edit.setText("00d 00:00:00")
+        if not hasattr(self, 'sched_alarm_day_combo'):
+            return
+        is_alarm = (idx == 0)
+        self.sched_alarm_day_combo.setVisible(is_alarm)
+        self.sched_alarm_time.setVisible(is_alarm)
+        self.sched_timer_days.setVisible(not is_alarm)
+        self.sched_timer_time.setVisible(not is_alarm)
 
     def init_scheduler(self):
         self.scheduler_group = QGroupBox("Protocol Event Scheduler")
@@ -956,29 +962,27 @@ class FEDTabWidget(QWidget):
         self.sched_time_type_combo = QComboBox()
         self.sched_time_type_combo.addItems(["Alarm", "Timer"])
         
-        self.sched_time_edit = QLineEdit()
-        self.sched_time_edit.setText("00d 00:00:00")
-        self.sched_time_edit.setFixedWidth(90)
-        self.sched_time_edit.setAlignment(Qt.AlignCenter)
-        self.sched_time_edit.setToolTip("Type digits to format time (e.g. 4123015 -> 04d 12:30:15)")
+        self.sched_alarm_day_combo = QComboBox()
+        self.sched_alarm_day_combo.addItems(["Today", "Tomorrow", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
         
-        def on_text_edited(text):
-            digits = "".join([c for c in text if c.isdigit()])
-            if not digits:
-                digits = "0"
-            digits = digits[-8:]
-            digits = digits.zfill(8)
-            formatted = f"{digits[0:2]}d {digits[2:4]}:{digits[4:6]}:{digits[6:8]}"
-            
-            self.sched_time_edit.blockSignals(True)
-            self.sched_time_edit.setText(formatted)
-            self.sched_time_edit.setCursorPosition(len(formatted))
-            self.sched_time_edit.blockSignals(False)
-            
-        self.sched_time_edit.textEdited.connect(on_text_edited)
+        self.sched_alarm_time = QTimeEdit()
+        self.sched_alarm_time.setDisplayFormat("HH:mm:ss")
+        self.sched_alarm_time.setTime(QTime(12, 0, 0))
+        
+        self.sched_timer_days = QSpinBox()
+        self.sched_timer_days.setRange(0, 999)
+        self.sched_timer_days.setSuffix(" days")
+        self.sched_timer_days.setValue(0)
+        
+        self.sched_timer_time = QTimeEdit()
+        self.sched_timer_time.setDisplayFormat("HH:mm:ss")
+        self.sched_timer_time.setTime(QTime(0, 0, 0))
         
         time_input_layout.addWidget(self.sched_time_type_combo)
-        time_input_layout.addWidget(self.sched_time_edit)
+        time_input_layout.addWidget(self.sched_alarm_day_combo)
+        time_input_layout.addWidget(self.sched_alarm_time)
+        time_input_layout.addWidget(self.sched_timer_days)
+        time_input_layout.addWidget(self.sched_timer_time)
         time_input_layout.addStretch()
         
         add_layout.addWidget(time_input_container, 0, 3)
@@ -1093,26 +1097,24 @@ class FEDTabWidget(QWidget):
         self.sched_timeout_unit_label.setVisible(is_timeout)
 
     def add_sched_event(self):
+        if not self.confirm_action_if_tracking("Are you sure you want to schedule this event?"):
+            return
+
         target_name = self.sched_target_combo.currentText()
         action = self.sched_action_combo.currentText()
-        time_text = self.sched_time_edit.text().strip()
         is_relative = (self.sched_time_type_combo.currentIndex() == 1)
 
-        parts_d = time_text.split("d ")
-        try:
-            days_val = int(parts_d[0]) if len(parts_d) > 0 else 0
-            rest = parts_d[1] if len(parts_d) > 1 else "00:00:00"
-        except ValueError:
+        if is_relative:
+            days_val = self.sched_timer_days.value()
+            time_val = self.sched_timer_time.time()
+            h, m, s = time_val.hour(), time_val.minute(), time_val.second()
+            time_text = f"{days_val:02d}d {h:02d}:{m:02d}:{s:02d}"
+        else:
+            day_str = self.sched_alarm_day_combo.currentText()
+            time_val = self.sched_alarm_time.time()
+            h, m, s = time_val.hour(), time_val.minute(), time_val.second()
+            time_text = f"{day_str} {h:02d}:{m:02d}:{s:02d}"
             days_val = 0
-            rest = time_text
-
-        parts = rest.split(":")
-        try:
-            h = int(parts[0]) if len(parts) > 0 else 0
-            m = int(parts[1]) if len(parts) > 1 else 0
-            s = int(parts[2]) if len(parts) > 2 else 0
-        except ValueError:
-            h, m, s = 0, 0, 0
 
         if is_relative and days_val == 0 and h == 0 and m == 0 and s == 0:
             QMessageBox.warning(self, "Validation Error", "Please specify a timer delay greater than 0 days and 00:00:00.")
@@ -1143,13 +1145,10 @@ class FEDTabWidget(QWidget):
         else:
             param_desc = "None"
 
-        total_offset_sec = (days_val * 86400 + h * 3600 + m * 60 + s) if is_relative else None
-
         event = {
             'target_name': target_name,
             'trigger_type': 'Relative' if is_relative else 'Absolute',
-            'trigger_val': f"+{time_text}" if is_relative else (time_text if days_val > 0 else rest),
-            'relative_offset_sec': total_offset_sec,
+            'trigger_val': f"+{time_text}" if is_relative else time_text,
             'days_offset': days_val,
             'time_text': time_text,
             'action': action,
@@ -1160,22 +1159,38 @@ class FEDTabWidget(QWidget):
         }
 
         now = datetime.now()
-        if event['trigger_type'] == 'Relative':
-            event['target_time'] = now + timedelta(seconds=event['relative_offset_sec'])
+        if is_relative:
+            total_offset_sec = (days_val * 86400 + h * 3600 + m * 60 + s)
+            event['relative_offset_sec'] = total_offset_sec
+            event['target_time'] = now + timedelta(seconds=total_offset_sec)
         else:
             target_tod = time(h, m, s)
-            if days_val > 0:
-                event['target_time'] = datetime.combine(now.date() + timedelta(days=days_val), target_tod)
+            event['relative_offset_sec'] = None
+            target_dt = datetime.combine(now.date(), target_tod)
+            
+            if day_str == "Today":
+                pass
+            elif day_str == "Tomorrow":
+                target_dt += timedelta(days=1)
             else:
-                target_dt = datetime.combine(now.date(), target_tod)
-                if target_dt < now:
-                    target_dt += timedelta(days=1)
-                event['target_time'] = target_dt
+                day_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6}
+                target_weekday = day_map.get(day_str, now.weekday())
+                days_ahead = target_weekday - now.weekday()
+                if days_ahead < 0:
+                    days_ahead += 7
+                elif days_ahead == 0 and target_tod <= now.time():
+                    days_ahead += 7
+                target_dt += timedelta(days=days_ahead)
+                
+            event['target_time'] = target_dt
 
         self.scheduled_events.append(event)
         self.update_scheduler_table()
         # Reset input values
-        self.sched_time_edit.setText("00d 00:00:00")
+        if is_relative:
+            self.sched_timer_days.setValue(0)
+            self.sched_timer_time.setTime(QTime(0, 0, 0))
+
 
     def update_scheduler_table(self):
         # Sort events by target_time before display
@@ -2398,7 +2413,7 @@ class FEDTabWidget(QWidget):
         else:
             return
             
-        self.send_command_to_device(device, command, action_name)
+        self.send_command_to_device(device, command, action_name, confirm=confirm)
 
     def handle_fed_command(self, command):
         if not self.confirm_action_if_tracking(f"Are you sure you want to send command '{command}' to all devices?"):
@@ -2445,8 +2460,11 @@ class FEDTabWidget(QWidget):
         self._spinner_idx += 1
 
     def refresh_all_ports(self):
-        if hasattr(self, '_global_scanner') and self._global_scanner is not None and self._global_scanner.isRunning():
-            return
+        try:
+            if hasattr(self, '_global_scanner') and self._global_scanner is not None and self._global_scanner.isRunning():
+                return
+        except RuntimeError:
+            self._global_scanner = None
             
         # Start spinner animation
         self.refresh_ports_btn.setEnabled(False)
