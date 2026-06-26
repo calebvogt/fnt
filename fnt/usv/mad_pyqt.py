@@ -2099,6 +2099,25 @@ class MADSamPredictWorker(QThread):
             self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
 
 
+class MADTrainGraphDialog(QDialog):
+    """Non-modal window that hosts the live training graph so the spectrogram
+    stays usable during a run. Closing it while training is active defers to the
+    main window (keep running in the background vs stop)."""
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Segmentation Training")
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
+        self.resize(900, 600)
+
+    def closeEvent(self, event):
+        self._main._on_train_dialog_close(event)
+
+
 # ======================================================================
 # Main window
 # ======================================================================
@@ -2331,10 +2350,11 @@ class MADMainWindow(QMainWindow):
         )
         right_layout.addWidget(self.spectrogram, 1)
 
-        # Live training graph occupies the same area as the spectrogram while
-        # a run is active (hidden otherwise).
-        self.train_panel.setVisible(False)
-        right_layout.addWidget(self.train_panel, 1)
+        # The live training graph lives in its own floating window
+        # (_train_dialog) so the spectrogram stays visible/usable while a run is
+        # in progress — see _show_training_dialog. Not added to this layout.
+        self._train_dialog = None
+        self._training_active = False
 
         self.waveform_overview = WaveformOverviewWidget()
         self.waveform_overview.view_changed.connect(self._on_overview_clicked)
@@ -2738,8 +2758,7 @@ class MADMainWindow(QMainWindow):
         view_row.addWidget(QLabel("View:"))
         self.btn_view_cycle = QPushButton("Spec + Mask (V)")
         self.btn_view_cycle.setToolTip(
-            "Cycle the preview: Spec + Mask → Spec only → Mask only.\n"
-            "Shortcut: V")
+            "Toggle the preview: Spec + Mask ↔ Spec only.\nShortcut: V")
         self.btn_view_cycle.clicked.connect(self._shortcut_cycle_view)
         view_row.addWidget(self.btn_view_cycle)
         view_row.addStretch()
@@ -2811,8 +2830,9 @@ class MADMainWindow(QMainWindow):
         self.btn_quick_infer.setEnabled(has_model)
 
     def _set_view_mode(self, mode: str):
-        labels = {'overlay': 'Spec + Mask (V)', 'spec': 'Spec only (V)',
-                  'mask_only': 'Mask only (V)'}
+        if mode == 'mask_only':  # retired view — fall back to overlay
+            mode = 'overlay'
+        labels = {'overlay': 'Spec + Mask (V)', 'spec': 'Spec only (V)'}
         if hasattr(self, 'btn_view_cycle'):
             self.btn_view_cycle.setText(labels.get(mode, 'Spec + Mask (V)'))
         self.spectrogram.set_view_mode(mode)
@@ -3368,22 +3388,27 @@ class MADMainWindow(QMainWindow):
         self._snapshot_for_undo("Clear All")
 
         sg = self.spectrogram
-        keep, removed = [], 0
+        dropped, keep = [], []
         for ann in sg.annotations:
             st = ann.get('status')
             drop = ((st == 'prediction' and want_pending)
                     or (st == 'rejected' and want_rejected)
                     or (st in (None, 'accepted') and want_accepted))
-            if drop:
-                self._purge_review_annotation(ann)
-                removed += 1
-            else:
-                keep.append(ann)
+            (dropped if drop else keep).append(ann)
+        # Batch the persistence: ONE CSV write + ONE h5 open for all dropped
+        # predictions/rejects, instead of a full rewrite per item (was O(N²) and
+        # froze on thousands of detections). Training examples (accepted) are
+        # deleted by id — usually few.
+        self._batch_remove_pred_persistence(dropped)
+        for ann in dropped:
+            if ann.get('status') in (None, 'accepted'):
+                self._purge_training_example(ann)
+        removed = len(dropped)
         sg.annotations = keep
         sg._selected_ann_idx = None
         self._pred_review_idx = None
         self._file_count_cache = {}
-        sg._rebuild_confirmed_mask()
+        sg._rebuild_confirmed_mask()   # one rebuild for the whole operation
         sg.update()
         self._refresh_annotation_list()
         self._update_pred_review_widgets()
@@ -4626,6 +4651,10 @@ class MADMainWindow(QMainWindow):
     def _on_inline_train(self):
         if self._project is None:
             return
+        # Already training? The Train button doubles as "re-show the graph".
+        if self._training_active:
+            self._show_training_dialog()
+            return
         self._consolidate_sibling_examples()
         from fnt.usv.usv_detector.mad_examples import count_examples
         n_examples = count_examples(self._project.training_data_dir)
@@ -4655,8 +4684,12 @@ class MADMainWindow(QMainWindow):
         self._log(f"Train START — {n_examples} examples, arch="
                   f"{cfg.model_arch}, encoder={cfg.encoder_name}, "
                   f"epochs={cfg.n_epochs}, batch={cfg.batch_size}")
-        self.btn_train.setEnabled(False)
-        self._set_training_view(True)
+        # Keep the button enabled but repurposed to re-show the graph window,
+        # so a closed graph can be reopened while the run continues.
+        self._training_active = True
+        self.btn_train.setText("Training… (show graph)")
+        self._set_train_config_enabled(False)  # lock config while running
+        self._show_training_dialog()
         self.train_panel.start_run()
         self._start_training(cfg, post_inference_scope=post_scope,
                              reporter=self.train_panel)
@@ -4688,20 +4721,56 @@ class MADMainWindow(QMainWindow):
         if n:
             self._log(f"Consolidated {n} per-wav label(s) into project store")
 
-    def _set_training_view(self, active: bool):
-        """Swap the right-hand preview between the spectrogram and the live
-        training graph (mirrors Mask Tracker: the graph replaces the preview
-        while a run is active)."""
-        self.train_panel.setVisible(active)
-        for w in (self.spectrogram, self.waveform_overview,
-                  self._scroll_bar_row, self._controls_bar):
-            w.setVisible(not active)
+    def _show_training_dialog(self):
+        """Show (or re-show) the floating training-graph window. The spectrogram
+        in the main window stays fully visible/usable while a run is active."""
+        if self._train_dialog is None:
+            self._train_dialog = MADTrainGraphDialog(self)
+            lay = QVBoxLayout(self._train_dialog)
+            lay.setContentsMargins(6, 6, 6, 6)
+            self.train_panel.setParent(self._train_dialog)
+            self.train_panel.setVisible(True)
+            lay.addWidget(self.train_panel)
+        self._train_dialog.show()
+        self._train_dialog.raise_()
+        self._train_dialog.activateWindow()
 
+    def _on_train_dialog_close(self, event):
+        """Closing the training window mid-run: keep it in the background (just
+        hide) or stop the run — never silently kill a long run."""
+        if not self._training_active:
+            event.accept()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Training in progress")
+        box.setText("A training run is still in progress.")
+        box.setInformativeText("Keep it running in the background, or stop it?")
+        keep = box.addButton("Keep running", QMessageBox.AcceptRole)
+        stop = box.addButton("Stop training", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is cancel:
+            event.ignore()
+            return
+        if clicked is stop:
+            try:
+                self.train_panel._on_stop()
+            except Exception:
+                pass
+            event.accept()  # hides the window; the run winds down
+            return
+        # Keep running → just hide the window; reopen via the Train button.
+        event.accept()
+        self.status_bar.showMessage(
+            "Training continues in the background — click "
+            "'Training… (show graph)' to reopen the graph.")
+
+    # Kept as a no-op: the graph is now its own window, so there's nothing to
+    # swap back when the user clicks a file/detection or changes tabs.
     def _dismiss_training_view(self):
-        """Hide the training graph if it's still showing (user clicked a file
-        or detection after training finished)."""
-        if self.train_panel.isVisible():
-            self._set_training_view(False)
+        return
 
     def _clear_preview(self):
         """Blank the shared spectrogram/waveform canvas (no file shown) and
@@ -4720,7 +4789,13 @@ class MADMainWindow(QMainWindow):
         self._refresh_annotation_list()
 
     def _on_training_finished(self, ok: bool):
+        self._training_active = False
         self.btn_train.setEnabled(bool(self.audio_files))
+        self._set_train_config_enabled(True)   # unlock config controls
+        self._update_train_button_count()  # restore "Train (N accepted labels)"
+        if self._train_dialog is not None:
+            self._train_dialog.setWindowTitle(
+                "Segmentation Training — complete (close when ready)")
         self._refresh_quick_infer_models()
         if not ok or self._project is None:
             return
@@ -5609,8 +5684,8 @@ class MADMainWindow(QMainWindow):
     def _shortcut_cycle_view(self):
         if self._focus_is_edit():
             return
-        # Spec + Mask → Mask only → Spec only → repeat
-        order = ['overlay', 'mask_only', 'spec']
+        # Spec + Mask ↔ Spec only
+        order = ['overlay', 'spec']
         try:
             idx = order.index(self.spectrogram.view_mode)
         except ValueError:
@@ -6087,6 +6162,22 @@ class MADMainWindow(QMainWindow):
             if grp is not None:
                 grp.setEnabled(enabled)
 
+    def _set_train_config_enabled(self, enabled: bool):
+        """Enable/disable the training-config controls while a run is active, so
+        it's visually clear training is in progress. The Train button itself is
+        left enabled — during a run it doubles as 'show graph'."""
+        for name in ('combo_arch', 'combo_train_encoder', 'spin_train_epochs',
+                     'spin_train_patience', 'spin_train_batch', 'spin_train_lr',
+                     'spin_train_val', 'combo_train_device',
+                     'chk_post_inference', 'combo_post_scope'):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(enabled)
+        # The post-scope combo otherwise tracks its checkbox.
+        if enabled and hasattr(self, 'chk_post_inference'):
+            self.combo_post_scope.setEnabled(
+                self.chk_post_inference.isChecked())
+
     def _update_source_folders_label(self):
         cfg = self._project
         if cfg is None or not cfg.source_folders:
@@ -6303,10 +6394,53 @@ class MADMainWindow(QMainWindow):
         # No-op: confirmed calls persist as examples at confirm time.
         return
 
+    def _ask_class_for_confirm(self, n, classes, last):
+        """Class picker for confirming masks. Built so a SINGLE Enter accepts —
+        an editable QInputDialog combo eats the first Enter on Windows (the user
+        had to press Enter twice). Returns the class name, or None if cancelled."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Confirm calls")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(f"Class for {n} mask(s) (Enter to confirm):"))
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(classes)
+        combo.setCurrentIndex(classes.index(last) if last in classes else 0)
+        v.addWidget(combo)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = bb.button(QDialogButtonBox.Ok)
+        ok_btn.setText("Confirm")
+        ok_btn.setDefault(True)
+        ok_btn.setAutoDefault(True)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        # Pressing Return in the combo's line edit accepts the dialog directly,
+        # so one Enter confirms instead of two.
+        combo.lineEdit().returnPressed.connect(dlg.accept)
+        combo.setFocus()
+        combo.lineEdit().selectAll()
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return combo.currentText().strip() or None
+
+    def _refresh_pending_status(self):
+        """Show how many manually-drawn masks are awaiting confirmation."""
+        try:
+            n = len(self.spectrogram.pending_components())
+        except Exception:
+            n = 0
+        if n > 0:
+            self.lbl_mask_status.setText(
+                f"✎ {n} mask(s) drawn — press Enter to confirm")
+        else:
+            self.lbl_mask_status.setText(
+                "No pending masks — paint or SAM, then Enter to confirm")
+
     def _on_stroke_committed(self):
-        # A brush stroke just ended; nothing to persist until the user
-        # confirms the pending mask with Enter.
-        return
+        # A brush stroke just ended; nothing is persisted until the user
+        # confirms with Enter, but show how many masks are pending.
+        self._refresh_pending_status()
 
     # ==================================================================
     # Paint tools
@@ -6580,6 +6714,7 @@ class MADMainWindow(QMainWindow):
         if self.spectrogram.paint_mode == 'sam' and mask is not None:
             added = self.spectrogram.add_sam_component(mask, t_off)
         if added:
+            self._refresh_pending_status()
             self.status_bar.showMessage(
                 "Mask added (yellow) — keep clicking, then Enter to assign a class")
         else:
@@ -6613,14 +6748,9 @@ class MADMainWindow(QMainWindow):
             last = self._session_last_class or classes[0]
         if last not in classes:
             classes = [last] + classes
-        name, ok = QInputDialog.getItem(
-            self, "Confirm calls",
-            f"Class for {len(comps)} mask(s) (Enter to reuse):",
-            classes, classes.index(last), True,
-        )
-        if not ok or not name.strip():
+        name = self._ask_class_for_confirm(len(comps), classes, last)
+        if not name:
             return
-        name = name.strip()
         if self._project is not None:
             if name not in self._project.classes:
                 self._project.classes.append(name)
@@ -6919,7 +7049,7 @@ class MADMainWindow(QMainWindow):
     def _undo_last(self):
         sg = self.spectrogram
         if sg.undo_pending():
-            self.status_bar.showMessage("Removed last pending mask")
+            self._refresh_pending_status()
             self._log("Undo: removed last pending mask")
             return
         if sg.annotations:
@@ -7563,8 +7693,16 @@ class MADMainWindow(QMainWindow):
             f"Training U-Net ({cfg.encoder_name}, up to {cfg.n_epochs} epochs, "
             f"patience={cfg.early_stop_patience})…"
         )
-        progress.append(f"Run dir: {cfg.resolve_run_dir()}")
-        progress.append(f"Files: {len(cfg.wav_paths)} labeled wav(s)")
+        # Report the actual training-set size (accepted labels) — training reads
+        # the consolidated example store, not cfg.wav_paths, so don't print the
+        # misleading "0 labeled wav(s)" / "n=0".
+        try:
+            from fnt.usv.usv_detector.mad_examples import count_examples
+            n_labels = count_examples(cfg.training_data_dir)
+        except Exception:
+            n_labels = 0
+        progress.append(f"Models dir: {os.path.dirname(cfg.resolve_run_dir())}")
+        progress.append(f"Training on {n_labels} accepted label(s)")
 
         worker = MADTrainingWorker(cfg, parent=self)
 
