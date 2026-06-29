@@ -17,7 +17,7 @@ The easiest way to use FieldNeuroethologyToolbox is by downloading the pre-built
 
 **Requirements for the Executable:**
 
-- **ffmpeg**: Must be installed and added to your system PATH for video processing features to work.
+- **ffmpeg**: Must be installed and added to your system PATH for video processing features to work. For windows, see here: https://www.youtube.com/watch?v=6sim9aF3g2c
 
 1. Navigate to the [Releases](https://github.com/calebvogt/fnt/releases) page on the GitHub repository.
 2. Download the latest release `.zip` or `.tar.gz` for your operating system (Windows, macOS, or Linux).
