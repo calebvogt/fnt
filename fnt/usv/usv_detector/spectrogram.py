@@ -6,6 +6,7 @@ optimized for ultrasonic vocalization detection.
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import numpy as np
@@ -35,19 +36,33 @@ def load_audio(filepath: str, target_sr: Optional[int] = None) -> Tuple[np.ndarr
         Tuple of (audio_data, sample_rate)
         audio_data is a 1D numpy array of float32 samples
     """
+    # Distinguish "file genuinely missing/unreachable" (e.g. a network share
+    # that dropped) from "file present but undecodable" up front, so the two
+    # never get conflated into the same cryptic message.
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(
+            f"Audio file not found or not accessible: {filepath}\n"
+            "If this is on a network/mapped drive, confirm the drive is "
+            "connected and the file finished syncing."
+        )
+
     audio = None
     sr = None
+    sf_error = None
 
     # Try soundfile first (fastest, handles most formats)
     if HAS_SOUNDFILE:
         try:
             audio, sr = sf.read(filepath, dtype='float32')
-        except Exception:
-            pass  # Fall through to ffmpeg
+        except Exception as e:
+            # Keep the real reason — soundfile couldn't decode this file
+            # (e.g. ADPCM). We fall back to ffmpeg, but if that's missing we
+            # want to surface why soundfile failed rather than swallow it.
+            sf_error = e
 
     # Fallback to ffmpeg for ADPCM and other formats
     if audio is None:
-        audio, sr = _load_with_ffmpeg(filepath)
+        audio, sr = _load_with_ffmpeg(filepath, sf_error=sf_error)
 
     # Convert to mono if stereo
     if audio.ndim > 1:
@@ -61,19 +76,40 @@ def load_audio(filepath: str, target_sr: Optional[int] = None) -> Tuple[np.ndarr
     return audio, sr
 
 
-def _load_with_ffmpeg(filepath: str) -> Tuple[np.ndarray, int]:
+def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tuple[np.ndarray, int]:
     """
     Load audio using ffmpeg (handles ADPCM and other exotic formats).
 
     Args:
         filepath: Path to audio file
+        sf_error: The exception soundfile raised (if any) before falling back,
+            included in error messages so a missing ffmpeg doesn't mask why
+            soundfile couldn't read the file in the first place.
 
     Returns:
         Tuple of (audio_data, sample_rate)
     """
+    # ffmpeg is a manual prerequisite (system PATH), not a pip/conda dependency
+    # of FNT. If it's absent, subprocess raises a bare FileNotFoundError /
+    # "[WinError 2] The system cannot find the file specified" that looks like
+    # the *audio* file is missing. Detect the missing tool first and say so.
+    ffprobe_exe = shutil.which('ffprobe')
+    ffmpeg_exe = shutil.which('ffmpeg')
+    if ffprobe_exe is None or ffmpeg_exe is None:
+        msg = (
+            "Could not read this audio file with soundfile, and ffmpeg is not "
+            "installed / not on PATH, so the fallback decoder is unavailable.\n"
+            "Install ffmpeg and restart the app, e.g.:\n"
+            "  conda install -c conda-forge ffmpeg   (in the fnt environment)\n"
+            "  winget install Gyan.FFmpeg            (system-wide on Windows)"
+        )
+        if sf_error is not None:
+            msg += f"\n\n(soundfile could not decode it: {sf_error})"
+        raise RuntimeError(msg)
+
     # First, get the sample rate from the input file
     probe_cmd = [
-        'ffprobe',
+        ffprobe_exe,
         '-v', 'error',
         '-select_streams', 'a:0',
         '-show_entries', 'stream=sample_rate',
@@ -84,8 +120,17 @@ def _load_with_ffmpeg(filepath: str) -> Tuple[np.ndarray, int]:
     try:
         result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
         sr = int(result.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError) as e:
-        raise RuntimeError(f"Failed to probe audio file: {e}")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or '').strip()
+        raise RuntimeError(
+            f"ffprobe could not read {os.path.basename(filepath)}"
+            + (f": {stderr}" if stderr else "")
+        )
+    except ValueError:
+        raise RuntimeError(
+            f"ffprobe returned no sample rate for {os.path.basename(filepath)} "
+            "— the file may be corrupt or not an audio file."
+        )
 
     # Convert to raw PCM float32 using ffmpeg
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp_file:
@@ -94,7 +139,7 @@ def _load_with_ffmpeg(filepath: str) -> Tuple[np.ndarray, int]:
     try:
         # Convert to raw 32-bit float PCM
         convert_cmd = [
-            'ffmpeg',
+            ffmpeg_exe,
             '-i', filepath,
             '-f', 'f32le',          # 32-bit float, little-endian
             '-acodec', 'pcm_f32le',

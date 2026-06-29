@@ -35,7 +35,7 @@ If you intend to modify the code or prefer managing your own Python environment,
 
 - **Git** — must be available on the command line (on your system PATH). Installing **GitHub Desktop alone is not sufficient**, because it bundles its own git that is not exposed to the terminal. The easiest fix is to install git into the conda environment with `conda install git` (included in the steps below).
 - Anaconda or Miniconda
-- ffmpeg (installed and added to your system PATH)
+- ffmpeg — required for audio/video processing (used by USV and video tools). The steps below install it into the conda environment with `conda install -c conda-forge ffmpeg`, which also puts it on the PATH whenever the `fnt` environment is active. ffmpeg is **not** a pip dependency, so `pip install -e .` alone does not provide it.
 - Package dependencies are listed in `pyproject.toml`
 
 ### Windows Installation
@@ -47,9 +47,12 @@ git clone https://github.com/calebvogt/fnt.git
 conda create --name fnt python=3.13
 conda activate fnt
 conda install git -y
+conda install -c conda-forge ffmpeg -y
 cd path\to\fnt
 pip install -e .
 ```
+
+> **Note:** `conda install -c conda-forge ffmpeg` installs both `ffmpeg` and `ffprobe` into the environment. Audio loading for the USV tools (including the MAD detector) and the video-processing tools rely on these. If they are missing you will see errors such as `[WinError 2] The system cannot find the file specified` when opening certain audio/video files.
 
 > **Note:** `conda install git` ensures a command-line git is available inside the environment. This is required because one dependency (SAM2) is installed directly from GitHub and pip needs `git` on the PATH to clone it. If git is missing you will see `ERROR: Cannot find command 'git'` during install.
 
@@ -81,6 +84,7 @@ git clone https://github.com/calebvogt/fnt.git
 conda create --name fnt python=3.13
 conda activate fnt
 conda install git -y
+conda install -c conda-forge ffmpeg -y
 cd path/to/fnt
 pip install -e .
 ```
