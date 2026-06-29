@@ -1,6 +1,6 @@
 [![build](https://github.com/calebvogt/fnt/actions/workflows/build.yml/badge.svg)](https://github.com/calebvogt/fnt/actions/workflows/build.yml)
 
-# FieldNeuroethologyToolbox (fnt)
+# Field Neuroethology Toolbox (fnt)
 
 Preprocessing and analysis toolbox for field and laboratory neurobehavioral data. This software is fully open source and made available freely to the research/hobbyist community. The software is released "as-is", and will continue to be updated as our own research needs evolve. Please open an issue for bugs or for feature requests! Thanks for checking us out! 
 
