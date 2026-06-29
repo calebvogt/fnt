@@ -203,6 +203,7 @@ def extract_blobs(
     prob_mask: np.ndarray, threshold: float,
     min_blob_pixels: int = 8,
     include_mask: bool = False,
+    spec: Optional[np.ndarray] = None,
 ) -> List[Dict]:
     """Return connected-component blobs from a thresholded prob mask.
 
@@ -251,7 +252,9 @@ def extract_blobs(
             'area_pixels': area,
             'score': score,
         }
-        if include_mask:
+        # Keep the bbox mask so blobs_to_rows can compute the metric set (it
+        # also has the full spectrogram for per-frame spectral features).
+        if include_mask or spec is not None:
             blob['mask'] = np.ascontiguousarray(sub_mask)
         blobs.append(blob)
     # Sort by time.
@@ -270,55 +273,328 @@ def _freq_per_bin(nfft: int, sr: int) -> float:
     return (sr / 2.0) / (nfft // 2)
 
 
+# Adjacent-frame frequency change above this counts as a "jump" (step call).
+_FREQ_JUMP_HZ = 5000.0
+
+# Per-call metric columns computed by ``compute_call_metrics`` — shared by the
+# prediction (blobs_to_rows) and hand-label (GUI) paths so both row types are
+# directly comparable. (call_number, inter_call_interval_ms, call_rate_hz are
+# derived across calls at CSV-write time; model_name/threshold/min_blob_pixels
+# are provenance set by the caller.)
+CALL_METRIC_KEYS = [
+    'peak_freq_hz', 'freq_bandwidth_hz',
+    'start_freq_hz', 'end_freq_hz', 'mean_freq_hz', 'freq_std_hz',
+    'freq_slope_hz_per_s', 'freq_excursion_hz', 'num_freq_jumps', 'sinuosity',
+    'spectral_centroid_hz', 'spectral_entropy', 'tonality',
+    'max_power_db', 'mean_power_db', 'total_energy_db', 'snr_db',
+    'peak_time_frac', 'amplitude_modulation', 'fill_ratio', 'aspect_ratio',
+]
+
+
+# ±N frequency bins around the per-frame peak counted as "tonal" (CAD parity).
+_TONALITY_HALF_BINS = 2
+
+
+def compute_call_metrics(
+    spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
+    df: float, dt: float, db_min: float, db_max: float,
+) -> Dict:
+    """Quantify one call.
+
+    ``spec_db_cols`` is the **full-frequency** spectrogram (dB) for the call's
+    time columns, shape ``(F_full, W)``; ``mask`` is the call's bounding-box
+    pixel mask, shape ``(H, W)``; ``f_low`` is the global frequency-bin index of
+    the mask's top row (so the band crop is ``spec_db_cols[f_low:f_low+H]``).
+    dB is clipped to [db_min, db_max] so predictions (clipped spec) and
+    hand-labels (raw dB) compute on the same scale. Per-frame spectral entropy
+    and tonality use the full column (matching CAD's `dsp_detector`). Returns a
+    dict keyed by :data:`CALL_METRIC_KEYS`; degenerate metrics are omitted.
+    """
+    m: Dict = {}
+    if mask is None or mask.size == 0 or not mask.any():
+        return m
+    H, W = mask.shape
+    full = np.clip(np.asarray(spec_db_cols, dtype=np.float64), db_min, db_max)
+    F_full = full.shape[0]
+    f_hi = f_low + H
+    if f_hi > F_full or full.shape[1] != W:
+        return m
+    bb = full[f_low:f_hi, :]                  # call-band crop (H, W), dB
+    Pbb = np.power(10.0, bb / 10.0)           # linear power in the band
+    ys, xs = np.where(mask)
+    vals_db = bb[mask]
+
+    # --- power / energy (over the call's pixels) ---
+    m['max_power_db'] = round(float(vals_db.max()), 2)
+    m['mean_power_db'] = round(float(vals_db.mean()), 2)
+    m['total_energy_db'] = round(float(10.0 * np.log10(Pbb[mask].sum() + 1e-12)), 2)
+    peak_pix = int(np.argmax(vals_db))        # loudest call pixel → peak freq
+    m['peak_freq_hz'] = round(float((f_low + ys[peak_pix]) * df), 2)
+
+    # --- frequency contour: peak-power freq per masked time column ---
+    cols, cfreq = [], []
+    for t in range(W):
+        rows_t = np.where(mask[:, t])[0]
+        if rows_t.size == 0:
+            continue
+        peak_row = rows_t[int(np.argmax(bb[rows_t, t]))]
+        cols.append(t)
+        cfreq.append((f_low + peak_row) * df)
+    if cfreq:
+        cols_a = np.asarray(cols, dtype=np.float64)
+        cf = np.asarray(cfreq, dtype=np.float64)
+        m['start_freq_hz'] = round(float(cf[0]), 2)
+        m['end_freq_hz'] = round(float(cf[-1]), 2)
+        m['mean_freq_hz'] = round(float(cf.mean()), 2)
+        m['freq_std_hz'] = round(float(cf.std()), 2)
+        t_s = cols_a * dt
+        if cf.size >= 2 and np.ptp(t_s) > 0:
+            slope = float(np.polyfit(t_s, cf, 1)[0])
+        else:
+            slope = 0.0
+        m['freq_slope_hz_per_s'] = round(slope, 2)
+        dcf = np.abs(np.diff(cf))
+        m['freq_excursion_hz'] = round(float(dcf.sum()), 2)
+        m['num_freq_jumps'] = int((dcf > _FREQ_JUMP_HZ).sum())
+        # sinuosity: contour path length / chord length, in (frame, bin) space
+        fb = cf / df
+        seg = np.hypot(np.diff(cols_a), np.diff(fb))
+        chord = float(np.hypot(cols_a[-1] - cols_a[0], fb[-1] - fb[0]))
+        m['sinuosity'] = round(float(seg.sum()) / chord, 3) if chord > 1e-6 else 1.0
+
+    # --- frequency bandwidth from mask extent ---
+    m['freq_bandwidth_hz'] = round(float((ys.max() - ys.min() + 1) * df), 2)
+
+    # --- spectral centroid: power-weighted mean freq over the call's pixels ---
+    Pm = np.where(mask, Pbb, 0.0)
+    row_power = Pm.sum(axis=1)                 # power per band freq bin (masked)
+    tot = float(row_power.sum())
+    if tot > 0:
+        freqs = (f_low + np.arange(H)) * df
+        m['spectral_centroid_hz'] = round(float((freqs * row_power).sum() / tot), 2)
+
+    # --- per-frame spectral entropy + tonality over the FULL column (CAD) ---
+    Pfull = np.power(10.0, full / 10.0)
+    max_ent = np.log2(F_full) if F_full > 1 else 1.0
+    ton = np.zeros(W)
+    ent = np.zeros(W)
+    half = _TONALITY_HALF_BINS
+    for t in range(W):
+        col = Pfull[:, t]
+        s = float(col.sum())
+        if s <= 0:
+            ent[t] = 1.0       # empty column → maximally "noisy"
+            continue
+        pk = int(np.argmax(col))
+        lo, hi = max(0, pk - half), min(F_full, pk + half + 1)
+        ton[t] = float(col[lo:hi].sum()) / s
+        p = col / s
+        p = p[p > 0]
+        ent[t] = float(-(p * np.log2(p)).sum()) / max_ent
+    m['tonality'] = round(float(ton.mean()), 4)
+    m['spectral_entropy'] = round(float(ent.mean()), 4)
+
+    # --- amplitude envelope over time (masked band energy per frame) ---
+    col_energy = Pm.sum(axis=0)
+    if W > 1:
+        m['peak_time_frac'] = round(int(np.argmax(col_energy)) / float(W - 1), 3)
+    env = col_energy[col_energy > 0]
+    if env.size:
+        emax, emin = float(env.max()), float(env.min())
+        denom = emax + emin
+        m['amplitude_modulation'] = round((emax - emin) / denom, 3) if denom > 0 else 0.0
+
+    # --- morphology ---
+    area = int(mask.sum())
+    m['fill_ratio'] = round(area / float(H * W), 3) if H * W else 0.0
+    m['aspect_ratio'] = round(W / float(H), 3) if H else 0.0
+
+    # --- SNR: peak call power minus the local noise floor (CAD: max − floor).
+    # Floor = median dB of the out-of-band rows at the call's time columns (the
+    # background spectrum flanking the call), always available; fall back to the
+    # off-mask pixels inside the bbox if the call spans the whole band. ---
+    band = np.zeros(F_full, dtype=bool)
+    band[f_low:f_hi] = True
+    if (~band).any():
+        noise = float(np.median(full[~band, :]))
+    else:
+        off = ~mask
+        noise = float(np.median(bb[off])) if off.any() else db_min
+    m['snr_db'] = round(float(m['max_power_db'] - noise), 2)
+    return m
+
+
 def blobs_to_rows(
     blobs: List[Dict], nperseg: int, noverlap: int, nfft: int, sr: int,
+    db_min: Optional[float] = None, db_max: Optional[float] = None,
+    spec: Optional[np.ndarray] = None,
 ) -> List[Dict]:
-    """Convert pixel-index blobs to second / Hz rows for CSV output."""
+    """Convert pixel-index blobs to second / Hz rows for CSV output. When the
+    (normalized) full ``spec`` + db range are supplied, attach the full per-call
+    metric set via :func:`compute_call_metrics`."""
     dt = _time_per_frame(nperseg, noverlap, sr)
     df = _freq_per_bin(nfft, sr)
+    span = (float(db_max) - float(db_min)
+            if db_min is not None and db_max is not None else None)
     rows: List[Dict] = []
     for i, b in enumerate(blobs):
-        rows.append({
+        min_f = round(b['f_low'] * df, 2)
+        max_f = round(b['f_high_exclusive'] * df, 2)
+        row = {
             'blob_id': i,
+            'class': '',
             'start_s': round(b['t_start'] * dt, 6),
             'stop_s': round(b['t_end_exclusive'] * dt, 6),
-            'min_freq_hz': round(b['f_low'] * df, 2),
-            'max_freq_hz': round(b['f_high_exclusive'] * df, 2),
+            'min_freq_hz': min_f,
+            'max_freq_hz': max_f,
+            'freq_bandwidth_hz': round(max_f - min_f, 2),
             'area_pixels': b['area_pixels'],
             'score': round(b['score'], 4),
             'status': 'pending',  # for user review (accept / reject)
-        })
+            'source': 'prediction',
+        }
+        if (spec is not None and b.get('mask') is not None and span is not None):
+            # Full-frequency dB columns for this call's time span.
+            cols_db = spec[:, b['t_start']:b['t_end_exclusive']] * span + db_min
+            row.update(compute_call_metrics(
+                cols_db, b['mask'], b['f_low'], df, dt, db_min, db_max))
+        rows.append(row)
     return rows
 
 
+# Unified per-wav detections CSV — column names/order mirror CAD's
+# ``_FNT_CAD_detections.csv`` so the two tools' outputs are cross-readable.
+# CAD-shared: call_number, call_id, start_seconds, stop_seconds, duration_ms,
+# min/max/peak_freq_hz, freq_bandwidth_hz, max/mean_power_db, status, source.
+# MAD-specific extras: class (call type), score (mean prob), area_pixels.
+# (Internally rows use blob_id/start_s/stop_s keys; this layer translates.)
+# Columns carried verbatim (key == column name) beyond the CAD-shared core.
+_EXTRA_COLS = [
+    'inter_call_interval_ms', 'call_rate_hz',
+    'start_freq_hz', 'end_freq_hz', 'mean_freq_hz', 'freq_std_hz',
+    'freq_slope_hz_per_s', 'freq_excursion_hz', 'num_freq_jumps', 'sinuosity',
+    'spectral_centroid_hz', 'spectral_entropy', 'tonality',
+    'total_energy_db', 'snr_db', 'peak_time_frac', 'amplitude_modulation',
+    'fill_ratio', 'aspect_ratio',
+    'model_name', 'threshold', 'min_blob_pixels',
+]
+
+# CAD-shared core (first 16, matching _FNT_CAD_detections.csv naming/order) +
+# MAD-specific quantification columns appended.
+CSV_FIELDNAMES = [
+    'call_number', 'call_id', 'start_seconds', 'stop_seconds', 'duration_ms',
+    'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
+    'max_power_db', 'mean_power_db', 'class', 'score', 'area_pixels',
+    'status', 'source',
+] + _EXTRA_COLS
+
+# Local-window half-width (seconds) for the call_rate_hz density estimate.
+_CALL_RATE_WINDOW_S = 0.5
+
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None or v == '':
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_blob_id(v):
+    """Call ids are ints for predictions but stable strings for hand-labels."""
+    s = str(v).strip()
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return s
+
+
 def write_blob_csv(path: str, rows: List[Dict]) -> None:
-    fieldnames = [
-        'blob_id', 'start_s', 'stop_s',
-        'min_freq_hz', 'max_freq_hz',
-        'area_pixels', 'score', 'status',
-    ]
+    """Write the unified detections CSV from internal row dicts (keys:
+    blob_id, class, start_s, stop_s, min/max_freq_hz, area_pixels, score,
+    status, and optionally peak_freq_hz/freq_bandwidth_hz/max_power_db/
+    mean_power_db/source). call_number is (re)assigned by time order;
+    duration/bandwidth are derived if absent."""
+    ordered = sorted(
+        enumerate(rows), key=lambda kv: (_safe_float(kv[1].get('start_s')), kv[0]))
+    starts = [_safe_float(r.get('start_s')) for _, r in ordered]
+    stops = [_safe_float(r.get('stop_s')) for _, r in ordered]
     with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES,
+                                extrasaction='ignore')
         writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
+        for n, (_, r) in enumerate(ordered, start=1):
+            start, stop = starts[n - 1], stops[n - 1]
+            minf = _safe_float(r.get('min_freq_hz'))
+            maxf = _safe_float(r.get('max_freq_hz'))
+            bw = r.get('freq_bandwidth_hz')
+            bw = round(maxf - minf, 2) if bw in (None, '') else bw
+            # Cross-call: gap to previous offset, and local emission rate.
+            ici = '' if n == 1 else round((start - stops[n - 2]) * 1000.0, 2)
+            lo, hi = start - _CALL_RATE_WINDOW_S, start + _CALL_RATE_WINDOW_S
+            rate = round(sum(1 for s in starts if lo <= s <= hi)
+                         / (2.0 * _CALL_RATE_WINDOW_S), 2)
+            out = {
+                'call_number': n,
+                'call_id': r.get('blob_id'),
+                'start_seconds': start,
+                'stop_seconds': stop,
+                'duration_ms': round((stop - start) * 1000.0, 2),
+                'min_freq_hz': minf,
+                'max_freq_hz': maxf,
+                'peak_freq_hz': r.get('peak_freq_hz', ''),
+                'freq_bandwidth_hz': bw,
+                'max_power_db': r.get('max_power_db', ''),
+                'mean_power_db': r.get('mean_power_db', ''),
+                'class': r.get('class', '') or '',
+                'score': r.get('score', ''),
+                'area_pixels': r.get('area_pixels', ''),
+                'status': r.get('status', 'pending') or 'pending',
+                'source': r.get('source', '') or '',
+            }
+            for col in _EXTRA_COLS:
+                out[col] = r.get(col, '')
+            out['inter_call_interval_ms'] = ici
+            out['call_rate_hz'] = rate
+            writer.writerow(out)
 
 
 def read_blob_csv(path: str) -> List[Dict]:
+    """Read the unified CSV into internal row dicts. Tolerant of the legacy
+    column names (blob_id/start_s/stop_s) and of missing optional columns."""
     rows: List[Dict] = []
     with open(path, 'r', newline='') as f:
         reader = csv.DictReader(f)
         for r in reader:
-            rows.append({
-                'blob_id': int(r['blob_id']),
-                'start_s': float(r['start_s']),
-                'stop_s': float(r['stop_s']),
-                'min_freq_hz': float(r['min_freq_hz']),
-                'max_freq_hz': float(r['max_freq_hz']),
-                'area_pixels': int(r['area_pixels']),
-                'score': float(r['score']),
-                'status': r.get('status', 'pending') or 'pending',
-            })
+            def g(*keys, default=None):
+                for k in keys:
+                    v = r.get(k)
+                    if v not in (None, ''):
+                        return v
+                return default
+            row = {
+                'blob_id': _coerce_blob_id(g('call_id', 'blob_id')),
+                'class': (g('class', default='') or '').strip(),
+                'start_s': _safe_float(g('start_seconds', 'start_s')),
+                'stop_s': _safe_float(g('stop_seconds', 'stop_s')),
+                'min_freq_hz': _safe_float(g('min_freq_hz')),
+                'max_freq_hz': _safe_float(g('max_freq_hz')),
+                'area_pixels': int(_safe_float(g('area_pixels'))),
+                'score': _safe_float(g('score')),
+                'status': g('status', default='pending') or 'pending',
+                'source': g('source', default='') or '',
+                'peak_freq_hz': g('peak_freq_hz', default=''),
+                'max_power_db': g('max_power_db', default=''),
+                'mean_power_db': g('mean_power_db', default=''),
+            }
+            # Carry the appended quantification/provenance columns through
+            # verbatim, so a read-modify-write (e.g. status change) preserves
+            # them. inter_call_interval_ms / call_rate_hz are recomputed on
+            # write, so they needn't round-trip.
+            for col in _EXTRA_COLS:
+                row[col] = g(col, default='')
+            rows.append(row)
     return rows
 
 
@@ -401,12 +677,30 @@ def run_inference_on_file(
         progress('blobs', 0, 1)
     _t_blob0 = _time.perf_counter()
     blobs = extract_blobs(prob, threshold=cfg.threshold,
-                          min_blob_pixels=cfg.min_blob_pixels, include_mask=True)
-    rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft, sr=sr)
+                          min_blob_pixels=cfg.min_blob_pixels, include_mask=True,
+                          spec=spec)
+    rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+                         sr=sr, db_min=db_min, db_max=db_max, spec=spec)
+    # Provenance: which model + settings produced these predictions.
+    model_name = Path(cfg.model_path).stem if cfg.model_path else ''
+    for r in rows:
+        r['model_name'] = model_name
+        r['threshold'] = cfg.threshold
+        r['min_blob_pixels'] = cfg.min_blob_pixels
 
     csv_path = pred_csv_sibling_path(wav_path)
     if cfg.save_blob_csv:
-        write_blob_csv(csv_path, rows)
+        # The CSV is unified: hand-labels (stable string blob_ids) live here
+        # alongside predictions (int blob_ids). A run replaces only the
+        # prediction rows; existing hand-label rows are preserved.
+        preserved = []
+        if Path(csv_path).is_file():
+            try:
+                preserved = [r for r in read_blob_csv(csv_path)
+                             if not isinstance(r.get('blob_id'), int)]
+            except Exception:
+                preserved = []
+        write_blob_csv(csv_path, preserved + rows)
     # Persist each blob's small cropped mask (NOT the multi-GB /prob grid):
     # blob_id matches the CSV row's blob_id (both come from enumerate over the
     # same time-sorted blob list). On file switch these few-MB crops are read

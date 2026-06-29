@@ -50,25 +50,100 @@ The **CSV is canonical** for tabular output. Pixel data lives in HDF5 siblings.
 
 Per recording `<wav>`:
 
-- `<wav>_FNT_MAD_predictions.csv` — one row per predicted call: box (start/stop
-  s, min/max Hz), area, **score**, and review **status**:
-  - `pending` — not yet reviewed (shown yellow).
-  - `accepted` — confirmed by the user; in train mode also saved as a training
-    example (shown blue / removed from the pending queue).
-  - `rejected` — a **recorded** human "no": kept visible shaded **red** and
-    labeled "Reject" as an audit trail of what the labeler dismissed and why
-    (informs a later user of the accept criteria). Rejected masks are *not* used
-    as explicit negative training data — training only consumes accepted
-    examples — but the record is valuable for reproducibility.
-  - **Delete** removes a detection entirely and leaves no trace — its CSV row
-    and stored crop are both dropped (no `deleted` status is written). Use
-    Delete for genuine noise you don't want recorded; use Reject to record a
-    decision.
+- `<wav>_FNT_MAD_predictions.csv` — the **unified table of every call** on the
+  file: hand-labels **and** model predictions, one row each. The first 16 columns
+  mirror CAD's `_FNT_CAD_detections.csv` (so the two tools are cross-readable);
+  the rest are MAD's richer per-call quantification. CAD's harmonic columns and
+  `dsp_params_json` are omitted (MAD has no harmonic linker and trains a model).
+
+  Every metric is computed by **one shared function** (`compute_call_metrics`)
+  for both predictions (over the blob) and hand-labels (over the painted mask),
+  so the two row types are directly comparable. Power/contour stats read the
+  spectrogram dB, clipped to the project's `db_min…db_max`.
+
+  **Identity & review**
+  - `call_number` — 1…N display index, renumbered by onset time on every write.
+  - `call_id` — stable join key to the h5 mask (int for predictions, string id
+    for hand-labels).
+  - `status` — `pending` (yellow, unreviewed) · `accepted` (green; hand-labels
+    write accepted, and accepting a prediction in train mode also saves a
+    training example) · `rejected` (a **recorded** human "no", kept visible red
+    as an audit trail; *not* used as negative training data). **Delete** drops
+    the row + mask entirely (no `deleted` status).
+  - `source` — `prediction` or `label`.
+  - `class` — call type (e.g. `USV`); `score` — mean model probability (`1.0`
+    for hand-labels). Inference preserves existing label rows and replaces only
+    the prediction rows.
+
+  **Time / sequence**
+  - `start_seconds`, `stop_seconds`, `duration_ms` — call onset, offset, length.
+  - `inter_call_interval_ms` — gap from the previous call's offset (blank for the
+    first); the basis for bout/sequence analysis.
+  - `call_rate_hz` — local emission rate: calls whose onset falls within ±0.5 s
+    of this one, per second.
+
+  **Frequency box & contour** (the contour is the peak-power frequency traced
+  across each time column inside the mask)
+  - `min_freq_hz`, `max_freq_hz` — frequency extent of the mask.
+  - `peak_freq_hz` — frequency of the single loudest pixel.
+  - `freq_bandwidth_hz` — `max − min`.
+  - `start_freq_hz`, `end_freq_hz` — contour frequency at onset / offset
+    (up-sweep vs down-sweep).
+  - `mean_freq_hz`, `freq_std_hz` — mean and spread of the contour.
+  - `freq_slope_hz_per_s` — net df/dt (least-squares fit); sweep direction/steep.
+  - `freq_excursion_hz` — total frequency distance the contour travels
+    (Σ|Δf|); separates simple tones from heavily modulated calls.
+  - `num_freq_jumps` — count of abrupt frequency steps (adjacent-frame |Δf| >
+    5 kHz); flags "step"/multi-component calls.
+  - `sinuosity` — contour path length ÷ straight-line length (1.0 = straight);
+    a wiggliness index for trills/complex calls.
+
+  **Spectral shape / purity** — both computed **per time frame then averaged**
+  over the full-frequency column (matching CAD's `dsp_detector`, so they're
+  correct for frequency-modulated calls — a clean sweep reads as tonal, not
+  noisy).
+  - `spectral_centroid_hz` — intensity-weighted mean frequency over the call's
+    pixels (energy "center of mass"; note this equals CAD's `mean_freq_hz`,
+    whereas MAD's `mean_freq_hz` above is the contour mean — a naming nuance).
+  - `spectral_entropy` — mean over frames of the Shannon entropy of each full
+    frequency column's normalized power, ÷ log2(n_freq_bins); 0 = pure tone,
+    1 = uniform/noisy.
+  - `tonality` — mean over frames of the fraction of column energy within ±2
+    bins of that frame's peak; →1 = pure tone, →0 = broadband. Good for
+    rejecting non-USV noise.
+
+  **Amplitude / quality** — power columns are read off the spectrogram **clipped
+  to the project's `db_min…db_max`** (predictions can't exceed the model's
+  normalized range), so a call saturating `db_max` reads as `db_max`; raise
+  `db_max` if your calls are louder.
+  - `max_power_db`, `mean_power_db` — loudest and mean dB over the call's pixels.
+  - `total_energy_db` — summed power (dB) over the mask.
+  - `snr_db` — `max_power_db` minus the local noise floor (median dB of the
+    out-of-band rows at the call's time columns; CAD-style max − floor). A
+    model-independent quality measure — good for filtering weak/false
+    detections.
+  - `peak_time_frac` — where the energy envelope peaks, 0–1 across the call
+    (onset-loud vs offset-loud).
+  - `amplitude_modulation` — envelope contrast `(max−min)/(max+min)` over the
+    per-frame energy; 0 = flat, →1 = high contrast. A modulation-*depth* proxy
+    (it does not measure modulation *rate*, and a single onset/offset ramp also
+    raises it).
+
+  **Morphology**
+  - `area_pixels` — number of mask pixels (segmentation's "size").
+  - `fill_ratio` — `area_pixels ÷ bounding-box area`; thin tonal calls fill
+    little, broadband smears fill a lot.
+  - `aspect_ratio` — bbox time-frames ÷ freq-bins (long-thin vs short-tall).
+
+  **Provenance** (predictions only; blank for hand-labels)
+  - `model_name` — checkpoint that produced the prediction.
+  - `threshold`, `min_blob_pixels` — the inference settings used.
 - `<wav>_FNT_masks.h5` — pixel data:
-  - `/calls/<id>` — confirmed (human-labeled) call mask crops.
+  - `/calls/<id>` — confirmed (human-labeled) call mask crops. Joined to the CSV
+    by `call_id`.
   - `/pred_calls/<blob_id>` — **predicted call mask crops** (small,
     gzip-compressed uint8, with `f_off`/`t_off` offsets). Joined to the CSV by
-    `blob_id`.
+    `call_id` (= the prediction's integer blob id).
   - root attr `n_pred_blobs` — cached prediction count, so file lists show
     counts without reading any pixel data.
 
