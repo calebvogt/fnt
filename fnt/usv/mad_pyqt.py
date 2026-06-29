@@ -5670,40 +5670,39 @@ class MADMainWindow(QMainWindow):
         self.act_close_project.setEnabled(False)
         file_menu.addAction(self.act_close_project)
 
-        labels_menu = menubar.addMenu("&Labels")
-        act_save_mask = QAction("&Save Current Mask", self)
+        # The Labels and Predict menus are hidden — every command is reachable
+        # from the GUI itself. We still register their keyboard shortcuts (and
+        # keep the self.act_* actions that other code enables/disables) by
+        # adding the actions straight to the window, so Ctrl+S / Ctrl+T /
+        # Ctrl+I keep working without the visible menus.
+        act_save_mask = QAction("Save Current Mask", self)
         act_save_mask.setShortcut("Ctrl+S")
         act_save_mask.triggered.connect(self._save_current_mask)
-        labels_menu.addAction(act_save_mask)
-        labels_menu.addSeparator()
-        act_sam_model = QAction("Choose SAM2 &Model…", self)
-        act_sam_model.setToolTip("Pick or switch the SAM2 checkpoint used for labeling")
-        act_sam_model.triggered.connect(self._change_sam_model)
-        labels_menu.addAction(act_sam_model)
+        self.addAction(act_save_mask)
 
-        predict_menu = menubar.addMenu("&Predict")
-        self.act_run_training = QAction("Run &Training…", self)
+        self.act_run_training = QAction("Run Training", self)
         self.act_run_training.setShortcut("Ctrl+T")
         self.act_run_training.triggered.connect(self._menu_run_training)
         self.act_run_training.setEnabled(False)
-        predict_menu.addAction(self.act_run_training)
+        self.addAction(self.act_run_training)
 
-        self.act_run_inference = QAction("Run &Inference…", self)
+        self.act_run_inference = QAction("Run Inference", self)
         self.act_run_inference.setShortcut("Ctrl+I")
         self.act_run_inference.triggered.connect(self._menu_run_inference)
         self.act_run_inference.setEnabled(False)
-        predict_menu.addAction(self.act_run_inference)
+        self.addAction(self.act_run_inference)
 
-        predict_menu.addSeparator()
-        self.act_load_pred = QAction("&Load Predictions for Current File", self)
-        self.act_load_pred.triggered.connect(self._load_predictions_as_annotations)
+        # Kept (enabled/disabled by project state) but shortcut-less + menu-less.
+        self.act_load_pred = QAction("Load Predictions for Current File", self)
+        self.act_load_pred.triggered.connect(
+            lambda: self._load_predictions_as_annotations())
         self.act_load_pred.setEnabled(False)
-        predict_menu.addAction(self.act_load_pred)
+        self.addAction(self.act_load_pred)
 
-        self.act_clear_pred = QAction("&Clear Predictions Overlay", self)
+        self.act_clear_pred = QAction("Clear Predictions Overlay", self)
         self.act_clear_pred.triggered.connect(self._clear_predictions)
         self.act_clear_pred.setEnabled(False)
-        predict_menu.addAction(self.act_clear_pred)
+        self.addAction(self.act_clear_pred)
 
         help_menu = menubar.addMenu("&Help")
         act_gpu = QAction("Check &GPU / CUDA setup…", self)
