@@ -2946,15 +2946,11 @@ class MADMainWindow(QMainWindow):
         src_row.setSpacing(2)
         self.btn_deploy_load_project = QPushButton("Load Project Models…")
         self.btn_deploy_load_project.setToolTip(
-            "Pick another MAD project folder to load its trained models into "
-            "the dropdown above.")
+            "Pick a trained MAD project folder to load its models into the "
+            "dropdown above — works with no project open, so you can point a "
+            "trained model at freshly loaded session audio and run inference.")
         self.btn_deploy_load_project.clicked.connect(self._browse_infer_project)
         src_row.addWidget(self.btn_deploy_load_project)
-        self.btn_deploy_browse = QPushButton("Browse Weights…")
-        self.btn_deploy_browse.setToolTip(
-            "Pick an individual weights.pt file from anywhere on disk.")
-        self.btn_deploy_browse.clicked.connect(self._browse_deploy_model)
-        src_row.addWidget(self.btn_deploy_browse)
         vbox.addLayout(src_row)
 
         self.lbl_deploy_model_info = QLabel("No model selected")
@@ -4190,24 +4186,33 @@ class MADMainWindow(QMainWindow):
         self._after_review_decision(ann.get('id'), was_pending)
 
     def _purge_training_example(self, ann: dict):
-        """Delete the saved training example backing a confirmed annotation
-        (no-op if there isn't one)."""
-        aid = ann.get('id')
-        if not aid or self._project is None:
+        """Delete the saved training example(s) backing a confirmed annotation
+        from both the project store and the per-wav sibling, so a rejected call
+        stops training the model. Keyed by id AND blob_id (they can differ once a
+        prediction is accepted), best-effort."""
+        if self._project is None:
             return
-        try:
-            from fnt.usv.usv_detector.mad_examples import delete_example
-            delete_example(self._project.training_data_dir, aid)
-        except Exception:
-            pass
+        ids = {ann.get('id'), ann.get('blob_id')}
+        ids = {str(i) for i in ids if i is not None}
+        if not ids:
+            return
         wav = self._active_review_wav_path()
+        h5 = None
         if wav:
+            from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+            h5 = masks_sibling_path(wav)
+        for aid in ids:
             try:
-                from fnt.usv.usv_detector.fnt_mask_store import (
-                    masks_sibling_path, td_delete)
-                td_delete(masks_sibling_path(wav), aid)
+                from fnt.usv.usv_detector.mad_examples import delete_example
+                delete_example(self._project.training_data_dir, aid)
             except Exception:
                 pass
+            if h5:
+                try:
+                    from fnt.usv.usv_detector.fnt_mask_store import td_delete
+                    td_delete(h5, aid)
+                except Exception:
+                    pass
 
     def _pred_describe(self, ann_idx: int) -> str:
         """Short '@ t.tts' description of an annotation for the log."""
@@ -4540,6 +4545,24 @@ class MADMainWindow(QMainWindow):
         except Exception:
             return {}, None
 
+    def _find_overlapping_confirmed(self, r, dt, df):
+        """Return a confirmed (status-less) annotation whose bbox overlaps the
+        CSV row ``r`` (used to reconcile a rejected call against a stale green),
+        or None."""
+        if dt <= 0 or df <= 0:
+            return None
+        rt0, rt1 = r['start_s'] / dt, r['stop_s'] / dt
+        rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
+        for a in self.spectrogram.annotations:
+            if a.get('status'):  # only status-less confirmed (green) masks
+                continue
+            if a['t1'] <= rt0 or a['t0'] >= rt1:
+                continue
+            if a['f1'] <= rf0 or a['f0'] >= rf1:
+                continue
+            return a
+        return None
+
     def _load_predictions_as_annotations(self, wav: Optional[str] = None):
         """Load inference predictions for ``wav`` (default: current training
         file) and turn each blob into a yellow prediction annotation.
@@ -4618,6 +4641,23 @@ class MADMainWindow(QMainWindow):
                  else ('prediction', 'rejected'))
         sg.annotations = [a for a in sg.annotations
                           if a.get('status') not in strip]
+        # Reconcile rejected calls against confirmed h5 masks. A 'rejected' CSV
+        # row overrules any confirmed (green) annotation it overlaps — drop the
+        # green so it doesn't linger, and if the row has no prediction crop,
+        # borrow the green's exact mask so the reject renders as a real red
+        # outline instead of a bounding box.
+        for r in rows:
+            if r.get('status') != 'rejected':
+                continue
+            m = self._find_overlapping_confirmed(r, dt, df)
+            if m is None:
+                continue
+            if crops.get(str(r.get('blob_id'))) is None:
+                r['_borrow'] = (m.get('mask'), m.get('f0'), m.get('t0'))
+            try:
+                sg.annotations.remove(m)
+            except ValueError:
+                pass
         # Hand-labels live in BOTH the h5 (loaded above as confirmed) and the
         # unified CSV (as 'accepted' rows). Skip any CSV row already represented
         # by a confirmed annotation so it isn't shown twice.
@@ -4643,10 +4683,17 @@ class MADMainWindow(QMainWindow):
             else:
                 ann_status = 'prediction'
             crop = crops.get(str(r.get('blob_id')))
+            borrow = r.get('_borrow')
             if crop is not None:
                 # Exact stored shape/offset — no rounding, no grid read.
                 blob_region = crop['mask']
                 f0, t0 = crop['f_off'], crop['t_off']
+                f1 = f0 + blob_region.shape[0]
+                t1 = t0 + blob_region.shape[1]
+            elif borrow is not None and borrow[0] is not None:
+                # Rejected row with no prediction crop — use the overlapping
+                # confirmed mask's exact shape so it draws as an outline.
+                blob_region, f0, t0 = borrow
                 f1 = f0 + blob_region.shape[0]
                 t1 = t0 + blob_region.shape[1]
             else:
@@ -6361,11 +6408,13 @@ class MADMainWindow(QMainWindow):
         self.file_list.blockSignals(False)
 
     def _set_train_sections_enabled(self, enabled: bool):
-        # Only the project-backed sections are gated on having a project open.
-        # Labeling Tools + Detections stay enabled so you can label a loaded
-        # session file with no project (labels save to siblings); their buttons
-        # follow whether audio is loaded via _update_paint_buttons_enabled.
-        for attr in ('_grp_training_list', '_grp_train_model'):
+        # Only the Training Data list is gated on a project (it lives in the
+        # project folder). The Model section stays enabled so a user can Load
+        # Project Models from any trained project and run inference on session
+        # audio with NO project open. Labeling Tools + Detections stay enabled
+        # too. The single action button's own logic disables training when
+        # there's no project/labels (see _update_run_button).
+        for attr in ('_grp_training_list',):
             grp = getattr(self, attr, None)
             if grp is not None:
                 grp.setEnabled(enabled)
