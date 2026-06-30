@@ -249,10 +249,15 @@ class IdentityAssignmentDialog(QDialog):
             tag_vlayout.addLayout(row1)
 
             row2 = QHBoxLayout()
-            row2.addWidget(QLabel("Start:"))
-            row2.addWidget(start_edit)
-            row2.addWidget(QLabel("Stop:"))
-            row2.addWidget(stop_edit)
+            start_label = QLabel("Start:")
+            start_label.setFixedWidth(35)
+            row2.addWidget(start_label)
+            row2.addWidget(start_edit, 1)
+            row2.addSpacing(10)
+            stop_label = QLabel("Stop:")
+            stop_label.setFixedWidth(35)
+            row2.addWidget(stop_label)
+            row2.addWidget(stop_edit, 1)
             tag_vlayout.addLayout(row2)
 
             tag_widget.setLayout(tag_vlayout)
@@ -1416,7 +1421,7 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def initUI(self):
         self.setWindowTitle("UWB PreProcessing Tool")
-        self.setGeometry(50, 50, 1050, 750)
+        self.setGeometry(50, 50, 520, 900)
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -1525,21 +1530,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.setLayout(main_layout)
         
     def create_settings_panel(self):
-        """Create the settings panel with two-column layout"""
+        """Create the settings panel as a single scrollable column"""
         panel = QWidget()
-        outer_layout = QVBoxLayout()
-
-        # Top section: two columns side by side
-        columns_layout = QHBoxLayout()
-
-        # ===== LEFT COLUMN: Database, Timezone, Tags, Filtering/Smoothing =====
-        left_col = QVBoxLayout()
+        layout = QVBoxLayout()
 
         # Database selection
         db_group = QGroupBox("Database Selection")
         db_layout = QVBoxLayout()
 
         btn_select = QPushButton("Select SQLite Database")
+        btn_select.setToolTip("Open a UWB SQLite database file (.db) for preprocessing")
         btn_select.clicked.connect(self.select_database)
         db_layout.addWidget(btn_select)
 
@@ -1557,17 +1557,19 @@ class UWBQuickVisualizationWindow(QWidget):
         table_layout.addWidget(QLabel("Table:"))
         self.combo_table = QComboBox()
         self.combo_table.setEnabled(False)
+        self.combo_table.setToolTip("Select which table in the database contains the UWB tracking data")
         self.combo_table.currentTextChanged.connect(self.on_table_selected)
         table_layout.addWidget(self.combo_table)
         db_layout.addLayout(table_layout)
 
         self.btn_preview_table = QPushButton("Preview Table")
+        self.btn_preview_table.setToolTip("Show the first rows of the selected table to verify correct data")
         self.btn_preview_table.clicked.connect(self.preview_table)
         self.btn_preview_table.setEnabled(False)
         db_layout.addWidget(self.btn_preview_table)
 
         db_group.setLayout(db_layout)
-        left_col.addWidget(db_group)
+        layout.addWidget(db_group)
 
         # Timezone
         tz_group = QGroupBox("Timezone")
@@ -1575,6 +1577,11 @@ class UWBQuickVisualizationWindow(QWidget):
         tz_layout = QHBoxLayout()
         tz_layout.addWidget(QLabel("Timezone:"))
         self.combo_timezone = QComboBox()
+        self.combo_timezone.setToolTip(
+            "Timestamps in the database are stored as UTC epoch milliseconds. "
+            "This setting converts them to your local timezone for all outputs, "
+            "plots, and the identity dialog time pickers."
+        )
         common_timezones = [
             "US/Mountain", "US/Pacific", "US/Central", "US/Eastern",
             "UTC", "Europe/London", "Europe/Paris", "Asia/Tokyo"
@@ -1584,7 +1591,7 @@ class UWBQuickVisualizationWindow(QWidget):
         tz_layout.addWidget(self.combo_timezone)
         tz_group_layout.addLayout(tz_layout)
         tz_group.setLayout(tz_group_layout)
-        left_col.addWidget(tz_group)
+        layout.addWidget(tz_group)
 
         # Tag selection
         self.tag_group = QGroupBox("Tag Selection")
@@ -1596,7 +1603,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.tag_layout.addWidget(self.lbl_no_tags)
 
         self.tag_group.setLayout(self.tag_layout)
-        left_col.addWidget(self.tag_group)
+        layout.addWidget(self.tag_group)
 
         # Smoothing & Filtering Options
         options_group = QGroupBox("Smoothing & Filtering Options")
@@ -1605,7 +1612,10 @@ class UWBQuickVisualizationWindow(QWidget):
         velocity_filter_layout = QHBoxLayout()
         self.chk_velocity_filter = QCheckBox("Velocity filter (remove >")
         self.chk_velocity_filter.setChecked(True)
-        self.chk_velocity_filter.setToolTip("Remove data points with unrealistic velocities")
+        self.chk_velocity_filter.setToolTip(
+            "Discard points where computed velocity exceeds the threshold. "
+            "Catches teleportation artifacts from multipath/reflection errors."
+        )
         velocity_filter_layout.addWidget(self.chk_velocity_filter)
         self.spin_velocity_threshold = QDoubleSpinBox()
         self.spin_velocity_threshold.setRange(0.1, 10.0)
@@ -1613,7 +1623,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_velocity_threshold.setSuffix(" m/s)")
         self.spin_velocity_threshold.setDecimals(1)
         self.spin_velocity_threshold.setSingleStep(0.1)
-        self.spin_velocity_threshold.setToolTip("Maximum allowed velocity in meters per second")
+        self.spin_velocity_threshold.setToolTip(
+            "Points moving faster than this are removed. "
+            "2 m/s is a good default for rodents in an arena."
+        )
         velocity_filter_layout.addWidget(self.spin_velocity_threshold)
         velocity_filter_layout.addStretch()
         options_layout.addLayout(velocity_filter_layout)
@@ -1621,7 +1634,10 @@ class UWBQuickVisualizationWindow(QWidget):
         jump_filter_layout = QHBoxLayout()
         self.chk_jump_filter = QCheckBox("Jump filter (remove >")
         self.chk_jump_filter.setChecked(True)
-        self.chk_jump_filter.setToolTip("Remove data points with unrealistic spatial jumps")
+        self.chk_jump_filter.setToolTip(
+            "Discard points where the spatial jump between consecutive samples "
+            "exceeds the threshold. Catches single-sample position glitches."
+        )
         jump_filter_layout.addWidget(self.chk_jump_filter)
         self.spin_jump_threshold = QDoubleSpinBox()
         self.spin_jump_threshold.setRange(0.1, 10.0)
@@ -1629,7 +1645,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_jump_threshold.setSuffix(" m)")
         self.spin_jump_threshold.setDecimals(1)
         self.spin_jump_threshold.setSingleStep(0.1)
-        self.spin_jump_threshold.setToolTip("Maximum allowed distance jump in meters")
+        self.spin_jump_threshold.setToolTip(
+            "Consecutive points farther apart than this distance are removed. "
+            "2 m is a good default for typical arena sizes."
+        )
         jump_filter_layout.addWidget(self.spin_jump_threshold)
         jump_filter_layout.addStretch()
         options_layout.addLayout(jump_filter_layout)
@@ -1640,7 +1659,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_time_gap.setRange(5, 300)
         self.spin_time_gap.setValue(30)
         self.spin_time_gap.setSuffix(" sec")
-        self.spin_time_gap.setToolTip("Group data by time gaps larger than this (prevents filtering across battery restarts)")
+        self.spin_time_gap.setToolTip(
+            "Splits data into segments when gaps exceed this duration. "
+            "Prevents velocity/jump filters from comparing points across "
+            "battery restarts or signal dropouts."
+        )
         time_gap_layout.addWidget(self.spin_time_gap)
         time_gap_layout.addStretch()
         options_layout.addLayout(time_gap_layout)
@@ -1648,6 +1671,13 @@ class UWBQuickVisualizationWindow(QWidget):
         smoothing_label_layout = QHBoxLayout()
         smoothing_label_layout.addWidget(QLabel("Smoothing method:"))
         self.combo_smoothing = QComboBox()
+        self.combo_smoothing.setToolTip(
+            "Applied per-tag after filtering.\n"
+            "• Rolling Average: good general-purpose smoothing\n"
+            "• Rolling Median: more robust to remaining outliers\n"
+            "• Savitzky-Golay: preserves peaks/edges better\n"
+            "• None: skip smoothing entirely"
+        )
         self.combo_smoothing.addItems(["None", "Rolling Average (default)", "Rolling Median", "Savitzky-Golay"])
         self.combo_smoothing.setCurrentIndex(1)
         self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
@@ -1660,6 +1690,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_rolling_window.setRange(1, 60)
         self.spin_rolling_window.setValue(30)
         self.spin_rolling_window.setEnabled(False)
+        self.spin_rolling_window.setToolTip(
+            "Size of the rolling window in seconds. "
+            "Larger values produce smoother trajectories but lose fine detail."
+        )
         self.rolling_window_layout.addWidget(self.spin_rolling_window)
         options_layout.addLayout(self.rolling_window_layout)
         self.spin_rolling_window.hide()
@@ -1669,13 +1703,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_load_background = QPushButton("Load Background")
         self.btn_load_background.clicked.connect(self.select_background_image)
         self.btn_load_background.setEnabled(False)
-        self.btn_load_background.setToolTip("Load a background map/floorplan image to overlay on visualizations")
+        self.btn_load_background.setToolTip(
+            "Load a floorplan or arena image to overlay under trajectory plots. "
+            "Requires an XML config in the database folder for spatial scaling."
+        )
         self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
         bg_buttons_layout.addWidget(self.btn_load_background)
         self.btn_remove_background = QPushButton("Remove Background")
         self.btn_remove_background.clicked.connect(self.remove_background)
         self.btn_remove_background.setEnabled(False)
-        self.btn_remove_background.setToolTip("Remove the background image from visualizations")
+        self.btn_remove_background.setToolTip("Clear the loaded background image from all visualizations")
         self.btn_remove_background.setStyleSheet("padding: 8px; font-size: 11px;")
         bg_buttons_layout.addWidget(self.btn_remove_background)
         options_layout.addLayout(bg_buttons_layout)
@@ -1688,29 +1725,33 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
         self.chk_show_anchors.setEnabled(False)
-        self.chk_show_anchors.setToolTip("Toggle visibility of UWB anchor/antenna positions (triangles)")
+        self.chk_show_anchors.setToolTip(
+            "Draw UWB anchor/antenna positions as triangles on trajectory plots. "
+            "Anchor locations are parsed from the XML config file."
+        )
         options_layout.addWidget(self.chk_show_anchors)
 
         options_group.setLayout(options_layout)
-        left_col.addWidget(options_group)
+        layout.addWidget(options_group)
 
-        left_col.addStretch()
-        columns_layout.addLayout(left_col, 1)
-
-        # ===== RIGHT COLUMN: Export Options =====
-        right_col = QVBoxLayout()
-
+        # Export Options
         export_group = QGroupBox("Export Options")
         export_layout = QVBoxLayout()
 
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
         self.chk_export_raw_csv.setChecked(True)
-        self.chk_export_raw_csv.setToolTip("Export raw database contents as CSV (no processing)")
+        self.chk_export_raw_csv.setToolTip(
+            "Dump the raw database table to CSV with no filtering, smoothing, or unit conversion. "
+            "Useful as a reference baseline."
+        )
         export_layout.addWidget(self.chk_export_raw_csv)
 
         self.chk_export_smoothed_csv = QCheckBox("Export Smoothed CSV")
         self.chk_export_smoothed_csv.setChecked(True)
-        self.chk_export_smoothed_csv.setToolTip("Export filtered + smoothed data at full resolution (no downsampling)")
+        self.chk_export_smoothed_csv.setToolTip(
+            "Export filtered and smoothed data at full temporal resolution. "
+            "Coordinates are in meters, timestamps in your selected timezone."
+        )
         export_layout.addWidget(self.chk_export_smoothed_csv)
 
         downsample_row = QWidget()
@@ -1718,13 +1759,16 @@ class UWBQuickVisualizationWindow(QWidget):
         downsample_layout.setContentsMargins(0, 0, 0, 0)
         self.chk_export_downsampled_csv = QCheckBox("Export Smoothed Downsampled CSV")
         self.chk_export_downsampled_csv.setChecked(True)
-        self.chk_export_downsampled_csv.setToolTip("Export filtered + smoothed + downsampled data at specified sample rate")
+        self.chk_export_downsampled_csv.setToolTip(
+            "Export filtered + smoothed data downsampled to a fixed rate. "
+            "Smaller file size; used as input for plots and animations."
+        )
         downsample_layout.addWidget(self.chk_export_downsampled_csv)
         self.spin_downsample_hz = QSpinBox()
         self.spin_downsample_hz.setRange(1, 5)
         self.spin_downsample_hz.setValue(1)
         self.spin_downsample_hz.setSuffix(" Hz")
-        self.spin_downsample_hz.setToolTip("Target sample rate for downsampled CSV (1-5 Hz)")
+        self.spin_downsample_hz.setToolTip("Target sample rate (samples per second) for the downsampled CSV")
         self.spin_downsample_hz.setFixedWidth(70)
         downsample_layout.addWidget(self.spin_downsample_hz)
         downsample_layout.addStretch()
@@ -1733,7 +1777,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.chk_proximity_detection = QCheckBox("Detect Proximity Bouts")
         self.chk_proximity_detection.setChecked(True)
-        self.chk_proximity_detection.setToolTip("Detect pairwise proximity events and bouts from smoothed data")
+        self.chk_proximity_detection.setToolTip(
+            "Detect when pairs of tags are within the proximity threshold. "
+            "Outputs two CSVs: per-sample proximity events and aggregated bouts."
+        )
         self.chk_proximity_detection.stateChanged.connect(self.on_proximity_detection_toggled)
         export_layout.addWidget(self.chk_proximity_detection)
 
@@ -1747,7 +1794,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_proximity_threshold.setSingleStep(0.05)
         self.spin_proximity_threshold.setDecimals(2)
         self.spin_proximity_threshold.setSuffix(" m")
-        self.spin_proximity_threshold.setToolTip("Tags within this distance are detected as in sociospatial proximity")
+        self.spin_proximity_threshold.setToolTip(
+            "Two tags closer than this distance are considered in sociospatial proximity. "
+            "0.5 m is a typical threshold for rodent social contact."
+        )
         self.spin_proximity_threshold.setFixedWidth(100)
         prox_layout.addWidget(self.spin_proximity_threshold)
         prox_layout.addStretch()
@@ -1758,7 +1808,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(True)
         self.chk_save_plots.stateChanged.connect(self.on_save_plots_toggled)
-        self.chk_save_plots.setToolTip("Generate and save visualization plots (PNG always included)")
+        self.chk_save_plots.setToolTip(
+            "Generate and save visualization plots to the plots/ subfolder. "
+            "PNG is always produced; SVG is optional below."
+        )
         export_layout.addWidget(self.chk_save_plots)
 
         self.plot_types_widget = QWidget()
@@ -1766,16 +1819,26 @@ class UWBQuickVisualizationWindow(QWidget):
         plot_types_layout.setContentsMargins(30, 0, 0, 0)
         self.plot_type_checkboxes = {}
         plot_types = [
-            ("daily_paths", "Daily Paths per Tag", "One PNG per tag with all days"),
-            ("trajectory_overview", "Trajectory Overview", "All tags overlaid"),
-            ("battery_levels", "Battery Levels", "Battery voltage over time"),
-            ("3d_occupancy", "3D Occupancy Heatmap", "3D visualization of occupancy over time"),
-            ("activity_timeline", "Activity Timeline", "Data points per hour over time"),
-            ("velocity_distribution", "Velocity Distribution", "Velocity distribution for each tag"),
-            ("cumulative_distance", "Cumulative Distance", "Distance traveled over time (reset daily)"),
-            ("velocity_timeline", "Velocity Timeline", "Velocity over time with activity threshold"),
-            ("actogram", "Circadian Actogram", "24-hour activity patterns across days"),
-            ("data_quality", "Data Quality Metrics", "Table showing data gaps and quality statistics")
+            ("daily_paths", "Daily Paths per Tag",
+             "One plot per tag showing XY trajectory for each day, color-coded by date"),
+            ("trajectory_overview", "Trajectory Overview",
+             "All selected tags overlaid on a single plot with optional background image"),
+            ("battery_levels", "Battery Levels",
+             "Battery voltage over time for each tag — useful for detecting low-power dropouts"),
+            ("3d_occupancy", "3D Occupancy Heatmap",
+             "3D surface plot of spatial occupancy density per tag"),
+            ("activity_timeline", "Activity Timeline",
+             "Data points per hour across the recording — reveals active vs. inactive periods"),
+            ("velocity_distribution", "Velocity Distribution",
+             "Histogram of movement speeds per tag to characterize locomotion patterns"),
+            ("cumulative_distance", "Cumulative Distance",
+             "Total distance traveled over time per tag, reset at midnight each day"),
+            ("velocity_timeline", "Velocity Timeline",
+             "Velocity over time per tag with an activity threshold line overlay"),
+            ("actogram", "Circadian Actogram",
+             "Double-plotted 24-hour activity raster showing circadian patterns across days"),
+            ("data_quality", "Data Quality Metrics",
+             "Summary table of data gaps, sample counts, and coverage statistics per tag")
         ]
         for key, plot_name, plot_desc in plot_types:
             cb = QCheckBox(plot_name)
@@ -1792,7 +1855,10 @@ class UWBQuickVisualizationWindow(QWidget):
         svg_option_layout.setContentsMargins(30, 0, 0, 0)
         self.chk_save_svg = QCheckBox("Also save as SVG")
         self.chk_save_svg.setChecked(False)
-        self.chk_save_svg.setToolTip("Additionally save plots in SVG format (vector graphics)")
+        self.chk_save_svg.setToolTip(
+            "Save each plot as a scalable vector graphic in addition to PNG. "
+            "Useful for publication-quality figures that can be edited in Illustrator."
+        )
         svg_option_layout.addWidget(self.chk_save_svg)
         svg_option_layout.addStretch()
         self.svg_option_widget.setLayout(svg_option_layout)
@@ -1802,7 +1868,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_save_animation = QCheckBox("Save Animation")
         self.chk_save_animation.setChecked(False)
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
-        self.chk_save_animation.setToolTip("Generate animated video of tracking data")
+        self.chk_save_animation.setToolTip(
+            "Render an MP4 video of tag trajectories over time. "
+            "Can take a long time for multi-day recordings at high quality."
+        )
         export_layout.addWidget(self.chk_save_animation)
 
         self.animation_options_widget = QWidget()
@@ -1814,7 +1883,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_animation_trail = QSpinBox()
         self.spin_animation_trail.setRange(1, 1000)
         self.spin_animation_trail.setValue(500)
-        self.spin_animation_trail.setToolTip("How much trailing data to show in animation")
+        self.spin_animation_trail.setToolTip(
+            "How many seconds of trailing path to draw behind each tag in the animation. "
+            "Higher values show more historical movement context."
+        )
         trail_layout.addWidget(self.spin_animation_trail)
         animation_options_layout.addLayout(trail_layout)
 
@@ -1823,7 +1895,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_animation_speed = QComboBox()
         self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "100x", "120x", "150x", "160x", "200x", "400x", "500x", "1000x"])
         self.combo_animation_speed.setCurrentText("80x")
-        self.combo_animation_speed.setToolTip("Playback speed multiplier (e.g., 10x = 10 seconds of real time per second of video)")
+        self.combo_animation_speed.setToolTip(
+            "How fast real time plays in the video. "
+            "80x means 80 seconds of tracking data per 1 second of video."
+        )
         speed_layout.addWidget(self.combo_animation_speed)
         animation_options_layout.addLayout(speed_layout)
 
@@ -1832,7 +1907,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_animation_fps = QComboBox()
         self.combo_animation_fps.addItems(["1", "5", "10", "20", "30"])
         self.combo_animation_fps.setCurrentText("30")
-        self.combo_animation_fps.setToolTip("Frames per second for output video (affects smoothness)")
+        self.combo_animation_fps.setToolTip(
+            "Video frames per second. Higher values are smoother but "
+            "produce larger files and take longer to render."
+        )
         fps_layout.addWidget(self.combo_animation_fps)
         animation_options_layout.addLayout(fps_layout)
 
@@ -1841,7 +1919,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_time_window = QSpinBox()
         self.spin_time_window.setRange(1, 300)
         self.spin_time_window.setValue(30)
-        self.spin_time_window.setToolTip("Time window in seconds for each frame")
+        self.spin_time_window.setToolTip(
+            "Width of the time slice shown in each animation frame. "
+            "Controls how much data is visible at any moment."
+        )
         time_window_layout.addWidget(self.spin_time_window)
         animation_options_layout.addLayout(time_window_layout)
 
@@ -1849,7 +1930,10 @@ class UWBQuickVisualizationWindow(QWidget):
         color_layout.addWidget(QLabel("Color by:"))
         self.combo_color_by = QComboBox()
         self.combo_color_by.addItems(["ID", "sex"])
-        self.combo_color_by.setToolTip("Color trajectories by ID or sex")
+        self.combo_color_by.setToolTip(
+            "Color each trajectory by individual tag identity or by sex (M/F). "
+            "Requires identities to be configured for sex-based coloring."
+        )
         color_layout.addWidget(self.combo_color_by)
         animation_options_layout.addLayout(color_layout)
 
@@ -1858,7 +1942,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_video_quality = QComboBox()
         self.combo_video_quality.addItems(["Draft (Fast)", "Standard", "High Quality"])
         self.combo_video_quality.setCurrentText("High Quality")
-        self.combo_video_quality.setToolTip("Draft=75dpi (4x faster), Standard=100dpi, High=150dpi")
+        self.combo_video_quality.setToolTip(
+            "Render resolution: Draft (75 dpi, ~4x faster), "
+            "Standard (100 dpi), High Quality (150 dpi). "
+            "Draft is good for quick previews."
+        )
         quality_layout.addWidget(self.combo_video_quality)
         animation_options_layout.addLayout(quality_layout)
 
@@ -1872,7 +1960,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_daily_animations = QCheckBox("Generate daily animations (one per day)")
         self.chk_daily_animations.setChecked(False)
         self.chk_daily_animations.stateChanged.connect(self.on_daily_animations_toggled)
-        self.chk_daily_animations.setToolTip("Create separate animation for each day (midnight to midnight)")
+        self.chk_daily_animations.setToolTip(
+            "Create a separate MP4 for each calendar day (midnight to midnight) "
+            "instead of one long video for the entire recording."
+        )
         animation_options_layout.addWidget(self.chk_daily_animations)
 
         self.daily_animation_days_widget = QWidget()
@@ -1890,14 +1981,9 @@ class UWBQuickVisualizationWindow(QWidget):
         export_layout.addWidget(self.animation_options_widget)
 
         export_group.setLayout(export_layout)
-        right_col.addWidget(export_group)
+        layout.addWidget(export_group)
 
-        right_col.addStretch()
-        columns_layout.addLayout(right_col, 1)
-
-        outer_layout.addLayout(columns_layout, 1)
-
-        # ===== BOTTOM: Messages, Progress, Export buttons (full width) =====
+        # Progress bar (hidden by default)
         self.progress_widget = QWidget()
         progress_layout = QVBoxLayout()
         progress_layout.setContentsMargins(0, 5, 0, 5)
@@ -1922,28 +2008,35 @@ class UWBQuickVisualizationWindow(QWidget):
         progress_layout.addWidget(self.progress_bar)
         self.progress_widget.setLayout(progress_layout)
         self.progress_widget.setVisible(False)
-        outer_layout.addWidget(self.progress_widget)
+        layout.addWidget(self.progress_widget)
 
+        # Export buttons
         export_buttons_layout = QHBoxLayout()
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_data)
         self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip(
+            "Run the full preprocessing pipeline: filter, smooth, export CSVs, "
+            "generate plots/animations, and save config to the output folder."
+        )
         self.btn_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
         export_buttons_layout.addWidget(self.btn_export)
         self.btn_stop_export = QPushButton("Stop Export")
         self.btn_stop_export.clicked.connect(self.stop_export)
+        self.btn_stop_export.setToolTip("Cancel the current export operation")
         self.btn_stop_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold; background-color: #d41100;")
         self.btn_stop_export.setVisible(False)
         export_buttons_layout.addWidget(self.btn_stop_export)
-        outer_layout.addLayout(export_buttons_layout)
+        layout.addLayout(export_buttons_layout)
 
+        # Messages window
         messages_label = QLabel("Messages:")
         messages_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        outer_layout.addWidget(messages_label)
+        layout.addWidget(messages_label)
 
         self.txt_messages = QTextEdit()
         self.txt_messages.setReadOnly(True)
-        self.txt_messages.setMaximumHeight(120)
+        self.txt_messages.setMaximumHeight(150)
         self.txt_messages.setStyleSheet("""
             QTextEdit {
                 background-color: #1e1e1e;
@@ -1954,15 +2047,16 @@ class UWBQuickVisualizationWindow(QWidget):
                 font-size: 9px;
             }
         """)
-        outer_layout.addWidget(self.txt_messages)
+        layout.addWidget(self.txt_messages)
 
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet("color: #666666; font-style: italic; font-size: 10px;")
         self.lbl_status.setVisible(False)
-        outer_layout.addWidget(self.lbl_status)
+        layout.addWidget(self.lbl_status)
 
-        panel.setLayout(outer_layout)
+        layout.addStretch()
+        panel.setLayout(layout)
 
         scroll = QScrollArea()
         scroll.setWidget(panel)
@@ -2699,20 +2793,25 @@ class UWBQuickVisualizationWindow(QWidget):
         # Add Select All/None buttons below checkboxes
         self.tag_buttons_layout = QHBoxLayout()
         btn_select_all = QPushButton("Select All")
+        btn_select_all.setToolTip("Check all tags for export")
         btn_select_all.setStyleSheet("padding: 6px; font-size: 10px;")
         btn_select_all.clicked.connect(self.select_all_tags)
         btn_select_none = QPushButton("Select None")
+        btn_select_none.setToolTip("Uncheck all tags")
         btn_select_none.setStyleSheet("padding: 6px; font-size: 10px;")
         btn_select_none.clicked.connect(self.select_none_tags)
         self.tag_buttons_layout.addWidget(btn_select_all)
         self.tag_buttons_layout.addWidget(btn_select_none)
         self.tag_layout.addLayout(self.tag_buttons_layout)
-        
+
         # Add Configure Identities button below Select All/None
         self.btn_assign_identities = QPushButton("Configure Identities...")
         self.btn_assign_identities.clicked.connect(self.open_identity_dialog)
         self.btn_assign_identities.setEnabled(False)
-        self.btn_assign_identities.setToolTip("Assign custom sex (M/F) and alphanumeric IDs to selected tags")
+        self.btn_assign_identities.setToolTip(
+            "Assign sex (M/F), custom IDs, and active time windows to each tag. "
+            "Time pickers default to the tag's first/last timestamp in your selected timezone."
+        )
         self.btn_assign_identities.setStyleSheet("padding: 6px; font-size: 10px;")
         self.tag_layout.addWidget(self.btn_assign_identities)
         
