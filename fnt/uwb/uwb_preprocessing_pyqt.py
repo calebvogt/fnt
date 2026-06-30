@@ -2917,17 +2917,22 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def get_config_dict(self):
         """Get current configuration as dictionary"""
+        from datetime import datetime
         config = {
+            'run_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'database_path': self.db_path,
+            'database_name': os.path.basename(self.db_path) if self.db_path else None,
             'table_name': self.table_name,
             'selected_tags': [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()],
             'timezone': self.combo_timezone.currentText(),
-            'smoothing_method': self.combo_smoothing.currentText(),
-            'rolling_window': self.spin_rolling_window.value(),
             'velocity_filter': self.chk_velocity_filter.isChecked(),
             'velocity_threshold': self.spin_velocity_threshold.value(),
             'jump_filter': self.chk_jump_filter.isChecked(),
             'jump_threshold': self.spin_jump_threshold.value(),
             'time_gap': self.spin_time_gap.value(),
+            'smoothing_method': self.combo_smoothing.currentText(),
+            'rolling_window': self.spin_rolling_window.value(),
+            'show_anchors': self.chk_show_anchors.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'export_downsampled_csv': self.chk_export_downsampled_csv.isChecked(),
@@ -2936,27 +2941,18 @@ class UWBQuickVisualizationWindow(QWidget):
             'proximity_threshold': self.spin_proximity_threshold.value(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
-            'plot_types': {
-                'daily_paths': self.plot_type_checkboxes['daily_paths'].isChecked(),
-                'trajectory_overview': self.plot_type_checkboxes['trajectory_overview'].isChecked(),
-                'battery_levels': self.plot_type_checkboxes['battery_levels'].isChecked(),
-                '3d_occupancy': self.plot_type_checkboxes['3d_occupancy'].isChecked(),
-                'activity_timeline': self.plot_type_checkboxes['activity_timeline'].isChecked(),
-                'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked(),
-                'cumulative_distance': self.plot_type_checkboxes['cumulative_distance'].isChecked(),
-                'velocity_timeline': self.plot_type_checkboxes['velocity_timeline'].isChecked(),
-                'actogram': self.plot_type_checkboxes['actogram'].isChecked(),
-                'data_quality': self.plot_type_checkboxes['data_quality'].isChecked()
-            },
+            'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
             'animation_speed': self.combo_animation_speed.currentText(),
             'animation_fps': self.combo_animation_fps.currentText(),
             'time_window': self.spin_time_window.value(),
             'color_by': self.combo_color_by.currentText(),
+            'video_quality': self.combo_video_quality.currentText(),
+            'daily_animations': self.chk_daily_animations.isChecked(),
             'tag_identities': self.tag_identities,
-            'background_image_path': self.background_image_path,  # Save background image path
-            'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None  # Save zone data
+            'background_image_path': self.background_image_path,
+            'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None
         }
         return config
     
@@ -2964,13 +2960,13 @@ class UWBQuickVisualizationWindow(QWidget):
         """Save current configuration to JSON file"""
         config = self.get_config_dict()
         config_path = os.path.join(output_dir, 'fnt_config.json')
-        
+
         try:
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=4)
-            self.lbl_status.setText(f"Config saved to {config_path}")
+            self.log_message(f"Config saved: {os.path.basename(config_path)}")
         except Exception as e:
-            print(f"Warning: Could not save config: {str(e)}")
+            self.log_message(f"Warning: Could not save config: {str(e)}")
     
     def load_config_if_exists(self):
         """Check for existing config file and load it.
@@ -3080,6 +3076,17 @@ class UWBQuickVisualizationWindow(QWidget):
                 index = self.combo_color_by.findText(config['color_by'])
                 if index >= 0:
                     self.combo_color_by.setCurrentIndex(index)
+
+            if 'video_quality' in config:
+                index = self.combo_video_quality.findText(config['video_quality'])
+                if index >= 0:
+                    self.combo_video_quality.setCurrentIndex(index)
+
+            if 'daily_animations' in config:
+                self.chk_daily_animations.setChecked(config['daily_animations'])
+
+            if 'show_anchors' in config:
+                self.chk_show_anchors.setChecked(config['show_anchors'])
 
             if 'tag_identities' in config:
                 # Convert string keys back to integers if needed
