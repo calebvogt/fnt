@@ -1906,7 +1906,7 @@ class UWBQuickVisualizationWindow(QWidget):
         fps_layout.addWidget(QLabel("FPS:"))
         self.combo_animation_fps = QComboBox()
         self.combo_animation_fps.addItems(["1", "5", "10", "20", "30"])
-        self.combo_animation_fps.setCurrentText("30")
+        self.combo_animation_fps.setCurrentText("20")
         self.combo_animation_fps.setToolTip(
             "Video frames per second. Higher values are smoother but "
             "produce larger files and take longer to render."
@@ -2112,7 +2112,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_save_animation.setChecked(False)
         self.spin_animation_trail.setValue(500)
         self.combo_animation_speed.setCurrentText("80x")
-        self.combo_animation_fps.setCurrentText("30")
+        self.combo_animation_fps.setCurrentText("20")
         self.spin_time_window.setValue(30)
 
         # Reset background image label
@@ -4024,12 +4024,14 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.progress_widget.setVisible(False)
                 return
 
-        # Create output directory and subfolders
+        # Create output directory and subfolders only as needed
         os.makedirs(output_dir, exist_ok=True)
         plots_dir = os.path.join(output_dir, 'plots')
-        os.makedirs(plots_dir, exist_ok=True)
+        if save_plots:
+            os.makedirs(plots_dir, exist_ok=True)
         animations_dir = os.path.join(output_dir, 'animations')
-        os.makedirs(animations_dir, exist_ok=True)
+        if save_animation:
+            os.makedirs(animations_dir, exist_ok=True)
 
         try:
             self.log_message(f"Starting export to {output_dir}")
