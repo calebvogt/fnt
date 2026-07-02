@@ -142,8 +142,15 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             result = subprocess.run(
                 probe_cmd, capture_output=True,
                 encoding='utf-8', errors='replace', check=True,
+                timeout=30,
             )
             sr = int(result.stdout.strip())
+        except subprocess.TimeoutExpired:
+            parts = [f"ffprobe timed out reading {os.path.basename(filepath)}"]
+            if sf_error is not None:
+                parts.append(f"soundfile also failed: {sf_error}")
+            parts.append(f"path: {filepath}")
+            raise RuntimeError("\n".join(parts))
         except FileNotFoundError:
             msg = (
                 "Could not read this audio file with soundfile, and "
@@ -173,6 +180,8 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
     # Try the file path directly first; if that fails, pipe the file through
     # stdin — on Windows, mapped/network drives (e.g. Z:\) are per-logon-
     # session and subprocesses sometimes can't see them even though Python can.
+    _FFMPEG_TIMEOUT = 60
+
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp_file:
         temp_path = tmp_file.name
 
@@ -187,19 +196,36 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
         ]
 
         # Attempt 1: direct file path (fast, supports seeking)
-        proc = subprocess.run(
-            [ffmpeg_exe, '-i', filepath] + base_cmd[1:],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        try:
+            proc = subprocess.run(
+                [ffmpeg_exe, '-i', filepath] + base_cmd[1:],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_FFMPEG_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            proc = None
 
         # Attempt 2: pipe through stdin if direct path failed
-        if proc.returncode != 0:
-            with open(filepath, 'rb') as audio_in:
-                proc = subprocess.run(
-                    [ffmpeg_exe, '-i', 'pipe:0'] + base_cmd[1:],
-                    stdin=audio_in,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
+        if proc is None or proc.returncode != 0:
+            try:
+                with open(filepath, 'rb') as audio_in:
+                    proc = subprocess.run(
+                        [ffmpeg_exe, '-i', 'pipe:0'] + base_cmd[1:],
+                        stdin=audio_in,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=_FFMPEG_TIMEOUT,
+                    )
+            except subprocess.TimeoutExpired:
+                parts = [
+                    f"ffmpeg timed out decoding "
+                    f"{os.path.basename(filepath)} "
+                    f"(>{_FFMPEG_TIMEOUT}s)",
+                    f"ffmpeg binary: {ffmpeg_exe}",
+                ]
+                if sf_error is not None:
+                    parts.append(f"soundfile also failed: {sf_error}")
+                parts.append(f"path: {filepath}")
+                raise RuntimeError("\n".join(parts))
 
         if proc.returncode != 0:
             detail = proc.stderr.decode('utf-8', errors='replace').strip()
@@ -208,6 +234,9 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             ]
             if detail:
                 parts.append(detail)
+            else:
+                parts.append("(ffmpeg produced no error output)")
+            parts.append(f"ffmpeg binary: {ffmpeg_exe}")
             if sf_error is not None:
                 parts.append(f"soundfile also failed: {sf_error}")
             parts.append(f"path: {filepath}")

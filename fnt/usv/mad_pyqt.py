@@ -6502,10 +6502,15 @@ class MADMainWindow(QMainWindow):
                 audio = np.mean(audio, axis=1)
             self.audio_data = audio.astype(np.float32, copy=False)
             self.sample_rate = int(sr)
-            has_previous = self.spectrogram.total_duration > 0
+            prev_window = (self.spectrogram.view_end
+                           - self.spectrogram.view_start)
             self.spectrogram.set_audio_data(
-                self.audio_data, self.sample_rate, preserve_view=has_previous
+                self.audio_data, self.sample_rate, preserve_view=False
             )
+            if prev_window > 0:
+                self.spectrogram.view_start = 0
+                self.spectrogram.view_end = min(
+                    prev_window, self.spectrogram.total_duration)
             self.waveform_overview.set_audio_data(
                 self.audio_data, self.sample_rate
             )
