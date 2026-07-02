@@ -7,6 +7,7 @@ optimized for ultrasonic vocalization detection.
 
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import numpy as np
@@ -79,6 +80,35 @@ def load_audio(filepath: str, target_sr: Optional[int] = None) -> Tuple[np.ndarr
     return audio, sr
 
 
+def _read_wav_sample_rate(filepath: str) -> Optional[int]:
+    """Read sample rate from a WAV/RIFF header without any external tools."""
+    try:
+        with open(filepath, 'rb') as f:
+            riff = f.read(12)
+            if len(riff) < 12 or riff[:4] != b'RIFF' or riff[8:12] != b'WAVE':
+                return None
+            # Walk chunks until we find 'fmt '
+            while True:
+                chunk_hdr = f.read(8)
+                if len(chunk_hdr) < 8:
+                    return None
+                chunk_id = chunk_hdr[:4]
+                chunk_size = struct.unpack('<I', chunk_hdr[4:8])[0]
+                if chunk_id == b'fmt ':
+                    if chunk_size < 16:
+                        return None
+                    fmt_data = f.read(16)
+                    # fmt_data layout: audio_format(2), channels(2),
+                    #                  sample_rate(4), byte_rate(4),
+                    #                  block_align(2), bits_per_sample(2)
+                    sr = struct.unpack('<I', fmt_data[4:8])[0]
+                    return sr if sr > 0 else None
+                # Skip this chunk (pad to even size per RIFF spec)
+                f.seek(chunk_size + (chunk_size & 1), 1)
+    except Exception:
+        return None
+
+
 def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tuple[np.ndarray, int]:
     """
     Load audio using ffmpeg (handles ADPCM and other exotic formats).
@@ -92,77 +122,99 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
     Returns:
         Tuple of (audio_data, sample_rate)
     """
-    # Resolve executables: prefer shutil.which (gives absolute path), but fall
-    # back to the bare name so subprocess can find it via the *system* PATH.
-    # On Windows, conda environments often don't inherit the full system PATH,
-    # so shutil.which('ffprobe') returns None even though ffprobe is callable
-    # from cmd.exe.
-    ffprobe_exe = shutil.which('ffprobe') or 'ffprobe'
     ffmpeg_exe = shutil.which('ffmpeg') or 'ffmpeg'
 
-    # First, get the sample rate from the input file
-    probe_cmd = [
-        ffprobe_exe,
-        '-v', 'warning',
-        '-select_streams', 'a:0',
-        '-show_entries', 'stream=sample_rate',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        filepath
-    ]
+    # Get sample rate: read it directly from the WAV header (pure Python, no
+    # subprocess — avoids ffprobe issues on Windows mapped drives / conda
+    # PATH isolation). Fall back to ffprobe only for non-WAV files.
+    sr = _read_wav_sample_rate(filepath)
+    if sr is None:
+        ffprobe_exe = shutil.which('ffprobe') or 'ffprobe'
+        probe_cmd = [
+            ffprobe_exe,
+            '-v', 'warning',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=sample_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            filepath
+        ]
+        try:
+            result = subprocess.run(
+                probe_cmd, capture_output=True,
+                encoding='utf-8', errors='replace', check=True,
+            )
+            sr = int(result.stdout.strip())
+        except FileNotFoundError:
+            msg = (
+                "Could not read this audio file with soundfile, and "
+                "ffprobe is not installed or not on PATH.\n"
+                "Install ffmpeg and restart the app, e.g.:\n"
+                "  conda install -c conda-forge ffmpeg   (in the fnt "
+                "environment)\n"
+                "  winget install Gyan.FFmpeg            (system-wide on "
+                "Windows)"
+            )
+            if sf_error is not None:
+                msg += f"\n\n(soundfile could not decode it: {sf_error})"
+            raise RuntimeError(msg)
+        except (subprocess.CalledProcessError, ValueError) as e:
+            detail = ''
+            if isinstance(e, subprocess.CalledProcessError):
+                detail = (e.stderr or e.stdout or '').strip()
+            parts = [f"ffprobe could not read {os.path.basename(filepath)}"]
+            if detail:
+                parts.append(detail)
+            if sf_error is not None:
+                parts.append(f"soundfile also failed: {sf_error}")
+            parts.append(f"path: {filepath}")
+            raise RuntimeError("\n".join(parts))
 
-    try:
-        result = subprocess.run(
-            probe_cmd, capture_output=True,
-            encoding='utf-8', errors='replace', check=True,
-        )
-        sr = int(result.stdout.strip())
-    except FileNotFoundError:
-        msg = (
-            "Could not read this audio file with soundfile, and ffmpeg/ffprobe "
-            "is not installed or not on PATH, so the fallback decoder is "
-            "unavailable.\nInstall ffmpeg and restart the app, e.g.:\n"
-            "  conda install -c conda-forge ffmpeg   (in the fnt environment)\n"
-            "  winget install Gyan.FFmpeg            (system-wide on Windows)"
-        )
-        if sf_error is not None:
-            msg += f"\n\n(soundfile could not decode it: {sf_error})"
-        raise RuntimeError(msg)
-    except subprocess.CalledProcessError as e:
-        detail = (e.stderr or e.stdout or '').strip()
-        parts = [f"ffprobe could not read {os.path.basename(filepath)}"]
-        if detail:
-            parts.append(detail)
-        if sf_error is not None:
-            parts.append(f"soundfile also failed: {sf_error}")
-        parts.append(f"path: {filepath}")
-        raise RuntimeError("\n".join(parts))
-    except ValueError:
-        raise RuntimeError(
-            f"ffprobe returned no sample rate for {os.path.basename(filepath)} "
-            "— the file may be corrupt or not an audio file."
-        )
-
-    # Convert to raw PCM float32 using ffmpeg
+    # Decode to raw PCM float32 using ffmpeg
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp_file:
         temp_path = tmp_file.name
 
     try:
-        # Convert to raw 32-bit float PCM
         convert_cmd = [
             ffmpeg_exe,
             '-i', filepath,
-            '-f', 'f32le',          # 32-bit float, little-endian
+            '-f', 'f32le',
             '-acodec', 'pcm_f32le',
-            '-ac', '1',              # Convert to mono
-            '-y',                    # Overwrite output
+            '-ac', '1',
+            '-y',
             temp_path
         ]
 
-        subprocess.run(convert_cmd, capture_output=True, check=True)
+        proc = subprocess.run(
+            convert_cmd, capture_output=True,
+            encoding='utf-8', errors='replace',
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or '').strip()
+            parts = [
+                f"ffmpeg could not decode {os.path.basename(filepath)}"
+            ]
+            if detail:
+                parts.append(detail)
+            if sf_error is not None:
+                parts.append(f"soundfile also failed: {sf_error}")
+            parts.append(f"path: {filepath}")
+            raise RuntimeError("\n".join(parts))
 
-        # Read raw PCM data
         audio = np.fromfile(temp_path, dtype=np.float32)
 
+    except FileNotFoundError:
+        msg = (
+            "Could not read this audio file with soundfile, and ffmpeg is "
+            "not installed or not on PATH.\nInstall ffmpeg and restart the "
+            "app, e.g.:\n"
+            "  conda install -c conda-forge ffmpeg   (in the fnt "
+            "environment)\n"
+            "  winget install Gyan.FFmpeg            (system-wide on "
+            "Windows)"
+        )
+        if sf_error is not None:
+            msg += f"\n\n(soundfile could not decode it: {sf_error})"
+        raise RuntimeError(msg)
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
@@ -460,8 +512,9 @@ def get_audio_info(filepath: str) -> dict:
     Returns:
         Dictionary with audio file information
     """
+    ffprobe_exe = shutil.which('ffprobe') or 'ffprobe'
     probe_cmd = [
-        'ffprobe',
+        ffprobe_exe,
         '-v', 'error',
         '-show_entries', 'format=duration,size:stream=codec_name,sample_rate,channels',
         '-of', 'json',
@@ -470,7 +523,10 @@ def get_audio_info(filepath: str) -> dict:
 
     try:
         import json
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            probe_cmd, capture_output=True,
+            encoding='utf-8', errors='replace', check=True,
+        )
         data = json.loads(result.stdout)
 
         stream = data.get('streams', [{}])[0]
