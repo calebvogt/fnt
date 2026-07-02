@@ -10,8 +10,11 @@ import shutil
 import subprocess
 import tempfile
 import numpy as np
-from scipy import signal
 from typing import Tuple, Optional
+
+# scipy.signal is imported lazily inside the functions that use it — importing
+# it at module load added ~0.5s to any tool that pulls in this module (e.g. the
+# Mask Audio Detector at startup) even before a spectrogram is computed.
 import warnings
 
 try:
@@ -89,28 +92,18 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
     Returns:
         Tuple of (audio_data, sample_rate)
     """
-    # ffmpeg is a manual prerequisite (system PATH), not a pip/conda dependency
-    # of FNT. If it's absent, subprocess raises a bare FileNotFoundError /
-    # "[WinError 2] The system cannot find the file specified" that looks like
-    # the *audio* file is missing. Detect the missing tool first and say so.
-    ffprobe_exe = shutil.which('ffprobe')
-    ffmpeg_exe = shutil.which('ffmpeg')
-    if ffprobe_exe is None or ffmpeg_exe is None:
-        msg = (
-            "Could not read this audio file with soundfile, and ffmpeg is not "
-            "installed / not on PATH, so the fallback decoder is unavailable.\n"
-            "Install ffmpeg and restart the app, e.g.:\n"
-            "  conda install -c conda-forge ffmpeg   (in the fnt environment)\n"
-            "  winget install Gyan.FFmpeg            (system-wide on Windows)"
-        )
-        if sf_error is not None:
-            msg += f"\n\n(soundfile could not decode it: {sf_error})"
-        raise RuntimeError(msg)
+    # Resolve executables: prefer shutil.which (gives absolute path), but fall
+    # back to the bare name so subprocess can find it via the *system* PATH.
+    # On Windows, conda environments often don't inherit the full system PATH,
+    # so shutil.which('ffprobe') returns None even though ffprobe is callable
+    # from cmd.exe.
+    ffprobe_exe = shutil.which('ffprobe') or 'ffprobe'
+    ffmpeg_exe = shutil.which('ffmpeg') or 'ffmpeg'
 
     # First, get the sample rate from the input file
     probe_cmd = [
         ffprobe_exe,
-        '-v', 'error',
+        '-v', 'warning',
         '-select_streams', 'a:0',
         '-show_entries', 'stream=sample_rate',
         '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -118,14 +111,31 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
     ]
 
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-        sr = int(result.stdout.strip())
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or '').strip()
-        raise RuntimeError(
-            f"ffprobe could not read {os.path.basename(filepath)}"
-            + (f": {stderr}" if stderr else "")
+        result = subprocess.run(
+            probe_cmd, capture_output=True,
+            encoding='utf-8', errors='replace', check=True,
         )
+        sr = int(result.stdout.strip())
+    except FileNotFoundError:
+        msg = (
+            "Could not read this audio file with soundfile, and ffmpeg/ffprobe "
+            "is not installed or not on PATH, so the fallback decoder is "
+            "unavailable.\nInstall ffmpeg and restart the app, e.g.:\n"
+            "  conda install -c conda-forge ffmpeg   (in the fnt environment)\n"
+            "  winget install Gyan.FFmpeg            (system-wide on Windows)"
+        )
+        if sf_error is not None:
+            msg += f"\n\n(soundfile could not decode it: {sf_error})"
+        raise RuntimeError(msg)
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or '').strip()
+        parts = [f"ffprobe could not read {os.path.basename(filepath)}"]
+        if detail:
+            parts.append(detail)
+        if sf_error is not None:
+            parts.append(f"soundfile also failed: {sf_error}")
+        parts.append(f"path: {filepath}")
+        raise RuntimeError("\n".join(parts))
     except ValueError:
         raise RuntimeError(
             f"ffprobe returned no sample rate for {os.path.basename(filepath)} "
@@ -176,6 +186,7 @@ def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
         return audio
 
     num_samples = int(len(audio) * target_sr / orig_sr)
+    from scipy import signal
     return signal.resample(audio, num_samples)
 
 
@@ -209,6 +220,7 @@ def compute_spectrogram(
         - Sxx_db: Spectrogram in dB scale
     """
     # Compute spectrogram
+    from scipy import signal
     frequencies, times, Sxx = signal.spectrogram(
         audio,
         fs=sr,
@@ -330,6 +342,7 @@ def bandpass_filter(
         raise ValueError(f"Invalid frequency range: {lowcut} - {highcut} Hz")
 
     # Design filter
+    from scipy import signal
     sos = signal.butter(
         order,
         [lowcut / nyquist, highcut / nyquist],

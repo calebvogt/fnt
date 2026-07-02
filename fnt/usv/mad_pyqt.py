@@ -36,7 +36,8 @@ from PyQt5.QtWidgets import (
     QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
-from scipy import signal
+# scipy.signal is imported lazily where used (spectrogram compute / resample)
+# so opening MAD doesn't pay scipy's ~0.5s import before any file is loaded.
 
 from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
 from fnt.usv.usv_detector.mad_labels import pred_csv_sibling_path
@@ -320,6 +321,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if len(segment) < self.nperseg:
             return None
         noverlap = min(self.noverlap, self.nperseg - 1)
+        from scipy import signal
         _f, _t, Sxx = signal.spectrogram(
             segment, fs=self.sample_rate, nperseg=self.nperseg,
             noverlap=noverlap, nfft=self.nfft, window='hann',
@@ -7701,6 +7703,7 @@ class MADMainWindow(QMainWindow):
             n_output_samples = int(output_duration * output_sr)
             if n_output_samples < 100:
                 return
+            from scipy import signal
             segment = signal.resample(segment, n_output_samples).astype(np.float32)
             sd.play(segment, output_sr)
             self.is_playing = True

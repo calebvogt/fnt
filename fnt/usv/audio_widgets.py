@@ -11,7 +11,9 @@ import numpy as np
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF
 from PyQt5.QtGui import QFont, QColor, QPainter, QImage, QPen, QBrush
 from PyQt5.QtWidgets import QWidget, QSizePolicy
-from scipy import signal
+# scipy.signal is imported lazily where used (see below) so importing this
+# widget module (e.g. at Mask Audio Detector startup) doesn't pay scipy's
+# ~0.5s import before any spectrogram is actually computed.
 
 
 # =============================================================================
@@ -479,6 +481,7 @@ class SpectrogramWidget(QWidget):
         noverlap = min(noverlap, int(nperseg * 0.75))  # Cap at 75% overlap
         nfft = max(nperseg, 512)
 
+        from scipy import signal
         frequencies, times, Sxx = signal.spectrogram(
             segment, fs=effective_sr,
             nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann'
