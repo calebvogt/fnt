@@ -169,14 +169,16 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             parts.append(f"path: {filepath}")
             raise RuntimeError("\n".join(parts))
 
-    # Decode to raw PCM float32 using ffmpeg
+    # Decode to raw PCM float32 using ffmpeg.
+    # Try the file path directly first; if that fails, pipe the file through
+    # stdin — on Windows, mapped/network drives (e.g. Z:\) are per-logon-
+    # session and subprocesses sometimes can't see them even though Python can.
     with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp_file:
         temp_path = tmp_file.name
 
     try:
-        convert_cmd = [
+        base_cmd = [
             ffmpeg_exe,
-            '-i', filepath,
             '-f', 'f32le',
             '-acodec', 'pcm_f32le',
             '-ac', '1',
@@ -184,12 +186,23 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             temp_path
         ]
 
+        # Attempt 1: direct file path (fast, supports seeking)
         proc = subprocess.run(
-            convert_cmd, capture_output=True,
-            encoding='utf-8', errors='replace',
+            [ffmpeg_exe, '-i', filepath] + base_cmd[1:],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+
+        # Attempt 2: pipe through stdin if direct path failed
         if proc.returncode != 0:
-            detail = (proc.stderr or '').strip()
+            with open(filepath, 'rb') as audio_in:
+                proc = subprocess.run(
+                    [ffmpeg_exe, '-i', 'pipe:0'] + base_cmd[1:],
+                    stdin=audio_in,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+
+        if proc.returncode != 0:
+            detail = proc.stderr.decode('utf-8', errors='replace').strip()
             parts = [
                 f"ffmpeg could not decode {os.path.basename(filepath)}"
             ]
