@@ -56,6 +56,31 @@ DEFAULT_SUBTITLE_STYLE = {
 
 _VIDEO_EXT_RE = r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$'
 
+# ffmpeg replaced the -vsync option with -fps_mode in 5.1 and has since removed
+# -vsync entirely in recent builds. Detect which the installed ffmpeg supports
+# once and cache it so we emit the right flag for variable-frame-rate output.
+_FPS_MODE_ARGS = None
+
+
+def get_fps_mode_args():
+    """Return the ffmpeg args for VFR output: ['-fps_mode','vfr'] or ['-vsync','vfr']."""
+    global _FPS_MODE_ARGS
+    if _FPS_MODE_ARGS is None:
+        use_fps_mode = True  # modern default
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-h", "full"],
+                capture_output=True, text=True, timeout=20)
+            help_text = (r.stdout or "") + (r.stderr or "")
+            if "fps_mode" in help_text:
+                use_fps_mode = True
+            elif "vsync" in help_text:
+                use_fps_mode = False
+        except Exception:
+            use_fps_mode = True  # assume a modern ffmpeg if the probe fails
+        _FPS_MODE_ARGS = ["-fps_mode", "vfr"] if use_fps_mode else ["-vsync", "vfr"]
+    return list(_FPS_MODE_ARGS)
+
 
 def make_output_filename(video_file, output_format, replace_whitespace=False,
                          prefix="", suffix=""):
@@ -588,8 +613,10 @@ class VideoProcessorWorker(QThread):
             "-avoid_negative_ts", "make_zero",   # Fix timestamp issues
             "-max_muxing_queue_size", "10000000",
             "-fflags", "+genpts",                # Generate presentation timestamps
-            "-vsync", "vfr"                      # Variable frame rate (preserves timing)
         ])
+        # Variable frame rate (preserves timing). Uses -fps_mode on modern
+        # ffmpeg, falling back to -vsync on older builds.
+        cmd.extend(get_fps_mode_args())
         
         # Scaling and padding
         video_filters.extend([
