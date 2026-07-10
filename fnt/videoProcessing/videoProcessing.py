@@ -885,6 +885,7 @@ class VideoProcessingGUI(QMainWindow):
         self.selected_dirs = []
         self.selected_videos = []
         self.worker = None
+        self._user_stopped = False
         self.subtitle_style = dict(DEFAULT_SUBTITLE_STYLE)
         self._arrow_paths = self._create_arrow_images()
         self.init_ui()
@@ -1690,6 +1691,7 @@ class VideoProcessingGUI(QMainWindow):
             # else: reprocess_btn clicked, skip_already_processed stays False
 
         # Disable controls
+        self._user_stopped = False
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.add_dir_btn.setEnabled(False)
@@ -1750,8 +1752,96 @@ class VideoProcessingGUI(QMainWindow):
     def stop_processing(self):
         """Stop video processing"""
         if self.worker:
+            self._user_stopped = True
             self.worker.stop()
             self.log_message("Stopping processing...")
+
+    def _collect_output_folders(self):
+        """Return (proc_dirs, failed_dirs) that exist for the current inputs."""
+        base_dirs = list(self.selected_dirs)
+        base_dirs += [os.path.dirname(v) for v in self.selected_videos]
+        # De-duplicate while preserving order.
+        seen, bases = set(), []
+        for d in base_dirs:
+            key = os.path.normcase(os.path.normpath(d))
+            if key not in seen:
+                seen.add(key)
+                bases.append(d)
+
+        proc_dirs, failed_dirs = [], []
+        for d in bases:
+            p = os.path.join(d, "proc")
+            if os.path.isdir(p):
+                proc_dirs.append(p)
+            f = os.path.join(d, "proc_failed_copies")
+            if os.path.isdir(f):
+                failed_dirs.append(f)
+        return proc_dirs, failed_dirs
+
+    @staticmethod
+    def _count_videos_in(dirs):
+        """Count video files across the given directories."""
+        exts = ["*.avi", "*.mp4", "*.mov", "*.mkv",
+                "*.webm", "*.flv", "*.wmv", "*.m4v"]
+        n = 0
+        for d in dirs:
+            for e in exts:
+                n += len(glob.glob(os.path.join(d, e)))
+        return n
+
+    def _prompt_cleanup_folders(self):
+        """After a user stop, offer to delete the proc / proc_failed_copies folders."""
+        proc_dirs, failed_dirs = self._collect_output_folders()
+        if not proc_dirs and not failed_dirs:
+            return
+
+        proc_count = self._count_videos_in(proc_dirs)
+        failed_count = self._count_videos_in(failed_dirs)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Clean Up Output Folders")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "Processing was stopped. Would you like to delete any of the "
+            "output folders below?\n(Both are kept by default.)"))
+
+        proc_cb = failed_cb = None
+        if proc_dirs:
+            folder_word = "folder" if len(proc_dirs) == 1 else "folders"
+            proc_cb = QCheckBox(
+                f"Delete 'proc' {folder_word} "
+                f"({len(proc_dirs)} {folder_word}, {proc_count} processed video(s))")
+            proc_cb.setChecked(False)
+            lay.addWidget(proc_cb)
+        if failed_dirs:
+            folder_word = "folder" if len(failed_dirs) == 1 else "folders"
+            failed_cb = QCheckBox(
+                f"Delete 'proc_failed_copies' {folder_word} "
+                f"({len(failed_dirs)} {folder_word}, {failed_count} copy/copies)")
+            failed_cb.setChecked(False)
+            lay.addWidget(failed_cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Apply")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        to_delete = []
+        if proc_cb is not None and proc_cb.isChecked():
+            to_delete += proc_dirs
+        if failed_cb is not None and failed_cb.isChecked():
+            to_delete += failed_dirs
+
+        for d in to_delete:
+            try:
+                shutil.rmtree(d)
+                self.log_message(f"🗑️ Deleted {d}")
+            except Exception as e:
+                self.log_message(f"⚠️ Could not delete {d}: {e}")
     
     def update_file_progress(self, current, total):
         """Update file progress"""
@@ -1811,15 +1901,24 @@ class VideoProcessingGUI(QMainWindow):
         
         # Log final message
         self.log_message(f"\\n{'✅' if success else '❌'} {message}")
-        
+
+        user_stopped = getattr(self, "_user_stopped", False)
+
         # Show completion dialog
-        if success and "failed" not in message.lower():
+        if user_stopped:
+            QMessageBox.information(self, "Stopped", message)
+        elif success and "failed" not in message.lower():
             QMessageBox.information(self, "Complete", message)
         elif success and "failed" in message.lower():
             QMessageBox.warning(self, "Completed with Failures", message)
         else:
             QMessageBox.critical(self, "Error", message)
-        
+
+        # On a user-initiated stop, offer to clean up the output folders.
+        if user_stopped:
+            self._prompt_cleanup_folders()
+        self._user_stopped = False
+
         self.worker = None
     
     def closeEvent(self, event):
