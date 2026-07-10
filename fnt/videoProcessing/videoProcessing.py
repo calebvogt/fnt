@@ -19,7 +19,8 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
         QGridLayout, QPushButton, QLabel, QSpinBox, QCheckBox, QComboBox,
         QFileDialog, QMessageBox, QProgressBar, QTextEdit, QGroupBox,
-        QFrame, QSizePolicy, QScrollArea
+        QFrame, QSizePolicy, QScrollArea, QDialog, QColorDialog,
+        QDialogButtonBox, QLineEdit
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPainterPath
@@ -28,6 +29,101 @@ except ImportError:
     PYQT_AVAILABLE = False
     print("PyQt5 not available. Please install with: pip install PyQt5")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Subtitle (timestamp burn-in) helpers
+# ---------------------------------------------------------------------------
+
+# Numpad-style ASS alignment values (\an): 1=bottom-left … 9=top-right.
+SUBTITLE_POSITIONS = [
+    ("Top Left", 7), ("Top Center", 8), ("Top Right", 9),
+    ("Middle Left", 4), ("Center", 5), ("Middle Right", 6),
+    ("Bottom Left", 1), ("Bottom Center", 2), ("Bottom Right", 3),
+]
+
+# Proven defaults from the original iDVR-pro batch command.
+DEFAULT_SUBTITLE_STYLE = {
+    "font_size": 10,
+    "alignment": 1,            # bottom-left
+    "text_color": (255, 255, 255),   # white
+    "box": True,               # opaque highlight box behind text (BorderStyle=3)
+    "box_color": (0, 0, 0),    # black
+    "outline": 1,
+    "margin_v": 20,
+}
+
+
+_VIDEO_EXT_RE = r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$'
+
+
+def make_output_filename(video_file, output_format, replace_whitespace=False,
+                         prefix="", suffix=""):
+    """Build the output filename for a source video.
+
+    By default the output keeps the source basename exactly (only the extension
+    changes to the chosen output format). An optional prefix/suffix are added
+    around the name, and spaces are replaced with underscores when requested.
+    """
+    base = os.path.basename(video_file)
+    base_no_ext = re.sub(_VIDEO_EXT_RE, '', base, flags=re.IGNORECASE)
+    name = f"{prefix}{base_no_ext}{suffix}"
+    if replace_whitespace:
+        name = name.replace(" ", "_")
+    return f"{name}.{output_format}"
+
+
+def rgb_to_ass(rgb, alpha=0):
+    """Convert an (r, g, b) tuple to an ASS colour string &HAABBGGRR.
+
+    ASS stores colour as blue-green-red with an alpha byte where
+    00 == fully opaque and FF == fully transparent.
+    """
+    r, g, b = rgb
+    return "&H{:02X}{:02X}{:02X}{:02X}".format(alpha & 0xFF, b, g, r)
+
+
+def find_subtitle_file(video_file):
+    """Return the path to a sibling .smi subtitle for a video, or None.
+
+    Matches the video's basename with a .smi extension (case-insensitive),
+    mirroring the iDVR-pro naming convention (foo.avi -> foo.smi).
+    """
+    base = os.path.splitext(video_file)[0]
+    for ext in (".smi", ".SMI", ".Smi"):
+        candidate = base + ext
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def build_force_style(style):
+    """Build the ffmpeg subtitles `force_style` value from a style dict."""
+    parts = [
+        f"FontSize={style['font_size']}",
+        f"Alignment={style['alignment']}",
+        f"PrimaryColour={rgb_to_ass(style['text_color'])}",
+        f"MarginV={style['margin_v']}",
+        f"MarginL={style['margin_v']}",
+        f"MarginR={style['margin_v']}",
+        "Shadow=0",
+    ]
+    if style.get("box", True):
+        # BorderStyle=3 => opaque box. Set both Outline/Back colours to the
+        # chosen highlight colour so the box renders consistently across
+        # libass versions regardless of which field a build uses for the box.
+        box_ass = rgb_to_ass(style["box_color"])
+        parts.append("BorderStyle=3")
+        parts.append(f"Outline={style['outline']}")
+        parts.append(f"OutlineColour={box_ass}")
+        parts.append(f"BackColour={box_ass}")
+    else:
+        # BorderStyle=1 => outline + (disabled) shadow. Use box colour as the
+        # text outline colour for readability on light backgrounds.
+        parts.append("BorderStyle=1")
+        parts.append(f"Outline={style['outline']}")
+        parts.append(f"OutlineColour={rgb_to_ass(style['box_color'])}")
+    return ",".join(parts)
 
 
 class VideoProcessorWorker(QThread):
@@ -40,7 +136,9 @@ class VideoProcessorWorker(QThread):
     
     def __init__(self, input_dirs, input_videos, frame_rate, grayscale, apply_clahe,
                  remove_audio, output_format, crf_quality, resolution, codec, preset,
-                 instance_id=1, skip_already_processed=False):
+                 instance_id=1, skip_already_processed=False,
+                 burn_subtitles=False, subtitle_style=None,
+                 replace_whitespace=False, filename_prefix="", filename_suffix=""):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -55,6 +153,11 @@ class VideoProcessorWorker(QThread):
         self.preset = preset
         self.instance_id = instance_id
         self.skip_already_processed = skip_already_processed
+        self.burn_subtitles = burn_subtitles
+        self.subtitle_style = subtitle_style or dict(DEFAULT_SUBTITLE_STYLE)
+        self.replace_whitespace = replace_whitespace
+        self.filename_prefix = filename_prefix
+        self.filename_suffix = filename_suffix
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -82,12 +185,10 @@ class VideoProcessorWorker(QThread):
 
     def _get_output_filename(self, video_file):
         """Get the expected output filename for a given input video."""
-        video_filename = os.path.basename(video_file)
-        video_filename_no_ext = re.sub(
-            r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
-            video_filename, flags=re.IGNORECASE
-        )
-        return f"{video_filename_no_ext}_processed.{self.output_format}"
+        return make_output_filename(
+            video_file, self.output_format,
+            replace_whitespace=self.replace_whitespace,
+            prefix=self.filename_prefix, suffix=self.filename_suffix)
 
     def _get_video_resolution(self, filepath):
         """Get video resolution (width, height) via ffprobe. Returns (w, h) or None."""
@@ -310,6 +411,12 @@ class VideoProcessorWorker(QThread):
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(video_file, output_file)
 
+            # When burning subtitles we run ffmpeg from the video's own folder so
+            # the .smi can be referenced by basename in the filtergraph (avoids
+            # Windows drive-letter/colon escaping). Input/output use absolute
+            # paths, so this cwd is otherwise harmless.
+            run_cwd = os.path.dirname(video_file) if self.burn_subtitles else None
+
             # Run FFmpeg and capture output for GUI display.
             # stdin=subprocess.DEVNULL prevents FFmpeg from hanging on
             # interactive prompts (e.g. "Enter command:" from corrupt files).
@@ -320,7 +427,8 @@ class VideoProcessorWorker(QThread):
                 stderr=subprocess.STDOUT,
                 text=True,
                 universal_newlines=True,
-                bufsize=1
+                bufsize=1,
+                cwd=run_cwd
             )
 
             # Use a background thread to read lines from stdout so we can
@@ -506,11 +614,232 @@ class VideoProcessorWorker(QThread):
         # Grayscale conversion (without contrast enhancement)
         if self.grayscale:
             video_filters.append("format=gray")
-        
+
+        # Burn in timestamps from a sibling .smi subtitle file (last in the
+        # chain so it draws on top of the scaled/padded/grayscale frame).
+        # ffmpeg runs with cwd == the video's directory (see process_single_file),
+        # so we reference the subtitle by basename to avoid Windows drive-letter
+        # and path-escaping headaches in the filtergraph.
+        if self.burn_subtitles:
+            smi_path = find_subtitle_file(input_file)
+            if smi_path:
+                smi_name = os.path.basename(smi_path)
+                # Escape characters special to the filtergraph value.
+                esc = smi_name.replace("\\", "\\\\").replace("'", "\\'")
+                force_style = build_force_style(self.subtitle_style)
+                video_filters.append(
+                    f"subtitles='{esc}':force_style='{force_style}'")
+            else:
+                self.progress_update.emit(
+                    f"  ⚠️ No .smi subtitle found for "
+                    f"{os.path.basename(input_file)} — processing without timestamps")
+
         video_filter = ",".join(video_filters)
         cmd.extend(["-vf", video_filter, output_file])
-        
+
         return cmd
+
+
+class SubtitleStyleDialog(QDialog):
+    """Dialog to configure how burned-in .smi timestamps look."""
+
+    def __init__(self, parent=None, style=None):
+        super().__init__(parent)
+        self.setWindowTitle("Subtitle / Timestamp Style")
+        self.setModal(True)
+        # Work on a copy so Cancel discards changes.
+        self.style = dict(DEFAULT_SUBTITLE_STYLE)
+        if style:
+            self.style.update(style)
+
+        layout = QGridLayout()
+        self.setLayout(layout)
+        r = 0
+
+        # Font size
+        layout.addWidget(QLabel("Text Size:"), r, 0)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(6, 72)
+        self.size_spin.setValue(self.style["font_size"])
+        self.size_spin.valueChanged.connect(self._on_change)
+        layout.addWidget(self.size_spin, r, 1)
+        r += 1
+
+        # Position
+        layout.addWidget(QLabel("Position:"), r, 0)
+        self.pos_combo = QComboBox()
+        for label, _ in SUBTITLE_POSITIONS:
+            self.pos_combo.addItem(label)
+        # Select current alignment
+        for i, (_, align) in enumerate(SUBTITLE_POSITIONS):
+            if align == self.style["alignment"]:
+                self.pos_combo.setCurrentIndex(i)
+                break
+        self.pos_combo.currentIndexChanged.connect(self._on_change)
+        layout.addWidget(self.pos_combo, r, 1)
+        r += 1
+
+        # Text colour
+        layout.addWidget(QLabel("Text Color:"), r, 0)
+        self.text_color_btn = QPushButton()
+        self.text_color_btn.clicked.connect(self._pick_text_color)
+        layout.addWidget(self.text_color_btn, r, 1)
+        r += 1
+
+        # Background box toggle
+        self.box_check = QCheckBox("Draw background highlight box")
+        self.box_check.setChecked(self.style["box"])
+        self.box_check.setToolTip(
+            "Opaque box behind the text (recommended for readability). "
+            "When off, text is drawn with a coloured outline instead.")
+        self.box_check.stateChanged.connect(self._on_box_toggle)
+        layout.addWidget(self.box_check, r, 0, 1, 2)
+        r += 1
+
+        # Background / outline colour
+        self.box_color_label = QLabel("Background Color:")
+        layout.addWidget(self.box_color_label, r, 0)
+        self.box_color_btn = QPushButton()
+        self.box_color_btn.clicked.connect(self._pick_box_color)
+        layout.addWidget(self.box_color_btn, r, 1)
+        r += 1
+
+        # Outline width
+        layout.addWidget(QLabel("Outline Width:"), r, 0)
+        self.outline_spin = QSpinBox()
+        self.outline_spin.setRange(0, 6)
+        self.outline_spin.setValue(self.style["outline"])
+        self.outline_spin.valueChanged.connect(self._on_change)
+        layout.addWidget(self.outline_spin, r, 1)
+        r += 1
+
+        # Margin
+        layout.addWidget(QLabel("Edge Margin (px):"), r, 0)
+        self.margin_spin = QSpinBox()
+        self.margin_spin.setRange(0, 300)
+        self.margin_spin.setValue(self.style["margin_v"])
+        self.margin_spin.setToolTip("Distance from the frame edge (applied to the chosen corner/side)")
+        self.margin_spin.valueChanged.connect(self._on_change)
+        layout.addWidget(self.margin_spin, r, 1)
+        r += 1
+
+        # Preview
+        layout.addWidget(QLabel("Preview:"), r, 0)
+        r += 1
+        self.preview = QLabel()
+        self.preview.setFixedSize(360, 140)
+        self.preview.setStyleSheet(
+            "background-color: #444444; border: 1px solid #666666;")
+        layout.addWidget(self.preview, r, 0, 1, 2)
+        r += 1
+
+        # OK / Cancel / Reset
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._reset_defaults)
+        layout.addWidget(buttons, r, 0, 1, 2)
+
+        self._refresh_color_buttons()
+        self._on_box_toggle()
+        self._update_preview()
+
+    # -- helpers -----------------------------------------------------------
+    def _swatch_style(self, rgb):
+        r, g, b = rgb
+        # Pick readable label text colour based on luminance.
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        fg = "#000000" if lum > 140 else "#ffffff"
+        return (f"background-color: rgb({r},{g},{b}); color: {fg}; "
+                f"border: 1px solid #888888; padding: 4px;")
+
+    def _refresh_color_buttons(self):
+        tc = self.style["text_color"]
+        bc = self.style["box_color"]
+        self.text_color_btn.setText("rgb(%d, %d, %d)" % tc)
+        self.text_color_btn.setStyleSheet(self._swatch_style(tc))
+        self.box_color_btn.setText("rgb(%d, %d, %d)" % bc)
+        self.box_color_btn.setStyleSheet(self._swatch_style(bc))
+
+    def _pick_text_color(self):
+        c = QColorDialog.getColor(QColor(*self.style["text_color"]), self, "Text Color")
+        if c.isValid():
+            self.style["text_color"] = (c.red(), c.green(), c.blue())
+            self._refresh_color_buttons()
+            self._update_preview()
+
+    def _pick_box_color(self):
+        c = QColorDialog.getColor(QColor(*self.style["box_color"]), self, "Background Color")
+        if c.isValid():
+            self.style["box_color"] = (c.red(), c.green(), c.blue())
+            self._refresh_color_buttons()
+            self._update_preview()
+
+    def _on_box_toggle(self):
+        is_box = self.box_check.isChecked()
+        self.box_color_label.setText("Background Color:" if is_box else "Outline Color:")
+        self._on_change()
+
+    def _on_change(self):
+        self._sync_style()
+        self._update_preview()
+
+    def _sync_style(self):
+        self.style["font_size"] = self.size_spin.value()
+        self.style["alignment"] = SUBTITLE_POSITIONS[self.pos_combo.currentIndex()][1]
+        self.style["box"] = self.box_check.isChecked()
+        self.style["outline"] = self.outline_spin.value()
+        self.style["margin_v"] = self.margin_spin.value()
+
+    def _reset_defaults(self):
+        self.style = dict(DEFAULT_SUBTITLE_STYLE)
+        self.size_spin.setValue(self.style["font_size"])
+        for i, (_, align) in enumerate(SUBTITLE_POSITIONS):
+            if align == self.style["alignment"]:
+                self.pos_combo.setCurrentIndex(i)
+                break
+        self.box_check.setChecked(self.style["box"])
+        self.outline_spin.setValue(self.style["outline"])
+        self.margin_spin.setValue(self.style["margin_v"])
+        self._refresh_color_buttons()
+        self._update_preview()
+
+    def _update_preview(self):
+        # Approximate the on-frame appearance. Scale the ASS font size up for
+        # legibility in the small preview (ASS sizes are tuned for 1080p).
+        tr, tg, tb = self.style["text_color"]
+        br, bg, bb = self.style["box_color"]
+        px = max(9, int(self.style["font_size"] * 1.6))
+        align = self.style["alignment"]
+        # Map numpad alignment -> Qt alignment for the preview.
+        vert = {7: Qt.AlignTop, 8: Qt.AlignTop, 9: Qt.AlignTop,
+                4: Qt.AlignVCenter, 5: Qt.AlignVCenter, 6: Qt.AlignVCenter,
+                1: Qt.AlignBottom, 2: Qt.AlignBottom, 3: Qt.AlignBottom}[align]
+        horiz = {7: Qt.AlignLeft, 4: Qt.AlignLeft, 1: Qt.AlignLeft,
+                 8: Qt.AlignHCenter, 5: Qt.AlignHCenter, 2: Qt.AlignHCenter,
+                 9: Qt.AlignRight, 6: Qt.AlignRight, 3: Qt.AlignRight}[align]
+        self.preview.setAlignment(vert | horiz)
+        m = max(2, int(self.style["margin_v"] * 0.4))
+        if self.style["box"]:
+            text_css = (f"color: rgb({tr},{tg},{tb}); "
+                        f"background-color: rgb({br},{bg},{bb}); padding: 1px 4px;")
+        else:
+            # Simulate outline with a text-shadow halo.
+            text_css = (f"color: rgb({tr},{tg},{tb}); background: transparent;")
+        self.preview.setText("CAM1 2018-07-17 19:49:37")
+        self.preview.setStyleSheet(
+            "QLabel { background-color: #444444; border: 1px solid #666666; }")
+        # Inner styling via a rich-text span so box/margins render.
+        self.preview.setTextFormat(Qt.RichText)
+        self.preview.setText(
+            f"<div style='margin:{m}px; font-size:{px}px; "
+            f"font-family:Arial;'>"
+            f"<span style='{text_css}'>CAM1 2018-07-17 19:49:37</span></div>")
+
+    def get_style(self):
+        self._sync_style()
+        return dict(self.style)
 
 
 class VideoProcessingGUI(QMainWindow):
@@ -529,6 +858,7 @@ class VideoProcessingGUI(QMainWindow):
         self.selected_dirs = []
         self.selected_videos = []
         self.worker = None
+        self.subtitle_style = dict(DEFAULT_SUBTITLE_STYLE)
         self._arrow_paths = self._create_arrow_images()
         self.init_ui()
     
@@ -835,6 +1165,62 @@ class VideoProcessingGUI(QMainWindow):
         self.remove_audio_check.setToolTip("Remove audio track from videos to reduce file size")
         group_layout.addWidget(self.remove_audio_check, row, 0, 1, 2)
         row += 1
+
+        # Burn-in timestamps from .smi subtitles
+        self.subtitles_check = QCheckBox("Burn in timestamps from .smi subtitles")
+        self.subtitles_check.setChecked(False)
+        self.subtitles_check.setToolTip(
+            "Hardcode timestamps from sibling .smi subtitle files (e.g. iDVR-pro "
+            "security cameras) directly into the output video.")
+        self.subtitles_check.stateChanged.connect(self._on_subtitles_toggle)
+        group_layout.addWidget(self.subtitles_check, row, 0, 1, 1)
+
+        self.subtitle_style_btn = QPushButton("Subtitle Style…")
+        self.subtitle_style_btn.setEnabled(False)
+        self.subtitle_style_btn.setToolTip("Adjust text size, position, colours and background box")
+        self.subtitle_style_btn.clicked.connect(self._open_subtitle_style_dialog)
+        group_layout.addWidget(self.subtitle_style_btn, row, 1, 1, 1)
+        row += 1
+
+        # Remove whitespace from output filenames option
+        self.replace_whitespace_check = QCheckBox("Remove whitespace from filenames")
+        self.replace_whitespace_check.setChecked(False)
+        self.replace_whitespace_check.setToolTip(
+            "Replace spaces with underscores in output filenames "
+            "(e.g. 'CAM1 2018-07-17.mp4' -> 'CAM1_2018-07-17.mp4')")
+        self.replace_whitespace_check.stateChanged.connect(self._update_filename_preview)
+        group_layout.addWidget(self.replace_whitespace_check, row, 0, 1, 2)
+        row += 1
+
+        # Optional filename prefix / suffix
+        group_layout.addWidget(QLabel("Filename Prefix:"), row, 0)
+        self.prefix_edit = QLineEdit()
+        self.prefix_edit.setPlaceholderText("(none)")
+        self.prefix_edit.setToolTip("Text added to the front of each output filename")
+        self.prefix_edit.textChanged.connect(self._update_filename_preview)
+        group_layout.addWidget(self.prefix_edit, row, 1)
+        row += 1
+
+        group_layout.addWidget(QLabel("Filename Suffix:"), row, 0)
+        self.suffix_edit = QLineEdit()
+        self.suffix_edit.setPlaceholderText("(none)")
+        self.suffix_edit.setToolTip("Text added to the end of each output filename (before the extension)")
+        self.suffix_edit.textChanged.connect(self._update_filename_preview)
+        group_layout.addWidget(self.suffix_edit, row, 1)
+        row += 1
+
+        # Live filename preview
+        self.filename_preview_label = QLabel()
+        self.filename_preview_label.setWordWrap(True)
+        self.filename_preview_label.setStyleSheet(
+            "color: #7fd1b9; font-family: 'Courier New', monospace; "
+            "font-size: 11px; margin: 2px 0 6px 0;")
+        group_layout.addWidget(self.filename_preview_label, row, 0, 1, 2)
+        row += 1
+
+        # Output format changes the extension shown in the preview.
+        self.format_combo.currentTextChanged.connect(self._update_filename_preview)
+        self._update_filename_preview()
         
         # CLAHE contrast enhancement option - COMMENTED OUT FOR NOW
         # Can be re-enabled later if needed
@@ -915,6 +1301,41 @@ class VideoProcessingGUI(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
     
+    def _on_subtitles_toggle(self):
+        """Enable/disable the style button with the subtitles checkbox."""
+        self.subtitle_style_btn.setEnabled(self.subtitles_check.isChecked())
+
+    def _update_filename_preview(self):
+        """Live-update the example output filename from the current options."""
+        # Use the first selected video as the example, else a representative name.
+        example = None
+        if self.selected_videos:
+            example = os.path.basename(self.selected_videos[0])
+        elif self.selected_dirs:
+            for ext in ("*.avi", "*.mp4", "*.mov", "*.mkv",
+                        "*.webm", "*.flv", "*.wmv", "*.m4v"):
+                hits = glob.glob(os.path.join(self.selected_dirs[0], ext))
+                if hits:
+                    example = os.path.basename(hits[0])
+                    break
+        if not example:
+            example = "CAM1 2018-07-17 19 49 37 025.avi"
+
+        out_name = make_output_filename(
+            example,
+            self.format_combo.currentText(),
+            replace_whitespace=self.replace_whitespace_check.isChecked(),
+            prefix=self.prefix_edit.text(),
+            suffix=self.suffix_edit.text(),
+        )
+        self.filename_preview_label.setText(f"Example:  {example}  →  proc/{out_name}")
+
+    def _open_subtitle_style_dialog(self):
+        """Open the subtitle styling dialog and store the result."""
+        dlg = SubtitleStyleDialog(self, self.subtitle_style)
+        if dlg.exec_() == QDialog.Accepted:
+            self.subtitle_style = dlg.get_style()
+
     def toggle_advanced_options(self):
         """Toggle visibility of advanced options"""
         is_visible = self.advanced_frame.isVisible()
@@ -1046,7 +1467,54 @@ class VideoProcessingGUI(QMainWindow):
                 display_items.append(f"\\nVideos ({len(self.selected_videos)}):")
                 display_items.extend([f"  • {v}" for v in self.selected_videos])
             self.dir_list_label.setText("\\n".join(display_items))
+        # Refresh the filename preview to reflect the current selection.
+        if hasattr(self, "filename_preview_label"):
+            self._update_filename_preview()
     
+    def _scan_subtitle_matches(self):
+        """Count how many selected videos have a matching .smi file.
+
+        Returns (with_smi, total_videos).
+        """
+        video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv",
+                            "*.webm", "*.flv", "*.wmv", "*.m4v"]
+        videos = []
+        for input_dir in self.selected_dirs:
+            for ext in video_extensions:
+                videos.extend(glob.glob(os.path.join(input_dir, ext)))
+        videos.extend(self.selected_videos)
+
+        with_smi = sum(1 for v in videos if find_subtitle_file(v) is not None)
+        return with_smi, len(videos)
+
+    def _find_output_collisions(self, output_format, replace_whitespace,
+                                prefix, suffix):
+        """Return {output_path: [source_files]} for outputs that ≥2 inputs share.
+
+        Two inputs collide only when they resolve to the same file in the same
+        proc/ folder (e.g. 'clip.avi' and 'clip.mov' both -> 'clip.mp4').
+        """
+        video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv",
+                            "*.webm", "*.flv", "*.wmv", "*.m4v"]
+        outputs = {}  # output_path -> [sources]
+
+        def register(src, proc_dir):
+            out = os.path.normcase(os.path.normpath(os.path.join(
+                proc_dir,
+                make_output_filename(src, output_format, replace_whitespace,
+                                     prefix, suffix))))
+            outputs.setdefault(out, []).append(src)
+
+        for input_dir in self.selected_dirs:
+            proc_dir = os.path.join(input_dir, "proc")
+            for ext in video_extensions:
+                for vf in glob.glob(os.path.join(input_dir, ext)):
+                    register(vf, proc_dir)
+        for video_file in self.selected_videos:
+            register(video_file, os.path.join(os.path.dirname(video_file), "proc"))
+
+        return {out: srcs for out, srcs in outputs.items() if len(srcs) > 1}
+
     def start_processing(self):
         """Start video processing"""
         if not self.selected_dirs and not self.selected_videos:
@@ -1076,6 +1544,66 @@ class VideoProcessingGUI(QMainWindow):
         resolution_text = self.resolution_combo.currentText()
         resolution = resolution_text.split()[0]  # Extract "1080p" or "720p"
 
+        replace_whitespace = self.replace_whitespace_check.isChecked()
+        filename_prefix = self.prefix_edit.text()
+        filename_suffix = self.suffix_edit.text()
+
+        # --- Guard: warn if multiple inputs map to the same output file ---
+        collisions = self._find_output_collisions(
+            output_format, replace_whitespace, filename_prefix, filename_suffix)
+        if collisions:
+            lines = []
+            for out, srcs in list(collisions.items())[:5]:
+                names = ", ".join(os.path.basename(s) for s in srcs)
+                lines.append(f"  • {os.path.basename(out)}  ⟵  {names}")
+            more = "" if len(collisions) <= 5 else f"\n  … and {len(collisions) - 5} more."
+            resp = QMessageBox.warning(
+                self, "Output Filename Collision",
+                f"{len(collisions)} output filename(s) would be produced by more "
+                f"than one source video. Each group writes to the same file in "
+                f"proc/, so only the last one processed would survive:\n\n"
+                + "\n".join(lines) + more +
+                "\n\nProcess anyway (files will overwrite each other)?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp == QMessageBox.No:
+                return
+
+        # --- Subtitle burn-in detection / confirmation ---
+        burn_subtitles = self.subtitles_check.isChecked()
+        with_smi, total_scanned = self._scan_subtitle_matches()
+
+        if not burn_subtitles and with_smi > 0:
+            # Auto-detect: offer to turn it on since matching .smi files exist.
+            resp = QMessageBox.question(
+                self, "Subtitle Files Detected",
+                f"{with_smi} of {total_scanned} videos have a matching .smi "
+                f"subtitle file.\n\nBurn these timestamps into the processed "
+                f"videos?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if resp == QMessageBox.Yes:
+                burn_subtitles = True
+                self.subtitles_check.setChecked(True)
+
+        if burn_subtitles:
+            if with_smi == 0:
+                resp = QMessageBox.warning(
+                    self, "No Subtitle Files Found",
+                    "Timestamp burn-in is enabled, but no matching .smi files "
+                    "were found next to your videos.\n\nProcess anyway (without "
+                    "timestamps)?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if resp == QMessageBox.No:
+                    return
+            elif with_smi < total_scanned:
+                resp = QMessageBox.question(
+                    self, "Some Videos Missing Subtitles",
+                    f"{with_smi} of {total_scanned} videos have a matching .smi "
+                    f"file. The remaining {total_scanned - with_smi} will be "
+                    f"processed without burned-in timestamps.\n\nContinue?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if resp == QMessageBox.No:
+                    return
+
         # --- Detect already-processed videos ---
         skip_already_processed = False
         video_extensions_check = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
@@ -1089,13 +1617,11 @@ class VideoProcessingGUI(QMainWindow):
                 video_files = glob.glob(os.path.join(input_dir, ext))
                 for vf in video_files:
                     total_video_count += 1
-                    vf_basename = os.path.basename(vf)
-                    vf_no_ext = re.sub(
-                        r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
-                        vf_basename, flags=re.IGNORECASE
-                    )
                     expected_output = os.path.join(
-                        proc_dir, f"{vf_no_ext}_processed.{output_format}"
+                        proc_dir,
+                        make_output_filename(
+                            vf, output_format, replace_whitespace,
+                            filename_prefix, filename_suffix)
                     )
                     if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
                         already_processed_count += 1
@@ -1104,13 +1630,11 @@ class VideoProcessingGUI(QMainWindow):
             total_video_count += 1
             video_dir = os.path.dirname(video_file)
             proc_dir = os.path.join(video_dir, "proc")
-            vf_basename = os.path.basename(video_file)
-            vf_no_ext = re.sub(
-                r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$', '',
-                vf_basename, flags=re.IGNORECASE
-            )
             expected_output = os.path.join(
-                proc_dir, f"{vf_no_ext}_processed.{output_format}"
+                proc_dir,
+                make_output_filename(
+                    video_file, output_format, replace_whitespace,
+                    filename_prefix, filename_suffix)
             )
             if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
                 already_processed_count += 1
@@ -1156,8 +1680,18 @@ class VideoProcessingGUI(QMainWindow):
         self.ffmpeg_log.clear()
         self.log_message("Starting video preprocessing...")
         self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
-        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}")
-        
+        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}")
+        if filename_prefix or filename_suffix:
+            self.log_message(
+                f"Filename: prefix='{filename_prefix}', suffix='{filename_suffix}'")
+        if burn_subtitles:
+            s = self.subtitle_style
+            pos = next((lbl for lbl, a in SUBTITLE_POSITIONS if a == s["alignment"]), "?")
+            self.log_message(
+                f"Subtitles: burning .smi timestamps ({with_smi} matched) — "
+                f"size {s['font_size']}, {pos}, "
+                f"box {'on' if s['box'] else 'off'}")
+
         # Start worker thread
         self.worker = VideoProcessorWorker(
             self.selected_dirs,
@@ -1172,7 +1706,12 @@ class VideoProcessingGUI(QMainWindow):
             codec,
             preset,
             self.instance_id,
-            skip_already_processed=skip_already_processed
+            skip_already_processed=skip_already_processed,
+            burn_subtitles=burn_subtitles,
+            subtitle_style=dict(self.subtitle_style),
+            replace_whitespace=replace_whitespace,
+            filename_prefix=filename_prefix,
+            filename_suffix=filename_suffix
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
