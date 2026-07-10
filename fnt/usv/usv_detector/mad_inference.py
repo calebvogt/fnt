@@ -657,9 +657,90 @@ def run_inference_on_file(
     )
     t_infer = _time.perf_counter() - _t_inf0
 
+    # --- Carry reviewed decisions across re-runs -----------------------
+    # Read the file's prior detections so a normal re-run only ever
+    # (re)generates *pending* predictions. Two classes of prior row survive:
+    #   • hand-labels        — string blob_id (painted / SAM), always kept, and
+    #   • reviewed predictions — int blob_id already Accepted or Rejected.
+    # Reviewed calls' regions are blanked from the probability map below so the
+    # model can't resurface them as fresh pending blobs. Deleted calls left no
+    # row, so their region re-opens for detection.
+    #
+    # ``preserve_labels`` is the master switch: when the user picks "Re-detect
+    # from scratch" it is False, so we ignore reviewed decisions (discard those
+    # rows, no region shielding) and re-detect everywhere. Hand-label ROWS are
+    # never deleted regardless, but with preserve off their regions aren't
+    # shielded either, so predictions may appear over them.
+    dt = _time_per_frame(nperseg, noverlap, sr)
+    df = _freq_per_bin(nfft, sr)
+    csv_path = pred_csv_sibling_path(wav_path)
+    prior_rows: List[Dict] = []
+    if Path(csv_path).is_file():
+        try:
+            prior_rows = read_blob_csv(csv_path)
+        except Exception:
+            prior_rows = []
+    handlabel_rows = [r for r in prior_rows
+                      if not isinstance(r.get('blob_id'), int)]
+    reviewed_rows = ([r for r in prior_rows
+                      if isinstance(r.get('blob_id'), int)
+                      and r.get('status') in ('accepted', 'rejected')]
+                     if cfg.preserve_labels else [])
+
+    # Prior per-blob crops — used both to redraw preserved calls as exact masks
+    # and to blank their exact mask (dilated) below.
+    from .fnt_mask_store import (masks_sibling_path as _masks_path,
+                                 read_all_pred_masks)
+    try:
+        old_crops = read_all_pred_masks(_masks_path(wav_path))
+    except Exception:
+        old_crops = {}
+
+    # Blank each reviewed call from the probability map. Prefer the exact stored
+    # mask dilated by a few px — the dilation swallows the sub-threshold
+    # probability halo just outside the old mask (so the call can't re-form,
+    # even at a modestly lower threshold) while staying tight to the call's
+    # actual shape, so a genuinely different call nearby is NOT over-suppressed.
+    # Fall back to the second/Hz bounding box only when no crop is stored.
+    _SUPPRESS_DILATE_PX = 3
+    if reviewed_rows:
+        from scipy import ndimage
+    Fb, Tb = prob.shape
+    for r in reviewed_rows:
+        c = old_crops.get(str(r.get('blob_id')))
+        m = None if c is None else (np.asarray(c.get('mask')) > 0)
+        if m is not None and m.any():
+            pad = _SUPPRESS_DILATE_PX
+            f_off, t_off = int(c['f_off']), int(c['t_off'])
+            mh, mw = m.shape
+            # Window on the full grid, padded so the dilation has room.
+            wf0, wf1 = max(0, f_off - pad), min(Fb, f_off + mh + pad)
+            wt0, wt1 = max(0, t_off - pad), min(Tb, t_off + mw + pad)
+            if wf1 <= wf0 or wt1 <= wt0:
+                continue
+            win = np.zeros((wf1 - wf0, wt1 - wt0), dtype=bool)
+            # Portion of the mask that lands inside the (clipped) window.
+            sf0, sf1 = max(0, wf0 - f_off), min(mh, wf1 - f_off)
+            st0, st1 = max(0, wt0 - t_off), min(mw, wt1 - t_off)
+            if sf1 > sf0 and st1 > st0:
+                win[(f_off + sf0) - wf0:(f_off + sf1) - wf0,
+                    (t_off + st0) - wt0:(t_off + st1) - wt0] = m[sf0:sf1, st0:st1]
+                win = ndimage.binary_dilation(win, iterations=pad)
+                prob[wf0:wf1, wt0:wt1][win] = 0.0
+        else:  # no stored crop — fall back to the CSV's second/Hz box
+            f0 = int(r.get('min_freq_hz', 0.0) / df) if df else 0
+            f1 = int(round(r.get('max_freq_hz', 0.0) / df)) if df else Fb
+            t0 = int(r.get('start_s', 0.0) / dt) if dt else 0
+            t1 = int(round(r.get('stop_s', 0.0) / dt)) if dt else Tb
+            f0, f1 = max(0, min(Fb, f0)), max(0, min(Fb, f1))
+            t0, t1 = max(0, min(Tb, t0)), max(0, min(Tb, t1))
+            if f1 > f0 and t1 > t0:
+                prob[f0:f1, t0:t1] = 0.0
+
     # Preserve confirmed labels: zero out the probability mask in any time
     # column that already contains a human-confirmed call for this file, so
-    # predictions never overwrite confirmed annotations.
+    # predictions never overwrite confirmed annotations. Skipped when the user
+    # asked to re-detect from scratch (preserve_labels False).
     if cfg.preserve_labels and cfg.training_data_dir:
         try:
             from .mad_examples import reconstruct_file_mask
@@ -681,6 +762,12 @@ def run_inference_on_file(
                           spec=spec)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
+    # Re-key the fresh predictions so their int blob_ids never collide with the
+    # reviewed predictions we're keeping (whose ids came from an earlier run).
+    kept_int_ids = [r['blob_id'] for r in reviewed_rows]
+    id_offset = (max(kept_int_ids) + 1) if kept_int_ids else 0
+    for i, r in enumerate(rows):
+        r['blob_id'] = id_offset + i
     # Provenance: which model + settings produced these predictions.
     model_name = Path(cfg.model_path).stem if cfg.model_path else ''
     for r in rows:
@@ -688,24 +775,17 @@ def run_inference_on_file(
         r['threshold'] = cfg.threshold
         r['min_blob_pixels'] = cfg.min_blob_pixels
 
-    csv_path = pred_csv_sibling_path(wav_path)
     if cfg.save_blob_csv:
-        # The CSV is unified: hand-labels (stable string blob_ids) live here
-        # alongside predictions (int blob_ids). A run replaces only the
-        # prediction rows; existing hand-label rows are preserved.
-        preserved = []
-        if Path(csv_path).is_file():
-            try:
-                preserved = [r for r in read_blob_csv(csv_path)
-                             if not isinstance(r.get('blob_id'), int)]
-            except Exception:
-                preserved = []
-        write_blob_csv(csv_path, preserved + rows)
+        # The CSV is unified: hand-labels (string blob_ids) and reviewed
+        # predictions (Accepted/Rejected) are carried over verbatim; only
+        # pending predictions are regenerated.
+        write_blob_csv(csv_path, handlabel_rows + reviewed_rows + rows)
     # Persist each blob's small cropped mask (NOT the multi-GB /prob grid):
-    # blob_id matches the CSV row's blob_id (both come from enumerate over the
-    # same time-sorted blob list). On file switch these few-MB crops are read
-    # directly, so predictions redraw without decompressing the full grid.
-    # MAD intentionally drops /prob — re-run inference to change the threshold.
+    # blob_id matches the CSV row's blob_id. On file switch these few-MB crops
+    # are read directly, so predictions redraw without decompressing the full
+    # grid. MAD intentionally drops /prob — re-run inference to change the
+    # threshold. Reviewed predictions keep their original crop so they still
+    # draw as exact masks (write_pred_masks replaces the whole crop group).
     h5_path = None
     try:
         from .fnt_mask_store import (masks_sibling_path, write_pred_masks,
@@ -714,11 +794,15 @@ def run_inference_on_file(
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
                        n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
-        crops = [
-            {'blob_id': i, 'mask': b['mask'],
-             'f_off': b['f_low'], 't_off': b['t_start']}
-            for i, b in enumerate(blobs)
-        ]
+        crops = []
+        for r in reviewed_rows:
+            c = old_crops.get(str(r['blob_id']))
+            if c is not None:
+                crops.append({'blob_id': r['blob_id'], 'mask': c['mask'],
+                              'f_off': c['f_off'], 't_off': c['t_off']})
+        for i, b in enumerate(blobs):
+            crops.append({'blob_id': id_offset + i, 'mask': b['mask'],
+                          'f_off': b['f_low'], 't_off': b['t_start']})
         write_pred_masks(h5_path, crops)
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)

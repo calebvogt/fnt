@@ -47,6 +47,13 @@ class UNetTrainingConfig:
     early_stop_patience: int = 8
     early_stop_min_delta: float = 1e-4
 
+    # Live per-epoch prediction previews: when on, each epoch emits a small
+    # rotating set of (spectrogram, ground-truth, predicted-mask) tiles for the
+    # GUI preview window. Cheap (one extra forward pass on ``preview_count``
+    # val tiles, under no_grad); off in headless/CLI use.
+    emit_previews: bool = False
+    preview_count: int = 6
+
     # Spectrogram / tile params — filled from MADProjectConfig.
     nperseg: int = 512
     noverlap: int = 384
@@ -150,6 +157,77 @@ def masked_bce_dice_loss(logits, target, weight, eps: float = 1e-6):
     dice = 1 - (2 * inter + eps) / (union + eps)
 
     return bce_masked + dice
+
+
+# ----------------------------------------------------------------------
+# Live per-epoch prediction previews
+# ----------------------------------------------------------------------
+def _shrink_for_preview(a: np.ndarray, max_h: int = 160, max_w: int = 192):
+    """Nearest-neighbour decimate a tile so preview payloads stay small."""
+    h, w = a.shape
+    sh = max(1, int(np.ceil(h / max_h)))
+    sw = max(1, int(np.ceil(w / max_w)))
+    return a[::sh, ::sw]
+
+
+def _build_epoch_previews(model, device, specs, targets, gt_pool, nogt_pool,
+                          rng, k):
+    """Run the current model on a fresh random handful of val tiles and return
+    lightweight preview payloads. ``gt_pool``/``nogt_pool`` are index lists into
+    ``specs``/``targets`` for tiles that do / don't contain a labelled call.
+    Roughly 2/3 are call tiles (with a ground-truth mask) and 1/3 background
+    tiles (no call), so the user sees both fit quality and false positives.
+
+    Each payload is a dict of small uint8 arrays: ``spec`` (grayscale 0-255),
+    ``pred`` (predicted probability 0-255), ``gt`` (0/1 mask, or None for
+    background tiles), ``dice`` (float over the supervised tile, or None), and
+    ``has_gt``. Must be called under ``model.eval()`` / ``torch.no_grad()``.
+    """
+    import torch
+
+    def _sample(pool, n):
+        if not pool or n <= 0:
+            return []
+        replace = n > len(pool)
+        return [int(i) for i in rng.choice(pool, size=n, replace=replace)]
+
+    if gt_pool:
+        n_gt = min(len(gt_pool), max(1, (k * 2) // 3)) if nogt_pool else \
+            min(len(gt_pool), k)
+    else:
+        n_gt = 0
+    n_nogt = (k - n_gt) if nogt_pool else 0
+    picks = [(i, True) for i in _sample(gt_pool, n_gt)]
+    picks += [(i, False) for i in _sample(nogt_pool, n_nogt)]
+    if not picks:
+        return []
+
+    batch = np.stack([specs[i] for i, _ in picks])[:, None, :, :]  # (n,1,H,W)
+    xb = torch.from_numpy(batch.astype(np.float32)).to(device)
+    with torch.no_grad():  # self-contained — safe even outside an eval context
+        probs = torch.sigmoid(model(xb))[:, 0].detach().cpu().numpy()  # [0,1]
+
+    tiles = []
+    for (idx, has_gt), prob in zip(picks, probs):
+        spec = specs[idx]
+        payload = {
+            'has_gt': bool(has_gt),
+            'spec': (np.clip(_shrink_for_preview(spec), 0.0, 1.0) * 255
+                     ).astype(np.uint8),
+            'pred': (np.clip(_shrink_for_preview(prob), 0.0, 1.0) * 255
+                     ).astype(np.uint8),
+            'gt': None,
+            'dice': None,
+        }
+        if has_gt:
+            gt = targets[idx] > 0.5
+            payload['gt'] = _shrink_for_preview(gt.astype(np.uint8))
+            pred_bin = prob > 0.5
+            inter = float(np.logical_and(pred_bin, gt).sum())
+            denom = float(pred_bin.sum() + gt.sum())
+            payload['dice'] = (2.0 * inter / denom) if denom > 0 else 1.0
+        tiles.append(payload)
+    return tiles
 
 
 # ----------------------------------------------------------------------
@@ -266,6 +344,18 @@ def train_unet(
     run_dir = Path(cfg.resolve_run_dir(n_examples=n_labels))
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- live-preview pools (rotating val tiles) ----
+    # Kept as numpy so we can re-run the *current* model on a fresh random
+    # handful each epoch. Split into call tiles (non-empty mask) and background
+    # tiles (empty mask → "no ground truth", surfaces false positives).
+    prev_specs = specs[val_idx]
+    prev_targets = targets[val_idx]
+    prev_gt_pool = [i for i in range(len(prev_targets))
+                    if prev_targets[i].sum() > 0]
+    prev_nogt_pool = [i for i in range(len(prev_targets))
+                      if prev_targets[i].sum() == 0]
+    prev_rng = np.random.default_rng()  # unseeded → rotates each epoch
+
     # ---- train ----
     history: List[Dict] = []
     best_val = float('inf')
@@ -347,6 +437,24 @@ def train_unet(
         history.append(metrics)
         if progress:
             progress(epoch, cfg.n_epochs, metrics)
+
+        # Live prediction preview: a fresh rotating handful of val tiles, run
+        # through the just-updated model (still in eval/no_grad from validation).
+        if progress and cfg.emit_previews and len(prev_specs):
+            try:
+                with torch.no_grad():
+                    tiles = _build_epoch_previews(
+                        model, device, prev_specs, prev_targets,
+                        prev_gt_pool, prev_nogt_pool, prev_rng,
+                        cfg.preview_count)
+                if tiles:
+                    progress(epoch, cfg.n_epochs, {
+                        'status': 'epoch_preview', 'epoch': epoch,
+                        'total_epochs': cfg.n_epochs, 'val_dice': val_dice,
+                        'tiles': tiles,
+                    })
+            except Exception:
+                pass  # previews are best-effort; never break a run
 
         if improved:
             torch.save(

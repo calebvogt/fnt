@@ -67,6 +67,31 @@ except Exception:
     HAS_CV2 = False
 
 
+_SORT_ROLE = Qt.UserRole + 1
+
+
+class SortableTreeWidgetItem(QTreeWidgetItem):
+    """QTreeWidgetItem that sorts numerically when a per-column numeric key is
+    stored under ``_SORT_ROLE``, falling back to case-insensitive text.
+
+    The default QTreeWidgetItem compares the *display* strings, so a Time
+    column showing ``"452.60s"`` and ``"52.74s"`` sorts lexicographically —
+    ``"4"`` before ``"5"`` — placing 452s ahead of 52s. Storing the raw float
+    as the sort key fixes that for Time/Dur/Px/Score/kHz.
+    """
+
+    def __lt__(self, other: 'QTreeWidgetItem') -> bool:
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        a = self.data(col, _SORT_ROLE)
+        b = other.data(col, _SORT_ROLE)
+        if a is not None and b is not None:
+            try:
+                return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return self.text(col).lower() < other.text(col).lower()
+
+
 RECENT_PROJECTS_KEY = "mad/recent_projects"
 MAX_RECENT_PROJECTS = 8
 
@@ -1297,7 +1322,7 @@ class RunTrainingDialog(QDialog):
         form = QFormLayout()
 
         self.spin_epochs = QSpinBox()
-        self.spin_epochs.setRange(1, 500)
+        self.spin_epochs.setRange(1, 10000)
         self.spin_epochs.setValue(100)
         self.spin_epochs.setSingleStep(10)
         self.spin_epochs.setToolTip(
@@ -1332,9 +1357,19 @@ class RunTrainingDialog(QDialog):
         self.spin_lr.setSingleStep(1e-4)
         self.spin_lr.setValue(1e-3)
         self.spin_lr.setToolTip(
-            "Step size for weight updates. The 1e-3 default is a safe starting "
-            "point. Too high → unstable / diverging loss; too low → very slow "
-            "training. Usually leave as-is."
+            "<b>Learning rate (LR)</b> — how far each weight moves along its "
+            "gradient on every batch (Adam optimizer). It is held fixed for the "
+            "whole run (no LR schedule/decay here).<br><br>"
+            "<b>Too high</b> (&gt; ~5e-3): steps overshoot — loss spikes, "
+            "oscillates, or diverges to NaN and never settles.<br>"
+            "<b>Too low</b> (&lt; ~1e-4): steps are tiny — loss falls very "
+            "slowly, needing far more epochs, and early-stopping may cut the run "
+            "off before it converges.<br>"
+            "<b>Well-tuned:</b> loss drops steadily then flattens, reaching good "
+            "accuracy in the fewest epochs.<br><br>"
+            "<b>1e-3 is a safe default.</b> Lower it (3e-4 / 1e-4) if loss "
+            "diverges; raise it slightly if training is stable but very slow. "
+            "Usually leave as-is."
         )
         form.addRow("Learning rate:", self.spin_lr)
 
@@ -1570,16 +1605,19 @@ class RunInferenceDialog(QDialog):
         self.chk_save_csv.setChecked(True)
         vbox.addWidget(self.chk_save_csv)
 
-        self.chk_preserve = QCheckBox(
-            "Preserve user-painted labels (skip time regions already labeled)"
+        self.chk_redetect = QCheckBox(
+            "Re-detect from scratch (ignore prior labels & reviews)"
         )
-        self.chk_preserve.setChecked(True)
-        self.chk_preserve.setToolTip(
-            "When enabled, the model's probability mask is zeroed in any\n"
-            "time column that already contains a manually-painted label.\n"
-            "Manual detections are never overwritten by inference."
+        self.chk_redetect.setChecked(False)
+        self.chk_redetect.setToolTip(
+            "Off (default): a re-run keeps hand-labels and Accepted/Rejected\n"
+            "calls, and the model won't re-detect over them — only pending\n"
+            "predictions are regenerated.\n"
+            "On: ignore every prior decision and re-detect everywhere (pending,\n"
+            "Accepted and Rejected are all discarded); hand-label rows are kept\n"
+            "as data but the model may predict over them too."
         )
-        vbox.addWidget(self.chk_preserve)
+        vbox.addWidget(self.chk_redetect)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -1612,7 +1650,7 @@ class RunInferenceDialog(QDialog):
             min_blob_pixels=self.spin_min_blob.value(),
             device=self.combo_device.currentText(),
             save_blob_csv=self.chk_save_csv.isChecked(),
-            preserve_labels=self.chk_preserve.isChecked(),
+            preserve_labels=not self.chk_redetect.isChecked(),
         )
 
 
@@ -1930,10 +1968,11 @@ class MADRunPanel(QWidget):
     run_finished = pyqtSignal(bool)   # ok — lets the section re-enable its button
 
     def __init__(self, parent=None, show_plot: bool = False,
-                 external_log: QTextEdit = None):
+                 external_log: QTextEdit = None, stop_label: str = "Stop"):
         super().__init__(parent)
         self._show_plot = show_plot
         self._external_log = external_log
+        self._stop_label = stop_label
         self._plot = None
         self._batches_x: list = []
         self._batch_losses: list = []
@@ -1974,7 +2013,7 @@ class MADRunPanel(QWidget):
         else:
             self.log = external_log
 
-        self.btn_stop = QPushButton("Stop")
+        self.btn_stop = QPushButton(self._stop_label)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._on_stop)
         vbox.addWidget(self.btn_stop)
@@ -2170,6 +2209,237 @@ class MADTrainGraphDialog(QDialog):
         self._main._on_train_dialog_close(event)
 
 
+class MADPreviewDialog(QDialog):
+    """Non-modal window showing per-epoch prediction previews. Each epoch adds a
+    page of tiles (spectrogram + ground-truth outline + predicted-mask overlay);
+    the user can scrub back through earlier epochs to watch the model improve.
+    Auto-follows the latest epoch unless the user scrolls back or unticks
+    'Follow latest'. History is capped to bound memory on very long runs."""
+
+    MAX_HISTORY = 200
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Live Prediction Previews")
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
+        self.resize(860, 640)
+        self._pages = []   # list of (epoch:int, val_dice:float|None, tiles:list)
+        self._view = 0
+        self._dirty = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_latest = QPushButton("Latest")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(0)
+        self.chk_follow = QCheckBox("Follow latest")
+        self.chk_follow.setChecked(True)
+        self.btn_prev.clicked.connect(lambda: self._go(self._view - 1))
+        self.btn_next.clicked.connect(lambda: self._go(self._view + 1))
+        self.btn_latest.clicked.connect(
+            lambda: self._go(len(self._pages) - 1))
+        self.slider.valueChanged.connect(self._on_slider)
+        nav.addWidget(self.btn_prev)
+        nav.addWidget(self.slider, 1)
+        nav.addWidget(self.btn_next)
+        nav.addWidget(self.btn_latest)
+        nav.addWidget(self.chk_follow)
+        v.addLayout(nav)
+
+        self.lbl = QLabel("waiting for first epoch…")
+        self.lbl.setStyleSheet("color:#cccccc; font-size:10px;")
+        v.addWidget(self.lbl)
+        legend = QLabel(
+            "<span style='color:#39ff88'>▢ outline = ground truth</span>"
+            "&nbsp;&nbsp;&nbsp;"
+            "<span style='color:#ff6666'>■ fill = predicted mask</span>")
+        legend.setStyleSheet("font-size:10px;")
+        v.addWidget(legend)
+
+        self._plot_ok = False
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import (
+                FigureCanvasQTAgg as FigureCanvas,
+            )
+            self._figure = Figure(tight_layout=True)
+            self._figure.patch.set_facecolor("#1e1e1e")
+            self._canvas = FigureCanvas(self._figure)
+            v.addWidget(self._canvas, 1)
+            self._plot_ok = True
+        except Exception:
+            msg = QLabel("matplotlib not installed — previews disabled.")
+            msg.setStyleSheet("color:#888888;")
+            v.addWidget(msg, 1)
+
+        # Coalesce rapid epochs into at most ~7 redraws/s so fast runs don't
+        # flood the UI thread with matplotlib draws.
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render)
+        self._update_nav()
+
+    def clear(self):
+        self._pages = []
+        self._view = 0
+        self.chk_follow.setChecked(True)
+        if self._plot_ok:
+            self._figure.clear()
+            try:
+                self._canvas.draw_idle()
+            except Exception:
+                pass
+        self._update_nav()
+
+    def add_page(self, epoch, val_dice, tiles):
+        if not tiles:
+            return
+        was_latest = (not self._pages) or (self._view == len(self._pages) - 1)
+        self._pages.append((int(epoch), val_dice, tiles))
+        if len(self._pages) > self.MAX_HISTORY:
+            self._pages.pop(0)
+            if not was_latest:
+                self._view = max(0, self._view - 1)
+        if self.chk_follow.isChecked() or was_latest:
+            self._view = len(self._pages) - 1
+            self._update_nav()
+            if not self._render_timer.isActive():
+                self._render_timer.start(140)
+        else:
+            self._update_nav()  # count/label change, but keep current view
+
+    def _on_slider(self, val):
+        if val != self._view:
+            self._go(val)
+
+    def _go(self, idx):
+        if not self._pages:
+            return
+        idx = max(0, min(len(self._pages) - 1, idx))
+        self._view = idx
+        if idx < len(self._pages) - 1:
+            self.chk_follow.setChecked(False)
+        self._update_nav()
+        self._render()
+
+    def _update_nav(self):
+        n = len(self._pages)
+        self.slider.blockSignals(True)
+        self.slider.setMaximum(max(0, n - 1))
+        self.slider.setValue(self._view)
+        self.slider.blockSignals(False)
+        self.btn_prev.setEnabled(self._view > 0)
+        self.btn_next.setEnabled(self._view < n - 1)
+        self.btn_latest.setEnabled(n > 0 and self._view < n - 1)
+        if n:
+            ep, dice, _ = self._pages[self._view]
+            tail = "  (latest)" if self._view == n - 1 else ""
+            ds = f"   val_dice={dice:.3f}" if dice is not None else ""
+            self.lbl.setText(
+                f"Epoch {ep}{ds}   —   {self._view + 1}/{n}{tail}")
+
+    def _render(self):
+        if not self._plot_ok or not self._pages:
+            return
+        _, _, tiles = self._pages[self._view]
+        fig = self._figure
+        fig.clear()
+        n = len(tiles)
+        cols = min(3, n) or 1
+        rows = int(np.ceil(n / cols))
+        for i, t in enumerate(tiles):
+            ax = fig.add_subplot(rows, cols, i + 1)
+            ax.imshow(t['spec'], cmap='gray', origin='lower', aspect='auto',
+                      vmin=0, vmax=255)
+            pm = (t['pred'].astype(np.float32) / 255.0) > 0.5
+            overlay = np.zeros((pm.shape[0], pm.shape[1], 4), dtype=np.float32)
+            overlay[pm] = (1.0, 0.4, 0.4, 0.45)
+            ax.imshow(overlay, origin='lower', aspect='auto')
+            if t.get('gt') is not None:
+                ax.contour(t['gt'].astype(np.float32), levels=[0.5],
+                           colors='#39ff88', linewidths=1.1)
+                title = (f"call · dice={t['dice']:.2f}"
+                         if t.get('dice') is not None else "call")
+            else:
+                title = "background (no call)"
+            ax.set_title(title, color="#cccccc", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # Just hide — the run keeps emitting previews (cheap) and the window can
+        # be reopened. The main window drops the reference on teardown.
+        event.accept()
+
+
+class MADDeviceProbeWorker(QThread):
+    """Detect the compute device 'auto' will resolve to, off the UI thread.
+
+    Importing torch can take a second or two, so this runs in the background at
+    startup and reports (kind, name, note) once ready — the Device combo and the
+    info label under it are updated when it finishes."""
+
+    done_signal = pyqtSignal(str, str, str)  # kind ('cuda'|'mps'|'cpu'), name, note
+
+    @staticmethod
+    def _nvidia_smi_name() -> Optional[str]:
+        import subprocess
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=6)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+        return None
+
+    def run(self):
+        kind, name, note = 'cpu', '', ''
+        try:
+            import torch
+            if torch.cuda.is_available():
+                kind = 'cuda'
+                try:
+                    name = torch.cuda.get_device_name(0)
+                except Exception:
+                    name = 'NVIDIA GPU'
+                note = f"{name} detected — training/inference will use CUDA."
+            elif getattr(getattr(torch, 'backends', None), 'mps', None) is not None \
+                    and torch.backends.mps.is_available():
+                kind, name = 'mps', 'Apple GPU'
+                note = "Apple-Silicon GPU (MPS) detected — will use MPS."
+            else:
+                nv = self._nvidia_smi_name()
+                if nv:
+                    name = nv
+                    note = (f"{nv} present, but this PyTorch is CPU-only — will "
+                            "run on CPU. Reinstall a CUDA build to use the GPU.")
+                else:
+                    note = "No GPU detected — will run on CPU."
+        except Exception:
+            nv = self._nvidia_smi_name()
+            if nv:
+                name = nv
+                note = f"{nv} present, but PyTorch isn't installed — will run on CPU."
+            else:
+                note = "PyTorch not found — will run on CPU."
+        self.done_signal.emit(kind, name, note)
+
+
 # ======================================================================
 # Main window
 # ======================================================================
@@ -2294,6 +2564,10 @@ class MADMainWindow(QMainWindow):
         self._update_paint_buttons_enabled()
         self._update_playback_buttons_enabled()
 
+        # Probe the compute device in the background and annotate the Device
+        # pickers ("Auto (NVIDIA GPU)") plus the info label under them.
+        self._start_device_probe()
+
         # No startup dialog — user loads wavs freely, project created on demand.
 
     # ==================================================================
@@ -2319,7 +2593,8 @@ class MADMainWindow(QMainWindow):
         # can wire its signals; it's placed in the right preview area below and
         # only shown while training runs (mirrors Mask Tracker).
         self.train_panel = MADRunPanel(show_plot=True,
-                                       external_log=self.session_log)
+                                       external_log=self.session_log,
+                                       stop_label="Stop Training Early")
 
         # ---------- Left panel: workflow-stage tabs over a shared canvas ----
         # Mask tab = label + train; Inference tab = run + blob review. Both
@@ -2401,6 +2676,7 @@ class MADMainWindow(QMainWindow):
         # (_train_dialog) so the spectrogram stays visible/usable while a run is
         # in progress — see _show_training_dialog. Not added to this layout.
         self._train_dialog = None
+        self._preview_dialog = None
         self._training_active = False
 
         self.waveform_overview = WaveformOverviewWidget()
@@ -2508,17 +2784,24 @@ class MADMainWindow(QMainWindow):
 
         controls_layout.addWidget(QLabel("Color Map:"))
         self.combo_colormap = QComboBox()
-        self.combo_colormap.addItems(
-            ['grayscale_inv', 'grayscale', 'viridis', 'magma', 'inferno']
-        )
-        self.combo_colormap.setFixedWidth(110)
+        # Display label -> internal colormap key (kept as userData so the LUT
+        # lookups and saved values keep using the short keys).
+        for label, key in (
+            ("Grayscale Inverted", 'grayscale_inv'),
+            ("Grayscale", 'grayscale'),
+            ("Viridis", 'viridis'),
+            ("Magma", 'magma'),
+            ("Inferno", 'inferno'),
+        ):
+            self.combo_colormap.addItem(label, key)
+        self.combo_colormap.setFixedWidth(140)
         self.combo_colormap.setToolTip(
-            "Spectrogram color palette (display only). 'viridis/magma/inferno' "
-            "are perceptually uniform; 'grayscale_inv' shows loud = dark.")
-        # Default to inverted grayscale (soft = white, loud = dark).
-        self.combo_colormap.setCurrentText('viridis')
+            "Spectrogram color palette (display only). 'Viridis/Magma/Inferno' "
+            "are perceptually uniform; 'Grayscale Inverted' shows loud = dark.")
+        # Default to viridis.
+        self.combo_colormap.setCurrentIndex(self.combo_colormap.findData('viridis'))
         self.spectrogram.set_colormap('viridis')
-        self.combo_colormap.currentTextChanged.connect(self._on_colormap_changed)
+        self.combo_colormap.currentIndexChanged.connect(self._on_colormap_changed)
         controls_layout.addWidget(self.combo_colormap)
 
         sep3 = QFrame(); sep3.setFrameShape(QFrame.VLine)
@@ -3016,7 +3299,7 @@ class MADMainWindow(QMainWindow):
         form.addRow("Encoder:", self.combo_train_encoder)
 
         self.spin_train_epochs = QSpinBox()
-        self.spin_train_epochs.setRange(1, 500)
+        self.spin_train_epochs.setRange(1, 10000)
         self.spin_train_epochs.setValue(100)
         self.spin_train_epochs.setSingleStep(10)
         self.spin_train_epochs.setToolTip(
@@ -3054,9 +3337,22 @@ class MADMainWindow(QMainWindow):
         self.spin_train_lr.setSingleStep(1e-4)
         self.spin_train_lr.setValue(1e-3)
         self.spin_train_lr.setToolTip(
-            "<b>Learning rate</b> for the Adam optimizer — the step size for "
-            "weight updates. Too high → unstable/diverging loss; too low → very "
-            "slow convergence. 1e-3 is a sensible default."
+            "<b>Learning rate (LR)</b> — how far each weight moves along its "
+            "gradient on every batch. Adam adapts a per-parameter scale, but "
+            "this value sets the overall step size, and it is held fixed for the "
+            "whole run (no LR schedule/warmup/decay here).<br><br>"
+            "<b>Too high</b> (e.g. &gt; ~5e-3): steps overshoot good minima — "
+            "training loss spikes, oscillates, or diverges to NaN, and "
+            "validation Dice stays low or jumps around. The best checkpoint is "
+            "kept, but the run wastes epochs never settling.<br>"
+            "<b>Too low</b> (e.g. &lt; ~1e-4): steps are tiny — loss creeps down "
+            "very slowly, so you need many more epochs, and early-stopping may "
+            "cut the run off (or it stalls on a plateau) before it converges.<br>"
+            "<b>Well-tuned:</b> loss falls steadily then flattens; the model "
+            "reaches good Dice in the fewest epochs.<br><br>"
+            "<b>1e-3 is a sensible default.</b> If loss diverges or oscillates, "
+            "lower it (try 3e-4 or 1e-4); if training is stable but painfully "
+            "slow, nudge it up. Larger batch sizes tolerate slightly higher LRs."
         )
         form.addRow("Learning rate:", self.spin_train_lr)
 
@@ -3073,13 +3369,17 @@ class MADMainWindow(QMainWindow):
         form.addRow("Validation fraction:", self.spin_train_val)
 
         self.combo_train_device = QComboBox()
-        self.combo_train_device.addItems(["auto", "cuda", "mps", "cpu"])
+        self._fill_device_combo(self.combo_train_device)
         self.combo_train_device.setToolTip(
             "<b>Compute device</b>: <b>auto</b> picks the best available "
             "(CUDA &gt; MPS &gt; CPU). <b>cuda</b> = NVIDIA GPU, <b>mps</b> = "
             "Apple-Silicon GPU, <b>cpu</b> = portable but much slower."
         )
         form.addRow("Device:", self.combo_train_device)
+        self.lbl_train_device_info = QLabel("Detecting compute device…")
+        self.lbl_train_device_info.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_train_device_info.setWordWrap(True)
+        form.addRow("", self.lbl_train_device_info)
 
         tc.addLayout(form)
 
@@ -3161,21 +3461,29 @@ class MADMainWindow(QMainWindow):
         iform.addRow("Min blob pixels:", self.spin_infer_min_blob)
 
         self.combo_infer_device = QComboBox()
-        self.combo_infer_device.addItems(["auto", "cuda", "mps", "cpu"])
+        self._fill_device_combo(self.combo_infer_device)
         self.combo_infer_device.setToolTip(
             "<b>Compute device</b> for inference: <b>auto</b> picks CUDA &gt; "
             "MPS &gt; CPU.")
         iform.addRow("Device:", self.combo_infer_device)
+        self.lbl_infer_device_info = QLabel("Detecting compute device…")
+        self.lbl_infer_device_info.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_infer_device_info.setWordWrap(True)
+        iform.addRow("", self.lbl_infer_device_info)
         vbox.addLayout(iform)
 
-        self.chk_infer_preserve = QCheckBox(
-            "Preserve painted labels (skip labeled time regions)")
-        self.chk_infer_preserve.setChecked(True)
-        self.chk_infer_preserve.setToolTip(
-            "Skip inference over time ranges you've already hand-labeled on a "
-            "file, so the model doesn't re-detect and duplicate confirmed "
-            "calls. Only matters on files that carry painted labels.")
-        vbox.addWidget(self.chk_infer_preserve)
+        self.chk_infer_redetect = QCheckBox(
+            "Re-detect from scratch (ignore prior labels & reviews)")
+        self.chk_infer_redetect.setChecked(False)
+        self.chk_infer_redetect.setToolTip(
+            "<b>Off (default):</b> a re-run keeps your work — hand-labels and "
+            "Accepted/Rejected calls are preserved and the model won't re-detect "
+            "over them; only pending predictions are regenerated.<br>"
+            "<b>On:</b> ignore every prior decision and re-detect everywhere. "
+            "Pending, Accepted and Rejected predictions are all discarded and "
+            "regenerated; hand-label rows are still kept as data, but the model "
+            "is allowed to predict over them too.")
+        vbox.addWidget(self.chk_infer_redetect)
 
         # Single context-aware action button: "Run Inference" with an existing
         # model, "Run Training" when Train-a-new-model is on with no target
@@ -3719,11 +4027,17 @@ class MADMainWindow(QMainWindow):
             score = ann.get('score', 0)
             icon = "○" if is_pred else ("✕" if is_rej else "●")
             score_s = f"{score:.2f}" if is_pred and score else ""
-            item = QTreeWidgetItem([
+            item = SortableTreeWidgetItem([
                 icon, f"{t0:.2f}s", cls, durs,
                 f"{freq_lo:.0f}-{freq_hi:.0f}",
                 str(pixels), score_s,
             ])
+            # Numeric sort keys so columns sort by value, not display text.
+            item.setData(1, _SORT_ROLE, t0)                    # Time
+            item.setData(3, _SORT_ROLE, dur)                   # Dur
+            item.setData(4, _SORT_ROLE, freq_lo)               # kHz (low edge)
+            item.setData(5, _SORT_ROLE, pixels)                # Px
+            item.setData(6, _SORT_ROLE, score if is_pred else -1.0)  # Score
             kind = ('prediction' if is_pred
                     else 'rejected' if is_rej else 'confirmed')
             item.setData(0, Qt.UserRole, (cur_wav, t0, ann.get('id', ''), kind))
@@ -3739,6 +4053,41 @@ class MADMainWindow(QMainWindow):
                 n_rej += 1
             else:
                 n_confirmed += 1
+        # In-progress SAM/paint masks (drawn but not yet confirmed with Enter)
+        # appear as yellow "○" pending rows so they show up in the list right
+        # away, before a class is assigned. They belong to the current file and
+        # are only listed under the "All"/"Pending" filters.
+        n_draw = 0
+        if dt and flt in ("All", "Pending"):
+            try:
+                comps = self.spectrogram.pending_components()
+            except Exception:
+                comps = []
+            for (pf0, pf1, pt0, pt1, local) in comps:
+                t0 = pt0 * dt
+                t1 = pt1 * dt
+                dur = max(0.0, t1 - t0)
+                durs = f"{dur:.2f}s" if dur >= 1.0 else f"{dur * 1000:.0f}ms"
+                freq_lo = pf0 * df / 1000 if df else 0
+                freq_hi = pf1 * df / 1000 if df else 0
+                pixels = int(local.sum())
+                item = SortableTreeWidgetItem([
+                    "○", f"{t0:.2f}s", "", durs,
+                    f"{freq_lo:.0f}-{freq_hi:.0f}", str(pixels), "",
+                ])
+                item.setData(1, _SORT_ROLE, t0)
+                item.setData(3, _SORT_ROLE, dur)
+                item.setData(4, _SORT_ROLE, freq_lo)
+                item.setData(5, _SORT_ROLE, pixels)
+                item.setData(6, _SORT_ROLE, -1.0)
+                # '__pending__' id never matches a real annotation, so clicking
+                # just pans to the mask without trying to select an annotation.
+                item.setData(0, Qt.UserRole, (cur_wav, t0, '__pending__', 'pending'))
+                color = QColor(255, 230, 90)  # same yellow as predictions
+                for c in range(ncols):
+                    item.setForeground(c, color)
+                new_items.append(item)
+                n_draw += 1
         if new_items:  # one batched insert is far faster than N addTopLevelItem
             tree.addTopLevelItems(new_items)
         tree.setSortingEnabled(True)
@@ -3750,8 +4099,10 @@ class MADMainWindow(QMainWindow):
             parts.append(f"{n_pred} prediction(s)")
         if n_rej:
             parts.append(f"{n_rej} rejected")
+        if n_draw:
+            parts.append(f"{n_draw} drawing")
         count_text = (
-            f"{n_confirmed + n_pred + n_rej} detection(s)" +
+            f"{n_confirmed + n_pred + n_rej + n_draw} detection(s)" +
             (f" ({', '.join(parts)})" if len(parts) > 1 else "")
         )
         if lbl:
@@ -4760,10 +5111,11 @@ class MADMainWindow(QMainWindow):
             batch_size=self.spin_train_batch.value(),
             learning_rate=self.spin_train_lr.value(),
             val_fraction=self.spin_train_val.value(),
-            device=self.combo_train_device.currentText(),
+            device=self._device_value(self.combo_train_device),
             nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
             db_min=sp['db_min'], db_max=sp['db_max'],
             training_data_dir=self._project.training_data_dir,
+            emit_previews=True,  # live per-epoch prediction preview window
         )
 
     def _apply_latest_training_config(self):
@@ -4813,7 +5165,7 @@ class MADMainWindow(QMainWindow):
                 self.spin_train_lr.setValue(float(cfg['learning_rate']))
             if cfg.get('val_fraction') is not None:
                 self.spin_train_val.setValue(float(cfg['val_fraction']))
-            _set_combo_text(self.combo_train_device, cfg.get('device'))
+            _set_combo_data(self.combo_train_device, cfg.get('device'))
             # Keep the encoder picker's enabled state in sync with HRNet.
             self._on_arch_changed()
         except Exception as e:
@@ -4857,6 +5209,7 @@ class MADMainWindow(QMainWindow):
         self._update_run_button()
         self._set_train_config_enabled(False)  # lock config while running
         self._show_training_dialog()
+        self._show_preview_dialog(reset=True)  # live per-epoch previews
         self.train_panel.start_run()
         self._start_training(cfg, post_inference_wavs=infer_wavs,
                              reporter=self.train_panel)
@@ -4911,6 +5264,19 @@ class MADMainWindow(QMainWindow):
         self._train_dialog.show()
         self._train_dialog.raise_()
         self._train_dialog.activateWindow()
+        # Bring the preview window back alongside the graph if it exists.
+        if self._preview_dialog is not None:
+            self._show_preview_dialog()
+
+    def _show_preview_dialog(self, reset: bool = False):
+        """Show (or re-show) the live prediction-preview window. Created lazily;
+        ``reset`` clears prior pages at the start of a new run."""
+        if self._preview_dialog is None:
+            self._preview_dialog = MADPreviewDialog(self)
+        if reset:
+            self._preview_dialog.clear()
+        self._preview_dialog.show()
+        self._preview_dialog.raise_()
 
     def _on_train_dialog_close(self, event):
         """Closing the training window mid-run: keep it in the background (just
@@ -5546,12 +5912,44 @@ class MADMainWindow(QMainWindow):
                 pass
         return False
 
+    def _file_has_pending_predictions(self, w) -> bool:
+        """True if the wav carries *pending* (unreviewed) predictions — the only
+        rows a re-run replaces. Accepted/Rejected predictions and hand-labels
+        are now preserved, so files with only reviewed detections don't warn."""
+        csv = pred_csv_sibling_path(w)
+        if os.path.isfile(csv):
+            try:
+                from fnt.usv.usv_detector.mad_inference import read_blob_csv
+                for r in read_blob_csv(csv):
+                    if (isinstance(r.get('blob_id'), int)
+                            and r.get('status') not in ('accepted', 'rejected')):
+                        return True
+                return False
+            except Exception:
+                pass
+        # No readable CSV — fall back to "has any prediction crops" (unreviewed).
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, has_pred_masks,
+        )
+        return has_pred_masks(masks_sibling_path(w))
+
     def _confirm_overwrite_predictions(self, wavs) -> bool:
-        """If any of ``wavs`` already carry model predictions, warn that
-        re-running inference replaces them and resets the accept/reject/delete
-        decisions made on those predictions. Hand-labels are NOT affected, so
-        label-only files don't trigger the prompt. Returns True to proceed."""
-        existing = [w for w in wavs if self._file_has_predictions(w)]
+        """Warn before a re-run touches existing detections. Two modes:
+
+        • Normal (default): only *pending* predictions are regenerated, so we
+          prompt only for files that still have unreviewed predictions and
+          reassure that reviewed calls / hand-labels are kept.
+        • "Re-detect from scratch": all prior predictions (including Accepted /
+          Rejected) are discarded, so we prompt for any file with predictions
+          and spell out that review decisions will be lost.
+
+        Returns True to proceed."""
+        redetect = bool(getattr(self, 'chk_infer_redetect', None)
+                        and self.chk_infer_redetect.isChecked())
+        if redetect:
+            existing = [w for w in wavs if self._file_has_predictions(w)]
+        else:
+            existing = [w for w in wavs if self._file_has_pending_predictions(w)]
         if not existing:
             return True
 
@@ -5562,18 +5960,33 @@ class MADMainWindow(QMainWindow):
         shown = "\n".join(_line(w) for w in existing[:8])
         more = (f"\n   …and {len(existing) - 8} more"
                 if len(existing) > 8 else "")
+        if redetect:
+            title = "Re-detect from scratch?"
+            body = (
+                f"'Re-detect from scratch' is on. {len(existing)} of "
+                f"{len(wavs)} file(s) carry predictions from a previous "
+                f"run:\n\n{shown}{more}\n\n"
+                "This will discard ALL of those predictions — including every "
+                "Accepted and Rejected decision — and re-detect everywhere.\n"
+                "Your painted / SAM labels are kept as data, but the model is "
+                "allowed to predict over them too.\n\n"
+                "Continue?")
+        else:
+            title = "Re-run inference on these files?"
+            body = (
+                f"{len(existing)} of {len(wavs)} file(s) still have pending "
+                f"(unreviewed) predictions from a previous run:\n\n"
+                f"{shown}{more}\n\n"
+                "Re-running inference will replace those pending predictions "
+                "with fresh ones. Everything you've already decided is kept:\n"
+                "   • Accepted and Rejected calls stay as they are, and the "
+                "model won't re-detect over them, and\n"
+                "   • your painted / SAM labels are untouched.\n"
+                "Deleted calls stay deleted — but their region re-opens for "
+                "fresh detection.\n\n"
+                "Continue?")
         reply = QMessageBox.warning(
-            self, "Overwrite existing predictions?",
-            f"{len(existing)} of {len(wavs)} file(s) already carry model "
-            f"predictions from a previous inference run:\n\n{shown}{more}\n\n"
-            "Re-running inference on those files will:\n"
-            "   • replace their predictions with fresh ones, and\n"
-            "   • reset every Accept / Reject / Delete decision you made on "
-            "those predictions back to pending.\n\n"
-            "Your confirmed (painted / SAM) labels are NOT affected — they're "
-            "kept, and 'Preserve painted labels' additionally skips "
-            "re-detecting over them. Files with no predictions are untouched.\n\n"
-            "Continue?",
+            self, title, body,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         return reply == QMessageBox.Yes
@@ -5606,9 +6019,9 @@ class MADMainWindow(QMainWindow):
             model_path=model,
             threshold=self.spin_infer_threshold.value(),
             min_blob_pixels=self.spin_infer_min_blob.value(),
-            device=self.combo_infer_device.currentText(),
+            device=self._device_value(self.combo_infer_device),
             save_blob_csv=True,  # always — it's the summary output + review state
-            preserve_labels=self.chk_infer_preserve.isChecked(),
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
         )
@@ -5758,6 +6171,53 @@ class MADMainWindow(QMainWindow):
         act_gpu.setToolTip("Test whether training/inference can use your GPU")
         act_gpu.triggered.connect(lambda: self._show_gpu_setup_dialog(force=True))
         help_menu.addAction(act_gpu)
+
+    # ------------------------------------------------------------------
+    # Compute device pickers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fill_device_combo(combo):
+        """Populate a Device combo. Display labels are friendly; the internal
+        short key ('auto'/'cuda'/'mps'/'cpu') is kept as userData so training/
+        inference and saved configs keep using the short keys. The 'Auto' label
+        is refined to name the detected accelerator once the probe finishes."""
+        for label, key in (
+            ("Auto", 'auto'),
+            ("CUDA (NVIDIA GPU)", 'cuda'),
+            ("MPS (Apple GPU)", 'mps'),
+            ("CPU", 'cpu'),
+        ):
+            combo.addItem(label, key)
+
+    @staticmethod
+    def _device_value(combo) -> str:
+        """The short device key for a combo built by :meth:`_fill_device_combo`."""
+        return combo.currentData() or combo.currentText() or 'auto'
+
+    def _start_device_probe(self):
+        """Kick off the background compute-device probe (once)."""
+        self._device_probe = MADDeviceProbeWorker(self)
+        self._device_probe.done_signal.connect(self._on_device_probe_done)
+        self._device_probe.start()
+
+    def _on_device_probe_done(self, kind: str, name: str, note: str):
+        auto_label = {
+            'cuda': 'Auto (NVIDIA GPU)',
+            'mps': 'Auto (Apple GPU)',
+        }.get(kind, 'Auto (CPU)')
+        for combo in (getattr(self, 'combo_train_device', None),
+                      getattr(self, 'combo_infer_device', None)):
+            if combo is None:
+                continue
+            i = combo.findData('auto')
+            if i >= 0:
+                combo.setItemText(i, auto_label)
+        color = "#7ec87e" if kind in ('cuda', 'mps') else "#c8a05a"
+        for lbl in (getattr(self, 'lbl_train_device_info', None),
+                    getattr(self, 'lbl_infer_device_info', None)):
+            if lbl is not None:
+                lbl.setText(note)
+                lbl.setStyleSheet(f"color: {color}; font-size: 9px;")
 
     # ------------------------------------------------------------------
     # GPU / CUDA readiness
@@ -6681,6 +7141,9 @@ class MADMainWindow(QMainWindow):
         else:
             self.lbl_mask_status.setText(
                 "No pending masks — paint or SAM, then Enter to confirm")
+        # Reflect the drawn (not-yet-confirmed) masks as yellow pending rows in
+        # the detections list.
+        self._refresh_annotation_list()
 
     def _on_stroke_committed(self):
         # A brush stroke just ended; nothing is persisted until the user
@@ -7174,6 +7637,7 @@ class MADMainWindow(QMainWindow):
             sg.clear_pending()
             sg.clear_sam_prompts()
             self.status_bar.showMessage("Pending masks cleared")
+            self._refresh_annotation_list()  # drop the yellow pending rows
 
     # --- undo / context menu / shape-edit (Phases D-F) ----------------
     def _undo_last(self):
@@ -7525,6 +7989,7 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.clear_pending()
         self.spectrogram.clear_sam_prompts()
         self.lbl_mask_status.setText("Pending mask cleared")
+        self._refresh_annotation_list()  # drop the yellow pending rows
         self._log("Cleared pending mask(s)")
 
     def _on_brush_radius_scrolled(self, value: int):
@@ -7556,12 +8021,19 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.max_freq = self.spin_display_max_freq.value()
         self._invalidate_spec_cache()
 
-    def _on_colormap_changed(self, name: str):
+    def _on_colormap_changed(self, _index: int = 0):
+        name = self.combo_colormap.currentData() or 'viridis'
         self.spectrogram.set_colormap(name)
 
     def _on_wheel_zoom(self, factor: float, center_time: float):
         if self.spectrogram.total_duration <= 0:
             return
+        # Anchor the zoom on the center of the current view (the current time
+        # point) rather than the mouse position. This keeps the wheel zoom
+        # stationary: scrolling in and out cyclically returns to the same view
+        # instead of drifting sideways. Panning is done with the arrow keys or
+        # scroll bar, not the wheel.
+        center_time = (self.spectrogram.view_start + self.spectrogram.view_end) / 2
         new_window = max(0.1, min(300.0, self.spin_view_window.value() * factor))
         self.spin_view_window.blockSignals(True)
         self.spin_view_window.setValue(new_window)
@@ -7710,11 +8182,25 @@ class MADMainWindow(QMainWindow):
                 return
             from scipy import signal
             segment = signal.resample(segment, n_output_samples).astype(np.float32)
+            import time as _time
             sd.play(segment, output_sr)
+            # Record the wall-clock start as close to sd.play() as possible so
+            # the playhead math isn't skewed by unrelated work below.
+            self._playback_start_time = _time.time()
+            # Compensate the playhead for the *actual* output latency (the gap
+            # between sd.play() and sound leaving the device) rather than a fixed
+            # 0.15 s guess, so the moving line stays in sync with what's heard.
+            try:
+                stream = sd.get_stream()
+                lat = getattr(stream, 'latency', None) if stream is not None else None
+                if isinstance(lat, (tuple, list)):
+                    lat = lat[-1]  # output latency of the (in, out) pair
+                if lat:
+                    self._playback_latency = float(lat)
+            except Exception:
+                pass
             self.is_playing = True
             self.btn_play.setText("Stop (Space)")
-            import time as _time
-            self._playback_start_time = _time.time()
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
@@ -7889,6 +8375,13 @@ class MADMainWindow(QMainWindow):
                     metrics.get('train_loss', float('nan')),
                     metrics.get('val_loss', float('nan')),
                 )
+            elif status == 'epoch_preview':
+                if self._preview_dialog is not None:
+                    self._preview_dialog.add_page(
+                        metrics.get('epoch', epoch),
+                        metrics.get('val_dice'),
+                        metrics.get('tiles', []),
+                    )
             elif status == 'early_stop':
                 progress.append(
                     f"  Early stop at epoch {epoch} — best_val_loss="
@@ -8013,9 +8506,9 @@ class MADMainWindow(QMainWindow):
             model_path=model_path,
             threshold=self.spin_infer_threshold.value(),
             min_blob_pixels=self.spin_infer_min_blob.value(),
-            device=self.combo_infer_device.currentText(),
+            device=self._device_value(self.combo_infer_device),
             save_blob_csv=True,
-            preserve_labels=self.chk_infer_preserve.isChecked(),
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
         )
