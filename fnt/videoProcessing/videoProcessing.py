@@ -56,6 +56,21 @@ DEFAULT_SUBTITLE_STYLE = {
 
 _VIDEO_EXT_RE = r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$'
 
+# All video extensions the tool understands, as glob patterns.
+DEFAULT_VIDEO_GLOBS = ["*.avi", "*.mp4", "*.mov", "*.mkv",
+                       "*.webm", "*.flv", "*.wmv", "*.m4v"]
+
+# Presets for the "Input file types" selector. Restricting the input type is the
+# clean way to avoid re-encoding (and colliding with) stray files of another
+# format that happen to sit next to your source videos.
+INPUT_TYPE_PRESETS = [
+    ("All supported video files", list(DEFAULT_VIDEO_GLOBS)),
+    ("AVI only (.avi)", ["*.avi"]),
+    ("MP4 only (.mp4)", ["*.mp4"]),
+    ("MOV only (.mov)", ["*.mov"]),
+    ("MKV only (.mkv)", ["*.mkv"]),
+]
+
 # ffmpeg replaced the -vsync option with -fps_mode in 5.1 and has since removed
 # -vsync entirely in recent builds. Detect which the installed ffmpeg supports
 # once and cache it so we emit the right flag for variable-frame-rate output.
@@ -163,7 +178,8 @@ class VideoProcessorWorker(QThread):
                  remove_audio, output_format, crf_quality, resolution, codec, preset,
                  instance_id=1, skip_already_processed=False,
                  burn_subtitles=False, subtitle_style=None,
-                 replace_whitespace=False, filename_prefix="", filename_suffix=""):
+                 replace_whitespace=False, filename_prefix="", filename_suffix="",
+                 input_extensions=None):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -183,6 +199,7 @@ class VideoProcessorWorker(QThread):
         self.replace_whitespace = replace_whitespace
         self.filename_prefix = filename_prefix
         self.filename_suffix = filename_suffix
+        self.input_extensions = list(input_extensions) if input_extensions else list(DEFAULT_VIDEO_GLOBS)
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -301,7 +318,7 @@ class VideoProcessorWorker(QThread):
             missing_files = []
 
             # --- Single-pass file discovery: build the complete list up front ---
-            video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
+            video_extensions = self.input_extensions
 
             # Each entry: (video_path, output_dir)
             file_list = []
@@ -1161,7 +1178,20 @@ class VideoProcessingGUI(QMainWindow):
         group_layout = QGridLayout()
         
         row = 0
-        
+
+        # Input file types — restrict which source formats are processed.
+        group_layout.addWidget(QLabel("Input File Types:"), row, 0)
+        self.input_types_combo = QComboBox()
+        for label, _ in INPUT_TYPE_PRESETS:
+            self.input_types_combo.addItem(label)
+        self.input_types_combo.setToolTip(
+            "Which source video formats to process from each input folder. "
+            "Restrict this (e.g. 'AVI only') to skip stray files of other "
+            "formats that sit next to your videos.")
+        self.input_types_combo.currentIndexChanged.connect(self._update_filename_preview)
+        group_layout.addWidget(self.input_types_combo, row, 1)
+        row += 1
+
         # Frame rate option
         group_layout.addWidget(QLabel("Frame Rate (fps):"), row, 0)
         self.frame_rate_spin = QSpinBox()
@@ -1329,6 +1359,13 @@ class VideoProcessingGUI(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
     
+    def _selected_input_globs(self):
+        """Return the glob patterns for the chosen input file types."""
+        idx = self.input_types_combo.currentIndex()
+        if 0 <= idx < len(INPUT_TYPE_PRESETS):
+            return list(INPUT_TYPE_PRESETS[idx][1])
+        return list(DEFAULT_VIDEO_GLOBS)
+
     def _on_subtitles_toggle(self):
         """Enable/disable the style button with the subtitles checkbox."""
         self.subtitle_style_btn.setEnabled(self.subtitles_check.isChecked())
@@ -1340,8 +1377,7 @@ class VideoProcessingGUI(QMainWindow):
         if self.selected_videos:
             example = os.path.basename(self.selected_videos[0])
         elif self.selected_dirs:
-            for ext in ("*.avi", "*.mp4", "*.mov", "*.mkv",
-                        "*.webm", "*.flv", "*.wmv", "*.m4v"):
+            for ext in self._selected_input_globs():
                 hits = glob.glob(os.path.join(self.selected_dirs[0], ext))
                 if hits:
                     example = os.path.basename(hits[0])
@@ -1504,8 +1540,7 @@ class VideoProcessingGUI(QMainWindow):
 
         Returns (with_smi, total_videos).
         """
-        video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv",
-                            "*.webm", "*.flv", "*.wmv", "*.m4v"]
+        video_extensions = self._selected_input_globs()
         videos = []
         for input_dir in self.selected_dirs:
             for ext in video_extensions:
@@ -1522,16 +1557,18 @@ class VideoProcessingGUI(QMainWindow):
         Two inputs collide only when they resolve to the same file in the same
         proc/ folder (e.g. 'clip.avi' and 'clip.mov' both -> 'clip.mp4').
         """
-        video_extensions = ["*.avi", "*.mp4", "*.mov", "*.mkv",
-                            "*.webm", "*.flv", "*.wmv", "*.m4v"]
-        outputs = {}  # output_path -> [sources]
+        video_extensions = self._selected_input_globs()
+        # normcase_key -> {"out": real_output_path, "srcs": [sources]}
+        groups = {}
 
         def register(src, proc_dir):
-            out = os.path.normcase(os.path.normpath(os.path.join(
+            real_out = os.path.join(
                 proc_dir,
                 make_output_filename(src, output_format, replace_whitespace,
-                                     prefix, suffix))))
-            outputs.setdefault(out, []).append(src)
+                                     prefix, suffix))
+            key = os.path.normcase(os.path.normpath(real_out))
+            g = groups.setdefault(key, {"out": real_out, "srcs": []})
+            g["srcs"].append(src)
 
         for input_dir in self.selected_dirs:
             proc_dir = os.path.join(input_dir, "proc")
@@ -1541,7 +1578,8 @@ class VideoProcessingGUI(QMainWindow):
         for video_file in self.selected_videos:
             register(video_file, os.path.join(os.path.dirname(video_file), "proc"))
 
-        return {out: srcs for out, srcs in outputs.items() if len(srcs) > 1}
+        # Preserve the real (non-normcased) output name for display.
+        return {g["out"]: g["srcs"] for g in groups.values() if len(g["srcs"]) > 1}
 
     def start_processing(self):
         """Start video processing"""
@@ -1575,6 +1613,7 @@ class VideoProcessingGUI(QMainWindow):
         replace_whitespace = self.replace_whitespace_check.isChecked()
         filename_prefix = self.prefix_edit.text()
         filename_suffix = self.suffix_edit.text()
+        input_extensions = self._selected_input_globs()
 
         # --- Guard: warn if multiple inputs map to the same output file ---
         collisions = self._find_output_collisions(
@@ -1634,7 +1673,7 @@ class VideoProcessingGUI(QMainWindow):
 
         # --- Detect already-processed videos ---
         skip_already_processed = False
-        video_extensions_check = ["*.avi", "*.mp4", "*.mov", "*.mkv", "*.webm", "*.flv", "*.wmv", "*.m4v"]
+        video_extensions_check = self._selected_input_globs()
 
         already_processed_count = 0
         total_video_count = 0
@@ -1709,6 +1748,7 @@ class VideoProcessingGUI(QMainWindow):
         self.ffmpeg_log.clear()
         self.log_message("Starting video preprocessing...")
         self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
+        self.log_message(f"Input types: {self.input_types_combo.currentText()}")
         self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}")
         if filename_prefix or filename_suffix:
             self.log_message(
@@ -1740,7 +1780,8 @@ class VideoProcessingGUI(QMainWindow):
             subtitle_style=dict(self.subtitle_style),
             replace_whitespace=replace_whitespace,
             filename_prefix=filename_prefix,
-            filename_suffix=filename_suffix
+            filename_suffix=filename_suffix,
+            input_extensions=input_extensions
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
