@@ -1247,9 +1247,9 @@ class InferenceWorker(QThread):
             def write(self, s):
                 if s and s.strip():
                     self._worker.log.emit(s.rstrip())
-                return self._real.write(s)
+                return len(s) if s else 0
             def flush(self):
-                return self._real.flush()
+                pass
 
         sys.stdout = _LogCapture(self, _real_stdout)
         try:
