@@ -60,6 +60,7 @@ dependencies = [
     "mne-lsl",        # LSL bindings (bundles liblsl on macOS); also pulled by OpenMuse
     "bleak",          # BLE backend (macOS CoreBluetooth, no dongle required)
     "pyqtgraph",      # fast live multichannel scrolling at 256 Hz
+    "PyOpenGL",       # ABMA 3D live arena view (pyqtgraph.opengl)
 ]
 
 [project.optional-dependencies]
