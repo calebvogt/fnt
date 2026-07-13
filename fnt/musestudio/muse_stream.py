@@ -51,8 +51,8 @@ def find_devices(timeout=15):
         )
     except FileNotFoundError:
         raise RuntimeError(
-            "OpenMuse CLI not found. Install the muse extra:\n"
-            '    pip install -e ".[muse]"'
+            "OpenMuse CLI not found. Reinstall project dependencies:\n"
+            "    pip install -e ."
         )
     except subprocess.TimeoutExpired as exc:
         raw = (exc.stdout or "") + (exc.stderr or "")

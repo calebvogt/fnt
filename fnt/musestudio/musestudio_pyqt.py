@@ -11,13 +11,18 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
+from fnt.musestudio.channel_table import LiveValuesPanel
 from fnt.musestudio.live_plot import MultiChannelScrollPlot
 from fnt.musestudio.muse_stream import (
     LSLReaderThread, MuseRecorder, MuseStreamProcess, find_devices,
 )
+
+
+def _is_battery(stream_name):
+    return "BATTERY" in stream_name.upper()
 
 
 class _ScanThread(QThread):
@@ -43,7 +48,8 @@ class MuseStudioWindow(QMainWindow):
         self.output_dir = os.path.join(os.path.expanduser("~"), "Documents")
 
         self.setWindowTitle("MuseStudio - FieldNeuroethologyToolbox")
-        self.resize(1100, 750)
+        self.resize(1280, 800)
+        self.setMinimumSize(960, 600)
         self._init_ui()
 
     # ------------------------------------------------------------------ UI
@@ -86,6 +92,14 @@ class MuseStudioWindow(QMainWindow):
         controls.addWidget(self.record_btn)
 
         controls.addStretch()
+
+        # Numeric battery readout (from the Muse-BATTERY stream; not plotted).
+        self.battery_label = QLabel("Battery: —")
+        self.battery_label.setStyleSheet(
+            "color: #cccccc; font-weight: bold; padding: 0 10px;"
+        )
+        controls.addWidget(self.battery_label)
+
         self.folder_btn = QPushButton("Save Folder…")
         self.folder_btn.clicked.connect(self.on_choose_folder)
         controls.addWidget(self.folder_btn)
@@ -95,9 +109,16 @@ class MuseStudioWindow(QMainWindow):
         self.folder_label.setStyleSheet("color: #999999;")
         root.addWidget(self.folder_label)
 
-        # Live plot.
+        # Body: scrolling plot (left) beside a live numeric channel table (right).
+        split = QSplitter(Qt.Horizontal)
         self.plot = MultiChannelScrollPlot()
-        root.addWidget(self.plot, stretch=1)
+        split.addWidget(self.plot)
+        self.values_panel = LiveValuesPanel()
+        split.addWidget(self.values_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([900, 320])
+        root.addWidget(split, stretch=1)
 
         # Status line.
         self.status_label = QLabel("Ready.")
@@ -145,12 +166,18 @@ class MuseStudioWindow(QMainWindow):
         except FileNotFoundError:
             QMessageBox.critical(
                 self, "OpenMuse not found",
-                'Install the muse extra:\n    pip install -e ".[muse]"',
+                "The OpenMuse CLI was not found. Reinstall project dependencies:\n"
+                "    pip install -e .",
             )
             return
 
+        # Fresh views for the new session.
+        self.plot.clear()
+        self.values_panel.clear_values()
+        self.battery_label.setText("Battery: —")
+
         self.reader = LSLReaderThread()
-        self.reader.samples_ready.connect(self.plot.add_samples)
+        self.reader.samples_ready.connect(self._on_samples)
         self.reader.connected.connect(self._on_connected)
         self.reader.disconnected.connect(self._on_disconnected)
         self.reader.error.connect(self._on_reader_error)
@@ -163,9 +190,24 @@ class MuseStudioWindow(QMainWindow):
         self._set_status("Connecting… (starting OpenMuse stream)")
 
     def _on_connected(self, names):
-        self.plot.set_channel_names(self.reader.channel_names())
+        ch_names = self.reader.channel_names()
+        # Battery is shown as a number, not plotted or listed as a channel.
+        plot_names = {k: v for k, v in ch_names.items() if not _is_battery(k)}
+        self.plot.set_channel_names(plot_names)
+        self.values_panel.set_channel_names(plot_names)
         self.record_btn.setEnabled(True)
         self._set_status(f"Connected. Streaming: {', '.join(names)}")
+
+    def _on_samples(self, stream_name, timestamps, data):
+        """Route incoming chunks: battery -> numeric label, everything else ->
+        the scrolling plot and the live values table."""
+        if _is_battery(stream_name):
+            if len(data):
+                pct = float(data[-1][0] if data.ndim == 2 else data[-1])
+                self.battery_label.setText(f"Battery: {pct:.0f}%")
+            return
+        self.plot.add_samples(stream_name, timestamps, data)
+        self.values_panel.add_samples(stream_name, timestamps, data)
 
     def _on_reader_error(self, msg):
         self._set_status("Stream error.")
@@ -191,6 +233,7 @@ class MuseStudioWindow(QMainWindow):
         self.device_combo.setEnabled(True)
         self.scan_btn.setEnabled(True)
         self.record_btn.setEnabled(False)
+        self.battery_label.setText("Battery: —")
         self._set_status("Disconnected.")
 
     def on_record(self):

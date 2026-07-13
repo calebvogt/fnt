@@ -764,9 +764,7 @@ class FNTMainWindow(QMainWindow):
             "• Live scrolling plots of EEG (256 Hz) and fNIRS (64 Hz)<br>"
             "• Records each stream to CSV in a timestamped session folder<br><br>"
             "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
-            "and experimental, and is not affiliated with InteraXon.<br><br>"
-            "Requires the optional <code>muse</code> dependencies: "
-            "<code>pip install -e \".[muse]\"</code>"
+            "and experimental, and is not affiliated with InteraXon."
         )
         info_label.setWordWrap(True)
         info_label.setOpenExternalLinks(True)
@@ -784,9 +782,8 @@ class FNTMainWindow(QMainWindow):
         except ImportError as e:
             QMessageBox.critical(
                 self, "MuseStudio dependencies missing",
-                "MuseStudio requires the optional 'muse' dependencies "
-                "(OpenMuse, mne-lsl, bleak, pyqtgraph).\n\n"
-                "Install them with:\n    pip install -e \".[muse]\"\n\n"
+                "MuseStudio requires OpenMuse, mne-lsl, bleak and pyqtgraph.\n\n"
+                "Reinstall project dependencies with:\n    pip install -e .\n\n"
                 f"Import error: {str(e)}",
             )
             return
