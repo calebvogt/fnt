@@ -60,6 +60,16 @@ class ArenaCanvas(FigureCanvas):
     def set_selected(self, idx):
         self._selected = idx
 
+    # 2D is already top-down; camera controls are no-ops for interface parity
+    def reset_camera(self):
+        pass
+
+    def top_down(self):
+        pass
+
+    def center_on(self, x, y):
+        pass
+
     # ------------------------------------------------------------------ #
     def set_arena(self, arena: ArenaConfig, chambers=None):
         self.arena = arena

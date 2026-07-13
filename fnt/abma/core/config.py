@@ -159,11 +159,72 @@ class Intervention:
 
 
 @dataclass
+class Coupling:
+    """One row of the attribute-interaction table (condition dynamics).
+
+    ``target += gain × source × (dt / hour)`` each step, or with ``effect='set'``
+    the target is set to ``gain`` wherever the source is active. Gains are per-hour.
+      source   : time | movement | activity | crowding | on_food | on_water |
+                 mass | metabolism | fed | hydrated | rested |
+                 energy | hunger | thirst | stress | health
+      target   : energy | hunger | thirst | stress | health
+      scale_by : none | mass | activity | metabolism
+      only_when: always | source_high | source_low   (gated by ``threshold``)
+    """
+    source: str = "time"
+    target: str = "energy"
+    effect: str = "rate"         # 'rate' | 'set'
+    gain: float = 0.0
+    scale_by: str = "none"
+    only_when: str = "always"
+    threshold: float = 0.5
+    note: str = ""
+
+
+def default_dynamics() -> list["Coupling"]:
+    """The built-in metabolic model as editable interaction rules.
+
+    Reproduces sensible physiology: needs rise (faster when moving), moving and
+    metabolism spend energy, being well-fed/hydrated restores it, deprivation
+    drains energy and eventually erodes health; crowding raises stress.
+    """
+    C = Coupling
+    return [
+        C("time", "hunger", "rate", 0.15, note="hunger rises over time"),
+        C("movement", "hunger", "rate", 1.5, note="moving builds hunger"),
+        C("on_food", "hunger", "set", 0.0, note="eating resets hunger"),
+        C("time", "thirst", "rate", 0.18, note="thirst rises over time"),
+        C("movement", "thirst", "rate", 1.8, note="moving builds thirst"),
+        C("on_water", "thirst", "set", 0.0, note="drinking resets thirst"),
+        C("fed", "energy", "rate", 0.5, note="recover energy when well-fed"),
+        C("hydrated", "energy", "rate", 0.25, note="recover energy when hydrated"),
+        C("time", "energy", "rate", -0.10, scale_by="metabolism",
+          note="baseline metabolism"),
+        C("movement", "energy", "rate", -1.2, scale_by="mass",
+          note="locomotion cost ∝ mass × speed"),
+        C("hunger", "energy", "rate", -0.4, only_when="source_high", threshold=0.5,
+          note="hunger drains energy"),
+        C("thirst", "energy", "rate", -0.4, only_when="source_high", threshold=0.5,
+          note="thirst drains energy"),
+        C("energy", "health", "rate", 0.05, only_when="source_high", threshold=0.3,
+          note="heal when energy is high"),
+        C("hunger", "health", "rate", -0.15, only_when="source_high",
+          threshold=0.9, note="starvation erodes health"),
+        C("thirst", "health", "rate", -0.15, only_when="source_high",
+          threshold=0.9, note="dehydration erodes health"),
+        C("stress", "health", "rate", -0.03, note="chronic stress erodes health"),
+        C("crowding", "stress", "rate", 0.006, note="crowding raises stress"),
+        C("time", "stress", "rate", -0.05, note="stress decays when calm"),
+    ]
+
+
+@dataclass
 class ExperimentConfig:
     name: str = "experiment"
     arena: ArenaConfig = field(default_factory=ArenaConfig)
     groups: list[AgentGroup] = field(default_factory=list)
     interventions: list[Intervention] = field(default_factory=list)
+    dynamics: list[Coupling] = field(default_factory=default_dynamics)
 
     days: float = 10.0                 # simulated duration (days)
     dt: float = 2.0                    # integration step (simulated seconds)
@@ -179,6 +240,10 @@ class ExperimentConfig:
     # Biology options
     individual_variation: float = 0.0  # per-agent trait jitter SD (0 = clones)
     enable_mortality: bool = False     # allow starvation death
+    # movement couplings (kept out of the condition-dynamics table since they
+    # affect speed, not a condition variable)
+    energy_speed_coupling: float = 0.6  # how much low energy slows movement (0=none)
+    rest_speed_factor: float = 0.15     # speed × this when satiated near home (1=off)
 
     # Output / execution
     trial_prefix: str = "S"            # trial id prefix, e.g. S001, S002 ...
@@ -227,11 +292,15 @@ class ExperimentConfig:
             "day_start_hour", "day_activity", "night_activity", "trial_prefix",
             "start_datetime", "parallel", "n_workers",
             "individual_variation", "enable_mortality",
+            "energy_speed_coupling", "rest_speed_factor",
         }
         scalars = {k: d[k] for k in known if k in d}
         interventions = [Intervention(**iv) for iv in d.get("interventions", [])]
+        dynamics = ([Coupling(**c) for c in d["dynamics"]]
+                    if "dynamics" in d else default_dynamics())
         return ExperimentConfig(arena=arena, groups=groups,
-                                interventions=interventions, **scalars)
+                                interventions=interventions, dynamics=dynamics,
+                                **scalars)
 
     @staticmethod
     def from_json(path: str) -> "ExperimentConfig":
@@ -243,16 +312,14 @@ class ExperimentConfig:
 
 
 def blank_experiment() -> ExperimentConfig:
-    """A neutral starting point — an empty arena and one generic agent type.
+    """A neutral starting point — an empty arena and NO agents.
 
     ABMA is a general-purpose ABM sandbox; this is what it opens with. The user
-    shapes the arena, defines their own agent type(s), and scripts the trial.
+    shapes the arena, defines their own agent type(s) in Build & Add Agents, and
+    only then do agents appear (and animate) in the preview.
     """
     arena = ArenaConfig(width=2.0, height=2.0, boundary="reflective", objects=[])
-    groups = [AgentGroup(label="agent_type_1", species="agent", sex="M", count=8,
-                         genotype=Genotype({}), treatment=Treatment("none", 0.0, 0.0),
-                         traits=TraitProfile())]
-    return ExperimentConfig(name="experiment", arena=arena, groups=groups,
+    return ExperimentConfig(name="experiment", arena=arena, groups=[],
                             days=2.0, n_trials=1,
                             start_datetime="2025-01-01T12:00:00")
 

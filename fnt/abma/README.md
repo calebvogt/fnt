@@ -66,13 +66,19 @@ change.
 value)` applied at run time — e.g. induce anosmia on day 3 with
 `3 · all · smell_ability · scale · 0`. Editable in the Experiment tab.
 
-**Layout.** Left is a vertically-scrolling column of section groups (Arena,
-Population, Experiment, Run) in the FNT house style (cf. Mask Tracker / MAD). Right
-is one **interactive "God's-eye" preview** used for *both* setup and running —
-drag to orbit, scroll to zoom — with a **3D/2D toggle**. The Arena section has a
-**Load Preset Arena…** button (dialog picker). The agent inspector is not docked;
-**hovering** an agent pops its stat card up near the cursor and **clicking** pins
-it, so the preview keeps the full width.
+**Layout.** Left is a column of **collapsible section steps** (1·Arena,
+2·Build & Add Agents, 3·Experiment, 4·Run log) in the FNT house style (cf. Mask
+Tracker / MAD), with a **persistent Run bar** pinned at the bottom so the primary
+action + progress are always visible. The Experiment step shows only the
+essentials (Duration, Replicates, a Resolution preset that sets dt/record); the
+rest lives under a collapsed **Advanced**. Right is one **interactive preview**
+used for *both* setup and running — drag to orbit, scroll to zoom — with a
+**3D/2D toggle** and a **transport bar** (play/pause · timeline scrubber · speed ·
+reset-camera · top-down · follow-selected). During editing a **live preview**
+animates the agents (unsaved); after a run the frame buffer is retained so you can
+**scrub/replay** it. The agent inspector is not docked — **hover** an agent to pop
+its stat card near the cursor, **click** to pin. The Arena step has a
+**Load Preset Arena…** button (dialog picker).
 
 **Live views (2D ⇄ 3D toggle).** The preview is either a 2D top-down canvas or a
 pyqtgraph OpenGL 3D scene. The 3D scene renders the arena as a **solid object**

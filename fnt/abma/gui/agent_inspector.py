@@ -167,6 +167,9 @@ class AgentInspector(QFrame):
     def set_population(self, meta_list):
         self._pop = {m["index"]: m for m in meta_list}
 
+    def selected_index(self):
+        return self._idx
+
     def clear_selection(self):
         self._idx = None
         self.spark.clear()

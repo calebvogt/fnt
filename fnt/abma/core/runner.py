@@ -52,7 +52,7 @@ def make_project(config: ExperimentConfig, project_dir: str) -> str:
 def run_experiment(config: ExperimentConfig, project_dir: str,
                    progress_cb=None, frame_cb=None, log_cb=None,
                    frame_interval_s: float = 300.0,
-                   analyze: bool = False, meta_cb=None) -> list[dict]:
+                   analyze: bool = False, meta_cb=None, cancel_cb=None) -> list[dict]:
     """Run all trials sequentially, with optional live frame streaming.
 
     progress_cb(overall_fraction), frame_cb(frame_dict) for trial 0 only,
@@ -67,24 +67,32 @@ def run_experiment(config: ExperimentConfig, project_dir: str,
         if log_cb:
             log_cb(msg)
 
+    cancelled = False
     if config.parallel and n > 1:
         _log(f"Running {n} trials in parallel ({config.n_workers} workers)...")
         cfg_d = config.to_dict()
         args = [(cfg_d, i, data_dir) for i in range(n)]
         with ProcessPoolExecutor(max_workers=config.n_workers) as ex:
-            for done, res in enumerate(ex.map(run_trial, args), 1):
-                results.append(res)
-                _log(f"  finished {res['trial_id']}")
+            futures = [ex.submit(run_trial, a) for a in args]
+            for done, fut in enumerate(futures, 1):
+                if cancel_cb is not None and cancel_cb():
+                    for f in futures[done - 1:]:
+                        f.cancel()
+                    cancelled = True
+                    break
+                results.append(fut.result())
+                _log(f"  finished {results[-1]['trial_id']}")
                 if progress_cb:
                     progress_cb(done / n)
     else:
         # replicates run in lockstep so they can be watched side-by-side
         _log(f"Running {n} replicate chamber(s) in lockstep "
              f"({config.total_agents()} agents each, {config.days} days)...")
-        results = _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
-                            frame_interval_s, meta_cb)
+        results, cancelled = _run_live(config, data_dir, progress_cb, frame_cb,
+                                       log_cb, frame_interval_s, meta_cb, cancel_cb)
 
-    _log(f"Done. {n} trial(s) written to {data_dir}")
+    _log(f"{'Stopped' if cancelled else 'Done'}. "
+         f"{len(results)} trial(s) written to {data_dir}")
 
     if analyze:
         from .analysis import analyze_experiment
@@ -97,8 +105,12 @@ def run_experiment(config: ExperimentConfig, project_dir: str,
 
 
 def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
-              frame_interval_s, meta_cb):
-    """Step every replicate together; stream a combined multi-chamber frame."""
+              frame_interval_s, meta_cb, cancel_cb=None):
+    """Step every replicate together; stream a combined multi-chamber frame.
+
+    Returns ``(results, cancelled)``. On a cooperative stop the loop breaks and
+    the ``finally`` still flushes/closes every recorder cleanly.
+    """
     from .recorder import (TrajectoryRecorder, EventRecorder, ConditionRecorder,
                            write_agents_table)
     n = config.n_trials
@@ -141,8 +153,12 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
     report_every = max(1, n_steps // 100)
 
     elapsed = 0.0
+    cancelled = False
     try:
         for k in range(n_steps):
+            if cancel_cb is not None and cancel_cb():
+                cancelled = True
+                break
             for si, sim in enumerate(sims):
                 sim.step(elapsed, dt, events=recs[si]["evt"])
             elapsed += dt
@@ -165,7 +181,7 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
             r["cond"].close()
     if progress_cb is not None:
         progress_cb(1.0)
-    return [r["paths"] for r in recs]
+    return [r["paths"] for r in recs], cancelled
 
 
 _FRAME_KEYS = ("heading", "sex_m", "alive", "color", "size", "shape",

@@ -9,11 +9,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QThread, QTimer, QPoint, pyqtSignal
+from PyQt5.QtGui import QColor, QPixmap, QPainter, QPolygon
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QTabWidget, QLabel, QPushButton, QDoubleSpinBox, QSpinBox, QComboBox,
@@ -21,12 +22,13 @@ from PyQt5.QtWidgets import (
     QTextEdit, QProgressBar, QFileDialog, QMessageBox, QHeaderView,
     QAbstractItemView, QAction, QSplitter, QStackedWidget, QScrollArea,
     QFrame, QDialog, QListWidget, QDialogButtonBox, QSizePolicy,
+    QToolButton, QSlider,
 )
 
 from ..core.config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
-    TraitProfile, ResourceObject, Intervention, Appearance, blank_experiment,
-    default_vole_experiment,
+    TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
+    default_dynamics, blank_experiment, default_vole_experiment,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -58,6 +60,8 @@ _TRAIT_DEFAULT = {
 }
 OBJ_COLS = ["kind", "x", "y", "radius", "label"]
 IV_COLS = ["at_day", "target", "attribute", "op", "value"]
+DYN_COLS = ["source", "target", "effect", "gain", "scale_by", "when",
+            "threshold", "note"]
 _IV_ATTRS = ["smell_ability", "identity_signal", "aggression", "boldness",
              "sociability", "exploration", "base_speed", "home_range_r",
              "mass", "metabolism"]
@@ -83,17 +87,32 @@ class ABMARunWorker(QThread):
         total_s = config.days * 86400.0
         # ~500 live frames regardless of duration; never finer than one step
         self._frame_interval = max(config.dt, total_s / 500.0)
+        self._cancel = threading.Event()
+        self._last_emit = 0.0
+        self._min_frame_dt = 1.0 / 30.0     # cap live frames at ~30/s (wall-clock)
+
+    def cancel(self):
+        """Request a graceful stop; the run loop checks this each step."""
+        self._cancel.set()
+
+    def _emit_frame(self, fr):
+        # throttle to wall-clock so a fast run can't flood the GUI event queue
+        now = time.monotonic()
+        if now - self._last_emit >= self._min_frame_dt:
+            self._last_emit = now
+            self.frame.emit(fr)
 
     def run(self):
         try:
             res = run_experiment(
                 self.config, self.project_dir,
                 progress_cb=lambda f: self.progress.emit(float(f)),
-                frame_cb=lambda fr: self.frame.emit(fr),
+                frame_cb=self._emit_frame,
                 log_cb=lambda m: self.log.emit(m),
                 frame_interval_s=self._frame_interval,
                 analyze=self.analyze,
                 meta_cb=lambda meta: self.agents.emit(meta),
+                cancel_cb=self._cancel.is_set,
             )
             self.done.emit(res)
         except Exception:
@@ -115,9 +134,19 @@ class ABMAWindow(QMainWindow):
         self._running = False
         self._preview_sim = None
         self._preview_elapsed = 0.0
+        self._preview_interval = 60          # ms; slowed for large populations
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._preview_tick)
-        self.setStyleSheet(_DARK_QSS)
+        # transport / playback state (for reviewing a run's buffered frames)
+        self._frames = []
+        self._play_idx = 0
+        self._playing = False
+        self._live_follow = True
+        self._play_speed = 1.0
+        self._follow_agent = False
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+        self.setStyleSheet(_DARK_QSS + "\n" + _arrow_qss())
         self._build_menu()
 
         # unified interactive preview: one 3D GL view + one 2D view (toggle),
@@ -152,9 +181,17 @@ class ABMAWindow(QMainWindow):
             return
         try:
             cfg = self._collect_config()
-        except Exception:
+        except Exception as e:
+            # surface config errors (e.g. a typo in a dynamics/attribute cell)
+            # instead of silently freezing the preview
             self._stop_preview()
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"⚠ preview paused — {e}")
+                self.status_label.setStyleSheet("color:#e0a23a; font-size:11px;")
             return
+        if hasattr(self, "status_label") and not self._frames:
+            self.status_label.setText("Idle.")
+            self.status_label.setStyleSheet("color:#8a9099; font-size:11px;")
         if cfg.total_agents() == 0:
             self._stop_preview()
             return
@@ -168,8 +205,18 @@ class ABMAWindow(QMainWindow):
         for v in self._views():
             v.set_arena(cfg.arena)          # single chamber for the preview
         self.inspector.set_population(self._preview_sim.agent_static())
-        if not self._preview_timer.isActive():
-            self._preview_timer.start(60)
+        # entering live preview discards any prior run's review buffer
+        self._frames = []
+        self._live_follow = True
+        if hasattr(self, "scrubber"):
+            self.scrubber.blockSignals(True)
+            self.scrubber.setRange(0, 0)
+            self.scrubber.blockSignals(False)
+            self.lbl_time.setText("")
+            self.btn_play.setText("⏸")
+        # the preview steps on the GUI thread; ease off for big populations
+        self._preview_interval = 60 if self._preview_sim.n <= 150 else 120
+        self._preview_timer.start(self._preview_interval)
 
     def _stop_preview(self):
         self._preview_timer.stop()
@@ -181,12 +228,17 @@ class ABMAWindow(QMainWindow):
         sim = self._preview_sim
         sim.step(self._preview_elapsed, 0.4, events=None)   # no records, no combat
         self._preview_elapsed += 0.4
-        self._on_frame(sim._frame(self._preview_elapsed))
+        self._render_live(sim._frame(self._preview_elapsed))
 
     # ------------------------------------------------------------------ #
     # Layout: left scrolling section column + right preview
     # ------------------------------------------------------------------ #
     def _build_left_column(self):
+        wrap = QWidget()
+        wlay = QVBoxLayout(wrap)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(0)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -195,21 +247,49 @@ class ABMAWindow(QMainWindow):
         content = QWidget()
         col = QVBoxLayout(content)
         col.setContentsMargins(10, 10, 10, 10)
-        col.setSpacing(10)
-        for title, builder in [
-            ("1 · Arena", self._build_arena_tab),
-            ("2 · Build && Add Agents", self._build_population_tab),
-            ("3 · Experiment", self._build_experiment_tab),
-            ("4 · Run", self._build_run_tab),
+        col.setSpacing(8)
+        self._sections = {}
+        for key, title, builder, expanded in [
+            ("arena", "1 · Arena", self._build_arena_tab, True),
+            ("agents", "2 · Build && Add Agents", self._build_population_tab, True),
+            ("experiment", "3 · Experiment", self._build_experiment_tab, False),
+            ("run", "4 · Run log", self._build_run_tab, False),
         ]:
-            gb = QGroupBox(title)
-            gbl = QVBoxLayout(gb)
-            gbl.setContentsMargins(8, 12, 8, 8)
-            gbl.addWidget(builder())
-            col.addWidget(gb)
+            sec = CollapsibleSection(title, builder(), expanded=expanded)
+            self._sections[key] = sec
+            col.addWidget(sec)
         col.addStretch(1)
         scroll.setWidget(content)
-        return scroll
+        wlay.addWidget(scroll, 1)
+
+        # ---- persistent action bar (Run is always reachable) ----
+        bar = QFrame()
+        bar.setObjectName("run_bar")
+        bl = QVBoxLayout(bar)
+        bl.setContentsMargins(10, 8, 10, 8)
+        bl.setSpacing(5)
+        btn_row = QHBoxLayout()
+        self.btn_run = QPushButton("▶  Run Experiment")
+        self.btn_run.setObjectName("accept_btn")
+        self.btn_run.clicked.connect(self._on_run)
+        self.btn_stop = QPushButton("■")
+        self.btn_stop.setObjectName("reject_btn")
+        self.btn_stop.setMaximumWidth(44)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_stop.setEnabled(False)
+        btn_row.addWidget(self.btn_run, 1)
+        btn_row.addWidget(self.btn_stop)
+        bl.addLayout(btn_row)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setMaximumHeight(6)
+        self.progress.setTextVisible(False)
+        bl.addWidget(self.progress)
+        self.status_label = QLabel("Idle.")
+        self.status_label.setStyleSheet("color:#8a9099; font-size:11px;")
+        bl.addWidget(self.status_label)
+        wlay.addWidget(bar)
+        return wrap
 
     def _build_preview(self):
         right = QWidget()
@@ -252,6 +332,52 @@ class ABMAWindow(QMainWindow):
             self.view_3d.agent_hovered.connect(self._on_agent_hover)
 
         rlay.addWidget(self.view_stack, 1)   # preview takes the full width
+
+        # ---- transport / playback bar ----
+        tb = QFrame()
+        tb.setObjectName("transport")
+        tl = QHBoxLayout(tb)
+        tl.setContentsMargins(8, 4, 8, 4)
+        tl.setSpacing(8)
+        self.btn_play = QToolButton()
+        self.btn_play.setText("⏸")
+        self.btn_play.setToolTip("Play / pause")
+        self.btn_play.clicked.connect(self._on_play_pause)
+        tl.addWidget(self.btn_play)
+        self.scrubber = QSlider(Qt.Horizontal)
+        self.scrubber.setRange(0, 0)
+        self.scrubber.valueChanged.connect(self._on_scrub)
+        tl.addWidget(self.scrubber, 1)
+        self.lbl_time = QLabel("")
+        self.lbl_time.setStyleSheet("color:#8a9099; font-size:11px;")
+        self.lbl_time.setMinimumWidth(110)
+        tl.addWidget(self.lbl_time)
+        self.in_speed = QComboBox()
+        self.in_speed.addItems(["0.5×", "1×", "2×", "4×"])
+        self.in_speed.setCurrentText("1×")
+        self.in_speed.setToolTip("Replay speed")
+        self.in_speed.currentTextChanged.connect(
+            lambda t: setattr(self, "_play_speed", float(t.rstrip("×"))))
+        tl.addWidget(self.in_speed)
+        for txt, tip, cb in [
+            ("⌂", "Reset camera", lambda: self._active_view().reset_camera()),
+            ("⊤", "Top-down view", lambda: self._active_view().top_down()),
+        ]:
+            b = QToolButton()
+            b.setText(txt)
+            b.setToolTip(tip)
+            b.clicked.connect(cb)
+            b.setEnabled(self.view_3d is not None)
+            tl.addWidget(b)
+        self.btn_follow = QToolButton()
+        self.btn_follow.setText("◎")
+        self.btn_follow.setToolTip("Follow selected agent")
+        self.btn_follow.setCheckable(True)
+        self.btn_follow.setEnabled(self.view_3d is not None)
+        self.btn_follow.toggled.connect(
+            lambda c: setattr(self, "_follow_agent", c))
+        tl.addWidget(self.btn_follow)
+        rlay.addWidget(tb)
 
         # inspector is a floating popup shown on hover / click (frees the preview)
         self.inspector = AgentInspector(self)
@@ -498,14 +624,33 @@ class ABMAWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # Tab 3: Experiment
     # ------------------------------------------------------------------ #
+    # fidelity presets -> (dt seconds, record interval seconds)
+    _FIDELITY = {"Fast": (5.0, 30.0), "Balanced": (2.0, 10.0),
+                 "Fine": (0.5, 2.0)}
+
     def _build_experiment_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        form = QFormLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        # ---- essentials (what everyone sets) ----
+        ess = QFormLayout()
         self.in_days = _dspin(0.05, 365, 10.0, 0.5, " days")
+        self.in_trials = _ispin(1, 100, 1)
+        self.in_trials.setToolTip("Replicate chambers, shown side-by-side")
+        self.in_fidelity = QComboBox()
+        self.in_fidelity.addItems(["Fast", "Balanced", "Fine", "Custom"])
+        self.in_fidelity.setToolTip(
+            "Simulation resolution: Fast = coarse & quick, Fine = smooth & slow")
+        self.in_fidelity.currentTextChanged.connect(self._apply_fidelity)
+        ess.addRow("Duration", self.in_days)
+        ess.addRow("Replicates", self.in_trials)
+        ess.addRow("Resolution", self.in_fidelity)
+        lay.addLayout(ess)
+
+        # ---- advanced knobs (collapsed by default) ----
         self.in_dt = _dspin(0.1, 60, 2.0, 0.5, " s")
         self.in_rec = _dspin(1, 3600, 10.0, 1.0, " s")
-        self.in_trials = _ispin(1, 100, 3)
         self.in_seed = _ispin(0, 10 ** 6, 0)
         self.in_daystart = _dspin(0, 23.9, 6.0, 0.5, " h")
         self.in_dayact = _dspin(0, 3, 0.7, 0.1)
@@ -515,29 +660,41 @@ class ABMAWindow(QMainWindow):
         self.in_mortality = QCheckBox("Enable starvation mortality")
         self.in_analyze = QCheckBox("Compute socio-spatial analysis after run")
         self.in_analyze.setChecked(True)
-        self.in_parallel = QCheckBox("Run trials in parallel (no live view)")
+        self.in_parallel = QCheckBox("Run replicates in parallel (no live view)")
         self.in_workers = _ispin(1, 16, 2)
+        self.in_espeed = _dspin(0, 1, 0.6, 0.1)
+        self.in_rest = _dspin(0, 1, 0.15, 0.05)
+        # editing dt/record by hand switches Resolution to Custom
+        self.in_dt.valueChanged.connect(self._mark_custom_fidelity)
+        self.in_rec.valueChanged.connect(self._mark_custom_fidelity)
+        adv_w = QWidget()
+        adv = QFormLayout(adv_w)
+        adv.setContentsMargins(4, 4, 4, 4)
         for lab, wdg, tip in [
-            ("Duration", self.in_days, "Simulated days per trial"),
-            ("Timestep (dt)", self.in_dt, "Integration step in simulated seconds"),
+            ("Timestep (dt)", self.in_dt, "Integration step (s) — set by Resolution"),
             ("Record interval", self.in_rec, "Seconds between logged positions"),
-            ("Trials (replicates)", self.in_trials, ""),
-            ("Random seed", self.in_seed, "Base seed; trial i uses seed+i"),
+            ("Random seed", self.in_seed, "Base seed; replicate i uses seed+i"),
+            ("Individual variation", self.in_variation,
+             "Per-agent trait jitter SD (0 = identical clones)"),
             ("Day start hour", self.in_daystart, "Local hour the light phase starts"),
             ("Day activity ×", self.in_dayact, "Movement multiplier during day"),
             ("Night activity ×", self.in_nightact, "Movement multiplier at night"),
             ("Release datetime", self.in_start, "ISO timestamp for t=0"),
-            ("Individual variation", self.in_variation,
-             "Per-agent trait jitter SD (0 = identical clones)"),
-            ("", self.in_mortality, "Agents can die of starvation if resources run out"),
+            ("Energy→speed coupling", self.in_espeed,
+             "How much low energy slows movement (0 = speed independent of energy)"),
+            ("Rest speed ×", self.in_rest,
+             "Speed multiplier when satiated near home (1 = no resting)"),
+            ("", self.in_mortality, ""),
             ("", self.in_analyze, ""),
             ("", self.in_parallel, ""),
             ("Parallel workers", self.in_workers, ""),
         ]:
             if tip:
                 wdg.setToolTip(tip)
-            form.addRow(lab, wdg)
-        lay.addLayout(form)
+            adv.addRow(lab, wdg)
+        lay.addWidget(CollapsibleSection("Advanced ▸ dt, seed, circadian, "
+                                         "mortality, parallel", adv_w,
+                                         expanded=False))
 
         # ---- intervention schedule ----
         iv_box = QGroupBox("Intervention schedule")
@@ -564,6 +721,37 @@ class ABMAWindow(QMainWindow):
         ivl.addLayout(ivr)
         lay.addWidget(iv_box)
 
+        # ---- attribute dynamics (interaction table) ----
+        dyn_body = QWidget()
+        dynl = QVBoxLayout(dyn_body)
+        dynl.setContentsMargins(2, 2, 2, 2)
+        dyn_hint = QLabel(
+            "How condition variables interact. Each rule: target += gain × "
+            "source per hour (or effect=set).\nsources: time · movement · "
+            "on_food · on_water · crowding · fed · hydrated · mass · metabolism · "
+            "energy/hunger/thirst/stress/health.  targets: energy · hunger · "
+            "thirst · stress · health.  scale_by: none/mass/activity/metabolism.  "
+            "when: always / source_high / source_low (vs threshold).")
+        dyn_hint.setWordWrap(True)
+        dyn_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        dynl.addWidget(dyn_hint)
+        self.dyn_table = _table(DYN_COLS)
+        self.dyn_table.setMinimumHeight(150)
+        dynl.addWidget(self.dyn_table)
+        dynr = QHBoxLayout()
+        for label, cb in [("Add rule", lambda: self._add_dyn_row()),
+                          ("Remove selected",
+                           lambda: self._del_row(self.dyn_table)),
+                          ("Reset to default", self._reset_dynamics)]:
+            b = QPushButton(label)
+            b.clicked.connect(cb)
+            dynr.addWidget(b)
+        dynr.addStretch()
+        dynl.addLayout(dynr)
+        lay.addWidget(CollapsibleSection(
+            "Attribute dynamics ▸ how energy, hunger, health… interact",
+            dyn_body, expanded=False))
+
         out_box = QGroupBox("Output")
         ob = QHBoxLayout(out_box)
         self.in_outdir = QLineEdit(
@@ -577,11 +765,69 @@ class ABMAWindow(QMainWindow):
         lay.addStretch(1)
         return w
 
+    def _apply_fidelity(self, name):
+        preset = self._FIDELITY.get(name)
+        if not preset:
+            return
+        for wdg, val in ((self.in_dt, preset[0]), (self.in_rec, preset[1])):
+            wdg.blockSignals(True)
+            wdg.setValue(val)
+            wdg.blockSignals(False)
+        self._rebuild_preview()
+
+    def _mark_custom_fidelity(self, *_):
+        if (self.in_dt.value(), self.in_rec.value()) not in self._FIDELITY.values():
+            self.in_fidelity.blockSignals(True)
+            self.in_fidelity.setCurrentText("Custom")
+            self.in_fidelity.blockSignals(False)
+
+    def _set_fidelity_combo(self):
+        cur = (self.in_dt.value(), self.in_rec.value())
+        name = next((k for k, v in self._FIDELITY.items() if v == cur), "Custom")
+        self.in_fidelity.blockSignals(True)
+        self.in_fidelity.setCurrentText(name)
+        self.in_fidelity.blockSignals(False)
+
     def _pick_outdir(self):
         d = QFileDialog.getExistingDirectory(self, "Choose project parent folder",
                                              self.in_outdir.text())
         if d:
             self.in_outdir.setText(d)
+
+    def _add_dyn_row(self, c: Coupling | None = None):
+        if not isinstance(c, Coupling):
+            c = Coupling()
+        t = self.dyn_table
+        r = t.rowCount()
+        t.insertRow(r)
+        for i, v in enumerate([c.source, c.target, c.effect, c.gain, c.scale_by,
+                               c.only_when, c.threshold, c.note]):
+            t.setItem(r, i, QTableWidgetItem(str(v)))
+
+    def _reset_dynamics(self):
+        self.dyn_table.setRowCount(0)
+        for c in default_dynamics():
+            self._add_dyn_row(c)
+
+    def _dynamics_from_table(self) -> list[Coupling]:
+        out = []
+        t = self.dyn_table
+        for r in range(t.rowCount()):
+            def cell(c, default=""):
+                it = t.item(r, c)
+                return it.text().strip() if it and it.text() else default
+            if not cell(0) or not cell(1):
+                continue
+            try:
+                out.append(Coupling(
+                    source=cell(0, "time"), target=cell(1, "energy"),
+                    effect=cell(2, "rate").lower(), gain=float(cell(3, "0")),
+                    scale_by=cell(4, "none").lower(),
+                    only_when=cell(5, "always").lower(),
+                    threshold=float(cell(6, "0.5")), note=cell(7)))
+            except ValueError as e:
+                raise ValueError(f"Dynamics row {r + 1}: {e}")
+        return out
 
     def _add_iv_row(self, iv: Intervention | None = None):
         if not isinstance(iv, Intervention):
@@ -617,23 +863,7 @@ class ABMAWindow(QMainWindow):
     def _build_run_tab(self):
         w = QWidget()
         left = QVBoxLayout(w)
-        self.btn_run = QPushButton("▶  Run experiment")
-        self.btn_run.setObjectName("accept_btn")
-        self.btn_run.clicked.connect(self._on_run)
-        self.btn_stop = QPushButton("■  Stop")
-        self.btn_stop.setObjectName("reject_btn")
-        self.btn_stop.clicked.connect(self._on_stop)
-        self.btn_stop.setEnabled(False)
-        r = QHBoxLayout()
-        r.addWidget(self.btn_run)
-        r.addWidget(self.btn_stop)
-        left.addLayout(r)
-        self.status_label = QLabel("Idle.")
-        self.status_label.setStyleSheet("color: #8fbfff; font-size: 12px;")
-        left.addWidget(self.status_label)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        left.addWidget(self.progress)
+        left.setContentsMargins(0, 0, 0, 0)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(130)
@@ -725,6 +955,7 @@ class ABMAWindow(QMainWindow):
             name=self.in_name.text().strip() or "experiment",
             arena=arena, groups=groups,
             interventions=self._interventions_from_table(),
+            dynamics=self._dynamics_from_table(),
             days=self.in_days.value(), dt=self.in_dt.value(),
             record_interval=self.in_rec.value(),
             n_trials=self.in_trials.value(), seed=self.in_seed.value(),
@@ -734,6 +965,8 @@ class ABMAWindow(QMainWindow):
             start_datetime=self.in_start.text().strip(),
             individual_variation=self.in_variation.value(),
             enable_mortality=self.in_mortality.isChecked(),
+            energy_speed_coupling=self.in_espeed.value(),
+            rest_speed_factor=self.in_rest.value(),
             parallel=self.in_parallel.isChecked(),
             n_workers=self.in_workers.value(),
             trial_prefix="S",
@@ -760,9 +993,14 @@ class ABMAWindow(QMainWindow):
             self.iv_table.setRowCount(0)
             for iv in cfg.interventions:
                 self._add_iv_row(iv)
+        if hasattr(self, "dyn_table"):
+            self.dyn_table.setRowCount(0)
+            for c in cfg.dynamics:
+                self._add_dyn_row(c)
         self.in_days.setValue(cfg.days)
         self.in_dt.setValue(cfg.dt)
         self.in_rec.setValue(cfg.record_interval)
+        self._set_fidelity_combo()
         self.in_trials.setValue(cfg.n_trials)
         self.in_seed.setValue(cfg.seed)
         self.in_daystart.setValue(cfg.day_start_hour)
@@ -771,6 +1009,8 @@ class ABMAWindow(QMainWindow):
         self.in_start.setText(cfg.start_datetime)
         self.in_variation.setValue(cfg.individual_variation)
         self.in_mortality.setChecked(cfg.enable_mortality)
+        self.in_espeed.setValue(cfg.energy_speed_coupling)
+        self.in_rest.setValue(cfg.rest_speed_factor)
         self._refresh_arena()
         self._update_pop_summary()
 
@@ -900,6 +1140,15 @@ class ABMAWindow(QMainWindow):
         self._running = True
         self._stop_preview()             # the real run takes over the views
         self._last_frame = None
+        self._frames = []                # fresh buffer for this run
+        self._play_idx = 0
+        self._live_follow = True
+        self._playing = False
+        self._play_timer.stop()
+        self.scrubber.blockSignals(True)
+        self.scrubber.setRange(0, 0)
+        self.scrubber.blockSignals(False)
+        self.btn_play.setText("⏸")
         self._inspector_pinned = False
         self._hover_idx = None
         self.inspector.hide()
@@ -935,13 +1184,91 @@ class ABMAWindow(QMainWindow):
                 f"ETA {_mmss(eta)}")
 
     def _on_frame(self, fr):
+        # a run frame — buffer it so it can be scrubbed / replayed
+        self._frames.append(fr)
+        self.scrubber.blockSignals(True)
+        self.scrubber.setRange(0, max(0, len(self._frames) - 1))
+        if self._live_follow:
+            self._play_idx = len(self._frames) - 1
+            self.scrubber.setValue(self._play_idx)
+        self.scrubber.blockSignals(False)
+        if self._live_follow:
+            self._display_frame(fr)
+
+    def _render_live(self, fr):
+        """Live editor-preview frame (not buffered — nothing to review)."""
+        self._display_frame(fr)
+
+    def _render_frame(self, idx):
+        if 0 <= idx < len(self._frames):
+            self._display_frame(self._frames[idx])
+
+    def _display_frame(self, fr):
         self._last_frame = fr
-        self._push_frame(self._active_view(), fr)   # only the visible view
+        self._push_frame(self._active_view(), fr)
+        sel = self.inspector.selected_index()
+        if self._follow_agent and sel is not None and sel < len(fr["x"]):
+            self._active_view().center_on(fr["x"][sel], fr["y"][sel])
         if self.inspector.isVisible():
             self._update_inspector_dynamic(fr)
+        d, h = fr.get("day"), fr.get("hour")
+        if d is not None and h is not None:
+            self.lbl_time.setText(f"day {d} · {int(h):02d}:00")
+
+    def _on_play_pause(self):
+        if self._running:                       # live run: toggle follow vs scrub
+            self._live_follow = not self._live_follow
+            self.btn_play.setText("⏸" if self._live_follow else "▶")
+            if self._live_follow and self._frames:
+                self._play_idx = len(self._frames) - 1
+                self.scrubber.blockSignals(True)
+                self.scrubber.setValue(self._play_idx)
+                self.scrubber.blockSignals(False)
+                self._render_frame(self._play_idx)
+        elif self._frames:                      # finished run: replay the buffer
+            if self._playing:
+                self._playing = False
+                self._play_timer.stop()
+                self.btn_play.setText("▶")
+            else:
+                self._playing = True
+                if self._play_idx >= len(self._frames) - 1:
+                    self._play_idx = 0
+                self._play_timer.start(50)
+                self.btn_play.setText("⏸")
+        else:                                   # live editor preview
+            if self._preview_timer.isActive():
+                self._preview_timer.stop()
+                self.btn_play.setText("▶")
+            elif self._preview_sim is not None:
+                self._preview_timer.start(self._preview_interval)
+                self.btn_play.setText("⏸")
+
+    def _play_tick(self):
+        if not self._frames:
+            self._play_timer.stop()
+            return
+        self._play_idx = min(self._play_idx + max(1, int(round(self._play_speed))),
+                             len(self._frames) - 1)
+        self.scrubber.blockSignals(True)
+        self.scrubber.setValue(self._play_idx)
+        self.scrubber.blockSignals(False)
+        self._render_frame(self._play_idx)
+        if self._play_idx >= len(self._frames) - 1:
+            self._playing = False
+            self._play_timer.stop()
+            self.btn_play.setText("▶")
+
+    def _on_scrub(self, idx):
+        self._live_follow = False
+        self._playing = False
+        self._play_timer.stop()
+        self.btn_play.setText("▶")
+        self._play_idx = idx
+        self._render_frame(idx)
 
     def _update_inspector_dynamic(self, fr):
-        idx = self.inspector._idx
+        idx = self.inspector.selected_index()
         if idx is None or idx >= len(fr["x"]):
             return
         self.inspector.update_dynamic({
@@ -974,7 +1301,15 @@ class ABMAWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_open.setEnabled(True)
         self._running = False
-        self._rebuild_preview()          # resume the live editor preview
+        # keep the frame buffer so the run can be scrubbed / replayed
+        self._live_follow = False
+        self._playing = False
+        self.btn_play.setText("▶")
+        if self._frames:
+            self._append_log("Playback ready — scrub the timeline or press ▶ to "
+                             "replay. Edit the setup to return to live preview.")
+        else:
+            self._rebuild_preview()
 
     def _analyze_existing(self):
         """Run the built-in analysis on an already-generated project folder."""
@@ -1004,14 +1339,12 @@ class ABMAWindow(QMainWindow):
         QMessageBox.critical(self, "Simulation failed", tb.splitlines()[-1])
 
     def _on_stop(self):
+        # cooperative stop: the run loop breaks and closes files cleanly, then
+        # emits done/failed (handled by _on_done/_on_failed). No hard terminate.
         if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(2000)
-            self._append_log("Stopped by user.")
-        self.btn_run.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self._running = False
-        self._rebuild_preview()
+            self.worker.cancel()
+            self._append_log("Stopping…")
+            self.btn_stop.setEnabled(False)
 
     def _open_output(self):
         d = getattr(self, "_project_dir", None)
@@ -1061,6 +1394,41 @@ class ArenaPresetDialog(QDialog):
     def chosen(self):
         r = self.list.currentRow()
         return PRESETS[r] if 0 <= r < len(PRESETS) else None
+
+
+# --------------------------------------------------------------------------- #
+# Collapsible section (accordion-style step)
+# --------------------------------------------------------------------------- #
+class CollapsibleSection(QWidget):
+    """A titled header that expands/collapses its content widget."""
+
+    def __init__(self, title, content, expanded=True, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self.header = QToolButton()
+        self.header.setObjectName("section_header")
+        self.header.setText(title)
+        self.header.setCheckable(True)
+        self.header.setChecked(expanded)
+        self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.header.clicked.connect(self._toggle)
+        v.addWidget(self.header)
+        self.content = content
+        self.content.setVisible(expanded)
+        v.addWidget(self.content)
+
+    def _toggle(self):
+        vis = self.header.isChecked()
+        self.content.setVisible(vis)
+        self.header.setArrowType(Qt.DownArrow if vis else Qt.RightArrow)
+
+    def set_expanded(self, expanded: bool):
+        self.header.setChecked(expanded)
+        self._toggle()
 
 
 # --------------------------------------------------------------------------- #
@@ -1253,6 +1621,44 @@ def _table(cols):
 
 
 _ACCENT = "#2979ff"
+_ARROW_QSS_CACHE = None
+
+
+def _arrow_qss():
+    """Generate up/down chevron PNGs at runtime and return QSS referencing them.
+
+    Reliable where QSS triangles / SVG data-URIs / native arrows fail (macOS).
+    """
+    global _ARROW_QSS_CACHE
+    if _ARROW_QSS_CACHE is not None:
+        return _ARROW_QSS_CACHE
+    import os
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "abma_icons")
+    os.makedirs(d, exist_ok=True)
+    paths = {}
+    for name, up in (("up", True), ("dn", False)):
+        pm = QPixmap(12, 8)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#dfe3e8"))
+        pts = ([QPoint(6, 1), QPoint(10, 6), QPoint(2, 6)] if up
+               else [QPoint(2, 2), QPoint(10, 2), QPoint(6, 7)])
+        p.drawPolygon(QPolygon(pts))
+        p.end()
+        fp = os.path.join(d, f"arrow_{name}.png")
+        pm.save(fp, "PNG")
+        paths[name] = fp.replace("\\", "/")
+    _ARROW_QSS_CACHE = (
+        f'QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ '
+        f'image: url("{paths["up"]}"); width: 12px; height: 8px; }}\n'
+        f'QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ '
+        f'image: url("{paths["dn"]}"); width: 12px; height: 8px; }}')
+    return _ARROW_QSS_CACHE
+
+
 _DARK_QSS = f"""
 QMainWindow, QWidget {{ background: #191b1f; color: #d6d9de;
     font-size: 12px; }}
@@ -1266,6 +1672,24 @@ QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px;
     color: #7f8790; font-weight: bold; }}
 QFrame#agent_card {{ background: #24272c; border: 1px solid #34383e;
     border-radius: 6px; }}
+QToolButton#section_header {{ background: #24272c; color: #c4c8cf;
+    border: 1px solid #303338; border-radius: 6px; padding: 8px 10px;
+    font-weight: bold; font-size: 13px; text-align: left; }}
+QToolButton#section_header:hover {{ background: #2b2f35; }}
+QFrame#run_bar {{ background: #1d2024; border-top: 1px solid #303338; }}
+QFrame#transport {{ background: #1d2024; border: 1px solid #303338;
+    border-radius: 6px; }}
+QFrame#transport QToolButton {{ background: #2b2f35; color: #e4e7ea;
+    border: 1px solid #3a3f46; border-radius: 4px; padding: 3px 7px;
+    font-size: 14px; }}
+QFrame#transport QToolButton:hover {{ background: #343941; }}
+QFrame#transport QToolButton:checked {{ background: {_ACCENT};
+    border-color: {_ACCENT}; color: white; }}
+QSlider::groove:horizontal {{ height: 4px; background: #34383e;
+    border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {_ACCENT}; width: 12px;
+    margin: -5px 0; border-radius: 6px; }}
+QSlider::sub-page:horizontal {{ background: {_ACCENT}; border-radius: 2px; }}
 
 QTabWidget::pane {{ border: 1px solid #303338; border-radius: 6px;
     background: #1d2024; top: -1px; }}
@@ -1314,21 +1738,18 @@ QProgressBar {{ border: 1px solid #303338; border-radius: 5px;
     text-align: center; background: #24272c; color: #c4c8cf; height: 16px; }}
 QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 4px; }}
 
-/* light button backgrounds so Qt's native (dark) up/down arrows stay visible */
 QSpinBox::up-button, QDoubleSpinBox::up-button {{
-    subcontrol-origin: border; subcontrol-position: top right; width: 17px;
-    border-left: 1px solid #34383e; background: #b7bcc4;
+    subcontrol-origin: border; subcontrol-position: top right; width: 18px;
+    border-left: 1px solid #34383e; background: #2b2f35;
     border-top-right-radius: 5px; }}
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
-    subcontrol-origin: border; subcontrol-position: bottom right; width: 17px;
-    border-left: 1px solid #34383e; background: #b7bcc4;
+    subcontrol-origin: border; subcontrol-position: bottom right; width: 18px;
+    border-left: 1px solid #34383e; background: #2b2f35;
     border-bottom-right-radius: 5px; }}
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
-    background: #cdd2d9; }}
-QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
-QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{
-    background: #9aa0a9; }}
+    background: #343941; }}
+/* up/down arrow images are appended at runtime by _arrow_qss() */
 
 QCheckBox {{ color: #c4c8cf; spacing: 6px; }}
 QSplitter::handle {{ background: #303338; }}

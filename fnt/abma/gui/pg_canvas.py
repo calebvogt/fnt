@@ -122,11 +122,31 @@ class Arena3DView(gl.GLViewWidget):
         gw = (max(xs) + w) - min(xs)
         gh = (max(ys) + h) - min(ys)
         wh = getattr(arena, "wall_height", 0.0)
-        self.opts["center"] = Vector(min(xs) + gw / 2, min(ys) + gh / 2,
-                                     min(wh, h) / 3.0)
-        self.setCameraPosition(distance=float(np.hypot(gw, gh)) * 1.5,
-                               elevation=32, azimuth=-60)
+        self._cam_center = Vector(min(xs) + gw / 2, min(ys) + gh / 2,
+                                  min(wh, h) / 3.0)
+        self._cam_distance = float(np.hypot(gw, gh)) * 1.5
+        self.reset_camera()
         self.clear_playback()
+
+    def reset_camera(self):
+        if getattr(self, "_cam_center", None) is None:
+            return
+        self.opts["center"] = self._cam_center
+        self.setCameraPosition(distance=self._cam_distance, elevation=32,
+                               azimuth=-60)
+
+    def top_down(self):
+        if getattr(self, "_cam_center", None) is None:
+            return
+        self.opts["center"] = self._cam_center
+        self.setCameraPosition(distance=self._cam_distance, elevation=89,
+                               azimuth=-90)
+
+    def center_on(self, x, y):
+        c = getattr(self, "_cam_center", None)
+        z = c.z() if c is not None else 0.0
+        self.opts["center"] = Vector(float(x), float(y), z)
+        self.update()
 
     def _draw_chamber(self, arena, dx, dy):
         w, h = arena.width, arena.height
@@ -231,17 +251,19 @@ class Arena3DView(gl.GLViewWidget):
             ang = float(np.degrees(heading[i]))
             sc = float(scale[i])
             off = _HEAD_OFF * sc
+            # local=True -> rotate/scale about the body's OWN centre, then
+            # translate to position (otherwise it orbits the world origin).
             b = self._bodies[i]
             b.resetTransform()
             b.translate(float(x[i]), float(y[i]), z * sc)
-            b.rotate(ang, 0, 0, 1)
-            b.scale(sc, sc, sc)
+            b.rotate(ang, 0, 0, 1, local=True)
+            b.scale(sc, sc, sc, local=True)
             b.setColor(col)
             hd = self._heads[i]
             hd.resetTransform()
             hd.translate(float(x[i] + np.cos(heading[i]) * off),
                          float(y[i] + np.sin(heading[i]) * off), z * sc)
-            hd.scale(sc, sc, sc)
+            hd.scale(sc, sc, sc, local=True)
             hd.setColor(col)
 
         # fading trails

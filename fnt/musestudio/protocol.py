@@ -1,0 +1,154 @@
+"""Guided experiment protocols for MuseStudio.
+
+A protocol is an ordered list of phases. Each phase shows the user an
+instruction and either runs for a fixed duration or waits for the user to
+click Continue. On entering a phase the runner emits its actions (start
+recording, calibrate baseline, turn audio on/off, stop recording), which the
+host window carries out.
+
+The first preset is a 10-minute eyes-closed alpha binaural-beat protocol:
+2 min baseline (also calibrates), 6 min stimulation, 2 min recovery. Durations
+live here as data, so tuning the trial is a one-line change.
+"""
+
+from dataclasses import dataclass, field
+
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+
+
+@dataclass
+class Phase:
+    name: str
+    instruction: str
+    duration: float | None            # seconds; None = wait for user Continue
+    actions: list = field(default_factory=list)
+    params: dict = field(default_factory=dict)
+
+
+@dataclass
+class Protocol:
+    key: str
+    name: str
+    description: str
+    phases: list
+
+
+def _binaural_10min():
+    return Protocol(
+        key="binaural10",
+        name="Binaural beats — 10 min",
+        description=("Eyes-closed 10 Hz (alpha) binaural-beat trial: "
+                     "2 min baseline, 6 min stimulation, 2 min recovery."),
+        phases=[
+            Phase(
+                "Set up",
+                "Put on the Muse headband and adjust it until contact is good "
+                "(watch the head map on the right). Put in your earphones, sit "
+                "comfortably, and relax your jaw.\n\nClick Continue when you are ready.",
+                None,
+            ),
+            Phase(
+                "Baseline",
+                "Close your eyes, stay still, and breathe normally.\n\n"
+                "We are measuring your resting brain rhythm for 2 minutes.",
+                120,
+                actions=["start_recording", "calibrate"],
+            ),
+            Phase(
+                "Stimulation",
+                "Keep your eyes closed and relax.\n\nBinaural beats are now playing — "
+                "let the sound settle. The tone becomes purer as your hemispheres "
+                "synchronize.",
+                360,
+                actions=["audio_on"],
+                params={"base": 200, "beat": 10, "closed_loop": True},
+            ),
+            Phase(
+                "Recovery",
+                "The tones have stopped.\n\nKeep your eyes closed and rest quietly "
+                "for 2 more minutes.",
+                120,
+                actions=["audio_off"],
+            ),
+            Phase(
+                "Done",
+                "Protocol complete — you can open your eyes and remove the headband.\n\n"
+                "Your recording has been saved.",
+                None,
+                actions=["stop_recording"],
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_binaural_10min()]}
+
+
+class ProtocolRunner(QObject):
+    """Steps a Protocol through its phases on a QTimer."""
+
+    phase_started = pyqtSignal(object, int, int)   # phase, index, total
+    tick = pyqtSignal(float, float)                # remaining, phase_duration
+    finished = pyqtSignal()
+    aborted = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._protocol = None
+        self._i = -1
+        self._remaining = 0.0
+        self._phase_dur = 0.0
+        self._waiting = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._on_tick)
+
+    def start(self, protocol):
+        self._protocol = protocol
+        self._i = -1
+        self._enter_next()
+
+    def is_running(self):
+        return self._protocol is not None
+
+    def waiting_for_user(self):
+        return self._waiting
+
+    def _enter_next(self):
+        self._i += 1
+        if self._protocol is None or self._i >= len(self._protocol.phases):
+            self._timer.stop()
+            self._protocol = None
+            self.finished.emit()
+            return
+        phase = self._protocol.phases[self._i]
+        self.phase_started.emit(phase, self._i, len(self._protocol.phases))
+        if phase.duration is None:
+            self._waiting = True
+            self._timer.stop()
+        else:
+            self._waiting = False
+            self._remaining = float(phase.duration)
+            self._phase_dur = float(phase.duration)
+            self.tick.emit(self._remaining, self._phase_dur)
+            self._timer.start()
+
+    def _on_tick(self):
+        self._remaining -= 0.25
+        if self._remaining <= 0:
+            self._timer.stop()
+            self._enter_next()
+        else:
+            self.tick.emit(self._remaining, self._phase_dur)
+
+    def advance(self):
+        """User pressed Continue on a wait-for-user phase."""
+        if self._waiting:
+            self._waiting = False
+            self._enter_next()
+
+    def abort(self):
+        self._timer.stop()
+        self._protocol = None
+        self._waiting = False
+        self.aborted.emit()

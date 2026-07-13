@@ -206,6 +206,9 @@ class Simulation:
             [_SHAPE_CODE.get(getattr(a.appearance, "shape", "rodent"), 0)
              for a in self.agents])
 
+        # ---- condition-dynamics ruleset (editable interaction table) ----
+        self.dynamics = list(getattr(cfg, "dynamics", []) or [])
+
         # ---- scheduled interventions (target, attribute, op, value, at time) ----
         self._iv_schedule = []
         for iv in getattr(cfg, "interventions", []):
@@ -308,11 +311,12 @@ class Simulation:
         dmag = np.linalg.norm(desired, axis=1) + 1e-9
         move_dir = desired / dmag[:, None]
         activity = self._activity(elapsed_s)
-        # low energy -> sluggish (the stamina coupling); stress adds jitter
-        spd = self.speed * activity * (0.4 + 0.6 * self.energy)
+        # energy -> speed coupling (low energy is sluggish); config-driven
+        f = cfg.energy_speed_coupling
+        spd = self.speed * activity * (1.0 - f + f * self.energy)
         satiated = (self.hunger < 0.5) & (self.thirst < 0.5) & \
                    (dist_home < self.home_r)
-        spd = np.where(satiated, spd * 0.15, spd)
+        spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
         self.P = P + move_dir * spd[:, None] * dt
         self.H = np.arctan2(move_dir[:, 1], move_dir[:, 0])
         self._apply_boundary()
@@ -332,35 +336,13 @@ class Simulation:
         self.home[self.alive] += ((self.P[self.alive] - self.home[self.alive])
                                   * (dt / self._settle_tau_s))
 
-        # --- drives ---
-        self.hunger = np.clip(self.hunger + 0.00003 * dt, 0, 1)
-        self.thirst = np.clip(self.thirst + 0.00004 * dt, 0, 1)
-        if self.food.shape[0]:
-            self.hunger[self._on_resource(self.P, self.food, self.food_r)] *= \
-                np.exp(-0.02 * dt)
-        if self.water.shape[0]:
-            self.thirst[self._on_resource(self.P, self.water, self.water_r)] *= \
-                np.exp(-0.02 * dt)
-
-        # --- energy: feeding gain minus metabolism and locomotion cost ---
-        mass_rel = self.mass / 40.0
-        deprivation = np.maximum(self.hunger, self.thirst)
-        feed = (0.65 - deprivation) * 4e-5
-        metabolic = 1.2e-6 * self.metabolism * (0.5 + activity)
-        locomotion = 3e-6 * mass_rel * (step_dist / dt) / 0.12
-        self.energy = np.clip(self.energy + dt * (feed - metabolic - locomotion),
-                              0.0, 1.0)
-
-        # --- stress: agonistic crowding (>2 neighbours) raises it, calm lowers ---
-        crowd = np.clip(within.sum(axis=1) - 2.0, 0.0, None)
-        self.stress = np.clip(
-            self.stress + dt * (4e-6 * crowd - 1.5e-5), 0.0, 1.0)
-
-        # --- health: heal when well-fed & calm, erode when starving/stressed ---
-        starving = (deprivation > 0.85) | (self.energy < 0.05)
-        heal = np.where(starving, -2.0e-5, 8e-6 * (self.energy - 0.3))
-        heal -= 1e-6 * self.stress
-        self.health = np.clip(self.health + dt * heal, 0.0, 1.0)
+        # --- condition dynamics (data-driven interaction rules) ---
+        on_food = (self._on_resource(self.P, self.food, self.food_r)
+                   if self.food.shape[0] else np.zeros(n, bool))
+        on_water = (self._on_resource(self.P, self.water, self.water_r)
+                    if self.water.shape[0] else np.zeros(n, bool))
+        self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
+                             on_food, on_water)
 
         # --- body mass drifts with energy balance, within a physiological band ---
         self.mass = np.clip(self.mass + dt * 1.5e-5 * (self.energy - 0.7),
@@ -396,6 +378,82 @@ class Simulation:
     def _on_resource(self, P, targets, radii):
         d = np.linalg.norm(P[:, None, :] - targets[None, :, :], axis=2)
         return np.any(d < radii[None, :], axis=1)
+
+    def _apply_dynamics(self, dt, step_dist, activity, n_near, on_food, on_water):
+        """Apply the editable interaction rules to the condition variables.
+
+        Each rule: target += gain × source × (dt/hour), or (effect='set')
+        target = gain where source is active. Sources are read from a snapshot so
+        rules act simultaneously (forward Euler), and gains are per-hour.
+        """
+        if not self.dynamics:
+            return
+        n = self.n
+        dth = dt / 3600.0
+        snap = {k: getattr(self, k).copy()
+                for k in ("energy", "hunger", "thirst", "stress", "health")}
+        speed = step_dist / dt
+        mass_rel = self.mass / 40.0
+        cache = {}                       # each distinct source is computed once
+
+        def src(name):
+            v = cache.get(name)
+            if v is not None:
+                return v
+            if name == "time":
+                v = np.ones(n)
+            elif name == "movement":
+                v = speed
+            elif name == "activity":
+                v = np.full(n, activity)
+            elif name == "crowding":
+                v = n_near.astype(float)
+            elif name == "on_food":
+                v = on_food.astype(float)
+            elif name == "on_water":
+                v = on_water.astype(float)
+            elif name == "mass":
+                v = mass_rel
+            elif name == "metabolism":
+                v = self.metabolism
+            elif name == "fed":
+                v = 1.0 - snap["hunger"]
+            elif name == "hydrated":
+                v = 1.0 - snap["thirst"]
+            elif name == "rested":
+                v = 1.0 - snap["stress"]
+            elif name in snap:
+                v = snap[name]
+            else:
+                v = np.zeros(n)
+            cache[name] = v
+            return v
+
+        for c in self.dynamics:
+            tgt = getattr(self, c.target, None)
+            if tgt is None:
+                continue
+            s = src(c.source)
+            if c.effect == "set":
+                tgt[s > 0.5] = c.gain
+                continue
+            if c.scale_by == "mass":
+                f = s * mass_rel
+            elif c.scale_by == "activity":
+                f = s * activity
+            elif c.scale_by == "metabolism":
+                f = s * self.metabolism
+            else:
+                f = s                    # no copy — never mutated below
+            if c.only_when == "source_high":
+                f = f * (s > c.threshold)
+            elif c.only_when == "source_low":
+                f = f * (s < c.threshold)
+            tgt += (c.gain * dth) * f
+
+        for k in snap:
+            arr = getattr(self, k)
+            np.clip(arr, 0.0, 1.0, out=arr)
 
     def _receptivity(self, elapsed_s):
         days = elapsed_s / 86400.0
