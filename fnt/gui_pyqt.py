@@ -317,6 +317,7 @@ class FNTMainWindow(QMainWindow):
         self.create_imaging_tab()
         self.create_wifp_tab()
         self.create_musestudio_tab()
+        self.create_abma_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -539,8 +540,62 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(quick_layout, quick_buttons)
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
-        
+
         layout.addStretch()
+
+
+    def create_abma_tab(self):
+        """Create the ABMA (Animal Behavior Modeling Arena) tab"""
+        tab, layout = self._make_scrollable_tab("ABMA")
+
+        desc = QLabel("Animal Behavior Modeling Arena — in silico agent-based experiments")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        design_group = QGroupBox("Experiment Designer")
+        design_layout = QGridLayout()
+        design_buttons = [
+            ("Open ABMA Designer",
+             "Design an arena, build populations, run replicate trials, export tracking data",
+             self.run_abma_designer),
+        ]
+        self.create_button_grid(design_layout, design_buttons)
+        design_group.setLayout(design_layout)
+        layout.addWidget(design_group)
+
+        info_group = QGroupBox("About ABMA")
+        info_layout = QVBoxLayout()
+        info_label = QLabel(
+            "<b>Run animal-behavior experiments in silico.</b><br>"
+            "1. <b>Arena</b> — set dimensions/boundary and place nests, food, water<br>"
+            "2. <b>Population</b> — define founder cohorts with sex, genotype "
+            "(e.g. OXTR:KO), and treatment (e.g. methimazole for anosmia)<br>"
+            "3. <b>Experiment</b> — set duration, replicates, circadian activity, seed<br>"
+            "4. <b>Run</b> — watch agents live, then export data<br><br>"
+            "<b>Key design:</b> output <code>uwb_&lt;trial&gt;_processed.csv</code> "
+            "matches FNT's UWB preprocessing schema exactly, so the UWB Proximity/"
+            "Network tools and your R pipeline run unchanged on simulated animals."
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+
+
+    def run_abma_designer(self):
+        """Launch the ABMA experiment designer window"""
+        try:
+            from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+
+            self.abma_window = ABMAWindow()
+            self.abma_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"ABMA Designer failed: {str(e)}")
 
 
     def create_rfid_tab(self):
