@@ -12,7 +12,7 @@ import sys
 import time
 import traceback
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
@@ -112,6 +112,11 @@ class ABMAWindow(QMainWindow):
         self._run_t0 = None
         self._last_frame = None
         self._zones = []
+        self._running = False
+        self._preview_sim = None
+        self._preview_elapsed = 0.0
+        self._preview_timer = QTimer(self)
+        self._preview_timer.timeout.connect(self._preview_tick)
         self.setStyleSheet(_DARK_QSS)
         self._build_menu()
 
@@ -136,9 +141,50 @@ class ABMAWindow(QMainWindow):
 
         self._load_config(blank_experiment())
         self._set_view(0)
+        self._rebuild_preview()
 
     # ------------------------------------------------------------------ #
-    # Layout: left scrolling section column + right God's-eye preview
+    # Live in-editor preview — agents animate as soon as they're added.
+    # This is purely visual; nothing is written to disk (only a real Run does).
+    # ------------------------------------------------------------------ #
+    def _rebuild_preview(self):
+        if self._running or not hasattr(self, "view_2d"):
+            return
+        try:
+            cfg = self._collect_config()
+        except Exception:
+            self._stop_preview()
+            return
+        if cfg.total_agents() == 0:
+            self._stop_preview()
+            return
+        import copy
+        from ..core.simulation import Simulation
+        pcfg = copy.deepcopy(cfg)
+        pcfg.n_trials = 1
+        pcfg.enable_mortality = False
+        self._preview_sim = Simulation(pcfg, trial_index=0)
+        self._preview_elapsed = 0.0
+        for v in self._views():
+            v.set_arena(cfg.arena)          # single chamber for the preview
+        self.inspector.set_population(self._preview_sim.agent_static())
+        if not self._preview_timer.isActive():
+            self._preview_timer.start(60)
+
+    def _stop_preview(self):
+        self._preview_timer.stop()
+        self._preview_sim = None
+
+    def _preview_tick(self):
+        if self._preview_sim is None:
+            return
+        sim = self._preview_sim
+        sim.step(self._preview_elapsed, 0.4, events=None)   # no records, no combat
+        self._preview_elapsed += 0.4
+        self._on_frame(sim._frame(self._preview_elapsed))
+
+    # ------------------------------------------------------------------ #
+    # Layout: left scrolling section column + right preview
     # ------------------------------------------------------------------ #
     def _build_left_column(self):
         scroll = QScrollArea()
@@ -172,7 +218,7 @@ class ABMAWindow(QMainWindow):
         rlay.setSpacing(4)
         title_row = QHBoxLayout()
         self.preview_title = QLabel(
-            "God's-eye preview  ·  drag to orbit, scroll to zoom")
+            "Preview Window  ·  drag to orbit, scroll to zoom")
         self.preview_title.setObjectName("preview_title")
         title_row.addWidget(self.preview_title)
         title_row.addStretch()
@@ -404,6 +450,7 @@ class ABMAWindow(QMainWindow):
         for i, g in enumerate(self._agent_types):
             self.cards_layout.addWidget(self._agent_card(i, g))
         self._update_pop_summary()
+        self._rebuild_preview()
 
     def _agent_card(self, i, g):
         card = QFrame()
@@ -769,6 +816,7 @@ class ABMAWindow(QMainWindow):
             self.arena_summary.setText(
                 f"Arena {arena.width:g}×{arena.height:g} {arena.units} · "
                 f"{arena.boundary} · {n} nests, {f} food, {wt} water")
+        self._rebuild_preview()
 
     def _update_pop_summary(self, *_):
         if not hasattr(self, "pop_summary"):
@@ -849,6 +897,8 @@ class ABMAWindow(QMainWindow):
         self._project_dir = project_dir
         self._run_cfg = cfg
         self._run_t0 = time.time()
+        self._running = True
+        self._stop_preview()             # the real run takes over the views
         self._last_frame = None
         self._inspector_pinned = False
         self._hover_idx = None
@@ -923,6 +973,8 @@ class ABMAWindow(QMainWindow):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_open.setEnabled(True)
+        self._running = False
+        self._rebuild_preview()          # resume the live editor preview
 
     def _analyze_existing(self):
         """Run the built-in analysis on an already-generated project folder."""
@@ -947,6 +999,8 @@ class ABMAWindow(QMainWindow):
         self._append_log("\n✗ ERROR:\n" + tb)
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._running = False
+        self._rebuild_preview()
         QMessageBox.critical(self, "Simulation failed", tb.splitlines()[-1])
 
     def _on_stop(self):
@@ -956,6 +1010,8 @@ class ABMAWindow(QMainWindow):
             self._append_log("Stopped by user.")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self._running = False
+        self._rebuild_preview()
 
     def _open_output(self):
         d = getattr(self, "_project_dir", None)
@@ -1257,6 +1313,22 @@ QPushButton:disabled {{ background: #212429; color: #5a5f66;
 QProgressBar {{ border: 1px solid #303338; border-radius: 5px;
     text-align: center; background: #24272c; color: #c4c8cf; height: 16px; }}
 QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 4px; }}
+
+/* light button backgrounds so Qt's native (dark) up/down arrows stay visible */
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-origin: border; subcontrol-position: top right; width: 17px;
+    border-left: 1px solid #34383e; background: #b7bcc4;
+    border-top-right-radius: 5px; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-origin: border; subcontrol-position: bottom right; width: 17px;
+    border-left: 1px solid #34383e; background: #b7bcc4;
+    border-bottom-right-radius: 5px; }}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+    background: #cdd2d9; }}
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{
+    background: #9aa0a9; }}
 
 QCheckBox {{ color: #c4c8cf; spacing: 6px; }}
 QSplitter::handle {{ background: #303338; }}
