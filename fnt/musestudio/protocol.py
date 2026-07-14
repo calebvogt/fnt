@@ -11,6 +11,7 @@ The first preset is a 10-minute eyes-closed alpha binaural-beat protocol:
 live here as data, so tuning the trial is a one-line change.
 """
 
+import time
 from dataclasses import dataclass, field
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
@@ -23,6 +24,8 @@ class Phase:
     duration: float | None            # seconds; None = wait for user Continue
     actions: list = field(default_factory=list)
     params: dict = field(default_factory=dict)
+    gate: str = ""                    # e.g. "synced": advance early once condition holds
+    ramp: dict = None                 # e.g. {"param": "heterodyne_offset", "to": 1.0}
 
 
 @dataclass
@@ -35,8 +38,8 @@ class Protocol:
 
 def _binaural_10min():
     return Protocol(
-        key="binaural10",
-        name="Binaural beats — 10 min",
+        key="hemisync1",
+        name="Hemisphere Synchronization Protocol #1",
         description=("Eyes-closed 10 Hz (alpha) binaural-beat trial: "
                      "2 min baseline, 6 min stimulation, 2 min recovery."),
         phases=[
@@ -65,10 +68,10 @@ def _binaural_10min():
             ),
             Phase(
                 "Recovery",
-                "The tones have stopped.\n\nKeep your eyes closed and rest quietly "
+                "The tones are fading out.\n\nKeep your eyes closed and rest quietly "
                 "for 2 more minutes.",
                 120,
-                actions=["audio_off"],
+                actions=["audio_fade_out"],
             ),
             Phase(
                 "Done",
@@ -81,7 +84,66 @@ def _binaural_10min():
     )
 
 
-PROTOCOLS = {p.key: p for p in [_binaural_10min()]}
+def _heterodyne():
+    return Protocol(
+        key="heterodyne1",
+        name="Hemisphere Heterodyne Protocol #2",
+        description=("Sync both hemispheres in alpha (monaural AM, closed-loop "
+                     "gated), then ramp a small interhemispheric offset (0→1 Hz) "
+                     "to induce a heterodyne, then recover."),
+        phases=[
+            Phase(
+                "Set up",
+                "Put on the Muse headband (good contact on the head map) and your "
+                "earphones. Sit comfortably and relax your jaw.\n\nClick Continue "
+                "when you are ready.",
+                None,
+            ),
+            Phase(
+                "Baseline",
+                "Close your eyes, stay still, breathe normally.\n\nMeasuring your "
+                "resting rhythm for 2 minutes.",
+                120,
+                actions=["start_recording", "calibrate"],
+            ),
+            Phase(
+                "Sync induction",
+                "Eyes closed. Both ears pulse together at 10 Hz — let your "
+                "hemispheres fall into sync. This stage ends automatically once "
+                "you hold synchronization (up to 5 min).",
+                300,                       # safety cap; ends early when synced
+                actions=["audio_on"],
+                params={"base": 200, "beat": 10, "closed_loop": True,
+                        "mode": "monaural_am"},
+                gate="synced",
+            ),
+            Phase(
+                "Heterodyne",
+                "Eyes closed. One hemisphere is now drifting slightly faster — "
+                "notice the slow pulsing between the two. Stay relaxed.",
+                240,
+                actions=["heterodyne_start"],
+                ramp={"param": "heterodyne_offset", "to": 1.0},  # 0→1 Hz over the stage
+            ),
+            Phase(
+                "Recovery",
+                "The tones are fading out.\n\nKeep your eyes closed and rest "
+                "quietly for 2 minutes.",
+                120,
+                actions=["audio_fade_out"],
+            ),
+            Phase(
+                "Done",
+                "Protocol complete — you can open your eyes and remove the "
+                "headband.\n\nYour recording has been saved.",
+                None,
+                actions=["stop_recording"],
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_binaural_10min(), _heterodyne()]}
 
 
 class ProtocolRunner(QObject):
@@ -96,11 +158,11 @@ class ProtocolRunner(QObject):
         super().__init__(parent)
         self._protocol = None
         self._i = -1
-        self._remaining = 0.0
+        self._phase_end = 0.0
         self._phase_dur = 0.0
         self._waiting = False
         self._timer = QTimer(self)
-        self._timer.setInterval(250)
+        self._timer.setInterval(100)
         self._timer.timeout.connect(self._on_tick)
 
     def start(self, protocol):
@@ -128,23 +190,30 @@ class ProtocolRunner(QObject):
             self._timer.stop()
         else:
             self._waiting = False
-            self._remaining = float(phase.duration)
             self._phase_dur = float(phase.duration)
-            self.tick.emit(self._remaining, self._phase_dur)
+            # Absolute end time -> countdown immune to QTimer jitter/drift.
+            self._phase_end = time.monotonic() + self._phase_dur
+            self.tick.emit(self._phase_dur, self._phase_dur)
             self._timer.start()
 
     def _on_tick(self):
-        self._remaining -= 0.25
-        if self._remaining <= 0:
+        remaining = self._phase_end - time.monotonic()
+        if remaining <= 0:
             self._timer.stop()
             self._enter_next()
         else:
-            self.tick.emit(self._remaining, self._phase_dur)
+            self.tick.emit(remaining, self._phase_dur)
 
     def advance(self):
         """User pressed Continue on a wait-for-user phase."""
         if self._waiting:
             self._waiting = False
+            self._enter_next()
+
+    def skip_to_next(self):
+        """Advance a timed phase early (e.g. a gate condition was met)."""
+        if self._protocol is not None and not self._waiting:
+            self._timer.stop()
             self._enter_next()
 
     def abort(self):

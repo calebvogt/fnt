@@ -51,6 +51,59 @@ class Zone:
 
 
 @dataclass
+class Pole:
+    """A vertical cylindrical structure (post/pillar) in the arena.
+
+    x, y   : centre position (metres)
+    radius : cylinder radius (metres)
+    height : cylinder height (metres) — may exceed the wall height
+    """
+    x: float = 0.0
+    y: float = 0.0
+    radius: float = 0.0762   # 6" diameter
+    height: float = 2.1336   # 7 ft
+    label: str = ""
+
+
+@dataclass
+class AntennaBox:
+    """A UWB antenna enclosure mounted on a pole (weatherproof box).
+
+    x, y : centre position (metres, usually a pole's position)
+    z    : centre height above ground (metres)
+    w,d,h: width (x), depth (y), height (z) in metres
+    """
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 1.8288    # 6 ft mount height (box centre)
+    w: float = 0.2032    # 8"
+    d: float = 0.1016    # 4"
+    h: float = 0.2032    # 8"
+    label: str = ""
+
+
+@dataclass
+class Cable:
+    """A PoE daisy-chain run from a gateway through its antennas.
+
+    gateway : the gateway antenna's label (e.g. "1 (G)")
+    arm     : "A" | "B" (a gateway has two arms)
+    nodes   : ordered [[x, y, z], …] box centres, starting at the gateway.
+    """
+    gateway: str = ""
+    arm: str = "A"
+    nodes: list[list[float]] = field(default_factory=list)
+
+
+@dataclass
+class AntennaLayout:
+    """A named set of antenna boxes (a selectable UWB deployment)."""
+    name: str = "antennas"
+    antennas: list[AntennaBox] = field(default_factory=list)
+    cables: list[Cable] = field(default_factory=list)
+
+
+@dataclass
 class ArenaConfig:
     width: float = 2.2
     height: float = 2.2
@@ -58,11 +111,24 @@ class ArenaConfig:
     boundary: str = "reflective"  # 'reflective' | 'absorbing' | 'wrap'
     objects: list[ResourceObject] = field(default_factory=list)
     zones: list[Zone] = field(default_factory=list)
+    poles: list[Pole] = field(default_factory=list)   # vertical posts/pillars
+    antennas: list[AntennaBox] = field(default_factory=list)  # primary UWB set
+    antenna_layouts: list[AntennaLayout] = field(default_factory=list)  # cyclable
     wall_height: float = 0.0       # 3D wall height (m); 0 = flat/open arena
     wall_thickness: float = 0.005  # 3D wall thickness (m)
+    ground: str = "floor"          # 'floor' | 'grass' (outdoor field site)
+    oriented: bool = False         # geographically aligned (+y=N,+x=E) -> compass
 
     def objects_of(self, kind: str) -> list[ResourceObject]:
         return [o for o in self.objects if o.kind == kind]
+
+    def antenna_sets(self):
+        """Selectable UWB layouts as (name, boxes, cables). Falls back to ``antennas``."""
+        if self.antenna_layouts:
+            return [(l.name, l.antennas, l.cables) for l in self.antenna_layouts]
+        if self.antennas:
+            return [("antennas", self.antennas, [])]
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -269,8 +335,21 @@ class ExperimentConfig:
             boundary=arena_d.get("boundary", "reflective"),
             objects=[ResourceObject(**o) for o in arena_d.get("objects", [])],
             zones=[Zone(**z) for z in arena_d.get("zones", [])],
+            poles=[Pole(**p) for p in arena_d.get("poles", [])],
+            antennas=[AntennaBox(**a) for a in arena_d.get("antennas", [])],
+            antenna_layouts=[
+                AntennaLayout(
+                    name=l.get("name", "antennas"),
+                    antennas=[AntennaBox(**a) for a in l.get("antennas", [])],
+                    cables=[Cable(gateway=c.get("gateway", ""),
+                                  arm=c.get("arm", "A"),
+                                  nodes=[list(n) for n in c.get("nodes", [])])
+                            for c in l.get("cables", [])])
+                for l in arena_d.get("antenna_layouts", [])],
             wall_height=arena_d.get("wall_height", 0.0),
             wall_thickness=arena_d.get("wall_thickness", 0.005),
+            ground=arena_d.get("ground", "floor"),
+            oriented=arena_d.get("oriented", False),
         )
         groups = []
         for g in d.get("groups", []):

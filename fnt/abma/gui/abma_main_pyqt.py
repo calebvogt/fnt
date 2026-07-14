@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QProgressBar, QFileDialog, QMessageBox, QHeaderView,
     QAbstractItemView, QAction, QSplitter, QStackedWidget, QScrollArea,
     QFrame, QDialog, QListWidget, QDialogButtonBox, QSizePolicy,
-    QToolButton, QSlider,
+    QToolButton, QSlider, QInputDialog,
 )
 
 from ..core.config import (
@@ -32,7 +32,9 @@ from ..core.config import (
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
-from ..core.presets import PRESETS
+from ..core.presets import (
+    all_presets, save_user_preset, suggest_preset_name,
+)
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
 
@@ -377,6 +379,28 @@ class ABMAWindow(QMainWindow):
         self.btn_follow.toggled.connect(
             lambda c: setattr(self, "_follow_agent", c))
         tl.addWidget(self.btn_follow)
+        self.btn_grass = QToolButton()
+        self.btn_grass.setText("🌱")
+        self.btn_grass.setToolTip("Toggle grass (outdoor field sites)")
+        self.btn_grass.setCheckable(True)
+        self.btn_grass.setEnabled(False)
+        self.btn_grass.toggled.connect(self._on_toggle_grass)
+        tl.addWidget(self.btn_grass)
+        self._antenna_state = -1        # -1 = off; else antenna-layout index
+        self.btn_antenna = QToolButton()
+        self.btn_antenna.setText("📡")
+        self.btn_antenna.setToolTip("UWB antennas: cycle layouts / off")
+        self.btn_antenna.setCheckable(True)
+        self.btn_antenna.setEnabled(False)
+        self.btn_antenna.clicked.connect(self._cycle_antennas)
+        tl.addWidget(self.btn_antenna)
+        self._measure_mode = None
+        self.btn_measure = QToolButton()
+        self.btn_measure.setText("📏")
+        self.btn_measure.setCheckable(True)
+        self.btn_measure.setToolTip("Measure grid: off → metric → imperial")
+        self.btn_measure.clicked.connect(self._cycle_measure)
+        tl.addWidget(self.btn_measure)
         rlay.addWidget(tb)
 
         # inspector is a floating popup shown on hover / click (frees the preview)
@@ -387,6 +411,50 @@ class ABMAWindow(QMainWindow):
         self._inspector_pinned = False
         self._hover_idx = None
         return right
+
+    def _on_toggle_grass(self, on):
+        for v in self._views():
+            if hasattr(v, "set_grass_enabled"):
+                v.set_grass_enabled(on)
+
+    def _antenna_sets(self):
+        if getattr(self, "_antenna_layouts", None):
+            return [(l.name, l.antennas) for l in self._antenna_layouts]
+        if getattr(self, "_antennas", None):
+            return [("antennas", self._antennas)]
+        return []
+
+    def _apply_antenna_state(self):
+        """Push the current antenna-layout index to both views + the button."""
+        self.btn_antenna.setChecked(self._antenna_state >= 0)
+        for v in self._views():
+            if hasattr(v, "set_antenna_layout"):
+                v.set_antenna_layout(self._antenna_state)
+
+    def _cycle_antennas(self, *_):
+        sets = self._antenna_sets()
+        n = len(sets)
+        if n == 0:
+            self._antenna_state = -1
+        elif self._antenna_state >= n - 1:
+            self._antenna_state = -1
+        else:
+            self._antenna_state += 1
+        self._apply_antenna_state()
+        msg = "off" if self._antenna_state < 0 else sets[self._antenna_state][0]
+        self.statusBar().showMessage(f"UWB antennas: {msg}", 2500)
+
+    def _cycle_measure(self, *_):
+        nxt = {None: "metric", "metric": "imperial",
+               "imperial": None}[self._measure_mode]
+        self._measure_mode = nxt
+        self.btn_measure.setChecked(nxt is not None)
+        for v in self._views():
+            if hasattr(v, "set_measure"):
+                v.set_measure(nxt)
+        lbl = {None: "off", "metric": "metric (m)",
+               "imperial": "imperial (ft)"}[nxt]
+        self.statusBar().showMessage(f"Measure grid: {lbl}", 2500)
 
     def _views(self):
         return [v for v in (self.view_3d, self.view_2d) if v is not None]
@@ -406,9 +474,15 @@ class ABMAWindow(QMainWindow):
     def _open_preset_dialog(self):
         dlg = ArenaPresetDialog(self)
         if dlg.exec_() == QDialog.Accepted and dlg.chosen():
-            p = dlg.chosen()
-            self._load_config(p.factory())
-            self.statusBar().showMessage(f"Loaded preset: {p.name}", 4000)
+            self._apply_preset(dlg.chosen())
+
+    def _apply_preset(self, p):
+        self._loaded_abbr = p.abbr or "Arena"
+        self._load_config(p.factory())
+        # a blank arena opens the editor to build from scratch; a named preset
+        # stays collapsed behind "Modify".
+        self.btn_modify.setChecked(bool(getattr(p, "blank", False)))
+        self.statusBar().showMessage(f"Loaded: {p.name}", 4000)
 
     # ------------------------------------------------------------------ #
     # Menu bar
@@ -416,10 +490,10 @@ class ABMAWindow(QMainWindow):
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
         preset_menu = m.addMenu("Load &Preset")
-        for p in PRESETS:
+        for p in all_presets():
             act = QAction(p.name, self)
             act.setStatusTip(p.description)
-            act.triggered.connect(lambda _, pr=p: self._load_preset(pr))
+            act.triggered.connect(lambda _, pr=p: self._apply_preset(pr))
             preset_menu.addAction(act)
         m.addSeparator()
         for text, shortcut, slot in [
@@ -454,9 +528,6 @@ class ABMAWindow(QMainWindow):
             cfg.to_json(path)
             self.statusBar().showMessage(f"Saved {path}", 4000)
 
-    def _load_preset(self, preset):
-        self._load_config(preset.factory())
-        self.statusBar().showMessage(f"Loaded preset: {preset.name}", 4000)
 
     def _open_config(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -476,27 +547,52 @@ class ABMAWindow(QMainWindow):
         w = QWidget()
         left = QVBoxLayout(w)
         left.setContentsMargins(0, 0, 0, 0)
+        self._arena_dirty = False
+        self._loaded_abbr = "Arena"
+
         btn_preset = QPushButton("⬗  Load Preset Arena…")
         btn_preset.setObjectName("accept_btn")
         btn_preset.clicked.connect(self._open_preset_dialog)
         left.addWidget(btn_preset)
+
+        self.arena_summary = QLabel("No arena loaded.")
+        self.arena_summary.setWordWrap(True)
+        self.arena_summary.setStyleSheet("color:#8fbfff; font-size:11px;")
+        left.addWidget(self.arena_summary)
+
+        act = QHBoxLayout()
+        self.btn_modify = QPushButton("Modify arena")
+        self.btn_modify.setCheckable(True)
+        self.btn_modify.toggled.connect(self._toggle_arena_editor)
+        self.btn_save_preset = QPushButton("Save preset…")
+        self.btn_save_preset.setEnabled(False)
+        self.btn_save_preset.setToolTip("Save the modified arena as a reusable preset")
+        self.btn_save_preset.clicked.connect(self._save_preset)
+        act.addWidget(self.btn_modify)
+        act.addWidget(self.btn_save_preset)
+        left.addLayout(act)
+
+        # ---- editing panel (hidden until Modify, or a blank arena is loaded) ----
+        self._arena_editor = QWidget()
+        ed = QVBoxLayout(self._arena_editor)
+        ed.setContentsMargins(0, 4, 0, 0)
         form = QFormLayout()
-        self.in_name = QLineEdit("vole_experiment")
-        self.in_width = _dspin(0.2, 50, 2.2, 0.1, " m")
-        self.in_height = _dspin(0.2, 50, 2.2, 0.1, " m")
+        form.setLabelAlignment(Qt.AlignLeft)                    # left-aligned labels
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.in_width = _dspin(0.2, 50, 2.0, 0.1, " m")
+        self.in_height = _dspin(0.2, 50, 2.0, 0.1, " m")
         self.in_boundary = QComboBox()
         self.in_boundary.addItems(["reflective", "wrap", "absorbing"])
-        for lab, wdg in [("Experiment name", self.in_name),
-                         ("Arena width", self.in_width),
+        for lab, wdg in [("Arena width", self.in_width),
                          ("Arena height", self.in_height),
                          ("Boundary", self.in_boundary)]:
             form.addRow(lab, wdg)
-        self.in_width.valueChanged.connect(self._refresh_arena)
-        self.in_height.valueChanged.connect(self._refresh_arena)
-        self.in_boundary.currentTextChanged.connect(self._refresh_arena)
-        left.addLayout(form)
+        self.in_width.valueChanged.connect(self._on_arena_edit)
+        self.in_height.valueChanged.connect(self._on_arena_edit)
+        self.in_boundary.currentTextChanged.connect(self._on_arena_edit)
+        ed.addLayout(form)
 
-        # click-to-add controls
         add_box = QGroupBox("Add object (then click the arena)")
         ab = QHBoxLayout(add_box)
         for kind in ("nest", "food", "water"):
@@ -505,22 +601,51 @@ class ABMAWindow(QMainWindow):
             b.clicked.connect(lambda _, k=kind, btn=b: self._arm(k, btn))
             ab.addWidget(b)
             setattr(self, f"_arm_btn_{kind}", b)
-        left.addWidget(add_box)
+        ed.addWidget(add_box)
 
         self.obj_table = _table(OBJ_COLS)
-        self.obj_table.setMinimumHeight(150)
-        self.obj_table.itemChanged.connect(self._refresh_arena)
-        left.addWidget(self.obj_table, 1)
-        row = QHBoxLayout()
+        self.obj_table.setMinimumHeight(140)
+        self.obj_table.itemChanged.connect(self._on_arena_edit)
+        ed.addWidget(self.obj_table, 1)
         b_del = QPushButton("Remove selected object")
-        b_del.clicked.connect(lambda: self._del_row(self.obj_table))
-        row.addWidget(b_del)
-        left.addLayout(row)
+        b_del.clicked.connect(
+            lambda: (self._del_row(self.obj_table), self._mark_arena_dirty()))
+        ed.addWidget(b_del)
 
-        self.arena_summary = QLabel()
-        self.arena_summary.setStyleSheet("color: #8fbfff; font-size: 11px;")
-        left.addWidget(self.arena_summary)
+        self._arena_editor.setVisible(False)
+        left.addWidget(self._arena_editor)
         return w
+
+    def _toggle_arena_editor(self, on):
+        self._arena_editor.setVisible(on)
+        self.btn_modify.setText("Hide arena editor" if on else "Modify arena")
+
+    def _on_arena_edit(self, *_):
+        self._refresh_arena()
+        self._mark_arena_dirty()
+
+    def _mark_arena_dirty(self):
+        if getattr(self, "_loading", False):
+            return
+        self._arena_dirty = True
+        if hasattr(self, "btn_save_preset"):
+            self.btn_save_preset.setEnabled(True)
+
+    def _save_preset(self):
+        try:
+            cfg = self._collect_config()
+        except Exception as e:
+            QMessageBox.warning(self, "Can't save preset", str(e))
+            return
+        default = suggest_preset_name(getattr(self, "_loaded_abbr", "Arena"))
+        name, ok = QInputDialog.getText(
+            self, "Save arena preset", "Preset name:", text=default)
+        if not ok or not name.strip():
+            return
+        save_user_preset(name.strip(), cfg)
+        self._arena_dirty = False
+        self.btn_save_preset.setEnabled(False)
+        self.statusBar().showMessage(f"Saved preset: {name.strip()}", 4000)
 
     def _arm(self, kind, btn):
         for k in ("nest", "food", "water"):
@@ -635,6 +760,9 @@ class ABMAWindow(QMainWindow):
 
         # ---- essentials (what everyone sets) ----
         ess = QFormLayout()
+        ess.setLabelAlignment(Qt.AlignLeft)
+        self.in_name = QLineEdit("experiment")
+        self.in_name.setToolTip("Names the output project folder")
         self.in_days = _dspin(0.05, 365, 10.0, 0.5, " days")
         self.in_trials = _ispin(1, 100, 1)
         self.in_trials.setToolTip("Replicate chambers, shown side-by-side")
@@ -643,6 +771,7 @@ class ABMAWindow(QMainWindow):
         self.in_fidelity.setToolTip(
             "Simulation resolution: Fast = coarse & quick, Fine = smooth & slow")
         self.in_fidelity.currentTextChanged.connect(self._apply_fidelity)
+        ess.addRow("Experiment name", self.in_name)
         ess.addRow("Duration", self.in_days)
         ess.addRow("Replicates", self.in_trials)
         ess.addRow("Resolution", self.in_fidelity)
@@ -973,8 +1102,15 @@ class ABMAWindow(QMainWindow):
         )
 
     def _load_config(self, cfg: ExperimentConfig):
+        self._loading = True          # suppress dirty-tracking during populate
         # arena attributes without a table cell ride along on the window
         self._zones = list(cfg.arena.zones)
+        self._poles = list(cfg.arena.poles)
+        self._antennas = list(cfg.arena.antennas)
+        self._antenna_layouts = list(cfg.arena.antenna_layouts)
+        self._antenna_state = -1        # antennas start hidden on load
+        self._ground = cfg.arena.ground
+        self._oriented = cfg.arena.oriented
         self._wall_height = cfg.arena.wall_height
         self._wall_thickness = cfg.arena.wall_thickness
         self.in_name.setText(cfg.name)
@@ -1013,6 +1149,11 @@ class ABMAWindow(QMainWindow):
         self.in_rest.setValue(cfg.rest_speed_factor)
         self._refresh_arena()
         self._update_pop_summary()
+        self._loading = False
+        # a freshly loaded arena is not yet "modified"
+        self._arena_dirty = False
+        if hasattr(self, "btn_save_preset"):
+            self.btn_save_preset.setEnabled(False)
 
     # ---- arena table helpers ---- #
     def _add_obj_row(self, o: ResourceObject):
@@ -1039,6 +1180,11 @@ class ABMAWindow(QMainWindow):
             width=self.in_width.value(), height=self.in_height.value(),
             boundary=self.in_boundary.currentText(), objects=objs,
             zones=list(getattr(self, "_zones", [])),
+            poles=list(getattr(self, "_poles", [])),
+            antennas=list(getattr(self, "_antennas", [])),
+            antenna_layouts=list(getattr(self, "_antenna_layouts", [])),
+            ground=getattr(self, "_ground", "floor"),
+            oriented=getattr(self, "_oriented", False),
             wall_height=getattr(self, "_wall_height", 0.0),
             wall_thickness=getattr(self, "_wall_thickness", 0.005))
 
@@ -1053,9 +1199,22 @@ class ABMAWindow(QMainWindow):
             n = len(arena.objects_of("nest"))
             f = len(arena.objects_of("food"))
             wt = len(arena.objects_of("water"))
+            npoles = len(getattr(arena, "poles", []))
+            pole_txt = f", {npoles} poles" if npoles else ""
             self.arena_summary.setText(
                 f"Arena {arena.width:g}×{arena.height:g} {arena.units} · "
-                f"{arena.boundary} · {n} nests, {f} food, {wt} water")
+                f"{arena.boundary} · {n} nests, {f} food, {wt} water{pole_txt}")
+        if hasattr(self, "btn_grass"):
+            grassy = getattr(arena, "ground", "floor") == "grass"
+            self.btn_grass.setEnabled(grassy)
+            if not grassy and self.btn_grass.isChecked():
+                self.btn_grass.setChecked(False)
+        if hasattr(self, "btn_antenna"):
+            sets = arena.antenna_sets() if hasattr(arena, "antenna_sets") else []
+            self.btn_antenna.setEnabled(bool(sets))
+            if self._antenna_state >= len(sets):
+                self._antenna_state = -1
+            self._apply_antenna_state()
         self._rebuild_preview()
 
     def _update_pop_summary(self, *_):
@@ -1368,16 +1527,17 @@ class ArenaPresetDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Load Preset Arena")
         self.setMinimumWidth(440)
+        self._presets = all_presets()      # built-in + user-saved
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Select a preset to load into the preview:"))
         self.list = QListWidget()
-        for p in PRESETS:
-            self.list.addItem(p.name)
+        for p in self._presets:
+            self.list.addItem(p.name if p.builtin else f"{p.name}  (saved)")
         self.list.setCurrentRow(0)
         self.list.currentRowChanged.connect(self._on_row)
         self.list.itemDoubleClicked.connect(lambda _: self.accept())
         lay.addWidget(self.list)
-        self.desc = QLabel(PRESETS[0].description if PRESETS else "")
+        self.desc = QLabel(self._presets[0].description if self._presets else "")
         self.desc.setWordWrap(True)
         self.desc.setStyleSheet("color:#8a9099; font-size:11px; padding:2px;")
         lay.addWidget(self.desc)
@@ -1388,12 +1548,12 @@ class ArenaPresetDialog(QDialog):
         lay.addWidget(bb)
 
     def _on_row(self, r):
-        if 0 <= r < len(PRESETS):
-            self.desc.setText(PRESETS[r].description)
+        if 0 <= r < len(self._presets):
+            self.desc.setText(self._presets[r].description)
 
     def chosen(self):
         r = self.list.currentRow()
-        return PRESETS[r] if 0 <= r < len(PRESETS) else None
+        return self._presets[r] if 0 <= r < len(self._presets) else None
 
 
 # --------------------------------------------------------------------------- #

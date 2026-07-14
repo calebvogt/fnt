@@ -19,6 +19,24 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
 
+def list_cameras(max_index=6):
+    """Probe camera indices and return those that open (contiguous from 0).
+
+    Opening a device briefly activates it (and may trigger the OS camera
+    permission prompt on first use), so this is best called on demand.
+    """
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        opened = cap.isOpened()
+        cap.release()
+        if opened:
+            found.append(i)
+        else:
+            break   # indices are contiguous; stop at the first gap
+    return found
+
+
 _local_clock = None
 
 

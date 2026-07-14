@@ -167,28 +167,17 @@ class SynchronyMeter(QWidget):
         p.end()
 
 
-class NeuroPanel(QGroupBox):
+class NeuroControls(QGroupBox):
+    """Left-column controls: band selector, calibrate button, status."""
+
     band_changed = pyqtSignal(str)
     calibrate_requested = pyqtSignal()
 
     def __init__(self, parent=None):
-        super().__init__("Neurofeedback — hemisphere synchrony", parent)
-        self.headmap = HeadMapWidget()
-        self.headmap.setToolTip(
-            "Top-down head. Disc colour = band power at each electrode; the arcs "
-            "between left/right pairs brighten and thicken as their phases lock."
-        )
-        self.meter = SynchronyMeter()
-        self.meter.setToolTip(
-            "Interhemispheric phase-locking (PLV): bottom = desynchronized, "
-            "top = synchronized. 'raw' means no baseline set yet."
-        )
-        self._build_ui()
-
-    def _build_ui(self):
+        super().__init__("Neurofeedback", parent)
         root = QVBoxLayout(self)
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Band"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Band"))
         self.band_combo = QComboBox()
         for name in BANDS:
             label = name + (" (EMG-prone)" if name == "gamma" else "")
@@ -201,28 +190,43 @@ class NeuroPanel(QGroupBox):
             "Frequency band to measure synchrony in. Alpha (8–12 Hz) is most "
             "reliable on Muse; gamma is easily contaminated by muscle activity."
         )
-        top.addWidget(self.band_combo)
+        row.addWidget(self.band_combo, stretch=1)
+        root.addLayout(row)
         self.calibrate_btn = QPushButton("Calibrate baseline (30s)")
         self.calibrate_btn.clicked.connect(self.calibrate_requested.emit)
         self.calibrate_btn.setToolTip(
             "Sit still for 30 s to record your resting synchrony. The meter is "
             "then shown relative to this baseline."
         )
-        top.addWidget(self.calibrate_btn)
-        top.addStretch()
+        root.addWidget(self.calibrate_btn)
         self.status = QLabel("Connect the Muse to begin.")
+        self.status.setWordWrap(True)
         self.status.setStyleSheet("color: #999999;")
-        top.addWidget(self.status)
-        root.addLayout(top)
+        root.addWidget(self.status)
 
-        body = QHBoxLayout()
+    def set_status(self, text):
+        self.status.setText(text)
+
+
+class NeuroView(QGroupBox):
+    """Right-side data view: head map + synchrony meter."""
+
+    def __init__(self, parent=None):
+        super().__init__("Hemisphere synchrony", parent)
+        self.headmap = HeadMapWidget()
+        self.headmap.setToolTip(
+            "Top-down head. Disc colour = band power at each electrode; the arcs "
+            "between left/right pairs brighten and thicken as their phases lock."
+        )
+        self.meter = SynchronyMeter()
+        self.meter.setToolTip(
+            "Interhemispheric phase-locking (PLV): bottom = desynchronized, "
+            "top = synchronized. 'raw' means no baseline set yet."
+        )
+        body = QHBoxLayout(self)
         body.addWidget(self.headmap, stretch=1)
         body.addWidget(self.meter)
-        root.addLayout(body)
 
     def update_metrics(self, metrics):
         self.headmap.update_metrics(metrics)
         self.meter.update_metrics(metrics)
-
-    def set_status(self, text):
-        self.status.setText(text)

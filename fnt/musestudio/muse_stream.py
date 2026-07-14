@@ -19,7 +19,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -147,16 +146,15 @@ class MuseStreamProcess:
 
 
 class MuseRecorder:
-    """Writes per-stream samples to CSV files in a timestamped session folder.
+    """Writes one CSV per stream into the given directory.
 
-    Thread-safe: ``write`` is called from the reader thread while ``start``/
-    ``stop`` are called from the GUI thread.
+    Thread-safe: ``write`` is called from the reader thread while ``stop`` is
+    called from the GUI thread.
     """
 
-    def __init__(self, base_dir):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(base_dir, f"MuseStudio_{ts}")
-        os.makedirs(self.session_dir, exist_ok=True)
+    def __init__(self, out_dir):
+        self.session_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
         self._lock = threading.Lock()
         self._files = {}   # stream_name -> (file_handle, csv.writer)
         self._counts = {}  # stream_name -> int

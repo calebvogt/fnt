@@ -12,11 +12,41 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Circle
 from matplotlib.collections import LineCollection
 from PyQt5.QtCore import pyqtSignal
 
 from ..core.config import ArenaConfig, ResourceObject
+
+
+def _bow_xy(a, b, k=0.08, n=14):
+    """Quadratic-bezier points from a to b, bowed sideways to look like slack."""
+    import math
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    ln = math.hypot(dx, dy) or 1.0
+    px, py = -dy / ln, dx / ln              # unit perpendicular
+    off = k * ln
+    mx, my = (a[0] + b[0]) / 2 + px * off, (a[1] + b[1]) / 2 + py * off
+    xs, ys = [], []
+    for i in range(n + 1):
+        t = i / n
+        u = 1 - t
+        xs.append(u * u * a[0] + 2 * u * t * mx + t * t * b[0])
+        ys.append(u * u * a[1] + 2 * u * t * my + t * t * b[1])
+    return xs, ys
+
+
+def _nice_step(extent, target=5):
+    """A 'nice' round grid step (1/2/2.5/5 × 10^k) giving ~``target`` divisions."""
+    import math
+    if extent <= 0:
+        return 1.0
+    raw = extent / target
+    mag = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag:
+            return m * mag
+    return 10 * mag
 
 _ZONE_COLOR = {"center": "#f2c14e", "periphery": "#7f8790", "roi": "#5aa9e6"}
 
@@ -80,6 +110,24 @@ class ArenaCanvas(FigureCanvas):
         """Arm click-to-add for ('nest'/'food'/'water') or disable (None)."""
         self._arm_kind = kind
 
+    def set_grass_enabled(self, on):
+        """Tint the ground green for outdoor field sites (toggle)."""
+        self._grass_on = bool(on)
+        if self.arena is not None:
+            self.draw_arena()
+
+    def set_antenna_layout(self, idx):
+        """Select which UWB layout to draw (-1 = off, else layout index)."""
+        self._antenna_idx = idx
+        if self.arena is not None:
+            self.draw_arena()
+
+    def set_measure(self, mode):
+        """Measurement grid: None | 'metric' | 'imperial'."""
+        self._measure_mode = mode
+        if self.arena is not None:
+            self.draw_arena()
+
     def draw_arena(self):
         ax = self.ax
         ax.clear()
@@ -88,8 +136,14 @@ class ArenaCanvas(FigureCanvas):
         ax.set_facecolor("#14171a")
         xs = [c[0] for c in chambers]
         ys = [c[1] for c in chambers]
-        ax.set_xlim(min(xs) - 0.05, max(xs) + a.width + 0.05)
-        ax.set_ylim(min(ys) - 0.05, max(ys) + a.height + 0.05)
+        # wider margin when a compass / measurement labels sit outside the arena
+        gm = 0.05
+        if getattr(a, "oriented", False):
+            gm = max(gm, 0.09 * max(a.width, a.height))
+        if getattr(self, "_measure_mode", None):
+            gm = max(gm, 0.06 * max(a.width, a.height))
+        ax.set_xlim(min(xs) - gm, max(xs) + a.width + gm)
+        ax.set_ylim(min(ys) - gm, max(ys) + a.height + gm)
         ax.set_aspect("equal")
         ax.set_title("Arena", color="#8a9099", fontsize=10)
         for side, spine in ax.spines.items():
@@ -97,8 +151,39 @@ class ArenaCanvas(FigureCanvas):
             spine.set_color("#303338")
         ax.tick_params(colors="#6f767e", labelsize=8)
         ax.grid(True, color="#22262b", lw=0.6)
+        # measurement grid overlay (toggle: metric / imperial)
+        mmode = getattr(self, "_measure_mode", None)
+        if mmode:
+            import numpy as np
+            mscale = (1.0 / 0.3048) if mmode == "imperial" else 1.0
+            munit = "ft" if mmode == "imperial" else "m"
+            mstep = _nice_step(max(a.width, a.height) * mscale) / mscale
+            gx = np.arange(0, a.width + 1e-9, mstep)
+            gy = np.arange(0, a.height + 1e-9, mstep)
+            loff = 0.012 * max(a.width, a.height)
+            for dx, dy in chambers:
+                for x in gx:
+                    ax.plot([dx + x, dx + x], [dy, dy + a.height],
+                            color="#4dd0e1", lw=0.6, alpha=0.5, zorder=1)
+                    if x > 0:
+                        ax.text(dx + x, dy - loff, f"{x * mscale:g}{munit}",
+                                color="#9fe3ec", fontsize=6, ha="center",
+                                va="top", zorder=6)
+                for y in gy:
+                    ax.plot([dx, dx + a.width], [dy + y, dy + y],
+                            color="#4dd0e1", lw=0.6, alpha=0.5, zorder=1)
+                    if y > 0:
+                        ax.text(dx - loff, dy + y, f"{y * mscale:g}{munit}",
+                                color="#9fe3ec", fontsize=6, ha="right",
+                                va="center", zorder=6)
         seen = set()
         for dx, dy in chambers:
+            # grass ground tint (outdoor field sites, toggleable)
+            if getattr(self, "_grass_on", False) and \
+                    getattr(a, "ground", "floor") == "grass":
+                ax.add_patch(Rectangle(
+                    (dx, dy), a.width, a.height, facecolor="#2f5d2a",
+                    alpha=0.4, edgecolor="none", zorder=0))
             # boundary
             ax.plot([dx, dx + a.width, dx + a.width, dx, dx],
                     [dy, dy, dy + a.height, dy + a.height, dy],
@@ -112,6 +197,36 @@ class ArenaCanvas(FigureCanvas):
                 ax.text(dx + z.x + z.w / 2, dy + z.y + z.h / 2, z.name,
                         color=col, fontsize=8, ha="center", va="center",
                         alpha=0.8, zorder=2)
+            # poles (vertical posts, drawn top-down as filled circles)
+            for p in getattr(a, "poles", []):
+                ax.add_patch(Circle(
+                    (dx + p.x, dy + p.y), p.radius, facecolor="#75542f",
+                    edgecolor="#c9a06a", lw=0.8, zorder=2))
+            # UWB antenna boxes + colour-coded PoE cables (cyclable layout)
+            asets = a.antenna_sets() if hasattr(a, "antenna_sets") else []
+            aidx = getattr(self, "_antenna_idx", -1)
+            if 0 <= aidx < len(asets):
+                from ..core.poe import gateway_color_map
+                _, boxes, cables = asets[aidx]
+                cmap = gateway_color_map(cables)
+                off = 0.02 * max(a.width, a.height)
+                for cab in cables:                    # cables under the boxes
+                    col = cmap.get(cab.gateway, (0.7, 0.7, 0.7, 1.0))
+                    for p, q in zip(cab.nodes, cab.nodes[1:]):
+                        bx, by = _bow_xy((dx + p[0], dy + p[1]),
+                                         (dx + q[0], dy + q[1]))
+                        ax.plot(bx, by, color=col, lw=1.3, alpha=0.9, zorder=3)
+                for an in boxes:
+                    fc = cmap.get(an.label)
+                    face = ("#%02x%02x%02x" % tuple(int(c * 255) for c in fc[:3])
+                            ) if fc else "#ccb787"
+                    ax.add_patch(Rectangle(
+                        (dx + an.x - an.w / 2, dy + an.y - an.d / 2), an.w, an.d,
+                        facecolor=face, edgecolor="#20201f", lw=0.7, zorder=4))
+                    if an.label:
+                        ax.text(dx + an.x, dy + an.y + off, an.label,
+                                color="#ffeb8c", fontsize=8, fontweight="bold",
+                                ha="center", va="bottom", zorder=5)
             # objects
             for o in a.objects:
                 st = _KIND_STYLE.get(o.kind, _KIND_STYLE["nest"])
@@ -123,6 +238,18 @@ class ArenaCanvas(FigureCanvas):
         if a.objects:
             ax.legend(loc="upper right", fontsize=7, framealpha=0.3,
                       labelcolor="#dddddd")
+        # compass for geographically-aligned sites (+y=N, +x=E)
+        if getattr(a, "oriented", False):
+            x0, x1 = min(xs), max(xs) + a.width
+            y0, y1 = min(ys), max(ys) + a.height
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            m = 0.045 * max(a.width, a.height)
+            for txt, px, py, col in [("N", cx, y1 + m, "#eb5a5a"),
+                                     ("S", cx, y0 - m, "#dce0e6"),
+                                     ("E", x1 + m, cy, "#dce0e6"),
+                                     ("W", x0 - m, cy, "#dce0e6")]:
+                ax.text(px, py, txt, color=col, fontsize=13, fontweight="bold",
+                        ha="center", va="center", zorder=6)
         self._agent_artist = None
         self._agent_scatters = []
         self._sel_artist = None

@@ -20,7 +20,7 @@ import json
 
 import numpy as np
 from scipy.signal import lfilter
-from PyQt5.QtCore import Qt, QSettings, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog,
     QLabel, QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
@@ -58,8 +58,11 @@ class BinauralPlayer:
     """Phase-continuous stereo sine generator (left = base, right = base+beat)."""
 
     def __init__(self):
-        self.left_freq = 200.0
-        self.right_freq = 210.0
+        self.mode = "binaural"          # "binaural" or "monaural_am"
+        self.left_freq = 200.0          # left ear tone (binaural) / carrier (AM)
+        self.right_freq = 210.0         # right ear tone (binaural)
+        self.am_left = 10.0             # left-ear modulation rate (AM mode)
+        self.am_right = 10.0            # right-ear modulation rate (AM mode)
         # Ramped gains (current -> target) for click-free changes.
         self._gain = self._t_gain = 0.0
         self._rough = self._t_rough = 0.0
@@ -67,6 +70,8 @@ class BinauralPlayer:
         self._reward = self._t_reward = 0.0
         self._phase_l = 0.0
         self._phase_r = 0.0
+        self._phase_aml = 0.0           # AM envelope phases
+        self._phase_amr = 0.0
         self._phase_rough = 0.0
         self._phase_reward = 0.0
         self._noise_zi = np.zeros(1)   # one-pole lowpass state (brown-ish noise)
@@ -83,12 +88,26 @@ class BinauralPlayer:
         wrough = 2 * np.pi * (self.left_freq + DETUNE_HZ) / SAMPLE_RATE
         wreward = 2 * np.pi * (self.left_freq * 1.5) / SAMPLE_RATE  # perfect fifth
 
-        core_l = np.sin(self._phase_l + wl * idx)
-        core_r = np.sin(self._phase_r + wr * idx)
+        if self.mode == "monaural_am":
+            # Shared carrier (base), amplitude-modulated at each ear's own rate
+            # -> more lateralized drive for interhemispheric heterodyning.
+            carrier = np.sin(self._phase_l + wl * idx)
+            waml = 2 * np.pi * self.am_left / SAMPLE_RATE
+            wamr = 2 * np.pi * self.am_right / SAMPLE_RATE
+            env_l = 0.5 + 0.5 * np.sin(self._phase_aml + waml * idx)
+            env_r = 0.5 + 0.5 * np.sin(self._phase_amr + wamr * idx)
+            core_l = carrier * env_l
+            core_r = carrier * env_r
+            self._phase_r = (self._phase_r + wr * n) % (2 * np.pi)  # keep advancing
+            self._phase_aml = (self._phase_aml + waml * n) % (2 * np.pi)
+            self._phase_amr = (self._phase_amr + wamr * n) % (2 * np.pi)
+        else:
+            core_l = np.sin(self._phase_l + wl * idx)
+            core_r = np.sin(self._phase_r + wr * idx)
+            self._phase_r = (self._phase_r + wr * n) % (2 * np.pi)
         rough = np.sin(self._phase_rough + wrough * idx)
         reward = np.sin(self._phase_reward + wreward * idx)
         self._phase_l = (self._phase_l + wl * n) % (2 * np.pi)
-        self._phase_r = (self._phase_r + wr * n) % (2 * np.pi)
         self._phase_rough = (self._phase_rough + wrough * n) % (2 * np.pi)
         self._phase_reward = (self._phase_reward + wreward * n) % (2 * np.pi)
 
@@ -114,6 +133,13 @@ class BinauralPlayer:
     def set_frequencies(self, left_freq, right_freq):
         self.left_freq = float(left_freq)
         self.right_freq = float(right_freq)
+
+    def set_mode(self, mode):
+        self.mode = "monaural_am" if mode == "monaural_am" else "binaural"
+
+    def set_am_freqs(self, left_hz, right_hz):
+        self.am_left = float(left_hz)
+        self.am_right = float(right_hz)
 
     def set_volume(self, volume01):
         """Set target amplitude from a 0..1 volume."""
@@ -145,6 +171,10 @@ class BinauralPlayer:
         """Ramp to silence but keep the stream open for an instant restart."""
         self._t_gain = 0.0
 
+    def set_master_gain(self, gain):
+        """Set the master target gain directly (used by timed fades)."""
+        self._t_gain = float(gain)
+
     def close(self):
         self._t_gain = 0.0
         if self._stream is not None:
@@ -167,12 +197,21 @@ class BinauralPanel(QGroupBox):
         self.player = BinauralPlayer()
         self._volume = 0.5
         self._last_level = 0.0
+        self._fading = False
+        self._fade_timer = QTimer(self)
+        self._fade_timer.timeout.connect(self._fade_step)
         self._settings = QSettings("FNT", "MuseStudio")
         self._build_ui()
         self._apply_params(log=False)
         self._reload_presets()
 
     # ------------------------------------------------------------------ UI
+    _SLIDER_STYLE = (
+        "QSlider::groove:horizontal{height:4px;background:#4a4a4a;border-radius:2px;}"
+        "QSlider::handle:horizontal{background:#0078d4;width:10px;height:10px;"
+        "margin:-4px 0;border-radius:5px;}"
+    )
+
     def _build_ui(self):
         grid = QGridLayout(self)
 
@@ -182,6 +221,7 @@ class BinauralPanel(QGroupBox):
         self.base_slider = QSlider(Qt.Horizontal)
         self.base_slider.setRange(BASE_MIN, BASE_MAX)
         self.base_slider.setValue(200)
+        self.base_slider.setStyleSheet(self._SLIDER_STYLE)
         self.base_slider.setToolTip(base_tip)
         grid.addWidget(self.base_slider, 0, 1)
         self.base_spin = QSpinBox()
@@ -198,6 +238,7 @@ class BinauralPanel(QGroupBox):
         self.beat_slider = QSlider(Qt.Horizontal)
         self.beat_slider.setRange(BEAT_MIN, BEAT_MAX)
         self.beat_slider.setValue(10)
+        self.beat_slider.setStyleSheet(self._SLIDER_STYLE)
         self.beat_slider.setToolTip(beat_tip)
         grid.addWidget(self.beat_slider, 1, 1)
         self.beat_spin = QSpinBox()
@@ -212,47 +253,59 @@ class BinauralPanel(QGroupBox):
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(50)
+        self.vol_slider.setStyleSheet(self._SLIDER_STYLE)
         self.vol_slider.setToolTip("Playback loudness. In closed-loop mode this is scaled by your synchrony.")
         grid.addWidget(self.vol_slider, 2, 1)
         self.vol_label = QLabel("50%")
         grid.addWidget(self.vol_label, 2, 2)
+        grid.setColumnStretch(1, 1)   # let sliders take the slack in a narrow column
 
-        # Readout + transport + presets.
-        bottom = QHBoxLayout()
+        # Readout on its own line, then transport + presets stacked (narrow-friendly).
         self.readout = QLabel()
+        self.readout.setWordWrap(True)
         self.readout.setStyleSheet("font-weight: bold; color: #4fc3f7;")
-        bottom.addWidget(self.readout)
-        bottom.addStretch()
+        grid.addWidget(self.readout, 3, 0, 1, 3)
 
+        transport = QHBoxLayout()
+        self.stimulus_combo = QComboBox()
+        self.stimulus_combo.addItem("Binaural", "binaural")
+        self.stimulus_combo.addItem("Monaural AM", "monaural_am")
+        self.stimulus_combo.setToolTip(
+            "Binaural: each ear a pure tone, beat = interaural difference (central).\n"
+            "Monaural AM: each ear's carrier amplitude-modulated at its own rate "
+            "(more lateralized; used for interhemispheric heterodyning)."
+        )
+        self.stimulus_combo.activated.connect(lambda _i: self._apply_params(log=True))
+        transport.addWidget(self.stimulus_combo)
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self.on_play_toggle)
-        self.play_btn.setToolTip("Start/stop the binaural tone. Use headphones for the effect to work.")
-        bottom.addWidget(self.play_btn)
-
+        self.play_btn.setToolTip("Start/stop the tone. Use headphones for the effect to work.")
+        transport.addWidget(self.play_btn)
         self.loop_check = QCheckBox("Closed-loop")
         self.loop_check.setToolTip(
             "Drive tone purity/volume from measured hemisphere synchrony:\n"
             "desynchronized = rough + noisy, synchronized = pure + full."
         )
         self.loop_check.toggled.connect(self._on_loop_toggled)
-        bottom.addWidget(self.loop_check)
+        transport.addWidget(self.loop_check)
+        transport.addStretch()
+        grid.addLayout(transport, 4, 0, 1, 3)
 
-        bottom.addWidget(QLabel("Preset:"))
+        presets = QHBoxLayout()
+        presets.addWidget(QLabel("Preset"))
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(140)
         self.preset_combo.activated.connect(self._on_preset_selected)
         self.preset_combo.setToolTip("Load a saved base/beat/volume combination.")
-        bottom.addWidget(self.preset_combo)
+        presets.addWidget(self.preset_combo, stretch=1)
         self.save_btn = QPushButton("Save…")
         self.save_btn.clicked.connect(self._on_save_preset)
         self.save_btn.setToolTip("Save the current base/beat/volume as a named preset.")
-        bottom.addWidget(self.save_btn)
+        presets.addWidget(self.save_btn)
         self.del_btn = QPushButton("Delete")
         self.del_btn.clicked.connect(self._on_delete_preset)
         self.del_btn.setToolTip("Delete the selected preset.")
-        bottom.addWidget(self.del_btn)
-
-        grid.addLayout(bottom, 3, 0, 1, 3)
+        presets.addWidget(self.del_btn)
+        grid.addLayout(presets, 5, 0, 1, 3)
 
         # Live updates (glide the audio) vs committed events (log to CSV).
         self.base_slider.valueChanged.connect(self.base_spin.setValue)
@@ -281,13 +334,33 @@ class BinauralPanel(QGroupBox):
 
     def _apply_params(self, log=True):
         p = self._params()
-        self.player.set_frequencies(p["left_hz"], p["right_hz"])
-        self.readout.setText(
-            f"Left {p['left_hz']:.0f} Hz   Right {p['right_hz']:.0f} Hz   "
-            f"(beat {p['beat_hz']} Hz)"
-        )
+        if self.stimulus_combo.currentData() == "monaural_am":
+            self.player.set_mode("monaural_am")
+            self.player.set_frequencies(p["base_hz"], p["base_hz"])  # shared carrier
+            self.player.set_am_freqs(p["beat_hz"], p["beat_hz"])     # isochronic both ears
+            self.readout.setText(
+                f"Monaural AM — carrier {p['base_hz']} Hz, both ears {p['beat_hz']} Hz"
+            )
+        else:
+            self.player.set_mode("binaural")
+            self.player.set_frequencies(p["left_hz"], p["right_hz"])
+            self.readout.setText(
+                f"Left {p['left_hz']:.0f} Hz   Right {p['right_hz']:.0f} Hz   "
+                f"(beat {p['beat_hz']} Hz)"
+            )
         if log:
             self._emit_event("param")
+
+    def set_heterodyne_offset(self, delta_hz):
+        """In monaural-AM mode, offset the right ear's rate by ``delta_hz`` from
+        the left (drives the interhemispheric heterodyne)."""
+        beat = self.beat_spin.value()
+        self.player.set_mode("monaural_am")
+        self.player.set_am_freqs(beat, beat + delta_hz)
+        self.readout.setText(
+            f"Heterodyne — L {beat:.1f} Hz   R {beat + delta_hz:.2f} Hz   "
+            f"(Δ {delta_hz:.2f} Hz)"
+        )
 
     def _on_volume(self, value):
         self._volume = value / 100.0
@@ -314,8 +387,11 @@ class BinauralPanel(QGroupBox):
     def is_closed_loop(self):
         return self.loop_check.isChecked()
 
-    def protocol_audio_on(self, base, beat, closed_loop=False):
+    def protocol_audio_on(self, base, beat, closed_loop=False, mode="binaural"):
         """Set tone and start playback (used by the guided protocol runner)."""
+        idx = self.stimulus_combo.findData(mode)
+        if idx >= 0:
+            self.stimulus_combo.setCurrentIndex(idx)
         self.base_spin.setValue(int(base))
         self.beat_spin.setValue(int(beat))
         self._apply_params(log=False)
@@ -324,8 +400,33 @@ class BinauralPanel(QGroupBox):
             self.on_play_toggle()
 
     def protocol_audio_off(self):
+        self._fade_timer.stop()
+        self._fading = False
         if self.player.is_playing():
             self.on_play_toggle()
+
+    def fade_out(self, seconds=5.0):
+        """Gradually ramp the tone to silence over ``seconds``, then stop."""
+        if not self.player.is_playing() or self._fading:
+            return
+        self._fading = True
+        self._fade_steps = max(1, int(seconds / 0.05))
+        self._fade_i = 0
+        self._fade_g0 = self.player._t_gain   # current master gain
+        self._fade_timer.start(50)
+
+    def _fade_step(self):
+        self._fade_i += 1
+        frac = 1.0 - self._fade_i / self._fade_steps
+        if frac <= 0:
+            self._fade_timer.stop()
+            self._fading = False
+            self.loop_check.setChecked(False)
+            if self.player.is_playing():
+                self.on_play_toggle()
+            self._emit_event("fade_out")
+            return
+        self.player.set_master_gain(self._fade_g0 * frac)
 
     def _on_loop_toggled(self, on):
         if on:
@@ -345,6 +446,8 @@ class BinauralPanel(QGroupBox):
         Low synchrony -> rough + noisy + quieter; high -> pure + reward + full.
         """
         self._last_level = float(np.clip(level, 0.0, 1.0))
+        if self._fading:   # don't fight an in-progress fade-out
+            return
         if not (self.loop_check.isChecked() and self.player.is_playing()):
             return
         lv = self._last_level

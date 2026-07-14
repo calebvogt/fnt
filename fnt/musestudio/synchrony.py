@@ -50,6 +50,7 @@ class SynchronyMetrics:
     level: float = 0.0                            # calibrated 0..1 (== combined if not calibrated)
     band: str = "alpha"
     band_power: dict = field(default_factory=dict)  # {electrode: power}
+    drift_hz: float = 0.0                         # interhemispheric phase-drift rate (heterodyne)
     contact_ok: bool = False
     calibrated: bool = False
 
@@ -189,10 +190,16 @@ class SynchronyAnalyzer(QObject):
             power[e] = float(np.mean(np.abs(analytic) ** 2))
 
         plv = {}
+        drifts = []
+        t = np.arange(len(sig[ELECTRODES[0]])) / self._fs
         for label, left, right in PAIRS:
             dphi = phase[left] - phase[right]
             plv[label] = float(np.abs(np.mean(np.exp(1j * dphi))))
+            # Heterodyne rate: slope of the unwrapped phase difference (Hz).
+            slope = np.polyfit(t, np.unwrap(dphi), 1)[0]
+            drifts.append(slope / (2 * np.pi))
         combined = float(np.mean(list(plv.values()))) if plv else 0.0
+        drift_hz = float(np.mean(drifts)) if drifts else 0.0
 
         # Baseline calibration collects combined PLV during a rest window.
         if self._baseline_active:
@@ -209,7 +216,8 @@ class SynchronyAnalyzer(QObject):
 
         self.metrics_updated.emit(SynchronyMetrics(
             plv=plv, plv_combined=combined, level=level, band=self._band,
-            band_power=power, contact_ok=contact_ok, calibrated=self._calibrated,
+            band_power=power, drift_hz=drift_hz,
+            contact_ok=contact_ok, calibrated=self._calibrated,
         ))
 
     def _finish_baseline(self):

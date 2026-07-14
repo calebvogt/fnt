@@ -792,7 +792,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_musestudio_tab(self):
         """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
-        tab, layout = self._make_scrollable_tab("EEG+fNIRS")
+        tab, layout = self._make_scrollable_tab("Muse")
 
         desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
         desc.setFont(QFont("Arial", 10, QFont.Bold))

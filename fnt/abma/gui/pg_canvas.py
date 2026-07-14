@@ -10,6 +10,7 @@ unavailable, so importing this module is always guarded by the caller.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 
 import numpy as np
@@ -17,7 +18,7 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from pyqtgraph import Vector
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QVector4D
+from PyQt5.QtGui import QVector4D, QFont
 
 from ..core.config import ResourceObject
 
@@ -42,6 +43,33 @@ _WALL_RGBA = (0.60, 0.70, 0.82, 0.10)   # translucent acrylic-like walls
 _BODY_L, _BODY_W, _BODY_H = 0.09, 0.035, 0.03
 _HEAD_R = 0.022
 _HEAD_OFF = _BODY_L / 2 + _HEAD_R * 0.6
+
+
+def _nice_step(extent, target=5):
+    """A 'nice' round grid step (1/2/2.5/5 × 10^k) giving ~``target`` divisions."""
+    import math
+    if extent <= 0:
+        return 1.0
+    raw = extent / target
+    mag = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag:
+            return m * mag
+    return 10 * mag
+
+
+def _slack_cable(nodes, sag_k=0.09, seg_pts=10):
+    """Polyline through ``nodes`` ([x,y,z]) with a downward parabolic sag."""
+    out = []
+    for a, b in zip(nodes, nodes[1:]):
+        span = math.hypot(b[0] - a[0], b[1] - a[1])
+        sag = min(0.3, sag_k * span)
+        for i in range(seg_pts + 1):
+            t = i / seg_pts
+            out.append([a[0] + (b[0] - a[0]) * t,
+                        a[1] + (b[1] - a[1]) * t,
+                        a[2] + (b[2] - a[2]) * t - sag * 4 * t * (1 - t)])
+    return np.array(out, float)
 
 
 def _box_meshdata(sx, sy, sz):
@@ -78,6 +106,13 @@ class Arena3DView(gl.GLViewWidget):
 
         self._chamber_items = []
         self._chambers = [(0.0, 0.0)]
+        self._grass_items = []
+        self._grass_on = False
+        self._antenna_items = []
+        self._antenna_idx = -1          # -1 = off; else index into layouts
+        self._compass_items = []
+        self._measure_items = []
+        self._measure_mode = None
         self._bodies = []
         self._heads = []
         self._body_md = _box_meshdata(_BODY_L, _BODY_W, _BODY_H)
@@ -102,6 +137,10 @@ class Arena3DView(gl.GLViewWidget):
         self._chamber_items = []
         for dx, dy in self._chambers:
             self._draw_chamber(arena, dx, dy)
+        self._build_grass()
+        self._build_antennas()
+        self._build_compass()
+        self._build_measure()
 
         # resource markers across all chambers (one scatter)
         rp, rc = [], []
@@ -127,6 +166,186 @@ class Arena3DView(gl.GLViewWidget):
         self._cam_distance = float(np.hypot(gw, gh)) * 1.5
         self.reset_camera()
         self.clear_playback()
+
+    def has_grass(self):
+        return getattr(self.arena, "ground", "floor") == "grass"
+
+    def set_grass_enabled(self, on):
+        self._grass_on = bool(on)
+        for it in self._grass_items:
+            it.setVisible(self._grass_on)
+        self.update()
+
+    def _build_grass(self):
+        """Scatter thin vertical blades over the floor; heights ~U(2\", 4\")."""
+        for it in self._grass_items:
+            self.removeItem(it)
+        self._grass_items = []
+        if not self.has_grass():
+            return
+        w, h = self.arena.width, self.arena.height
+        rng = np.random.default_rng(1234)               # stable field each load
+        density = 22.0                                  # blades per m^2
+        for dx, dy in self._chambers:
+            n = int(min(28000, max(200, w * h * density)))
+            bx = dx + rng.random(n) * w
+            by = dy + rng.random(n) * h
+            bh = 0.0508 + rng.random(n) * 0.0508        # 2"–4" tall
+            lean = 0.01                                 # small random tip sway
+            tx = bx + (rng.random(n) - 0.5) * lean
+            ty = by + (rng.random(n) - 0.5) * lean
+            pos = np.empty((2 * n, 3), float)
+            pos[0::2] = np.column_stack([bx, by, np.zeros(n)])
+            pos[1::2] = np.column_stack([tx, ty, bh])
+            base = np.tile([0.16, 0.32, 0.12, 0.85], (n, 1))   # dark green root
+            tip = np.tile([0.42, 0.68, 0.28, 0.9], (n, 1))     # lighter tip
+            tip[:, :3] *= (0.75 + 0.5 * rng.random(n))[:, None]  # per-blade variety
+            col = np.empty((2 * n, 4), float)
+            col[0::2] = base
+            col[1::2] = np.clip(tip, 0, 1)
+            blades = gl.GLLinePlotItem(pos=pos, color=col, width=1.0,
+                                       mode="lines", antialias=True)
+            blades.setGLOptions("translucent")
+            blades.setVisible(self._grass_on)
+            self.addItem(blades)
+            self._grass_items.append(blades)
+
+    def antenna_sets(self):
+        return self.arena.antenna_sets() if self.arena is not None else []
+
+    def set_antenna_layout(self, idx):
+        """idx: -1 = off, else index into the arena's antenna layouts."""
+        self._antenna_idx = idx
+        self._build_antennas()
+
+    def _build_antennas(self):
+        """Antenna boxes + numbers + colour-coded PoE cables for the layout."""
+        from ..core.poe import gateway_color_map
+        for it in self._antenna_items:
+            self.removeItem(it)
+        self._antenna_items = []
+        sets = self.antenna_sets()
+        idx = self._antenna_idx
+        if not (0 <= idx < len(sets)):
+            return
+        _, boxes, cables = sets[idx]
+        cmap = gateway_color_map(cables)
+        has_text = hasattr(gl, "GLTextItem")
+        font = QFont("Helvetica", 20)
+        font.setBold(True)
+        for dx, dy in self._chambers:
+            # PoE cables first (drawn under the boxes)
+            for cab in cables:
+                col = cmap.get(cab.gateway, (0.7, 0.7, 0.7, 1.0))
+                pts = _slack_cable([[dx + n[0], dy + n[1], n[2]]
+                                    for n in cab.nodes])
+                line = gl.GLLinePlotItem(pos=pts, color=col, width=2.5,
+                                         antialias=True)
+                line.setGLOptions("translucent")
+                self.addItem(line)
+                self._antenna_items.append(line)
+            for a in boxes:
+                gw = a.label in cmap
+                color = cmap[a.label] if gw else (0.80, 0.72, 0.55, 1.0)
+                box = gl.GLMeshItem(meshdata=_box_meshdata(a.w, a.d, a.h),
+                                    smooth=False, color=color,
+                                    glOptions="opaque", drawEdges=True,
+                                    edgeColor=(0.20, 0.20, 0.22, 1.0))
+                box.translate(dx + a.x, dy + a.y, a.z)
+                self.addItem(box)
+                self._antenna_items.append(box)
+                if has_text and a.label:
+                    t = gl.GLTextItem(
+                        pos=np.array([dx + a.x, dy + a.y,
+                                      a.z + a.h / 2 + 0.35]),
+                        text=a.label, color=pg.mkColor(255, 235, 140, 255),
+                        font=font)
+                    self.addItem(t)
+                    self._antenna_items.append(t)
+
+    def _build_compass(self):
+        """N/E/S/W markers just outside the arena for geographically-aligned sites.
+
+        Convention: +y is North, +x is East (origin corner = SW). Always shown
+        (not toggled) when ``arena.oriented`` is set.
+        """
+        for it in self._compass_items:
+            self.removeItem(it)
+        self._compass_items = []
+        if not getattr(self.arena, "oriented", False) or \
+                not hasattr(gl, "GLTextItem"):
+            return
+        w, h = self.arena.width, self.arena.height
+        xs = [c[0] for c in self._chambers]
+        ys = [c[1] for c in self._chambers]
+        x0, x1 = min(xs), max(xs) + w
+        y0, y1 = min(ys), max(ys) + h
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        m = 0.06 * max(x1 - x0, y1 - y0)
+        font = QFont("Helvetica", 30)
+        font.setBold(True)
+        _N = pg.mkColor(235, 90, 90, 255)     # red north
+        _O = pg.mkColor(220, 224, 230, 255)   # others
+        for txt, px, py, col in [("N", cx, y1 + m, _N), ("S", cx, y0 - m, _O),
+                                 ("E", x1 + m, cy, _O), ("W", x0 - m, cy, _O)]:
+            t = gl.GLTextItem(pos=np.array([px, py, 0.4]), text=txt,
+                              color=col, font=font)
+            self.addItem(t)
+            self._compass_items.append(t)
+
+    def set_measure(self, mode):
+        """mode: None | 'metric' | 'imperial' — labelled measurement grid."""
+        self._measure_mode = mode
+        self._build_measure()
+
+    def _build_measure(self):
+        for it in self._measure_items:
+            self.removeItem(it)
+        self._measure_items = []
+        mode = getattr(self, "_measure_mode", None)
+        if not mode or self.arena is None:
+            return
+        w, h = self.arena.width, self.arena.height
+        scale = (1.0 / 0.3048) if mode == "imperial" else 1.0
+        unit = "ft" if mode == "imperial" else "m"
+        step = _nice_step(max(w, h) * scale) / scale        # step in metres
+        xs = np.arange(0, w + 1e-9, step)
+        ys = np.arange(0, h + 1e-9, step)
+        z = 0.02
+        lab_off = 0.02 * max(w, h)
+        col = pg.mkColor(120, 210, 230, 255)
+        has_text = hasattr(gl, "GLTextItem")
+        font = QFont("Helvetica", 13)
+        for dx, dy in self._chambers:
+            segs = []
+            for x in xs:
+                segs += [[dx + x, dy, z], [dx + x, dy + h, z]]
+            for y in ys:
+                segs += [[dx, dy + y, z], [dx + w, dy + y, z]]
+            line = gl.GLLinePlotItem(pos=np.array(segs, float),
+                                     color=(0.30, 0.82, 0.92, 0.5), width=1,
+                                     mode="lines", antialias=True)
+            line.setGLOptions("translucent")
+            self.addItem(line)
+            self._measure_items.append(line)
+            if not has_text:
+                continue
+            for x in xs:
+                if x <= 0:
+                    continue
+                t = gl.GLTextItem(pos=np.array([dx + x, dy - lab_off, z]),
+                                  text=f"{x * scale:g}{unit}", color=col,
+                                  font=font)
+                self.addItem(t)
+                self._measure_items.append(t)
+            for y in ys:
+                if y <= 0:
+                    continue
+                t = gl.GLTextItem(pos=np.array([dx - lab_off, dy + y, z]),
+                                  text=f"{y * scale:g}{unit}", color=col,
+                                  font=font)
+                self.addItem(t)
+                self._measure_items.append(t)
 
     def reset_camera(self):
         if getattr(self, "_cam_center", None) is None:
@@ -180,6 +399,16 @@ class Arena3DView(gl.GLViewWidget):
                                      edgeColor=(0.5, 0.6, 0.72, 0.35))
                 slab.translate(dx + cx, dy + cy, wh / 2)
                 self._add_chamber(slab)
+
+        for p in getattr(arena, "poles", []):
+            md = gl.MeshData.cylinder(rows=1, cols=16,
+                                      radius=[p.radius, p.radius],
+                                      length=p.height)
+            pole = gl.GLMeshItem(meshdata=md, smooth=True,
+                                 color=(0.46, 0.34, 0.23, 1.0),
+                                 glOptions="opaque")
+            pole.translate(dx + p.x, dy + p.y, 0.0)
+            self._add_chamber(pole)
 
         for z in getattr(arena, "zones", []):
             col = _ZONE_RGBA.get(z.role, _ZONE_RGBA["roi"])
