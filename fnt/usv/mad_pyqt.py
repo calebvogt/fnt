@@ -25,7 +25,7 @@ from PyQt5.QtCore import (
     Qt, QEvent, QObject, QSettings, QThread, QTimer, QRectF, QPointF, pyqtSignal,
 )
 from PyQt5.QtGui import (
-    QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
+    QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF, QPalette,
 )
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -33,7 +33,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QTreeWidget,
+    QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTabWidget, QTextEdit, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 # scipy.signal is imported lazily where used (spectrogram compute / resample)
@@ -68,6 +69,66 @@ except Exception:
 
 
 _SORT_ROLE = Qt.UserRole + 1
+
+
+_ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
+_ROLE_FILE_COUNTS = Qt.UserRole + 21  # (accepted, pending, rejected) or None
+
+
+class FileCountDelegate(QStyledItemDelegate):
+    """Render a file-list row as ``name  (A, P, R)`` with A green (accepted),
+    P yellow (pending) and R red (rejected). The base name lives in
+    ``_ROLE_FILE_LABEL`` and the ``(a, p, r)`` tuple in ``_ROLE_FILE_COUNTS``
+    (None → just the name). The row's DisplayRole text is kept as a plain
+    ``name (a, p, r)`` string so column sizing / fallback rendering still work;
+    this delegate only recolors the segments."""
+
+    _ACC = QColor(90, 210, 120)
+    _PEND = QColor(240, 210, 70)
+    _REJ = QColor(235, 90, 90)
+
+    def paint(self, painter, option, index):
+        label = index.data(_ROLE_FILE_LABEL)
+        if label is None:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        # Let the style paint the row background/selection, but not the text —
+        # we draw that ourselves so each count can carry its own color.
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        counts = index.data(_ROLE_FILE_COUNTS)
+        painter.save()
+        painter.setClipRect(opt.rect)
+        fm = opt.fontMetrics
+        y = opt.rect.top() + (opt.rect.height() + fm.ascent() - fm.descent()) // 2
+        x = opt.rect.left() + 5
+        selected = bool(opt.state & QStyle.State_Selected)
+        base_col = (opt.palette.color(QPalette.HighlightedText) if selected
+                    else QColor(220, 220, 220))
+        has_counts = counts is not None and any(counts)
+
+        def draw(text, col):
+            nonlocal x
+            painter.setPen(col)
+            painter.drawText(x, y, text)
+            x += fm.horizontalAdvance(text)
+
+        draw(("✓  " if has_counts else "") + str(label), base_col)
+        if has_counts:
+            a, p, r = counts
+            draw("  (", base_col)
+            draw(str(a), self._ACC)
+            draw(", ", base_col)
+            draw(str(p), self._PEND)
+            draw(", ", base_col)
+            draw(str(r), self._REJ)
+            draw(")", base_col)
+        painter.restore()
 
 
 class SortableTreeWidgetItem(QTreeWidgetItem):
@@ -2541,7 +2602,9 @@ class MADMainWindow(QMainWindow):
         self._session_classes: List[str] = ["USV"]
         self._session_last_class: str = "USV"
         # Persisted per-file total annotation count cache.
-        self._file_count_cache: Dict[str, int] = {}
+        # basename -> (accepted, pending, rejected) counts for the file lists
+        self._file_count_cache: Dict[str, tuple] = {}
+        self._loaded_wav_path: Optional[str] = None  # wav the annotations are for
 
         # SAM2-assisted labeling state
         self._sam_ckpt: Optional[str] = None
@@ -2655,9 +2718,6 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.zoom_requested.connect(self._on_wheel_zoom)
         self.spectrogram.stroke_committed.connect(self._on_stroke_committed)
         self.spectrogram.sam_points_changed.connect(self._on_sam_points_changed)
-        self.spectrogram.brush_radius_changed.connect(
-            self._on_brush_radius_scrolled
-        )
         self.spectrogram.request_context_menu.connect(
             self._on_annotation_context_menu
         )
@@ -2897,6 +2957,7 @@ class MADMainWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setMaximumHeight(180)
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.file_list.setItemDelegate(FileCountDelegate(self.file_list))
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
         vbox.addWidget(self.file_list)
@@ -3041,22 +3102,9 @@ class MADMainWindow(QMainWindow):
 
         vbox.addLayout(mode_row)
 
-        brush_row = QHBoxLayout()
-        brush_row.setSpacing(2)
-        brush_row.addWidget(QLabel("Brush radius:"))
-        self.spin_brush_radius = QSpinBox()
-        self.spin_brush_radius.setRange(1, 64)
-        self.spin_brush_radius.setValue(3)
-        self.spin_brush_radius.setSuffix(" px")
-        self.spin_brush_radius.setToolTip(
-            "Brush radius in spectrogram pixels (time-frame × freq-bin)"
-        )
-        self.spin_brush_radius.valueChanged.connect(
-            lambda v: self.spectrogram.set_brush_radius(v)
-        )
-        brush_row.addWidget(self.spin_brush_radius)
-        brush_row.addStretch()
-        vbox.addLayout(brush_row)
+        # Brush radius has no dedicated control — scroll the wheel over the
+        # spectrogram (or use the [ / ] shortcuts) to adjust it. The Paint
+        # button's tooltip documents this.
 
         # Paint strokes auto-save to the sibling PNG (see mouseReleaseEvent).
         self.lbl_mask_status = QLabel("No mask")
@@ -3089,61 +3137,11 @@ class MADMainWindow(QMainWindow):
         hint.setWordWrap(True)
         vbox.addWidget(hint)
 
-        # Quick inference: button + model selector
-        infer_row = QHBoxLayout()
-        infer_row.setSpacing(4)
-        self.btn_quick_infer = QPushButton("Quick Inference (Q)")
-        self.btn_quick_infer.setToolTip(
-            "Run inference on the current visible view using the selected model.\n"
-            "Predictions appear as yellow annotations. Shortcut: I"
-        )
-        self.btn_quick_infer.clicked.connect(self._quick_inference_current_file)
-        self.btn_quick_infer.setEnabled(False)
-        infer_row.addWidget(self.btn_quick_infer)
-        self.combo_quick_infer_model = QComboBox()
-        self.combo_quick_infer_model.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.combo_quick_infer_model.setToolTip(
-            "Select which trained model to use for quick inference")
-        infer_row.addWidget(self.combo_quick_infer_model, 1)
-        vbox.addLayout(infer_row)
+        # Quick Inference lives in the Model Training & Inference section now
+        # (next to Load Project Models), sharing that section's model dropdown.
 
         group.setLayout(vbox)
         layout.addWidget(group)
-
-    def _refresh_quick_infer_models(self):
-        """Populate the quick-inference model dropdown from project models/."""
-        if not hasattr(self, 'combo_quick_infer_model'):
-            return
-        prev = self.combo_quick_infer_model.currentData()
-        self.combo_quick_infer_model.blockSignals(True)
-        self.combo_quick_infer_model.clear()
-        if self._project is None:
-            self.combo_quick_infer_model.blockSignals(False)
-            return
-        models_root = os.path.join(self._project.project_dir, 'models')
-        if not os.path.isdir(models_root):
-            self.combo_quick_infer_model.blockSignals(False)
-            return
-        for name in sorted(os.listdir(models_root)):
-            w = os.path.join(models_root, name, 'weights.pt')
-            if os.path.isfile(w):
-                self.combo_quick_infer_model.addItem(name, w)
-        if self.combo_quick_infer_model.count() > 0:
-            if prev:
-                for i in range(self.combo_quick_infer_model.count()):
-                    if self.combo_quick_infer_model.itemData(i) == prev:
-                        self.combo_quick_infer_model.setCurrentIndex(i)
-                        break
-                else:
-                    self.combo_quick_infer_model.setCurrentIndex(
-                        self.combo_quick_infer_model.count() - 1)
-            else:
-                self.combo_quick_infer_model.setCurrentIndex(
-                    self.combo_quick_infer_model.count() - 1)
-        self.combo_quick_infer_model.blockSignals(False)
-        has_model = self.combo_quick_infer_model.count() > 0
-        self.btn_quick_infer.setEnabled(has_model)
 
     def _set_view_mode(self, mode: str):
         if mode == 'mask_only':  # retired view — fall back to overlay
@@ -3172,6 +3170,7 @@ class MADMainWindow(QMainWindow):
         self.deploy_list = QListWidget()
         self.deploy_list.setMaximumHeight(150)
         self.deploy_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.deploy_list.setItemDelegate(FileCountDelegate(self.deploy_list))
         self.deploy_list.setToolTip(
             "Training Data recordings (stored in the project). Click to preview "
             "and review; edits modify this training copy's csv/h5.")
@@ -3236,6 +3235,18 @@ class MADMainWindow(QMainWindow):
             "trained model at freshly loaded session audio and run inference.")
         self.btn_deploy_load_project.clicked.connect(self._browse_infer_project)
         src_row.addWidget(self.btn_deploy_load_project)
+        self.btn_quick_infer = QPushButton("Quick Inference (Q)")
+        self.btn_quick_infer.setToolTip(
+            "Run inference on the current visible view using the model selected "
+            "in the dropdown above.\n"
+            "Predictions appear as yellow annotations. Shortcut: Q\n\n"
+            "Note: quick inference uses fixed, hardcoded settings — probability "
+            "threshold = 0.5 and min blob pixels = 8 — and ignores the Run "
+            "Inference panel's values. Use the full Run Inference to change them."
+        )
+        self.btn_quick_infer.clicked.connect(self._quick_inference_current_file)
+        self.btn_quick_infer.setEnabled(False)
+        src_row.addWidget(self.btn_quick_infer)
         vbox.addLayout(src_row)
 
         self.lbl_deploy_model_info = QLabel("No model selected")
@@ -3368,6 +3379,28 @@ class MADMainWindow(QMainWindow):
         )
         form.addRow("Validation fraction:", self.spin_train_val)
 
+        self.combo_train_loss = QComboBox()
+        self.combo_train_loss.addItem("BCE + Dice", 'bce_dice')
+        self.combo_train_loss.addItem("Focal-Tversky (recall)", 'focal_tversky')
+        self.combo_train_loss.setToolTip(
+            "<b>Segmentation loss.</b><br>"
+            "<b>BCE + Dice</b> (default): balanced; good general choice.<br>"
+            "<b>Focal-Tversky</b>: penalizes missed pixels (false negatives) more "
+            "than false positives (α=0.3, β=0.7), so it grows masks to cover thin "
+            "/ faint structure like harmonics that BCE+Dice under-segments. Try it "
+            "if your validation <i>recall</i> is much lower than precision.")
+        form.addRow("Loss:", self.combo_train_loss)
+
+        self.chk_train_augment = QCheckBox("Data augmentation")
+        self.chk_train_augment.setChecked(True)
+        self.chk_train_augment.setToolTip(
+            "Augment training tiles on the fly (validation is never augmented): "
+            "SpecAugment-style time/frequency masking, mild noise & gain jitter, "
+            "and a small time shift. The biggest lever against overfitting on a "
+            "modest label set — recommended on. Turn off to reproduce the old "
+            "un-augmented behavior.")
+        form.addRow("", self.chk_train_augment)
+
         self.combo_train_device = QComboBox()
         self._fill_device_combo(self.combo_train_device)
         self.combo_train_device.setToolTip(
@@ -3397,9 +3430,7 @@ class MADMainWindow(QMainWindow):
         # preview area (built in _build_ui) and is only shown while training
         # runs — mirroring Mask Tracker. Here we just wire its signals.
         self.train_panel.run_finished.connect(self._on_training_finished)
-        self.train_panel.cancel_requested.connect(
-            lambda: self.status_bar.showMessage("Stopping training…")
-        )
+        self.train_panel.cancel_requested.connect(self._on_training_stop_requested)
 
         # ---- Run inference ----
         _sub("Run Inference")
@@ -4127,14 +4158,9 @@ class MADMainWindow(QMainWindow):
         item = self.deploy_list.item(idx)
         if item is None:
             return
-        base = os.path.basename(self.deploy_files[idx])
-        n = len(self.spectrogram.annotations)
-        if n:
-            item.setText(f"✓  {base}  ({n})")
-            item.setForeground(QColor(80, 200, 120))
-        else:
-            item.setText(base)
-            item.setData(Qt.ForegroundRole, None)
+        fp = self.deploy_files[idx]
+        self._apply_file_row(item, os.path.basename(fp),
+                             self._file_status_counts(fp))
 
     def _update_overview_marks(self):
         """Place one status-colored tick per detection on the waveform overview
@@ -5116,6 +5142,8 @@ class MADMainWindow(QMainWindow):
             db_min=sp['db_min'], db_max=sp['db_max'],
             training_data_dir=self._project.training_data_dir,
             emit_previews=True,  # live per-epoch prediction preview window
+            augment=self.chk_train_augment.isChecked(),
+            loss=self.combo_train_loss.currentData() or 'bce_dice',
         )
 
     def _apply_latest_training_config(self):
@@ -5165,6 +5193,10 @@ class MADMainWindow(QMainWindow):
                 self.spin_train_lr.setValue(float(cfg['learning_rate']))
             if cfg.get('val_fraction') is not None:
                 self.spin_train_val.setValue(float(cfg['val_fraction']))
+            if cfg.get('loss') is not None:
+                _set_combo_data(self.combo_train_loss, cfg.get('loss'))
+            if cfg.get('augment') is not None:
+                self.chk_train_augment.setChecked(bool(cfg['augment']))
             _set_combo_data(self.combo_train_device, cfg.get('device'))
             # Keep the encoder picker's enabled state in sync with HRNet.
             self._on_arch_changed()
@@ -5208,6 +5240,7 @@ class MADMainWindow(QMainWindow):
         self._training_active = True
         self._update_run_button()
         self._set_train_config_enabled(False)  # lock config while running
+        self._closing_train_windows = False  # re-arm the close-confirm prompt
         self._show_training_dialog()
         self._show_preview_dialog(reset=True)  # live per-epoch previews
         self.train_panel.start_run()
@@ -5278,10 +5311,23 @@ class MADMainWindow(QMainWindow):
         self._preview_dialog.show()
         self._preview_dialog.raise_()
 
+    def _on_training_stop_requested(self):
+        """User clicked 'Stop Training Early' — request the stop and close the
+        training + preview windows immediately (the run winds down in the
+        background). Overrides the old 'keep the window open until you close it'
+        behavior."""
+        self.status_bar.showMessage("Stopping training…")
+        self._closing_train_windows = True
+        for dlg in (self._train_dialog, self._preview_dialog):
+            if dlg is not None:
+                dlg.close()
+
     def _on_train_dialog_close(self, event):
         """Closing the training window mid-run: keep it in the background (just
-        hide) or stop the run — never silently kill a long run."""
-        if not self._training_active:
+        hide) or stop the run — never silently kill a long run. When the close
+        is triggered by 'Stop Training Early', skip the prompt entirely."""
+        if not self._training_active or getattr(self, '_closing_train_windows',
+                                                 False):
             event.accept()
             return
         box = QMessageBox(self)
@@ -5338,7 +5384,6 @@ class MADMainWindow(QMainWindow):
         if self._train_dialog is not None:
             self._train_dialog.setWindowTitle(
                 "Segmentation Training — complete (close when ready)")
-        self._refresh_quick_infer_models()
         if not ok or self._project is None:
             return
         if getattr(self, '_post_train_infer_wavs', None):
@@ -5620,6 +5665,9 @@ class MADMainWindow(QMainWindow):
                 os.path.basename(os.path.dirname(path)))
         else:
             self.lbl_deploy_model_info.setText("No model selected")
+        # Quick Inference shares this dropdown — enable it when a model is set.
+        if hasattr(self, 'btn_quick_infer'):
+            self.btn_quick_infer.setEnabled(bool(path))
         self._update_infer_run_enabled()
 
     def _update_infer_run_enabled(self):
@@ -5655,27 +5703,75 @@ class MADMainWindow(QMainWindow):
         return out
 
     # --- Training Data list (project recordings the model trains on) -----
-    def _file_call_count(self, fp) -> Optional[int]:
-        """Total masks recorded for a wav — every call in the unified CSV,
-        regardless of source (label/prediction) or status. Falls back to the h5
-        (confirmed /td + predicted /pred_calls) when there's no CSV. Returns
-        None if the file has no masks. Shared by the session + Training lists."""
-        from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, get_prob_blob_count, td_count,
-        )
-        from fnt.usv.usv_detector.mad_inference import read_blob_csv
+    # --- per-file status breakdown (accepted / pending / rejected) --------
+    def _mem_status_counts(self):
+        """(accepted, pending, rejected) from the in-memory annotations of the
+        currently-loaded file. Accepted = confirmed labels + accepted predictions
+        (anything that isn't a pending prediction or a rejection)."""
+        a = p = r = 0
+        for ann in self.spectrogram.annotations:
+            st = ann.get('status')
+            if st == 'rejected':
+                r += 1
+            elif st == 'prediction':
+                p += 1
+            else:
+                a += 1
+        return (a, p, r)
+
+    def _csv_status_counts(self, fp):
+        """(accepted, pending, rejected) from a file's persisted CSV (or h5
+        fallback). Read straight from disk, so it's correct for files that
+        aren't the one currently loaded in the preview."""
         csv_p = pred_csv_sibling_path(fp)
         if os.path.isfile(csv_p):
             try:
-                return len(read_blob_csv(csv_p)) or None
+                from fnt.usv.usv_detector.mad_inference import read_blob_csv
+                a = p = r = 0
+                for row in read_blob_csv(csv_p):
+                    st = row.get('status') or 'pending'
+                    if st == 'rejected':
+                        r += 1
+                    elif st == 'pending':
+                        p += 1
+                    else:  # 'accepted', hand-labels, anything else
+                        a += 1
+                return (a, p, r)
             except Exception:
                 pass
         try:
+            from fnt.usv.usv_detector.fnt_mask_store import (
+                masks_sibling_path, get_prob_blob_count, td_count,
+            )
             h5 = masks_sibling_path(fp)
-            n = (td_count(h5) or 0) + (get_prob_blob_count(h5) or 0)
-            return n or None
+            return (td_count(h5) or 0, get_prob_blob_count(h5) or 0, 0)
         except Exception:
-            return None
+            return (0, 0, 0)
+
+    def _file_status_counts(self, fp):
+        """(accepted, pending, rejected) for a wav. Uses the live in-memory
+        annotations when ``fp`` is the file actually loaded in the preview (so
+        edits show instantly); otherwise reads the persisted CSV. The
+        loaded-file check is what stops the Training Data count from briefly
+        showing the *previous* file's number while a new file loads."""
+        loaded = getattr(self, '_loaded_wav_path', None)
+        if (loaded and self.audio_data is not None
+                and os.path.normpath(loaded) == os.path.normpath(fp)):
+            return self._mem_status_counts()
+        return self._csv_status_counts(fp)
+
+    def _apply_file_row(self, item, base, counts):
+        """Set a list row's display text + delegate data for ``base`` with an
+        optional ``(accepted, pending, rejected)`` tuple. The DisplayRole text is
+        a plain string (for sizing); :class:`FileCountDelegate` recolors it."""
+        if counts is not None and any(counts):
+            a, p, r = counts
+            item.setText(f"✓  {base}  ({a}, {p}, {r})")
+        else:
+            item.setText(base)
+        item.setData(_ROLE_FILE_LABEL, base)
+        item.setData(_ROLE_FILE_COUNTS, counts)
+        item.setData(Qt.ForegroundRole, None)  # delegate owns the colors
 
     def _refresh_deploy_queue(self):
         """Render the Training Data list, showing a green ✓ + the recorded call
@@ -5686,13 +5782,13 @@ class MADMainWindow(QMainWindow):
         self.deploy_list.clear()
         for p in self.deploy_files:
             base = os.path.basename(p)
-            cnt = self._file_call_count(p)
-            if cnt:
-                item = QListWidgetItem(f"✓  {base}  ({cnt})")
-                item.setForeground(QColor(80, 200, 120))
-                item.setToolTip("Has labeled/predicted calls — click to review")
-            else:
-                item = QListWidgetItem(base)
+            counts = self._file_status_counts(p)
+            item = QListWidgetItem()
+            self._apply_file_row(item, base, counts)
+            if any(counts):
+                item.setToolTip(
+                    "Calls recorded (accepted, pending, rejected) — "
+                    "click to review")
             self.deploy_list.addItem(item)
         self.deploy_list.blockSignals(False)
         self.lbl_deploy_queue.setText(
@@ -5715,18 +5811,21 @@ class MADMainWindow(QMainWindow):
             return
         base = os.path.basename(wav_path)
         if state == 'done':
-            tag = f"  ({count})" if count is not None else ""
-            item.setText(f"✓  {base}{tag}")
-            item.setForeground(QColor(80, 200, 120))
+            # Freshly inferred — show the accepted/pending/rejected breakdown.
+            self._apply_file_row(item, base, self._file_status_counts(wav_path))
             item.setToolTip(
                 f"Inference done — {count} detection(s); click to review"
                 if count is not None else
                 "Inference done — click to review detections")
         elif state == 'error':
+            item.setData(_ROLE_FILE_LABEL, None)
+            item.setData(_ROLE_FILE_COUNTS, None)
             item.setText(f"✗  {base}")
             item.setForeground(QColor(220, 90, 90))
             item.setToolTip("Inference failed")
-        else:  # pending
+        else:  # queued (not yet run)
+            item.setData(_ROLE_FILE_LABEL, None)
+            item.setData(_ROLE_FILE_COUNTS, None)
             item.setText(base)
             item.setData(Qt.ForegroundRole, None)
             item.setToolTip("")
@@ -6077,6 +6176,11 @@ class MADMainWindow(QMainWindow):
             self.spectrogram.set_annotations(
                 self._load_confirmed_annotations(filepath, gridhw))
             n_pred = self._load_predictions_as_annotations(wav=filepath) or 0
+            # The in-memory annotations now belong to this file — record it so
+            # the list count reads them live (and doesn't show the prior file's
+            # number mid-load).
+            self._loaded_wav_path = filepath
+            self._update_active_training_count()
             self._sync_scrollbar_from_view()
             suffix = f"  |  {n_pred} prediction(s)" if n_pred else ""
             self.status_bar.showMessage(
@@ -6473,12 +6577,16 @@ class MADMainWindow(QMainWindow):
     def _shortcut_brush_smaller(self):
         if self._focus_is_edit():
             return
-        self.spin_brush_radius.setValue(max(1, self.spin_brush_radius.value() - 1))
+        sg = self.spectrogram
+        sg.set_brush_radius(max(1, sg.brush_radius_px - 1))
+        sg.update()
 
     def _shortcut_brush_bigger(self):
         if self._focus_is_edit():
             return
-        self.spin_brush_radius.setValue(min(64, self.spin_brush_radius.value() + 1))
+        sg = self.spectrogram
+        sg.set_brush_radius(min(64, sg.brush_radius_px + 1))
+        sg.update()
 
     def _shortcut_cycle_view(self):
         if self._focus_is_edit():
@@ -6677,7 +6785,6 @@ class MADMainWindow(QMainWindow):
         self.act_run_inference.setEnabled(True)
         self.act_load_pred.setEnabled(True)
         self.act_clear_pred.setEnabled(True)
-        self._refresh_quick_infer_models()
         self._set_train_sections_enabled(True)
         self._offer_training_store_migration()
         self._refresh_deploy_models()
@@ -6816,27 +6923,27 @@ class MADMainWindow(QMainWindow):
         self._scan_all_file_counts()
 
     def _scan_all_file_counts(self):
-        """Populate ``_file_count_cache`` with the total mask count per session
-        file — every call in the unified CSV, regardless of source or status —
-        via the shared :meth:`_file_call_count` (same number the Training Data
-        list shows). One cheap sibling read per file; the multi-GB probability
-        grid is never touched. Call on project open / file-list rebuild, NOT on
-        file switch.
+        """Populate ``_file_count_cache`` with the (accepted, pending, rejected)
+        breakdown per session file, via the shared :meth:`_csv_status_counts`
+        (same numbers the Training Data list shows). One cheap sibling read per
+        file; the multi-GB probability grid is never touched. Call on project
+        open / file-list rebuild, NOT on file switch.
         """
-        cache: Dict[str, int] = {}
+        cache: Dict[str, tuple] = {}
         for fp in self.audio_files:
-            cnt = self._file_call_count(fp)
-            if cnt:
-                cache[os.path.basename(fp)] = cnt
+            counts = self._csv_status_counts(fp)
+            if any(counts):
+                cache[os.path.basename(fp)] = counts
         self._file_count_cache = cache
         self._update_file_list_counts(sync_current=False)
 
     def _update_file_list_counts(self, sync_current: bool = True):
-        """Refresh the file-list labels from the cached counts (fast).
+        """Refresh the file-list labels from the cached (accepted, pending,
+        rejected) counts (fast).
 
         With ``sync_current`` (the default, used after a file is loaded or its
         calls are edited), the *currently displayed* file's entry is reconciled
-        with the live in-memory annotation count so edits show immediately.
+        with the live in-memory annotation breakdown so edits show immediately.
         The scan passes ``sync_current=False`` so it renders purely from the
         stored counts and never clobbers a not-yet-loaded current file.
         """
@@ -6852,9 +6959,9 @@ class MADMainWindow(QMainWindow):
                 and self.audio_files and self.audio_data is not None):
             cur_wav = os.path.basename(
                 self.audio_files[self.current_file_idx])
-            n_mem = len(self.spectrogram.annotations)
-            if n_mem > 0:
-                self._file_count_cache[cur_wav] = n_mem
+            counts = self._mem_status_counts()
+            if any(counts):
+                self._file_count_cache[cur_wav] = counts
             elif cur_wav in self._file_count_cache:
                 del self._file_count_cache[cur_wav]
         self.file_list.blockSignals(True)
@@ -6862,11 +6969,7 @@ class MADMainWindow(QMainWindow):
             item = self.file_list.item(i)
             fp = item.data(Qt.UserRole)
             bn = os.path.basename(fp)
-            n = self._file_count_cache.get(bn, 0)
-            if n > 0:
-                item.setText(f"{bn}  ({n})")
-            else:
-                item.setText(bn)
+            self._apply_file_row(item, bn, self._file_count_cache.get(bn))
         self.file_list.blockSignals(False)
 
     def _set_train_sections_enabled(self, enabled: bool):
@@ -6887,7 +6990,8 @@ class MADMainWindow(QMainWindow):
         left enabled — during a run it doubles as 'show graph'."""
         for name in ('combo_arch', 'combo_train_encoder', 'spin_train_epochs',
                      'spin_train_patience', 'spin_train_batch', 'spin_train_lr',
-                     'spin_train_val', 'combo_train_device'):
+                     'spin_train_val', 'combo_train_loss', 'chk_train_augment',
+                     'combo_train_device'):
             w = getattr(self, name, None)
             if w is not None:
                 w.setEnabled(enabled)
@@ -6978,6 +7082,9 @@ class MADMainWindow(QMainWindow):
                 self.spectrogram.view_start, self.spectrogram.view_end
             )
             self._init_or_load_mask_for_current_file()
+            # In-memory annotations now belong to this file — record it so the
+            # session-list count reads them live rather than the prior file's.
+            self._loaded_wav_path = filepath
             self._sync_scrollbar_from_view()
             if self._project is not None:
                 self._project.last_opened_file = filepath
@@ -7158,7 +7265,6 @@ class MADMainWindow(QMainWindow):
         for btn in (self.btn_paint, self.btn_erase, self.btn_clear_mask,
                     self.btn_sam, self.btn_sam_model, self.btn_undo):
             btn.setEnabled(has_audio)
-        self.spin_brush_radius.setEnabled(has_audio)
         if not has_audio:
             self.btn_paint.setChecked(False)
             self.btn_erase.setChecked(False)
@@ -7992,13 +8098,6 @@ class MADMainWindow(QMainWindow):
         self._refresh_annotation_list()  # drop the yellow pending rows
         self._log("Cleared pending mask(s)")
 
-    def _on_brush_radius_scrolled(self, value: int):
-        # Reflect a wheel-driven radius change in the spin box without
-        # re-triggering set_brush_radius (the widget already applied it).
-        self.spin_brush_radius.blockSignals(True)
-        self.spin_brush_radius.setValue(value)
-        self.spin_brush_radius.blockSignals(False)
-
     # ==================================================================
     # Spectrogram view controls
     # ==================================================================
@@ -8368,7 +8467,9 @@ class MADMainWindow(QMainWindow):
                     f"  epoch {epoch}: "
                     f"train={metrics.get('train_loss', 0):.4f} "
                     f"val={metrics.get('val_loss', 0):.4f} "
-                    f"dice={metrics.get('val_dice', 0):.3f}"
+                    f"dice={metrics.get('val_dice', 0):.3f} "
+                    f"prec={metrics.get('val_precision', 0):.3f} "
+                    f"rec={metrics.get('val_recall', 0):.3f}"
                 )
                 progress.plot_epoch(
                     metrics.get('global_batch', 0),
@@ -8530,21 +8631,108 @@ class MADMainWindow(QMainWindow):
                 candidates.append(w)
         return candidates[-1] if candidates else None
 
-    def _quick_inference_current_file(self):
-        """Run inference on the visible view using the selected model.
-        Mapped to the I key. Produces in-memory predictions only."""
-        if self._project is None:
-            self.status_bar.showMessage(
-                "Open a project first to run inference")
+    def _log_model_info_for_q(self, model_path: str,
+                              threshold: float, min_blob: int):
+        """Log the selected model's training summary + the spec params this
+        inference actually uses, so subpar masks can be diagnosed — most often a
+        train-vs-inference spectrogram mismatch. Logged once per model per
+        session (the block stays in the copyable log for later Q presses)."""
+        if getattr(self, '_q_info_logged_for', None) == model_path:
             return
-        model = (self.combo_quick_infer_model.currentData()
-                 if hasattr(self, 'combo_quick_infer_model')
-                 and self.combo_quick_infer_model.count() > 0
-                 else self._latest_model_path())
+        self._q_info_logged_for = model_path
+        import json
+        run = os.path.basename(os.path.dirname(model_path))
+        summ_path = os.path.join(os.path.dirname(model_path),
+                                 'training_summary.json')
+        summ, cfg = {}, {}
+        if os.path.isfile(summ_path):
+            try:
+                with open(summ_path) as f:
+                    summ = json.load(f) or {}
+                cfg = summ.get('config', {}) or {}
+            except Exception:
+                pass
+        self._log(f"── Quick-inference model: {run} ──")
+        if cfg:
+            hist = summ.get('history') or []
+            last = hist[-1] if hist else {}
+            self._log(
+                f"   arch={cfg.get('model_arch')} encoder={cfg.get('encoder_name')}"
+                f" weights={cfg.get('encoder_weights')}")
+            self._log(
+                f"   tiles: train={summ.get('n_train_tiles','?')} "
+                f"val={summ.get('n_val_tiles','?')}   "
+                f"epochs_run={summ.get('n_epochs_run','?')}/{cfg.get('n_epochs','?')}"
+                f"{'  (early-stopped)' if summ.get('early_stopped') else ''}")
+            def _f(x):
+                try:
+                    return f"{float(x):.4f}"
+                except (TypeError, ValueError):
+                    return str(x)
+            self._log(
+                f"   best_val_loss={_f(summ.get('best_val_loss'))} "
+                f"@epoch {summ.get('best_epoch','?')}  "
+                f"final val_loss={_f(last.get('val_loss'))}")
+            # Best-checkpoint validation quality (the deployed weights).
+            bd = summ.get('best_val_dice', last.get('val_dice'))
+            bp = summ.get('best_val_precision', last.get('val_precision'))
+            br = summ.get('best_val_recall', last.get('val_recall'))
+            self._log(
+                f"   best-ckpt val: dice={_f(bd)} precision={_f(bp)} "
+                f"recall={_f(br)}")
+            sweep = summ.get('best_val_dice_sweep')
+            if isinstance(sweep, dict) and sweep:
+                sw = "  ".join(f"{k}:{_f(v)}" for k, v in sweep.items())
+                self._log(f"   Dice vs threshold: {sw}   "
+                          f"(best≈{summ.get('best_threshold','?')})")
+            pf = summ.get('val_pos_frac')
+            if pf is not None:
+                self._log(f"   label sparsity: {_f(pf)} of supervised pixels "
+                          f"are call (mask foreground)")
+            loss_name = cfg.get('loss', 'bce_dice')
+            aug = "on" if cfg.get('augment') else "off"
+            extra = ""
+            if loss_name == 'focal_tversky':
+                extra = (f" (a={cfg.get('tversky_alpha')} b={cfg.get('tversky_beta')} "
+                         f"g={cfg.get('tversky_gamma')})")
+            self._log(
+                f"   loss={loss_name}{extra}  augment={aug}")
+            self._log(
+                f"   lr={cfg.get('learning_rate')} batch={cfg.get('batch_size')} "
+                f"val_frac={cfg.get('val_fraction')}")
+            self._log(
+                f"   TRAIN spec: nperseg={cfg.get('nperseg')} "
+                f"noverlap={cfg.get('noverlap')} nfft={cfg.get('nfft')} "
+                f"db=[{cfg.get('db_min')},{cfg.get('db_max')}] "
+                f"tile={cfg.get('tile_freq_bins')}x{cfg.get('tile_time_frames')}")
+        else:
+            self._log("   (no training_summary.json beside the model — trained "
+                      "by an older version? spec params can't be compared)")
+        sp = self._spec_params()
+        self._log(
+            f"   INFER spec: nperseg={sp['nperseg']} noverlap={sp['noverlap']} "
+            f"nfft={sp['nfft']} db=[{sp['db_min']},{sp['db_max']}]   "
+            f"threshold={threshold} min_blob_pixels={min_blob}")
+        if cfg:
+            mism = [k for k in ('nperseg', 'noverlap', 'nfft', 'db_min', 'db_max')
+                    if cfg.get(k) is not None
+                    and str(cfg.get(k)) != str(sp.get(k))]
+            if mism:
+                self._log(
+                    f"   ⚠ SPEC MISMATCH vs training ({', '.join(mism)}) — the "
+                    "spectrogram fed to the model differs from what it trained "
+                    "on; this alone can wreck masks. Match the project spec "
+                    "params to training, or retrain.")
+
+    def _quick_inference_current_file(self):
+        """Run inference on the visible view using the model selected in the
+        Model dropdown. Shortcut: Q. Produces in-memory predictions only."""
+        model = self._selected_deploy_model_path() or self._default_model_path()
         if not model:
             self.status_bar.showMessage(
-                "No trained model found — train a model first")
+                "No trained model selected — train or load a model first")
             return
+        self._log_model_info_for_q(model, threshold=0.5, min_blob=8)
         if self._active_wav_path() is None:
             return
         sg = self.spectrogram
