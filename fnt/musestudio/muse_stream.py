@@ -51,8 +51,8 @@ def find_devices(timeout=15):
         )
     except FileNotFoundError:
         raise RuntimeError(
-            "OpenMuse CLI not found. Install the muse extra:\n"
-            '    pip install -e ".[muse]"'
+            "OpenMuse CLI not found. Reinstall project dependencies:\n"
+            "    pip install -e ."
         )
     except subprocess.TimeoutExpired as exc:
         raw = (exc.stdout or "") + (exc.stderr or "")
@@ -214,13 +214,15 @@ class LSLReaderThread(QThread):
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, resolve_timeout=10.0, parent=None):
+    def __init__(self, resolve_timeout=10.0, address=None, parent=None):
         super().__init__(parent)
         self._running = False
         self._resolve_timeout = resolve_timeout
+        self._address = address       # restrict to this device's streams if given
         self._recorder = None
         self._rec_lock = threading.Lock()
         self._channel_names = {}  # stream_name -> [names]
+        self._sfreq = {}          # stream_name -> sample rate (Hz)
 
     # --- recording control (called from GUI thread) ---
     def start_recording(self, recorder):
@@ -239,17 +241,28 @@ class LSLReaderThread(QThread):
         """Return a copy of {stream_name: [channel names]} (valid after connect)."""
         return dict(self._channel_names)
 
+    def sample_rate(self, stream_name):
+        """Sample rate (Hz) of a resolved stream, or None."""
+        return self._sfreq.get(stream_name)
+
     def stop(self):
         self._running = False
 
     def run(self):
         self._running = True
+        inlets = []
         try:
             from mne_lsl.lsl import StreamInlet, resolve_streams
 
             self.status.emit("Resolving LSL streams from OpenMuse...")
             infos = resolve_streams(timeout=self._resolve_timeout)
             muse_infos = [si for si in infos if si.name.startswith(MUSE_STREAM_PREFIX)]
+            # If we know the device address, prefer its streams (OpenMuse embeds
+            # the id in the stream name) so a second headband/app doesn't leak in.
+            if self._address:
+                matched = [si for si in muse_infos if self._address in si.name]
+                if matched:
+                    muse_infos = matched
             if not muse_infos:
                 self.error.emit(
                     "No Muse LSL streams found. Is the OpenMuse streamer "
@@ -257,14 +270,13 @@ class LSLReaderThread(QThread):
                 )
                 return
 
-            inlets = []
             names = []
             for si in muse_infos:
                 inlet = StreamInlet(si, max_buffered=4)
                 inlet.open_stream(timeout=5.0)
                 sinfo = inlet.get_sinfo()
-                ch_names = self._channel_names_for(sinfo)
-                self._channel_names[si.name] = ch_names
+                self._channel_names[si.name] = self._channel_names_for(sinfo)
+                self._sfreq[si.name] = getattr(sinfo, "sfreq", None)
                 inlets.append((si.name, inlet))
                 names.append(si.name)
 
@@ -287,15 +299,14 @@ class LSLReaderThread(QThread):
                         rec.write(name, timestamps, data, self._channel_names[name])
                 if not got_any:
                     time.sleep(0.005)  # avoid busy-spin when no data is pending
-
+        except Exception as exc:  # noqa: BLE001 - surface any backend failure to UI
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+        finally:
             for _, inlet in inlets:
                 try:
                     inlet.close_stream()
                 except Exception:
                     pass
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure to UI
-            self.error.emit(f"{type(exc).__name__}: {exc}")
-        finally:
             self.disconnected.emit()
 
     @staticmethod
