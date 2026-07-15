@@ -54,6 +54,20 @@ class UNetTrainingConfig:
     emit_previews: bool = False
     preview_count: int = 6
 
+    # On-the-fly training augmentation (train tiles only; val is never
+    # augmented). SpecAugment-style time/freq masking + mild noise/gain jitter
+    # + a small time shift. The single biggest lever against overfitting on a
+    # modest label set. Turn off to reproduce un-augmented behavior.
+    augment: bool = True
+
+    # Segmentation loss: 'bce_dice' (default, symmetric) or 'focal_tversky'
+    # (recall-weighted via beta>alpha — better for thin/faint structure that a
+    # symmetric loss under-segments). gamma focuses on hard examples.
+    loss: str = "bce_dice"
+    tversky_alpha: float = 0.3   # false-positive penalty
+    tversky_beta: float = 0.7    # false-negative penalty (>alpha => favor recall)
+    tversky_gamma: float = 1.3333  # focal exponent
+
     # Spectrogram / tile params — filled from MADProjectConfig.
     nperseg: int = 512
     noverlap: int = 384
@@ -157,6 +171,117 @@ def masked_bce_dice_loss(logits, target, weight, eps: float = 1e-6):
     dice = 1 - (2 * inter + eps) / (union + eps)
 
     return bce_masked + dice
+
+
+def masked_focal_tversky_loss(logits, target, weight, alpha=0.3, beta=0.7,
+                              gamma=1.3333, eps: float = 1e-6):
+    """Masked BCE + Focal-Tversky over the supervised region.
+
+    The Tversky index TP/(TP + alpha*FP + beta*FN) generalizes Dice; with
+    ``beta > alpha`` it penalizes false negatives (missed pixels) more than
+    false positives, pushing recall up — useful for thin, faint call structure
+    that a symmetric BCE+Dice tends to under-segment. The focal exponent
+    ``gamma`` concentrates gradient on hard (low-TI) tiles. A small BCE term is
+    kept for gradient stability early on (mirrors :func:`masked_bce_dice_loss`).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+    bce_masked = (bce * weight).sum() / weight.sum().clamp_min(1.0)
+
+    probs = torch.sigmoid(logits)
+    t = target * weight
+    tp = (probs * t).sum()
+    fp = (probs * (1 - target) * weight).sum()
+    fn = ((1 - probs) * t).sum()
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    focal_tversky = (1.0 - tversky).clamp_min(0.0) ** gamma
+
+    return bce_masked + focal_tversky
+
+
+def make_loss_fn(cfg):
+    """Return ``loss(logits, target, weight)`` for the configured loss."""
+    if getattr(cfg, 'loss', 'bce_dice') == 'focal_tversky':
+        a = float(getattr(cfg, 'tversky_alpha', 0.3))
+        b = float(getattr(cfg, 'tversky_beta', 0.7))
+        g = float(getattr(cfg, 'tversky_gamma', 1.3333))
+        return lambda logits, target, weight: masked_focal_tversky_loss(
+            logits, target, weight, a, b, g)
+    return masked_bce_dice_loss
+
+
+class _AugmentedTileDataset:
+    """Training-tile dataset that augments on the fly (val never uses this).
+
+    Geometric ops (time shift) move spec + target + weight together; spectral
+    ops (SpecAugment time/freq masking, Gaussian noise, gain jitter) corrupt the
+    *input spec only* — the target/weight are untouched, so the model learns to
+    predict the call even when the input is partly masked or noisy. Each op fires
+    independently with its own probability, so most tiles get a mild mix."""
+
+    def __init__(self, specs, targets, weights, seed: int = 0,
+                 p_time_shift=0.5, max_shift_frac=0.1,
+                 p_freq_mask=0.5, max_freq_frac=0.15, n_freq_masks=2,
+                 p_time_mask=0.5, max_time_frac=0.15, n_time_masks=2,
+                 p_noise=0.5, noise_std=0.03,
+                 p_gain=0.5, gain_range=(0.9, 1.1)):
+        import torch
+        self._torch = torch
+        self.specs = specs      # (N, H, W) float32, ~[0,1]
+        self.targets = targets
+        self.weights = weights
+        self.rng = np.random.default_rng(seed)
+        self.p_time_shift, self.max_shift_frac = p_time_shift, max_shift_frac
+        self.p_freq_mask, self.max_freq_frac, self.n_freq_masks = \
+            p_freq_mask, max_freq_frac, n_freq_masks
+        self.p_time_mask, self.max_time_frac, self.n_time_masks = \
+            p_time_mask, max_time_frac, n_time_masks
+        self.p_noise, self.noise_std = p_noise, noise_std
+        self.p_gain, self.gain_range = p_gain, gain_range
+
+    def __len__(self):
+        return self.specs.shape[0]
+
+    def _bands(self, n_masks, length, max_frac):
+        for _ in range(n_masks):
+            span = int(self.rng.integers(0, max(1, int(length * max_frac)) + 1))
+            if span <= 0:
+                continue
+            start = int(self.rng.integers(0, max(1, length - span + 1)))
+            yield start, start + span
+
+    def __getitem__(self, i):
+        s = self.specs[i].copy()      # (H, W)
+        t = self.targets[i].copy()
+        w = self.weights[i].copy()
+        H, W = s.shape
+        # --- geometric: whole-tile time shift (spec + target + weight) ---
+        if self.rng.random() < self.p_time_shift:
+            sh = int(self.rng.integers(-int(W * self.max_shift_frac),
+                                       int(W * self.max_shift_frac) + 1))
+            if sh:
+                s = np.roll(s, sh, axis=1)
+                t = np.roll(t, sh, axis=1)
+                w = np.roll(w, sh, axis=1)
+        # --- spectral (input spec only) ---
+        if self.rng.random() < self.p_freq_mask:
+            for a, b in self._bands(self.n_freq_masks, H, self.max_freq_frac):
+                s[a:b, :] = 0.0
+        if self.rng.random() < self.p_time_mask:
+            for a, b in self._bands(self.n_time_masks, W, self.max_time_frac):
+                s[:, a:b] = 0.0
+        if self.rng.random() < self.p_noise:
+            s = s + self.rng.normal(0.0, self.noise_std, s.shape).astype(s.dtype)
+        if self.rng.random() < self.p_gain:
+            lo, hi = self.gain_range
+            s = s * float(self.rng.uniform(lo, hi))
+        s = np.clip(s, 0.0, 1.0)
+        torch = self._torch
+        return (torch.from_numpy(s).float().unsqueeze(0),
+                torch.from_numpy(t).float().unsqueeze(0),
+                torch.from_numpy(w).float().unsqueeze(0))
 
 
 # ----------------------------------------------------------------------
@@ -293,11 +418,16 @@ def train_unet(
     def to_tensor(arr):
         return torch.from_numpy(arr).float().unsqueeze(1)  # (N, 1, H, W)
 
-    train_ds = TensorDataset(
-        to_tensor(specs[train_idx]),
-        to_tensor(targets[train_idx]),
-        to_tensor(weights[train_idx]),
-    )
+    # Train tiles are augmented on the fly when enabled; val is always raw.
+    if getattr(cfg, 'augment', False):
+        train_ds = _AugmentedTileDataset(
+            specs[train_idx], targets[train_idx], weights[train_idx])
+    else:
+        train_ds = TensorDataset(
+            to_tensor(specs[train_idx]),
+            to_tensor(targets[train_idx]),
+            to_tensor(weights[train_idx]),
+        )
     val_ds = TensorDataset(
         to_tensor(specs[val_idx]),
         to_tensor(targets[val_idx]),
@@ -305,6 +435,8 @@ def train_unet(
     )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+
+    loss_fn = make_loss_fn(cfg)
 
     # ---- model ----
     device = _resolve_device(cfg.device)
@@ -359,6 +491,8 @@ def train_unet(
     # ---- train ----
     history: List[Dict] = []
     best_val = float('inf')
+    best_epoch = 0
+    best_metrics: Dict = {}
     best_path = run_dir / 'weights.pt'
     epochs_without_improvement = 0
     early_stopped = False
@@ -377,7 +511,7 @@ def train_unet(
             xb = xb.to(device); yb = yb.to(device); wb = wb.to(device)
             optim.zero_grad()
             logits = model(xb)
-            loss = masked_bce_dice_loss(logits, yb, wb)
+            loss = loss_fn(logits, yb, wb)
             loss.backward()
             optim.step()
             batch_loss = float(loss.item())
@@ -398,27 +532,56 @@ def train_unet(
         model.eval()
         val_loss_sum, val_n = 0.0, 0
         dice_sum = 0.0
+        # Pixel confusion (TP/FP/FN) over the supervised region at several
+        # thresholds — cheap, nothing stored — for precision/recall and a
+        # Dice-vs-threshold sweep. These separate "masks too tight / missing
+        # faint structure" (low recall) from "masks bloated" (low precision),
+        # and reveal whether a lower inference threshold would recover the call.
+        _THRS = (0.3, 0.4, 0.5, 0.6, 0.7)
+        _tp = {t: 0.0 for t in _THRS}
+        _fp = {t: 0.0 for t in _THRS}
+        _fn = {t: 0.0 for t in _THRS}
+        pos_px = 0.0
+        sup_px = 0.0
         with torch.no_grad():
             for xb, yb, wb in val_loader:
                 xb = xb.to(device); yb = yb.to(device); wb = wb.to(device)
                 logits = model(xb)
-                loss = masked_bce_dice_loss(logits, yb, wb)
+                loss = loss_fn(logits, yb, wb)
                 val_loss_sum += float(loss.item()) * xb.size(0)
                 val_n += xb.size(0)
 
                 probs = torch.sigmoid(logits)
-                pred = (probs > 0.5).float() * wb
                 tgt = yb * wb
+                pred = (probs > 0.5).float() * wb
                 inter = (pred * tgt).sum()
                 union = pred.sum() + tgt.sum()
                 dice = (2 * inter / (union + 1e-6)).item() if union.item() > 0 else float('nan')
                 dice_sum += dice * xb.size(0)
+                pos_px += float(tgt.sum())
+                sup_px += float(wb.sum())
+                for t in _THRS:
+                    pbt = (probs > t).float() * wb
+                    _tp[t] += float((pbt * tgt).sum())
+                    _fp[t] += float((pbt * (1 - yb) * wb).sum())
+                    _fn[t] += float(((wb - pbt) * tgt).sum())
         val_loss = val_loss_sum / max(1, val_n)
         val_dice = dice_sum / max(1, val_n)
+
+        def _prd(t):
+            prec = _tp[t] / (_tp[t] + _fp[t] + 1e-6)
+            rec = _tp[t] / (_tp[t] + _fn[t] + 1e-6)
+            d = 2 * _tp[t] / (2 * _tp[t] + _fp[t] + _fn[t] + 1e-6)
+            return prec, rec, d
+        val_precision, val_recall, _ = _prd(0.5)
+        dice_sweep = {t: round(_prd(t)[2], 4) for t in _THRS}
+        best_thr = max(dice_sweep, key=dice_sweep.get)
+        pos_frac = pos_px / max(1.0, sup_px)  # how sparse the masks are
 
         improved = val_loss < best_val - cfg.early_stop_min_delta
         if improved:
             best_val = val_loss
+            best_epoch = epoch
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -428,12 +591,19 @@ def train_unet(
             'epoch': epoch, 'total_epochs': cfg.n_epochs,
             'train_loss': train_loss, 'val_loss': val_loss,
             'val_dice': val_dice,
+            'val_precision': round(val_precision, 4),
+            'val_recall': round(val_recall, 4),
+            'val_dice_sweep': dice_sweep,
+            'best_threshold': best_thr,
+            'val_pos_frac': round(pos_frac, 5),
             'best_val_loss': best_val,
             'epochs_without_improvement': epochs_without_improvement,
             'patience': cfg.early_stop_patience,
             'n_train_tiles': train_n, 'n_val_tiles': val_n,
             'global_batch': global_batch,
         }
+        if improved:
+            best_metrics = metrics
         history.append(metrics)
         if progress:
             progress(epoch, cfg.n_epochs, metrics)
@@ -489,10 +659,20 @@ def train_unet(
             break
 
     # ---- summary ----
+    # ``best_metrics`` are the validation stats at the saved (best-val-loss)
+    # checkpoint — the model that actually gets deployed — so precision/recall
+    # and the threshold sweep describe the weights on disk, not the last epoch.
     summary = {
         'model_path': str(best_path),
         'run_dir': str(run_dir),
         'best_val_loss': best_val,
+        'best_epoch': best_epoch,
+        'best_val_dice': best_metrics.get('val_dice'),
+        'best_val_precision': best_metrics.get('val_precision'),
+        'best_val_recall': best_metrics.get('val_recall'),
+        'best_val_dice_sweep': best_metrics.get('val_dice_sweep'),
+        'best_threshold': best_metrics.get('best_threshold'),
+        'val_pos_frac': best_metrics.get('val_pos_frac'),
         'n_epochs_run': len(history),
         'early_stopped': early_stopped,
         'n_train_tiles': n_total - n_val,

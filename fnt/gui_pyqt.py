@@ -317,6 +317,7 @@ class FNTMainWindow(QMainWindow):
         self.create_imaging_tab()
         self.create_wifp_tab()
         self.create_musestudio_tab()
+        self.create_abma_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -539,8 +540,62 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(quick_layout, quick_buttons)
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
-        
+
         layout.addStretch()
+
+
+    def create_abma_tab(self):
+        """Create the ABMA (Animal Behavior Modeling Arena) tab"""
+        tab, layout = self._make_scrollable_tab("ABMA")
+
+        desc = QLabel("Animal Behavior Modeling Arena — in silico agent-based experiments")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        design_group = QGroupBox("Experiment Designer")
+        design_layout = QGridLayout()
+        design_buttons = [
+            ("Open ABMA Designer",
+             "Design an arena, build populations, run replicate trials, export tracking data",
+             self.run_abma_designer),
+        ]
+        self.create_button_grid(design_layout, design_buttons)
+        design_group.setLayout(design_layout)
+        layout.addWidget(design_group)
+
+        info_group = QGroupBox("About ABMA")
+        info_layout = QVBoxLayout()
+        info_label = QLabel(
+            "<b>Run animal-behavior experiments in silico.</b><br>"
+            "1. <b>Arena</b> — set dimensions/boundary and place nests, food, water<br>"
+            "2. <b>Population</b> — define founder cohorts with sex, genotype "
+            "(e.g. OXTR:KO), and treatment (e.g. methimazole for anosmia)<br>"
+            "3. <b>Experiment</b> — set duration, replicates, circadian activity, seed<br>"
+            "4. <b>Run</b> — watch agents live, then export data<br><br>"
+            "<b>Key design:</b> output <code>uwb_&lt;trial&gt;_processed.csv</code> "
+            "matches FNT's UWB preprocessing schema exactly, so the UWB Proximity/"
+            "Network tools and your R pipeline run unchanged on simulated animals."
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+
+
+    def run_abma_designer(self):
+        """Launch the ABMA experiment designer window"""
+        try:
+            from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+
+            self.abma_window = ABMAWindow()
+            self.abma_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"ABMA Designer failed: {str(e)}")
 
 
     def create_rfid_tab(self):
@@ -737,7 +792,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_musestudio_tab(self):
         """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
-        tab, layout = self._make_scrollable_tab("EEG+fNIRS")
+        tab, layout = self._make_scrollable_tab("Muse")
 
         desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
@@ -761,12 +816,17 @@ class FNTMainWindow(QMainWindow):
             "<b>MuseStudio</b> connects directly to a Muse S Athena headband over "
             "Bluetooth LE (no phone or dongle on a modern Mac) using "
             "<a href='https://github.com/DominiqueMakowski/OpenMuse'>OpenMuse</a>.<br><br>"
-            "• Live scrolling plots of EEG (256 Hz) and fNIRS (64 Hz)<br>"
+            "• Live scrolling plots of EEG (256 Hz) and optics/fNIRS (64 Hz)<br>"
+            "• Live numeric channel table and battery percentage readout<br>"
+            "• Optional webcam preview + recording, timestamp-synced to the Muse data<br>"
+            "• Binaural-beat generator (base 20–1500 Hz, beat 1–50 Hz) with savable presets<br>"
+            "• Closed-loop biofeedback: interhemispheric synchrony (PLV) drives tone purity, "
+            "with a head-map + synchrony meter<br>"
+            "• Guided sessions: free record, or a one-click timed protocol (10-min binaural trial) "
+            "with on-screen instructions<br>"
             "• Records each stream to CSV in a timestamped session folder<br><br>"
             "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
-            "and experimental, and is not affiliated with InteraXon.<br><br>"
-            "Requires the optional <code>muse</code> dependencies: "
-            "<code>pip install -e \".[muse]\"</code>"
+            "and experimental, and is not affiliated with InteraXon."
         )
         info_label.setWordWrap(True)
         info_label.setOpenExternalLinks(True)
@@ -784,9 +844,8 @@ class FNTMainWindow(QMainWindow):
         except ImportError as e:
             QMessageBox.critical(
                 self, "MuseStudio dependencies missing",
-                "MuseStudio requires the optional 'muse' dependencies "
-                "(OpenMuse, mne-lsl, bleak, pyqtgraph).\n\n"
-                "Install them with:\n    pip install -e \".[muse]\"\n\n"
+                "MuseStudio requires OpenMuse, mne-lsl, bleak and pyqtgraph.\n\n"
+                "Reinstall project dependencies with:\n    pip install -e .\n\n"
                 f"Import error: {str(e)}",
             )
             return
