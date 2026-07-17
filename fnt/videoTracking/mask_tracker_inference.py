@@ -41,7 +41,25 @@ class MaskInferenceConfig:
     use_masks: bool = False
 
 
-def detect_system_profile() -> Dict:
+_SYSTEM_PROFILE_CACHE: Optional[Dict] = None
+
+
+def detect_system_profile(force: bool = False) -> Dict:
+    """Auto-detect hardware and return recommended inference settings.
+
+    Result is cached after the first call — detection spawns subprocesses and
+    imports torch (to probe CUDA), which is slow, and the hardware doesn't
+    change during a session. Pass force=True to re-detect.
+    """
+    global _SYSTEM_PROFILE_CACHE
+    if _SYSTEM_PROFILE_CACHE is not None and not force:
+        return _SYSTEM_PROFILE_CACHE
+    profile = _detect_system_profile_uncached()
+    _SYSTEM_PROFILE_CACHE = profile
+    return profile
+
+
+def _detect_system_profile_uncached() -> Dict:
     """Auto-detect hardware and return recommended inference settings."""
     import platform
     import subprocess
@@ -55,6 +73,10 @@ def detect_system_profile() -> Dict:
         "has_cuda": False,
         "cuda_name": None,
         "has_mps": False,
+        "torch_version": None,
+        "torch_cuda": None,        # CUDA version torch was built with (None => CPU-only build)
+        "gpu_physical": None,      # NVIDIA GPU physically present (via nvidia-smi)
+        "gpu_hint": "",            # actionable message when a GPU is present but unusable
         "recommended_device": "cpu",
         "recommended_resolution": 512,
         "recommended_use_masks": False,
@@ -80,27 +102,25 @@ def detect_system_profile() -> Dict:
         except Exception:
             profile["chip"] = platform.processor() or "Apple Silicon"
     elif profile["os"] == "Windows":
-        # PowerShell is the reliable approach on modern Windows (wmic is deprecated)
+        # PowerShell is the reliable approach on modern Windows (wmic is
+        # deprecated). Launching PowerShell is slow, so fetch RAM and CPU
+        # name in a single invocation instead of two.
+        profile["chip"] = platform.processor() or "Unknown"
         try:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip().isdigit():
-                profile["ram_gb"] = int(result.stdout.strip()) // (1024 ** 3)
-        except Exception:
-            pass
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory; "
                  "(Get-CimInstance Win32_Processor).Name"],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                profile["chip"] = result.stdout.strip()
+            if result.returncode == 0:
+                lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+                if lines and lines[0].isdigit():
+                    profile["ram_gb"] = int(lines[0]) // (1024 ** 3)
+                if len(lines) >= 2 and lines[1]:
+                    profile["chip"] = lines[1]
         except Exception:
-            profile["chip"] = platform.processor() or "Unknown"
+            pass
     else:
         try:
             with open("/proc/meminfo") as f:
@@ -115,6 +135,8 @@ def detect_system_profile() -> Dict:
 
     try:
         import torch
+        profile["torch_version"] = torch.__version__
+        profile["torch_cuda"] = torch.version.cuda
         profile["has_cuda"] = torch.cuda.is_available()
         if profile["has_cuda"]:
             profile["cuda_name"] = torch.cuda.get_device_name(0)
@@ -124,6 +146,26 @@ def detect_system_profile() -> Dict:
         )
     except ImportError:
         pass
+
+    # If torch can't use CUDA, check whether an NVIDIA GPU is physically present
+    # (via nvidia-smi) so we can explain *why* it isn't being used, rather than
+    # just reporting "CPU only" on a machine that clearly has a GPU.
+    if not profile["has_cuda"] and not profile["has_mps"]:
+        gpu_name = _detect_nvidia_gpu()
+        if gpu_name:
+            profile["gpu_physical"] = gpu_name
+            if profile["torch_cuda"] is None:
+                profile["gpu_hint"] = (
+                    f"{gpu_name} found, but PyTorch is a CPU-only build "
+                    f"(torch {profile['torch_version']}). Reinstall PyTorch with "
+                    f"CUDA support to enable GPU acceleration."
+                )
+            else:
+                profile["gpu_hint"] = (
+                    f"{gpu_name} found, but PyTorch (built for CUDA "
+                    f"{profile['torch_cuda']}) can't access it — check/update "
+                    f"your NVIDIA driver."
+                )
 
     if profile["has_cuda"]:
         profile["recommended_device"] = "cuda"
@@ -139,6 +181,27 @@ def detect_system_profile() -> Dict:
         profile["recommended_use_masks"] = False
 
     return profile
+
+
+def _detect_nvidia_gpu() -> Optional[str]:
+    """Return the name of a physically present NVIDIA GPU via nvidia-smi, else None.
+
+    This works even when the installed PyTorch is a CPU-only build (which is the
+    common reason a real GPU goes unused), because it queries the driver directly.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+            if lines:
+                return lines[0]
+    except Exception:
+        pass
+    return None
 
 
 def _resolve_device(pref: str) -> str:

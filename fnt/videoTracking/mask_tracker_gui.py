@@ -9,6 +9,7 @@ All code written from scratch for FieldNeuroethologyToolbox.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
@@ -2451,45 +2452,117 @@ class FrameExtractWorker(QThread):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, video_paths, frame_indices_per_video, output_dir):
+    # PNG compression is CPU-heavy; level 1 is much faster than the default
+    # with only a modest size increase (frames stay lossless for annotation).
+    _PNG_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+
+    def __init__(self, video_paths, output_dir, method, count, max_workers=None):
         super().__init__()
-        self.video_paths = video_paths
-        self.frame_indices_per_video = frame_indices_per_video
+        self.video_paths = list(video_paths)
         self.output_dir = output_dir
+        self.method = method
+        self.count = count
+        if max_workers is None:
+            # Extraction is decode + I/O bound; cv2 releases the GIL, so real
+            # parallelism is possible. Cap so we don't thrash a network share.
+            max_workers = max(1, min(8, (os.cpu_count() or 4)))
+        self.max_workers = max_workers
+
+    @staticmethod
+    def _compute_indices(total_frames: int, method: int, n: int) -> List[int]:
+        if total_frames <= 0:
+            return []
+        if method == 0:  # uniform sample
+            if n >= total_frames:
+                return list(range(total_frames))
+            step = total_frames / n
+            return [int(i * step) for i in range(n)]
+        elif method == 1:  # random sample
+            n = min(n, total_frames)
+            return sorted(random.sample(range(total_frames), n))
+        elif method == 2:  # every Nth frame
+            return list(range(0, total_frames, max(1, n)))
+        return []
+
+    def _process_one(self, vpath):
+        """Open a single video, compute its frame indices, and extract them.
+
+        Runs in a worker-pool thread; each thread owns its own VideoCapture.
+        Returns (saved_items, skipped_count).
+        """
+        saved = []
+        skipped = 0
+        cap = cv2.VideoCapture(vpath)
+        if not cap.isOpened():
+            return saved, skipped
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            stem = Path(vpath).stem
+            for fidx in self._compute_indices(total, self.method, self.count):
+                fname = f"{stem}_frame_{fidx:06d}.png"
+                out_path = os.path.join(self.output_dir, fname)
+                if os.path.exists(out_path):
+                    # Don't overwrite existing frames
+                    saved.append((vpath, fidx, out_path))
+                    skipped += 1
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = cap.read()
+                if ret:
+                    cv2.imwrite(out_path, frame, self._PNG_PARAMS)
+                    saved.append((vpath, fidx, out_path))
+        finally:
+            cap.release()
+        return saved, skipped
 
     def run(self):
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             saved = []
             skipped = 0
-            total = sum(len(v) for v in self.frame_indices_per_video.values())
+            total_videos = len(self.video_paths)
             done = 0
-            for vpath, frame_idxs in self.frame_indices_per_video.items():
-                cap = cv2.VideoCapture(vpath)
-                if not cap.isOpened():
-                    continue
-                stem = Path(vpath).stem
-                for fidx in sorted(frame_idxs):
-                    fname = f"{stem}_frame_{fidx:06d}.png"
-                    out_path = os.path.join(self.output_dir, fname)
-                    if os.path.exists(out_path):
-                        # Don't overwrite existing frames
-                        saved.append((vpath, fidx, out_path))
-                        skipped += 1
-                    else:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                        ret, frame = cap.read()
-                        if ret:
-                            cv2.imwrite(out_path, frame)
-                            saved.append((vpath, fidx, out_path))
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers
+            ) as ex:
+                futures = {
+                    ex.submit(self._process_one, vp): vp
+                    for vp in self.video_paths
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        vid_saved, vid_skipped = fut.result()
+                        saved.extend(vid_saved)
+                        skipped += vid_skipped
+                    except Exception as e:
+                        print(f"[MTT] Extraction failed for "
+                              f"{futures[fut]}: {e}")
                     done += 1
-                    self.progress.emit(done, total)
-                cap.release()
+                    self.progress.emit(done, total_videos)
             if skipped:
                 print(f"[MTT] Skipped {skipped} existing frames")
             self.finished.emit(saved)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class SystemProfileWorker(QThread):
+    """Detect hardware in the background so startup isn't blocked.
+
+    detect_system_profile() spawns PowerShell subprocesses and imports torch
+    (to check CUDA), which together cost several seconds. Running it on the
+    main thread froze the window at launch, so we do it off-thread and apply
+    the recommended Inference defaults once it finishes.
+    """
+    finished = pyqtSignal(dict)
+
+    def run(self):
+        try:
+            from .mask_tracker_inference import detect_system_profile
+            profile = detect_system_profile()
+        except Exception:
+            return
+        self.finished.emit(profile)
 
 
 # ======================================================================
@@ -2519,6 +2592,7 @@ class MaskTrackerWindow(QMainWindow):
         self._extracted_frames: List[Tuple[str, int, str]] = []
         self.current_frame_idx: int = -1
         self._output_dir: Optional[str] = None
+        self._skip_delete_frame_warning: bool = False
 
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
@@ -2697,7 +2771,7 @@ class MaskTrackerWindow(QMainWindow):
         # Left panel: tabs
         self.tab_widget = QTabWidget()
         fm = self.fontMetrics()
-        min_w = max(340, fm.averageCharWidth() * 52 + 40)
+        min_w = max(300, fm.averageCharWidth() * 44 + 30)
         self.tab_widget.setMinimumWidth(min_w)
 
         self._build_annotator_tab()
@@ -2783,22 +2857,29 @@ class MaskTrackerWindow(QMainWindow):
         )
         self._sam_toggle_off_style = (
             "QPushButton { background-color: #424242; color: #cccccc; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #616161; }"
         )
         self._sam_toggle_on_style = (
             "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; border: 2px solid #66bb6a; }"
+            "padding: 3px 6px; border-radius: 3px; border: 2px solid #66bb6a; }"
             "QPushButton:hover { background-color: #388e3c; }"
         )
         self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
         self.btn_sam_toggle.toggled.connect(self._on_sam_toggle)
         info_layout.addWidget(self.btn_sam_toggle)
 
+        self.btn_sam_model = QPushButton("...")
+        self.btn_sam_model.setFixedWidth(28)
+        self.btn_sam_model.setToolTip("Change the SAM2 model used for AI labeling.")
+        self.btn_sam_model.setStyleSheet(self._sam_toggle_off_style)
+        self.btn_sam_model.clicked.connect(self._choose_sam2_model)
+        info_layout.addWidget(self.btn_sam_model)
+
         self.btn_edit_classes = QPushButton("Edit Object Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #448aff; }"
         )
         self.btn_edit_classes.clicked.connect(self._edit_classes)
@@ -2812,7 +2893,8 @@ class MaskTrackerWindow(QMainWindow):
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
-            self.btn_sam_toggle, self.btn_edit_classes, self.lbl_zoom_info,
+            self.btn_sam_toggle, self.btn_sam_model, self.btn_edit_classes,
+            self.lbl_zoom_info,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -2824,7 +2906,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_edit_behaviors = QPushButton("Edit Behavior Classes")
         self.btn_edit_behaviors.setStyleSheet(
             "QPushButton { background-color: #7b1fa2; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #9c27b0; }"
         )
         self.btn_edit_behaviors.setToolTip(
@@ -2987,7 +3069,7 @@ class MaskTrackerWindow(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        max_left = max(600, fm.averageCharWidth() * 95 + 40)
+        max_left = max(520, fm.averageCharWidth() * 80 + 40)
         splitter.setSizes([min_w, 800])
         right_panel.setMinimumWidth(300)
         self.tab_widget.setMaximumWidth(max_left)
@@ -4657,13 +4739,18 @@ class MaskTrackerWindow(QMainWindow):
         self._apply_system_defaults()
 
     def _apply_system_defaults(self):
-        """Auto-detect hardware and set optimal tracking defaults."""
-        try:
-            from .mask_tracker_inference import detect_system_profile
-            profile = detect_system_profile()
-        except Exception:
-            return
+        """Auto-detect hardware and set optimal tracking defaults.
 
+        Detection is slow (PowerShell + torch/CUDA), so it runs in a background
+        thread. The window shows immediately; defaults are applied when ready.
+        """
+        self.lbl_track_system_info.setText("Detecting hardware…")
+        self._sysprofile_worker = SystemProfileWorker(self)
+        self._sysprofile_worker.finished.connect(self._on_system_profile_ready)
+        self._sysprofile_worker.start()
+
+    def _on_system_profile_ready(self, profile: dict):
+        """Apply hardware-based defaults once background detection finishes."""
         dev = profile["recommended_device"]
         device_map = {"cpu": "CPU", "cuda": "CUDA (GPU)", "mps": "MPS (Apple Silicon)"}
         target_text = device_map.get(dev, "CPU")
@@ -4690,6 +4777,10 @@ class MaskTrackerWindow(QMainWindow):
         self.lbl_track_system_info.setText(
             f"Detected: {chip}{ram_str} — defaults: {dev}, {res_str}, {masks_str}"
         )
+
+        # A single detection feeds every hardware-info widget across the tabs.
+        self._populate_hw_info(profile)
+        self._populate_cls_system_info(profile)
 
     # ------------------------------------------------------------------
     # Annotator tab sections
@@ -4802,12 +4893,13 @@ class MaskTrackerWindow(QMainWindow):
 
         self.frame_list = QTreeWidget()
         self.frame_list.setMaximumHeight(320)
-        self.frame_list.setColumnCount(2)
-        self.frame_list.setHeaderLabels(["Frame", "Conf"])
+        self.frame_list.setColumnCount(3)
+        self.frame_list.setHeaderLabels(["Frame", "Annotations", "Conf"])
         header = self.frame_list.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSortIndicatorShown(True)
         header.setSectionsClickable(True)
         self.frame_list.setRootIsDecorated(False)
@@ -4851,7 +4943,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_delete_unlabeled = QPushButton("Delete Unlabeled Frames")
         self.btn_delete_unlabeled.setStyleSheet(
             "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #e53935; }"
         )
         self.btn_delete_unlabeled.setToolTip(
@@ -4864,7 +4956,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_delete_frame = QPushButton("Delete Frame")
         self.btn_delete_frame.setStyleSheet(
             "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #e53935; }"
         )
         self.btn_delete_frame.setToolTip(
@@ -4879,7 +4971,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_clear_inferences = QPushButton("Clear Inferences")
         self.btn_clear_inferences.setStyleSheet(
             "QPushButton { background-color: #e65100; color: white; font-weight: bold; "
-            "padding: 3px 12px; border-radius: 3px; }"
+            "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #f57c00; }"
         )
         self.btn_clear_inferences.setToolTip(
@@ -4896,9 +4988,27 @@ class MaskTrackerWindow(QMainWindow):
     # Project management
     # ==================================================================
     def _new_project(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Project Folder")
-        if not d:
+        location = QFileDialog.getExistingDirectory(self, "Select Project Folder Location")
+        if not location:
             return
+        name, ok = QInputDialog.getText(
+            self, "Name Project Folder", "Project folder name:"
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid Name", "Project folder name cannot be empty.")
+            return
+        d = os.path.join(location, name)
+        if os.path.exists(d):
+            QMessageBox.warning(
+                self, "Folder Exists",
+                f"A folder named '{name}' already exists in this location.\n"
+                "Please choose a different name."
+            )
+            return
+        os.makedirs(d, exist_ok=True)
         self._project_dir = d
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
@@ -5257,21 +5367,6 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_output_dir.setText(d)
             self.lbl_output_dir.setStyleSheet("color: #cccccc; font-size: 10px;")
 
-    def _compute_frame_indices(self, total_frames: int) -> List[int]:
-        method = self.combo_method.currentIndex()
-        n = self.spin_count.value()
-        if method == 0:
-            if n >= total_frames:
-                return list(range(total_frames))
-            step = total_frames / n
-            return [int(i * step) for i in range(n)]
-        elif method == 1:
-            n = min(n, total_frames)
-            return sorted(random.sample(range(total_frames), n))
-        elif method == 2:
-            return list(range(0, total_frames, max(1, n)))
-        return []
-
     def _generate_frames(self):
         if not self.video_paths:
             QMessageBox.warning(self, "No Videos", "Load videos first.")
@@ -5299,28 +5394,20 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_output_dir.setText(self._output_dir)
             self.lbl_output_dir.setStyleSheet("color: #cccccc; font-size: 10px;")
 
-        frame_map = {}
-        for vp in vids:
-            cap = cv2.VideoCapture(vp)
-            if not cap.isOpened():
-                continue
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-            indices = self._compute_frame_indices(total)
-            if indices:
-                frame_map[vp] = indices
+        # Frame counting + extraction all happen inside the worker thread so
+        # the UI never blocks (opening hundreds of videos on the main thread
+        # was what froze the tool). Progress is reported per video.
+        method = self.combo_method.currentIndex()
+        count = self.spin_count.value()
 
-        if not frame_map:
-            QMessageBox.warning(self, "No Frames", "Could not compute frames for any video.")
-            return
-
-        total = sum(len(v) for v in frame_map.values())
-        self.extract_progress.setMaximum(total)
+        self.extract_progress.setMaximum(len(vids))
         self.extract_progress.setValue(0)
         self.extract_progress.setVisible(True)
         self.btn_generate.setEnabled(False)
 
-        self._extract_worker = FrameExtractWorker(vids, frame_map, self._output_dir)
+        self._extract_worker = FrameExtractWorker(
+            vids, self._output_dir, method, count
+        )
         self._extract_worker.progress.connect(lambda d, t: self.extract_progress.setValue(d))
         self._extract_worker.finished.connect(self._on_extract_finished)
         self._extract_worker.error.connect(self._on_extract_error)
@@ -5365,12 +5452,12 @@ class MaskTrackerWindow(QMainWindow):
     # Extracted frames
     # ==================================================================
     class _NumericTreeItem(QTreeWidgetItem):
-        """QTreeWidgetItem that sorts the confidence column numerically."""
+        """QTreeWidgetItem that sorts the Annotations/Conf columns numerically."""
         def __lt__(self, other):
             col = self.treeWidget().sortColumn() if self.treeWidget() else 0
-            if col == 1:
-                a = self.data(1, Qt.UserRole)
-                b = other.data(1, Qt.UserRole)
+            if col in (1, 2):
+                a = self.data(col, Qt.UserRole)
+                b = other.data(col, Qt.UserRole)
                 if a is None:
                     a = -1.0
                 if b is None:
@@ -5378,41 +5465,70 @@ class MaskTrackerWindow(QMainWindow):
                 return a < b
             return super().__lt__(other)
 
+    def _render_frame_item(self, item, idx: int):
+        """Populate one frame row: name color + Annotations count + Conf.
+
+        Shared by the full rebuild (_refresh_frame_list) and the live
+        single-row update (_update_frame_list_item) so both stay in sync.
+        Frame name is green if it has any accepted mask, yellow if it only
+        has pending (inferred) masks, grey if none. The Annotations column
+        breaks the mask count down by state.
+        """
+        _, _, fp = self._extracted_frames[idx]
+        filename = os.path.basename(fp)
+        n_total, n_inferred = self._count_annotations_for_file(filename)
+        n_approved = n_total - n_inferred
+
+        if n_approved > 0:
+            name_color = QColor("#4fc456")   # green: has accepted mask(s)
+        elif n_total > 0:
+            name_color = QColor("#e6c830")   # yellow: pending only
+        else:
+            name_color = QColor("#cccccc")   # grey: unlabeled
+
+        item.setText(0, filename)
+        item.setData(0, Qt.UserRole, idx)
+        item.setForeground(0, name_color)
+
+        # Annotations column: number of masks, broken down by state.
+        if n_approved and n_inferred:
+            ann_text = f"{n_approved} ✓ · {n_inferred} pending"
+        elif n_approved:
+            ann_text = f"{n_approved} ✓"
+        elif n_inferred:
+            ann_text = f"{n_inferred} pending"
+        else:
+            ann_text = ""
+        item.setText(1, ann_text)
+        item.setData(1, Qt.UserRole, float(n_total))  # numeric sort key
+        item.setForeground(1, name_color)
+        item.setToolTip(
+            1,
+            f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
+            if n_total else "No annotations yet",
+        )
+
+        # Confidence column.
+        conf = self._frame_confidence.get(filename)
+        item.setText(2, f"{conf:.2f}" if conf is not None else "")
+        item.setData(2, Qt.UserRole, conf if conf is not None else -1.0)
+        if conf is not None:
+            if conf < 0.3:
+                item.setForeground(2, QColor("#e53935"))
+            elif conf < 0.6:
+                item.setForeground(2, QColor("#e6c830"))
+            else:
+                item.setForeground(2, QColor("#4fc456"))
+        else:
+            item.setForeground(2, QColor("#cccccc"))
+
     def _refresh_frame_list(self):
         self.frame_list.blockSignals(True)
         self.frame_list.setSortingEnabled(False)
         self.frame_list.clear()
-        for idx, (_, _, fp) in enumerate(self._extracted_frames):
-            filename = os.path.basename(fp)
-            n_total, n_inferred = self._count_annotations_for_file(filename)
-            n_approved = n_total - n_inferred
-            if n_total > 0 and n_inferred == n_total:
-                label = f"● {filename} ({n_total})"
-                color = QColor("#e6c830")
-            elif n_total > 0 and n_inferred > 0:
-                label = f"◐ {filename} ({n_approved}+{n_inferred})"
-                color = QColor("#e6c830")
-            elif n_total > 0:
-                label = f"✔ {filename} ({n_total})"
-                color = QColor("#4fc456")
-            else:
-                label = f"   {filename}"
-                color = QColor("#cccccc")
-
-            conf = self._frame_confidence.get(filename)
-            conf_text = f"{conf:.2f}" if conf is not None else ""
-
-            item = self._NumericTreeItem([label, conf_text])
-            item.setData(0, Qt.UserRole, idx)
-            item.setData(1, Qt.UserRole, conf if conf is not None else -1.0)
-            item.setForeground(0, color)
-            if conf is not None:
-                if conf < 0.3:
-                    item.setForeground(1, QColor("#e53935"))
-                elif conf < 0.6:
-                    item.setForeground(1, QColor("#e6c830"))
-                else:
-                    item.setForeground(1, QColor("#4fc456"))
+        for idx in range(len(self._extracted_frames)):
+            item = self._NumericTreeItem(["", "", ""])
+            self._render_frame_item(item, idx)
             self.frame_list.addTopLevelItem(item)
         self.frame_list.setSortingEnabled(True)
         self.frame_list.blockSignals(False)
@@ -5572,19 +5688,26 @@ class MaskTrackerWindow(QMainWindow):
         _, _, fp = self._extracted_frames[self.current_frame_idx]
         filename = os.path.basename(fp)
 
-        # Check if frame has annotations
-        n_total, _ = self._count_annotations_for_file(filename)
-        msg = f"Delete training frame '{filename}' from project folder?"
-        if n_total > 0:
-            msg += f"\n\nThis frame has {n_total} annotation(s) that will also be removed."
-        msg += "\n\nThis cannot be undone."
+        if not self._skip_delete_frame_warning:
+            # Check if frame has annotations
+            n_total, _ = self._count_annotations_for_file(filename)
+            msg = f"Delete training frame '{filename}' from project folder?"
+            if n_total > 0:
+                msg += f"\n\nThis frame has {n_total} annotation(s) that will also be removed."
+            msg += "\n\nThis cannot be undone."
 
-        reply = QMessageBox.warning(
-            self, "Delete Training Frame", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Delete Training Frame")
+            box.setText(msg)
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            skip_cb = QCheckBox("Do not show this message again")
+            box.setCheckBox(skip_cb)
+            if box.exec_() != QMessageBox.Yes:
+                return
+            if skip_cb.isChecked():
+                self._skip_delete_frame_warning = True
 
         # Remove annotations and image record for this frame
         if filename in self._coco._image_id_map:
@@ -5851,6 +5974,48 @@ class MaskTrackerWindow(QMainWindow):
                 self.lbl_mode.setText("Navigate")
                 self._ai_enabled = False
 
+    def _choose_sam2_model(self):
+        """Pick or replace the SAM2 model (invoked by the '...' button).
+
+        Unlike _ensure_sam2_loaded, this can swap out an already-loaded model
+        and does not fall back to Navigate mode when the user cancels — the
+        current model (if any) simply stays in use.
+        """
+        from .sam2_checkpoint_manager import (
+            SAM2_CHECKPOINTS, LOCAL_MODELS_DIR, _LEGACY_DIRS,
+            _find_existing_checkpoints,
+        )
+        search_dirs = [LOCAL_MODELS_DIR] + list(_LEGACY_DIRS)
+        custom_path = self._project_config.get("sam2_model_path")
+        if custom_path and os.path.isdir(custom_path):
+            search_dirs.insert(0, Path(custom_path))
+        found = _find_existing_checkpoints(*search_dirs)
+
+        if not found:
+            # Nothing installed yet — offer to download one.
+            self._show_sam2_download_dialog()
+            return
+
+        names = list(found.keys())
+        descriptions = [
+            f"{n} ({SAM2_CHECKPOINTS.get(n, {}).get('size_mb', '?')} MB)"
+            for n in names
+        ]
+        descriptions.append("Download additional model...")
+        choice, ok = QInputDialog.getItem(
+            self, "Select SAM2 Model", "Select the SAM2 model to use:",
+            descriptions, 0, False,
+        )
+        if not ok:
+            return
+        if choice == "Download additional model...":
+            self._show_sam2_download_dialog()
+        else:
+            idx = descriptions.index(choice)
+            self._load_sam2_model(
+                str(found[names[idx]]), SAM2_CHECKPOINTS[names[idx]]["config"]
+            )
+
     def _show_sam2_download_dialog(self):
         try:
             from .sam2_checkpoint_manager import SAM2CheckpointDialog
@@ -5882,6 +6047,9 @@ class MaskTrackerWindow(QMainWindow):
             self._ai_enabled = False
             return
         self._segmenter = SAM2ImageSegmenter(checkpoint_path, config_name)
+        # Force the (possibly new) segmenter to receive the current frame once
+        # loaded — important when swapping models mid-session.
+        self._image_set = False
         self.status_bar.showMessage(f"Loading SAM2 ({os.path.basename(checkpoint_path)})...")
         self._sam2_worker = SAM2LoadWorker(self._segmenter)
         self._sam2_worker.finished.connect(self._on_sam2_loaded)
@@ -6082,10 +6250,15 @@ class MaskTrackerWindow(QMainWindow):
     # ==================================================================
     # Training
     # ==================================================================
-    def _populate_hw_info(self):
+    def _populate_hw_info(self, profile: dict = None):
+        # At build time no profile is available yet — detection runs in the
+        # background (see SystemProfileWorker) and calls back here. Just show
+        # a placeholder so startup isn't blocked.
+        if profile is None:
+            self.lbl_hw_info.setText("Detecting hardware…")
+            return
         try:
-            from .mask_tracker_inference import detect_system_profile
-            p = detect_system_profile()
+            p = profile
             lines = []
             lines.append(f"Chip: {p.get('chip', 'Unknown')}")
             lines.append(f"CPU cores: {p.get('cpu_cores', '?')}  |  RAM: {p.get('ram_gb', '?')} GB")
@@ -6095,19 +6268,33 @@ class MaskTrackerWindow(QMainWindow):
             if p.get("has_mps"):
                 gpu_parts.append("MPS (Apple Metal)")
             if not gpu_parts:
-                gpu_parts.append("None (CPU only)")
+                if p.get("gpu_physical"):
+                    gpu_parts.append(f"{p['gpu_physical']} (not enabled)")
+                else:
+                    gpu_parts.append("None (CPU only)")
             lines.append(f"GPU: {', '.join(gpu_parts)}")
             lines.append(f"Recommended: {p['recommended_device'].upper()}, "
                          f"{p['recommended_resolution']}px, "
                          f"{'masks' if p['recommended_use_masks'] else 'boxes'}")
+            hint = p.get("gpu_hint")
+            if hint:
+                lines.append(f"⚠ {hint}")
             self.lbl_hw_info.setText("\n".join(lines))
+            # Amber the whole block when there's an unusable GPU to draw the eye.
+            self.lbl_hw_info.setStyleSheet(
+                "color: #e6c830; font-size: 10px;" if hint
+                else "color: #999999; font-size: 10px;"
+            )
+            self.lbl_hw_info.setToolTip(hint or "")
         except Exception as e:
             self.lbl_hw_info.setText(f"Hardware detection failed: {e}")
 
-    def _populate_cls_system_info(self):
+    def _populate_cls_system_info(self, profile: dict = None):
+        if profile is None:
+            self.lbl_cls_system_info.setText("System: detecting…")
+            return
         try:
-            from .mask_tracker_inference import detect_system_profile
-            p = detect_system_profile()
+            p = profile
             parts = [p.get("chip", "Unknown")]
             if p.get("has_cuda"):
                 parts.append(f"CUDA ({p.get('cuda_name', '?')})")
@@ -9916,33 +10103,7 @@ class MaskTrackerWindow(QMainWindow):
                 break
         if item is None:
             return
-        _, _, fp = self._extracted_frames[row]
-        filename = os.path.basename(fp)
-        n_total, n_inferred = self._count_annotations_for_file(filename)
-        n_approved = n_total - n_inferred
-        if n_total > 0 and n_inferred == n_total:
-            item.setText(0, f"● {filename} ({n_total})")
-            item.setForeground(0, QColor("#e6c830"))
-        elif n_total > 0 and n_inferred > 0:
-            item.setText(0, f"◐ {filename} ({n_approved}+{n_inferred})")
-            item.setForeground(0, QColor("#e6c830"))
-        elif n_total > 0:
-            item.setText(0, f"✔ {filename} ({n_total})")
-            item.setForeground(0, QColor("#4fc456"))
-        else:
-            item.setText(0, f"   {filename}")
-            item.setForeground(0, QColor("#cccccc"))
-
-        conf = self._frame_confidence.get(filename)
-        item.setText(1, f"{conf:.2f}" if conf is not None else "")
-        item.setData(1, Qt.UserRole, conf if conf is not None else -1.0)
-        if conf is not None:
-            if conf < 0.3:
-                item.setForeground(1, QColor("#e53935"))
-            elif conf < 0.6:
-                item.setForeground(1, QColor("#e6c830"))
-            else:
-                item.setForeground(1, QColor("#4fc456"))
+        self._render_frame_item(item, row)
 
     def closeEvent(self, event):
         self._close_video()
