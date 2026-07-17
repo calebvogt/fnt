@@ -1,8 +1,8 @@
 """PoE daisy-chain wiring optimiser for the UWB antenna layouts.
 
-Each gateway is a depot with two arms (A/B); each arm is an open daisy chain of
-up to ``cap_arm`` antennas, and a gateway carries at most ``cap_gw`` antennas
-across both arms. Gateways never connect to each other. We minimise total
+Each gateway is a depot with two arms: arm A holds up to 5 antennas and arm B
+up to 4 (9 total per gateway). Each arm is an open daisy chain. Gateways never
+connect to each other. We minimise total
 Euclidean PoE cable length with a multi-start heuristic: randomised
 cheapest-append construction + per-arm 2-opt + relocate/swap local search,
 keeping the best of many restarts — near-optimal for these small grids.
@@ -68,15 +68,11 @@ def _two_opt(gpos, nodes):
                     improved = True
 
 
-def _gcount(arms, gi):
-    return sum(len(a["nodes"]) for a in arms if a["gi"] == gi)
-
-
 def _total(arms):
     return sum(_arm_len(a["gpos"], a["nodes"]) for a in arms)
 
 
-def _local_search(arms, cap_arm, cap_gw):
+def _local_search(arms):
     for a in arms:
         _two_opt(a["gpos"], a["nodes"])
 
@@ -85,9 +81,7 @@ def _local_search(arms, cap_arm, cap_gw):
             for ni in range(len(src["nodes"])):
                 node = src["nodes"][ni]
                 for dst in arms:
-                    if dst is src or len(dst["nodes"]) >= cap_arm:
-                        continue
-                    if dst["gi"] != src["gi"] and _gcount(arms, dst["gi"]) >= cap_gw:
+                    if dst is src or len(dst["nodes"]) >= dst["cap"]:
                         continue
                     st = src["nodes"][:ni] + src["nodes"][ni + 1:]
                     dt = dst["nodes"] + [node]
@@ -124,16 +118,18 @@ def _local_search(arms, cap_arm, cap_gw):
             break
 
 
-def solve_poe_wiring(gateways, leaves, z=1.8288, cap_arm=8, cap_gw=9,
-                     restarts=80, seed=7):
+def solve_poe_wiring(gateways, leaves, z=1.8288, arm_caps=(5, 4),
+                     restarts=120, seed=7):
     """Return (cables, total_length_m).
 
-    gateways : list of (label, (x, y));  leaves : list of (label, (x, y))
+    Each gateway has an arm A (capacity ``arm_caps[0]``) and arm B
+    (``arm_caps[1]``). gateways/leaves are lists of (label, (x, y)).
     """
     rng = random.Random(seed)
     best, best_len = None, float("inf")
     for r in range(restarts):
-        arms = [{"gi": gi, "glabel": gl, "arm": arm, "gpos": gp, "nodes": []}
+        arms = [{"gi": gi, "glabel": gl, "arm": arm, "gpos": gp, "nodes": [],
+                 "cap": arm_caps[0] if arm == "A" else arm_caps[1]}
                 for gi, (gl, gp) in enumerate(gateways) for arm in ("A", "B")]
         order = list(range(len(leaves)))
         if r > 0:
@@ -143,7 +139,7 @@ def solve_poe_wiring(gateways, leaves, z=1.8288, cap_arm=8, cap_gw=9,
             llabel, lpos = leaves[li]
             pick = None
             for arm in arms:
-                if len(arm["nodes"]) >= cap_arm or _gcount(arms, arm["gi"]) >= cap_gw:
+                if len(arm["nodes"]) >= arm["cap"]:
                     continue
                 last = arm["nodes"][-1][1] if arm["nodes"] else arm["gpos"]
                 d = _dist(last, lpos)
@@ -155,7 +151,7 @@ def solve_poe_wiring(gateways, leaves, z=1.8288, cap_arm=8, cap_gw=9,
             pick[1]["nodes"].append((llabel, lpos))
         if not ok:
             continue
-        _local_search(arms, cap_arm, cap_gw)
+        _local_search(arms)
         L = _total(arms)
         if L < best_len:
             best_len, best = L, deepcopy(arms)
