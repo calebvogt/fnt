@@ -79,6 +79,7 @@ class AntennaBox:
     w: float = 0.2032    # 8"
     d: float = 0.1016    # 4"
     h: float = 0.2032    # 8"
+    style: str = "box"   # 'box' (weatherproof enclosure) | 'bare' (open antenna)
     label: str = ""
 
 
@@ -104,6 +105,76 @@ class AntennaLayout:
 
 
 @dataclass
+class WaterTower:
+    """A free-standing water tower (small cylinder). Default 1 qt: 6" dia, 8" tall."""
+    x: float = 0.0
+    y: float = 0.0
+    radius: float = 0.0762   # 6" diameter
+    height: float = 0.2032   # 8"
+    label: str = ""
+
+
+@dataclass
+class GrassSpec:
+    """Ground-cover appearance for outdoor sites.
+
+    This is a *visual* model, not a botanical stem count: ``density`` is how
+    many blades we draw per m², chosen to reproduce the fractional cover seen
+    from above. ``patchiness`` clumps them (0 = uniform, 1 = strongly clumped,
+    leaving bare ground between tufts) and ``dry_fraction`` is the share drawn
+    straw-coloured rather than green.
+
+    ``cover_map`` optionally carries the site's large-scale cover pattern as a
+    coarse grid of relative density (0-1). It is stored in ARENA orientation:
+    row 0 = South, last row = North; column 0 = West, last column = East
+    (matching +y = N, +x = E), so a map traced off a north-up aerial photo must
+    be flipped vertically before being stored here. Empty = uniform.
+    """
+    density: float = 44.0        # blades drawn per m²
+    h_min: float = 0.0508        # 2"
+    h_max: float = 0.1016        # 4"
+    dry_fraction: float = 0.0    # 0 = all green, 1 = all straw
+    patchiness: float = 0.0      # 0 = uniform, 1 = strongly clumped
+    cover_map: list = field(default_factory=list)   # rows S->N, cols W->E
+
+
+@dataclass
+class Hut:
+    """A small acrylic shelter set on the floor.
+
+    kind  : 'tube' (hollow rectangular tube, open both ends) | 'dome'
+            (half dome with entrance arches)
+    w,d,h : tube = length × width × height; dome = diameter × – × height
+    angle : rotation about z, degrees (tube long axis)
+    """
+    kind: str = "tube"
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 0.1524    # 6" tube length / 5" dome diameter
+    d: float = 0.1016    # 4" tube width
+    h: float = 0.1016    # 4" tube height / dome height
+    thickness: float = 0.00635   # 1/4" acrylic
+    angle: float = 0.0
+    label: str = ""
+
+
+@dataclass
+class ResourceZone:
+    """A ground resource station (box) holding nesting material + food.
+
+    entrance : "N" | "S" | "E" | "W" — side carrying the doorway.
+    """
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 0.762    # 30" (east-west)
+    d: float = 0.508    # 20" (north-south)
+    h: float = 0.4318   # 17" tall
+    entrance: str = "E"
+    hole: float = 0.0762  # 3" entrance hole (diameter, vole-passable)
+    label: str = ""
+
+
+@dataclass
 class ArenaConfig:
     width: float = 2.2
     height: float = 2.2
@@ -112,11 +183,15 @@ class ArenaConfig:
     objects: list[ResourceObject] = field(default_factory=list)
     zones: list[Zone] = field(default_factory=list)
     poles: list[Pole] = field(default_factory=list)   # vertical posts/pillars
+    water_towers: list[WaterTower] = field(default_factory=list)
+    resource_zones: list[ResourceZone] = field(default_factory=list)
+    huts: list[Hut] = field(default_factory=list)      # acrylic tube / dome huts
     antennas: list[AntennaBox] = field(default_factory=list)  # primary UWB set
     antenna_layouts: list[AntennaLayout] = field(default_factory=list)  # cyclable
     wall_height: float = 0.0       # 3D wall height (m); 0 = flat/open arena
     wall_thickness: float = 0.005  # 3D wall thickness (m)
     ground: str = "floor"          # 'floor' | 'grass' (outdoor field site)
+    grass: GrassSpec = field(default_factory=GrassSpec)   # ground-cover look
     oriented: bool = False         # geographically aligned (+y=N,+x=E) -> compass
 
     def objects_of(self, kind: str) -> list[ResourceObject]:
@@ -336,6 +411,11 @@ class ExperimentConfig:
             objects=[ResourceObject(**o) for o in arena_d.get("objects", [])],
             zones=[Zone(**z) for z in arena_d.get("zones", [])],
             poles=[Pole(**p) for p in arena_d.get("poles", [])],
+            water_towers=[WaterTower(**w)
+                          for w in arena_d.get("water_towers", [])],
+            resource_zones=[ResourceZone(**z)
+                            for z in arena_d.get("resource_zones", [])],
+            huts=[Hut(**hh) for hh in arena_d.get("huts", [])],
             antennas=[AntennaBox(**a) for a in arena_d.get("antennas", [])],
             antenna_layouts=[
                 AntennaLayout(
@@ -349,6 +429,7 @@ class ExperimentConfig:
             wall_height=arena_d.get("wall_height", 0.0),
             wall_thickness=arena_d.get("wall_thickness", 0.005),
             ground=arena_d.get("ground", "floor"),
+            grass=GrassSpec(**arena_d.get("grass", {})),
             oriented=arena_d.get("oriented", False),
         )
         groups = []

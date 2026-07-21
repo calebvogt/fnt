@@ -14,7 +14,7 @@ import time
 import traceback
 
 from PyQt5.QtCore import Qt, QThread, QTimer, QPoint, pyqtSignal
-from PyQt5.QtGui import QColor, QPixmap, QPainter, QPolygon
+from PyQt5.QtGui import QColor, QPixmap, QPainter, QPolygon, QPen
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QTabWidget, QLabel, QPushButton, QDoubleSpinBox, QSpinBox, QComboBox,
@@ -22,13 +22,13 @@ from PyQt5.QtWidgets import (
     QTextEdit, QProgressBar, QFileDialog, QMessageBox, QHeaderView,
     QAbstractItemView, QAction, QSplitter, QStackedWidget, QScrollArea,
     QFrame, QDialog, QListWidget, QDialogButtonBox, QSizePolicy,
-    QToolButton, QSlider, QInputDialog,
+    QToolButton, QSlider, QInputDialog, QMenu,
 )
 
 from ..core.config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
-    default_dynamics, blank_experiment, default_vole_experiment,
+    default_dynamics, GrassSpec, blank_experiment, default_vole_experiment,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -300,7 +300,8 @@ class ABMAWindow(QMainWindow):
         rlay.setSpacing(4)
         title_row = QHBoxLayout()
         self.preview_title = QLabel(
-            "Preview Window  ·  drag to orbit, scroll to zoom")
+            "Preview Window  ·  drag to orbit · right-drag (or ⇧+drag) to pan · "
+            "scroll to zoom")
         self.preview_title.setObjectName("preview_title")
         title_row.addWidget(self.preview_title)
         title_row.addStretch()
@@ -361,16 +362,26 @@ class ABMAWindow(QMainWindow):
         self.in_speed.currentTextChanged.connect(
             lambda t: setattr(self, "_play_speed", float(t.rstrip("×"))))
         tl.addWidget(self.in_speed)
-        for txt, tip, cb in [
-            ("⌂", "Reset camera", lambda: self._active_view().reset_camera()),
-            ("⊤", "Top-down view", lambda: self._active_view().top_down()),
-        ]:
-            b = QToolButton()
-            b.setText(txt)
-            b.setToolTip(tip)
-            b.clicked.connect(cb)
-            b.setEnabled(self.view_3d is not None)
-            tl.addWidget(b)
+        b = QToolButton()
+        b.setText("⌂")
+        b.setToolTip("Reset camera (isometric)")
+        b.clicked.connect(lambda: self._snap_view("iso"))
+        b.setEnabled(self.view_3d is not None)
+        tl.addWidget(b)
+        # CAD-style snap-view menu (top/bottom/N/S/E/W/iso)
+        self.btn_viewcube = QToolButton()
+        self.btn_viewcube.setText("◫ View")
+        self.btn_viewcube.setToolTip("Snap to a standard view")
+        self.btn_viewcube.setPopupMode(QToolButton.InstantPopup)
+        vmenu = QMenu(self.btn_viewcube)
+        for label, name in [("Isometric", "iso"), ("Top View", "top"),
+                            ("Bottom", "bottom"), ("North side", "north"),
+                            ("South side", "south"), ("East side", "east"),
+                            ("West side", "west")]:
+            vmenu.addAction(label, lambda nm=name: self._snap_view(nm))
+        self.btn_viewcube.setMenu(vmenu)
+        self.btn_viewcube.setEnabled(self.view_3d is not None)
+        tl.addWidget(self.btn_viewcube)
         self.btn_follow = QToolButton()
         self.btn_follow.setText("◎")
         self.btn_follow.setToolTip("Follow selected agent")
@@ -379,6 +390,19 @@ class ABMAWindow(QMainWindow):
         self.btn_follow.toggled.connect(
             lambda c: setattr(self, "_follow_agent", c))
         tl.addWidget(self.btn_follow)
+        self.btn_agents = QToolButton()
+        self.btn_agents.setText("🐭")
+        self.btn_agents.setToolTip("Show / hide agents")
+        self.btn_agents.setCheckable(True)
+        self.btn_agents.setChecked(True)
+        self.btn_agents.toggled.connect(self._on_toggle_agents)
+        tl.addWidget(self.btn_agents)
+        self.btn_theme = QToolButton()
+        self.btn_theme.setText("☀")
+        self.btn_theme.setToolTip("Light / dark arena model")
+        self.btn_theme.setCheckable(True)
+        self.btn_theme.toggled.connect(self._on_toggle_theme)
+        tl.addWidget(self.btn_theme)
         self.btn_grass = QToolButton()
         self.btn_grass.setText("🌱")
         self.btn_grass.setToolTip("Toggle grass (outdoor field sites)")
@@ -401,6 +425,15 @@ class ABMAWindow(QMainWindow):
         self.btn_measure.setToolTip("Measure grid: off → metric → imperial")
         self.btn_measure.clicked.connect(self._cycle_measure)
         tl.addWidget(self.btn_measure)
+        self._resource_state = -1       # -1 off, 0 lids-on, 1 lids-off
+        self.btn_resources = QToolButton()
+        self.btn_resources.setText("💧🌿")
+        self.btn_resources.setToolTip(
+            "Show / hide water towers & resource zones")
+        self.btn_resources.setCheckable(True)
+        self.btn_resources.setEnabled(False)
+        self.btn_resources.clicked.connect(self._cycle_resources)
+        tl.addWidget(self.btn_resources)
         rlay.addWidget(tb)
 
         # inspector is a floating popup shown on hover / click (frees the preview)
@@ -416,6 +449,27 @@ class ABMAWindow(QMainWindow):
         for v in self._views():
             if hasattr(v, "set_grass_enabled"):
                 v.set_grass_enabled(on)
+
+    def _on_toggle_agents(self, on):
+        for v in self._views():
+            if hasattr(v, "set_agents_visible"):
+                v.set_agents_visible(on)
+
+    def _on_toggle_theme(self, on):
+        theme = "light" if on else "dark"
+        self.btn_theme.setText("🌙" if on else "☀")
+        for v in self._views():
+            if hasattr(v, "set_theme"):
+                v.set_theme(theme)
+
+    def _snap_view(self, name):
+        v = self._active_view()
+        if hasattr(v, "snap_view"):
+            v.snap_view(name)
+        elif name == "top" and hasattr(v, "top_down"):
+            v.top_down()
+        elif hasattr(v, "reset_camera"):
+            v.reset_camera()
 
     def _antenna_sets(self):
         if getattr(self, "_antenna_layouts", None):
@@ -443,6 +497,19 @@ class ABMAWindow(QMainWindow):
         self._apply_antenna_state()
         msg = "off" if self._antenna_state < 0 else sets[self._antenna_state][0]
         self.statusBar().showMessage(f"UWB antennas: {msg}", 2500)
+
+    def _apply_resource_state(self):
+        self.btn_resources.setChecked(self._resource_state >= 0)
+        for v in self._views():
+            if hasattr(v, "set_resources_mode"):
+                v.set_resources_mode(self._resource_state)
+
+    def _cycle_resources(self, *_):
+        # zones have no lid, so this is a simple show / hide
+        self._resource_state = 0 if self._resource_state < 0 else -1
+        self._apply_resource_state()
+        msg = "shown" if self._resource_state >= 0 else "off"
+        self.statusBar().showMessage(f"Resources: {msg}", 2500)
 
     def _cycle_measure(self, *_):
         nxt = {None: "metric", "metric": "imperial",
@@ -478,11 +545,31 @@ class ABMAWindow(QMainWindow):
 
     def _apply_preset(self, p):
         self._loaded_abbr = p.abbr or "Arena"
-        self._load_config(p.factory())
+        self._loaded_preset = p
+        cfgs = p.config_list() if hasattr(p, "config_list") else [(p.name, p.factory)]
+        self.cfg_combo.blockSignals(True)
+        self.cfg_combo.clear()
+        self.cfg_combo.addItems([c[0] for c in cfgs])
+        self.cfg_combo.setCurrentIndex(0)
+        self.cfg_combo.blockSignals(False)
+        self._cfg_row.setVisible(len(cfgs) > 1)
+        self._load_config(cfgs[0][1]())
         # a blank arena opens the editor to build from scratch; a named preset
         # stays collapsed behind "Modify".
         self.btn_modify.setChecked(bool(getattr(p, "blank", False)))
         self.statusBar().showMessage(f"Loaded: {p.name}", 4000)
+
+    def _on_config_changed(self, idx):
+        """Switch to another named configuration of the loaded enclosure."""
+        p = getattr(self, "_loaded_preset", None)
+        if p is None or idx < 0:
+            return
+        cfgs = p.config_list()
+        if not (0 <= idx < len(cfgs)):
+            return
+        name, factory = cfgs[idx]
+        self._load_config(factory())
+        self.statusBar().showMessage(f"Configuration: {name}", 4000)
 
     # ------------------------------------------------------------------ #
     # Menu bar
@@ -555,6 +642,18 @@ class ABMAWindow(QMainWindow):
         btn_preset.clicked.connect(self._open_preset_dialog)
         left.addWidget(btn_preset)
 
+        # configuration picker — shown only for presets with named variants
+        self._cfg_row = QWidget()
+        cfgl = QHBoxLayout(self._cfg_row)
+        cfgl.setContentsMargins(0, 0, 0, 0)
+        cfgl.addWidget(QLabel("Configuration"))
+        self.cfg_combo = QComboBox()
+        self.cfg_combo.setToolTip("Alternate configurations of this enclosure")
+        self.cfg_combo.currentIndexChanged.connect(self._on_config_changed)
+        cfgl.addWidget(self.cfg_combo, 1)
+        self._cfg_row.setVisible(False)
+        left.addWidget(self._cfg_row)
+
         self.arena_summary = QLabel("No arena loaded.")
         self.arena_summary.setWordWrap(True)
         self.arena_summary.setStyleSheet("color:#8fbfff; font-size:11px;")
@@ -571,6 +670,12 @@ class ABMAWindow(QMainWindow):
         act.addWidget(self.btn_modify)
         act.addWidget(self.btn_save_preset)
         left.addLayout(act)
+
+        self.btn_photo_grass = QPushButton("🌿  Grass from drone photo…")
+        self.btn_photo_grass.setToolTip(
+            "Measure ground cover from an overhead photo of this enclosure")
+        self.btn_photo_grass.clicked.connect(self._grass_from_photo)
+        left.addWidget(self.btn_photo_grass)
 
         # ---- editing panel (hidden until Modify, or a blank arena is loaded) ----
         self._arena_editor = QWidget()
@@ -615,6 +720,49 @@ class ABMAWindow(QMainWindow):
         self._arena_editor.setVisible(False)
         left.addWidget(self._arena_editor)
         return w
+
+    def _grass_from_photo(self):
+        """Measure ground cover from an overhead photo and apply it as grass."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select an overhead photo of this enclosure", "",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff)")
+        if not path:
+            return
+        dlg = CornerPickDialog(path, self)
+        if dlg.exec_() != QDialog.Accepted or len(dlg.corners()) != 4:
+            return
+        try:
+            from ..core.photo_cover import (analyse_photo, to_cover_map,
+                                            suggested_dry_fraction)
+            arena = self._arena_from_table()
+            res = analyse_photo(path, dlg.corners(), arena.width, arena.height,
+                                grid=8)
+            spec = self._grass_spec or GrassSpec()
+            spec.cover_map = to_cover_map(res["cover"])
+            spec.dry_fraction = suggested_dry_fraction(res["mean_green"])
+            spec.patchiness = max(spec.patchiness, 0.7)
+            self._grass_spec = spec
+            self._ground = "grass"
+        except Exception as e:
+            QMessageBox.warning(self, "Could not analyse photo", str(e))
+            return
+        self._mark_arena_dirty()
+        self._refresh_arena()
+        if hasattr(self, "btn_grass"):
+            self.btn_grass.setChecked(True)
+        QMessageBox.information(
+            self, "Ground cover measured",
+            f"Live green cover: {100 * res['mean_green']:.1f}%  "
+            f"(range {100 * res['min_green']:.0f}–{100 * res['max_green']:.0f}% "
+            "by cell)\n"
+            f"North {100 * res['north_half']:.1f}%  vs  South "
+            f"{100 * res['south_half']:.1f}%\n"
+            f"West {100 * res['west_half']:.1f}%  vs  East "
+            f"{100 * res['east_half']:.1f}%\n\n"
+            f"Applied as an 8×8 cover map with dry_fraction "
+            f"{spec.dry_fraction:.2f}.\n"
+            "Only live green is measurable from colour; dry thatch is "
+            "represented by a uniform floor.")
 
     def _toggle_arena_editor(self, on):
         self._arena_editor.setVisible(on)
@@ -1106,10 +1254,15 @@ class ABMAWindow(QMainWindow):
         # arena attributes without a table cell ride along on the window
         self._zones = list(cfg.arena.zones)
         self._poles = list(cfg.arena.poles)
+        self._water_towers = list(cfg.arena.water_towers)
+        self._resource_zones = list(cfg.arena.resource_zones)
+        self._huts = list(cfg.arena.huts)
+        self._resource_state = -1       # resources start hidden on load
         self._antennas = list(cfg.arena.antennas)
         self._antenna_layouts = list(cfg.arena.antenna_layouts)
         self._antenna_state = -1        # antennas start hidden on load
         self._ground = cfg.arena.ground
+        self._grass_spec = cfg.arena.grass
         self._oriented = cfg.arena.oriented
         self._wall_height = cfg.arena.wall_height
         self._wall_thickness = cfg.arena.wall_thickness
@@ -1181,9 +1334,13 @@ class ABMAWindow(QMainWindow):
             boundary=self.in_boundary.currentText(), objects=objs,
             zones=list(getattr(self, "_zones", [])),
             poles=list(getattr(self, "_poles", [])),
+            water_towers=list(getattr(self, "_water_towers", [])),
+            resource_zones=list(getattr(self, "_resource_zones", [])),
+            huts=list(getattr(self, "_huts", [])),
             antennas=list(getattr(self, "_antennas", [])),
             antenna_layouts=list(getattr(self, "_antenna_layouts", [])),
             ground=getattr(self, "_ground", "floor"),
+            grass=getattr(self, "_grass_spec", None) or GrassSpec(),
             oriented=getattr(self, "_oriented", False),
             wall_height=getattr(self, "_wall_height", 0.0),
             wall_thickness=getattr(self, "_wall_thickness", 0.005))
@@ -1209,6 +1366,13 @@ class ABMAWindow(QMainWindow):
             self.btn_grass.setEnabled(grassy)
             if not grassy and self.btn_grass.isChecked():
                 self.btn_grass.setChecked(False)
+        if hasattr(self, "btn_resources"):
+            has_res = bool(getattr(arena, "water_towers", [])
+                           or getattr(arena, "resource_zones", []))
+            self.btn_resources.setEnabled(has_res)
+            if not has_res:
+                self._resource_state = -1
+            self._apply_resource_state()
         if hasattr(self, "btn_antenna"):
             sets = arena.antenna_sets() if hasattr(arena, "antenna_sets") else []
             self.btn_antenna.setEnabled(bool(sets))
@@ -1559,6 +1723,75 @@ class ArenaPresetDialog(QDialog):
 # --------------------------------------------------------------------------- #
 # Collapsible section (accordion-style step)
 # --------------------------------------------------------------------------- #
+class CornerPickDialog(QDialog):
+    """Click the four inner corners of the enclosure on an overhead photo."""
+
+    ORDER = ["SW (south-west)", "SE (south-east)",
+             "NE (north-east)", "NW (north-west)"]
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mark the enclosure corners")
+        self.pts = []                       # full-resolution image pixels
+        pix = QPixmap(path)
+        self._full = (pix.width(), pix.height())
+        shown = pix.scaled(1000, 700, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._scale = pix.width() / max(1, shown.width())
+        self._base = shown
+        lay = QVBoxLayout(self)
+        self.hint = QLabel()
+        self.hint.setStyleSheet("font-weight:bold; color:#8fbfff;")
+        lay.addWidget(self.hint)
+        self.view = QLabel()
+        self.view.setPixmap(shown)
+        self.view.mousePressEvent = self._click
+        lay.addWidget(self.view)
+        row = QHBoxLayout()
+        undo = QPushButton("Undo last")
+        undo.clicked.connect(self._undo)
+        row.addWidget(undo)
+        row.addStretch()
+        self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.bb.accepted.connect(self.accept)
+        self.bb.rejected.connect(self.reject)
+        row.addWidget(self.bb)
+        lay.addLayout(row)
+        self._refresh()
+
+    def _refresh(self):
+        n = len(self.pts)
+        self.bb.button(QDialogButtonBox.Ok).setEnabled(n == 4)
+        self.hint.setText("All four marked — press OK." if n == 4 else
+                          f"Click corner {n + 1} of 4:  {self.ORDER[n]}")
+        pm = QPixmap(self._base)
+        p = QPainter(pm)
+        p.setPen(QPen(QColor("#ffd23f"), 3))
+        for i, (fx, fy) in enumerate(self.pts):
+            x, y = fx / self._scale, fy / self._scale
+            p.drawEllipse(int(x - 7), int(y - 7), 14, 14)
+            p.drawText(int(x + 10), int(y - 10), self.ORDER[i][:2])
+        if len(self.pts) > 1:
+            for a, b in zip(self.pts, self.pts[1:]):
+                p.drawLine(int(a[0] / self._scale), int(a[1] / self._scale),
+                           int(b[0] / self._scale), int(b[1] / self._scale))
+        p.end()
+        self.view.setPixmap(pm)
+
+    def _click(self, ev):
+        if len(self.pts) < 4:
+            self.pts.append((ev.pos().x() * self._scale,
+                             ev.pos().y() * self._scale))
+            self._refresh()
+
+    def _undo(self):
+        if self.pts:
+            self.pts.pop()
+            self._refresh()
+
+    def corners(self):
+        return list(self.pts)
+
+
 class CollapsibleSection(QWidget):
     """A titled header that expands/collapses its content widget."""
 

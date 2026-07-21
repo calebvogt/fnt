@@ -162,6 +162,7 @@ class Simulation:
         # territories emerge over ~half a day rather than being prescribed.
         self._settle_tau_s = 0.5 * 86400.0
         self.H = self.rng.uniform(0, 2 * np.pi, n)
+        self._build_obstacles()
         # ---- condition (dynamic 0..1 bars; presented ×100) ----
         self.hunger = self.rng.uniform(0, 0.3, n)
         self.thirst = self.rng.uniform(0, 0.3, n)
@@ -317,7 +318,8 @@ class Simulation:
         satiated = (self.hunger < 0.5) & (self.thirst < 0.5) & \
                    (dist_home < self.home_r)
         spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
-        self.P = P + move_dir * spd[:, None] * dt
+        self.P = self._resolve_obstacles(P, P + move_dir * spd[:, None] * dt,
+                                         fwd=move_dir)
         self.H = np.arctan2(move_dir[:, 1], move_dir[:, 0])
         self._apply_boundary()
         if not self.alive.all():          # dead animals do not move
@@ -461,6 +463,117 @@ class Simulation:
                                            + self.estrus_phase)))
         r = np.clip((r - 0.6) / 0.4, 0, 1)  # only high near peak
         return r * (1 - self.sex_m)          # males not receptive
+
+    # ------------------------------------------------------------------ #
+    # Physical obstacles: poles + water towers (circles), resource-zone
+    # walls with a doorway gap (segments). Agents cannot pass through them.
+    # ------------------------------------------------------------------ #
+    def _build_obstacles(self):
+        self._agent_r = 0.02      # ~half a body width (m)
+        # the drawn body is a box + head sphere reaching ~8 cm ahead of centre;
+        # the nose is tested too so heads cannot poke through solids.
+        self._nose_r = 0.08
+        a = self.cfg.arena
+        circ = []                                  # (cx, cy, r_eff)
+        for p in getattr(a, "poles", []):
+            circ.append((p.x, p.y, p.radius + self._agent_r))
+        for wt in getattr(a, "water_towers", []):
+            circ.append((wt.x, wt.y, wt.radius + self._agent_r))
+        segs = []                                  # (x1, y1, x2, y2) wall panels
+        for z in getattr(a, "resource_zones", []):
+            hw = getattr(z, "hole", 0.0762)
+            x0, x1 = z.x - z.w / 2, z.x + z.w / 2
+            y0, y1 = z.y - z.d / 2, z.y + z.d / 2
+            side = getattr(z, "entrance", "E")
+            for yw, name in ((y1, "N"), (y0, "S")):        # walls running E-W
+                if name == side:                    # split around the doorway
+                    segs += [(x0, yw, z.x - hw / 2, yw),
+                             (z.x + hw / 2, yw, x1, yw)]
+                else:
+                    segs += [(x0, yw, x1, yw)]
+            for xw, name in ((x1, "E"), (x0, "W")):        # walls running N-S
+                if name == side:
+                    segs += [(xw, y0, xw, z.y - hw / 2),
+                             (xw, z.y + hw / 2, xw, y1)]
+                else:
+                    segs += [(xw, y0, xw, y1)]
+        self._obs_circles = np.array(circ, float) if circ else np.zeros((0, 3))
+        self._obs_segs = np.array(segs, float) if segs else np.zeros((0, 4))
+
+    def _resolve_obstacles(self, P_old, P_new, fwd=None):
+        """Block moves that cross a wall or enter a solid; no tunnelling.
+
+        Both the body centre and the nose (``fwd`` × nose radius ahead of it)
+        are swept, so the drawn body never overlaps a solid — while a doorway
+        wide enough for the animal still lets it through.
+        """
+        n = len(P_old)
+        tmin = np.ones(n)
+        offsets = [None] if fwd is None else [None, fwd * self._nose_r]
+        for off in offsets:
+            A = P_old if off is None else P_old + off
+            B = P_new if off is None else P_new + off
+            tmin = np.minimum(tmin, self._first_hit(A, B))
+        moved = tmin < 1.0
+        if moved.any():
+            scale = np.where(moved, np.maximum(tmin - 0.02, 0.0), 1.0)
+            P_new = P_old + (P_new - P_old) * scale[:, None]
+        # push out anything that began the step already inside a solid
+        C = self._obs_circles
+        if len(C):
+            cxa, cya, cra = C.T
+            for _ in range(2):
+                dx = P_new[:, 0][:, None] - cxa[None, :]
+                dy = P_new[:, 1][:, None] - cya[None, :]
+                dist = np.hypot(dx, dy)
+                inside = dist < cra[None, :]
+                if not inside.any():
+                    break
+                dm = np.where(inside, dist, np.inf)
+                j = np.argmin(dm, axis=1)
+                for i in np.where(np.isfinite(dm[np.arange(n), j]))[0]:
+                    k = j[i]
+                    d = max(dist[i, k], 1e-9)
+                    P_new[i] = [cxa[k] + dx[i, k] / d * cra[k],
+                                cya[k] + dy[i, k] / d * cra[k]]
+        return P_new
+
+    def _first_hit(self, A, B):
+        """Earliest fraction along A->B that crosses a wall or enters a solid."""
+        n = len(A)
+        tmin = np.ones(n)
+        dxp = (B[:, 0] - A[:, 0])[:, None]
+        dyp = (B[:, 1] - A[:, 1])[:, None]
+        # --- walls (path vs segment) ---
+        S = self._obs_segs
+        if len(S):
+            sx = (S[:, 2] - S[:, 0])[None, :]
+            sy = (S[:, 3] - S[:, 1])[None, :]
+            denom = dxp * sy - dyp * sx
+            cax = S[:, 0][None, :] - A[:, 0][:, None]
+            cay = S[:, 1][None, :] - A[:, 1][:, None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = (cax * sy - cay * sx) / denom
+                u = (cax * dyp - cay * dxp) / denom
+            hit = (np.abs(denom) > 1e-12) & (t >= 0) & (t <= 1) & \
+                  (u >= 0) & (u <= 1)
+            tmin = np.minimum(tmin, np.where(hit, t, np.inf).min(axis=1))
+        # --- solids (swept path vs circle: poles + water towers) ---
+        C = self._obs_circles
+        if len(C):
+            cx, cy, cr = C[:, 0][None, :], C[:, 1][None, :], C[:, 2][None, :]
+            fx = A[:, 0][:, None] - cx
+            fy = A[:, 1][:, None] - cy
+            aa = dxp * dxp + dyp * dyp
+            bb = 2 * (fx * dxp + fy * dyp)
+            cc = fx * fx + fy * fy - cr * cr
+            disc = bb * bb - 4 * aa * cc
+            sq = np.sqrt(np.maximum(disc, 0.0))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tc = (-bb - sq) / (2 * aa)
+            hitc = (disc >= 0) & (tc >= 0) & (tc <= 1)
+            tmin = np.minimum(tmin, np.where(hitc, tc, np.inf).min(axis=1))
+        return tmin
 
     def _apply_boundary(self):
         w, h = self.cfg.arena.width, self.cfg.arena.height

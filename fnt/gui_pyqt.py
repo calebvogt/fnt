@@ -316,8 +316,8 @@ class FNTMainWindow(QMainWindow):
         self.create_fed_tab()
         self.create_imaging_tab()
         self.create_wifp_tab()
-        self.create_musestudio_tab()
         self.create_abma_tab()
+        self.create_musestudio_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -556,7 +556,7 @@ class FNTMainWindow(QMainWindow):
         design_group = QGroupBox("Experiment Designer")
         design_layout = QGridLayout()
         design_buttons = [
-            ("Open ABMA Designer",
+            ("Animal Behavior Modeling Arena (ABMA)",
              "Design an arena, build populations, run replicate trials, export tracking data",
              self.run_abma_designer),
         ]
@@ -802,7 +802,7 @@ class FNTMainWindow(QMainWindow):
         group = QGroupBox("MuseStudio")
         group_layout = QGridLayout()
         buttons = [
-            ("Open MuseStudio",
+            ("MuseStudio",
              "Connect to a Muse S Athena over Bluetooth, live-plot EEG/fNIRS, and record to CSV",
              self.run_musestudio),
         ]

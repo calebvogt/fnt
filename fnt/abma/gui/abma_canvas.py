@@ -19,6 +19,21 @@ from PyQt5.QtCore import pyqtSignal
 from ..core.config import ArenaConfig, ResourceObject
 
 
+# Light / dark palettes for the 2D arena model.
+_THEMES_2D = {
+    "dark": dict(face="#14171a", spine="#303338", tick="#6f767e",
+                 grid="#22262b", title="#8a9099", boundary="#5a6069",
+                 grass="#2f5d2a", ant_text="#ffeb8c", compass_n="#eb5a5a",
+                 compass="#dce0e6", meas="#4dd0e1", meas_text="#9fe3ec",
+                 run_title="#cccccc"),
+    "light": dict(face="#f2f4f7", spine="#b6bbc3", tick="#4a5058",
+                  grid="#dde1e7", title="#4a5058", boundary="#6b7178",
+                  grass="#8fbf76", ant_text="#7a5200", compass_n="#c0392b",
+                  compass="#33383f", meas="#0e7c99", meas_text="#0b6a86",
+                  run_title="#33383f"),
+}
+
+
 def _bow_xy(a, b, k=0.08, n=14):
     """Quadratic-bezier points from a to b, bowed sideways to look like slack."""
     import math
@@ -73,6 +88,9 @@ class ArenaCanvas(FigureCanvas):
         self.ax = self.fig.add_subplot(111)
         self.arena = ArenaConfig()
         self._arm_kind = None
+        self._theme = "dark"
+        self._pal = _THEMES_2D["dark"]
+        self._agents_visible = True
         self._agent_artist = None
         self._agent_scatters = []
         self._sel_artist = None
@@ -128,12 +146,43 @@ class ArenaCanvas(FigureCanvas):
         if self.arena is not None:
             self.draw_arena()
 
+    def set_resources_mode(self, mode):
+        """-1 off, 0 lids-on, 1 lids-off (look inside)."""
+        self._resource_mode = mode
+        if self.arena is not None:
+            self.draw_arena()
+
+    def set_agents_visible(self, on):
+        self._agents_visible = bool(on)
+        if not on:
+            for a in self._agent_scatters:
+                a.remove()
+            self._agent_scatters = []
+            for art in (self._heading_artist, self._sel_artist):
+                if art is not None:
+                    art.set_visible(False)
+        elif self._heading_artist is not None:
+            self._heading_artist.set_visible(True)
+        self.draw_idle()
+
+    def snap_view(self, name):
+        pass    # the 2D canvas is inherently top-down
+
+    def set_theme(self, name):
+        """Switch the arena model between 'dark' and 'light' palettes."""
+        self._theme = name if name in _THEMES_2D else "dark"
+        self._pal = _THEMES_2D[self._theme]
+        self.fig.patch.set_facecolor(self._pal["face"])
+        if self.arena is not None:
+            self.draw_arena()
+
     def draw_arena(self):
         ax = self.ax
         ax.clear()
         a = self.arena
         chambers = getattr(self, "_chambers", [(0.0, 0.0)])
-        ax.set_facecolor("#14171a")
+        pal = self._pal
+        ax.set_facecolor(pal["face"])
         xs = [c[0] for c in chambers]
         ys = [c[1] for c in chambers]
         # wider margin when a compass / measurement labels sit outside the arena
@@ -145,12 +194,12 @@ class ArenaCanvas(FigureCanvas):
         ax.set_xlim(min(xs) - gm, max(xs) + a.width + gm)
         ax.set_ylim(min(ys) - gm, max(ys) + a.height + gm)
         ax.set_aspect("equal")
-        ax.set_title("Arena", color="#8a9099", fontsize=10)
+        ax.set_title("Arena", color=pal["title"], fontsize=10)
         for side, spine in ax.spines.items():
             spine.set_visible(side in ("left", "bottom"))
-            spine.set_color("#303338")
-        ax.tick_params(colors="#6f767e", labelsize=8)
-        ax.grid(True, color="#22262b", lw=0.6)
+            spine.set_color(pal["spine"])
+        ax.tick_params(colors=pal["tick"], labelsize=8)
+        ax.grid(True, color=pal["grid"], lw=0.6)
         # measurement grid overlay (toggle: metric / imperial)
         mmode = getattr(self, "_measure_mode", None)
         if mmode:
@@ -164,30 +213,35 @@ class ArenaCanvas(FigureCanvas):
             for dx, dy in chambers:
                 for x in gx:
                     ax.plot([dx + x, dx + x], [dy, dy + a.height],
-                            color="#4dd0e1", lw=0.6, alpha=0.5, zorder=1)
+                            color=pal["meas"], lw=0.6, alpha=0.5, zorder=1)
                     if x > 0:
                         ax.text(dx + x, dy - loff, f"{x * mscale:g}{munit}",
-                                color="#9fe3ec", fontsize=6, ha="center",
+                                color=pal["meas_text"], fontsize=6, ha="center",
                                 va="top", zorder=6)
                 for y in gy:
                     ax.plot([dx, dx + a.width], [dy + y, dy + y],
-                            color="#4dd0e1", lw=0.6, alpha=0.5, zorder=1)
+                            color=pal["meas"], lw=0.6, alpha=0.5, zorder=1)
                     if y > 0:
                         ax.text(dx - loff, dy + y, f"{y * mscale:g}{munit}",
-                                color="#9fe3ec", fontsize=6, ha="right",
+                                color=pal["meas_text"], fontsize=6, ha="right",
                                 va="center", zorder=6)
         seen = set()
         for dx, dy in chambers:
             # grass ground tint (outdoor field sites, toggleable)
             if getattr(self, "_grass_on", False) and \
                     getattr(a, "ground", "floor") == "grass":
+                # blend the tint toward straw for dry/senesced swards
+                from matplotlib.colors import to_rgb
+                dryf = getattr(getattr(a, "grass", None), "dry_fraction", 0.0)
+                g, straw = to_rgb(pal["grass"]), to_rgb("#b9a06a")
+                gc = tuple(g[i] * (1 - dryf) + straw[i] * dryf for i in range(3))
                 ax.add_patch(Rectangle(
-                    (dx, dy), a.width, a.height, facecolor="#2f5d2a",
+                    (dx, dy), a.width, a.height, facecolor=gc,
                     alpha=0.4, edgecolor="none", zorder=0))
             # boundary
             ax.plot([dx, dx + a.width, dx + a.width, dx, dx],
                     [dy, dy, dy + a.height, dy + a.height, dy],
-                    color="#5a6069", lw=1.5)
+                    color=pal["boundary"], lw=1.5)
             # zones (regions of interest, e.g. OFT centre)
             for z in getattr(a, "zones", []):
                 col = _ZONE_COLOR.get(z.role, _ZONE_COLOR["roi"])
@@ -197,11 +251,60 @@ class ArenaCanvas(FigureCanvas):
                 ax.text(dx + z.x + z.w / 2, dy + z.y + z.h / 2, z.name,
                         color=col, fontsize=8, ha="center", va="center",
                         alpha=0.8, zorder=2)
+            # acrylic huts: tubes as red rectangles, domes as red circles
+            for hut in getattr(a, "huts", []):
+                if hut.kind == "dome":
+                    ax.add_patch(Circle((dx + hut.x, dy + hut.y), hut.w / 2,
+                                        facecolor="#e23b3b", edgecolor="#7a1a1a",
+                                        lw=0.7, zorder=3))
+                else:
+                    r = Rectangle((dx + hut.x - hut.w / 2, dy + hut.y - hut.d / 2),
+                                  hut.w, hut.d, facecolor="#e23b3b",
+                                  edgecolor="#7a1a1a", lw=0.7, zorder=3)
+                    if hut.angle:
+                        r.set_transform(
+                            matplotlib.transforms.Affine2D().rotate_deg_around(
+                                dx + hut.x, dy + hut.y, hut.angle) + ax.transData)
+                    ax.add_patch(r)
             # poles (vertical posts, drawn top-down as filled circles)
             for p in getattr(a, "poles", []):
                 ax.add_patch(Circle(
                     (dx + p.x, dy + p.y), p.radius, facecolor="#75542f",
                     edgecolor="#c9a06a", lw=0.8, zorder=2))
+            # ground resources: water towers + walled resource zones
+            rmode = getattr(self, "_resource_mode", -1)
+            if rmode >= 0:
+                for z in getattr(a, "resource_zones", []):
+                    x0, y0 = dx + z.x - z.w / 2, dy + z.y - z.d / 2
+                    # no lid: zones are always drawn open (aspen floor showing)
+                    face = "#c8b384"
+                    ax.add_patch(Rectangle((x0, y0), z.w, z.d, facecolor=face,
+                                           edgecolor="#12224f", lw=1.6, zorder=2))
+                    hole = getattr(z, "hole", 0.0762)
+                    side = getattr(z, "entrance", "E")
+                    # doorway: a notch cut through the wall, outlined in white
+                    gcol = pal["grass"] if getattr(a, "ground", "floor") == "grass" \
+                        else pal["face"]
+                    if side in ("E", "W"):
+                        ex = dx + z.x + (z.w / 2 if side == "E" else -z.w / 2)
+                        notch = ((ex - 0.035, dy + z.y - hole / 2), 0.07, hole)
+                    else:
+                        ey = dy + z.y + (z.d / 2 if side == "N" else -z.d / 2)
+                        notch = ((dx + z.x - hole / 2, ey - 0.035), hole, 0.07)
+                    ax.add_patch(Rectangle(notch[0], notch[1], notch[2],
+                                           facecolor=gcol, edgecolor="#ffffff",
+                                           lw=1.2, zorder=4))
+                    # ~6×6" chow pile in a corner
+                    pw = 6 * 0.0254
+                    ax.add_patch(Rectangle(
+                        (dx + z.x + z.w / 2 - pw - 0.03,
+                         dy + z.y - z.d / 2 + 0.03), pw, pw,
+                        facecolor="#7a6035", edgecolor="#4a3a1f", lw=0.6,
+                        zorder=4))
+                for wt in getattr(a, "water_towers", []):
+                    ax.add_patch(Circle(
+                        (dx + wt.x, dy + wt.y), wt.radius, facecolor="#3f8fd8",
+                        edgecolor="#bfe0ff", lw=0.8, zorder=2))
             # UWB antenna boxes + colour-coded PoE cables (cyclable layout)
             asets = a.antenna_sets() if hasattr(a, "antenna_sets") else []
             aidx = getattr(self, "_antenna_idx", -1)
@@ -219,13 +322,15 @@ class ArenaCanvas(FigureCanvas):
                 for an in boxes:
                     fc = cmap.get(an.label)
                     face = ("#%02x%02x%02x" % tuple(int(c * 255) for c in fc[:3])
-                            ) if fc else "#ccb787"
+                            ) if fc else (
+                        "#2b2b30" if getattr(an, "style", "box") == "bare"
+                        else "#ccb787")
                     ax.add_patch(Rectangle(
                         (dx + an.x - an.w / 2, dy + an.y - an.d / 2), an.w, an.d,
                         facecolor=face, edgecolor="#20201f", lw=0.7, zorder=4))
                     if an.label:
                         ax.text(dx + an.x, dy + an.y + off, an.label,
-                                color="#ffeb8c", fontsize=8, fontweight="bold",
+                                color=pal["ant_text"], fontsize=8, fontweight="bold",
                                 ha="center", va="bottom", zorder=5)
             # objects
             for o in a.objects:
@@ -244,10 +349,10 @@ class ArenaCanvas(FigureCanvas):
             y0, y1 = min(ys), max(ys) + a.height
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
             m = 0.045 * max(a.width, a.height)
-            for txt, px, py, col in [("N", cx, y1 + m, "#eb5a5a"),
-                                     ("S", cx, y0 - m, "#dce0e6"),
-                                     ("E", x1 + m, cy, "#dce0e6"),
-                                     ("W", x0 - m, cy, "#dce0e6")]:
+            for txt, px, py, col in [("N", cx, y1 + m, pal["compass_n"]),
+                                     ("S", cx, y0 - m, pal["compass"]),
+                                     ("E", x1 + m, cy, pal["compass"]),
+                                     ("W", x0 - m, cy, pal["compass"])]:
                 ax.text(px, py, txt, color=col, fontsize=13, fontweight="bold",
                         ha="center", va="center", zorder=6)
         self._agent_artist = None
@@ -307,15 +412,16 @@ class ArenaCanvas(FigureCanvas):
         for a in self._agent_scatters:
             a.remove()
         self._agent_scatters = []
-        for code, mk in ((0, "o"), (1, "D"), (2, "^")):
-            m = codes == code
-            if m.any():
-                self._agent_scatters.append(self.ax.scatter(
-                    x[m], y[m], c=rgba[m], s=s[m], marker=mk,
-                    edgecolors="black", linewidths=0.5, zorder=6))
+        if getattr(self, "_agents_visible", True):
+            for code, mk in ((0, "o"), (1, "D"), (2, "^")):
+                m = codes == code
+                if m.any():
+                    self._agent_scatters.append(self.ax.scatter(
+                        x[m], y[m], c=rgba[m], s=s[m], marker=mk,
+                        edgecolors="black", linewidths=0.5, zorder=6))
 
         # heading ticks (short line in each agent's facing direction)
-        if heading is not None:
+        if heading is not None and getattr(self, "_agents_visible", True):
             heading = np.asarray(heading, float)
             L = 0.04 * max(self.arena.width, self.arena.height)
             segs = [[(x[i], y[i]),
@@ -350,7 +456,7 @@ class ArenaCanvas(FigureCanvas):
         n_alive = int(alive.sum())
         if n_alive < len(alive):
             title += f"  ({n_alive}/{len(alive)} alive)"
-        self.ax.set_title(title, color="#cccccc", fontsize=10)
+        self.ax.set_title(title, color=self._pal["run_title"], fontsize=10)
         self.draw_idle()
 
     # ------------------------------------------------------------------ #
