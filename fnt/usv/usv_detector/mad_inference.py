@@ -47,6 +47,13 @@ class MADInferenceConfig:
     preserve_labels: bool = True
     # Example store used to look up confirmed labels for preserve_labels.
     training_data_dir: str = ""
+    # Merge consecutive detections that belong to one call but surfaced as
+    # separate blobs (tile seams, brief sub-threshold dips). Off by default.
+    # ``merge_max_gap_s`` is the largest time gap bridged; freq-overlap gating
+    # keeps time-adjacent but frequency-separated calls (harmonics) distinct.
+    merge_consecutive: bool = False
+    merge_max_gap_s: float = 0.01
+    merge_require_freq_overlap: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -260,6 +267,80 @@ def extract_blobs(
     # Sort by time.
     blobs.sort(key=lambda b: (b['t_start'], b['f_low']))
     return blobs
+
+
+def _freq_overlap(a: Dict, b: Dict) -> bool:
+    return (a['f_low'] < b['f_high_exclusive']
+            and b['f_low'] < a['f_high_exclusive'])
+
+
+def merge_consecutive_blobs(
+    blobs: List[Dict], max_gap_frames: int,
+    require_freq_overlap: bool = True,
+) -> List[Dict]:
+    """Merge runs of consecutive blobs into single detections.
+
+    A long call split across tile seams (or broken by a brief sub-threshold
+    dip) surfaces as several adjacent blobs; this stitches them back into one.
+    Two blobs join when the time gap between the running cluster's offset and
+    the next blob's onset is ``<= max_gap_frames`` (a negative gap means they
+    already overlap in time) and — when ``require_freq_overlap`` — their
+    frequency bands overlap, so calls stacked in time but separated in
+    frequency (e.g. a harmonic vs. its fundamental) are left distinct.
+
+    Inspired by BirdNET's ``--merge_consecutive``. Blobs must carry the
+    ``'mask'`` bbox crop (as :func:`extract_blobs` produces with
+    ``include_mask=True``); merged masks are OR-composited into the union
+    bounding box, and the merged ``score`` is area-weighted across components
+    so a big confident blob isn't diluted by a small faint neighbour. Returns
+    new blob dicts in onset order; input is left untouched.
+    """
+    if max_gap_frames < 0 or len(blobs) < 2:
+        return list(blobs)
+    ordered = sorted(blobs, key=lambda b: (b['t_start'], b['f_low']))
+
+    def _flush(group: List[Dict]) -> Dict:
+        if len(group) == 1:
+            return dict(group[0])
+        f_low = min(b['f_low'] for b in group)
+        f_high = max(b['f_high_exclusive'] for b in group)
+        t_start = min(b['t_start'] for b in group)
+        t_end = max(b['t_end_exclusive'] for b in group)
+        mask = np.zeros((f_high - f_low, t_end - t_start), dtype=bool)
+        for b in group:
+            bm = b.get('mask')
+            if bm is None:
+                continue
+            fo, to = b['f_low'] - f_low, b['t_start'] - t_start
+            mask[fo:fo + bm.shape[0], to:to + bm.shape[1]] |= bm
+        area = int(mask.sum()) or sum(b['area_pixels'] for b in group)
+        w = float(sum(b['area_pixels'] for b in group)) or 1.0
+        score = sum(b['score'] * b['area_pixels'] for b in group) / w
+        return {
+            't_start': t_start, 't_end_exclusive': t_end,
+            'f_low': f_low, 'f_high_exclusive': f_high,
+            'area_pixels': area, 'score': float(score),
+            'mask': np.ascontiguousarray(mask),
+        }
+
+    merged: List[Dict] = []
+    group = [ordered[0]]
+    cur_end = ordered[0]['t_end_exclusive']
+    for b in ordered[1:]:
+        gap = b['t_start'] - cur_end
+        joins = gap <= max_gap_frames and (
+            not require_freq_overlap
+            or any(_freq_overlap(b, g) for g in group))
+        if joins:
+            group.append(b)
+            cur_end = max(cur_end, b['t_end_exclusive'])
+        else:
+            merged.append(_flush(group))
+            group = [b]
+            cur_end = b['t_end_exclusive']
+    merged.append(_flush(group))
+    merged.sort(key=lambda b: (b['t_start'], b['f_low']))
+    return merged
 
 
 # ----------------------------------------------------------------------
@@ -599,6 +680,214 @@ def read_blob_csv(path: str) -> List[Dict]:
 
 
 # ----------------------------------------------------------------------
+# Interchange exports — Raven selection tables and Audacity label tracks.
+# Both take the same internal ``rows`` format as :func:`write_blob_csv`
+# (keys: blob_id, class, start_s, stop_s, min_freq_hz, max_freq_hz, score)
+# and, like it, drop rejected detections and sort by onset time. These are
+# the two formats the bioacoustics community reaches for first (Raven Pro
+# selection tables, Audacity label import), so MAD output opens directly in
+# those tools without a manual conversion step.
+# ----------------------------------------------------------------------
+
+def _export_rows(rows: List[Dict]) -> List[Dict]:
+    """Rejected detections dropped, remainder sorted by onset (stable)."""
+    keep = [r for r in rows
+            if (r.get('status') or 'pending') != 'rejected']
+    return [r for _, r in sorted(
+        enumerate(keep),
+        key=lambda kv: (_safe_float(kv[1].get('start_s')), kv[0]))]
+
+
+def write_raven_selection_table(path: str, rows: List[Dict]) -> None:
+    """Write a Raven Pro selection table (tab-delimited .txt).
+
+    Columns follow Raven's spectrogram-selection convention so the file can be
+    dropped straight onto a sound in Raven Pro. ``class`` maps to Annotation and
+    ``score`` to a trailing Score column (both ignored by Raven's core but shown
+    in the selection table view)."""
+    header = [
+        'Selection', 'View', 'Channel',
+        'Begin Time (s)', 'End Time (s)',
+        'Low Freq (Hz)', 'High Freq (Hz)',
+        'Annotation', 'Score',
+    ]
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerow(header)
+        for n, r in enumerate(_export_rows(rows), start=1):
+            score = r.get('score', '')
+            writer.writerow([
+                n, 'Spectrogram 1', 1,
+                round(_safe_float(r.get('start_s')), 6),
+                round(_safe_float(r.get('stop_s')), 6),
+                round(_safe_float(r.get('min_freq_hz')), 2),
+                round(_safe_float(r.get('max_freq_hz')), 2),
+                (r.get('class') or '').strip(),
+                round(_safe_float(score), 4) if score not in (None, '') else '',
+            ])
+
+
+def write_audacity_labels(path: str, rows: List[Dict]) -> None:
+    """Write an Audacity label track (tab-delimited .txt).
+
+    Uses Audacity's extended frequency-label format: each label is a start/stop/
+    text line followed by a ``\\t<low>\\t<high>`` continuation line carrying the
+    frequency range, so the labels land on the spectrogram at the right band."""
+    with open(path, 'w', newline='') as f:
+        for r in _export_rows(rows):
+            label = (r.get('class') or '').strip() or 'call'
+            start = round(_safe_float(r.get('start_s')), 6)
+            stop = round(_safe_float(r.get('stop_s')), 6)
+            low = round(_safe_float(r.get('min_freq_hz')), 2)
+            high = round(_safe_float(r.get('max_freq_hz')), 2)
+            f.write(f"{start}\t{stop}\t{label}\n")
+            f.write(f"\\\t{low}\t{high}\n")
+
+
+# ----------------------------------------------------------------------
+# Call embeddings — fixed-length feature vectors per detection.
+#
+# Each detection's spectrogram patch is pushed through the trained model's
+# encoder and the deepest feature map is global-average-pooled to a single
+# vector (512-d for a ResNet18 encoder). These embeddings support clustering
+# calls by similarity, surfacing novel call types, or comparing repertoires
+# across animals — the use cases BirdNET's ``embeddings`` command targets,
+# but computed from the model you trained on your own calls.
+# ----------------------------------------------------------------------
+
+def extract_embeddings(
+    model, spec_image: np.ndarray, boxes: List[Tuple[int, int, int, int]],
+    device: str, patch_size: int = 128, batch_size: int = 16,
+) -> np.ndarray:
+    """Global-average-pooled encoder features for each pixel box.
+
+    ``boxes`` are ``(f_low, f_high_exclusive, t_start, t_end_exclusive)`` in
+    spectrogram-pixel coordinates. Each box is cropped from ``spec_image``,
+    resized to ``patch_size`` (a multiple of 32 for the encoder's downsampling),
+    and run through ``model.encoder``; the deepest feature map is pooled over
+    space. Returns a ``(len(boxes), D)`` float32 array (D=512 for ResNet18).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if not boxes:
+        return np.zeros((0, 0), dtype=np.float32)
+    H, W = spec_image.shape
+    out: List[np.ndarray] = []
+    for b0 in range(0, len(boxes), batch_size):
+        chunk = boxes[b0:b0 + batch_size]
+        patches = np.zeros((len(chunk), 1, patch_size, patch_size),
+                           dtype=np.float32)
+        for k, (f0, f1, t0, t1) in enumerate(chunk):
+            f0, f1 = max(0, f0), min(H, max(f0 + 1, f1))
+            t0, t1 = max(0, t0), min(W, max(t0 + 1, t1))
+            crop = spec_image[f0:f1, t0:t1]
+            ten = torch.from_numpy(np.ascontiguousarray(crop))[None, None]
+            rs = F.interpolate(ten, size=(patch_size, patch_size),
+                               mode='bilinear', align_corners=False)
+            patches[k, 0] = rs[0, 0].numpy()
+        xb = torch.from_numpy(patches).to(device)
+        with torch.no_grad():
+            feats = model.encoder(xb)
+            deepest = feats[-1]  # (B, C, h, w)
+            pooled = deepest.mean(dim=(2, 3))  # (B, C)
+        out.append(pooled.cpu().numpy().astype(np.float32))
+    return np.concatenate(out, axis=0)
+
+
+def embed_file(
+    wav_path: str, cfg: MADInferenceConfig,
+    model=None, ckpt=None, device: Optional[str] = None,
+) -> Dict:
+    """Compute a per-detection embedding for one wav's saved detections.
+
+    Reads the file's sibling detections CSV (produced by inference), rebuilds
+    the spectrogram with the checkpoint's params, and embeds each detection's
+    box. Returns ``{'wav_path', 'blob_id', 'start_s', 'stop_s', 'class',
+    'embeddings'}`` where ``embeddings`` is ``(N, D)``. Raises if the file has
+    no saved detections."""
+    if model is None:
+        model, ckpt, device = load_model(cfg.model_path, cfg.device)
+    assert ckpt is not None and device is not None
+
+    csv_path = pred_csv_sibling_path(wav_path)
+    if not Path(csv_path).is_file():
+        raise RuntimeError(
+            f"No detections CSV for {Path(wav_path).name} — run inference "
+            "(analyze) first.")
+    rows = [r for r in read_blob_csv(csv_path)
+            if (r.get('status') or 'pending') != 'rejected']
+    if not rows:
+        return {'wav_path': wav_path, 'blob_id': [], 'start_s': [],
+                'stop_s': [], 'class': [],
+                'embeddings': np.zeros((0, 0), dtype=np.float32)}
+
+    nperseg = int(cfg.nperseg if cfg.nperseg is not None else ckpt.get('nperseg', 512))
+    noverlap = int(cfg.noverlap if cfg.noverlap is not None else ckpt.get('noverlap', 384))
+    nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
+    db_min = float(cfg.db_min if cfg.db_min is not None else ckpt.get('db_min', -100.0))
+    db_max = float(cfg.db_max if cfg.db_max is not None else ckpt.get('db_max', -20.0))
+
+    audio, sr = load_audio(wav_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    spec = compute_full_spec_image(
+        audio.astype(np.float32), sr, nperseg=nperseg, noverlap=noverlap,
+        nfft=nfft, db_min=db_min, db_max=db_max)
+
+    dt = _time_per_frame(nperseg, noverlap, sr)
+    df = _freq_per_bin(nfft, sr)
+    boxes: List[Tuple[int, int, int, int]] = []
+    for r in rows:
+        t0 = int(_safe_float(r.get('start_s')) / dt) if dt else 0
+        t1 = int(round(_safe_float(r.get('stop_s')) / dt)) if dt else 0
+        f0 = int(_safe_float(r.get('min_freq_hz')) / df) if df else 0
+        f1 = int(round(_safe_float(r.get('max_freq_hz')) / df)) if df else 0
+        boxes.append((f0, f1, t0, t1))
+
+    emb = extract_embeddings(model, spec, boxes, device)
+    return {
+        'wav_path': wav_path,
+        'blob_id': [r.get('blob_id') for r in rows],
+        'start_s': [_safe_float(r.get('start_s')) for r in rows],
+        'stop_s': [_safe_float(r.get('stop_s')) for r in rows],
+        'class': [(r.get('class') or '').strip() for r in rows],
+        'embeddings': emb,
+    }
+
+
+def write_embeddings_npz(path: str, results: List[Dict]) -> int:
+    """Write per-detection embeddings from one or more :func:`embed_file`
+    results into a single ``.npz``. Arrays: ``wav`` (source file per row),
+    ``blob_id``, ``start_s``, ``stop_s``, ``class``, and ``embeddings``
+    ``(total_N, D)``. Returns the total row count."""
+    wav, bid, t0, t1, cls, embs = [], [], [], [], [], []
+    for res in results:
+        e = res['embeddings']
+        if e.size == 0:
+            continue
+        n = e.shape[0]
+        wav.extend([res['wav_path']] * n)
+        bid.extend(res['blob_id'])
+        t0.extend(res['start_s'])
+        t1.extend(res['stop_s'])
+        cls.extend(res['class'])
+        embs.append(e)
+    stacked = (np.concatenate(embs, axis=0) if embs
+               else np.zeros((0, 0), dtype=np.float32))
+    np.savez(
+        path,
+        wav=np.array(wav, dtype=object),
+        blob_id=np.array(bid, dtype=object),
+        start_s=np.array(t0, dtype=np.float32),
+        stop_s=np.array(t1, dtype=np.float32),
+        **{'class': np.array(cls, dtype=object)},
+        embeddings=stacked,
+    )
+    return stacked.shape[0]
+
+
+# ----------------------------------------------------------------------
 # End-to-end per-file run
 # ----------------------------------------------------------------------
 def run_inference_on_file(
@@ -760,6 +1049,12 @@ def run_inference_on_file(
     blobs = extract_blobs(prob, threshold=cfg.threshold,
                           min_blob_pixels=cfg.min_blob_pixels, include_mask=True,
                           spec=spec)
+    if cfg.merge_consecutive:
+        # dt (seconds/frame) → gap in frames; both derived above.
+        max_gap_frames = int(round(cfg.merge_max_gap_s / dt)) if dt else 0
+        blobs = merge_consecutive_blobs(
+            blobs, max_gap_frames=max_gap_frames,
+            require_freq_overlap=cfg.merge_require_freq_overlap)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
     # Re-key the fresh predictions so their int blob_ids never collide with the

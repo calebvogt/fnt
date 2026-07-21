@@ -6180,6 +6180,7 @@ class MADMainWindow(QMainWindow):
             # the list count reads them live (and doesn't show the prior file's
             # number mid-load).
             self._loaded_wav_path = filepath
+            self.menu_export.setEnabled(True)
             self._update_active_training_count()
             self._sync_scrollbar_from_view()
             suffix = f"  |  {n_pred} prediction(s)" if n_pred else ""
@@ -6195,6 +6196,62 @@ class MADMainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self._update_paint_buttons_enabled()
         self._update_playback_buttons_enabled()
+
+    def _export_detections(self, fmt: str):
+        """Export the current file's persisted detections to an interchange
+        format. ``fmt`` is 'raven' (Raven Pro selection table) or 'audacity'
+        (Audacity label track). Reads the sibling CSV so the export reflects
+        what's saved on disk, then writes the chosen format next to it."""
+        wav = getattr(self, '_loaded_wav_path', None)
+        if not wav:
+            QMessageBox.information(
+                self, "Export Detections",
+                "Load a file first — there are no detections to export.")
+            return
+        csv_path = pred_csv_sibling_path(wav)
+        if not os.path.isfile(csv_path):
+            QMessageBox.information(
+                self, "Export Detections",
+                "This file has no saved detections yet. Run inference or "
+                "confirm labels, then export.")
+            return
+        from fnt.usv.usv_detector.mad_inference import (
+            read_blob_csv, write_raven_selection_table, write_audacity_labels)
+        try:
+            rows = read_blob_csv(csv_path)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export Detections", f"Could not read detections:\n{e}")
+            return
+        if not rows:
+            QMessageBox.information(
+                self, "Export Detections", "No detections to export.")
+            return
+        stem = os.path.splitext(os.path.basename(wav))[0]
+        if fmt == 'raven':
+            default = os.path.join(
+                os.path.dirname(wav), f"{stem}.Table.1.selections.txt")
+            caption, filt, writer = (
+                "Export Raven Selection Table",
+                "Raven selection table (*.txt)", write_raven_selection_table)
+        else:
+            default = os.path.join(os.path.dirname(wav), f"{stem}.labels.txt")
+            caption, filt, writer = (
+                "Export Audacity Labels",
+                "Audacity label track (*.txt)", write_audacity_labels)
+        out_path, _ = QFileDialog.getSaveFileName(self, caption, default, filt)
+        if not out_path:
+            return
+        try:
+            writer(out_path, rows)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export Detections", f"Export failed:\n{e}")
+            return
+        n = sum(1 for r in rows
+                if (r.get('status') or 'pending') != 'rejected')
+        self.status_bar.showMessage(
+            f"Exported {n} detection(s) → {os.path.basename(out_path)}")
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -6235,6 +6292,25 @@ class MADMainWindow(QMainWindow):
         self.act_close_project.triggered.connect(self._menu_close_project)
         self.act_close_project.setEnabled(False)
         file_menu.addAction(self.act_close_project)
+
+        file_menu.addSeparator()
+
+        # Export the current file's detections to interchange formats that open
+        # directly in common bioacoustics tools.
+        self.menu_export = file_menu.addMenu("&Export Detections")
+        self.menu_export.setEnabled(False)
+        act_export_raven = QAction("Raven Selection Table…", self)
+        act_export_raven.setToolTip(
+            "Export current file's detections as a Raven Pro selection table")
+        act_export_raven.triggered.connect(
+            lambda: self._export_detections('raven'))
+        self.menu_export.addAction(act_export_raven)
+        act_export_audacity = QAction("Audacity Labels…", self)
+        act_export_audacity.setToolTip(
+            "Export current file's detections as an Audacity label track")
+        act_export_audacity.triggered.connect(
+            lambda: self._export_detections('audacity'))
+        self.menu_export.addAction(act_export_audacity)
 
         # The Labels and Predict menus are hidden — every command is reachable
         # from the GUI itself. We still register their keyboard shortcuts (and
@@ -7085,6 +7161,7 @@ class MADMainWindow(QMainWindow):
             # In-memory annotations now belong to this file — record it so the
             # session-list count reads them live rather than the prior file's.
             self._loaded_wav_path = filepath
+            self.menu_export.setEnabled(True)
             self._sync_scrollbar_from_view()
             if self._project is not None:
                 self._project.last_opened_file = filepath

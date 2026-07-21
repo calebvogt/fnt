@@ -83,6 +83,7 @@ all = [
 
 [project.scripts]
 fnt = "fnt.gui_pyqt:main"
+mad = "fnt.usv.usv_detector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"
