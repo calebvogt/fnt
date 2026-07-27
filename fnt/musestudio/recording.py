@@ -10,6 +10,11 @@ Each recording gets a timestamped parent folder:
             Video/                # webcam.mp4, webcam_timestamps.csv
             Audio/                # audio_events.csv (binaural stimulus log)
             Analysis/             # synchrony.csv (derived PLV metrics)
+            Events/               # events.csv — protocol phases on the LSL clock
+
+``session_logs.txt`` is the human-readable narrative (wall clock).
+``Data/Events/events.csv`` is its machine-readable counterpart on the **LSL
+clock**, which is what lets review segment the signals by protocol phase.
 
 ``SessionLogger`` buffers actions from the moment the window opens, so when a
 recording starts the log already contains the lead-up (scan, connect, …).
@@ -34,8 +39,9 @@ class RecordingSession:
         self.video_dir = os.path.join(self.data_dir, "Video")
         self.audio_dir = os.path.join(self.data_dir, "Audio")
         self.analysis_dir = os.path.join(self.data_dir, "Analysis")
+        self.events_dir = os.path.join(self.data_dir, "Events")
         for d in (self.root, self.data_dir, self.muse_dir, self.video_dir,
-                  self.audio_dir, self.analysis_dir):
+                  self.audio_dir, self.analysis_dir, self.events_dir):
             os.makedirs(d, exist_ok=True)
         self.config_path = os.path.join(self.root, "recording_config.json")
         self.log_path = os.path.join(self.root, "session_logs.txt")

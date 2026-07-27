@@ -15,6 +15,7 @@ import from the GUI even when those packages aren't installed.
 from __future__ import annotations
 
 import csv
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -350,6 +351,33 @@ def _time_per_frame(nperseg: int, noverlap: int, sr: int) -> float:
     return (nperseg - noverlap) / float(sr)
 
 
+def _frame_time_origin(nperseg: int, sr: int) -> float:
+    """Seconds at spectrogram frame 0.
+
+    ``scipy.signal.spectrogram`` centres its first frame half a window in, so
+    frame ``i`` sits at ``(nperseg/2 + i*hop)/sr`` — **not** ``i*hop/sr``.
+    Dropping this term biased every exported onset early by ``nperseg/(2*sr)``
+    (~1 ms at nperseg=512, sr=250 kHz — two whole hops) and put MAD's times on a
+    different axis from CAD's, which reads ``times[idx]`` straight out of scipy.
+    See MAD_README.md.
+    """
+    return nperseg / (2.0 * float(sr))
+
+
+def frames_to_seconds(idx, nperseg: int, noverlap: int, sr: int):
+    """Spectrogram frame index → seconds (scipy/CAD convention)."""
+    return (_frame_time_origin(nperseg, sr)
+            + idx * _time_per_frame(nperseg, noverlap, sr))
+
+
+def seconds_to_frames(sec, nperseg: int, noverlap: int, sr: int):
+    """Seconds → spectrogram frame index (inverse of :func:`frames_to_seconds`)."""
+    dt = _time_per_frame(nperseg, noverlap, sr)
+    if dt <= 0:
+        return 0.0
+    return (sec - _frame_time_origin(nperseg, sr)) / dt
+
+
 def _freq_per_bin(nfft: int, sr: int) -> float:
     return (sr / 2.0) / (nfft // 2)
 
@@ -514,6 +542,7 @@ def blobs_to_rows(
     (normalized) full ``spec`` + db range are supplied, attach the full per-call
     metric set via :func:`compute_call_metrics`."""
     dt = _time_per_frame(nperseg, noverlap, sr)
+    t_org = _frame_time_origin(nperseg, sr)
     df = _freq_per_bin(nfft, sr)
     span = (float(db_max) - float(db_min)
             if db_min is not None and db_max is not None else None)
@@ -524,8 +553,8 @@ def blobs_to_rows(
         row = {
             'blob_id': i,
             'class': '',
-            'start_s': round(b['t_start'] * dt, 6),
-            'stop_s': round(b['t_end_exclusive'] * dt, 6),
+            'start_s': round(t_org + b['t_start'] * dt, 6),
+            'stop_s': round(t_org + b['t_end_exclusive'] * dt, 6),
             'min_freq_hz': min_f,
             'max_freq_hz': max_f,
             'freq_bandwidth_hz': round(max_f - min_f, 2),
@@ -612,9 +641,12 @@ def write_blob_csv(path: str, rows: List[Dict]) -> None:
             bw = r.get('freq_bandwidth_hz')
             bw = round(maxf - minf, 2) if bw in (None, '') else bw
             # Cross-call: gap to previous offset, and local emission rate.
+            # ``starts`` is sorted, so the window population is two bisects
+            # instead of a full scan — the scan made this writer O(N^2), which
+            # dominated every bulk review action on files with 1000+ calls.
             ici = '' if n == 1 else round((start - stops[n - 2]) * 1000.0, 2)
             lo, hi = start - _CALL_RATE_WINDOW_S, start + _CALL_RATE_WINDOW_S
-            rate = round(sum(1 for s in starts if lo <= s <= hi)
+            rate = round((bisect_right(starts, hi) - bisect_left(starts, lo))
                          / (2.0 * _CALL_RATE_WINDOW_S), 2)
             out = {
                 'call_number': n,
@@ -835,12 +867,13 @@ def embed_file(
         audio.astype(np.float32), sr, nperseg=nperseg, noverlap=noverlap,
         nfft=nfft, db_min=db_min, db_max=db_max)
 
-    dt = _time_per_frame(nperseg, noverlap, sr)
     df = _freq_per_bin(nfft, sr)
     boxes: List[Tuple[int, int, int, int]] = []
     for r in rows:
-        t0 = int(_safe_float(r.get('start_s')) / dt) if dt else 0
-        t1 = int(round(_safe_float(r.get('stop_s')) / dt)) if dt else 0
+        t0 = int(seconds_to_frames(
+            _safe_float(r.get('start_s')), nperseg, noverlap, sr))
+        t1 = int(round(seconds_to_frames(
+            _safe_float(r.get('stop_s')), nperseg, noverlap, sr)))
         f0 = int(_safe_float(r.get('min_freq_hz')) / df) if df else 0
         f1 = int(round(_safe_float(r.get('max_freq_hz')) / df)) if df else 0
         boxes.append((f0, f1, t0, t1))
@@ -1019,8 +1052,10 @@ def run_inference_on_file(
         else:  # no stored crop — fall back to the CSV's second/Hz box
             f0 = int(r.get('min_freq_hz', 0.0) / df) if df else 0
             f1 = int(round(r.get('max_freq_hz', 0.0) / df)) if df else Fb
-            t0 = int(r.get('start_s', 0.0) / dt) if dt else 0
-            t1 = int(round(r.get('stop_s', 0.0) / dt)) if dt else Tb
+            t0 = int(seconds_to_frames(
+                r.get('start_s', 0.0), nperseg, noverlap, sr))
+            t1 = int(round(seconds_to_frames(
+                r.get('stop_s', 0.0), nperseg, noverlap, sr)))
             f0, f1 = max(0, min(Fb, f0)), max(0, min(Fb, f1))
             t0, t1 = max(0, min(Tb, t0)), max(0, min(Tb, t1))
             if f1 > f0 and t1 > t0:

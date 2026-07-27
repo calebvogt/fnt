@@ -175,6 +175,31 @@ class ResourceZone:
 
 
 @dataclass
+class PolicyParams:
+    """Free parameters of the rule-based movement policy.
+
+    These are *free* in the provenance sense — not measured from any animal,
+    just weights that trade off competing drives. Keeping them in the config
+    (rather than as hidden constants) is what makes them sweepable in a study
+    and visible as the tuned quantities they are.
+    """
+    k_home: float = 1.0         # home-range spring gain (when satiated)
+    # A hungry animal leaves its home range to forage and returns after: home
+    # fidelity is relaxed in proportion to need. Without this, fidelity has to
+    # be traded off globally against foraging, and no single value works —
+    # measured: a large sparse arena needs weak fidelity to reach dispersed
+    # resources, while a small one needs strong fidelity to stay on nearby
+    # ones, and each setting starves the other case.
+    forage_releases_home: float = 0.85   # 0 = never relax, 1 = fully relax
+    k_resource: float = 1.6     # resource-seeking gain
+    k_social: float = 1.0       # social attraction/repulsion gain
+    k_territory: float = 2.0    # scent-marked territory avoidance gain
+    k_random: float = 0.5       # exploratory noise gain
+    perception_r: float = 0.6   # neighbour perception radius (m)
+    forage_threshold: float = 0.5   # hunger/thirst at which seeking switches on
+
+
+@dataclass
 class ArenaConfig:
     width: float = 2.2
     height: float = 2.2
@@ -385,6 +410,7 @@ class ExperimentConfig:
     # affect speed, not a condition variable)
     energy_speed_coupling: float = 0.6  # how much low energy slows movement (0=none)
     rest_speed_factor: float = 0.15     # speed × this when satiated near home (1=off)
+    policy: PolicyParams = field(default_factory=PolicyParams)
 
     # Output / execution
     trial_prefix: str = "S"            # trial id prefix, e.g. S001, S002 ...
@@ -460,6 +486,7 @@ class ExperimentConfig:
                     if "dynamics" in d else default_dynamics())
         return ExperimentConfig(arena=arena, groups=groups,
                                 interventions=interventions, dynamics=dynamics,
+                                policy=PolicyParams(**d.get("policy", {})),
                                 **scalars)
 
     @staticmethod

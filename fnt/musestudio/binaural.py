@@ -206,12 +206,6 @@ class BinauralPanel(QGroupBox):
         self._reload_presets()
 
     # ------------------------------------------------------------------ UI
-    _SLIDER_STYLE = (
-        "QSlider::groove:horizontal{height:4px;background:#4a4a4a;border-radius:2px;}"
-        "QSlider::handle:horizontal{background:#0078d4;width:10px;height:10px;"
-        "margin:-4px 0;border-radius:5px;}"
-    )
-
     def _build_ui(self):
         grid = QGridLayout(self)
 
@@ -221,7 +215,6 @@ class BinauralPanel(QGroupBox):
         self.base_slider = QSlider(Qt.Horizontal)
         self.base_slider.setRange(BASE_MIN, BASE_MAX)
         self.base_slider.setValue(200)
-        self.base_slider.setStyleSheet(self._SLIDER_STYLE)
         self.base_slider.setToolTip(base_tip)
         grid.addWidget(self.base_slider, 0, 1)
         self.base_spin = QSpinBox()
@@ -238,7 +231,6 @@ class BinauralPanel(QGroupBox):
         self.beat_slider = QSlider(Qt.Horizontal)
         self.beat_slider.setRange(BEAT_MIN, BEAT_MAX)
         self.beat_slider.setValue(10)
-        self.beat_slider.setStyleSheet(self._SLIDER_STYLE)
         self.beat_slider.setToolTip(beat_tip)
         grid.addWidget(self.beat_slider, 1, 1)
         self.beat_spin = QSpinBox()
@@ -253,7 +245,6 @@ class BinauralPanel(QGroupBox):
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(50)
-        self.vol_slider.setStyleSheet(self._SLIDER_STYLE)
         self.vol_slider.setToolTip("Playback loudness. In closed-loop mode this is scaled by your synchrony.")
         grid.addWidget(self.vol_slider, 2, 1)
         self.vol_label = QLabel("50%")

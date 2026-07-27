@@ -49,6 +49,18 @@ _MALE_RGBA = (0.29, 0.56, 0.85, 1.0)
 _FEMALE_RGBA = (0.88, 0.33, 0.60, 1.0)
 
 
+def _zone_door(z):
+    """Outside-facing centre of a resource zone's doorway."""
+    side = getattr(z, "entrance", "E")
+    if side == "E":
+        return (z.x + z.w / 2, z.y)
+    if side == "W":
+        return (z.x - z.w / 2, z.y)
+    if side == "N":
+        return (z.x, z.y + z.d / 2)
+    return (z.x, z.y - z.d / 2)
+
+
 def _appearance_rgba(appearance, sex):
     """Resolve an agent's base colour: explicit hex, else auto by sex."""
     hex_col = getattr(appearance, "color", "") or ""
@@ -84,6 +96,9 @@ class Simulation:
     # Movement-decision weights now live on the Policy (see policy.py). The
     # engine keeps the physics/physiology/combat constants below.
     contact_r = 0.12      # interaction/contact radius (m)
+    # how far an animal can feed/drink from a structure's surface: body reach
+    # plus a step of slack, so contact is not knife-edge at coarse dt.
+    _REACH = 0.18
     estrus_period_days = 4.0
     mate_rate = 0.02      # per-tick mating probability when in contact & receptive
     aggr_rate = 0.6       # per-encounter contest probability scaler (× aggr_i × aggr_j)
@@ -222,12 +237,37 @@ class Simulation:
                     (iv.at_day * 86400.0, idxs, arr, iv.op, float(iv.value)))
 
         # ---- resources ----
-        self.food = np.array([[o.x, o.y] for o in cfg.arena.objects_of("food")],
-                             float).reshape(-1, 2)
-        self.water = np.array([[o.x, o.y] for o in cfg.arena.objects_of("water")],
-                              float).reshape(-1, 2)
-        self.food_r = np.array([o.radius for o in cfg.arena.objects_of("food")])
-        self.water_r = np.array([o.radius for o in cfg.arena.objects_of("water")])
+        # Built structures count as resources, not just decoration: a resource
+        # zone holds the chow pile, a water tower holds water. Otherwise an
+        # enclosure that visibly contains food would starve its animals.
+        # A walled resource zone is only reachable through its doorway, so the
+        # animal steers for the *entrance* while feeding happens anywhere
+        # inside. Seek target and feeding region are therefore separate: aiming
+        # at the centre would just press the animal against the outside wall.
+        food, food_seek = [], []
+        for o in cfg.arena.objects_of("food"):
+            food.append((o.x, o.y, o.radius))
+            food_seek.append((o.x, o.y))
+        for z in getattr(cfg.arena, "resource_zones", []):
+            # anywhere inside the box counts as being at the chow pile
+            food.append((z.x, z.y, float(np.hypot(z.w, z.d) / 2.0)))
+            food_seek.append(_zone_door(z))
+        water, water_seek = [], []
+        for o in cfg.arena.objects_of("water"):
+            water.append((o.x, o.y, o.radius))
+            water_seek.append((o.x, o.y))
+        for t in getattr(cfg.arena, "water_towers", []):
+            # a tower is also a solid: collision holds the animal at
+            # radius + body, so the drinkable band must clear that and add a
+            # reach margin, or there is no reachable annulus at all.
+            water.append((t.x, t.y, t.radius + self._REACH))
+            water_seek.append((t.x, t.y))
+        self.food = np.array([[x, y] for x, y, _ in food], float).reshape(-1, 2)
+        self.water = np.array([[x, y] for x, y, _ in water], float).reshape(-1, 2)
+        self.food_r = np.array([r for _, _, r in food], float)
+        self.water_r = np.array([r for _, _, r in water], float)
+        self.food_seek = np.array(food_seek, float).reshape(-1, 2)
+        self.water_seek = np.array(water_seek, float).reshape(-1, 2)
 
     # ------------------------------------------------------------------ #
     # Circadian activity

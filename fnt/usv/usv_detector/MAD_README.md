@@ -82,6 +82,22 @@ Per recording `<wav>`:
   - `call_rate_hz` — local emission rate: calls whose onset falls within ±0.5 s
     of this one, per second.
 
+  > **Time convention (changed).** Spectrogram frame `i` maps to
+  > `nperseg/(2·sr) + i·(nperseg−noverlap)/sr` seconds — `scipy.signal.spectrogram`
+  > centres its first frame half a window into the signal, and CAD reads its
+  > times straight off that axis. MAD previously used `i·hop/sr`, dropping the
+  > `nperseg/(2·sr)` origin term, so every exported onset sat early by ~1 ms at
+  > `nperseg=512, sr=250 kHz` (two whole hops, and it scales with window size)
+  > and did not line up with CAD's for the same call. Durations were unaffected
+  > (both endpoints shifted equally); absolute onsets were not.
+  >
+  > **CSVs written before this change are offset by `nperseg/(2·sr)`.** Re-run
+  > inference to regenerate them, or add that constant when comparing old files
+  > against new ones, CAD output, or video/UWB timestamps. Stored mask crops
+  > carry their own pixel offsets and are unaffected. `frames_to_seconds()` /
+  > `seconds_to_frames()` in `mad_inference.py` are the single source of truth
+  > for this conversion — use them rather than multiplying by `dt` by hand.
+
   **Frequency box & contour** (the contour is the peak-power frequency traced
   across each time column inside the mask)
   - `min_freq_hz`, `max_freq_hz` — frequency extent of the mask.

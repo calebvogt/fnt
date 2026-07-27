@@ -4674,16 +4674,24 @@ class MADMainWindow(QMainWindow):
             return ann.get('csv_path')
         return pred_csv_sibling_path(wav)
 
-    def _upsert_call_csv_row(self, ann: dict, status: str, score=None):
-        """Insert or update one call's row in the unified per-wav CSV (matched
-        by blob_id/id). Used for hand-labels and for syncing review decisions."""
-        csv_path = self._pred_csv_path(ann)
+    def _frame_time_origin_s(self) -> float:
+        """Seconds at spectrogram frame 0. scipy centres frame 0 half a window
+        in, so frame→seconds is ``origin + idx*dt`` and seconds→frame is
+        ``(s - origin)/dt``. See ``mad_inference._frame_time_origin``."""
+        from fnt.usv.usv_detector.mad_inference import _frame_time_origin
+        sp = self._spec_params()
+        return _frame_time_origin(sp['nperseg'], self.sample_rate or 1)
+
+    def _ann_to_csv_row(self, ann: dict, status: str, score=None):
+        """Build the unified-CSV row dict for one annotation — no file I/O, so
+        bulk callers can assemble many rows for a single write."""
         bid = self._ann_csv_id(ann)
-        if not csv_path or bid is None or self.sample_rate is None:
-            return
+        if bid is None or self.sample_rate is None:
+            return None
+        from fnt.usv.usv_detector.mad_inference import (
+            CALL_METRIC_KEYS, frames_to_seconds)
         sp = self._spec_params()
         sr = self.sample_rate or 1
-        dt = (sp['nperseg'] - sp['noverlap']) / float(sr)
         df = (sr / 2.0) / (sp['nfft'] // 2) if sp.get('nfft') else 0.0
         msk = ann.get('mask')
         area = int(msk.sum()) if msk is not None else int(ann.get('area_pixels', 0))
@@ -4692,8 +4700,10 @@ class MADMainWindow(QMainWindow):
         row = {
             'blob_id': bid,
             'class': ann.get('category', '') or '',
-            'start_s': round(ann['t0'] * dt, 6),
-            'stop_s': round(ann['t1'] * dt, 6),
+            'start_s': round(frames_to_seconds(
+                ann['t0'], sp['nperseg'], sp['noverlap'], sr), 6),
+            'stop_s': round(frames_to_seconds(
+                ann['t1'], sp['nperseg'], sp['noverlap'], sr), 6),
             'min_freq_hz': minf,
             'max_freq_hz': maxf,
             'area_pixels': area,
@@ -4702,11 +4712,20 @@ class MADMainWindow(QMainWindow):
             'source': ann.get('source', 'label'),
         }
         # Carry the full quantification set the annotation computed at confirm.
-        from fnt.usv.usv_detector.mad_inference import CALL_METRIC_KEYS
         for k in CALL_METRIC_KEYS:
             if ann.get(k) is not None:
                 row[k] = ann.get(k)
         row.setdefault('freq_bandwidth_hz', round(maxf - minf, 2))
+        return row
+
+    def _upsert_call_csv_row(self, ann: dict, status: str, score=None):
+        """Insert or update one call's row in the unified per-wav CSV (matched
+        by blob_id/id). Used for hand-labels and for syncing review decisions."""
+        csv_path = self._pred_csv_path(ann)
+        row = self._ann_to_csv_row(ann, status, score)
+        if not csv_path or row is None:
+            return
+        bid = row['blob_id']
         try:
             from fnt.usv.usv_detector.mad_inference import (
                 read_blob_csv, write_blob_csv)
@@ -4758,6 +4777,52 @@ class MADMainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _batch_write_pred_csv_status(self, anns, status: str) -> int:
+        """Persist an accept/reject decision for MANY detections in ONE CSV
+        read + ONE write (vs once per item), for fast Accept All / Reject All /
+        box-select. Rows with no existing CSV entry (a hand-label confirmed this
+        session) are synthesized, matching :meth:`_write_pred_csv_status`.
+
+        Doing this per item made bulk review quadratic in the file's call count
+        — a 5000-detection file took over an hour of frozen UI. Returns the
+        number of annotations recorded.
+        """
+        anns = list(anns)
+        if not anns:
+            return 0
+        wav = self._active_review_wav_path()
+        csv_path = pred_csv_sibling_path(wav) if wav else None
+        if not csv_path:
+            return 0
+        want = {}
+        for a in anns:
+            bid = self._ann_csv_id(a)
+            if bid is not None:
+                want[str(bid)] = a
+        if not want:
+            return 0
+        try:
+            from fnt.usv.usv_detector.mad_inference import (
+                read_blob_csv, write_blob_csv)
+            rows = read_blob_csv(csv_path) if os.path.isfile(csv_path) else []
+            seen = set()
+            for r in rows:
+                key = str(r.get('blob_id'))
+                if key in want:
+                    r['status'] = status
+                    seen.add(key)
+            # Anything with no row yet (hand-label confirmed this session).
+            for key, a in want.items():
+                if key in seen:
+                    continue
+                row = self._ann_to_csv_row(a, status)
+                if row is not None:
+                    rows.append(row)
+            write_blob_csv(csv_path, rows)
+        except Exception:
+            return 0
+        return len(want)
+
     def _skip_current_pred(self):
         """Leave the current detection undecided and jump to the next pending
         one after it (no decision recorded)."""
@@ -4805,9 +4870,9 @@ class MADMainWindow(QMainWindow):
         self._log(f"Accept All — {len(preds)} prediction(s) [{self._review_mode}]")
         if self._review_mode == 'deploy':
             # Keep accepted detections visible (blue), recorded in the CSV.
-            for ann_idx in preds:
-                ann = self.spectrogram.annotations[ann_idx]
-                self._write_pred_csv_status(ann, 'accepted')
+            anns = [self.spectrogram.annotations[i] for i in preds]
+            self._batch_write_pred_csv_status(anns, 'accepted')
+            for ann in anns:
                 ann['status'] = 'accepted'
             self.spectrogram._rebuild_confirmed_mask()
             self.spectrogram.update()
@@ -4824,18 +4889,22 @@ class MADMainWindow(QMainWindow):
             cls_name = self._project.last_class or 'USV'
         else:
             cls_name = self._session_last_class or 'USV'
-        n = 0
+        # Save each training example (unavoidably per-call), then record every
+        # decision in ONE CSV write. The join key is blob_id, which the new
+        # example id doesn't change, so the batch can run after the loop.
+        done = []
         for ann_idx in preds:
             ann = self.spectrogram.annotations[ann_idx]
             comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
             try:
                 ex_id = self._save_component_example(cls_name, comp)
-                self._write_pred_csv_status(ann, 'accepted')
                 ann['status'] = 'accepted'
                 ann['id'] = ex_id
-                n += 1
+                done.append(ann)
             except Exception:
                 continue
+        self._batch_write_pred_csv_status(done, 'accepted')
+        n = len(done)
         self.spectrogram._rebuild_confirmed_mask()
         self.spectrogram.update()
         self._pred_review_idx = None
@@ -4852,9 +4921,9 @@ class MADMainWindow(QMainWindow):
         self._snapshot_for_undo("Reject All", crops=False)
         self._log(f"Reject All — {len(preds)} prediction(s) [{self._review_mode}]")
         # Recorded decisions: mark each rejected and keep it visible (red).
-        for ann_idx in preds:
-            ann = self.spectrogram.annotations[ann_idx]
-            self._write_pred_csv_status(ann, 'rejected')
+        anns = [self.spectrogram.annotations[i] for i in preds]
+        self._batch_write_pred_csv_status(anns, 'rejected')
+        for ann in anns:
             ann['status'] = 'rejected'
         self.spectrogram.update()
         self._pred_review_idx = None
@@ -4888,11 +4957,12 @@ class MADMainWindow(QMainWindow):
         try:
             if rows:
                 dt = (sp['nperseg'] - sp['noverlap']) / float(self.sample_rate)
+                t_org = self._frame_time_origin_s()
                 df = (self.sample_rate / 2.0) / (sp['nfft'] // 2)
                 crops = []
                 for r in rows:
-                    t0 = int(round(r['start_s'] / dt))
-                    t1 = int(round(r['stop_s'] / dt))
+                    t0 = int(round((r['start_s'] - t_org) / dt))
+                    t1 = int(round((r['stop_s'] - t_org) / dt))
                     f0 = int(round(r['min_freq_hz'] / df))
                     f1 = min(int(round(r['max_freq_hz'] / df)),
                              pred_mask.shape[0])
@@ -4930,7 +5000,8 @@ class MADMainWindow(QMainWindow):
         or None."""
         if dt <= 0 or df <= 0:
             return None
-        rt0, rt1 = r['start_s'] / dt, r['stop_s'] / dt
+        t_org = self._frame_time_origin_s()
+        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
         rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
         for a in self.spectrogram.annotations:
             if a.get('status'):  # only status-less confirmed (green) masks
@@ -4996,12 +5067,14 @@ class MADMainWindow(QMainWindow):
         # synthesize minimal rows straight from the crops.
         if not rows and crops:
             rows = []
+            t_org = self._frame_time_origin_s()
             for bid, c in crops.items():
                 h, w = c['mask'].shape
                 f_off, t_off = c['f_off'], c['t_off']
                 rows.append({
                     'blob_id': int(bid) if str(bid).isdigit() else bid,
-                    'start_s': t_off * dt, 'stop_s': (t_off + w) * dt,
+                    'start_s': t_org + t_off * dt,
+                    'stop_s': t_org + (t_off + w) * dt,
                     'min_freq_hz': f_off * df, 'max_freq_hz': (f_off + h) * df,
                     'area_pixels': int(c['mask'].sum()), 'score': 0.0,
                     'status': 'pending',
@@ -5077,8 +5150,9 @@ class MADMainWindow(QMainWindow):
                 t1 = t0 + blob_region.shape[1]
             else:
                 # No crop (e.g. CSV-only legacy) — fall back to the box rect.
-                t0 = int(round(r['start_s'] / dt))
-                t1 = int(round(r['stop_s'] / dt))
+                t_org = self._frame_time_origin_s()
+                t0 = int(round((r['start_s'] - t_org) / dt))
+                t1 = int(round((r['stop_s'] - t_org) / dt))
                 f0 = int(round(r['min_freq_hz'] / df))
                 f1 = int(round(r['max_freq_hz'] / df))
                 if t1 <= t0 or f1 <= f0:
@@ -5210,7 +5284,10 @@ class MADMainWindow(QMainWindow):
         if self._training_active:
             self._show_training_dialog()
             return
-        self._consolidate_sibling_examples()
+        # Abort before any long run if the label set couldn't be fully rebuilt
+        # (the method has already told the user why).
+        if not self._consolidate_sibling_examples():
+            return
         from fnt.usv.usv_detector.mad_examples import count_examples
         n_examples = count_examples(self._project.training_data_dir)
         if n_examples == 0:
@@ -5247,42 +5324,84 @@ class MADMainWindow(QMainWindow):
         self._start_training(cfg, post_inference_wavs=infer_wavs,
                              reporter=self.train_panel)
 
-    def _consolidate_sibling_examples(self):
+    def _consolidate_sibling_examples(self) -> bool:
         """Rebuild the project's consolidated ``training_data.h5`` from the
         Training Data list's per-wav sibling examples — the source of truth.
 
         Non-destructive to the siblings (the central store is just a training
         cache), and rebuilt fresh each time so removed/edited labels never
         linger. A file therefore only trains the model once it's been copied
-        into Training Data."""
+        into Training Data.
+
+        The rebuild goes into a temp file and is swapped in with ``os.replace``
+        only after a complete, error-free pass, so an interruption (full disk,
+        dropped network share, unreadable sibling h5) can never leave the
+        project with a truncated store — or none at all. Returns False, with
+        the previous store intact and the user told why, if anything failed:
+        silently training on a subset of the labels is worse than not training.
+        """
         if self._project is None:
-            return
+            return True
         from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, td_iter_examples, td_count,
+            masks_sibling_path, td_iter_examples, td_count, td_save_example,
         )
-        from fnt.usv.usv_detector.mad_examples import save_example, _store_path
+        from fnt.usv.usv_detector.mad_examples import _store_path
         td_dir = self._project.training_data_dir
         os.makedirs(td_dir, exist_ok=True)
         store = _store_path(td_dir)
+        tmp = store + ".rebuild.tmp"
+
+        def _drop_tmp():
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        _drop_tmp()
+        n, failed = 0, []
         try:
-            if os.path.isfile(store):
-                os.remove(store)
-        except Exception as e:
-            self._log(f"could not reset training store: {e}")
-        n = 0
-        for fp in self.deploy_files:
-            h5 = masks_sibling_path(fp)
-            if td_count(h5) == 0:
-                continue
-            for ex in list(td_iter_examples(h5)):
-                meta = ex['meta']
-                eid = meta.get('id', '')
+            for fp in self.deploy_files:
+                h5 = masks_sibling_path(fp)
                 try:
-                    save_example(td_dir, ex['spec'], ex['mask'], meta, eid)
-                    n += 1
-                except Exception:
+                    if td_count(h5) == 0:
+                        continue
+                    examples = list(td_iter_examples(h5))
+                except Exception as e:
+                    failed.append(f"{os.path.basename(fp)}: {e}")
                     continue
+                for ex in examples:
+                    meta = ex['meta']
+                    try:
+                        td_save_example(tmp, ex['spec'], ex['mask'], meta,
+                                        meta.get('id') or None)
+                        n += 1
+                    except Exception as e:
+                        failed.append(f"{os.path.basename(fp)}: {e}")
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} label(s) could not be copied. "
+                    f"First error — {failed[0]}")
+            if n:
+                os.replace(tmp, store)      # atomic swap; old store until now
+            else:
+                _drop_tmp()                 # Training Data really is empty
+                if os.path.isfile(store):
+                    os.remove(store)
+        except Exception as e:
+            _drop_tmp()                     # keep the previous store as-is
+            self._log(f"Training store rebuild FAILED — {e}")
+            QMessageBox.critical(
+                self, "Could not rebuild training store",
+                f"The training store could not be rebuilt from the Training "
+                f"Data labels:\n\n{e}\n\nThe previous store was left untouched "
+                f"and training was NOT started, so the model is never fitted "
+                f"on a partial label set.\n\nIf the Training Data lives on a "
+                f"network drive, check it is still connected."
+            )
+            return False
         self._log(f"Built training store from {n} Training Data label(s)")
+        return True
 
     def _show_training_dialog(self):
         """Show (or re-show) the floating training-graph window. The spectrogram
@@ -7759,6 +7878,7 @@ class MADMainWindow(QMainWindow):
 
         df = (sr / 2.0) / (nfft // 2)
         dt = hop / float(sr)
+        t_org = self._frame_time_origin_s()
         # Full per-call quantification over the labeled pixels — uses the SAME
         # shared function as the prediction path so label/prediction rows are
         # directly comparable in the unified CSV.
@@ -7785,8 +7905,10 @@ class MADMainWindow(QMainWindow):
             'class': class_name,
             'source_wav': wav_name,
             'patch_t_off': int(pt0), 'patch_f_off': 0,
-            't_start_s': round(t0 * dt, 6), 't_stop_s': round(t1 * dt, 6),
-            'patch_t0_s': round(pt0 * dt, 6), 'patch_t1_s': round(pt1 * dt, 6),
+            't_start_s': round(t_org + t0 * dt, 6),
+            't_stop_s': round(t_org + t1 * dt, 6),
+            'patch_t0_s': round(t_org + pt0 * dt, 6),
+            'patch_t1_s': round(t_org + pt1 * dt, 6),
             'f_low_hz': round(f0 * df, 2), 'f_high_hz': round(f1 * df, 2),
             'patch_t_frames': int(W), 'f_bins': int(n_freq),
             'nperseg': nperseg, 'noverlap': noverlap_val, 'nfft': nfft,
@@ -7988,26 +8110,41 @@ class MADMainWindow(QMainWindow):
                     self._delete_annotation(i, refresh=False)
                     n_done += 1
         else:
-            # Process high→low so earlier removals don't shift later indices.
-            for i in sorted(idxs, reverse=True):
-                if not (0 <= i < len(sg.annotations)):
-                    continue
-                ann = sg.annotations[i]
-                is_pred = ann.get('status') == 'prediction'
-                if action == 'accept':
-                    if is_pred:
-                        if self._review_mode == 'deploy':
-                            self._write_pred_csv_status(ann, 'accepted')
-                            ann['status'] = 'accepted'  # keep visible (blue)
-                        else:
-                            self._accept_prediction(i)
-                        n_done += 1
-                elif action == 'reject':
-                    if is_pred:
-                        # Recorded decision: keep visible (red), persist it.
-                        self._write_pred_csv_status(ann, 'rejected')
-                        ann['status'] = 'rejected'
-                        n_done += 1
+            # Collect the targets, then persist every decision in ONE CSV write.
+            # Writing per item (and, in train mode, rebuilding the detection tree
+            # per item via _accept_prediction) made box review quadratic in the
+            # file's call count.
+            status = 'accepted' if action == 'accept' else 'rejected'
+            targets = [sg.annotations[i] for i in sorted(idxs)
+                       if 0 <= i < len(sg.annotations)
+                       and sg.annotations[i].get('status') == 'prediction']
+            if (action == 'accept' and self._review_mode != 'deploy'
+                    and (self.audio_data is None
+                         or self._active_wav_path() is None)):
+                targets = []          # can't save examples without a loaded file
+            elif action == 'accept' and self._review_mode != 'deploy':
+                # Train mode: each accepted call also becomes a training example.
+                cls_default = ((self._project.last_class if self._project
+                                else self._session_last_class) or 'USV')
+                done = []
+                for ann in targets:
+                    comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'],
+                            ann['mask'])
+                    try:
+                        ex_id = self._save_component_example(
+                            ann.get('category') or cls_default, comp)
+                        ann['status'] = 'accepted'
+                        ann['id'] = ex_id
+                        done.append(ann)
+                    except Exception:
+                        continue
+                targets = done
+            else:
+                for ann in targets:
+                    ann['status'] = status
+            self._batch_write_pred_csv_status(targets, status)
+            n_done = len(targets)
+            sg._rebuild_confirmed_mask()
         self._box_sel_ids = []
         sg._selected_set = set()
         sg._selected_ann_idx = None
@@ -8886,8 +9023,9 @@ class MADMainWindow(QMainWindow):
             return
 
         # Remove existing predictions that overlap the inferred view range
-        t0_view = int(round(view_start / dt))
-        t1_view = int(round(view_end / dt))
+        t_org = self._frame_time_origin_s()
+        t0_view = int(round((view_start - t_org) / dt))
+        t1_view = int(round((view_end - t_org) / dt))
         sg.annotations = [
             a for a in sg.annotations
             if a.get('status') != 'prediction'
@@ -8897,8 +9035,8 @@ class MADMainWindow(QMainWindow):
         n_added = 0
         new_crops = []  # small per-blob masks to persist (NOT the full grid)
         for r in rows:
-            t0 = int(round(r['start_s'] / dt))
-            t1 = int(round(r['stop_s'] / dt))
+            t0 = int(round((r['start_s'] - t_org) / dt))
+            t1 = int(round((r['stop_s'] - t_org) / dt))
             f0 = int(round(r['min_freq_hz'] / df))
             f1 = int(round(r['max_freq_hz'] / df))
             if t1 <= t0 or f1 <= f0:

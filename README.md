@@ -126,3 +126,15 @@ That's it — the updated code is immediately available the next time you run `f
 conda activate fnt
 pip install -e .
 ```
+
+## License
+
+FieldNeuroethologyToolbox is released under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See the [LICENSE](LICENSE) file for the full text.
+
+In short:
+
+- You are free to use, modify, and redistribute this software, including for commercial purposes.
+- If you distribute a modified version, you must release your source code under the same license.
+- If you run a modified version as a network service, you must offer its source code to users of that service.
+
+If you use FNT in published research, please cite this repository: [github.com/calebvogt/fnt](https://github.com/calebvogt/fnt)

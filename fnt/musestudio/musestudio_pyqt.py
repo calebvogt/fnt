@@ -18,19 +18,25 @@ from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QSplitter, QVBoxLayout, QWidget,
+    QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from fnt.musestudio import theme
+from fnt.musestudio.analysis import BandPowerAnalyzer, HemodynamicsAnalyzer
 from fnt.musestudio.binaural import BinauralPanel, play_cue
 from fnt.musestudio.channel_table import LiveValuesPanel
-from fnt.musestudio.live_plot import MultiChannelScrollPlot
+from fnt.musestudio.live_plot import LiveSignalView
 from fnt.musestudio.muse_stream import (
     LSLReaderThread, MuseRecorder, MuseStreamProcess, find_devices,
 )
 from fnt.musestudio.neuro_widgets import NeuroControls, NeuroView
 from fnt.musestudio.protocol import PROTOCOLS, ProtocolRunner
 from fnt.musestudio.recording import RecordingSession, SessionLogger
+from fnt.musestudio.review_view import ReviewPanel
 from fnt.musestudio.synchrony import SynchronyAnalyzer
+from fnt.musestudio.viz import (
+    BandHistoryPlot, BandPowerBars, LateralityView, SpectrogramView,
+)
 from fnt.musestudio.webcam import WebcamThread, list_cameras
 
 
@@ -50,6 +56,11 @@ def _is_eeg(stream_name):
 
 def _is_battery(stream_name):
     return "BATTERY" in stream_name.upper()
+
+
+def _is_optics(stream_name):
+    """The Athena's fNIRS/PPG stream is published as Muse-OPTICS."""
+    return "OPTIC" in stream_name.upper() or "NIRS" in stream_name.upper()
 
 
 _local_clock = None
@@ -163,8 +174,11 @@ class MuseStudioWindow(QMainWindow):
         self._audio_writer = None
         self._sync_file = None
         self._sync_writer = None
+        self._event_file = None
+        self._event_writer = None
         self._eeg_stream = None
         self._eeg_channels = []
+        self._optics_channels = []
         self._device_address = None
         self._session_active = False
         self._recording_enabled = False
@@ -180,8 +194,9 @@ class MuseStudioWindow(QMainWindow):
         self.output_dir = self._settings.value("recording_dir", default_dir)
 
         self.setWindowTitle("MuseStudio - FieldNeuroethologyToolbox")
-        self.resize(1280, 800)
-        self.setMinimumSize(960, 600)
+        self.resize(1480, 900)
+        self.setMinimumSize(1100, 700)
+        self.setStyleSheet(theme.STYLESHEET)
         self._init_ui()
 
         # Guided-protocol runner and a free-record elapsed timer.
@@ -327,6 +342,12 @@ class MuseStudioWindow(QMainWindow):
         self.folder_btn.setToolTip("Choose the default folder where each recording is created.")
         loc_row.addWidget(self.folder_btn)
         rg.addLayout(loc_row)
+        self.review_btn = QPushButton("Review a recording…")
+        self.review_btn.clicked.connect(self.on_review_recording)
+        self.review_btn.setToolTip(
+            "Open a finished recording and compare each protocol phase "
+            "against baseline.")
+        rg.addWidget(self.review_btn)
         col.insertWidget(1, self.recording_group)   # directly under the View group
 
         col.addStretch()
@@ -341,50 +362,136 @@ class MuseStudioWindow(QMainWindow):
         return scroll
 
     def _build_right_view(self):
-        """Preview / data view: instruction banner, plots, camera, values, head map."""
+        """Data view: session banner + tabbed views, with the raw signal first."""
         right = QWidget()
         rlay = QVBoxLayout(right)
         rlay.setContentsMargins(4, 4, 4, 4)
+        rlay.setSpacing(6)
 
         self.session_banner = SessionBanner()
         self.session_banner.continue_clicked.connect(self._on_continue)
         rlay.addWidget(self.session_banner)
 
-        data_split = QSplitter(Qt.Vertical)
-        self.plot = MultiChannelScrollPlot()
-        self.plot.setToolTip(
-            "Live scrolling signals, newest on the right. One stacked panel per "
-            "stream (EEG, optics); traces are auto-scaled per channel."
-        )
-        data_split.addWidget(self.plot)
+        self.view_tabs = QTabWidget()
+        self.view_tabs.addTab(self._build_live_tab(), "Live signal")
+        self.view_tabs.addTab(self._build_bands_tab(), "Bands")
+        self.view_tabs.addTab(self._build_spectrogram_tab(), "Spectrogram")
+        self.view_tabs.addTab(self._build_synchrony_tab(), "Synchrony")
+        self.view_tabs.addTab(self._build_camera_tab(), "Camera")
+        self.review = ReviewPanel()
+        self.view_tabs.addTab(self.review, "Review")
+        rlay.addWidget(self.view_tabs, stretch=1)
 
-        bottom = QSplitter(Qt.Horizontal)
+        self.status_label = QLabel("Ready.")
+        self.status_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        rlay.addWidget(self.status_label)
+        return right
+
+    def _build_live_tab(self):
+        """Primary view: raw signals at a real µV scale, plus the value table."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 8, 6, 6)
+        split = QSplitter(Qt.Horizontal)
+        self.plot = LiveSignalView()
+        self.plot.setToolTip(
+            "Live signals, newest on the right. EEG uses a fixed µV scale and a "
+            "display-only 1–40 Hz filter; recording always saves raw data."
+        )
+        split.addWidget(self.plot)
+        self.values_panel = LiveValuesPanel()
+        self.values_panel.setToolTip(
+            "Latest value of every channel — the columns written to the per-stream CSVs.")
+        self.values_panel.setMaximumWidth(300)
+        split.addWidget(self.values_panel)
+        split.setStretchFactor(0, 4)
+        split.setStretchFactor(1, 1)
+        split.setSizes([900, 260])
+        lay.addWidget(split)
+        return page
+
+    def _build_bands_tab(self):
+        """Band power now (bars) and over time (history), plus L/R laterality."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 8, 6, 6)
+        split = QSplitter(Qt.Vertical)
+
+        top = QSplitter(Qt.Horizontal)
+        self.band_bars = BandPowerBars()
+        self.band_bars.setToolTip(
+            "Share of total power in each band, averaged across electrodes.")
+        top.addWidget(self.band_bars)
+        self.band_history = BandHistoryPlot()
+        self.band_history.setToolTip("How the band mix has evolved over the session.")
+        top.addWidget(self.band_history)
+        top.setSizes([420, 640])
+        split.addWidget(top)
+
+        self.laterality = LateralityView()
+        self.laterality.setToolTip(
+            "Left vs right comparison. EEG alpha asymmetry: alpha is inversely "
+            "related to activation, so more alpha on a side means that side is "
+            "relatively less engaged. fNIRS ΔOD is an uncalibrated proxy for "
+            "blood-volume change."
+        )
+        split.addWidget(self.laterality)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([420, 170])
+        lay.addWidget(split)
+        return page
+
+    def _build_spectrogram_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 8, 6, 6)
+        self.spectrogram = SpectrogramView()
+        self.spectrogram.setToolTip(
+            "Rolling time–frequency map of one electrode. A steady bright band "
+            "around 10 Hz is an alpha rhythm."
+        )
+        self.spectrogram.channel_combo.activated.connect(
+            lambda i: self.bands.set_spectrogram_channel(
+                self.spectrogram.channel_combo.itemData(i) or 0)
+        )
+        lay.addWidget(self.spectrogram)
+        return page
+
+    def _build_synchrony_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 8, 6, 6)
+        self.neuro_view = NeuroView()
+        lay.addWidget(self.neuro_view)
+        return page
+
+    def _build_camera_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 8, 6, 6)
         self.camera_view = QLabel("Camera off")
         self.camera_view.setAlignment(Qt.AlignCenter)
         self.camera_view.setMinimumSize(240, 200)
         self.camera_view.setStyleSheet(
-            "background-color: #111111; color: #777777; border: 1px solid #3f3f3f;"
+            f"background-color: {theme.PLOT_BG}; color: {theme.TEXT_FAINT};"
+            f" border: 1px solid {theme.BORDER}; border-radius: 6px;"
         )
-        self.camera_view.setToolTip("Live webcam preview. Recorded with frame timestamps during a session.")
-        bottom.addWidget(self.camera_view)
-        self.values_panel = LiveValuesPanel()
-        self.values_panel.setToolTip("Latest value of every channel — the columns written to the per-stream CSVs.")
-        bottom.addWidget(self.values_panel)
-        self.neuro_view = NeuroView()
-        bottom.addWidget(self.neuro_view)
-        bottom.setSizes([360, 300, 340])
-        data_split.addWidget(bottom)
-        data_split.setStretchFactor(0, 3)
-        data_split.setStretchFactor(1, 2)
-        data_split.setSizes([460, 320])
-        rlay.addWidget(data_split, stretch=1)
-
-        self.status_label = QLabel("Ready.")
-        self.status_label.setStyleSheet("color: #cccccc;")
-        rlay.addWidget(self.status_label)
-        return right
+        self.camera_view.setToolTip(
+            "Live webcam preview. Recorded with frame timestamps during a session.")
+        lay.addWidget(self.camera_view)
+        return page
 
     def _wire_analyzer(self):
+        # Frequency-domain analysis -> bands tab + spectrogram.
+        self.bands = BandPowerAnalyzer(self)
+        self.bands.updated.connect(self._on_band_metrics)
+        self.bands.spectrogram_updated.connect(self.spectrogram.update_spectrogram)
+
+        # Optics -> fNIRS laterality (uncalibrated ΔOD proxy).
+        self.hemo = HemodynamicsAnalyzer(self)
+        self.hemo.updated.connect(self.laterality.update_hemo)
+
         self.analyzer = SynchronyAnalyzer(self)
         self.analyzer.metrics_updated.connect(self._on_metrics)
         self.analyzer.status.connect(self.neuro_controls.set_status)
@@ -497,10 +604,24 @@ class MuseStudioWindow(QMainWindow):
         self._eeg_stream = next((n for n in names if _is_eeg(n)), None)
         self._eeg_channels = ch_names.get(self._eeg_stream, []) if self._eeg_stream else []
         self.analyzer.reset()
+        self.bands.reset()
+        self.hemo.reset()
+
+        # Real sample rates drive the display filters and every analyzer.
+        rates = {n: self.reader.sample_rate(n) for n in names}
+        self.plot.set_sample_rates(rates)
         if self._eeg_stream:
-            fs = self.reader.sample_rate(self._eeg_stream)
+            fs = rates.get(self._eeg_stream)
             if fs:
                 self.analyzer.set_sample_rate(fs)
+            self.bands.configure(self._eeg_channels, fs)
+            self.spectrogram.set_channels(self._eeg_channels)
+
+        optics_stream = next((n for n in names if _is_optics(n)), None)
+        self._optics_channels = ch_names.get(optics_stream, []) if optics_stream else []
+        if optics_stream:
+            self.hemo.configure(self._optics_channels, rates.get(optics_stream))
+
         self._set_status(f"Connected. Streaming: {', '.join(names)}")
         self._log(f"Connected — streams: {', '.join(names)}")
 
@@ -518,6 +639,16 @@ class MuseStudioWindow(QMainWindow):
         self.values_panel.add_samples(stream_name, timestamps, data)
         if stream_name == self._eeg_stream:
             self.analyzer.add_eeg(self._eeg_channels, data)
+            self.bands.add_eeg(self._eeg_channels, data)
+        elif _is_optics(stream_name):
+            self.hemo.add_optics(self._optics_channels, data)
+
+    def _on_band_metrics(self, m):
+        """Band powers -> bars, history and the EEG half of the laterality view."""
+        self.band_bars.update_metrics(m)
+        self.laterality.update_bands(m)
+        times, series = self.bands.history()
+        self.band_history.update_history(times, series)
 
     def _on_metrics(self, m):
         """Synchrony update: refresh visuals, drive audio, log if recording."""
@@ -652,6 +783,9 @@ class MuseStudioWindow(QMainWindow):
         self._sync_hold_start = None
         self._log(f"Protocol phase {index + 1}/{total}: {phase.name}"
                   + (f" ({int(phase.duration)}s)" if phase.duration else ""))
+        # LSL-stamped so review can segment the recording by phase.
+        self._write_event("phase", phase.name,
+                          f"{index + 1}/{total} dur={phase.duration or ''}")
         self.session_banner.show_phase(phase, index, total, waiting)
         # Cue beep marks the transition for eyes-closed users. Skip it when the
         # phase starts a tone (the tone itself is the cue) or one is already
@@ -678,6 +812,7 @@ class MuseStudioWindow(QMainWindow):
             # Only meaningful with a live EEG signal.
             if self._has_eeg():
                 self.analyzer.start_baseline(float(phase.duration or 30.0))
+                self._write_event("marker", "calibrate_start", phase.duration or 30.0)
             else:
                 self._log("No EEG — skipping baseline calibration")
         elif action == "audio_on":
@@ -736,6 +871,7 @@ class MuseStudioWindow(QMainWindow):
         # Route each artifact to its Data subfolder by provenance.
         self._open_audio_log(self.session.audio_dir)       # stimulus log
         self._open_sync_log(self.session.analysis_dir)     # derived PLV
+        self._open_event_log(self.session.events_dir)      # protocol timeline
         cam_note = ""
         if self.webcam is not None:
             self.webcam.start_recording(self.session.video_dir)  # opens on first frame
@@ -747,6 +883,7 @@ class MuseStudioWindow(QMainWindow):
         self._set_status(f"Recording{cam_note} to {self.session.name}")
 
     def _stop_recording(self):
+        self._close_event_log()
         self._close_audio_log()
         self._close_sync_log()
         frames = self.webcam.stop_recording() if self.webcam is not None else 0
@@ -802,8 +939,14 @@ class MuseStudioWindow(QMainWindow):
                 "root": self.session.root, "data": self.session.data_dir,
                 "muse": self.session.muse_dir, "video": self.session.video_dir,
                 "audio": self.session.audio_dir, "analysis": self.session.analysis_dir,
+                "events": self.session.events_dir,
             },
         }
+
+    def on_review_recording(self):
+        """Jump to the Review tab and open a recording folder."""
+        self.view_tabs.setCurrentWidget(self.review)
+        self.review.on_open()
 
     def on_choose_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -836,6 +979,34 @@ class MuseStudioWindow(QMainWindow):
             self._audio_file.close()
             self._audio_file = None
             self._audio_writer = None
+
+    # ----------------------------------------------------------- event log
+    def _open_event_log(self, session_dir):
+        """Machine-readable protocol timeline on the LSL clock (review reads this)."""
+        self._event_file = open(
+            os.path.join(session_dir, "events.csv"), "w", newline=""
+        )
+        self._event_writer = csv.writer(self._event_file)
+        self._event_writer.writerow(["lsl_timestamp", "kind", "label", "detail"])
+        self._write_event("session", "record_start", self.mode_combo.currentData() or "")
+        # The phase that *starts* the recording already emitted its marker before
+        # this log existed, so re-emit it here — otherwise the baseline phase
+        # (the thing every other phase is compared against) would be missing.
+        if self._current_phase is not None:
+            self._write_event("phase", self._current_phase.name, "active at record start")
+
+    def _close_event_log(self):
+        if self._event_file is not None:
+            self._write_event("session", "record_stop", "")
+            self._event_file.close()
+            self._event_file = None
+            self._event_writer = None
+
+    def _write_event(self, kind, label, detail=""):
+        if self._event_writer is None:
+            return
+        self._event_writer.writerow([f"{_lsl_now():.6f}", kind, label, str(detail)])
+        self._event_file.flush()
 
     def _open_sync_log(self, session_dir):
         self._sync_file = open(

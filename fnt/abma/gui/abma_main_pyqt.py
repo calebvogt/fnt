@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QProgressBar, QFileDialog, QMessageBox, QHeaderView,
     QAbstractItemView, QAction, QSplitter, QStackedWidget, QScrollArea,
     QFrame, QDialog, QListWidget, QDialogButtonBox, QSizePolicy,
-    QToolButton, QSlider, QInputDialog, QMenu,
+    QToolButton, QSlider, QInputDialog, QMenu, QApplication,
 )
 
 from ..core.config import (
@@ -35,6 +35,7 @@ from ..core.sampling import parse_spec
 from ..core.presets import (
     all_presets, save_user_preset, suggest_preset_name,
 )
+from ..core.project import Project, list_projects, default_root
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
 
@@ -130,6 +131,7 @@ class ABMAWindow(QMainWindow):
         self.setWindowTitle("ABMA — Animal Behavior Modeling Arena")
         self.resize(1240, 800)
         self.worker = None
+        self.project = None                  # the open Project, if any
         self._run_t0 = None
         self._last_frame = None
         self._zones = []
@@ -331,8 +333,10 @@ class ABMAWindow(QMainWindow):
         self.view_2d.agent_picked.connect(self._select_agent)
         self.view_2d.object_added.connect(self._on_canvas_add)
         self.view_2d.agent_hovered.connect(self._on_agent_hover)
+        self.view_2d.object_moved.connect(self._on_object_moved)
         if self.view_3d is not None:
             self.view_3d.agent_hovered.connect(self._on_agent_hover)
+            self.view_3d.object_moved.connect(self._on_object_moved)
 
         rlay.addWidget(self.view_stack, 1)   # preview takes the full width
 
@@ -397,11 +401,13 @@ class ABMAWindow(QMainWindow):
         self.btn_agents.setChecked(True)
         self.btn_agents.toggled.connect(self._on_toggle_agents)
         tl.addWidget(self.btn_agents)
+        self._theme_state = "dark"
         self.btn_theme = QToolButton()
-        self.btn_theme.setText("☀")
-        self.btn_theme.setToolTip("Light / dark arena model")
+        self.btn_theme.setText("🌙")
+        self.btn_theme.setToolTip(
+            "Arena theme: dark → light → pure white (for slides)")
         self.btn_theme.setCheckable(True)
-        self.btn_theme.toggled.connect(self._on_toggle_theme)
+        self.btn_theme.clicked.connect(self._cycle_theme)
         tl.addWidget(self.btn_theme)
         self.btn_grass = QToolButton()
         self.btn_grass.setText("🌱")
@@ -455,12 +461,21 @@ class ABMAWindow(QMainWindow):
             if hasattr(v, "set_agents_visible"):
                 v.set_agents_visible(on)
 
-    def _on_toggle_theme(self, on):
-        theme = "light" if on else "dark"
-        self.btn_theme.setText("🌙" if on else "☀")
+    _THEME_ORDER = ["dark", "light", "white"]
+    _THEME_ICON = {"dark": "🌙", "light": "☀", "white": "⬜"}
+    _THEME_NAME = {"dark": "dark", "light": "light",
+                   "white": "pure white (for slides)"}
+
+    def _cycle_theme(self, *_):
+        order = self._THEME_ORDER
+        self._theme_state = order[(order.index(self._theme_state) + 1) % len(order)]
+        self.btn_theme.setText(self._THEME_ICON[self._theme_state])
+        self.btn_theme.setChecked(self._theme_state != "dark")
         for v in self._views():
             if hasattr(v, "set_theme"):
-                v.set_theme(theme)
+                v.set_theme(self._theme_state)
+        self.statusBar().showMessage(
+            f"Arena theme: {self._THEME_NAME[self._theme_state]}", 2500)
 
     def _snap_view(self, name):
         v = self._active_view()
@@ -478,24 +493,34 @@ class ABMAWindow(QMainWindow):
             return [("antennas", self._antennas)]
         return []
 
+    def _antenna_options(self):
+        """Cycle steps: each layout with, then without, its antenna numbers."""
+        opts = []
+        for i, entry in enumerate(self._antenna_sets()):
+            opts.append((i, True, entry[0]))
+            opts.append((i, False, f"{entry[0]} — no labels"))
+        return opts
+
     def _apply_antenna_state(self):
-        """Push the current antenna-layout index to both views + the button."""
+        """Push the current antenna layout + label mode to both views."""
         self.btn_antenna.setChecked(self._antenna_state >= 0)
+        opts = self._antenna_options()
+        if 0 <= self._antenna_state < len(opts):
+            idx, labels, _ = opts[self._antenna_state]
+        else:
+            idx, labels = -1, True
         for v in self._views():
             if hasattr(v, "set_antenna_layout"):
-                v.set_antenna_layout(self._antenna_state)
+                v.set_antenna_layout(idx, labels)
 
     def _cycle_antennas(self, *_):
-        sets = self._antenna_sets()
-        n = len(sets)
-        if n == 0:
-            self._antenna_state = -1
-        elif self._antenna_state >= n - 1:
+        opts = self._antenna_options()
+        if not opts or self._antenna_state >= len(opts) - 1:
             self._antenna_state = -1
         else:
             self._antenna_state += 1
         self._apply_antenna_state()
-        msg = "off" if self._antenna_state < 0 else sets[self._antenna_state][0]
+        msg = "off" if self._antenna_state < 0 else opts[self._antenna_state][2]
         self.statusBar().showMessage(f"UWB antennas: {msg}", 2500)
 
     def _apply_resource_state(self):
@@ -537,6 +562,141 @@ class ABMAWindow(QMainWindow):
             0 if show3d else self.view_stack.count() - 1)
         if self._last_frame is not None:
             self._push_frame(self._active_view(), self._last_frame)
+
+    # ------------------------------------------------------------------ #
+    # Projects — the unit that carries world + population + protocol + runs
+    # ------------------------------------------------------------------ #
+    def show_start_dialog(self):
+        """Title screen. Called by the launcher, never from __init__ (so the
+        window stays constructible headlessly)."""
+        dlg = StartDialog(self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.choice:
+            return
+        kind = dlg.choice[0]
+        if kind == "new":
+            _, preset, name = dlg.choice
+            self._apply_preset(preset)
+            self._new_project(name)
+        else:
+            self._open_project(dlg.choice[1])
+
+    def _new_project(self, name):
+        try:
+            cfg = self._collect_config()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid configuration", str(e))
+            return
+        cfg.name = name
+        try:
+            self.project = Project.create(name, cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "Could not create project", str(e))
+            return
+        self.in_name.setText(name)
+        self._update_title()
+        self.statusBar().showMessage(f"Project created: {self.project.path}", 6000)
+
+    def _open_project(self, path):
+        try:
+            proj = Project.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Could not open project", str(e))
+            return
+        self.project = proj
+        if proj.config is not None:
+            self._load_config(proj.config)
+        self._update_title()
+        n = len(proj.runs())
+        self.statusBar().showMessage(
+            f"Opened '{proj.name}' — {n} run(s) in history", 6000)
+
+    def _save_project(self):
+        if self.project is None:
+            name, ok = QInputDialog.getText(
+                self, "Save as project", "Project name:",
+                text=self.in_name.text().strip() or "experiment")
+            if not ok or not name.strip():
+                return
+            self._new_project(name.strip())
+            return
+        try:
+            self.project.config = self._collect_config()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid configuration", str(e))
+            return
+        self.project.save()
+        self.statusBar().showMessage(f"Saved {self.project.name}", 4000)
+
+    def _run_study_dialog(self):
+        """Sweep one parameter across levels and compare the arms."""
+        try:
+            base = self._collect_config()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid configuration", str(e))
+            return
+        path, ok = QInputDialog.getText(
+            self, "Run study — 1/3: what to vary",
+            "Override path ([*] = all groups):",
+            text="groups[*].traits.smell_ability")
+        if not ok or not path.strip():
+            return
+        levels, ok = QInputDialog.getText(
+            self, "Run study — 2/3: conditions",
+            "name=value, comma separated:", text="intact=1.0, anosmic=0.0")
+        if not ok or not levels.strip():
+            return
+        reps, ok = QInputDialog.getInt(
+            self, "Run study — 3/3: replicates",
+            "Replicates per condition:", 4, 1, 50)
+        if not ok:
+            return
+        try:
+            lv = {}
+            for part in levels.split(","):
+                k, v = part.split("=")
+                try:
+                    lv[k.strip()] = float(v)
+                except ValueError:
+                    lv[k.strip()] = v.strip()
+            if len(lv) < 2:
+                raise ValueError("need at least two conditions")
+            from ..core.study import lesion_study, run_study
+            study = lesion_study(f"{base.name}_study", base, path.strip(),
+                                 lv, replicates=reps)
+            study.config_for(0)                 # fail fast on a bad path
+        except Exception as e:
+            QMessageBox.warning(self, "Could not build study", str(e))
+            return
+
+        root = (self.project.path if self.project
+                else (self.in_outdir.text().strip() or os.getcwd()))
+        sdir = os.path.join(root, "studies",
+                            f"{time.strftime('%Y%m%d-%H%M')}_{path.split('.')[-1]}")
+        n_runs = len(lv) * reps
+        if QMessageBox.question(
+                self, "Run study?",
+                f"{len(lv)} conditions × {reps} replicates = {n_runs} trials\n"
+                f"varying {path}\n\nOutput: {sdir}") != QMessageBox.Yes:
+            return
+        self._append_log(f"Study: {len(lv)} conditions × {reps} replicates…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            res = run_study(study, sdir, log_cb=self._append_log)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Study failed", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self._project_dir = sdir
+        msg = f"Study complete — {n_runs} trials.\n\n{sdir}"
+        if res.get("comparison_csv"):
+            msg += "\n\nresults/metrics_long.csv  (tidy, for R)\nresults/comparison.csv"
+        QMessageBox.information(self, "Study complete", msg)
+
+    def _update_title(self):
+        base = "ABMA — Animal Behavior Modeling Arena"
+        self.setWindowTitle(f"{self.project.name} — {base}"
+                            if self.project else base)
 
     def _open_preset_dialog(self):
         dlg = ArenaPresetDialog(self)
@@ -584,6 +744,10 @@ class ABMAWindow(QMainWindow):
             preset_menu.addAction(act)
         m.addSeparator()
         for text, shortcut, slot in [
+            ("Start screen…", None, self.show_start_dialog),
+            ("&Save Project", "Ctrl+Shift+S", self._save_project),
+            ("Run &Study (compare conditions)…", None, self._run_study_dialog),
+            (None, None, None),
             ("&New (blank experiment)", "Ctrl+N",
              lambda: self._load_config(blank_experiment())),
             (None, None, None),
@@ -693,10 +857,20 @@ class ABMAWindow(QMainWindow):
                          ("Arena height", self.in_height),
                          ("Boundary", self.in_boundary)]:
             form.addRow(lab, wdg)
+        self.in_snap = _dspin(0.0, 5.0, 0.0, 0.05, " m")
+        self.in_snap.setToolTip(
+            "Snap while dragging objects (0 = free). Editing aid only — the "
+            "simulation itself stays continuous.")
+        self.in_snap.valueChanged.connect(lambda _: self._apply_edit_mode())
+        form.addRow("Snap to grid", self.in_snap)
         self.in_width.valueChanged.connect(self._on_arena_edit)
         self.in_height.valueChanged.connect(self._on_arena_edit)
         self.in_boundary.currentTextChanged.connect(self._on_arena_edit)
         ed.addLayout(form)
+        hint = QLabel("Drag objects in the preview to move them.")
+        hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        hint.setWordWrap(True)
+        ed.addWidget(hint)
 
         add_box = QGroupBox("Add object (then click the arena)")
         ab = QHBoxLayout(add_box)
@@ -767,6 +941,35 @@ class ABMAWindow(QMainWindow):
     def _toggle_arena_editor(self, on):
         self._arena_editor.setVisible(on)
         self.btn_modify.setText("Hide arena editor" if on else "Modify arena")
+        self._apply_edit_mode()
+
+    def _apply_edit_mode(self):
+        """Objects are only draggable while the arena editor is open."""
+        on = self.btn_modify.isChecked() and not self._running
+        snap = self.in_snap.value() if hasattr(self, "in_snap") else 0.0
+        for v in self._views():
+            if hasattr(v, "set_edit_layout"):
+                v.set_edit_layout(on, snap)
+
+    def _on_object_moved(self, kind, index, x, y):
+        """Live drag from either view -> update the arena and redraw."""
+        x = min(max(float(x), 0.0), self.in_width.value())
+        y = min(max(float(y), 0.0), self.in_height.value())
+        attr = {"hut": "_huts", "water": "_water_towers", "pole": "_poles",
+                "zone": "_resource_zones"}.get(kind)
+        if attr is not None:
+            lst = getattr(self, attr, [])
+            if 0 <= index < len(lst):
+                lst[index].x, lst[index].y = x, y
+        elif kind == "object":                    # lives in the object table
+            t = self.obj_table
+            if 0 <= index < t.rowCount():
+                t.blockSignals(True)
+                t.item(index, 1).setText(f"{x:.3f}")
+                t.item(index, 2).setText(f"{y:.3f}")
+                t.blockSignals(False)
+        self._mark_arena_dirty()
+        self._refresh_arena()
 
     def _on_arena_edit(self, *_):
         self._refresh_arena()
@@ -1376,7 +1579,7 @@ class ABMAWindow(QMainWindow):
         if hasattr(self, "btn_antenna"):
             sets = arena.antenna_sets() if hasattr(arena, "antenna_sets") else []
             self.btn_antenna.setEnabled(bool(sets))
-            if self._antenna_state >= len(sets):
+            if self._antenna_state >= 2 * len(sets):     # 2 steps per layout
                 self._antenna_state = -1
             self._apply_antenna_state()
         self._rebuild_preview()
@@ -1449,14 +1652,22 @@ class ABMAWindow(QMainWindow):
         if box.exec_() != QMessageBox.Ok:
             return
 
-        parent = self.in_outdir.text().strip() or os.getcwd()
-        project_dir = os.path.join(parent, cfg.name)
-        if os.path.exists(os.path.join(project_dir, "data")):
-            if QMessageBox.question(
-                    self, "Overwrite?",
-                    f"{project_dir} already has data. Overwrite trials?"
-            ) != QMessageBox.Yes:
-                return
+        # Runs are append-only: each execution gets its own folder inside the
+        # project, so history is never overwritten and every run stays
+        # reproducible from its own config.json.
+        if self.project is not None:
+            self.project.config = cfg          # keep the working config current
+            self.project.save()
+            project_dir = self.project.new_run_dir()
+        else:
+            parent = self.in_outdir.text().strip() or os.getcwd()
+            project_dir = os.path.join(parent, cfg.name)
+            if os.path.exists(os.path.join(project_dir, "data")):
+                if QMessageBox.question(
+                        self, "Overwrite?",
+                        f"{project_dir} already has data. Overwrite trials?"
+                ) != QMessageBox.Yes:
+                    return
         self._project_dir = project_dir
         self._run_cfg = cfg
         self._run_t0 = time.time()
@@ -1723,6 +1934,107 @@ class ArenaPresetDialog(QDialog):
 # --------------------------------------------------------------------------- #
 # Collapsible section (accordion-style step)
 # --------------------------------------------------------------------------- #
+class StartDialog(QDialog):
+    """Title screen: start a new project, or reopen an existing one.
+
+    A project is the unit that carries the world, the population, the protocol
+    and every run made from it — so "load project" and "reproduce this
+    experiment" are the same action.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ABMA")
+        self.setMinimumWidth(620)
+        self.choice = None                  # ("new", preset) | ("open", path)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        title = QLabel("Animal Behavior Modeling Arena")
+        title.setStyleSheet("font-size:22px; font-weight:bold; color:#e9edf2;")
+        lay.addWidget(title)
+        sub = QLabel("Build a world, populate it, run the experiment.")
+        sub.setStyleSheet("color:#8a9099;")
+        lay.addWidget(sub)
+
+        # ---- new project ---------------------------------------------- #
+        newbox = QGroupBox("New project")
+        nl = QVBoxLayout(newbox)
+        nl.addWidget(QLabel("Start from:"))
+        self.preset_list = QListWidget()
+        self._presets = all_presets()
+        for p in self._presets:
+            self.preset_list.addItem(
+                p.name if p.builtin else f"{p.name}  (saved)")
+        self.preset_list.setCurrentRow(0)
+        self.preset_list.setMaximumHeight(120)
+        self.preset_list.itemDoubleClicked.connect(lambda _: self._new())
+        nl.addWidget(self.preset_list)
+        b_new = QPushButton("＋  Create project")
+        b_new.setObjectName("accept_btn")
+        b_new.clicked.connect(self._new)
+        nl.addWidget(b_new)
+        lay.addWidget(newbox)
+
+        # ---- open existing --------------------------------------------- #
+        openbox = QGroupBox("Open project")
+        ol = QVBoxLayout(openbox)
+        self.proj_list = QListWidget()
+        self._rows = list_projects()
+        for r in self._rows:
+            self.proj_list.addItem(f"{r['name']}   —   {r['summary']}"
+                                   f"   ·   {r['modified'][:10]}")
+        if self._rows:
+            self.proj_list.setCurrentRow(0)
+            self.proj_list.itemDoubleClicked.connect(lambda _: self._open())
+        else:
+            self.proj_list.addItem("No projects yet — create one above.")
+            self.proj_list.setEnabled(False)
+        self.proj_list.setMaximumHeight(140)
+        ol.addWidget(self.proj_list)
+        orow = QHBoxLayout()
+        b_open = QPushButton("Open selected")
+        b_open.setEnabled(bool(self._rows))
+        b_open.clicked.connect(self._open)
+        b_browse = QPushButton("Browse…")
+        b_browse.clicked.connect(self._browse)
+        orow.addWidget(b_open)
+        orow.addWidget(b_browse)
+        orow.addStretch()
+        ol.addLayout(orow)
+        lay.addWidget(openbox)
+
+        skip = QPushButton("Skip — just open the editor")
+        skip.setToolTip("Work without a project (runs won't be kept in history)")
+        skip.clicked.connect(self.reject)
+        lay.addWidget(skip)
+
+    def _new(self):
+        r = self.preset_list.currentRow()
+        if not (0 <= r < len(self._presets)):
+            return
+        name, ok = QInputDialog.getText(
+            self, "New project", "Project name:",
+            text=self._presets[r].abbr or "experiment")
+        if not ok or not name.strip():
+            return
+        self.choice = ("new", self._presets[r], name.strip())
+        self.accept()
+
+    def _open(self):
+        r = self.proj_list.currentRow()
+        if 0 <= r < len(self._rows):
+            self.choice = ("open", self._rows[r]["path"])
+            self.accept()
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Select an ABMA project folder", default_root())
+        if d:
+            self.choice = ("open", d)
+            self.accept()
+
+
 class CornerPickDialog(QDialog):
     """Click the four inner corners of the enclosure on an overhead photo."""
 

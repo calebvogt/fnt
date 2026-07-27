@@ -36,6 +36,18 @@ class RuleBasedPolicy(Policy):
     def decide(self, sim, elapsed_s: float):
         P = sim.P
         n = sim.n
+        # config-driven weights (fall back to the class defaults)
+        pp = getattr(sim.cfg, "policy", None)
+        if pp is not None:
+            self.k_home = pp.k_home
+            self.k_resource = pp.k_resource
+            self.k_social = pp.k_social
+            self.k_territory = pp.k_territory
+            self.k_random = pp.k_random
+            self.perception_r = pp.perception_r
+            thr = pp.forage_threshold
+        else:
+            thr = 0.5
 
         # --- home-range spring ---
         hv = sim.home - P
@@ -46,12 +58,19 @@ class RuleBasedPolicy(Policy):
         desired = w_home[:, None] * home_dir
 
         # --- resource seeking ---
-        need_food = np.clip(sim.hunger - 0.5, 0, 1)
-        need_water = np.clip(sim.thirst - 0.5, 0, 1)
-        if sim.food.shape[0]:
-            desired += self.k_resource * sim._seek(P, sim.food, need_food)
-        if sim.water.shape[0]:
-            desired += self.k_resource * sim._seek(P, sim.water, need_water)
+        span = max(1e-6, 1.0 - thr)
+        need_food = np.clip((sim.hunger - thr) / span, 0, 1)
+        need_water = np.clip((sim.thirst - thr) / span, 0, 1)
+        # a hungry animal suspends home fidelity to make a foraging trip
+        rel = getattr(pp, "forage_releases_home", 0.0) if pp is not None else 0.0
+        desired *= (1.0 - rel * np.maximum(need_food, need_water))[:, None]
+        # steer for the access point (a walled zone's doorway), not the centre
+        food_t = getattr(sim, "food_seek", sim.food)
+        water_t = getattr(sim, "water_seek", sim.water)
+        if food_t.shape[0]:
+            desired += self.k_resource * sim._seek(P, food_t, need_food)
+        if water_t.shape[0]:
+            desired += self.k_resource * sim._seek(P, water_t, need_water)
 
         # --- pairwise social / territorial forces (olfaction-gated) ---
         diff = P[None, :, :] - P[:, None, :]

@@ -594,6 +594,7 @@ class FNTMainWindow(QMainWindow):
 
             self.abma_window = ABMAWindow()
             self.abma_window.show()
+            self.abma_window.show_start_dialog()   # New / Open project
         except Exception as e:
             QMessageBox.critical(self, "Error", f"ABMA Designer failed: {str(e)}")
 
@@ -850,8 +851,8 @@ class FNTMainWindow(QMainWindow):
             )
             return
         try:
+            # MuseStudio ships its own theme — don't inherit the launcher's.
             self.musestudio_window = MuseStudioWindow()
-            self.musestudio_window.setStyleSheet(self.styleSheet())
             self.musestudio_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"MuseStudio failed: {str(e)}")
@@ -986,10 +987,19 @@ class FNTMainWindow(QMainWindow):
         """Launch video trimming tool"""
         # PyQt dialogs must run in main thread, not worker thread
         try:
-            from fnt.videoProcessing.video_trim_pyqt import video_trim
-            video_trim()
+            from fnt.videoProcessing.video_trim_pyqt import VideoTrimTool
+
+            # Create a new instance each time to allow multiple windows
+            video_trim_window = VideoTrimTool()
+            video_trim_window.show()
+
+            # Store reference to prevent garbage collection (list allows multiple)
+            if not hasattr(self, 'video_trim_windows'):
+                self.video_trim_windows = []
+            self.video_trim_windows.append(video_trim_window)
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Video trimming failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to launch video trim tool: {str(e)}")
     
     def run_video_concatenate(self):
         """Launch video concatenation tool with PyQt interface"""

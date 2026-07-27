@@ -35,6 +35,36 @@ from fnt.uwb.uwb_preview_canvas import (
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR)
 
 
+# Columns the processing pipeline actually consumes. Wiser tables carry ~20
+# columns, most of them unused TEXT fields (zones, alias, groupnames,
+# arenaname) that dominate DataFrame memory: reading all of them for one Echo
+# tag cost 5.0 s / 387 MB versus 1.6 s / 37 MB for just these five.
+#
+# This applies only to the *processed* reads (preview and the smoothed /
+# downsampled exports). The raw CSV export still does SELECT * so the
+# full-fidelity dump of the database is preserved untouched.
+PROCESSING_COLUMNS = ("shortid", "timestamp", "location_x", "location_y",
+                      "battery_voltage")
+# Without these the pipeline cannot run at all, so a table missing any of them
+# falls back to SELECT * rather than failing on a missing column.
+REQUIRED_COLUMNS = ("shortid", "timestamp", "location_x", "location_y")
+
+
+def processing_select_clause(conn, table_name):
+    """SELECT list covering PROCESSING_COLUMNS present in ``table_name``.
+
+    Intersects with the real schema so tables written by different Wiser
+    versions still work, and degrades to ``*`` if anything essential is absent.
+    """
+    try:
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    except Exception:
+        return "*"
+    if not have or any(c not in have for c in REQUIRED_COLUMNS):
+        return "*"
+    return ", ".join(c for c in PROCESSING_COLUMNS if c in have)
+
+
 def forward_backward_ewma(series, span):
     """Zero-phase exponential weighted moving average (filtfilt-style cascade).
 
@@ -64,8 +94,10 @@ class PreviewIndexBuilder(QThread):
     reads every row for a tag and is a full scan either way.
     """
     progress = pyqtSignal(str)
-    done = pyqtSignal(str)      # path to the indexed copy
-    failed = pyqtSignal(str)
+    # (source_db_path, indexed_copy_path) — the source is carried through so the
+    # receiver can tell whether the database it was built for is still current.
+    done = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str)   # (source_db_path, error)
 
     INDEX_NAME = "idx_fnt_shortid_ts"
 
@@ -111,7 +143,7 @@ class PreviewIndexBuilder(QThread):
                              "altered. Safe to delete; it will be rebuilt on "
                              "demand."),
                 }, f, indent=4)
-            self.done.emit(self.dst_path)
+            self.done.emit(self.src_path, self.dst_path)
         except Exception as e:
             for p in (tmp,):
                 try:
@@ -119,7 +151,7 @@ class PreviewIndexBuilder(QThread):
                         os.remove(p)
                 except Exception:
                     pass
-            self.failed.emit(str(e))
+            self.failed.emit(self.src_path, str(e))
 
 
 class PreviewChunkLoader(QThread):
@@ -150,9 +182,10 @@ class PreviewChunkLoader(QThread):
             # The connection must be created in this thread; sqlite3 objects
             # cannot be shared across threads.
             conn = sqlite3.connect(self.db_path)
+            cols = processing_select_clause(conn, self.table_name)
             placeholders = ",".join(["?"] * len(self.tags))
             df = pd.read_sql_query(
-                f"SELECT * FROM {self.table_name} "
+                f"SELECT {cols} FROM {self.table_name} "
                 f"WHERE shortid IN ({placeholders}) AND timestamp BETWEEN ? AND ? "
                 f"ORDER BY shortid, timestamp",
                 conn, params=self.tags + [self.start_ms, self.end_ms])
@@ -493,7 +526,8 @@ class PlotSaverWorker(QThread):
                 
                 # Connect to database
                 conn = sqlite3.connect(self.db_path)
-                query = f"SELECT * FROM {self.table_name}"
+                query = (f"SELECT {processing_select_clause(conn, self.table_name)} "
+                         f"FROM {self.table_name}")
                 data = pd.read_sql_query(query, conn)
                 conn.close()
                 
@@ -1445,6 +1479,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_t1 = None               # last ping, epoch ms
         self.preview_playhead_ms = 0
         self._timeline_guard = False         # suppress slider feedback loops
+        self._tag_selection_guard = False    # suppress bulk checkbox churn
         self.preview_db_path = None          # indexed copy, or the original
         self.preview_index_builder = None
 
@@ -1537,9 +1572,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 summary_data['Parameter'].append('')
                 summary_data['Value'].append('')
                 
-                summary_data['Parameter'].append('--- Filtering Statistics ---')
+                summary_data['Parameter'].append('--- Filtering Statistics (all tags) ---')
                 summary_data['Value'].append('')
-                
+
+                summary_data['Parameter'].append('Tags Processed')
+                summary_data['Value'].append(self.filter_stats.get('tags_processed', 'N/A'))
+
                 summary_data['Parameter'].append('Initial Data Points')
                 summary_data['Value'].append(self.filter_stats.get('initial_count', 'N/A'))
                 
@@ -1719,6 +1757,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_scrub_timer = QTimer(self)
         self.preview_scrub_timer.setSingleShot(True)
         self.preview_scrub_timer.timeout.connect(self._on_scrub_settled)
+
+        # Select All/None and config loading toggle every tag checkbox in a
+        # burst; coalesce them into one preview rebuild.
+        self.preview_tag_timer = QTimer(self)
+        self.preview_tag_timer.setSingleShot(True)
+        self.preview_tag_timer.timeout.connect(self._apply_tag_selection_change)
 
         # Anything upstream of the rendered frames invalidates cached chunks,
         # otherwise the pane would keep showing data processed under the old
@@ -2747,6 +2791,52 @@ class UWBQuickVisualizationWindow(QWidget):
     def selected_preview_tags(self):
         return [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
 
+    def on_tag_selection_changed(self, _state=None):
+        """Tag selection changed — refresh the preview for the new tag set.
+
+        Coalesced through a timer because Select All/None and config loading
+        toggle every checkbox in a burst, and each one emits separately.
+        """
+        if self._tag_selection_guard:
+            return
+        if not (getattr(self, "chk_enable_preview", None)
+                and self.chk_enable_preview.isChecked()):
+            return
+        self.preview_tag_timer.start(150)
+
+    def _apply_tag_selection_change(self):
+        """Rebuild the timeline and cached chunks for the current tag set."""
+        if not self.chk_enable_preview.isChecked():
+            return
+        tags = self.selected_preview_tags()
+        if not tags:
+            self.stop_preview_playback()
+            self.preview_cache.clear()
+            self.preview_x = None
+            self._update_cache_label()
+            self.lbl_preview_status.setText("No tags selected")
+            self.preview_canvas_2d.clear()
+            if self.preview_canvas_3d is not None:
+                self.preview_canvas_3d.clear()
+            return
+
+        # Switching databases with the preview already open lands here (config
+        # load re-checks the boxes), and that path never runs the enable
+        # handler, so make sure the new database gets its indexed copy.
+        if self.preview_db_path is None:
+            self.ensure_preview_index_db()
+
+        # The recording bounds are per-tag, so adding or removing a tag can
+        # change the span the timeline has to cover.
+        keep = self.preview_playhead_ms
+        if self.init_preview_timeline():
+            if self.preview_t0 <= keep <= self.preview_t1:
+                self.preview_playhead_ms = keep     # stay where the user was
+            else:
+                self.preview_playhead_ms = self.preview_t0
+            self._sync_timeline_to_playhead()
+        self.invalidate_preview_cache()
+
     def invalidate_preview_cache(self):
         """Drop cached chunks. Called whenever anything upstream of the frames
         changes — filtering, smoothing, timezone, tag selection, chunk size —
@@ -2832,9 +2922,25 @@ class UWBQuickVisualizationWindow(QWidget):
                                     self.table_name, tags, start, end, idx)
         loader.loaded.connect(self._on_chunk_loaded)
         loader.failed.connect(self._on_chunk_failed)
-        loader.finished.connect(lambda i=idx: self.preview_inflight.pop(i, None))
+        # The inflight dict holds the only strong reference to the thread.
+        # Dropping it inside the finished handler can free the QThread during
+        # signal emission ("Destroyed while thread is still running"), so defer
+        # the drop to the next event-loop turn, once emission has unwound.
+        loader.finished.connect(lambda i=idx: QTimer.singleShot(
+            0, lambda: self._retire_loader(i)))
         self.preview_inflight[idx] = loader
         loader.start()
+
+    def _retire_loader(self, idx):
+        """Release a finished loader. Safe: runs outside the finished signal."""
+        loader = self.preview_inflight.get(idx)
+        if loader is None:
+            return
+        if not loader.isFinished():
+            # Slot raced ahead of the thread actually stopping; try again.
+            QTimer.singleShot(50, lambda: self._retire_loader(idx))
+            return
+        self.preview_inflight.pop(idx, None)
 
     def _on_chunk_failed(self, idx, err):
         self.log_message(f"Preview chunk {idx} failed: {err}")
@@ -2916,7 +3022,9 @@ class UWBQuickVisualizationWindow(QWidget):
             g['raw_x'] = g['location_x']
             g['raw_y'] = g['location_y']
             if do_filter:
-                g = self.apply_filters_to_data(g)
+                # collect_stats=False: preview scrubbing must not overwrite the
+                # figures an export writes into runSummary.csv
+                g = self.apply_filters_to_data(g, collect_stats=False)
             if smoothing_method != "None" and len(g):
                 g = self.apply_smoothing_to_data(g, smoothing_method)
             if len(g):
@@ -3223,11 +3331,27 @@ class UWBQuickVisualizationWindow(QWidget):
         self._set_index_status("Fast index: building…", "#cc9900")
 
         b = PreviewIndexBuilder(self.db_path, self.table_name, copy_path, meta_path)
-        b.progress.connect(lambda m: self._set_index_status(f"Fast index: {m}", "#cc9900"))
+        b.progress.connect(self._on_index_progress)
         b.done.connect(self._on_index_ready)
         b.failed.connect(self._on_index_failed)
         self.preview_index_builder = b
         b.start()
+
+    def _index_build_is_current(self, src_path):
+        """Is a build result still for the database the tool is showing?
+
+        A build takes seconds; the user can switch databases in that time. Any
+        result for a different source must be discarded, or the preview would
+        silently read another trial's data.
+        """
+        return bool(self.db_path) and os.path.abspath(src_path) == os.path.abspath(self.db_path)
+
+    def _on_index_progress(self, msg):
+        if self.preview_index_builder is None:
+            return
+        if not self._index_build_is_current(self.preview_index_builder.src_path):
+            return
+        self._set_index_status(f"Fast index: {msg}", "#cc9900")
 
     def _set_index_status(self, text, color):
         if hasattr(self, "btn_build_index"):
@@ -3235,7 +3359,16 @@ class UWBQuickVisualizationWindow(QWidget):
             self.btn_build_index.setStyleSheet(
                 f"padding: 4px; font-size: 10px; color: {color};")
 
-    def _on_index_ready(self, path):
+    def _on_index_ready(self, src_path, path):
+        self.preview_index_builder = None
+        if not self._index_build_is_current(src_path):
+            # The user moved to another database while this was building. The
+            # copy on disk is still valid for its own database and will be
+            # picked up if they return to it — it just must not be adopted now.
+            self.log_message(
+                f"Indexed copy for {os.path.basename(src_path)} finished after "
+                f"the database changed — not used for the current selection.")
+            return
         self.preview_db_path = path
         mb = os.path.getsize(path) / 1e6
         self._set_index_status("Fast index: ready ✓", "#00aa00")
@@ -3245,7 +3378,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # Cached chunks came from the unindexed original but are byte-identical
         # in content, so they stay valid — only future reads get faster.
 
-    def _on_index_failed(self, err):
+    def _on_index_failed(self, src_path, err):
+        self.preview_index_builder = None
+        if not self._index_build_is_current(src_path):
+            return
         self._set_index_status("Fast index: unavailable (using original)", "#cc5555")
         self.log_message(
             f"Could not build indexed copy ({err}). Preview still works, "
@@ -3308,6 +3444,13 @@ class UWBQuickVisualizationWindow(QWidget):
         # Drop all cached preview chunks so nothing leaks across databases
         self.stop_preview_playback()
         self.preview_cache.clear()
+        # Let in-flight reads finish before releasing them. Clearing the dict
+        # outright would drop the last reference to a running QThread and abort
+        # the process. These are short windowed reads (~5 ms indexed, ~0.4 s
+        # unindexed), so the wait is not user-visible.
+        for loader in list(self.preview_inflight.values()):
+            if loader.isRunning():
+                loader.wait(5000)
         self.preview_inflight.clear()
         self.preview_current_chunk = None
         self.preview_pending_current = None
@@ -4071,6 +4214,9 @@ class UWBQuickVisualizationWindow(QWidget):
                 cb = QCheckBox(f"HexID {hex_id}")
             cb.setChecked(True)
             cb.stateChanged.connect(self.update_identity_button_state)
+            # The preview's frame columns and its timeline range both derive
+            # from the tag selection, so a change has to rebuild both.
+            cb.stateChanged.connect(self.on_tag_selection_changed)
             self.tag_checkboxes[tag] = cb
             self.tag_layout.addWidget(cb)
         
@@ -4238,7 +4384,11 @@ class UWBQuickVisualizationWindow(QWidget):
         
         return data
     
-    def apply_filters_to_data(self, data):
+    def reset_filter_stats(self):
+        """Clear accumulated filter statistics at the start of an export run."""
+        self.filter_stats = {}
+
+    def apply_filters_to_data(self, data, collect_stats=True):
         """Apply velocity and jump filtering with time window grouping to any dataframe"""
         initial_count = len(data)
         removed_velocity = 0
@@ -4294,17 +4444,24 @@ class UWBQuickVisualizationWindow(QWidget):
         if initial_count != final_count:
             self.log_message(f"  Total filtered: {initial_count - final_count} points ({100*(initial_count-final_count)/initial_count:.1f}%)")
         
-        # Store stats for summary report
-        if not hasattr(self, 'filter_stats'):
-            self.filter_stats = {}
-        self.filter_stats = {
-            'initial_count': initial_count,
-            'removed_velocity': removed_velocity,
-            'removed_jump': removed_jump,
-            'final_count': final_count,
-            'percent_filtered': 100 * (initial_count - final_count) / initial_count if initial_count > 0 else 0
-        }
-        
+        # Accumulate stats for the run summary. This runs once per tag during
+        # export, so the totals must sum across calls — replacing them would
+        # report only the last tag while labelling it as the whole run.
+        # The preview passes collect_stats=False so scrubbing cannot pollute
+        # an export's figures.
+        if collect_stats:
+            s = getattr(self, 'filter_stats', None) or {}
+            self.filter_stats = {
+                'initial_count': s.get('initial_count', 0) + initial_count,
+                'removed_velocity': s.get('removed_velocity', 0) + removed_velocity,
+                'removed_jump': s.get('removed_jump', 0) + removed_jump,
+                'final_count': s.get('final_count', 0) + final_count,
+                'tags_processed': s.get('tags_processed', 0) + 1,
+            }
+            tot = self.filter_stats['initial_count']
+            self.filter_stats['percent_filtered'] = (
+                100 * (tot - self.filter_stats['final_count']) / tot if tot else 0)
+
         return data
 
     def get_config_dict(self):
@@ -5387,8 +5544,22 @@ class UWBQuickVisualizationWindow(QWidget):
                 smoothing_method = self.get_smoothing_method()
                 do_filter = self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked()
 
+                # Filter statistics accumulate across tags; without this reset
+                # the run summary would report whatever the last call left
+                # behind (a preview chunk, or a previous export).
+                self.reset_filter_stats()
+
                 processed_chunks = []
                 conn = sqlite3.connect(self.db_path)
+
+                # Read only the columns the pipeline uses. The unused TEXT
+                # columns dominate memory, so this is the difference between
+                # ~390 MB and ~37 MB of transient DataFrame per tag.
+                proc_cols = processing_select_clause(conn, self.table_name)
+                if proc_cols != "*":
+                    self.log_message(
+                        f"Reading columns [{proc_cols}] for processing; "
+                        f"the raw CSV still contains every database column.")
 
                 for i, tag in enumerate(selected_tags):
                     if self.export_cancelled:
@@ -5401,7 +5572,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     QApplication.processEvents()
 
                     tag_data = pd.read_sql_query(
-                        f"SELECT * FROM {self.table_name} WHERE shortid = ?",
+                        f"SELECT {proc_cols} FROM {self.table_name} WHERE shortid = ?",
                         conn, params=(tag,))
 
                     if len(tag_data) == 0:

@@ -138,6 +138,10 @@ def analyze_trial(traj_csv: str, out_dir: str | None = None,
         summary["mean_final_mass_g"] = round(float(last["mass"].mean()), 2)
         summary["mean_health"] = round(float(cd["health"].mean()), 1)
         summary["mean_stress"] = round(float(cd["stress"].mean()), 1)
+        # foraging success: are the animals actually getting fed and watered?
+        for col in ("hunger", "thirst", "energy"):
+            if col in cd:
+                summary[f"mean_{col}"] = round(float(cd[col].mean()), 3)
     return summary
 
 

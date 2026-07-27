@@ -42,19 +42,26 @@ _THEMES = {
         day_bg=(0.13, 0.15, 0.18, 1.0), night_bg=(0.04, 0.05, 0.07, 1.0),
         floor=(0.12, 0.14, 0.17, 1.0), grid=(1, 1, 1, 0.12),
         rect=(0.60, 0.60, 0.60, 1.0), wall=(0.60, 0.70, 0.82, 0.10),
-        pole=(0.46, 0.34, 0.23, 1.0),
+        wall_edge=(0.50, 0.60, 0.72, 0.35), pole=(0.46, 0.34, 0.23, 1.0),
         compass_n=(235, 90, 90, 255), compass=(220, 224, 230, 255),
         ant_text=(255, 235, 140, 255),
         meas_line=(0.30, 0.82, 0.92, 0.5), meas_text=(120, 210, 230, 255)),
+    # light mode: white surround, tan walls, and the same dark ground as dark
+    # mode — so on-floor marks (grid, outline, measure lines) stay light.
     "light": dict(
-        day_bg=(0.95, 0.96, 0.97, 1.0), night_bg=(0.78, 0.81, 0.85, 1.0),
-        floor=(0.86, 0.88, 0.90, 1.0), grid=(0, 0, 0, 0.18),
-        rect=(0.25, 0.27, 0.30, 1.0), wall=(0.30, 0.42, 0.60, 0.16),
-        pole=(0.42, 0.30, 0.19, 1.0),
+        day_bg=(1.0, 1.0, 1.0, 1.0), night_bg=(0.93, 0.94, 0.96, 1.0),
+        floor=(0.12, 0.14, 0.17, 1.0), grid=(1, 1, 1, 0.12),
+        rect=(0.60, 0.60, 0.60, 1.0), wall=(0.80, 0.68, 0.46, 0.32),
+        wall_edge=(0.55, 0.44, 0.26, 0.60), pole=(0.46, 0.34, 0.23, 1.0),
         compass_n=(190, 45, 40, 255), compass=(45, 50, 58, 255),
-        ant_text=(120, 78, 0, 255),
-        meas_line=(0.05, 0.42, 0.55, 0.65), meas_text=(12, 95, 125, 255)),
+        ant_text=(150, 95, 0, 255),
+        meas_line=(0.30, 0.82, 0.92, 0.55), meas_text=(12, 95, 125, 255)),
 }
+# "white": light, but the background stays pure white regardless of the
+# day/night cycle — for screenshots dropped onto white slides.
+_THEMES["white"] = dict(_THEMES["light"],
+                        day_bg=(1.0, 1.0, 1.0, 1.0),
+                        night_bg=(1.0, 1.0, 1.0, 1.0))
 
 # mouse body geometry (metres): body box L×W×H, head sphere radius
 _BODY_L, _BODY_W, _BODY_H = 0.09, 0.035, 0.03
@@ -108,6 +115,7 @@ class Arena3DView(gl.GLViewWidget):
     object_added = pyqtSignal(object)   # emitted when placing on the floor
     agent_picked = pyqtSignal(int)      # click: agent index, or -1 for empty
     agent_hovered = pyqtSignal(int)     # hover: agent index, or -1
+    object_moved = pyqtSignal(str, int, float, float)   # kind, index, x, y
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -126,6 +134,9 @@ class Arena3DView(gl.GLViewWidget):
         self._n = 0
         self._agents_visible = True
         self._arm_kind = None
+        self._edit_layout = False       # drag world objects (arena editor open)
+        self._snap = 0.0                # editing snap in metres; 0 = free
+        self._drag = None
 
         self._chamber_items = []
         self._chambers = [(0.0, 0.0)]
@@ -133,6 +144,7 @@ class Arena3DView(gl.GLViewWidget):
         self._grass_on = False
         self._antenna_items = []
         self._antenna_idx = -1          # -1 = off; else index into layouts
+        self._antenna_labels = True     # draw the floating antenna numbers
         self._compass_items = []
         self._measure_items = []
         self._measure_mode = None
@@ -292,9 +304,14 @@ class Arena3DView(gl.GLViewWidget):
     def antenna_sets(self):
         return self.arena.antenna_sets() if self.arena is not None else []
 
-    def set_antenna_layout(self, idx):
-        """idx: -1 = off, else index into the arena's antenna layouts."""
+    def set_antenna_layout(self, idx, labels=True):
+        """idx: -1 = off, else index into the arena's antenna layouts.
+
+        ``labels`` draws the floating antenna numbers; turn it off for a clean
+        view of the arena and hardware alone.
+        """
         self._antenna_idx = idx
+        self._antenna_labels = bool(labels)
         self._build_antennas()
 
     def _build_antennas(self):
@@ -309,7 +326,8 @@ class Arena3DView(gl.GLViewWidget):
             return
         _, boxes, cables = sets[idx]
         cmap = gateway_color_map(cables)
-        has_text = hasattr(gl, "GLTextItem")
+        has_text = hasattr(gl, "GLTextItem") and getattr(
+            self, "_antenna_labels", True)
         font = QFont("Helvetica", 20)
         font.setBold(True)
         for dx, dy in self._chambers:
@@ -641,7 +659,7 @@ class Arena3DView(gl.GLViewWidget):
                 slab = gl.GLMeshItem(meshdata=_box_meshdata(sx, sy, wh),
                                      smooth=False, color=pal["wall"],
                                      glOptions="translucent", drawEdges=True,
-                                     edgeColor=(0.5, 0.6, 0.72, 0.35))
+                                     edgeColor=pal["wall_edge"])
                 slab.translate(dx + cx, dy + cy, wh / 2)
                 self._add_chamber(slab)
 
@@ -835,9 +853,30 @@ class Arena3DView(gl.GLViewWidget):
                or (ev.button() == Qt.LeftButton
                    and (ev.modifiers() & Qt.ShiftModifier)))
         self._pan_last = ev.pos() if pan else None
+        # grab a world object? (left-drag on empty space still orbits)
+        self._drag = None
+        if (getattr(self, "_edit_layout", False) and not pan
+                and ev.button() == Qt.LeftButton and not self._arm_kind):
+            pt = self._floor_point(ev.pos().x(), ev.pos().y())
+            if pt is not None:
+                hit = self._pick_object(*pt)
+                if hit:
+                    kind, i, o = hit
+                    self._drag = (kind, i, o.x - pt[0], o.y - pt[1])
+                    ev.accept()
+                    return
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if getattr(self, "_drag", None) is not None:
+            kind, i, ox, oy = self._drag
+            pt = self._floor_point(ev.pos().x(), ev.pos().y())
+            if pt is not None and self.arena is not None:
+                x = min(max(self._snapped(pt[0] + ox), 0.0), self.arena.width)
+                y = min(max(self._snapped(pt[1] + oy), 0.0), self.arena.height)
+                self.object_moved.emit(kind, i, float(x), float(y))
+            ev.accept()
+            return
         if self._is_pan(ev):                 # slide the orbit centre in view plane
             lpos = ev.pos()
             if self._pan_last is not None:
@@ -853,6 +892,11 @@ class Arena3DView(gl.GLViewWidget):
             self.agent_hovered.emit(idx if idx is not None else -1)
 
     def mouseReleaseEvent(self, ev):
+        if getattr(self, "_drag", None) is not None:
+            self._drag = None                # placement already emitted live
+            self._press_xy = None
+            ev.accept()
+            return
         super().mouseReleaseEvent(ev)
         self._pan_last = None
         if self._press_xy is None:
@@ -938,3 +982,45 @@ class Arena3DView(gl.GLViewWidget):
 
     def arm_add(self, kind):
         self._arm_kind = kind
+
+    # ------------------------------------------------------------------ #
+    # Direct manipulation: drag world objects on the floor plane.
+    # Space stays continuous; ``snap`` only quantises while editing, the way a
+    # CAD/level editor does — the physics never sees a grid.
+    # ------------------------------------------------------------------ #
+    def set_edit_layout(self, on, snap=0.0):
+        self._edit_layout = bool(on)
+        self._snap = float(snap or 0.0)
+
+    # world lists that can be dragged, in hit-test priority (small first)
+    _MOVABLE = (("hut", "huts"), ("water", "water_towers"),
+                ("pole", "poles"), ("zone", "resource_zones"),
+                ("object", "objects"))
+
+    def _obj_extent(self, kind, o):
+        """Half-extent (ex, ey) used for hit-testing an object."""
+        if kind in ("pole", "water"):
+            r = getattr(o, "radius", 0.1)
+            return r, r
+        if kind == "object":
+            r = getattr(o, "radius", 0.15)
+            return r, r
+        return getattr(o, "w", 0.2) / 2.0, getattr(o, "d", 0.2) / 2.0
+
+    def _pick_object(self, wx, wy):
+        """Topmost movable object containing world point (wx, wy)."""
+        if self.arena is None:
+            return None
+        dx, dy = self._chambers[0]
+        for kind, attr in self._MOVABLE:
+            for i, o in enumerate(getattr(self.arena, attr, []) or []):
+                ex, ey = self._obj_extent(kind, o)
+                pad = 0.02                      # a little grab tolerance
+                if (abs(wx - (dx + o.x)) <= ex + pad
+                        and abs(wy - (dy + o.y)) <= ey + pad):
+                    return kind, i, o
+        return None
+
+    def _snapped(self, v):
+        s = getattr(self, "_snap", 0.0)
+        return round(v / s) * s if s > 0 else v

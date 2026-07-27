@@ -13,19 +13,45 @@ Matches SLEAP ROI Tool styling and workflow.
 import os
 import sys
 import cv2
+import shutil
 import subprocess
 import numpy as np
 import tempfile
 from typing import List, Tuple, Optional
+
+
+def _no_window_kwargs():
+    """subprocess kwargs to suppress the console window that pops up on Windows."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
+def find_ffmpeg():
+    """Return the ffmpeg executable path, or None if it isn't on PATH.
+
+    Cross-platform: shutil.which resolves 'ffmpeg.exe' on Windows and 'ffmpeg'
+    on macOS/Linux.
+    """
+    return shutil.which("ffmpeg")
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QFileDialog, QMessageBox, QGroupBox, QComboBox,
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QApplication,
     QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget,
-    QTableWidgetItem, QHeaderView, QSplitter, QSizePolicy
+    QTableWidgetItem, QHeaderView, QSplitter, QSizePolicy, QStackedWidget
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QBrush, QColor
+
+# Optional audio/video playback (QtMultimedia). Guarded so the tool still works
+# for scrubbing/cropping if the multimedia plugins aren't available.
+try:
+    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+    from PyQt5.QtMultimediaWidgets import QVideoWidget
+    HAVE_QT_MULTIMEDIA = True
+except Exception:
+    HAVE_QT_MULTIMEDIA = False
 
 
 class VideoTrimConfig:
@@ -120,6 +146,7 @@ class BatchTrimWorker(QThread):
             command = [
                 "ffmpeg",
                 "-y",
+                "-nostdin",
                 "-hwaccel", "none",
                 "-threads", "4",
                 "-ss", str(config.start_time),
@@ -173,14 +200,18 @@ class BatchTrimWorker(QThread):
             self.output_message.emit(f"FFmpeg Command:\n{cmd_str}\n")
             self.output_message.emit(f"{'-'*80}\n")
             
-            # Run FFmpeg
+            # Run FFmpeg. stdin=DEVNULL stops ffmpeg hanging on an interactive
+            # prompt from a corrupt file; the no-window kwargs suppress the
+            # console window that would otherwise flash on Windows.
             process = subprocess.Popen(
                 command,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                **_no_window_kwargs()
             )
             
             # Read output in real-time and track frame count
@@ -218,7 +249,8 @@ class BatchTrimWorker(QThread):
             self.output_message.emit(f"  Expected frames: {expected_frames}\n")
             self.output_message.emit(f"  Actual frames: {final_frame_count}\n")
             self.output_message.emit(f"  Expected duration: {trim_duration:.2f}s @ {config.fps}fps\n")
-            self.output_message.emit(f"  Calculated output duration: {final_frame_count / config.fps:.2f}s\n")
+            calc_duration = final_frame_count / config.fps if config.fps else 0.0
+            self.output_message.emit(f"  Calculated output duration: {calc_duration:.2f}s\n")
             
             if success:
                 if final_frame_count == expected_frames:
@@ -441,7 +473,14 @@ class VideoTrimTool(QMainWindow):
         
         # Worker thread
         self.processor = None
-        
+
+        # Playback (audio+video) state
+        self.media_player = None
+        self.video_widget = None
+        self.is_playing = False
+        self._playback_media_path = None
+        self._pending_seek_ms = None
+
         self.init_ui()
     
     def init_ui(self):
@@ -891,7 +930,7 @@ class VideoTrimTool(QMainWindow):
             QTextEdit {
                 background-color: #1e1e1e;
                 color: #d4d4d4;
-                font-family: 'Consolas', 'Courier New', monospace;
+                font-family: 'Menlo', 'Consolas', 'Courier New', monospace;
                 font-size: 9pt;
             }
         """)
@@ -915,7 +954,23 @@ class VideoTrimTool(QMainWindow):
         self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
         self.preview_label.setMinimumSize(960, 540)  # Larger preview (16:9 aspect ratio)
         self.preview_label.setText("Select a video to begin")
-        preview_layout.addWidget(self.preview_label, stretch=1)
+
+        # Stack the still-frame preview (scrub/crop) with a video widget used for
+        # actual playback (with audio). Page 0 = still frame, page 1 = playback.
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.addWidget(self.preview_label)
+        if HAVE_QT_MULTIMEDIA:
+            self.video_widget = QVideoWidget()
+            self.video_widget.setStyleSheet("background-color: black;")
+            self.preview_stack.addWidget(self.video_widget)
+
+            self.media_player = QMediaPlayer(self)
+            self.media_player.setVideoOutput(self.video_widget)
+            self.media_player.stateChanged.connect(self.on_media_state_changed)
+            self.media_player.positionChanged.connect(self.on_media_position_changed)
+            self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
+            self.media_player.error.connect(self.on_media_error)
+        preview_layout.addWidget(self.preview_stack, stretch=1)
         
         # Start position controls (moved inside preview group, closer to video)
         position_controls = QVBoxLayout()
@@ -953,10 +1008,30 @@ class VideoTrimTool(QMainWindow):
         self.time_range_slider.handleActivated.connect(self.on_range_handle_activated)
         position_controls.addWidget(self.time_range_slider)
         
+        # Playback controls (audio + video)
+        playback_row = QHBoxLayout()
+        playback_row.addStretch()
+        self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setFixedWidth(120)
+        self.btn_play.setEnabled(False)
+        self.btn_play.clicked.connect(self.toggle_playback)
+        playback_row.addWidget(self.btn_play)
+        self.mute_check = QCheckBox("Mute")
+        self.mute_check.setChecked(False)
+        self.mute_check.stateChanged.connect(self.on_mute_changed)
+        playback_row.addWidget(self.mute_check)
+        playback_row.addStretch()
+        position_controls.addLayout(playback_row)
+
+        if not HAVE_QT_MULTIMEDIA:
+            self.btn_play.setToolTip(
+                "Playback unavailable: PyQt5 QtMultimedia is not installed in this environment.")
+            self.mute_check.setEnabled(False)
+
         # Adjustment buttons
         button_layout = QHBoxLayout()
         button_layout.addStretch()
-        
+
         adjustments = [("-60s", -60), ("-30s", -30), ("-10s", -10), ("-1s", -1),
                       ("+1s", +1), ("+10s", +10), ("+30s", +30), ("+60s", +60)]
         
@@ -1055,7 +1130,14 @@ class VideoTrimTool(QMainWindow):
             return
         
         config = self.video_configs[self.current_config_idx]
-        
+
+        # Stop any playback and release the previous media so file handles free up.
+        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
+            self.media_player.stop()
+            self.media_player.setMedia(QMediaContent())
+            self._playback_media_path = None
+            self._pending_seek_ms = None
+
         # Release previous video
         if self.preview_cap:
             self.preview_cap.release()
@@ -1070,8 +1152,17 @@ class VideoTrimTool(QMainWindow):
         config.width = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         config.height = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         config.fps = self.preview_cap.get(cv2.CAP_PROP_FPS)
+        # Some codecs/containers report fps as 0 or NaN via OpenCV (and which
+        # backend is used varies by OS). Fall back to a sane default so we never
+        # divide by zero.
+        if not config.fps or config.fps <= 0 or config.fps != config.fps:  # NaN != NaN
+            config.fps = 30.0
+            QMessageBox.warning(
+                self, "Unknown Frame Rate",
+                "This video's frame rate could not be read; assuming 30 fps. "
+                "Trim times will be based on that estimate.")
         total_frames = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        config.total_duration = total_frames / config.fps
+        config.total_duration = total_frames / config.fps if config.fps > 0 else 0.0
         
         # Set default duration to full video if not configured
         if not config.configured:
@@ -1111,6 +1202,8 @@ class VideoTrimTool(QMainWindow):
         self.btn_draw_crop.setEnabled(True)
         self.start_time_input.setEnabled(True)
         self.btn_add_to_queue.setEnabled(True)
+        if HAVE_QT_MULTIMEDIA:
+            self.btn_play.setEnabled(True)
 
         # Trigger UI mode update (show correct slider for current duration mode)
         self.on_duration_changed(self.duration_combo.currentText())
@@ -1289,10 +1382,16 @@ class VideoTrimTool(QMainWindow):
         if self.current_config_idx >= len(self.video_configs):
             return
         
+        # Crop drawing happens on the still-frame page — stop playback and show it.
+        if HAVE_QT_MULTIMEDIA and self.media_player is not None and self.is_playing:
+            self.media_player.pause()
+        if hasattr(self, "preview_stack"):
+            self.preview_stack.setCurrentWidget(self.preview_label)
+
         self.drawing_crop = True
         config = self.video_configs[self.current_config_idx]
         config.crop_polygon = []
-        
+
         self.btn_draw_crop.setEnabled(False)
         self.crop_status_label.setText("Drawing... Click to add points. Press ENTER when done.")
         self.crop_status_label.setStyleSheet("color: #28a745; font-weight: bold;")
@@ -1377,10 +1476,98 @@ class VideoTrimTool(QMainWindow):
         self.preview_label.setMouseTracking(False)
         self.update_preview()
     
+    def toggle_playback(self):
+        """Play/pause the current video (with audio) between start and stop times."""
+        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
+            return
+        if self.current_config_idx >= len(self.video_configs):
+            return
+
+        if self.is_playing:
+            self.media_player.pause()
+            return
+
+        config = self.video_configs[self.current_config_idx]
+        start_ms = int(config.start_time * 1000)
+        if config.stop_time is not None:
+            stop_ms = int(config.stop_time * 1000)
+        else:
+            stop_ms = int(config.total_duration * 1000)
+
+        # Show the video widget for playback.
+        self.preview_stack.setCurrentWidget(self.video_widget)
+        self.media_player.setMuted(self.mute_check.isChecked())
+
+        # (Re)load media if this is a different file. setMedia is async, so defer
+        # the seek to the trim start until the media reports it has loaded.
+        if self._playback_media_path != config.video_path:
+            self.media_player.setMedia(
+                QMediaContent(QUrl.fromLocalFile(config.video_path)))
+            self._playback_media_path = config.video_path
+            self._pending_seek_ms = start_ms
+        else:
+            pos = self.media_player.position()
+            # Restart from the trim start if we're outside the [start, stop] window.
+            if pos < start_ms or pos >= stop_ms:
+                self.media_player.setPosition(start_ms)
+
+        self.media_player.play()
+
+    def on_media_status_changed(self, status):
+        """Apply a deferred seek once freshly-loaded media is ready."""
+        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
+            return
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) \
+                and self._pending_seek_ms is not None:
+            self.media_player.setPosition(self._pending_seek_ms)
+            self._pending_seek_ms = None
+
+    def on_media_position_changed(self, position_ms):
+        """Stop playback at the configured stop time (preview the trim window)."""
+        if not self.is_playing or self.current_config_idx >= len(self.video_configs):
+            return
+        config = self.video_configs[self.current_config_idx]
+        if config.stop_time is not None:
+            stop_ms = int(config.stop_time * 1000)
+        else:
+            stop_ms = int(config.total_duration * 1000)
+        if position_ms >= stop_ms:
+            self.media_player.pause()
+            self.media_player.setPosition(stop_ms)
+
+    def on_media_state_changed(self, state):
+        """Keep the Play/Pause button in sync with the player state."""
+        self.is_playing = (state == QMediaPlayer.PlayingState)
+        self.btn_play.setText("⏸ Pause" if self.is_playing else "▶ Play")
+
+    def on_mute_changed(self, _state):
+        """Toggle audio mute during playback."""
+        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
+            self.media_player.setMuted(self.mute_check.isChecked())
+
+    def on_media_error(self, *_args):
+        """Surface playback errors and fall back to the still-frame preview."""
+        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
+            return
+        err = self.media_player.errorString()
+        if err:
+            if hasattr(self, "output_text") and self.output_text is not None:
+                self.output_text.append(f"⚠️ Playback error: {err}")
+            self.preview_stack.setCurrentWidget(self.preview_label)
+            self.update_preview()
+
     def update_preview(self):
         """Update video preview"""
         if self.current_config_idx >= len(self.video_configs) or not self.preview_cap:
             return
+
+        # Scrubbing/crop always uses the still-frame page — pause playback and
+        # switch away from the video widget so the updated frame is visible.
+        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
+            if self.is_playing:
+                self.media_player.pause()
+            if hasattr(self, "preview_stack") and self.preview_stack.currentWidget() is not self.preview_label:
+                self.preview_stack.setCurrentWidget(self.preview_label)
         
         config = self.video_configs[self.current_config_idx]
 
@@ -1573,7 +1760,18 @@ class VideoTrimTool(QMainWindow):
         """Start batch processing"""
         if len(self.processing_queue) == 0:
             return
-        
+
+        # Fail fast with a clear message if ffmpeg isn't installed / on PATH.
+        if find_ffmpeg() is None:
+            QMessageBox.critical(
+                self, "FFmpeg Not Found",
+                "FFmpeg could not be found on your system PATH.\n\n"
+                "Install FFmpeg and ensure it is on your PATH:\n"
+                "  • macOS:    brew install ffmpeg\n"
+                "  • Windows:  download from ffmpeg.org and add it to PATH\n"
+                "  • Linux:    sudo apt install ffmpeg (or your distro's package)")
+            return
+
         # Clear output window
         self.output_text.clear()
         
@@ -1654,22 +1852,34 @@ class VideoTrimTool(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close"""
+        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
+            self.media_player.stop()
+            self.media_player.setMedia(QMediaContent())
         if self.preview_cap:
             self.preview_cap.release()
         event.accept()
 
 
 def video_trim():
-    """Launch the video trim tool"""
+    """Launch the video trim tool.
+
+    Returns the window so callers can keep a reference. Only starts a Qt event
+    loop when this function created the QApplication (standalone use). When an
+    app is already running (e.g. launched from the FNT launcher), starting a
+    second event loop raised "event loop is already running" and segfaulted.
+    """
     app = QApplication.instance()
-    if app is None:
+    owns_app = app is None
+    if owns_app:
         app = QApplication(sys.argv)
-    
+
     window = VideoTrimTool()
     window.show()
-    
-    if app:
+
+    if owns_app:
         app.exec_()
+
+    return window
 
 
 if __name__ == "__main__":

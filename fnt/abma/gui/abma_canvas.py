@@ -21,17 +21,21 @@ from ..core.config import ArenaConfig, ResourceObject
 
 # Light / dark palettes for the 2D arena model.
 _THEMES_2D = {
-    "dark": dict(face="#14171a", spine="#303338", tick="#6f767e",
-                 grid="#22262b", title="#8a9099", boundary="#5a6069",
-                 grass="#2f5d2a", ant_text="#ffeb8c", compass_n="#eb5a5a",
-                 compass="#dce0e6", meas="#4dd0e1", meas_text="#9fe3ec",
-                 run_title="#cccccc"),
-    "light": dict(face="#f2f4f7", spine="#b6bbc3", tick="#4a5058",
-                  grid="#dde1e7", title="#4a5058", boundary="#6b7178",
-                  grass="#8fbf76", ant_text="#7a5200", compass_n="#c0392b",
-                  compass="#33383f", meas="#0e7c99", meas_text="#0b6a86",
-                  run_title="#33383f"),
+    "dark": dict(face="#14171a", floor="#14171a", spine="#303338",
+                 tick="#6f767e", grid="#22262b", title="#8a9099",
+                 boundary="#5a6069", grass="#2f5d2a", ant_text="#ffeb8c",
+                 compass_n="#eb5a5a", compass="#dce0e6", meas="#4dd0e1",
+                 meas_text="#9fe3ec", run_title="#cccccc"),
+    # light: white surround, dark arena ground (same as dark mode)
+    "light": dict(face="#ffffff", floor="#14171a", spine="#b6bbc3",
+                  tick="#4a5058", grid="#e4e8ee", title="#4a5058",
+                  boundary="#8a9199", grass="#2f5d2a", ant_text="#ffeb8c",
+                  compass_n="#c0392b", compass="#33383f", meas="#4dd0e1",
+                  meas_text="#0b6a86", run_title="#33383f"),
 }
+# "white": same as light — the 2D surround is already pure white and does not
+# follow the day/night cycle.
+_THEMES_2D["white"] = dict(_THEMES_2D["light"])
 
 
 def _bow_xy(a, b, k=0.08, n=14):
@@ -80,6 +84,7 @@ class ArenaCanvas(FigureCanvas):
     object_added = pyqtSignal(object)  # emits a ResourceObject on click-add
     agent_picked = pyqtSignal(int)     # emits agent index on click, or -1 empty
     agent_hovered = pyqtSignal(int)    # emits agent index on hover, or -1
+    object_moved = pyqtSignal(str, int, float, float)   # kind, index, x, y
 
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(5, 5), facecolor="#191b1f")
@@ -101,7 +106,11 @@ class ArenaCanvas(FigureCanvas):
         self._trail_artists = []
         self._history = deque(maxlen=8)
         self._daynight_text = None
+        self._edit_layout = False
+        self._snap = 0.0
+        self._drag = None
         self.mpl_connect("button_press_event", self._on_click)
+        self.mpl_connect("button_release_event", self._on_release)
         self.mpl_connect("motion_notify_event", self._on_motion)
         self.draw_arena()
 
@@ -128,15 +137,48 @@ class ArenaCanvas(FigureCanvas):
         """Arm click-to-add for ('nest'/'food'/'water') or disable (None)."""
         self._arm_kind = kind
 
+    # ---- direct manipulation (continuous space; snap is edit-time only) ---
+    _MOVABLE = (("hut", "huts"), ("water", "water_towers"),
+                ("pole", "poles"), ("zone", "resource_zones"),
+                ("object", "objects"))
+
+    def set_edit_layout(self, on, snap=0.0):
+        self._edit_layout = bool(on)
+        self._snap = float(snap or 0.0)
+
+    def _snapped(self, v):
+        s = getattr(self, "_snap", 0.0)
+        return round(v / s) * s if s > 0 else v
+
+    def _pick_object(self, wx, wy):
+        a = self.arena
+        if a is None:
+            return None
+        dx, dy = self._chambers[0]
+        for kind, attr in self._MOVABLE:
+            for i, o in enumerate(getattr(a, attr, []) or []):
+                if kind in ("pole", "water", "object"):
+                    ex = ey = getattr(o, "radius", 0.15)
+                else:
+                    ex, ey = getattr(o, "w", .2) / 2, getattr(o, "d", .2) / 2
+                if (abs(wx - (dx + o.x)) <= ex + 0.02
+                        and abs(wy - (dy + o.y)) <= ey + 0.02):
+                    return kind, i, o
+        return None
+
     def set_grass_enabled(self, on):
         """Tint the ground green for outdoor field sites (toggle)."""
         self._grass_on = bool(on)
         if self.arena is not None:
             self.draw_arena()
 
-    def set_antenna_layout(self, idx):
-        """Select which UWB layout to draw (-1 = off, else layout index)."""
+    def set_antenna_layout(self, idx, labels=True):
+        """Select which UWB layout to draw (-1 = off, else layout index).
+
+        ``labels`` draws the antenna numbers next to each box.
+        """
         self._antenna_idx = idx
+        self._antenna_labels = bool(labels)
         if self.arena is not None:
             self.draw_arena()
 
@@ -227,6 +269,10 @@ class ArenaCanvas(FigureCanvas):
                                 va="center", zorder=6)
         seen = set()
         for dx, dy in chambers:
+            # arena ground (stays dark in both themes; the surround is themed)
+            ax.add_patch(Rectangle((dx, dy), a.width, a.height,
+                                   facecolor=pal["floor"], edgecolor="none",
+                                   zorder=-1))
             # grass ground tint (outdoor field sites, toggleable)
             if getattr(self, "_grass_on", False) and \
                     getattr(a, "ground", "floor") == "grass":
@@ -328,7 +374,7 @@ class ArenaCanvas(FigureCanvas):
                     ax.add_patch(Rectangle(
                         (dx + an.x - an.w / 2, dy + an.y - an.d / 2), an.w, an.d,
                         facecolor=face, edgecolor="#20201f", lw=0.7, zorder=4))
-                    if an.label:
+                    if an.label and getattr(self, "_antenna_labels", True):
                         ax.text(dx + an.x, dy + an.y + off, an.label,
                                 color=pal["ant_text"], fontsize=8, fontweight="bold",
                                 ha="center", va="bottom", zorder=5)
@@ -463,6 +509,13 @@ class ArenaCanvas(FigureCanvas):
     def _on_click(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
+        # grab a world object to drag (arena editor open, nothing armed)
+        if getattr(self, "_edit_layout", False) and self._arm_kind is None:
+            hit = self._pick_object(event.xdata, event.ydata)
+            if hit:
+                kind, i, o = hit
+                self._drag = (kind, i, o.x - event.xdata, o.y - event.ydata)
+                return
         # playback mode (no object armed): pick the nearest agent
         if self._arm_kind is None:
             if self._last_xy is None or len(self._last_xy) == 0:
@@ -486,9 +539,20 @@ class ArenaCanvas(FigureCanvas):
         # The window owns object state; just propose the object.
         self.object_added.emit(obj)
 
+    def _on_release(self, event):
+        self._drag = None
+
     def _on_motion(self, event):
         """Emit the agent under the cursor (or -1) for the hover popup."""
         import numpy as np
+        if getattr(self, "_drag", None) is not None:
+            if event.inaxes == self.ax and event.xdata is not None:
+                kind, i, ox, oy = self._drag
+                a = self.arena
+                x = min(max(self._snapped(event.xdata + ox), 0.0), a.width)
+                y = min(max(self._snapped(event.ydata + oy), 0.0), a.height)
+                self.object_moved.emit(kind, i, float(x), float(y))
+            return
         if (self._arm_kind is not None or event.inaxes != self.ax
                 or event.xdata is None or self._last_xy is None
                 or len(self._last_xy) == 0):
