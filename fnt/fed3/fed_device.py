@@ -1,75 +1,99 @@
-"""FED3 Device data structure.
+"""State for one FED3 device slot.
 
-Defines the FedDevice class, wrapping device state, UI components,
-and tracking/download variables. Supports both attribute access
-and dictionary-like subscript access for backward compatibility.
+Groups the three things a slot owns — its Qt widgets, its live connection, and
+its recorded data — so the tab widget can hand a device around instead of
+threading a dozen parallel dictionaries through every call.
+
+The previous version accepted arbitrary ``**kwargs`` and supported dict-style
+subscripting, which meant a typo in a key silently created a new attribute
+instead of failing. Fields are explicit here and accessed as attributes.
 """
 
+from datetime import datetime
+
+
 class FedDevice:
-    def __init__(self, **kwargs):
-        # UI Elements
-        self.box = kwargs.get('box')
-        self.slot_num = kwargs.get('slot_num')
-        self.name_edit = kwargs.get('name_edit')
-        self.port_combo = kwargs.get('port_combo')
-        self.remove_btn = kwargs.get('remove_btn')
-        self.mode_combo = kwargs.get('mode_combo')
-        self.apply_btn = kwargs.get('apply_btn')
-        self.fr_label = kwargs.get('fr_label')
-        self.ratio_spin = kwargs.get('ratio_spin')
-        self.timeout_label = kwargs.get('timeout_label')
-        self.timeout_spin = kwargs.get('timeout_spin')
-        self.timeout_unit_label = kwargs.get('timeout_unit_label')
-        self.last_sync_label = kwargs.get('last_sync_label')
-        self.feed_btn = kwargs.get('feed_btn')
-        self.lights_toggle_btn = kwargs.get('lights_toggle_btn')
-        self.reset_btn = kwargs.get('reset_btn')
-        self.export_btn = kwargs.get('export_btn')
-        self.timer = kwargs.get('timer')
-        self.svg_container = kwargs.get('svg_container')
-        self.svg_title = kwargs.get('svg_title')
-        self.svg_view = kwargs.get('svg_view')
+    """One device slot: UI, connection, and recorded state."""
 
-        # State Variables
-        self.is_syncing = kwargs.get('is_syncing', False)
-        self.is_tracking = kwargs.get('is_tracking', False)
-        self.tracker_worker = kwargs.get('tracker_worker', None)
-        self.log_file = kwargs.get('log_file', None)
-        self.events = kwargs.get('events', [])
-        self.tracking_start_time = kwargs.get('tracking_start_time', None)
+    def __init__(self, slot_num, widgets):
+        self.slot_num = slot_num
 
-        # File List state
-        self.file_list_pending = kwargs.get('file_list_pending', False)
-        self.file_list_buffer = kwargs.get('file_list_buffer', [])
-        self.file_list_callback = kwargs.get('file_list_callback', None)
+        # --- UI (populated by the tab when the slot is built) -------------
+        for name, widget in widgets.items():
+            setattr(self, name, widget)
 
-        # File Download state
-        self.download_pending = kwargs.get('download_pending', False)
-        self.download_filename = kwargs.get('download_filename', None)
-        self.download_lines = kwargs.get('download_lines', [])
-        self.download_started = kwargs.get('download_started', False)
-        self.download_waiting_crc = kwargs.get('download_waiting_crc', False)
-        self.download_callback = kwargs.get('download_callback', None)
+        # --- identity ----------------------------------------------------
+        # Tracks the last committed display name so a rename can be propagated
+        # to anything that references the device by name (scheduled events).
+        self.last_known_name = f"Device {slot_num}"
+        self.saved_port = ""
+        self.device_id = None           # on-board ID reported by PING
+        self.firmware = None            # firmware version string, None if legacy
 
-        # Download safety timer to prevent indefinite hangs
-        self.download_timer = kwargs.get('download_timer', None)
+        # --- connection --------------------------------------------------
+        self.link = None                # Fed3Link while connected
+        self.transfer = None            # Fed3Transfer, created with the link
+        self.mirror = None              # DeviceMirror while a session is recording
+        self.has_connected = False      # ever connected, so a drop is unexpected
+        self.connect_attempts = 0
+        self.last_sync_time = None
+        self.last_device_time = None    # device RTC at the last sync
 
-        # Statistics / counters
-        self.stats = kwargs.get('stats', {'left': 0, 'right': 0, 'pellet': 0})
+        # --- recorded state ----------------------------------------------
+        self.is_tracking = False
+        self.events = []                # datetimes of pellet events, for the plot
+        self.stats = {"left": 0, "right": 0, "pellet": 0}
+        self.tracking_start_time = None
+        self.event_log = None           # DeviceEventLog while recording
 
-    def __getitem__(self, key):
-        if not hasattr(self, key):
-            raise KeyError(key)
-        return getattr(self, key)
+    # --- naming -----------------------------------------------------------
 
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
+    @property
+    def name(self):
+        """Display name: the user's label, else the slot title."""
+        return self.name_edit.text().strip() or f"Device {self.slot_num}"
 
-    def __contains__(self, key):
-        return hasattr(self, key)
+    @property
+    def port(self):
+        """Currently selected port, or "" when the slot is unassigned."""
+        text = (self.port_combo.currentData()
+                or self.port_combo.currentText() or "").strip()
+        return "" if text in ("Scanning...", "No FED3 found") else text
 
-    def get(self, key, default=None):
-        return getattr(self, key, default)
+    @property
+    def is_connected(self):
+        return self.link is not None and self.link.is_live()
 
-    def set(self, key, value):
-        setattr(self, key, value)
+    # --- state ------------------------------------------------------------
+
+    def reset_counters(self):
+        self.stats = {"left": 0, "right": 0, "pellet": 0}
+        self.events = []
+        self.tracking_start_time = datetime.now()
+
+    def apply_counts(self, counts):
+        """Adopt the device's absolute totals.
+
+        The device is authoritative: taking its counts rather than incrementing
+        locally means a reconnection resynchronizes instead of under-counting
+        everything that happened while the link was down.
+        """
+        for key in ("left", "right", "pellet"):
+            if key in counts:
+                self.stats[key] = counts[key]
+
+    def to_state(self):
+        """Serializable slot state for session resume."""
+        return {
+            "slot_num": self.slot_num,
+            "name": self.name,
+            "port": self.port,
+            "device_id": self.device_id,
+            "firmware": self.firmware,
+            "mode": self.mode_combo.currentText(),
+            "ratio": self.ratio_spin.value(),
+            "timeout": self.timeout_spin.value(),
+            "stats": dict(self.stats),
+            "tracking_start_time": (self.tracking_start_time.isoformat()
+                                    if self.tracking_start_time else None),
+        }
