@@ -310,12 +310,13 @@ class FNTMainWindow(QMainWindow):
         
         # Create tabs
         self.create_video_tab()
-        self.create_uwb_tab()
         self.create_usv_tab()
+        self.create_uwb_tab()
         self.create_rfid_tab()
         self.create_fed_tab()
-        self.create_wifp_tab()
         self.create_imaging_tab()
+        self.create_wifp_tab()
+        self.create_musestudio_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -455,8 +456,8 @@ class FNTMainWindow(QMainWindow):
         tracking_layout = QGridLayout()
 
         tracking_buttons = [
-            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
             ("Simple Tracker", "Fast CPU-only tracking using classical computer vision methods", self.run_simple_tracker),
+            ("Mask Tracker", "SAM2 annotation, YOLO instance segmentation training, and video tracking", self.run_sam2_annotator),
             ("ROI Tool", "Define ROIs and analyze spatial occupancy (SLEAP, Mask Tracker, Simple Tracker)", self.run_roi_tool),
         ]
 
@@ -480,7 +481,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_usv_tab(self):
         """Create the USV processing tab"""
-        tab, layout = self._make_scrollable_tab("USV")
+        tab, layout = self._make_scrollable_tab("Audio")
 
         # Description
         desc = QLabel("Ultrasonic vocalization analysis tools")
@@ -507,9 +508,8 @@ class FNTMainWindow(QMainWindow):
         analysis_layout = QGridLayout()
 
         analysis_buttons = [
-            ("Classic Audio Detector", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
-            ("Deep Audio Detector", "ML model training and inference (YOLO)", self.run_deep_audio_detector),
-            ("Mask Audio Detector", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
+            ("Classic Audio Detector (CAD)", "DSP-based audio detection and labeling", self.run_classic_audio_detector),
+            ("Mask Audio Detector (MAD)", "Paint-based segmentation labeling, training, and inference", self.run_mask_audio_detector),
         ]
 
         self.create_button_grid(analysis_layout, analysis_buttons)
@@ -749,6 +749,68 @@ class FNTMainWindow(QMainWindow):
 
         layout.addStretch()
 
+    def create_musestudio_tab(self):
+        """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
+        tab, layout = self._make_scrollable_tab("EEG+fNIRS")
+
+        desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        group = QGroupBox("MuseStudio")
+        group_layout = QGridLayout()
+        buttons = [
+            ("Open MuseStudio",
+             "Connect to a Muse S Athena over Bluetooth, live-plot EEG/fNIRS, and record to CSV",
+             self.run_musestudio),
+        ]
+        self.create_button_grid(group_layout, buttons)
+        group.setLayout(group_layout)
+        layout.addWidget(group)
+
+        info_group = QGroupBox("About MuseStudio")
+        info_layout = QVBoxLayout()
+        info_label = QLabel(
+            "<b>MuseStudio</b> connects directly to a Muse S Athena headband over "
+            "Bluetooth LE (no phone or dongle on a modern Mac) using "
+            "<a href='https://github.com/DominiqueMakowski/OpenMuse'>OpenMuse</a>.<br><br>"
+            "• Live scrolling plots of EEG (256 Hz) and fNIRS (64 Hz)<br>"
+            "• Records each stream to CSV in a timestamped session folder<br><br>"
+            "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
+            "and experimental, and is not affiliated with InteraXon.<br><br>"
+            "Requires the optional <code>muse</code> dependencies: "
+            "<code>pip install -e \".[muse]\"</code>"
+        )
+        info_label.setWordWrap(True)
+        info_label.setOpenExternalLinks(True)
+        info_label.setStyleSheet("color: #cccccc; padding: 10px;")
+        info_layout.addWidget(info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+
+    def run_musestudio(self):
+        """Launch the MuseStudio window"""
+        try:
+            from fnt.musestudio.musestudio_pyqt import MuseStudioWindow
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "MuseStudio dependencies missing",
+                "MuseStudio requires the optional 'muse' dependencies "
+                "(OpenMuse, mne-lsl, bleak, pyqtgraph).\n\n"
+                "Install them with:\n    pip install -e \".[muse]\"\n\n"
+                f"Import error: {str(e)}",
+            )
+            return
+        try:
+            self.musestudio_window = MuseStudioWindow()
+            self.musestudio_window.setStyleSheet(self.styleSheet())
+            self.musestudio_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"MuseStudio failed: {str(e)}")
+
     def create_utilities_tab(self):
         """Create the utilities tab"""
         tab, layout = self._make_scrollable_tab("Utilities")
@@ -978,13 +1040,13 @@ class FNTMainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
 
     def run_sam2_annotator(self):
-        """Launch SAM2 Annotator tool"""
+        """Launch Mask Tracker Tool"""
         try:
-            from fnt.videoTracking.sam2_annotator_pyqt import SAM2AnnotatorWindow
-            self.sam2_annotator_window = SAM2AnnotatorWindow()
-            self.sam2_annotator_window.show()
+            from fnt.videoTracking.mask_tracker_gui import MaskTrackerWindow
+            self.mask_tracker_window = MaskTrackerWindow()
+            self.mask_tracker_window.show()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch SAM2 Annotator: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to launch Mask Tracker: {str(e)}")
 
 
     # LabGym Methods
@@ -1009,16 +1071,6 @@ class FNTMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Classic Audio Detector failed: {str(e)}")
 
-    def run_deep_audio_detector(self):
-        """Launch Deep Audio Detector - ML model training and inference"""
-        try:
-            from fnt.usv.deep_audio_detector import DeepAudioDetectorWindow
-
-            self.dad_window = DeepAudioDetectorWindow()
-            self.dad_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Deep Audio Detector failed: {str(e)}")
-
     def run_mask_audio_detector(self):
         """Launch Mask Audio Detector - segmentation-based labeling, training, inference"""
         try:
@@ -1028,16 +1080,6 @@ class FNTMainWindow(QMainWindow):
             self.mad_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Mask Audio Detector failed: {str(e)}")
-
-    def run_usv_studio(self):
-        """Launch USV Studio - DEPRECATED, use Classic/Deep Audio Detector instead"""
-        try:
-            from fnt.usv.usv_studio_pyqt import USVStudioWindow
-
-            self.usv_studio_window = USVStudioWindow()
-            self.usv_studio_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"USV Studio failed: {str(e)}")
 
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""

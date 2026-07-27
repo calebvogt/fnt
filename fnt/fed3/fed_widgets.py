@@ -192,7 +192,7 @@ class FEDSvgView(QWidget):
         y_off = (h - new_h) // 2
         svg_rect = QRectF(x_off, y_off, new_w, new_h)
 
-        if self._renderer:
+        if self._renderer and self._renderer.isValid():
             self._renderer.render(painter, svg_rect)
 
         # --- Overlay sizes ---
@@ -244,6 +244,7 @@ class FEDSvgView(QWidget):
 
     def minimumSizeHint(self):
         return QSize(250, 150)
+
 
 
 

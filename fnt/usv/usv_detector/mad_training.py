@@ -27,6 +27,12 @@ import numpy as np
 class UNetTrainingConfig:
     project_dir: str
     run_name: str = ""               # auto-filled from timestamp if empty
+    # Decoder architecture (all via segmentation_models_pytorch):
+    #   'unet'   : smp.Unet (baseline)
+    #   'unetpp' : smp.UnetPlusPlus (denser skips, finer detail)
+    #   'manet'  : smp.MAnet (attention decoder)
+    #   'hrnet'  : smp.Unet with a timm HRNet encoder (high-res features)
+    model_arch: str = "unet"
     encoder_name: str = "resnet18"
     encoder_weights: Optional[str] = "imagenet"
     n_epochs: int = 30
@@ -51,10 +57,19 @@ class UNetTrainingConfig:
     tile_freq_bins: int = 512
     tile_overlap_fraction: float = 0.25
 
+    # Self-contained per-call example store the model trains from. When set,
+    # training reads patches from here instead of (WAV + sibling-PNG) pairs.
+    training_data_dir: str = ""
+
     wav_paths: List[str] = field(default_factory=list)
 
-    def resolve_run_dir(self) -> str:
-        name = self.run_name or datetime.now().strftime("unet_%Y%m%d_%H%M%S")
+    def resolve_run_dir(self, n_examples: int = 0) -> str:
+        if self.run_name:
+            name = self.run_name
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            arch = (self.model_arch or "unet").lower()
+            name = f"{ts}_{arch}_n={n_examples}"
         return str(Path(self.project_dir) / "models" / name)
 
 
@@ -75,6 +90,38 @@ def _resolve_device(pref: str) -> str:
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+# ----------------------------------------------------------------------
+# Model factory — shared by training and inference
+# ----------------------------------------------------------------------
+# Encoder forced for the HRNet architecture option (high-resolution
+# features for crisp thin-structure outlines).
+HRNET_ENCODER = "tu-hrnet_w18"
+
+
+def build_model(arch: str, encoder_name: str, encoder_weights,
+                in_channels: int = 1, classes: int = 1):
+    """Construct a binary segmentation model for the given architecture.
+
+    Used by both :func:`train_unet` and inference so a checkpoint always
+    rebuilds with the architecture it was trained on. ``arch`` is one of
+    ``'unet' | 'unetpp' | 'manet' | 'hrnet'`` (unknown values fall back to
+    ``'unet'``). The ``'hrnet'`` option ignores ``encoder_name`` and uses a
+    timm HRNet encoder under the standard U-Net decoder.
+    """
+    import segmentation_models_pytorch as smp
+
+    arch = (arch or "unet").lower()
+    kw = dict(encoder_weights=encoder_weights, in_channels=in_channels,
+              classes=classes)
+    if arch == "unetpp":
+        return smp.UnetPlusPlus(encoder_name=encoder_name, **kw)
+    if arch == "manet":
+        return smp.MAnet(encoder_name=encoder_name, **kw)
+    if arch == "hrnet":
+        return smp.Unet(encoder_name=HRNET_ENCODER, **kw)
+    return smp.Unet(encoder_name=encoder_name, **kw)
 
 
 # ----------------------------------------------------------------------
@@ -134,18 +181,15 @@ def train_unet(
             "Install with:\n    pip install segmentation-models-pytorch"
         ) from e
 
-    from .mad_dataset import collect_training_tiles
+    from .mad_examples import collect_training_examples
 
-    # ---- collect tiles ----
+    # ---- collect tiles from the self-contained example store ----
     if progress:
         progress(0, cfg.n_epochs, {'status': 'collecting_tiles'})
-    specs, targets, weights = collect_training_tiles(
-        cfg.wav_paths,
-        nperseg=cfg.nperseg, noverlap=cfg.noverlap, nfft=cfg.nfft,
-        db_min=cfg.db_min, db_max=cfg.db_max,
+    specs, targets, weights = collect_training_examples(
+        cfg.training_data_dir,
         tile_time_frames=cfg.tile_time_frames,
         tile_freq_bins=cfg.tile_freq_bins,
-        overlap_fraction=cfg.tile_overlap_fraction,
         progress=(
             lambda i, n, name: progress(0, cfg.n_epochs, {
                 'status': 'collecting_tiles', 'file_i': i,
@@ -157,8 +201,8 @@ def train_unet(
     n_total = specs.shape[0]
     if n_total == 0:
         raise RuntimeError(
-            "No labeled tiles found. Paint at least one positive pixel in "
-            "one or more files before training."
+            "No confirmed training examples found. Label and confirm at least "
+            "one call (Enter) before training."
         )
 
     # ---- train/val split ----
@@ -186,15 +230,13 @@ def train_unet(
 
     # ---- model ----
     device = _resolve_device(cfg.device)
-    model = smp.Unet(
-        encoder_name=cfg.encoder_name,
-        encoder_weights=cfg.encoder_weights,
-        in_channels=1,
-        classes=1,
+    model = build_model(
+        cfg.model_arch, cfg.encoder_name, cfg.encoder_weights,
+        in_channels=1, classes=1,
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
-    run_dir = Path(cfg.resolve_run_dir())
+    run_dir = Path(cfg.resolve_run_dir(n_examples=n_total))
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- train ----
@@ -283,6 +325,7 @@ def train_unet(
             torch.save(
                 {
                     'state_dict': model.state_dict(),
+                    'model_arch': cfg.model_arch,
                     'encoder_name': cfg.encoder_name,
                     'in_channels': 1,
                     'classes': 1,

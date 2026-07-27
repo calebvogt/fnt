@@ -2,7 +2,7 @@
 Shared audio visualization widgets for USV detection tools.
 
 Contains SpectrogramWidget and WaveformOverviewWidget, used by both
-the Classic Audio Detector and the Deep Audio Detector.
+the Classic Audio Detector and the Mask Audio Detector.
 """
 
 import math
@@ -25,6 +25,11 @@ class SpectrogramWidget(QWidget):
     box_adjusted = pyqtSignal(int, float, float, float, float)
     drag_complete = pyqtSignal()  # Emitted when box drag is finished
     zoom_requested = pyqtSignal(float, float)  # factor, center_time
+    mask_edited = pyqtSignal(object)  # call_id whose mask just changed
+    # Frequency-sample dot dragged: (det_idx, dot_index 0-based, new_freq_hz).
+    sample_freq_adjusted = pyqtSignal(int, int, float)
+    # A sample-dot drag finished (det_idx) — persist + refresh.
+    sample_drag_complete = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,6 +64,7 @@ class SpectrogramWidget(QWidget):
         self.drag_start = None
         self.drag_start_box = None
         self.drag_detection_idx = None
+        self.drag_dot_index = None  # which peak_freq sample dot is being dragged
 
         # Drawing new box
         self.is_drawing = False
@@ -78,6 +84,115 @@ class SpectrogramWidget(QWidget):
         self._filter_params = None
         self._raw_spec_db = None
         self._raw_spec_freqs = None
+
+        # --- per-call mask / brush layer (CAD Part 2b) ---
+        # Masks live on the DSP spectrogram grid (freq-bin x time-frame).
+        self.spec_grid = None          # {sample_rate, nperseg, noverlap, nfft,
+                                       #  n_freq_bins, n_time_frames}
+        self.call_masks = {}           # call_id -> {mask(bool crop), f_off, t_off}
+        self.mask_edit_active = False
+        self.mask_edit_call_id = None
+        self._edit_full_mask = None    # full-grid bool array while editing
+        self.brush_radius = 6          # in spec-grid pixels
+        self.eraser_mode = False
+        self._mask_painting = False
+        self._cursor_pos = None
+
+    # ------------------------------------------------------------------
+    # Per-call mask / brush layer (CAD Part 2b)
+    # ------------------------------------------------------------------
+    def set_spec_grid(self, sample_rate, nperseg, noverlap, nfft):
+        """Record the DSP spectrogram grid so masks map to (freq-bin, frame)."""
+        hop = max(1, nperseg - noverlap)
+        n_freq = nfft // 2 + 1
+        n_time = (max(0, len(self.audio_data) - nperseg) // hop + 1
+                  if self.audio_data is not None else 0)
+        self.spec_grid = {
+            'sample_rate': int(sample_rate), 'nperseg': int(nperseg),
+            'noverlap': int(noverlap), 'nfft': int(nfft),
+            'n_freq_bins': int(n_freq), 'n_time_frames': int(n_time),
+            'hop': hop,
+        }
+
+    def set_call_masks(self, masks: dict):
+        """Replace all stored per-call masks ({call_id: {mask, f_off, t_off}})."""
+        self.call_masks = dict(masks) if masks else {}
+        self.update()
+
+    def set_brush(self, radius=None, eraser=None):
+        if radius is not None:
+            self.brush_radius = int(radius)
+        if eraser is not None:
+            self.eraser_mode = bool(eraser)
+
+    def enter_mask_edit(self, call_id):
+        """Begin brushing the mask for ``call_id`` (loads any existing mask)."""
+        if self.spec_grid is None:
+            return False
+        self.mask_edit_active = True
+        self.mask_edit_call_id = call_id
+        n_freq = self.spec_grid['n_freq_bins']
+        n_time = self.spec_grid['n_time_frames']
+        full = np.zeros((n_freq, n_time), dtype=bool)
+        ex = self.call_masks.get(call_id)
+        if ex is not None:
+            m = ex['mask']; f0 = ex['f_off']; t0 = ex['t_off']
+            f1 = min(n_freq, f0 + m.shape[0]); t1 = min(n_time, t0 + m.shape[1])
+            full[f0:f1, t0:t1] = m[:f1 - f0, :t1 - t0]
+        self._edit_full_mask = full
+        self.setCursor(Qt.BlankCursor)
+        self.update()
+        return True
+
+    def exit_mask_edit(self, commit=True):
+        """Finish brushing; crop+store the mask and emit ``mask_edited``."""
+        cid = self.mask_edit_call_id
+        if commit and self._edit_full_mask is not None and cid is not None:
+            full = self._edit_full_mask
+            if full.any():
+                fs = np.where(full.any(axis=1))[0]
+                ts = np.where(full.any(axis=0))[0]
+                f0, f1 = int(fs[0]), int(fs[-1]) + 1
+                t0, t1 = int(ts[0]), int(ts[-1]) + 1
+                self.call_masks[cid] = {
+                    'mask': np.ascontiguousarray(full[f0:f1, t0:t1]),
+                    'f_off': f0, 't_off': t0,
+                }
+            else:
+                self.call_masks.pop(cid, None)
+            self.mask_edited.emit(cid)
+        self.mask_edit_active = False
+        self.mask_edit_call_id = None
+        self._edit_full_mask = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _xy_to_grid(self, pos, spec_rect):
+        """Screen point -> (f_bin, t_frame) on the DSP grid, or None."""
+        if self.spec_grid is None:
+            return None
+        t = self._x_to_time(pos.x(), spec_rect)
+        f = self._y_to_freq(pos.y(), spec_rect)
+        hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+        nfft = self.spec_grid['nfft']
+        t_frame = int(round(t * sr / hop))
+        f_bin = int(round(f / ((sr / 2.0) / (nfft // 2))))
+        n_freq = self.spec_grid['n_freq_bins']; n_time = self.spec_grid['n_time_frames']
+        if not (0 <= t_frame < n_time and 0 <= f_bin < n_freq):
+            return None
+        return f_bin, t_frame
+
+    def _stamp_brush(self, f_bin, t_frame):
+        """Paint/erase a disk of brush_radius into the in-progress mask."""
+        if self._edit_full_mask is None:
+            return
+        r = self.brush_radius
+        h, w = self._edit_full_mask.shape
+        f0 = max(0, f_bin - r); f1 = min(h, f_bin + r + 1)
+        t0 = max(0, t_frame - r); t1 = min(w, t_frame + r + 1)
+        ff, tt = np.ogrid[f0:f1, t0:t1]
+        disk = (ff - f_bin) ** 2 + (tt - t_frame) ** 2 <= r * r
+        self._edit_full_mask[f0:f1, t0:t1][disk] = (not self.eraser_mode)
 
     def set_colormap(self, name):
         """Set colormap by name and recompute spectrogram."""
@@ -200,6 +315,12 @@ class SpectrogramWidget(QWidget):
                 [113, 113, 113], [142, 142, 142], [170, 170, 170], [198, 198, 198],
                 [227, 227, 227], [255, 255, 255],
             ],
+            # Inverted grayscale: soft (low amplitude) = white, loud = dark.
+            'grayscale_inv': [
+                [255, 255, 255], [227, 227, 227], [198, 198, 198], [170, 170, 170],
+                [142, 142, 142], [113, 113, 113], [85, 85, 85], [57, 57, 57],
+                [28, 28, 28], [0, 0, 0],
+            ],
         }
         colors = np.array(colormaps.get(name, colormaps['viridis']), dtype=np.float32)
 
@@ -263,6 +384,7 @@ class SpectrogramWidget(QWidget):
         if self.drag_mode is not None:
             self.drag_mode = None
             self.drag_detection_idx = None
+            self.drag_dot_index = None
             self.drag_start = None
             self.drag_start_box = None
         self.detections = detections
@@ -276,6 +398,12 @@ class SpectrogramWidget(QWidget):
             self.detections[idx]['stop_seconds'] = stop_s
             self.detections[idx]['min_freq_hz'] = min_freq
             self.detections[idx]['max_freq_hz'] = max_freq
+            self.update()
+
+    def update_sample_freq(self, idx, dot_index, freq):
+        """Update one peak_freq_N sample dot in place (used during dot drag)."""
+        if 0 <= idx < len(self.detections):
+            self.detections[idx][f'peak_freq_{dot_index + 1}'] = freq
             self.update()
 
     def set_view_range(self, start_s, end_s):
@@ -425,6 +553,27 @@ class SpectrogramWidget(QWidget):
         )
         painter.drawImage(spec_rect.topLeft(), scaled_image)
 
+        # Draw per-call masks (under the boxes).
+        if self.call_masks and self.spec_grid is not None:
+            for det in self.detections:
+                cid = det.get('call_id')
+                ex = self.call_masks.get(cid) if cid is not None else None
+                if ex is not None and not (self.mask_edit_active
+                                           and cid == self.mask_edit_call_id):
+                    self._draw_mask(painter, ex['mask'], ex['f_off'],
+                                    ex['t_off'], spec_rect, QColor(80, 200, 255, 110))
+
+        # Draw the in-progress edited mask (brighter).
+        if self.mask_edit_active and self._edit_full_mask is not None:
+            full = self._edit_full_mask
+            if full.any():
+                fs = np.where(full.any(axis=1))[0]
+                ts = np.where(full.any(axis=0))[0]
+                f0, f1 = int(fs[0]), int(fs[-1]) + 1
+                t0, t1 = int(ts[0]), int(ts[-1]) + 1
+                self._draw_mask(painter, full[f0:f1, t0:t1], f0, t0,
+                                spec_rect, QColor(255, 220, 60, 150))
+
         # Draw detection boxes
         for i, det in enumerate(self.detections):
             self._draw_detection_box(painter, det, i, spec_rect)
@@ -432,6 +581,19 @@ class SpectrogramWidget(QWidget):
         # Draw temp box if drawing
         if self.is_drawing and self.draw_start and self.draw_current:
             self._draw_temp_box(painter, spec_rect)
+
+        # Brush cursor circle in mask-edit mode.
+        if (self.mask_edit_active and self._cursor_pos is not None
+                and spec_rect.contains(self._cursor_pos) and self.spec_grid):
+            hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+            # brush radius (grid frames) -> screen px via the time axis
+            px_per_frame = (self._time_to_x((hop * 1) / sr, spec_rect)
+                            - self._time_to_x(0, spec_rect))
+            rpx = max(3, abs(px_per_frame) * self.brush_radius)
+            painter.setPen(QPen(QColor(255, 80, 80) if self.eraser_mode
+                                else QColor(255, 255, 255), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(self._cursor_pos, int(rpx), int(rpx))
 
         # Draw playback position line
         if self.playback_position is not None:
@@ -442,6 +604,30 @@ class SpectrogramWidget(QWidget):
                                  int(x), int(spec_rect.bottom()))
 
         self._draw_axes(painter, spec_rect)
+
+    def _draw_mask(self, painter, mask, f_off, t_off, spec_rect, color):
+        """Render a cropped boolean mask (grid coords) as a translucent overlay."""
+        if mask is None or not mask.any() or self.spec_grid is None:
+            return
+        hop = self.spec_grid['hop']; sr = self.spec_grid['sample_rate']
+        nfft = self.spec_grid['nfft']
+        freq_per_bin = (sr / 2.0) / (nfft // 2)
+        h, w = mask.shape
+        # Screen rect for the mask crop (freq grows up → flip rows).
+        x0 = self._time_to_x(t_off * hop / sr, spec_rect)
+        x1 = self._time_to_x((t_off + w) * hop / sr, spec_rect)
+        y_bottom = self._freq_to_y(f_off * freq_per_bin, spec_rect)
+        y_top = self._freq_to_y((f_off + h) * freq_per_bin, spec_rect)
+        if x1 <= x0 or y_bottom <= y_top:
+            return
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        sel = mask.astype(bool)
+        rgba[sel, 0] = color.red(); rgba[sel, 1] = color.green()
+        rgba[sel, 2] = color.blue(); rgba[sel, 3] = color.alpha()
+        rgba = rgba[::-1]  # flip so row 0 = highest freq (screen top)
+        rgba = np.ascontiguousarray(rgba)
+        img = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888)
+        painter.drawImage(QRectF(x0, y_top, x1 - x0, y_bottom - y_top), img)
 
     def _get_spec_rect(self):
         """Get spectrogram drawing area."""
@@ -561,36 +747,56 @@ class SpectrogramWidget(QWidget):
         if status in ('accepted', 'pending') and det.get('peak_freq_1'):
             self._draw_freq_contour(painter, det, x1, x2, spec_rect)
 
-    def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
-        """Draw peak frequency sample dots and connecting lines."""
-        # Collect peak_freq_N values
+    def _collect_sample_freqs(self, det):
+        """Return the det's peak_freq_N sample values in order (skipping NaN)."""
         points = []
         i = 1
         while True:
-            key = f'peak_freq_{i}'
-            val = det.get(key)
+            val = det.get(f'peak_freq_{i}')
             if val is None:
                 break
-            if not (isinstance(val, (int, float)) and not math.isnan(val)):
-                i += 1
-                continue
-            points.append(val)
+            if isinstance(val, (int, float)) and not math.isnan(val):
+                points.append(val)
             i += 1
+        return points
 
-        if len(points) < 2:
-            return
+    def _sample_dot_coords(self, det, spec_rect):
+        """Screen (px, py) for each peak_freq_N dot, evenly spaced across the box.
 
+        Dots are positioned by index across the box width (the samples are
+        evenly distributed in time), so only the vertical position carries the
+        sampled frequency. Returns [] when there are fewer than 2 samples.
+        """
+        points = self._collect_sample_freqs(det)
         n = len(points)
-        # Evenly space dots horizontally across the box
-        dot_coords = []
+        if n < 2:
+            return []
+        x1 = self._time_to_x(det.get('start_seconds', 0), spec_rect)
+        x2 = self._time_to_x(det.get('stop_seconds', 0), spec_rect)
+        coords = []
         for j, freq in enumerate(points):
             t = j / (n - 1) if n > 1 else 0.5
             px = x1 + t * (x2 - x1)
             py = self._freq_to_y(freq, spec_rect)
-            dot_coords.append((px, py))
+            coords.append((px, py))
+        return coords
 
-        # Draw connecting lines (cyan)
-        pen = QPen(QColor(0, 220, 255, 200))
+    def _draw_freq_contour(self, painter, det, x1, x2, spec_rect):
+        """Draw peak frequency sample dots and connecting lines.
+
+        Manually adjusted samples (``freq_samples_manual``) are drawn in orange
+        to flag that the box is decoupled from automatic frequency sampling.
+        """
+        dot_coords = self._sample_dot_coords(det, spec_rect)
+        if len(dot_coords) < 2:
+            return
+
+        manual = bool(det.get('freq_samples_manual', False))
+        line_color = QColor(255, 170, 0, 200) if manual else QColor(0, 220, 255, 200)
+        dot_color = QColor(255, 170, 0, 235) if manual else QColor(0, 220, 255, 230)
+
+        # Draw connecting lines
+        pen = QPen(line_color)
         pen.setWidth(2)
         painter.setPen(pen)
         for j in range(len(dot_coords) - 1):
@@ -599,10 +805,11 @@ class SpectrogramWidget(QWidget):
                 int(dot_coords[j+1][0]), int(dot_coords[j+1][1])
             )
 
-        # Draw dots
-        painter.setBrush(QBrush(QColor(0, 220, 255, 230)))
+        # Draw dots — larger/grabbable on the selected, accepted box.
+        draggable = (det.get('status') == 'accepted')
+        painter.setBrush(QBrush(dot_color))
         painter.setPen(QPen(QColor(255, 255, 255), 1))
-        radius = 4
+        radius = 5 if draggable else 4
         for px, py in dot_coords:
             painter.drawEllipse(int(px - radius), int(py - radius), radius * 2, radius * 2)
 
@@ -728,11 +935,25 @@ class SpectrogramWidget(QWidget):
 
     def mousePressEvent(self, event):
         """Handle mouse press."""
-        if event.button() != Qt.LeftButton:
-            return
-
         spec_rect = self._get_spec_rect()
         pos = event.pos()
+
+        # Mask-brush mode intercepts painting (left = paint, right = erase).
+        if self.mask_edit_active and spec_rect.contains(pos):
+            if event.button() in (Qt.LeftButton, Qt.RightButton):
+                self._mask_painting = True
+                prev = self.eraser_mode
+                if event.button() == Qt.RightButton:
+                    self.eraser_mode = True
+                g = self._xy_to_grid(pos, spec_rect)
+                if g:
+                    self._stamp_brush(*g)
+                self.eraser_mode = prev
+                self.update()
+            return
+
+        if event.button() != Qt.LeftButton:
+            return
 
         if not spec_rect.contains(pos):
             return
@@ -746,6 +967,16 @@ class SpectrogramWidget(QWidget):
         if clicked_det >= 0 and clicked_det != self.current_detection_idx:
             # Clicked a non-selected detection — select it (don't drag)
             self.detection_selected.emit(clicked_det)
+            return
+
+        # Frequency-sample dot drag (selected + accepted box only). Checked
+        # before edges/move so a dot sitting on the box edge stays grabbable.
+        dot_det, dot_i = self._find_sample_dot_at_pos(pos, spec_rect)
+        if dot_det is not None:
+            self.drag_mode = 'sample_dot'
+            self.drag_detection_idx = dot_det
+            self.drag_dot_index = dot_i
+            self.drag_start = (time_s, freq_hz)
             return
 
         # Now check edges/move on the SELECTED detection only
@@ -775,6 +1006,15 @@ class SpectrogramWidget(QWidget):
         spec_rect = self._get_spec_rect()
         pos = event.pos()
 
+        if self.mask_edit_active:
+            self._cursor_pos = pos
+            if self._mask_painting:
+                g = self._xy_to_grid(pos, spec_rect)
+                if g:
+                    self._stamp_brush(*g)
+            self.update()
+            return
+
         if self.is_drawing and self.draw_start:
             time_s = self._x_to_time(pos.x(), spec_rect)
             freq_hz = self._y_to_freq(pos.y(), spec_rect)
@@ -783,6 +1023,11 @@ class SpectrogramWidget(QWidget):
         elif self.drag_mode:
             self._handle_drag(pos, spec_rect)
         else:
+            # A grabbable frequency-sample dot takes cursor priority.
+            dot_det, _ = self._find_sample_dot_at_pos(pos, spec_rect)
+            if dot_det is not None:
+                self.setCursor(Qt.SizeVerCursor)
+                return
             edge, _ = self._find_edge_at_pos(pos, spec_rect)
             if edge in ('resize_left', 'resize_right'):
                 self.setCursor(Qt.SizeHorCursor)
@@ -802,10 +1047,16 @@ class SpectrogramWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
+        if self.mask_edit_active:
+            self._mask_painting = False
+            return
+
         if event.button() != Qt.LeftButton:
             return
 
+        was_sample_drag = self.drag_mode == 'sample_dot'
         was_dragging = self.drag_mode is not None
+        drag_idx = self.drag_detection_idx
 
         if self.is_drawing and self.draw_start and self.draw_current:
             t1, f1 = self.draw_start
@@ -819,11 +1070,15 @@ class SpectrogramWidget(QWidget):
         self.draw_current = None
         self.drag_mode = None
         self.drag_detection_idx = None
+        self.drag_dot_index = None
         self.drag_start_box = None
         self.update()
 
         # Notify parent that drag is complete (for saving)
-        if was_dragging:
+        if was_sample_drag:
+            # Sample-dot edits persist without re-measuring the box geometry.
+            self.sample_drag_complete.emit(drag_idx if drag_idx is not None else -1)
+        elif was_dragging:
             self.drag_complete.emit()
 
     def wheelEvent(self, event):
@@ -910,6 +1165,30 @@ class SpectrogramWidget(QWidget):
 
         return None, None
 
+    def _find_sample_dot_at_pos(self, pos, spec_rect, threshold=8):
+        """Find a draggable peak_freq sample dot under the cursor.
+
+        Only the currently selected, ``accepted`` detection's dots are
+        grabbable — the user must accept a call before re-positioning its
+        frequency samples. Returns ``(det_idx, dot_index)`` or ``(None, None)``.
+        """
+        idx = self.current_detection_idx
+        if not (0 <= idx < len(self.detections)):
+            return None, None
+        det = self.detections[idx]
+        if det.get('status') != 'accepted':
+            return None, None
+        best = None
+        best_d2 = threshold * threshold
+        for dot_i, (px, py) in enumerate(self._sample_dot_coords(det, spec_rect)):
+            d2 = (pos.x() - px) ** 2 + (pos.y() - py) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = dot_i
+        if best is None:
+            return None, None
+        return idx, best
+
     def _find_detection_at_pos(self, pos, spec_rect):
         """Find detection at position (checks both x and y axes).
 
@@ -945,6 +1224,15 @@ class SpectrogramWidget(QWidget):
         # Clamp to valid ranges
         time_s = max(0, min(time_s, self.total_duration))
         freq_hz = max(0, min(freq_hz, self.max_freq))
+
+        # Frequency-sample dot: vertical-only move, clamped to the box's band.
+        # (Horizontal positions stay evenly distributed across the box time span.)
+        if self.drag_mode == 'sample_dot':
+            min_f = det.get('min_freq_hz', self.min_freq)
+            max_f = det.get('max_freq_hz', self.max_freq)
+            f = max(min_f, min(freq_hz, max_f))
+            self.sample_freq_adjusted.emit(self.drag_detection_idx, self.drag_dot_index, f)
+            return
 
         start_s = det.get('start_seconds', 0)
         stop_s = det.get('stop_seconds', 0)
@@ -1015,6 +1303,7 @@ class WaveformOverviewWidget(QWidget):
         self.view_end = 1.0
         self._dragging = False
         self.detection_times = []  # List of (start_s, stop_s) for tick marks
+        self.status_marks = []  # List of (center_s, QColor) status-colored ticks
 
     def set_audio_data(self, audio_data, sample_rate):
         """Compute downsampled envelope for display."""
@@ -1044,6 +1333,16 @@ class WaveformOverviewWidget(QWidget):
             detection_times: List of (start_seconds, stop_seconds) tuples
         """
         self.detection_times = detection_times or []
+        self.update()
+
+    def set_status_marks(self, marks):
+        """Set status-colored tick marks along the overview strip.
+
+        Args:
+            marks: list of ``(center_seconds, QColor)`` — one tick per detection,
+                colored by labeling status (pending/accepted/rejected).
+        """
+        self.status_marks = marks or []
         self.update()
 
     def set_view_range(self, start, end):
@@ -1076,6 +1375,15 @@ class WaveformOverviewWidget(QWidget):
             painter.setPen(QPen(QColor(255, 200, 50, 180), 1))
             for start_s, stop_s in self.detection_times:
                 cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
+                painter.drawLine(cx, 0, cx, h)
+
+        # Draw status-colored tick marks (pending/accepted/rejected). One per
+        # detection at its center time, so the user can see where calls cluster
+        # along the whole file without zooming out.
+        if self.status_marks and self.total_duration > 0:
+            for cs, color in self.status_marks:
+                cx = int(cs / self.total_duration * w)
+                painter.setPen(QPen(color, 1))
                 painter.drawLine(cx, 0, cx, h)
 
         # Draw viewport highlight

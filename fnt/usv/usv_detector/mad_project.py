@@ -1,9 +1,8 @@
 """MAD (Mask Audio Detector) project configuration and directory layout.
 
-Parallels :mod:`fnt.usv.usv_detector.yolo_detector` but for semantic
-segmentation instead of bounding-box detection. A MAD project is a SLEAP-style
-self-contained directory. Pixel-level labels live as sibling PNGs next to
-each .wav (analogous to DAD's sibling CSVs).
+A MAD project is a self-contained directory. Pixel-level labels and training
+examples live in per-wav ``_FNT_masks.h5`` siblings and a consolidated
+``training_data.h5`` store under the project's ``models/training_data/``.
 """
 from __future__ import annotations
 
@@ -36,6 +35,9 @@ class MADProjectConfig:
     project_dir: str = ""
     project_name: str = ""
     source_folders: List[str] = field(default_factory=list)
+    # Individually added .wav files (via "Add Files…") — persisted so they
+    # reappear when the project is reopened, alongside source_folders.
+    audio_files: List[str] = field(default_factory=list)
     last_opened_file: Optional[str] = None
 
     # Spectrogram parameters — must match between label, train, and inference.
@@ -59,12 +61,28 @@ class MADProjectConfig:
     # Inference.
     mask_threshold: float = 0.5
 
+    # Call-type classes the user has confirmed (metadata on each saved
+    # training example; the segmentation model itself stays binary). The
+    # class dialog defaults to ``last_class`` so repeat-Enter reuses it.
+    classes: List[str] = field(default_factory=lambda: ["USV"])
+    last_class: str = "USV"
+
     # Model history: list of {name, arch, n_positive_pixels, n_negative_pixels, path, date}.
     models: List[Dict] = field(default_factory=list)
 
     schema_version: int = 1
 
     # ------------------------------------------------------------------
+    @property
+    def training_data_dir(self) -> str:
+        """Self-contained per-call example store, shared across model runs."""
+        return os.path.join(self.project_dir, 'models', 'training_data')
+
+    @property
+    def recordings_dir(self) -> str:
+        """Audio files copied into the project for portability."""
+        return os.path.join(self.project_dir, 'recordings')
+
     def save(self, path: Optional[str] = None) -> None:
         """Save config to ``<project_dir>/mad_project_info.json``."""
         if path is None:
@@ -100,7 +118,9 @@ def create_mad_project(
     """Create a new MAD project directory and write its config."""
     os.makedirs(project_dir, exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'models', 'training_data'), exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'datasets'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'recordings'), exist_ok=True)
 
     if config is None:
         config = MADProjectConfig()

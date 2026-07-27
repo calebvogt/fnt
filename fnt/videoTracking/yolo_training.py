@@ -141,22 +141,21 @@ def convert_coco_to_yolo(
 
 
 def _resolve_device(pref: str) -> str:
-    """Resolve training device.  MPS is excluded — YOLO training on Apple
-    Metal produces corrupt weights (loss stays ~10x higher than CPU and the
-    resulting model cannot detect anything).  MPS inference is fine, but
-    training must use CPU or CUDA."""
+    """Resolve training device preference to an available backend."""
     import torch
     if pref == "cpu":
         return "cpu"
     if pref == "cuda":
         return "cuda" if torch.cuda.is_available() else "cpu"
     if pref == "mps":
-        print("[YOLO Train] MPS requested but disabled for training "
-              "(known convergence issues) — using CPU instead")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
+    # "auto" — pick best available
     if torch.cuda.is_available():
         return "cuda"
-    # Skip MPS even on "auto" — only use CUDA or CPU for training
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
@@ -202,8 +201,8 @@ def train_yolo_seg(
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         cuda_ver = torch.version.cuda or "N/A"
         print(f"[YOLO Train] GPU: {gpu_name} ({gpu_mem:.1f} GB)  |  CUDA: {cuda_ver}")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print(f"[YOLO Train] MPS available (not used for training)")
+    elif device == "mps":
+        print(f"[YOLO Train] Apple MPS (Metal Performance Shaders)")
     print(f"[YOLO Train] Device: {device}")
 
     if "cuda" in device:
@@ -221,12 +220,10 @@ def train_yolo_seg(
     print(f"[YOLO Train] Pretrained weights: {pretrained_path}")
     model = YOLO(str(pretrained_path))
 
-    # Log model parameter count
     total_params = sum(p.numel() for p in model.model.parameters())
-    trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
-    print(f"[YOLO Train] Parameters: {total_params:,} total, {trainable:,} trainable")
-
     freeze_layers = 10 if cfg.freeze_backbone else 0
+    print(f"[YOLO Train] Parameters: {total_params:,} total, "
+          f"freeze={freeze_layers} layers")
 
     iteration_count = [0]
     best_loss = [float("inf")]
