@@ -35,8 +35,6 @@ device that has not been reflashed keeps working, with reduced fidelity.
 
 from datetime import datetime
 
-FW_VERSION_REQUIRED = "2.0"
-
 EOT = "\x04"
 
 # --- commands -------------------------------------------------------------
