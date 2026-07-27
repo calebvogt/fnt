@@ -1,210 +1,42 @@
-"""FED3 device communication helper.
+"""One-shot FED3 commands for scripts and the CLI.
 
-Provides `list_serial_ports()`, `sync_time()`, and `Fed3Tracker` for GUI.
+The GUI does **not** use these: it holds a persistent :class:`~fnt.fed3.fed_serial.Fed3Link`
+per device and sends through that. These helpers exist for command-line use and
+for talking to a device the GUI is not tracking. They refuse to open a port that
+a live link already owns, which is what stops a stray one-shot command from
+stealing the port out from under a running experiment.
 """
 
 import time
-import threading
 from datetime import datetime
 
+from . import fed_protocol as proto
+from .fed_serial import (
+    BAUD,
+    PORT_REGISTRY,
+    SETTLE_SECONDS,
+    is_candidate_port,
+    list_serial_ports,
+)
 
-def is_candidate_port(p):
-    """Check if a serial port is a potential candidate for a FED3 device.
-
-    Filters out known unresponsive or unrelated ports (e.g. Bluetooth,
-    motherboard serial ports, Intel AMT SOL) while keeping USB/ACM/CDC devices.
-    """
-    dev = getattr(p, "device", "") or ""
-    desc = getattr(p, "description", "") or ""
-    hwid = getattr(p, "hwid", "") or ""
-    
-    dev_lower = dev.lower()
-    desc_lower = desc.lower()
-    hwid_lower = hwid.lower()
-    
-    # 1. Exclude Bluetooth ports
-    if "bluetooth" in desc_lower or "bth" in hwid_lower or "bluetooth" in dev_lower or "rfcomm" in dev_lower:
-        return False
-        
-    # 2. Exclude standard motherboard / legacy / physical COM ports
-    if "communications port" in desc_lower or "standard serial port" in desc_lower:
-        return False
-    if hwid_lower.startswith("acpi"):
-        return False
-    if "/dev/ttys" in dev_lower:
-        return False
-        
-    # 3. Exclude Intel Active Management Technology / SOL
-    if "intel" in desc_lower and ("active management" in desc_lower or "sol" in desc_lower):
-        return False
-        
-    # 4. Include ports that have explicit USB / ACM / CDC / Arduino / Feather / Adafruit keywords
-    if any(k in dev or k in desc or k in hwid for k in ("ACM", "ttyACM", "USB", "Arduino", "Feather", "Adafruit", "CDC")):
-        return True
-        
-    # 5. Include any port with a valid USB Vendor ID
-    if getattr(p, "vid", None) is not None:
-        return True
-        
-    return False
+__all__ = [
+    "is_candidate_port",
+    "list_serial_ports",
+    "sync_time",
+    "send_custom_command",
+]
 
 
-class Fed3Tracker:
-    def __init__(self, port, baud=115200):
-        self.port = port
-        self.baud = baud
-        self.ser = None
-        self._running = False
-        self.lock = threading.Lock()
-
-    def start(self, callback, connected_callback=None):
-        try:
-            import serial
-            import os
-            
-            with self.lock:
-                self.ser = serial.Serial(self.port, self.baud, timeout=1, dsrdtr=False, rtscts=False)
-                try:
-                    # Set DTR/RTS to True to reset the SAMD21 board and bypass boot animation
-                    self.ser.dtr = True
-                    self.ser.rts = True
-                except Exception:
-                    pass
-                self._running = True
-
-            time.sleep(2.0) # Allow device to reset/settle after opening
-            
-            # Check self._running again after sleep
-            if not self._running:
-                return
-
-            if connected_callback:
-                try:
-                    connected_callback()
-                except Exception:
-                    pass
-            
-            while self._running:
-                # Check if port still exists on the filesystem (works on Linux/macOS)
-                if self.port.startswith("/dev/") and not os.path.exists(self.port):
-                    if self._running:
-                        callback("ERROR: Device disconnected (port disappeared)")
-                    self._running = False
-                    break
-
-                ser_ref = None
-                with self.lock:
-                    if self._running:
-                        ser_ref = self.ser
-
-                if ser_ref is None or not ser_ref.is_open:
-                    break
-
-                try:
-                    in_wait = ser_ref.in_waiting
-                except Exception as e:
-                    if self._running:
-                        callback(f"ERROR: Serial port error: {e}")
-                    self._running = False
-                    break
-
-                if in_wait > 0:
-                    try:
-                        line = ser_ref.readline()
-                        if not line and in_wait > 0:
-                            # We expected bytes but got nothing, check if port still exists
-                            if self.port.startswith("/dev/") and not os.path.exists(self.port):
-                                if self._running:
-                                    callback("ERROR: Device disconnected")
-                                self._running = False
-                                break
-                        if not self._running:
-                            break
-                        line_str = line.decode("utf-8", errors="ignore")
-                        if line_str:
-                            callback(line_str)
-                    except Exception as e:
-                        if not self._running:
-                            break
-                        if isinstance(e, (serial.SerialException, OSError)):
-                            callback(f"ERROR: Serial read error: {e}")
-                            self._running = False
-                            break
-                        pass
-                else:
-                    time.sleep(0.05)
-        except Exception as e:
-            if self._running:
-                callback(f"ERROR: {e}")
-            self._running = False
-        finally:
-            self.stop()
-
-    def stop(self):
-        self._running = False
-        with self.lock:
-            if self.ser and self.ser.is_open:
-                try:
-                    self.ser.close()
-                except Exception:
-                    pass
-                self.ser = None
-
-    def send_command(self, command):
-        with self.lock:
-            if self.ser and self.ser.is_open:
-                if not command.endswith('\n'):
-                    command += '\n'
-                try:
-                    self.ser.write(command.encode("utf-8"))
-                    return True, f"Sent: {command.strip()}"
-                except Exception as e:
-                    return False, f"Send error: {e}"
-            return False, "Port not open."
+def sync_time(port=None, baud=BAUD, timeout=1, wait=0.5):
+    """Set a FED3's RTC to the host clock. Returns ``(ok, message)``."""
+    return send_custom_command(proto.cmd_sync(datetime.now()),
+                               port=port, baud=baud, timeout=timeout, wait=wait)
 
 
-def list_serial_ports():
-    """Return a list of available serial port device names.
+def send_custom_command(command, port=None, baud=BAUD, timeout=1, wait=0.5):
+    """Open a port, send one command, report what came back.
 
-    Returns an empty list if pyserial is not installed or no ports found.
-    """
-    try:
-        from serial.tools import list_ports
-        return [p.device for p in list_ports.comports() if is_candidate_port(p)]
-    except Exception:
-        return []
-
-
-def sync_time(port=None, baud=115200, timeout=1, wait=0.5):
-    """Send a SYNC command to a FED3 device.
-
-    Args:
-        port: Serial port string (e.g. '/dev/ttyACM0' or 'COM3'). If None,
-              the function will attempt to auto-detect a sensible port.
-        baud: Baud rate (default 115200).
-        timeout: Serial timeout in seconds.
-        wait: Seconds to wait after sending before reading responses.
-
-    Returns:
-        (success: bool, message: str)
-    """
-    now = datetime.now()
-    sync_string = now.strftime("SYNC:%Y,%m,%d,%H,%M,%S\n")
-    return send_custom_command(sync_string, port=port, baud=baud, timeout=timeout, wait=wait)
-
-
-def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
-    """Send a custom command to a FED3 device.
-
-    Args:
-        command: String to send to the device.
-        port: Serial port string.
-        baud: Baud rate.
-        timeout: Serial timeout.
-        wait: Seconds to wait for response.
-
-    Returns:
-        (success: bool, message: str)
+    Returns ``(ok, message)``.
     """
     try:
         import serial
@@ -212,26 +44,20 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
     except Exception:
         return False, "pyserial not installed. Install with: pip install pyserial"
 
-    # Auto-detect port if not provided
     if port is None:
-        ports = [p for p in list_ports.comports() if is_candidate_port(p)]
-        if not ports:
-            # Fallback to all ports if no candidate matches
-            ports = list(list_ports.comports())
-            if not ports:
-                return False, "No serial ports detected"
-        candidate = None
-        for p in ports:
-            dev = getattr(p, "device", "")
-            desc = getattr(p, "description", "")
-            if any(k in dev or k in desc for k in ("ACM", "ttyACM", "USB", "Arduino", "CDC")):
-                candidate = dev
-                break
-        if candidate is None:
-            candidate = ports[0].device
-        port = candidate
+        port = _autodetect_port(list_ports)
+        if port is None:
+            return False, "No serial ports detected"
 
-    out_lines = []
+    owner = PORT_REGISTRY.owner(port)
+    if owner is not None:
+        return False, (f"{port} is held by {owner}. Send the command through the "
+                       f"device's live connection instead of opening the port again.")
+
+    if not command.endswith("\n"):
+        command += "\n"
+
+    out = [f"Opening {port} @ {baud}", f"Sending: {command.strip()}"]
     ser = None
     try:
         ser = serial.Serial(port, baud, timeout=timeout, dsrdtr=False, rtscts=False)
@@ -240,44 +66,54 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
             ser.rts = True
         except Exception:
             pass
-        # Allow device to reset/settle after opening
-        time.sleep(2.0)
+        time.sleep(SETTLE_SECONDS)
+        ser.reset_input_buffer()
 
-        if not command.endswith('\n'):
-            command += '\n'
-            
-        out_lines.append(f"Opening {port} @ {baud}")
-        out_lines.append(f"Sending: {command.strip()}")
         ser.write(command.encode("utf-8"))
+        ser.flush()
         time.sleep(wait)
 
         try:
             while ser.in_waiting > 0:
-                response = ser.readline().decode("utf-8", errors="ignore").strip()
-                if response:
-                    out_lines.append(f"FED3 says: {response}")
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    out.append(f"FED3 says: {line}")
         except Exception:
-            # If reading fails, continue to close port
-            pass
+            pass    # keep whatever we got and close cleanly
 
-        if not out_lines:
-            out_lines.append("No response received from device.")
-        return True, "\n".join(out_lines)
-
-    except Exception as e:
-        return False, f"Error opening {port}: {e}"
+        if len(out) == 2:
+            out.append("No response received from device.")
+        return True, "\n".join(out)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Error opening {port}: {exc}"
     finally:
-        if ser and ser.is_open:
+        if ser is not None and ser.is_open:
             ser.close()
+
+
+def _autodetect_port(list_ports):
+    candidates = [p for p in list_ports.comports() if is_candidate_port(p)]
+    if not candidates:
+        candidates = list(list_ports.comports())
+    if not candidates:
+        return None
+    for p in candidates:
+        blob = f"{p.device} {p.description}"
+        if any(k in blob for k in ("ACM", "ttyACM", "USB", "Arduino", "CDC")):
+            return p.device
+    return candidates[0].device
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Send time sync to FED3 device.")
-    parser.add_argument("--port", "-p", help="Serial port (e.g., /dev/ttyACM0 or COM3)", default=None)
-    parser.add_argument("--baud", "-b", type=int, default=115200)
+
+    parser = argparse.ArgumentParser(description="Send time sync to a FED3 device.")
+    parser.add_argument("--port", "-p", default=None,
+                        help="Serial port (e.g. /dev/ttyACM0 or COM3)")
+    parser.add_argument("--baud", "-b", type=int, default=BAUD)
     args = parser.parse_args()
-    ok, msg = sync_time(port=args.port, baud=args.baud)
-    print(msg)
+
+    ok, message = sync_time(port=args.port, baud=args.baud)
+    print(message)
     if not ok:
         raise SystemExit(1)

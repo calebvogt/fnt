@@ -1,114 +1,201 @@
-"""FED3 plot rendering and management.
+"""Cumulative-pellet plot for the FED3 tab.
 
-Separates matplotlib rendering logic from the main widget.
+Two problems with the previous rendering are fixed here.
+
+The x-axis never advanced: limits were pinned to the first and last *event*, so
+between pellets the axis froze and a device that stopped responding looked
+identical to one that was simply idle. The right edge now tracks the current
+time whenever a device is live, so elapsed time is always visible and a flat
+line reads unambiguously as "no pellets since".
+
+Styling was applied ad hoc on every redraw, with a legend and tick colours
+re-set each frame and a hard-coded 5-minute floor on the range. Style now lives
+in one place, the axis is configured once, and only the data changes between
+frames.
 """
 
 from datetime import datetime, timedelta
+
 import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
 
+BACKGROUND = "#2b2b2b"
+AXES_FACE = "#1e1e1e"
+FOREGROUND = "#e0e0e0"
+MUTED = "#8a8a8a"
+GRID = "#3a3a3a"
+SPINE = "#4a4a4a"
+
+# Qualitative palette chosen to stay distinguishable on the dark axes and to
+# survive being printed in greyscale.
+SERIES_COLORS = [
+    "#4fc3f7", "#81c784", "#ffb74d", "#e57373",
+    "#ba68c8", "#4db6ac", "#fff176", "#f06292",
+]
+
+# Time windows offered in the toolbar: (label, hours or None for everything).
+WINDOWS = [("Last hour", 1), ("Last 6 h", 6), ("Last 24 h", 24),
+           ("Last 3 days", 72), ("Entire session", None)]
+
+DEFAULT_DARK_CYCLE = (19, 7)        # lights off at 19:00, on at 07:00
+
+
+class PlotSeries:
+    """One device's contribution to the plot."""
+
+    __slots__ = ("name", "times", "is_live", "start_time")
+
+    def __init__(self, name, times, is_live=False, start_time=None):
+        self.name = name
+        self.times = times                  # datetimes of pellet events
+        self.is_live = is_live
+        self.start_time = start_time
+
+
 class FedPlotManager:
-    def __init__(self, canvas, ax, plot_placeholder):
+    """Renders cumulative pellet counts against wall-clock time."""
+
+    def __init__(self, canvas, ax, placeholder):
         self.canvas = canvas
         self.ax = ax
-        self.plot_placeholder = plot_placeholder
+        self.placeholder = placeholder
+        self.window_hours = None
+        self.dark_cycle = DEFAULT_DARK_CYCLE
+        self.show_dark_cycle = True
+        self._style_axes()
 
-    def update_plot(self, target_dev, all_devices):
+    # --- configuration ----------------------------------------------------
+
+    def set_window(self, hours):
+        self.window_hours = hours
+
+    def set_dark_cycle(self, start_hour, end_hour, enabled=True):
+        self.dark_cycle = (start_hour, end_hour)
+        self.show_dark_cycle = enabled
+
+    # --- rendering --------------------------------------------------------
+
+    def update(self, series):
+        """Redraw from a list of :class:`PlotSeries`."""
+        drawable = [s for s in series if s.times or s.is_live]
+        self.placeholder.setVisible(not drawable)
+        self.canvas.setVisible(bool(drawable))
+        if not drawable:
+            return
+
         self.ax.clear()
-        self.ax.set_title("Pellets retrieved", color='white')
-        self.ax.set_xlabel("Time", color='white')
-        self.ax.set_ylabel("Cumulative Pellets", color='white')
-        self.ax.tick_params(colors='white')
-        for spine in self.ax.spines.values():
-            spine.set_edgecolor('#444444')
-        
-        plotted_something = False
-        min_time = None
-        max_time = None
-        
-        devices_to_plot = [target_dev] if target_dev else all_devices
-        
-        for dev in devices_to_plot:
-            events = dev.get('events', [])
-            dev_name = dev['name_edit'].text().strip() or dev['box'].title()
-            
-            if events:
-                times = mdates.date2num(events)
-                counts = list(range(1, len(events) + 1))
-                
-                if min_time is None or events[0] < min_time:
-                    min_time = events[0]
-                if max_time is None or events[-1] > max_time:
-                    max_time = events[-1]
-                
-                # Use standard .plot() instead of deprecated/removed .plot_date()
-                self.ax.plot(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
-                plotted_something = True
-            elif dev.get('is_tracking') and dev.get('tracking_start_time'):
-                start_t = dev['tracking_start_time']
-                end_t = max(datetime.now(), start_t + timedelta(minutes=5))
-                times = mdates.date2num([start_t, end_t])
-                counts = [0, 0]
-                
-                if min_time is None or start_t < min_time:
-                    min_time = start_t
-                if max_time is None or end_t > max_time:
-                    max_time = end_t
-                
-                # Use standard .plot() instead of deprecated/removed .plot_date()
-                self.ax.plot(times, counts, '-', label=dev_name, linewidth=2, marker='o', markersize=6, drawstyle='steps-post')
-                plotted_something = True
-        
-        # Toggle between placeholder and canvas
-        self.plot_placeholder.setVisible(not plotted_something)
-        self.canvas.setVisible(plotted_something)
-                
-        if plotted_something:
-            self.ax.legend(facecolor='#2b2b2b', edgecolor='#444444', labelcolor='white')
-            
-            # Shade dark cycle (19:00 to 07:00)
-            if min_time and max_time:
-                current_shade_start = min_time.replace(hour=19, minute=0, second=0, microsecond=0)
-                if min_time.hour < 19:
-                    current_shade_start -= timedelta(days=1)
-                
-                while current_shade_start < max_time:
-                    shade_end = current_shade_start + timedelta(hours=12)
-                    self.ax.axvspan(mdates.date2num(current_shade_start), 
-                                    mdates.date2num(shade_end), 
-                                    color='gray', alpha=0.3, zorder=0)
-                    current_shade_start += timedelta(days=1)
-            
-            # Auto-scale x-axis so ticks adapt as the time range grows
-            locator = mdates.AutoDateLocator()
-            self.ax.xaxis.set_major_locator(locator)
-            self.ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
-            self.ax.autoscale_view()
-            
-            # Overwrite autoscaled limits with safer bounds to prevent zero-range formatting errors
-            if min_time and max_time:
-                if (max_time - min_time).total_seconds() < 300:
-                    mid = min_time + (max_time - min_time) / 2
-                    min_t_plot = mid - timedelta(minutes=2.5)
-                    max_t_plot = mid + timedelta(minutes=2.5)
-                else:
-                    min_t_plot = min_time
-                    max_t_plot = max_time
-                self.ax.set_xlim(mdates.date2num(min_t_plot), mdates.date2num(max_t_plot))
-            
-            # Configure integer ticks on y-axis
-            self.ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-            
-            max_y = 0
-            for dev in devices_to_plot:
-                events = dev.get('events', [])
-                if events:
-                    max_y = max(max_y, len(events))
-            if max_y == 0:
-                self.ax.set_ylim(0, 10)
-            else:
-                self.ax.set_ylim(bottom=0)
-                
-            self.canvas.figure.autofmt_xdate()
-            self.canvas.figure.tight_layout(pad=1.5)
-            self.canvas.draw()
+        self._style_axes()
+
+        now = datetime.now()
+        start, end = self._time_range(drawable, now)
+
+        if self.show_dark_cycle:
+            self._shade_dark_cycle(start, end)
+
+        max_count = 0
+        for index, item in enumerate(drawable):
+            color = SERIES_COLORS[index % len(SERIES_COLORS)]
+            max_count = max(max_count, self._draw_series(item, color, start, end, now))
+
+        self.ax.set_xlim(mdates.date2num(start), mdates.date2num(end))
+        self.ax.set_ylim(0, max(max_count * 1.1, 5))
+        self.ax.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
+
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=8)
+        self.ax.xaxis.set_major_locator(locator)
+        self.ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+        legend = self.ax.legend(
+            loc="upper left", frameon=True, fontsize=8,
+            facecolor=AXES_FACE, edgecolor=SPINE, labelcolor=FOREGROUND)
+        legend.get_frame().set_alpha(0.85)
+
+        self.canvas.figure.tight_layout(pad=1.2)
+        self.canvas.draw_idle()
+
+    def _draw_series(self, item, color, start, end, now):
+        """Draw one device; returns its highest cumulative count in view."""
+        visible = [t for t in item.times if start <= t <= end]
+        # Pellets before the window still count toward the cumulative total.
+        base = sum(1 for t in item.times if t < start)
+
+        if not visible:
+            # A live device with no pellets in view is drawn as a flat line at
+            # its carried-over total, so it is visibly present rather than absent.
+            if item.is_live:
+                anchor = max(start, item.start_time or start)
+                self.ax.plot([mdates.date2num(anchor), mdates.date2num(now)],
+                             [base, base], "-", color=color, linewidth=1.6,
+                             alpha=0.85, label=item.name)
+            return base
+
+        counts = list(range(base + 1, base + len(visible) + 1))
+        times = [mdates.date2num(t) for t in visible]
+
+        self.ax.plot(times, counts, drawstyle="steps-post", color=color,
+                     linewidth=1.8, label=item.name)
+        self.ax.plot(times, counts, linestyle="none", marker="o", markersize=3.5,
+                     color=color, alpha=0.9)
+
+        # Extend the trace to the present so the gap since the last pellet is
+        # legible rather than implied by empty space.
+        if item.is_live and visible[-1] < now:
+            self.ax.plot([times[-1], mdates.date2num(now)], [counts[-1], counts[-1]],
+                         "-", color=color, linewidth=1.8, alpha=0.5)
+        return counts[-1]
+
+    def _time_range(self, series, now):
+        """Window to display, always ending at *now* while anything is live."""
+        earliest = None
+        for item in series:
+            candidates = [t for t in (item.start_time,) if t is not None]
+            if item.times:
+                candidates.append(item.times[0])
+            for candidate in candidates:
+                if earliest is None or candidate < earliest:
+                    earliest = candidate
+        if earliest is None:
+            earliest = now
+
+        latest = now if any(s.is_live for s in series) else max(
+            (item.times[-1] for item in series if item.times), default=now)
+
+        if self.window_hours is not None:
+            earliest = max(earliest, latest - timedelta(hours=self.window_hours))
+
+        # Never hand matplotlib a zero-width range: date formatting degenerates.
+        if (latest - earliest).total_seconds() < 60:
+            latest = earliest + timedelta(minutes=1)
+        pad = (latest - earliest) * 0.02
+        return earliest - pad, latest + pad
+
+    def _shade_dark_cycle(self, start, end):
+        """Shade lights-off periods behind the traces."""
+        lights_off, lights_on = self.dark_cycle
+        cursor = start.replace(hour=lights_off, minute=0, second=0, microsecond=0)
+        if cursor > start:
+            cursor -= timedelta(days=1)
+
+        # Dark phase may wrap midnight; its length is the forward distance from
+        # lights-off to lights-on.
+        hours = (lights_on - lights_off) % 24 or 24
+
+        while cursor < end:
+            self.ax.axvspan(
+                mdates.date2num(max(cursor, start)),
+                mdates.date2num(min(cursor + timedelta(hours=hours), end)),
+                color="#000000", alpha=0.28, zorder=0, linewidth=0)
+            cursor += timedelta(days=1)
+
+    def _style_axes(self):
+        self.ax.set_facecolor(AXES_FACE)
+        self.ax.set_title("Cumulative pellets retrieved", color=FOREGROUND,
+                          fontsize=11, pad=8)
+        self.ax.set_xlabel("Time", color=MUTED, fontsize=9)
+        self.ax.set_ylabel("Pellets", color=MUTED, fontsize=9)
+        self.ax.tick_params(colors=MUTED, labelsize=8, length=3)
+        self.ax.grid(True, color=GRID, linewidth=0.6, alpha=0.7)
+        self.ax.set_axisbelow(True)
+        for side, spine in self.ax.spines.items():
+            spine.set_visible(side in ("left", "bottom"))
+            spine.set_edgecolor(SPINE)

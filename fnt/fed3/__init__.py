@@ -1,7 +1,4 @@
-"""fnt.fed3 package: FED3 device helpers.
-
-Expose list_serial_ports and sync_time from fed_comms.py for a cleaner package API.
-"""
+"""fnt.fed3: FED3 device control, live monitoring and session recording."""
 
 from .fed_comms import list_serial_ports, sync_time
 from .fed_widgets import FEDTabWidget
