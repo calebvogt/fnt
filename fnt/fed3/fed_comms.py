@@ -57,25 +57,85 @@ class Fed3Tracker:
         self._running = False
         self.lock = threading.Lock()
 
-    def start(self, callback):
+    def start(self, callback, connected_callback=None):
         try:
             import serial
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            import os
+            
+            with self.lock:
+                self.ser = serial.Serial(self.port, self.baud, timeout=1, dsrdtr=False, rtscts=False)
+                try:
+                    # Set DTR/RTS to True to reset the SAMD21 board and bypass boot animation
+                    self.ser.dtr = True
+                    self.ser.rts = True
+                except Exception:
+                    pass
+                self._running = True
+
             time.sleep(2.0) # Allow device to reset/settle after opening
-            self._running = True
+            
+            # Check self._running again after sleep
+            if not self._running:
+                return
+
+            if connected_callback:
+                try:
+                    connected_callback()
+                except Exception:
+                    pass
             
             while self._running:
-                if self.ser.in_waiting > 0:
+                # Check if port still exists on the filesystem (works on Linux/macOS)
+                if self.port.startswith("/dev/") and not os.path.exists(self.port):
+                    if self._running:
+                        callback("ERROR: Device disconnected (port disappeared)")
+                    self._running = False
+                    break
+
+                ser_ref = None
+                with self.lock:
+                    if self._running:
+                        ser_ref = self.ser
+
+                if ser_ref is None or not ser_ref.is_open:
+                    break
+
+                try:
+                    in_wait = ser_ref.in_waiting
+                except Exception as e:
+                    if self._running:
+                        callback(f"ERROR: Serial port error: {e}")
+                    self._running = False
+                    break
+
+                if in_wait > 0:
                     try:
-                        line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                        if line:
-                            callback(line)
-                    except Exception:
+                        line = ser_ref.readline()
+                        if not line and in_wait > 0:
+                            # We expected bytes but got nothing, check if port still exists
+                            if self.port.startswith("/dev/") and not os.path.exists(self.port):
+                                if self._running:
+                                    callback("ERROR: Device disconnected")
+                                self._running = False
+                                break
+                        if not self._running:
+                            break
+                        line_str = line.decode("utf-8", errors="ignore")
+                        if line_str:
+                            callback(line_str)
+                    except Exception as e:
+                        if not self._running:
+                            break
+                        if isinstance(e, (serial.SerialException, OSError)):
+                            callback(f"ERROR: Serial read error: {e}")
+                            self._running = False
+                            break
                         pass
                 else:
                     time.sleep(0.05)
         except Exception as e:
-            callback(f"ERROR: {e}")
+            if self._running:
+                callback(f"ERROR: {e}")
             self._running = False
         finally:
             self.stop()
@@ -174,7 +234,12 @@ def send_custom_command(command, port=None, baud=115200, timeout=1, wait=0.5):
     out_lines = []
     ser = None
     try:
-        ser = serial.Serial(port, baud, timeout=timeout)
+        ser = serial.Serial(port, baud, timeout=timeout, dsrdtr=False, rtscts=False)
+        try:
+            ser.dtr = True
+            ser.rts = True
+        except Exception:
+            pass
         # Allow device to reset/settle after opening
         time.sleep(2.0)
 
