@@ -946,12 +946,6 @@ class FEDTabWidget(QWidget):
             if status == "FED3 Active":
                 active.append(port)
                 self._port_info[port] = {"id": device_id, "firmware": firmware}
-                if firmware and firmware < proto.FW_VERSION_REQUIRED:
-                    self.log.append_log(
-                        f"{port}: firmware {firmware} is older than "
-                        f"{proto.FW_VERSION_REQUIRED}. Live data works, but SD "
-                        f"mirroring and non-blocking transfers need a reflash.",
-                        False)
 
         self.log.append_log(f"[Scan] Active FED3 ports: {active or 'none'}")
         self._populate_port_combos(all_ports)
