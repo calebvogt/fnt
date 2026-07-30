@@ -1,9 +1,8 @@
 """FED3 monitoring and control tab.
 
 Ties together the serial links (:mod:`fed_serial`), the SD-card mirror
-(:mod:`fed_mirror`), the recording session (:mod:`fed_session`), the webcam
-(:mod:`fed_webcam`), the scheduler (:mod:`fed_scheduler`) and the plot
-(:mod:`fed_plot`).
+(:mod:`fed_mirror`), the recording session (:mod:`fed_session`), the scheduler
+(:mod:`fed_scheduler`) and the plot (:mod:`fed_plot`).
 
 Design notes for the parts that changed most:
 
@@ -11,9 +10,8 @@ Design notes for the parts that changed most:
 for the lifetime of its port. Commands are queued onto that link rather than
 opening the port again, which is what previously produced port-busy lockouts.
 
-*Recording.* Behavioural events, camera frames and every user action share one
-host time base, so a pellet and a video frame can be compared without alignment.
-Session state is persisted continuously, so a crash is resumable.
+*Recording.* Behavioural events and every user action share one
+host time base. Session state is persisted continuously, so a crash is resumable.
 
 *Plot refresh.* Events mark the plot dirty; a 1 Hz timer redraws. Redrawing per
 event made a busy rig unresponsive during pellet bursts.
@@ -51,7 +49,6 @@ from .fed_ui import (
     CollapsibleLogBox, FEDSvgView, FileSelectorDialog, FlowLayout,
     ResumeSessionDialog,
 )
-from .fed_webcam import WebcamRecorder, list_cameras
 
 UI_TICK_MS = 1000               # scheduler countdowns and plot refresh
 RECONNECT_TICK_MS = 5000        # auto-reconnect sweep
@@ -79,7 +76,6 @@ class FEDTabWidget(QWidget):
         self.session = None
         self.logger = session_mod.SessionLogger()
         self.scheduler = sched.Scheduler()
-        self.webcam = None
         self.sessions_dir = session_mod.default_session_root()
         self.removed_ports = set()
         self._port_info = {}                 # port -> {"id":.., "firmware":..}
@@ -163,7 +159,7 @@ class FEDTabWidget(QWidget):
         self.record_btn.setCheckable(True)
         self.record_btn.setToolTip(
             "Start a timestamped session folder. Behavioural events, the SD-card "
-            "mirror, webcam video and every user action are recorded into it on a "
+            "mirror and every user action are recorded into it on a "
             "shared clock.")
         self.record_btn.toggled.connect(self._on_record_toggled)
         row.addWidget(self.record_btn)
@@ -182,37 +178,6 @@ class FEDTabWidget(QWidget):
         row.addWidget(choose_btn)
         layout.addLayout(row)
 
-        camera_row = QHBoxLayout()
-        camera_row.addWidget(QLabel("Camera:"))
-        self.camera_combo = QComboBox()
-        self.camera_combo.setToolTip(
-            "Detected cameras. While a session is recording, video is written "
-            "with a per-frame timestamp CSV on the same clock as FED events.")
-        camera_row.addWidget(self.camera_combo)
-
-        self.camera_btn = QPushButton("Start Camera")
-        self.camera_btn.clicked.connect(self._toggle_camera)
-        camera_row.addWidget(self.camera_btn)
-
-        rescan_btn = QPushButton("Rescan")
-        rescan_btn.clicked.connect(self._populate_cameras)
-        camera_row.addWidget(rescan_btn)
-
-        self.camera_status = QLabel("Camera off")
-        self.camera_status.setStyleSheet("color: #999999;")
-        camera_row.addWidget(self.camera_status, stretch=1)
-        layout.addLayout(camera_row)
-
-        self.camera_view = QLabel("Camera off")
-        self.camera_view.setAlignment(Qt.AlignCenter)
-        self.camera_view.setMinimumHeight(240)
-        self.camera_view.setStyleSheet(
-            "background-color: #1e1e1e; color: #777777; "
-            "border: 1px dashed #444444; border-radius: 6px;")
-        self.camera_view.setVisible(False)
-        layout.addWidget(self.camera_view)
-
-        self._populate_cameras()
         return group
 
     # --- global control ---------------------------------------------------
@@ -1446,9 +1411,6 @@ class FEDTabWidget(QWidget):
         for device in self.devices:
             self._attach_session_to_device(device)
 
-        if self.webcam is not None:
-            self._arm_camera_recording()
-
         self.record_btn.setText("Stop Recording")
         self.session_label.setText(f"Recording to {self.session.name}")
         self.session_label.setStyleSheet("color: #4caf50;")
@@ -1487,9 +1449,6 @@ class FEDTabWidget(QWidget):
     def _stop_session(self):
         if self.session is None:
             return
-        frames = 0
-        if self.webcam is not None:
-            frames = self.webcam.stop_recording()
 
         for device in self.devices:
             if device.mirror is not None:
@@ -1498,9 +1457,7 @@ class FEDTabWidget(QWidget):
                 device.mirror = None
             device.event_log = None
 
-        self._log_action("Recording stopped",
-                         detail=f"{frames} video frames" if frames else "",
-                         source="system")
+        self._log_action("Recording stopped", source="system")
         self.session.mark_closed()
         self.logger.detach()
 
@@ -1517,8 +1474,6 @@ class FEDTabWidget(QWidget):
             "status": session_mod.STATUS_RUNNING,
             "devices": [d.to_state() for d in self.devices],
             "scheduled_events": self.scheduler.to_list(),
-            "camera_index": self.camera_combo.currentData(),
-            "camera_recording": self.webcam is not None and self.webcam.is_recording(),
             "auto_sync": self.auto_sync_btn.isChecked(),
         })
 
@@ -1611,80 +1566,6 @@ class FEDTabWidget(QWidget):
         else:
             subprocess.Popen(["xdg-open", path])
 
-    # ==================================================================
-    # Camera
-    # ==================================================================
-
-    def _populate_cameras(self):
-        try:
-            cameras = list_cameras()
-        except Exception as exc:  # noqa: BLE001
-            self.log.append_log(f"Camera scan failed: {exc}", False)
-            cameras = []
-        self.camera_combo.clear()
-        for index in cameras:
-            self.camera_combo.addItem(f"Camera {index}", index)
-        if not cameras:
-            self.camera_combo.addItem("No camera detected", None)
-
-    def _toggle_camera(self):
-        if self.webcam is not None:
-            self._stop_camera()
-            return
-        index = self.camera_combo.currentData()
-        if index is None:
-            QMessageBox.warning(self, "Camera", "No camera was detected.")
-            return
-
-        self.webcam = WebcamRecorder(camera_index=index,
-                                     label=self.camera_combo.currentText())
-        self.webcam.frame_ready.connect(self._on_camera_frame)
-        self.webcam.opened.connect(self._on_camera_opened)
-        self.webcam.error.connect(self._on_camera_error)
-        self.webcam.start()
-
-        self.camera_btn.setText("Stop Camera")
-        self.camera_combo.setEnabled(False)
-        self.camera_view.setVisible(True)
-        self._log_action("Camera started", detail=self.camera_combo.currentText())
-
-        if self.session is not None:
-            self._arm_camera_recording()
-
-    def _arm_camera_recording(self):
-        label = self.webcam.label
-        self.webcam.start_recording(self.session.video_path(label),
-                                    self.session.video_frames_path(label))
-        self._log_action("Camera recording armed", detail=label, source="system")
-
-    def _stop_camera(self):
-        if self.webcam is None:
-            return
-        frames = self.webcam.stop_recording()
-        self.webcam.stop()
-        if not self.webcam.wait(3000):      # a blocked camera read needs forcing
-            self.webcam.terminate()
-            self.webcam.wait(1000)
-        self.webcam = None
-
-        self.camera_btn.setText("Start Camera")
-        self.camera_combo.setEnabled(True)
-        self.camera_view.setPixmap(QPixmap())
-        self.camera_view.setText("Camera off")
-        self.camera_view.setVisible(False)
-        self.camera_status.setText("Camera off")
-        self._log_action("Camera stopped", detail=f"{frames} frames recorded")
-
-    def _on_camera_frame(self, image):
-        self.camera_view.setPixmap(QPixmap.fromImage(image).scaled(
-            self.camera_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def _on_camera_opened(self, width, height, fps):
-        self.camera_status.setText(f"Camera on: {width}x{height} @ {fps:.0f} fps")
-
-    def _on_camera_error(self, message):
-        self._stop_camera()
-        QMessageBox.critical(self, "Camera error", message)
 
     # ==================================================================
     # Export
@@ -1942,8 +1823,6 @@ class FEDTabWidget(QWidget):
             if timer is not None:
                 timer.stop()
 
-        if self.webcam is not None:
-            self._stop_camera()
         if self.session is not None:
             self._stop_session()
 

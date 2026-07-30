@@ -11,14 +11,13 @@ Every recording gets a timestamped folder::
             FED/<device>/events.csv          # behavioural events, host + device clock
             FED/<device>/mirror/<FILE>.CSV   # byte-exact copy of the SD card file
             FED/<device>/mirror_state.json   # per-file byte offsets
-            Video/<camera>.mp4               # + <camera>_frames.csv
             Sync/clock_sync.csv              # host vs device RTC at each sync
 
 Time base
 ---------
-Every host-side timestamp in a session — FED events, camera frames, interactions,
+Every host-side timestamp in a session — FED events, interactions,
 clock syncs — is :func:`host_now`, a single wall-clock epoch float. That is what
-makes camera frames and pokes directly comparable without post-hoc alignment.
+makes events directly comparable without post-hoc alignment.
 The device RTC is recorded alongside, never substituted for it, so clock drift
 stays measurable rather than baked in.
 
@@ -92,9 +91,8 @@ class RecordingSession:
 
         self.data_dir = os.path.join(self.root, "Data")
         self.fed_dir = os.path.join(self.data_dir, "FED")
-        self.video_dir = os.path.join(self.data_dir, "Video")
         self.sync_dir = os.path.join(self.data_dir, "Sync")
-        for d in (self.root, self.data_dir, self.fed_dir, self.video_dir, self.sync_dir):
+        for d in (self.root, self.data_dir, self.fed_dir, self.sync_dir):
             os.makedirs(d, exist_ok=True)
 
         self.config_path = os.path.join(self.root, "session_config.json")
@@ -120,11 +118,6 @@ class RecordingSession:
         os.makedirs(path, exist_ok=True)
         return path
 
-    def video_path(self, camera_label):
-        return os.path.join(self.video_dir, f"{_safe_name(camera_label)}.mp4")
-
-    def video_frames_path(self, camera_label):
-        return os.path.join(self.video_dir, f"{_safe_name(camera_label)}_frames.csv")
 
     # --- config / state ---------------------------------------------------
 
@@ -158,7 +151,7 @@ class RecordingSession:
 
         ``offset_s`` is device minus host; a growing magnitude across a session
         is RTC drift, and it is what lets device-clock SD timestamps be mapped
-        onto the host time base the camera uses.
+        onto the host time base.
         """
         host_ts = sent_at if sent_at is not None else host_now()
         offset = ""
@@ -319,6 +312,6 @@ def _append_csv(path, fields, row):
 
 
 def _safe_name(name):
-    """Filesystem-safe version of a user-supplied device or camera name."""
+    """Filesystem-safe version of a user-supplied device name."""
     cleaned = "".join(c if c.isalnum() or c in "-_. " else "_" for c in str(name)).strip()
     return cleaned.replace(" ", "_") or "unnamed"
