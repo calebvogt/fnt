@@ -50,12 +50,12 @@ _THEMES = {
     # mode — so on-floor marks (grid, outline, measure lines) stay light.
     "light": dict(
         day_bg=(1.0, 1.0, 1.0, 1.0), night_bg=(0.93, 0.94, 0.96, 1.0),
-        floor=(0.12, 0.14, 0.17, 1.0), grid=(1, 1, 1, 0.12),
-        rect=(0.60, 0.60, 0.60, 1.0), wall=(0.80, 0.68, 0.46, 0.32),
+        floor=(0.90, 0.92, 0.95, 1.0), grid=(0.30, 0.34, 0.40, 0.18),
+        rect=(0.45, 0.48, 0.52, 1.0), wall=(0.80, 0.68, 0.46, 0.32),
         wall_edge=(0.55, 0.44, 0.26, 0.60), pole=(0.46, 0.34, 0.23, 1.0),
         compass_n=(190, 45, 40, 255), compass=(45, 50, 58, 255),
         ant_text=(150, 95, 0, 255),
-        meas_line=(0.30, 0.82, 0.92, 0.55), meas_text=(12, 95, 125, 255)),
+        meas_line=(0.10, 0.45, 0.58, 0.65), meas_text=(12, 95, 125, 255)),
 }
 # "white": light, but the background stays pure white regardless of the
 # day/night cycle — for screenshots dropped onto white slides.

@@ -26,11 +26,11 @@ _THEMES_2D = {
                  boundary="#5a6069", grass="#2f5d2a", ant_text="#ffeb8c",
                  compass_n="#eb5a5a", compass="#dce0e6", meas="#4dd0e1",
                  meas_text="#9fe3ec", run_title="#cccccc"),
-    # light: white surround, dark arena ground (same as dark mode)
-    "light": dict(face="#ffffff", floor="#14171a", spine="#b6bbc3",
-                  tick="#4a5058", grid="#e4e8ee", title="#4a5058",
-                  boundary="#8a9199", grass="#2f5d2a", ant_text="#ffeb8c",
-                  compass_n="#c0392b", compass="#33383f", meas="#4dd0e1",
+    # light: genuinely light — pale floor, soft green sward, no dark anywhere
+    "light": dict(face="#ffffff", floor="#eef1f5", spine="#b6bbc3",
+                  tick="#4a5058", grid=None, title="#4a5058",
+                  boundary="#5a6069", grass="#8fbf6f", ant_text="#7a5200",
+                  compass_n="#c0392b", compass="#33383f", meas="#0e7c99",
                   meas_text="#0b6a86", run_title="#33383f"),
 }
 # "white": same as light — the 2D surround is already pure white and does not
@@ -241,7 +241,10 @@ class ArenaCanvas(FigureCanvas):
             spine.set_visible(side in ("left", "bottom"))
             spine.set_color(pal["spine"])
         ax.tick_params(colors=pal["tick"], labelsize=8)
-        ax.grid(True, color=pal["grid"], lw=0.6)
+        if pal.get("grid"):        # no background grid in the light themes
+            ax.grid(True, color=pal["grid"], lw=0.6)
+        else:
+            ax.grid(False)
         # measurement grid overlay (toggle: metric / imperial)
         mmode = getattr(self, "_measure_mode", None)
         if mmode:
