@@ -18,6 +18,9 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.backends.backend_qt5agg import (
+    FigureCanvasQTAgg, NavigationToolbar2QT)
 from scipy.signal import savgol_filter
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QMessageBox,
@@ -26,7 +29,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
                              QDateTimeEdit, QTreeWidget, QTreeWidgetItem,
-                             QSplitter, QSlider)
+                             QSplitter, QSlider, QProgressDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QFont
 
@@ -819,7 +822,7 @@ class PlotSaverWorker(QThread):
                 # Use scaled dimensions in meters
                 ax.imshow(self.background_image, 
                          extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
-                         origin='lower',
+                         origin='upper',
                          aspect='auto',
                          alpha=0.6,
                          zorder=0)
@@ -828,7 +831,7 @@ class PlotSaverWorker(QThread):
                 img_height, img_width = self.background_image.shape[:2]
                 ax.imshow(self.background_image, 
                          extent=[0, img_width, 0, img_height],
-                         origin='lower',
+                         origin='upper',
                          aspect='auto',
                          alpha=0.6,
                          zorder=0)
@@ -1423,6 +1426,26 @@ class PlotSaverWorker(QThread):
         return True
 
 
+class FigurePopup(QDialog):
+    """A resizable, zoom/pan-able window wrapping a matplotlib Figure.
+
+    Used for the occupancy heatmaps: the matplotlib navigation toolbar gives
+    scroll/box zoom and pan over the raster panels, and Save exports the view.
+    """
+    def __init__(self, fig, title="Figure", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(820, 640)
+        # Non-modal so the user can keep working with the tool behind it.
+        self.setModal(False)
+        layout = QVBoxLayout()
+        self.canvas = FigureCanvasQTAgg(fig)
+        toolbar = NavigationToolbar2QT(self.canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(self.canvas, 1)
+        self.setLayout(layout)
+
+
 class UWBQuickVisualizationWindow(QWidget):
     # Preview view modes
     VIEW_XML = "XML (site map)"
@@ -1467,6 +1490,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_hz = 1
         self.preview_x = None           # (frames, tags) smoothed positions
         self.preview_y = None
+        self.preview_xf = None          # forward-filled marker positions
+        self.preview_yf = None
         self.preview_raw_x = None       # same grid, pre-smoothing
         self.preview_raw_y = None
         self.preview_colors = None
@@ -1480,6 +1505,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_playhead_ms = 0
         self._timeline_guard = False         # suppress slider feedback loops
         self._tag_selection_guard = False    # suppress bulk checkbox churn
+        self._preview_active = False         # streaming begins once data exists
         self.preview_db_path = None          # indexed copy, or the original
         self.preview_index_builder = None
 
@@ -1634,7 +1660,7 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def initUI(self):
         self.setWindowTitle("UWB PreProcessing Tool")
-        self.setGeometry(50, 50, 520, 900)
+        self.setGeometry(50, 50, 1500, 950)
         
         # Set dark theme style
         self.setStyleSheet("""
@@ -1737,16 +1763,23 @@ class UWBQuickVisualizationWindow(QWidget):
             }
         """)
 
-        # Settings column on the left, optional preview pane on the right.
-        # The pane starts hidden so the tool opens narrow and fast; enabling it
-        # widens the window (see on_preview_toggled).
+        # Settings column on the left, live preview on the right — the same
+        # left-controls / right-display layout as the other FNT tools. The
+        # preview is always present and simply sits empty until a database is
+        # loaded; no data is read until tags exist and the user scrubs/plays.
         self.main_splitter = QSplitter(Qt.Horizontal)
-        self.main_splitter.addWidget(self.create_settings_panel())
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(5)
+        # Build the preview pane (canvases) first: the left column's Preview
+        # Options group wires signals whose slots touch the canvases, so the
+        # canvases must exist before that group is constructed.
         self.preview_panel = self.create_preview_panel()
-        self.preview_panel.setVisible(False)
+        settings_panel = self.create_settings_panel()
+        self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(self.preview_panel)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([520, 980])
 
         main_layout = QVBoxLayout()
         main_layout.addWidget(self.main_splitter)
@@ -1851,24 +1884,6 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.tag_group.setLayout(self.tag_layout)
         layout.addWidget(self.tag_group)
-
-        # Preview toggle. Off by default: the pane is a diagnostic aid, and
-        # keeping it off means the tool opens narrow and touches no data.
-        self.chk_enable_preview = QCheckBox("Enable Preview Window")
-        self.chk_enable_preview.setChecked(False)
-        self.chk_enable_preview.stateChanged.connect(self.on_preview_toggled)
-        self.chk_enable_preview.setToolTip(
-            "Show an interactive preview pane for visually comparing smoothing "
-            "methods against the raw fixes.\n"
-            "\n"
-            "Only a bounded time window is ever read into memory (set by "
-            "'Window length' in the preview pane), so this stays responsive no "
-            "matter how large the database is. The preview applies whatever "
-            "filter and smoothing settings are currently selected, so you can "
-            "switch between Rolling Average, Rolling Median, Savitzky-Golay "
-            "and Forward-Backward EWMA and see the effect immediately."
-        )
-        layout.addWidget(self.chk_enable_preview)
 
         # Smoothing & Filtering Options
         options_group = QGroupBox("Smoothing & Filtering Options")
@@ -2016,9 +2031,19 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setWordWrap(True)
         options_layout.addWidget(self.lbl_background_status)
 
+        self.chk_show_background = QCheckBox("Show background image")
+        self.chk_show_background.setChecked(True)
+        self.chk_show_background.setToolTip(
+            "Toggle the loaded floorplan/background image on the 2D preview and "
+            "in saved plots, without unloading it. The tracking data, zones and "
+            "anchors stay put.")
+        self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
+        options_layout.addWidget(self.chk_show_background)
+
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
         self.chk_show_anchors.setEnabled(False)
+        self.chk_show_anchors.stateChanged.connect(self.on_show_background_toggled)
         self.chk_show_anchors.setToolTip(
             "Draw UWB anchor/antenna positions as triangles on trajectory plots. "
             "Anchor locations are parsed from the XML config file."
@@ -2027,6 +2052,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
+
+        # Preview Options — controls for the live display on the right. Built
+        # here so the whole left column stays a single scrollable settings
+        # stack; the right pane holds only the map and transport.
+        layout.addWidget(self._build_preview_options_group())
 
         # Export Options
         export_group = QGroupBox("Export Options")
@@ -2362,11 +2392,16 @@ class UWBQuickVisualizationWindow(QWidget):
     # Preview pane
     # ------------------------------------------------------------------ #
     def create_preview_panel(self):
-        """Right-hand interactive preview pane (hidden until enabled)."""
+        """Right-hand display: the arena map on top, transport controls below.
+
+        Every configuration control lives in the left column's 'Preview
+        Options' group (see _build_preview_options_group); this pane is kept
+        deliberately spare so the map gets the room.
+        """
         panel = QWidget()
         layout = QVBoxLayout()
 
-        # --- render surface ---
+        # --- render surface (the map) ---
         self.preview_stack = QWidget()
         stack_layout = QVBoxLayout()
         stack_layout.setContentsMargins(0, 0, 0, 0)
@@ -2384,183 +2419,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_stack.setLayout(stack_layout)
         layout.addWidget(self.preview_stack, 1)
 
-        # --- view controls ---
-        view_row = QHBoxLayout()
-        view_row.addWidget(QLabel("View:"))
-        self.combo_view_mode = QComboBox()
-        self.combo_view_mode.addItems([
-            self.VIEW_XML, self.VIEW_2D, self.VIEW_3D])
-        self.combo_view_mode.setCurrentText(self.VIEW_2D)
-        self.combo_view_mode.setToolTip(
-            "• XML (site map): the real surveyed layout read from the site XML "
-            "— the embedded floorplan image plus every named zone drawn in its "
-            "authored colour. Use this to check tracks against actual arena "
-            "features.\n"
-            "\n"
-            "• 2D Idealized: clean top-down schematic with no site imagery. "
-            "Best for judging smoothing quality without visual clutter.\n"
-            "\n"
-            "• 3D Idealized: orbitable GPU scene — floor grid, enclosure walls, "
-            "support poles, and anchors at their surveyed heights. Drag to "
-            "orbit, scroll to zoom."
-        )
-        self.combo_view_mode.currentTextChanged.connect(self.on_preview_backend_changed)
-        view_row.addWidget(self.combo_view_mode)
+        # --- transport (scrubber + play/pause + speed), directly under the map ---
+        self.slider_timeline = QSlider(Qt.Horizontal)
+        self.slider_timeline.setRange(0, 0)
+        self.slider_timeline.setToolTip(
+            "Scrub the whole recording, first ping to last. Nothing is read "
+            "while you drag — the chunk under the playhead loads once you stop "
+            "moving.")
+        self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
+        layout.addWidget(self.slider_timeline)
 
-        btn_reset_cam = QPushButton("Reset View")
-        btn_reset_cam.setToolTip("Return the camera to the default angled view")
-        btn_reset_cam.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_reset_cam.clicked.connect(lambda: self._preview_backend().reset_camera())
-        view_row.addWidget(btn_reset_cam)
-
-        btn_top = QPushButton("Top-Down")
-        btn_top.setToolTip("Look straight down at the arena")
-        btn_top.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_top.clicked.connect(lambda: self._preview_backend().top_down())
-        view_row.addWidget(btn_top)
-        view_row.addStretch()
-        layout.addLayout(view_row)
-
-        # --- arena / registration ---
-        arena_group = QGroupBox("Arena")
-        arena_layout = QVBoxLayout()
-
-        arena_row = QHBoxLayout()
-        arena_row.addWidget(QLabel("Source:"))
-        self.combo_arena = QComboBox()
-        self.combo_arena.addItem("Auto (fit to data)")
-        for name in BUILTIN_ARENAS:
-            self.combo_arena.addItem(name)
-        self.combo_arena.setToolTip(
-            "'Auto' sizes a plain rectangle to the loaded samples plus a "
-            "margin, which always works regardless of site.\n"
-            "\n"
-            "A named enclosure draws its real geometry (walls, support poles) "
-            "at true scale. Use the X/Y offset below to register that geometry "
-            "against the data if the tracking origin does not sit at the "
-            "enclosure's south-west corner."
-        )
-        self.combo_arena.currentTextChanged.connect(self.refresh_preview_arena)
-        arena_row.addWidget(self.combo_arena)
-        arena_layout.addLayout(arena_row)
-
-        offset_row = QHBoxLayout()
-        offset_row.addWidget(QLabel("Offset X:"))
-        self.spin_arena_dx = QDoubleSpinBox()
-        self.spin_arena_dx.setRange(-500.0, 500.0)
-        self.spin_arena_dx.setDecimals(2)
-        self.spin_arena_dx.setSuffix(" m")
-        self.spin_arena_dx.setToolTip(
-            "Moves the arena geometry east/west relative to the tracking data. "
-            "The samples are never transformed — only the drawn enclosure moves.")
-        self.spin_arena_dx.valueChanged.connect(self.refresh_preview_arena)
-        offset_row.addWidget(self.spin_arena_dx)
-        offset_row.addWidget(QLabel("Y:"))
-        self.spin_arena_dy = QDoubleSpinBox()
-        self.spin_arena_dy.setRange(-500.0, 500.0)
-        self.spin_arena_dy.setDecimals(2)
-        self.spin_arena_dy.setSuffix(" m")
-        self.spin_arena_dy.setToolTip("Moves the arena geometry north/south relative to the data.")
-        self.spin_arena_dy.valueChanged.connect(self.refresh_preview_arena)
-        offset_row.addWidget(self.spin_arena_dy)
-
-        btn_auto_reg = QPushButton("Auto-Fit")
-        btn_auto_reg.setToolTip(
-            "Set the offset so the enclosure is centred on the loaded data's "
-            "bounding box. A good starting point when you know the site but "
-            "not the tracking origin.")
-        btn_auto_reg.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_auto_reg.clicked.connect(self.auto_register_arena)
-        offset_row.addWidget(btn_auto_reg)
-        offset_row.addStretch()
-        arena_layout.addLayout(offset_row)
-
-        arena_group.setLayout(arena_layout)
-        layout.addWidget(arena_group)
-
-        # --- data window ---
-        window_group = QGroupBox("Preview Data Window")
-        window_layout = QVBoxLayout()
-
-        dur_row = QHBoxLayout()
-        dur_row.addWidget(QLabel("Chunk:"))
-        self.spin_preview_minutes = QSpinBox()
-        self.spin_preview_minutes.setRange(1, 60)
-        self.spin_preview_minutes.setValue(5)
-        self.spin_preview_minutes.setSuffix(" min")
-        self.spin_preview_minutes.setToolTip(
-            "How much recording time is held in memory at once. The timeline "
-            "below spans the whole database, but only a few chunks of this "
-            "length are ever resident — that is what keeps memory flat "
-            "regardless of database size.\n"
-            "\n"
-            "Larger chunks mean fewer loads while scrubbing, at proportionally "
-            "more RAM.")
-        self.spin_preview_minutes.valueChanged.connect(self.invalidate_preview_cache)
-        dur_row.addWidget(self.spin_preview_minutes)
-
-        dur_row.addWidget(QLabel("Rate:"))
-        self.combo_preview_hz = QComboBox()
-        self.combo_preview_hz.addItems(["1 Hz", "2 Hz", "5 Hz"])
-        self.combo_preview_hz.setToolTip(
-            "Playback resolution. Each chunk is binned to this rate to build "
-            "frames. These tags report at well under 1 Hz each, so 1 Hz is "
-            "usually the right choice; higher rates mostly add empty frames.")
-        self.combo_preview_hz.currentTextChanged.connect(self.invalidate_preview_cache)
-        dur_row.addWidget(self.combo_preview_hz)
-        dur_row.addStretch()
-        window_layout.addLayout(dur_row)
-
-        self.lbl_preview_status = QLabel("Enable a database and tags, then scrub the timeline")
-        self.lbl_preview_status.setStyleSheet("color: #888888; font-style: italic; font-size: 9px;")
-        self.lbl_preview_status.setWordWrap(True)
-        window_layout.addWidget(self.lbl_preview_status)
-
-        self.btn_build_index = QPushButton("Fast index: not built")
-        self.btn_build_index.setStyleSheet("padding: 4px; font-size: 10px;")
-        self.btn_build_index.setToolTip(
-            "Wiser databases ship with no index, so every preview read scans "
-            "the whole table. The first time you enable the preview, FNT makes "
-            "an indexed COPY in the analysis folder — chunk loads go from "
-            "~0.40 s to ~0.005 s (about 80x).\n"
-            "\n"
-            "Your original database is never modified. The copy is identical "
-            "to it plus one index on (shortid, timestamp): nothing filtered, "
-            "no rows changed. It costs roughly 25% extra disk and is safe to "
-            "delete — it rebuilds on demand.\n"
-            "\n"
-            "Note this speeds up preview scrubbing only. Export reads every "
-            "row for a tag and is a full scan either way, so it is unaffected."
-            "\n\nClick to force a rebuild if the source database has changed.")
-        self.btn_build_index.clicked.connect(self.rebuild_preview_index)
-        window_layout.addWidget(self.btn_build_index)
-
-        window_group.setLayout(window_layout)
-        layout.addWidget(window_group)
-
-        # --- display options ---
-        disp_row = QHBoxLayout()
-        self.chk_preview_raw = QCheckBox("Overlay raw")
-        self.chk_preview_raw.setChecked(True)
-        self.chk_preview_raw.setToolTip(
-            "Draw the unsmoothed fixes in grey underneath the smoothed track. "
-            "This is the fastest way to judge whether a smoothing method is "
-            "following the animal or cutting corners.")
-        self.chk_preview_raw.stateChanged.connect(self.render_preview_frame)
-        disp_row.addWidget(self.chk_preview_raw)
-
-        disp_row.addWidget(QLabel("Trail:"))
-        self.spin_preview_trail = QSpinBox()
-        self.spin_preview_trail.setRange(0, 600)
-        self.spin_preview_trail.setValue(60)
-        self.spin_preview_trail.setSuffix(" s")
-        self.spin_preview_trail.setToolTip("Seconds of trailing path drawn behind each tag")
-        self.spin_preview_trail.valueChanged.connect(self.render_preview_frame)
-        disp_row.addWidget(self.spin_preview_trail)
-        disp_row.addStretch()
-        layout.addLayout(disp_row)
-
-        # --- transport ---
         transport_row = QHBoxLayout()
         self.btn_preview_rewind = QPushButton("|<")
         self.btn_preview_rewind.setFixedWidth(40)
@@ -2587,25 +2455,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_preview_speed.currentTextChanged.connect(self.on_preview_speed_changed)
         transport_row.addWidget(self.combo_preview_speed)
         transport_row.addStretch()
-
-        self.lbl_cache_status = QLabel("")
-        self.lbl_cache_status.setStyleSheet("color: #666666; font-size: 9px;")
-        self.lbl_cache_status.setToolTip(
-            "Chunks currently resident in memory. Capped — the oldest is "
-            "evicted as you scrub, so memory does not grow over a session.")
-        transport_row.addWidget(self.lbl_cache_status)
         layout.addLayout(transport_row)
-
-        # Timeline spans the ENTIRE recording, in seconds. Data loads only
-        # after scrubbing settles (see on_timeline_moved).
-        self.slider_timeline = QSlider(Qt.Horizontal)
-        self.slider_timeline.setRange(0, 0)
-        self.slider_timeline.setToolTip(
-            "Scrub the whole recording, first ping to last. Nothing is read "
-            "while you drag — the chunk under the playhead loads once you stop "
-            "moving.")
-        self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
-        layout.addWidget(self.slider_timeline)
 
         self.lbl_preview_time = QLabel("--")
         self.lbl_preview_time.setStyleSheet("color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
@@ -2616,28 +2466,242 @@ class UWBQuickVisualizationWindow(QWidget):
         panel.setMinimumWidth(520)
         return panel
 
-    def on_preview_toggled(self):
-        """Show/hide the preview pane and resize the window to match."""
-        enabled = self.chk_enable_preview.isChecked()
-        self.preview_panel.setVisible(enabled)
-        if enabled:
-            self.resize(1500, 950)
-            self.main_splitter.setSizes([520, 980])
-            if not PREVIEW_HAVE_GL:
-                self.log_message(
-                    f"Preview enabled (2D only — 3D unavailable: {PREVIEW_GL_ERROR})")
-            self.refresh_preview_arena()
-            # Build (or adopt) the indexed copy. Reads fall back to the
-            # original until it is ready, so the preview works immediately.
-            self.ensure_preview_index_db()
-            # Size the timeline to the recording and load the first chunk
-            if self.init_preview_timeline():
-                self.preview_playhead_ms = self.preview_t0
-                self._sync_timeline_to_playhead()
-                self._request_chunk(0, make_current=True)
-        else:
-            self.stop_preview_playback()
-            self.resize(520, 900)
+    def _build_preview_options_group(self):
+        """All preview configuration, as a group for the left settings column.
+
+        The controls formerly crowded under the map now live here so the right
+        pane can be just the map plus its transport bar.
+        """
+        group = QGroupBox("Preview Options")
+        v = QVBoxLayout()
+
+        # View selector + camera shortcuts
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("View:"))
+        self.combo_view_mode = QComboBox()
+        self.combo_view_mode.addItems([self.VIEW_XML, self.VIEW_2D, self.VIEW_3D])
+        self.combo_view_mode.setCurrentText(self.VIEW_2D)
+        self.combo_view_mode.setToolTip(
+            "• XML (site map): the real surveyed layout read from the site XML "
+            "— the embedded floorplan image plus every named zone drawn in its "
+            "authored colour. Use this to check tracks against actual arena "
+            "features.\n"
+            "\n"
+            "• 2D Idealized: clean top-down schematic with no site imagery. "
+            "Best for judging smoothing quality without visual clutter.\n"
+            "\n"
+            "• 3D Idealized: orbitable GPU scene — floor grid, enclosure walls, "
+            "support poles, and anchors at their surveyed heights. Drag to "
+            "orbit, scroll to zoom."
+        )
+        self.combo_view_mode.currentTextChanged.connect(self.on_preview_backend_changed)
+        view_row.addWidget(self.combo_view_mode, 1)
+        v.addLayout(view_row)
+
+        cam_row = QHBoxLayout()
+        btn_reset_cam = QPushButton("Reset View")
+        btn_reset_cam.setToolTip("Return the camera to the default angled view")
+        btn_reset_cam.setStyleSheet("padding: 4px; font-size: 10px;")
+        btn_reset_cam.clicked.connect(lambda: self._preview_backend().reset_camera())
+        cam_row.addWidget(btn_reset_cam)
+        btn_top = QPushButton("Top-Down")
+        btn_top.setToolTip("Look straight down at the arena")
+        btn_top.setStyleSheet("padding: 4px; font-size: 10px;")
+        btn_top.clicked.connect(lambda: self._preview_backend().top_down())
+        cam_row.addWidget(btn_top)
+        v.addLayout(cam_row)
+
+        # Arena source + registration offset
+        arena_row = QHBoxLayout()
+        arena_row.addWidget(QLabel("Arena:"))
+        self.combo_arena = QComboBox()
+        self.combo_arena.addItem("Auto (fit to data)")
+        for name in BUILTIN_ARENAS:
+            self.combo_arena.addItem(name)
+        self.combo_arena.setToolTip(
+            "'Auto' sizes a plain rectangle to the loaded samples plus a "
+            "margin, which always works regardless of site.\n"
+            "\n"
+            "A named enclosure draws its real geometry (walls, support poles) "
+            "at true scale. Use the X/Y offset below to register that geometry "
+            "against the data if the tracking origin does not sit at the "
+            "enclosure's south-west corner."
+        )
+        self.combo_arena.currentTextChanged.connect(self.refresh_preview_arena)
+        arena_row.addWidget(self.combo_arena, 1)
+        v.addLayout(arena_row)
+
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Offset X:"))
+        self.spin_arena_dx = QDoubleSpinBox()
+        self.spin_arena_dx.setRange(-500.0, 500.0)
+        self.spin_arena_dx.setDecimals(2)
+        self.spin_arena_dx.setSuffix(" m")
+        self.spin_arena_dx.setToolTip(
+            "Moves the arena geometry east/west relative to the tracking data. "
+            "The samples are never transformed — only the drawn enclosure moves.")
+        self.spin_arena_dx.valueChanged.connect(self.refresh_preview_arena)
+        offset_row.addWidget(self.spin_arena_dx)
+        offset_row.addWidget(QLabel("Y:"))
+        self.spin_arena_dy = QDoubleSpinBox()
+        self.spin_arena_dy.setRange(-500.0, 500.0)
+        self.spin_arena_dy.setDecimals(2)
+        self.spin_arena_dy.setSuffix(" m")
+        self.spin_arena_dy.setToolTip("Moves the arena geometry north/south relative to the data.")
+        self.spin_arena_dy.valueChanged.connect(self.refresh_preview_arena)
+        offset_row.addWidget(self.spin_arena_dy)
+        btn_auto_reg = QPushButton("Auto-Fit")
+        btn_auto_reg.setToolTip(
+            "Set the offset so the enclosure is centred on the loaded data's "
+            "bounding box. A good starting point when you know the site but "
+            "not the tracking origin.")
+        btn_auto_reg.setStyleSheet("padding: 4px; font-size: 10px;")
+        btn_auto_reg.clicked.connect(self.auto_register_arena)
+        offset_row.addWidget(btn_auto_reg)
+        v.addLayout(offset_row)
+
+        # Display options: raw overlay + trail length
+        disp_row = QHBoxLayout()
+        self.chk_preview_raw = QCheckBox("Overlay raw")
+        self.chk_preview_raw.setChecked(False)   # off by default: clean track
+        self.chk_preview_raw.setToolTip(
+            "Off by default for a clean track line. When on, draws every "
+            "unsmoothed fix as a faint grey dot beneath the track — useful for "
+            "judging whether a smoothing method follows the animal or cuts "
+            "corners, but it looks like scattered noise.")
+        self.chk_preview_raw.stateChanged.connect(self.render_preview_frame)
+        disp_row.addWidget(self.chk_preview_raw)
+
+        self.chk_preview_light = QCheckBox("Light mode")
+        self.chk_preview_light.setChecked(False)
+        self.chk_preview_light.setToolTip(
+            "White background with a tan arena floor, matching the ABMA "
+            "VoleTerra 2D light model. Good for figures and print.")
+        self.chk_preview_light.stateChanged.connect(self.on_preview_theme_changed)
+        disp_row.addWidget(self.chk_preview_light)
+        disp_row.addStretch()
+        v.addLayout(disp_row)
+
+        trail_row = QHBoxLayout()
+        trail_row.addWidget(QLabel("Trail:"))
+        self.spin_preview_trail = QSpinBox()
+        self.spin_preview_trail.setRange(0, 3600)     # up to one hour of path
+        self.spin_preview_trail.setValue(60)
+        self.spin_preview_trail.setSuffix(" s")
+        self.spin_preview_trail.setSingleStep(30)
+        self.spin_preview_trail.setToolTip(
+            "Seconds of trailing track drawn behind each tag, up to one hour "
+            "(3600 s). The trail is bounded by the loaded chunk, so to see the "
+            "full hour raise 'Chunk' to 60 min as well.")
+        self.spin_preview_trail.valueChanged.connect(self.render_preview_frame)
+        trail_row.addWidget(self.spin_preview_trail)
+        trail_row.addStretch()
+        v.addLayout(trail_row)
+
+        # Data window: chunk length + playback rate
+        dur_row = QHBoxLayout()
+        dur_row.addWidget(QLabel("Chunk:"))
+        self.spin_preview_minutes = QSpinBox()
+        self.spin_preview_minutes.setRange(1, 60)
+        self.spin_preview_minutes.setValue(5)
+        self.spin_preview_minutes.setSuffix(" min")
+        self.spin_preview_minutes.setToolTip(
+            "How much recording time is held in memory at once. The timeline "
+            "spans the whole database, but only a few chunks of this length are "
+            "ever resident — that is what keeps memory flat regardless of "
+            "database size.\n"
+            "\n"
+            "Larger chunks mean fewer loads while scrubbing, at proportionally "
+            "more RAM.")
+        self.spin_preview_minutes.valueChanged.connect(self.invalidate_preview_cache)
+        dur_row.addWidget(self.spin_preview_minutes)
+        dur_row.addWidget(QLabel("Rate:"))
+        self.combo_preview_hz = QComboBox()
+        self.combo_preview_hz.addItems(["1 Hz", "2 Hz", "5 Hz"])
+        self.combo_preview_hz.setToolTip(
+            "Playback resolution. Each chunk is binned to this rate to build "
+            "frames. These tags report at well under 1 Hz each, so 1 Hz is "
+            "usually the right choice; higher rates mostly add empty frames.")
+        self.combo_preview_hz.currentTextChanged.connect(self.invalidate_preview_cache)
+        dur_row.addWidget(self.combo_preview_hz)
+        dur_row.addStretch()
+        v.addLayout(dur_row)
+
+        self.lbl_preview_status = QLabel("Load a database and select tags to preview")
+        self.lbl_preview_status.setStyleSheet("color: #888888; font-style: italic; font-size: 9px;")
+        self.lbl_preview_status.setWordWrap(True)
+        v.addWidget(self.lbl_preview_status)
+
+        self.lbl_cache_status = QLabel("")
+        self.lbl_cache_status.setStyleSheet("color: #666666; font-size: 9px;")
+        self.lbl_cache_status.setToolTip(
+            "Chunks currently resident in memory. Capped — the oldest is "
+            "evicted as you scrub, so memory does not grow over a session.")
+        v.addWidget(self.lbl_cache_status)
+
+        # Quick snapshot plot
+        self.btn_last_locations = QPushButton("Plot Last Known Locations")
+        self.btn_last_locations.setToolTip(
+            "Save a snapshot showing the most recent fix for every selected "
+            "tag, labelled by identity, over the arena. Written as a PNG (and "
+            "SVG if 'Also save as SVG' is on) to the analysis folder — a quick "
+            "way to see where each animal ended up without exporting the full "
+            "run.")
+        self.btn_last_locations.clicked.connect(self.plot_last_known_locations)
+        v.addWidget(self.btn_last_locations)
+
+        self.btn_occupancy = QPushButton("Occupancy Heatmaps")
+        self.btn_occupancy.setToolTip(
+            "Build a space-use (occupancy) heatmap from the ENTIRE recording "
+            "for every selected tag, faceted one panel per animal, and open it "
+            "in a zoomable window. Each panel shows the % of time spent in each "
+            "arena cell. Select a single tag first for one large per-animal "
+            "map. Also saved as a PNG to the analysis folder.")
+        self.btn_occupancy.clicked.connect(self.plot_occupancy_heatmaps)
+        v.addWidget(self.btn_occupancy)
+
+        self.btn_build_index = QPushButton("Fast index: not built")
+        self.btn_build_index.setStyleSheet("padding: 4px; font-size: 10px;")
+        self.btn_build_index.setToolTip(
+            "Wiser databases ship with no index, so every preview read scans "
+            "the whole table. FNT can make an indexed COPY in the analysis "
+            "folder — chunk loads go from ~0.40 s to ~0.005 s (about 80x).\n"
+            "\n"
+            "Your original database is never modified. The copy is identical "
+            "to it plus one index on (shortid, timestamp): nothing filtered, "
+            "no rows changed. It costs roughly 25% extra disk and is safe to "
+            "delete — it rebuilds on demand.\n"
+            "\n"
+            "Note this speeds up preview scrubbing only. Export reads every "
+            "row for a tag and is a full scan either way, so it is unaffected."
+            "\n\nClick to build, or to force a rebuild if the source changed.")
+        self.btn_build_index.clicked.connect(self.rebuild_preview_index)
+        v.addWidget(self.btn_build_index)
+
+        group.setLayout(v)
+        return group
+
+    def activate_preview(self):
+        """Bring the always-visible preview to life once data is available.
+
+        The pane is shown from startup (empty), mirroring the other FNT tools.
+        This is called when a database, table and at least one tag exist. It
+        adopts an existing indexed copy if one is present but does NOT build a
+        fresh ~GB copy automatically — reads stream from the original database
+        (fast enough: ~1.6 s for the first chunk on a 1 GB file), and the user
+        can opt into the index via the 'Fast index' button for instant seeks.
+        """
+        if not (self.db_path and self.table_name and self.selected_preview_tags()):
+            return
+        self._preview_active = True
+        if not PREVIEW_HAVE_GL:
+            self.log_message(f"Preview: 3D unavailable ({PREVIEW_GL_ERROR}); 2D and XML views work.")
+        self.adopt_preview_index_db()
+        self.refresh_preview_arena()
+        if self.init_preview_timeline():
+            self.preview_playhead_ms = self.preview_t0
+            self._sync_timeline_to_playhead()
+            self._request_chunk(0, make_current=True)
 
     def _preview_backend(self):
         """The canvas currently on screen."""
@@ -2732,10 +2796,24 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_arena = arena
         self.preview_canvas_2d.set_arena(arena)
         self.preview_canvas_2d.show_anchors = self.chk_show_anchors.isChecked()
-        self.preview_canvas_2d.background_image = self.background_image
-        if self.background_image is not None and self.bg_width_meters:
+        # Background-image mapping (UWB world coords, metres):
+        #   • data location_x/y are inches -> metres via *0.0254
+        #   • image footprint = pixels * xml_scale(in/px) * 0.0254
+        #   • placed at extent [0, W, 0, H] so the image's bottom-left corner
+        #     is world (0, 0) — the Wiser reference frame
+        #   • drawn origin="upper" (see UWBPreview2D.update_frame): the image is
+        #     shown UPRIGHT, north at top, exactly as the file looks
+        #   • the canvas expands the view to include the whole image so it is
+        #     never clipped by the data-fit arena bounds
+        # Honour the show/hide toggle: only hand the canvas an image when the
+        # user has the background enabled.
+        show_bg = self.background_image is not None and self.chk_show_background.isChecked()
+        self.preview_canvas_2d.background_image = self.background_image if show_bg else None
+        if show_bg and self.bg_width_meters:
             self.preview_canvas_2d.bg_extent = (0, self.bg_width_meters,
                                                 0, self.bg_height_meters)
+        else:
+            self.preview_canvas_2d.bg_extent = None
         if self.preview_canvas_3d is not None:
             self.preview_canvas_3d.set_arena(arena)
         self.render_preview_frame()
@@ -2799,14 +2877,20 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         if self._tag_selection_guard:
             return
-        if not (getattr(self, "chk_enable_preview", None)
-                and self.chk_enable_preview.isChecked()):
+        # First tags for a freshly-loaded database bring the preview to life;
+        # later changes just refresh it.
+        if not self._preview_active:
+            if self.db_path and self.table_name and self.selected_preview_tags():
+                self.preview_tag_timer.start(150)
             return
         self.preview_tag_timer.start(150)
 
     def _apply_tag_selection_change(self):
         """Rebuild the timeline and cached chunks for the current tag set."""
-        if not self.chk_enable_preview.isChecked():
+        if not (self.db_path and self.table_name):
+            return
+        if not self._preview_active:
+            self.activate_preview()
             return
         tags = self.selected_preview_tags()
         if not tags:
@@ -2844,7 +2928,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_cache.clear()
         self.preview_x = None
         self._update_cache_label()
-        if getattr(self, "chk_enable_preview", None) and self.chk_enable_preview.isChecked():
+        if self._preview_active and self.preview_t0 is not None:
             # Re-fetch whatever the playhead is sitting on under the new settings
             self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
                                 make_current=True)
@@ -3067,13 +3151,39 @@ class UWBQuickVisualizationWindow(QWidget):
         Y = py.to_numpy(float)
         RX = rx.to_numpy(float)
         RY = ry.to_numpy(float)
+
+        # Forward-filled marker positions. UWB tags report asynchronously at
+        # well under 1 Hz, so in any single time bin most tags have no fix and
+        # would blink out. Carrying each tag's last known position forward keeps
+        # a solid, persistent marker; the sparse trail still uses the real
+        # fixes. Cells before a tag's first fix stay NaN (nothing to show yet).
+        XF = pd.DataFrame(X).ffill().to_numpy()
+        YF = pd.DataFrame(Y).ffill().to_numpy()
+
         times = pd.to_datetime(grid * bin_ns, utc=True).tz_convert(
             pytz.timezone(self.combo_timezone.currentText()))
 
-        return dict(x=X, y=Y, raw_x=RX, raw_y=RY, times=times, tags=cols, hz=hz,
+        return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, times=times,
+                    tags=cols, hz=hz,
                     t_start=int(times[0].timestamp() * 1000),
                     t_end=int(times[-1].timestamp() * 1000),
-                    nbytes=X.nbytes + Y.nbytes + RX.nbytes + RY.nbytes)
+                    nbytes=X.nbytes + Y.nbytes + XF.nbytes + YF.nbytes
+                           + RX.nbytes + RY.nbytes)
+
+    # Default preview marker colours: blue for male, red for female. Tags with
+    # no configured identity default to male (matching the codebase's
+    # sex.get(..., 'M') convention), so they show as solid blue until the user
+    # assigns sex/identity in Configure Identities.
+    _SEX_BLUE = (0.20, 0.55, 0.90, 1.0)
+    _SEX_RED = (0.90, 0.25, 0.25, 1.0)
+
+    def _preview_tag_colors(self, tags):
+        """One RGBA per tag: blue=male, red=female, from configured identities."""
+        out = []
+        for tag in tags:
+            sex = (self.tag_identities.get(tag, {}) or {}).get('sex', 'M')
+            out.append(self._SEX_RED if sex == 'F' else self._SEX_BLUE)
+        return np.array(out, dtype=float)
 
     def _show_chunk(self, idx):
         """Make a cached chunk the active one and render the playhead frame."""
@@ -3083,13 +3193,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_current_chunk = idx
         self.preview_tags = c["tags"]
         self.preview_x, self.preview_y = c["x"], c["y"]
+        self.preview_xf, self.preview_yf = c["xf"], c["yf"]
         self.preview_raw_x, self.preview_raw_y = c["raw_x"], c["raw_y"]
         self.preview_times = c["times"]
         self.preview_hz = c["hz"]
-
-        cmap = plt.get_cmap('tab20')
-        self.preview_colors = np.array(
-            [cmap(i % 20) for i in range(len(self.preview_tags))], dtype=float)
+        self.preview_colors = self._preview_tag_colors(self.preview_tags)
 
         # Clamp the playhead into this chunk's actual span
         self.preview_playhead_ms = int(np.clip(
@@ -3154,42 +3262,42 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         idx = self._frame_index()
 
-        x = self.preview_x[idx]
-        y = self.preview_y[idx]
+        # Marker uses the forward-filled position so a tag stays put between its
+        # sparse fixes instead of blinking; the trail below uses the real fixes.
+        xf = getattr(self, "preview_xf", self.preview_x)
+        yf = getattr(self, "preview_yf", self.preview_y)
+        x = xf[idx]
+        y = yf[idx]
         colors = self.preview_colors
 
+        # Build the trailing track: one connected polyline per tag over the
+        # trail window (seconds -> frames). The window can reach back an hour,
+        # but is bounded by the loaded chunk, so a longer trail needs a longer
+        # Chunk. Points are the (smoothed) positions; drawing them as a line is
+        # the "track" the user wants instead of a dot cloud.
         trail_frames = int(self.spin_preview_trail.value() * self.preview_hz)
-        pos_list, col_list = [], []
+        tracks = []
+        raw_pts = None
         if trail_frames > 0:
             lo = max(0, idx - trail_frames)
             seg_x = self.preview_x[lo:idx + 1]
             seg_y = self.preview_y[lo:idx + 1]
-            n_steps = len(seg_x)
             for t in range(len(self.preview_tags)):
                 tx, ty = seg_x[:, t], seg_y[:, t]
                 ok = np.isfinite(tx) & np.isfinite(ty)
-                if not ok.any():
-                    continue
-                pos_list.append(np.column_stack([tx[ok], ty[ok], np.zeros(ok.sum())]))
-                fade = np.linspace(0.12, 0.85, n_steps)[ok]   # older points fade
-                c = np.tile(colors[t], (ok.sum(), 1)).astype(float)
-                c[:, 3] = fade
-                col_list.append(c)
+                if ok.sum() >= 1:
+                    tracks.append((np.column_stack([tx[ok], ty[ok]]),
+                                   tuple(colors[t])))
 
             if self.chk_preview_raw.isChecked():
                 rseg_x = self.preview_raw_x[lo:idx + 1]
                 rseg_y = self.preview_raw_y[lo:idx + 1]
-                for t in range(len(self.preview_tags)):
-                    tx, ty = rseg_x[:, t], rseg_y[:, t]
-                    ok = np.isfinite(tx) & np.isfinite(ty)
-                    if not ok.any():
-                        continue
-                    pos_list.append(np.column_stack([tx[ok], ty[ok], np.zeros(ok.sum())]))
-                    col_list.append(np.tile((0.65, 0.65, 0.65, 0.35), (ok.sum(), 1)))
+                rok = np.isfinite(rseg_x) & np.isfinite(rseg_y)
+                if rok.any():
+                    raw_pts = np.column_stack([rseg_x[rok], rseg_y[rok]])
 
-        trails = ((np.vstack(pos_list), np.vstack(col_list)) if pos_list
-                  else (np.zeros((0, 3)), np.zeros((0, 4))))
-        self._preview_backend().update_frame(x, y, colors, trails)
+        self._preview_backend().update_frame(x, y, colors,
+                                             tracks=tracks, raw_pts=raw_pts)
         self._update_time_label()
 
     # -- transport --------------------------------------------------------- #
@@ -3263,6 +3371,311 @@ class UWBQuickVisualizationWindow(QWidget):
         self._sync_timeline_to_playhead()
         self._request_chunk(0, make_current=True)
 
+    # -- quick snapshot plot ---------------------------------------------- #
+    def plot_last_known_locations(self):
+        """Save a labelled snapshot of each selected tag's most recent fix.
+
+        One cheap query per tag (MAX(timestamp)), so it is fast even on the
+        unindexed original — and faster still if the indexed copy exists. The
+        figure is drawn over the same arena the preview shows (XML zones/map
+        when available), then written to the analysis folder.
+        """
+        if not self.db_path or not self.table_name:
+            QMessageBox.warning(self, "No Database", "Select a database and table first")
+            return
+        tags = self.selected_preview_tags()
+        if not tags:
+            QMessageBox.warning(self, "No Tags", "Select at least one tag first")
+            return
+
+        try:
+            tz = pytz.timezone(self.combo_timezone.currentText())
+            db = self.preview_db_path or self.db_path
+            conn = sqlite3.connect(db)
+            placeholders = ",".join(["?"] * len(tags))
+            # Last fix per tag: join each tag's MAX(timestamp) back to its row.
+            rows = conn.execute(
+                f"SELECT d.shortid, d.location_x, d.location_y, d.timestamp "
+                f"FROM {self.table_name} d "
+                f"JOIN (SELECT shortid, MAX(timestamp) mt FROM {self.table_name} "
+                f"      WHERE shortid IN ({placeholders}) GROUP BY shortid) m "
+                f"ON d.shortid = m.shortid AND d.timestamp = m.mt",
+                tags).fetchall()
+            conn.close()
+        except Exception as e:
+            self.log_message(f"Last-locations query failed: {e}")
+            QMessageBox.critical(self, "Query Failed", f"Could not read last locations:\n{e}")
+            return
+
+        if not rows:
+            QMessageBox.information(self, "No Data", "No fixes found for the selected tags.")
+            return
+
+        # Deduplicate on shortid (a tie in MAX could yield two rows) and convert
+        # inches -> metres to match every other coordinate in the tool.
+        latest = {}
+        for shortid, lx, ly, ts in rows:
+            if shortid not in latest or ts > latest[shortid][2]:
+                latest[shortid] = (lx * 0.0254, ly * 0.0254, ts)
+
+        fig = Figure(figsize=(8, 8))
+        ax = fig.add_subplot(111)
+        pal_bg, pal_fg = "#1e1e1e", "#cccccc"
+        fig.patch.set_facecolor(pal_bg)
+        ax.set_facecolor(pal_bg)
+
+        # Arena context: reuse the XML site map/zones if parsed, else a plain
+        # box fitted to the points.
+        xs = [v[0] for v in latest.values()]
+        ys = [v[1] for v in latest.values()]
+        if self.xml_map_image is not None and self.xml_map_extent is not None:
+            ax.imshow(self.xml_map_image, extent=list(self.xml_map_extent),
+                      origin="upper", zorder=0)
+        for z in self.xml_zones:
+            pts = z["points"]
+            if len(pts) < 3:
+                continue
+            is_bounds = z.get("name", "").strip().lower() == "arena"
+            ax.add_patch(MplPolygon(
+                pts, closed=True, facecolor="none" if is_bounds else z.get("color", "#888"),
+                edgecolor=z.get("color", "#888"), alpha=1.0 if is_bounds else 0.22,
+                linewidth=1.8 if is_bounds else 1.0, zorder=1))
+        if self.anchor_positions:
+            ax.scatter([a["x"] for a in self.anchor_positions],
+                       [a["y"] for a in self.anchor_positions],
+                       marker="^", s=40, c="#f2c24f", edgecolors="none", zorder=2)
+
+        cmap = plt.get_cmap('tab20')
+        for i, (shortid, (x, y, ts)) in enumerate(sorted(latest.items())):
+            label = self._tag_display_label(shortid)
+            local = pd.Timestamp(int(ts), unit='ms', tz='UTC').tz_convert(tz)
+            ax.scatter([x], [y], s=140, color=cmap(i % 20),
+                       edgecolors="white", linewidths=1.0, zorder=5)
+            ax.annotate(f"{label}\n{local:%m-%d %H:%M}", (x, y),
+                        textcoords="offset points", xytext=(8, 6),
+                        color=pal_fg, fontsize=8, zorder=6)
+
+        ax.set_aspect("equal")
+        ax.set_xlabel("X (m)", color=pal_fg)
+        ax.set_ylabel("Y (m)", color=pal_fg)
+        ax.tick_params(colors=pal_fg)
+        for sp in ax.spines.values():
+            sp.set_color("#555555")
+        ax.set_title(f"Last known locations · {len(latest)} tags", color=pal_fg)
+        fig.tight_layout()
+
+        # Save into the analysis folder, matching the export naming.
+        db_dir = os.path.dirname(self.db_path)
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+        out_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+        os.makedirs(out_dir, exist_ok=True)
+        png = os.path.join(out_dir, f"{db_name}_LastKnownLocations.png")
+        try:
+            fig.savefig(png, dpi=150, facecolor=pal_bg, bbox_inches="tight")
+            saved = [os.path.basename(png)]
+            if self.chk_save_svg.isChecked():
+                svg = os.path.splitext(png)[0] + ".svg"
+                fig.savefig(svg, facecolor=pal_bg, bbox_inches="tight")
+                saved.append(os.path.basename(svg))
+            self.log_message(f"✓ Saved last-known-locations plot: {', '.join(saved)}")
+            QMessageBox.information(
+                self, "Plot Saved",
+                f"Saved {', '.join(saved)}\n\nin {os.path.basename(out_dir)}/")
+        except Exception as e:
+            self.log_message(f"Could not save last-locations plot: {e}")
+            QMessageBox.critical(self, "Save Failed", str(e))
+
+    def _tag_display_label(self, shortid):
+        """Identity label for a tag: 'sex-identity' if configured, else HexID."""
+        info = self.tag_identities.get(shortid)
+        if info:
+            sex, ident = info.get("sex", ""), info.get("identity", "")
+            if sex and ident:
+                return f"{sex}-{ident}"
+            if ident:
+                return str(ident)
+        return f"HexID {hex(shortid).upper().replace('0X', '')}"
+
+    # -- occupancy heatmaps ------------------------------------------------ #
+    def plot_occupancy_heatmaps(self):
+        """Build per-animal space-use heatmaps over the whole recording.
+
+        Each tag's fixes are binned into a 2-D histogram of % time per arena
+        cell, then shown faceted (one panel per animal) in a zoomable window.
+        Memory stays flat: each tag is read, filtered, histogrammed and then
+        discarded — only the small bin grids are kept.
+        """
+        if not self.db_path or not self.table_name:
+            QMessageBox.warning(self, "No Database", "Select a database and table first")
+            return
+        tags = self.selected_preview_tags()
+        if not tags:
+            QMessageBox.warning(self, "No Tags", "Select at least one tag first")
+            return
+
+        db = self.preview_db_path or self.db_path
+        tz = pytz.timezone(self.combo_timezone.currentText())
+        do_filter = self.chk_velocity_filter.isChecked() or self.chk_jump_filter.isChecked()
+
+        progress = QProgressDialog("Building occupancy heatmaps…", "Cancel",
+                                   0, len(tags) + 1, self)
+        progress.setWindowTitle("Occupancy Heatmaps")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            conn = sqlite3.connect(db)
+
+            # Common spatial extent so every facet shares one grid. Prefer the
+            # anchor footprint (the true arena); UWB data carries stray fixes
+            # far outside it, so a raw data min/max would blow up the frame.
+            placeholders = ",".join(["?"] * len(tags))
+            if self.anchor_positions:
+                xs_a = [a["x"] for a in self.anchor_positions]
+                ys_a = [a["y"] for a in self.anchor_positions]
+                x0, x1 = min(xs_a), max(xs_a)
+                y0, y1 = min(ys_a), max(ys_a)
+            else:
+                # No anchors: use robust percentiles to reject outliers. Sample
+                # the data rather than pulling every row for the bounds.
+                s = pd.read_sql_query(
+                    f"SELECT location_x, location_y FROM {self.table_name} "
+                    f"WHERE shortid IN ({placeholders}) "
+                    f"ORDER BY timestamp LIMIT 200000", conn, params=tags)
+                if len(s) == 0:
+                    conn.close(); progress.close()
+                    QMessageBox.information(self, "No Data", "No fixes for the selected tags.")
+                    return
+                x0, x1 = np.percentile(s['location_x'] * 0.0254, [1, 99])
+                y0, y1 = np.percentile(s['location_y'] * 0.0254, [1, 99])
+            pad = 0.5
+            x0, x1 = x0 - pad, x1 + pad
+            y0, y1 = y0 - pad, y1 + pad
+            # histogram2d range clips out-of-arena outliers automatically
+            hist_range = [[x0, x1], [y0, y1]]
+            # ~0.15 m cells, capped so huge arenas stay a sane grid size
+            nx = int(np.clip(round((x1 - x0) / 0.15), 20, 90))
+            ny = int(np.clip(round((y1 - y0) / 0.15), 20, 90))
+            xedges = np.linspace(x0, x1, nx + 1)
+            yedges = np.linspace(y0, y1, ny + 1)
+
+            heatmaps, labels = [], []
+            for i, tag in enumerate(tags):
+                if progress.wasCanceled():
+                    conn.close(); return
+                progress.setLabelText(f"Tag {i + 1}/{len(tags)} — reading & binning…")
+                progress.setValue(i)
+                QApplication.processEvents()
+
+                td = pd.read_sql_query(
+                    f"SELECT timestamp, location_x, location_y FROM {self.table_name} "
+                    f"WHERE shortid = ? ORDER BY timestamp", conn, params=(tag,))
+                if len(td) == 0:
+                    heatmaps.append(None); labels.append(self._tag_display_label(tag))
+                    continue
+
+                td['shortid'] = tag
+                td['location_x'] *= 0.0254
+                td['location_y'] *= 0.0254
+
+                # Respect the tag's active window and the current filters, so
+                # the heatmap matches what an export would produce.
+                if tag in self.tag_identities:
+                    info = self.tag_identities[tag]
+                    if 'start_time' in info and 'stop_time' in info:
+                        td['Timestamp'] = pd.to_datetime(
+                            td['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
+                        start = pd.Timestamp(info['start_time']).tz_localize(tz)
+                        stop = pd.Timestamp(info['stop_time']).tz_localize(tz)
+                        td = td[(td['Timestamp'] >= start) & (td['Timestamp'] <= stop)]
+                if do_filter and len(td) > 0:
+                    td['Timestamp'] = pd.to_datetime(
+                        td['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
+                    td = self.apply_filters_to_data(td, collect_stats=False)
+
+                labels.append(self._tag_display_label(tag))
+                if len(td) == 0:
+                    heatmaps.append(None); continue
+                # range= clips fixes outside the arena frame
+                H, _, _ = np.histogram2d(td['location_x'].to_numpy(),
+                                         td['location_y'].to_numpy(),
+                                         bins=[xedges, yedges], range=hist_range)
+                total = H.sum()
+                heatmaps.append((H / total * 100.0) if total else None)
+                self.log_message(f"  {labels[-1]}: {int(total):,} fixes binned")
+
+            conn.close()
+            progress.setValue(len(tags))
+            QApplication.processEvents()
+
+            valid = [h for h in heatmaps if h is not None]
+            if not valid:
+                progress.close()
+                QMessageBox.information(self, "No Data",
+                                        "No fixes survived filtering for the selected tags.")
+                return
+
+            # Shared colour scale: 99th percentile of occupied cells, so a
+            # single hot spot doesn't wash out every panel.
+            pooled = np.concatenate([h[h > 0].ravel() for h in valid])
+            vmax = float(np.percentile(pooled, 99)) if len(pooled) else 1.0
+
+            fig = self._build_heatmap_figure(heatmaps, labels, xedges, yedges, vmax)
+            progress.close()
+
+            # Save alongside the other outputs, then show it zoomably.
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+            out_dir = os.path.join(os.path.dirname(self.db_path), f"{db_name}_FNT_analysis")
+            os.makedirs(out_dir, exist_ok=True)
+            png = os.path.join(out_dir, f"{db_name}_OccupancyHeatmaps.png")
+            try:
+                fig.savefig(png, dpi=150, facecolor="white", bbox_inches="tight")
+                self.log_message(f"✓ Saved occupancy heatmaps: {os.path.basename(png)}")
+            except Exception as e:
+                self.log_message(f"Could not save heatmap PNG: {e}")
+
+            self._heatmap_popup = FigurePopup(
+                fig, title=f"Occupancy Heatmaps — {db_name}", parent=self)
+            self._heatmap_popup.resize(960, 720)
+            self._heatmap_popup.show()
+
+        except Exception as e:
+            progress.close()
+            self.log_message(f"Occupancy heatmap failed: {e}")
+            QMessageBox.critical(self, "Heatmap Failed", str(e))
+
+    def _build_heatmap_figure(self, heatmaps, labels, xedges, yedges, vmax):
+        """Faceted magma raster of % time per cell, shared colour scale."""
+        n = len(heatmaps)
+        ncols = 1 if n == 1 else min(3, n)
+        nrows = int(np.ceil(n / ncols))
+        fig = Figure(figsize=(3.2 * ncols + 1.2, 3.0 * nrows), facecolor="white")
+        extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+        im = None
+        for i, (H, lab) in enumerate(zip(heatmaps, labels)):
+            ax = fig.add_subplot(nrows, ncols, i + 1)
+            ax.set_facecolor("black")
+            if H is not None:
+                # histogram2d is [x, y]; transpose so rows=y for imshow, and
+                # origin="lower" puts +y up.
+                im = ax.imshow(H.T, extent=extent, origin="lower", cmap="magma",
+                               vmin=0, vmax=vmax, aspect="equal",
+                               interpolation="nearest")
+            else:
+                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                        ha="center", va="center", color="#999")
+                ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[2], extent[3])
+            ax.set_title(lab, fontsize=10)
+            ax.set_xlabel("X Position (m)", fontsize=8)
+            ax.set_ylabel("Y Position (m)", fontsize=8)
+            ax.tick_params(labelsize=7)
+        if im is not None:
+            cbar = fig.colorbar(im, ax=fig.axes, fraction=0.025, pad=0.02)
+            cbar.set_label("% time", fontsize=9)
+        fig.suptitle("Occupancy (space use) over full recording", fontsize=12)
+        return fig
+
     # -- indexed preview copy ---------------------------------------------- #
     # The original Wiser database is treated as a read-only primary record and
     # is never written to. Fast scrubbing instead uses a derived, indexed copy
@@ -3293,6 +3706,38 @@ class UWBQuickVisualizationWindow(QWidget):
                     and meta.get("table_name") == self.table_name)
         except Exception:
             return False
+
+    def adopt_preview_index_db(self):
+        """Use an existing indexed copy if one is current, else the original.
+
+        Never builds — this runs automatically when the preview activates, and
+        writing a multi-GB copy on every database load would be a surprise. The
+        'Fast index' button (ensure_preview_index_db) is the explicit opt-in.
+        """
+        if not self.db_path or not self.table_name:
+            return
+        self.preview_db_path = self.db_path
+        _, copy_path, meta_path = self._preview_index_paths()
+
+        # Sweep any leftover .partial from a build that was interrupted (crash
+        # or hard kill) — these can be multi-GB and would otherwise linger. Only
+        # safe to remove when no build is currently running.
+        if not (self.preview_index_builder is not None
+                and self.preview_index_builder.isRunning()):
+            for junk in (copy_path + ".partial", copy_path + ".partial-journal"):
+                try:
+                    if os.path.exists(junk):
+                        os.remove(junk)
+                        self.log_message(f"Removed stale index build file: {os.path.basename(junk)}")
+                except Exception:
+                    pass
+
+        if self._indexed_copy_is_current(copy_path, meta_path):
+            self.preview_db_path = copy_path
+            self._set_index_status("Fast index: ready ✓", "#00aa00")
+            self.log_message(f"Using existing indexed copy for preview: {os.path.basename(copy_path)}")
+        else:
+            self._set_index_status("Fast index: not built (click to speed up scrubbing)", "#cccccc")
 
     def ensure_preview_index_db(self):
         """Point the preview at an indexed copy, building one if needed.
@@ -3441,7 +3886,9 @@ class UWBQuickVisualizationWindow(QWidget):
         self.arena_zones = None
         self.anchor_positions = []
 
-        # Drop all cached preview chunks so nothing leaks across databases
+        # Drop all cached preview chunks so nothing leaks across databases. The
+        # pane stays visible but goes inert until the new database's tags load.
+        self._preview_active = False
         self.stop_preview_playback()
         self.preview_cache.clear()
         # Let in-flight reads finish before releasing them. Clearing the dict
@@ -3458,6 +3905,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_playhead_ms = 0
         self.preview_db_path = None
         self.preview_x = self.preview_y = None
+        self.preview_xf = self.preview_yf = None
         self.preview_raw_x = self.preview_raw_y = None
         self.preview_times = None
         self.preview_tags = []
@@ -3469,7 +3917,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self._timeline_guard = True
             self.slider_timeline.setRange(0, 0)
             self._timeline_guard = False
-            self.lbl_preview_status.setText("Select tags, then scrub the timeline")
+            self.lbl_preview_status.setText("Load a database and select tags to preview")
             self.lbl_preview_time.setText("--")
             self._update_cache_label()
             self._set_index_status("Fast index: not built", "#cccccc")
@@ -3571,11 +4019,56 @@ class UWBQuickVisualizationWindow(QWidget):
             # Check for XML configuration file in the database directory
             self.load_xml_config()
 
-            # Auto-load background image if PNG exists alongside database
+            # Auto-load a background image only if one clearly belongs to this
+            # database (name match). Otherwise offer to pick one.
             self.auto_load_background()
+            if self.background_image is None:
+                self.prompt_background_image()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
+
+    def is_wiser_database(self):
+        """Heuristic: does this look like a Wiser UWB export?
+
+        True if the site XML has a <Wiser> root, or the table carries the
+        Wiser column signature (shortid + location_x/y + timestamp).
+        """
+        if self.xml_config_path and os.path.exists(self.xml_config_path):
+            try:
+                root = ET.parse(self.xml_config_path).getroot()
+                if root.tag.lower() == "wiser":
+                    return True
+            except Exception:
+                pass
+        if self.db_path and self.table_name:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cols = {r[1].lower() for r in conn.execute(f"PRAGMA table_info({self.table_name})")}
+                conn.close()
+                return {"shortid", "location_x", "location_y", "timestamp"}.issubset(cols)
+            except Exception:
+                pass
+        return False
+
+    def prompt_background_image(self):
+        """Offer to load a floorplan/background image for this database."""
+        wiser = self.is_wiser_database()
+        lead = ("This looks like a Wiser UWB database.\n\n" if wiser else "")
+        scale_note = (
+            f"An XML scale ({self.xml_scale} in/px) was found, so the image "
+            f"will be placed at true size with its bottom-left corner at the "
+            f"tracking origin (0, 0)."
+            if self.xml_scale else
+            "No XML scale was found — the image can still be loaded but its "
+            "size may not match the tracking coordinates.")
+        reply = QMessageBox.question(
+            self, "Load Background Image?",
+            f"{lead}Would you like to load a background floorplan image for "
+            f"the arena?\n\n{scale_note}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.select_background_image()
     
     def load_xml_config(self):
         """Look for XML configuration file in the database directory"""
@@ -3783,11 +4276,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 if xml_name in fname or fname in xml_name:
                     selected_png = f
                     break
-        if not selected_png and len(png_files) == 1:
-            selected_png = png_files[0]
 
+        # No single-PNG fallback: an arbitrary lone PNG (e.g. an ABMA model
+        # config) is often NOT the floorplan. Without a name match, defer to
+        # the "Load Background Image?" prompt so the user picks deliberately.
         if not selected_png:
-            self.log_message(f"Multiple PNG files found in directory — skipping auto-load (use Load Background to select)")
             return
 
         file_path = os.path.join(db_dir, selected_png)
@@ -3808,6 +4301,8 @@ class UWBQuickVisualizationWindow(QWidget):
             self.lbl_background_status.setText(f"\u2713 Background: {selected_png}")
             self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
             self.btn_remove_background.setEnabled(True)
+            if self._preview_active:
+                self.refresh_preview_arena()
 
         except Exception as e:
             self.log_message(f"Warning: Could not auto-load background {selected_png}: {str(e)}")
@@ -3855,6 +4350,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
                 self.btn_remove_background.setEnabled(True)
 
+                # Switch the live preview to 2D (the only view that shows the
+                # background) and redraw so the floorplan appears immediately.
+                if self._preview_active:
+                    if self.combo_view_mode.currentText() != self.VIEW_2D:
+                        self.combo_view_mode.setCurrentText(self.VIEW_2D)
+                    self.refresh_preview_arena()
+
             except Exception as e:
                 self.log_message(f"Error loading background image: {str(e)}")
                 self.background_image = None
@@ -3874,6 +4376,27 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.btn_remove_background.setEnabled(False)
         self.log_message("Background image removed")
+        if self.preview_canvas_2d is not None:
+            self.preview_canvas_2d.background_image = None
+            self.preview_canvas_2d.bg_extent = None
+        if self._preview_active:
+            self.refresh_preview_arena()
+
+    def on_show_background_toggled(self, _state=None):
+        """Redraw the preview after a display toggle (background or anchors)."""
+        if self._preview_active:
+            self.refresh_preview_arena()
+
+    def on_preview_theme_changed(self, _state=None):
+        """Switch the preview canvases between the dark and light palettes."""
+        theme = "light" if self.chk_preview_light.isChecked() else "dark"
+        self.preview_canvas_2d.set_theme(theme)
+        if self.preview_canvas_3d is not None:
+            self.preview_canvas_3d.set_theme(theme)
+        if self._preview_active:
+            self.refresh_preview_arena()
+        else:
+            self.preview_canvas_2d.show_placeholder()
 
     def on_table_selected(self, table_name):
         """Handle table selection"""
@@ -4101,6 +4624,10 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
             # Update tag checkbox labels to reflect new identities
             self.update_tag_labels()
+            # Recolour preview markers by the newly-assigned sex (blue=M, red=F)
+            if self._preview_active and self.preview_tags:
+                self.preview_colors = self._preview_tag_colors(self.preview_tags)
+                self.render_preview_frame()
             self.lbl_status.setText(f"Identity assignments saved for {len(self.tag_identities)} tags")
             
             # Auto-save configuration to JSON
@@ -4247,10 +4774,16 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Apply pending tag selection from loaded config
         self.apply_pending_tag_selection()
-        
+
         # Update identity button state
         self.update_identity_button_state()
-    
+
+        # Tags now exist for this database — bring the live preview to life.
+        # Checkbox creation above sets states before their signals are wired,
+        # so no on_tag_selection_changed fired; activate explicitly.
+        if not self._preview_active and self.selected_preview_tags():
+            self.activate_preview()
+
     def update_identity_button_state(self):
         """Enable Configure Identities button if any tag is selected"""
         any_selected = any(cb.isChecked() for cb in self.tag_checkboxes.values())
@@ -5132,7 +5665,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.background_image is not None and self.bg_width_meters is not None:
             bg_artist = ax.imshow(self.background_image, 
                      extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
-                     origin='lower',
+                     origin='upper',
                      aspect='auto',
                      alpha=0.6,
                      zorder=0)
@@ -5213,7 +5746,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if bg_artist is not None:
                 ax.imshow(self.background_image, 
                          extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
-                         origin='lower',
+                         origin='upper',
                          aspect='auto',
                          alpha=0.6,
                          zorder=0)
@@ -5799,7 +6332,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_timezone.currentText(),
                     self.tag_identities,
                     bool(self.tag_identities),  # Use identities if any are configured
-                    self.background_image,  # Pass background image
+                    # Respect the show/hide toggle so exported plots match the preview
+                    self.background_image if self.chk_show_background.isChecked() else None,
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height
                     csv_path,  # Pass CSV path for reuse

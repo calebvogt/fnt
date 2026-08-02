@@ -48,6 +48,7 @@ except Exception as _e:  # pragma: no cover - depends on optional PyOpenGL
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle, Polygon, Rectangle
 
 # Palettes deliberately mirror the ABMA arena views so the two tools read as
@@ -57,12 +58,16 @@ _THEMES = {
         bg=(0.13, 0.15, 0.18, 1.0), floor=(0.12, 0.14, 0.17, 1.0),
         grid=(1, 1, 1, 0.12), wall=(0.60, 0.70, 0.82, 0.10),
         pole=(0.46, 0.34, 0.23, 1.0), anchor=(0.95, 0.76, 0.31, 1.0),
-        mpl_bg="#1e1e1e", mpl_fg="#cccccc", mpl_grid="#3f3f3f"),
+        mpl_bg="#1e1e1e", mpl_fg="#cccccc", mpl_grid="#3f3f3f",
+        mpl_floor="#26292e"),
     "light": dict(
-        bg=(0.95, 0.96, 0.97, 1.0), floor=(0.86, 0.88, 0.90, 1.0),
-        grid=(0, 0, 0, 0.18), wall=(0.30, 0.42, 0.60, 0.16),
+        bg=(1.0, 1.0, 1.0, 1.0), floor=(0.89, 0.83, 0.70, 1.0),
+        grid=(0, 0, 0, 0.15), wall=(0.30, 0.42, 0.60, 0.16),
         pole=(0.42, 0.30, 0.19, 1.0), anchor=(0.80, 0.55, 0.10, 1.0),
-        mpl_bg="#ffffff", mpl_fg="#222222", mpl_grid="#cccccc"),
+        # pure-white surround with a tan arena floor, mirroring the ABMA
+        # VoleTerra 2D light model
+        mpl_bg="#ffffff", mpl_fg="#33383f", mpl_grid="#b6bbc3",
+        mpl_floor="#e3d5b0"),
 }
 
 
@@ -314,12 +319,13 @@ class UWBPreview3D(gl.GLViewWidget if HAVE_GL else object):
         self._arena_items.append(item)
 
     # -- per-frame --------------------------------------------------------- #
-    def update_frame(self, x, y, colors, trails=None):
-        """Place one sphere per tag; ``trails`` is an (M,4) x/y/r/g-style array.
+    def update_frame(self, x, y, colors, tracks=None, raw_pts=None):
+        """Place one sphere per tag and draw the trailing tracks.
 
-        ``trails`` should be an (M, 3) position array plus an (M, 4) colour
-        array as a tuple, or None. Kept as plain arrays so the caller can
-        rebuild the whole trail on a scrub without any internal history.
+        ``tracks``: list of (xy Nx2, rgb) smoothed polylines per tag.
+        ``raw_pts``: optional Mx2 raw fixes. Both are flattened into the GL
+        scatter trail here (the 3D view keeps its point-cloud trail; the 2D
+        view is the one that renders true connected lines).
         """
         x = np.asarray(x, float)
         y = np.asarray(y, float)
@@ -344,8 +350,22 @@ class UWBPreview3D(gl.GLViewWidget if HAVE_GL else object):
             else:
                 it.setVisible(False)   # tag has no fix at this instant
 
-        if trails is not None and len(trails[0]):
-            self._trail.setData(pos=trails[0], color=trails[1],
+        pos_list, col_list = [], []
+        for xy, rgb in (tracks or []):
+            if len(xy) < 1:
+                continue
+            m = len(xy)
+            pos_list.append(np.column_stack([xy[:, 0], xy[:, 1], np.zeros(m)]))
+            c = np.empty((m, 4), float)
+            c[:, :3] = np.array(rgb[:3])
+            c[:, 3] = np.linspace(0.12, 0.9, m)
+            col_list.append(c)
+        if raw_pts is not None and len(raw_pts):
+            m = len(raw_pts)
+            pos_list.append(np.column_stack([raw_pts[:, 0], raw_pts[:, 1], np.zeros(m)]))
+            col_list.append(np.tile((0.5, 0.5, 0.5, 0.3), (m, 1)))
+        if pos_list:
+            self._trail.setData(pos=np.vstack(pos_list), color=np.vstack(col_list),
                                 size=max(2.0, self._marker_r * 40), pxMode=True)
         else:
             self._trail.setData(pos=np.zeros((0, 3)))
@@ -389,6 +409,27 @@ class UWBPreview2D(FigureCanvas):
         self.bg_extent = None       # (x0, x1, y0, y1) in metres
         self.show_anchors = True
         self._apply_theme()
+        self.show_placeholder()
+
+    def show_placeholder(self, msg="Load a database and select tags\nto preview tracking data"):
+        """Neutral empty state: no bare 0–1 axes, just a centred hint.
+
+        Shown at startup and whenever there is nothing to draw, so the pane
+        reads as 'waiting' rather than 'broken'.
+        """
+        pal = _THEMES[self._theme]
+        self.fig.clf()
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(pal["mpl_bg"])
+        self.fig.patch.set_facecolor(pal["mpl_bg"])
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        for sp in self.ax.spines.values():
+            sp.set_visible(False)
+        self.ax.text(0.5, 0.5, msg, transform=self.ax.transAxes,
+                     ha="center", va="center", color=pal["mpl_grid"],
+                     fontsize=13, fontstyle="italic")
+        self.draw_idle()
 
     def _apply_theme(self):
         pal = _THEMES[self._theme]
@@ -408,20 +449,39 @@ class UWBPreview2D(FigureCanvas):
     def set_arena(self, arena):
         self.arena = arena
 
-    def update_frame(self, x, y, colors, trails=None):
+    def update_frame(self, x, y, colors, tracks=None, raw_pts=None):
+        """Draw one frame.
+
+        ``tracks``: list of (xy Nx2 array, rgb tuple) — one smoothed polyline
+        per tag, drawn as a fading connected line (the "track").
+        ``raw_pts``: optional Mx2 array of raw fixes, drawn as faint dots.
+        """
         pal = _THEMES[self._theme]
         a = self.arena
         self.ax.clear()
         self._apply_theme()
 
         # Site map from the XML takes precedence; otherwise any separately
-        # loaded background/floorplan image.
+        # loaded background/floorplan image. Both use origin="upper": the image
+        # is drawn UPRIGHT (exactly as the file looks — north at top) with its
+        # bottom-left corner at world (0, 0). This matches the Wiser workflow:
+        # the floorplan is placed at the origin and antennas/tracks are laid
+        # over it in the same metre frame.
+        has_image = (a.map_image is not None and a.map_extent is not None) or \
+                    (self.background_image is not None and self.bg_extent is not None)
         if a.map_image is not None and a.map_extent is not None:
             self.ax.imshow(a.map_image, extent=list(a.map_extent),
                            origin="upper", zorder=0)
         elif self.background_image is not None and self.bg_extent is not None:
             self.ax.imshow(self.background_image, extent=list(self.bg_extent),
-                           origin="lower", zorder=0)
+                           origin="upper", zorder=0)
+        elif not a.zones:
+            # No image and no zones: fill the arena as a solid floor (tan in
+            # light mode) so the idealized view reads as a real enclosure.
+            self.ax.add_patch(Rectangle(
+                (a.origin_x, a.origin_y), a.width, a.height,
+                facecolor=pal["mpl_floor"], edgecolor=pal["mpl_grid"],
+                linewidth=1.0, zorder=0))
 
         if a.zones:
             for z in a.zones:
@@ -445,10 +505,6 @@ class UWBPreview2D(FigureCanvas):
                     z.get("name", ""), (cx, cy), color="#111111", fontsize=7,
                     fontweight="bold", ha="center", va="center", zorder=6,
                     path_effects=[pe.withStroke(linewidth=2.2, foreground="white")])
-        else:
-            self.ax.add_patch(Rectangle(
-                (a.origin_x, a.origin_y), a.width, a.height,
-                fill=False, edgecolor=pal["mpl_grid"], linewidth=1.0, zorder=1))
 
         for p in a.poles:
             self.ax.add_patch(Circle(
@@ -456,24 +512,54 @@ class UWBPreview2D(FigureCanvas):
                 facecolor="#75573b", edgecolor="none", zorder=2))
 
         if self.show_anchors and a.anchors:
+            # Bright gold triangles with a dark edge so they read clearly on top
+            # of the floorplan (whose own grid dots are a similar hue).
             self.ax.scatter([q["x"] for q in a.anchors],
                             [q["y"] for q in a.anchors],
-                            marker="^", s=45, c="#f2c24f",
-                            edgecolors="none", zorder=3, label="anchors")
+                            marker="^", s=110, c="#ffd21e",
+                            edgecolors="#1a1a1a", linewidths=1.0,
+                            zorder=6, label="anchors")
 
-        if trails is not None and len(trails[0]):
-            pos, col = trails
-            self.ax.scatter(pos[:, 0], pos[:, 1], s=3, c=col, zorder=4)
+        # Raw fixes (optional overlay): faint dots showing the actual samples
+        # under the smoothed track.
+        if raw_pts is not None and len(raw_pts):
+            self.ax.scatter(raw_pts[:, 0], raw_pts[:, 1], s=4,
+                            c=[(0.5, 0.5, 0.5, 0.30)], edgecolors="none", zorder=3)
+
+        # Tracks: one connected line per tag, fading from old (transparent) to
+        # recent (opaque) — the movement path rather than a dot cloud.
+        if tracks:
+            for xy, rgb in tracks:
+                if len(xy) < 2:
+                    continue
+                pts = xy.reshape(-1, 1, 2)
+                segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+                n = len(segs)
+                seg_cols = np.empty((n, 4), float)
+                seg_cols[:, :3] = np.array(rgb[:3])
+                seg_cols[:, 3] = np.linspace(0.12, 0.95, n)
+                self.ax.add_collection(
+                    LineCollection(segs, colors=seg_cols, linewidths=1.7, zorder=4))
 
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         ok = np.isfinite(x) & np.isfinite(y)
         if ok.any():
-            self.ax.scatter(x[ok], y[ok], s=90, c=np.asarray(colors)[ok],
-                            edgecolors="white", linewidths=0.6, zorder=5)
+            edge = "white" if self._theme == "dark" else "#333333"
+            self.ax.scatter(x[ok], y[ok], s=42, c=np.asarray(colors)[ok],
+                            edgecolors=edge, linewidths=0.6, zorder=5)
 
-        self.ax.set_xlim(a.origin_x, a.origin_x + a.width)
-        self.ax.set_ylim(a.origin_y, a.origin_y + a.height)
+        # View bounds start at the arena, then expand to include the whole
+        # background image so it is never clipped. In the Wiser workflow the
+        # floorplan is the reference frame, so it should be fully visible.
+        xmin, xmax = a.origin_x, a.origin_x + a.width
+        ymin, ymax = a.origin_y, a.origin_y + a.height
+        if self.background_image is not None and self.bg_extent is not None:
+            bx0, bx1, by0, by1 = self.bg_extent
+            xmin, xmax = min(xmin, bx0), max(xmax, bx1)
+            ymin, ymax = min(ymin, by0), max(ymax, by1)
+        self.ax.set_xlim(xmin, xmax)
+        self.ax.set_ylim(ymin, ymax)
         self.ax.set_aspect("equal")
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
@@ -481,9 +567,7 @@ class UWBPreview2D(FigureCanvas):
         self.draw_idle()
 
     def clear(self):
-        self.ax.clear()
-        self._apply_theme()
-        self.draw_idle()
+        self.show_placeholder()
 
     def reset_camera(self):
         self.draw_idle()
