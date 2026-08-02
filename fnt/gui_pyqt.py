@@ -942,6 +942,11 @@ class FNTMainWindow(QMainWindow):
         """Create a grid of buttons with descriptions"""
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
+        # Keep both columns equal width so a lone button occupies half the row
+        # (matching the two-column layout used on the other tabs) instead of
+        # stretching to fill the whole width.
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
         row, col = 0, 0
 
         for title, description, callback in buttons:

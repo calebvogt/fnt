@@ -25,9 +25,9 @@ Batch analysis module for detecting pairwise proximity events between tracked an
 - Computes inter-animal distances at each timestamp
 - Detects **proximity bouts** — contiguous periods where two animals are within a configurable distance threshold
 - Configurable gap-bridging to merge bouts separated by brief interruptions
-- Outputs two tables:
-  - **proximity_events** — per-timestamp pairwise distances with `in_proximity` flag
-  - **proximity_bouts** — summarized bouts with start/stop times, duration, and mean distance
+- Outputs **proximity_bouts** — summarized bouts with start/stop times, duration, mean distance, and observation count
+
+  Bouts are specific to the chosen distance threshold; re-run the analysis with a different threshold to explore other distances. The raw per-timestamp pairwise distances are computed internally but not exported.
 
 ## Input Data Format
 

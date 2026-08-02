@@ -53,6 +53,98 @@ PROCESSING_COLUMNS = ("shortid", "timestamp", "location_x", "location_y",
 REQUIRED_COLUMNS = ("shortid", "timestamp", "location_x", "location_y")
 
 
+def get_fnt_version():
+    """Resolve the installed FNT version for stamping into export artifacts.
+
+    Mirrors the main GUI's resolution order: read pyproject.toml when running
+    from a source checkout, then fall back to installed package metadata (used
+    by the PyInstaller build). Returns 'unknown' if neither is available so
+    stamping never breaks an export.
+    """
+    try:
+        import tomllib
+        from pathlib import Path
+        toml_path = Path(__file__).resolve().parent.parent.parent / 'pyproject.toml'
+        if toml_path.exists():
+            with open(toml_path, "rb") as f:
+                data = tomllib.load(f)
+            version = data.get('project', {}).get('version')
+            if version:
+                return version
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+        return version("fnt")
+    except Exception:
+        return "unknown"
+
+
+def list_visible_files(directory):
+    """List filenames in ``directory``, excluding hidden and macOS sidecar files.
+
+    Network/exFAT shares written from macOS accumulate AppleDouble companions
+    ('._<name>') and '.DS_Store' entries alongside the real files. These are not
+    configuration or data files and must never be auto-discovered — e.g.
+    '._EchoConfiguration_2024.11.6.xml' would otherwise shadow the real
+    'EchoConfiguration_2024.11.6.xml' (its leading '.' can even sort first, so a
+    naive scan picks it). Filtering any name starting with '.' covers AppleDouble
+    files, .DS_Store, and Unix dotfiles in one rule.
+
+    Returns [] if the directory cannot be read.
+    """
+    try:
+        return [f for f in os.listdir(directory) if not f.startswith('.')]
+    except OSError:
+        return []
+
+
+# Default spatial context layers for exported plots/animation. The user picks
+# these per-export in PlotLayersDialog; the choice is stored on the window and
+# in the config. Kept separate from the Preview Options 'Show ...' toggles,
+# which only affect the live preview.
+DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True}
+
+
+def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
+                        zones_xml=None, zones_df=None, anchors=None):
+    """Draw the background image, zone polygons and anchor markers on ``ax``.
+
+    Gated by ``layers`` (a dict with 'background'/'zones'/'anchors' booleans) so
+    every exported spatial figure honours the same per-export choice. Sources
+    are passed explicitly because the worker and the main window hold them in
+    different forms (loaded PNG vs. XML map image; xml_zones list vs.
+    arena_zones DataFrame).
+    """
+    layers = layers or {}
+    if layers.get('background') and bg_image is not None and bg_extent is not None:
+        ax.imshow(bg_image, extent=list(bg_extent), origin='upper',
+                  aspect='auto', alpha=0.6, zorder=0)
+    if layers.get('zones'):
+        if zones_xml:
+            for z in zones_xml:
+                pts = z.get('points')
+                if pts is None or len(pts) < 3:
+                    continue
+                is_bounds = (z.get('name', '') or '').strip().lower() == 'arena'
+                ax.add_patch(MplPolygon(
+                    pts, closed=True,
+                    facecolor='none' if is_bounds else z.get('color', '#888'),
+                    edgecolor=z.get('color', '#888'),
+                    alpha=1.0 if is_bounds else 0.22,
+                    linewidth=1.8 if is_bounds else 1.0, zorder=1))
+        elif zones_df is not None and not zones_df.empty:
+            for zone_name in zones_df['zone'].unique():
+                coords = zones_df[zones_df['zone'] == zone_name][['x', 'y']].values
+                if len(coords) >= 3:
+                    ax.add_patch(MplPolygon(coords, closed=True, fill=False,
+                                            edgecolor='black', linewidth=1.5,
+                                            linestyle='--', zorder=1))
+    if layers.get('anchors') and anchors:
+        ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
+                   marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+
+
 def processing_select_clause(conn, table_name):
     """SELECT list covering PROCESSING_COLUMNS present in ``table_name``.
 
@@ -82,6 +174,53 @@ def forward_backward_ewma(series, span):
     """
     forward = series.ewm(span=span, adjust=False).mean()
     return forward[::-1].ewm(span=span, adjust=False).mean()[::-1]
+
+
+def rolling_smooth_xy(data, agg, window_value, time_based):
+    """Centred (zero-phase) rolling smoothing of location_x/location_y per tag.
+
+    Shared by the interactive preview/export path and the plot-worker fallback
+    so both interpret the smoothing window identically.
+
+    Parameters
+    ----------
+    data : DataFrame with 'shortid', 'Timestamp', 'location_x', 'location_y'.
+    agg : 'mean' (Rolling Average) or 'median' (Rolling Median).
+    window_value : the window size. When ``time_based`` it is a duration in
+        seconds; otherwise it is a count of consecutive samples.
+    time_based : if True the window is a real-time span (e.g. '30s') evaluated
+        against each tag's Timestamp, so the degree of smoothing is independent
+        of the (irregular, well-under-1 Hz) reporting rate — 30 s of data is
+        averaged regardless of how many fixes landed in that interval. If False
+        the window is a fixed number of consecutive fixes, so its wall-clock
+        span drifts with the reporting rate (the historical behaviour).
+
+    In both modes the window is **centred**, so each output sample uses roughly
+    equal amounts of past and future data and smoothing adds no temporal lag.
+    Writes 'smoothed_x'/'smoothed_y' back into ``data`` and returns it.
+    """
+    def _agg(roller):
+        return roller.mean() if agg == 'mean' else roller.median()
+
+    if time_based:
+        # Time-based rolling needs a monotonic DatetimeIndex, so sort each tag
+        # by Timestamp, roll, then scatter the result back to the original rows.
+        win = f"{int(window_value)}s"
+        data['smoothed_x'] = np.nan
+        data['smoothed_y'] = np.nan
+        for _, g in data.groupby('shortid'):
+            g_sorted = g.sort_values('Timestamp')
+            idx = pd.DatetimeIndex(g_sorted['Timestamp'])
+            for src, dst in (('location_x', 'smoothed_x'), ('location_y', 'smoothed_y')):
+                s = pd.Series(g_sorted[src].to_numpy(), index=idx)
+                rolled = _agg(s.rolling(win, center=True, min_periods=1))
+                data.loc[g_sorted.index, dst] = rolled.to_numpy()
+    else:
+        window_size = max(3, int(window_value))  # sample-count floor of 3
+        for src, dst in (('location_x', 'smoothed_x'), ('location_y', 'smoothed_y')):
+            data[dst] = data.groupby('shortid')[src].transform(
+                lambda x: _agg(x.rolling(window=window_size, center=True, min_periods=1)))
+    return data
 
 
 class PreviewIndexBuilder(QThread):
@@ -202,9 +341,13 @@ class ExportConflictDialog(QDialog):
     """Dialog shown when export would overwrite existing files.
     Shows categorized lists of conflicting and new files."""
 
-    SKIP = 0
-    OVERWRITE = 1
-    NEW_FOLDER = 2
+    # Non-zero so none of these collide with QDialog.Rejected (0), which is
+    # what the Cancel button and the window close (X) return via reject(). If
+    # SKIP were 0 a cancel would be indistinguishable from "skip existing" and
+    # the export would proceed anyway instead of halting.
+    SKIP = 1
+    OVERWRITE = 2
+    NEW_FOLDER = 3
 
     def __init__(self, conflicting_files, new_files, parent=None):
         """
@@ -331,6 +474,71 @@ class ExportConflictDialog(QDialog):
 
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+
+
+class PlotLayersDialog(QDialog):
+    """Choose which spatial context layers exported plots/animation include.
+
+    Shown on export when plots or an animation are requested and at least one
+    layer (background image / XML zones / anchors) is available. Each toggle is
+    independent — unchecking all draws tag positions only. Options with no data
+    are disabled. OK applies the choice; Cancel aborts the export.
+    """
+
+    def __init__(self, has_background, has_zones, has_anchors, defaults=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Plot & Animation Layers")
+        self.setModal(True)
+        defaults = defaults or DEFAULT_PLOT_LAYERS
+
+        layout = QVBoxLayout()
+        info = QLabel(
+            "Choose the spatial context to draw under the tag trajectories in "
+            "exported plots and animations. Unavailable layers are greyed out; "
+            "with none checked, only the tag positions are drawn.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        def _make(text, available, default, tip):
+            cb = QCheckBox(text)
+            cb.setEnabled(available)
+            cb.setChecked(bool(default) and available)
+            if not available:
+                cb.setToolTip("Not available for this dataset")
+            else:
+                cb.setToolTip(tip)
+            layout.addWidget(cb)
+            return cb
+
+        self.chk_background = _make(
+            "Background image", has_background, defaults.get('background', True),
+            "Draw the loaded floorplan / site-map image beneath the tracks.")
+        self.chk_zones = _make(
+            "Zones (from XML)", has_zones, defaults.get('zones', True),
+            "Draw the surveyed zone polygons parsed from the site XML.")
+        self.chk_anchors = _make(
+            "Anchor positions", has_anchors, defaults.get('anchors', True),
+            "Draw the UWB anchor/antenna positions as triangles.")
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setToolTip("Use these layers for this export")
+        ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(ok_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Cancel the export")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def get_layers(self):
+        return {
+            'background': self.chk_background.isChecked(),
+            'zones': self.chk_zones.isChecked(),
+            'anchors': self.chk_anchors.isChecked(),
+        }
 
 
 class IdentityAssignmentDialog(QDialog):
@@ -475,10 +683,14 @@ class PlotSaverWorker(QThread):
     finished = pyqtSignal(bool, str)
     
     def __init__(self, db_path, table_name, selected_tags, downsample, smoothing_method,
+                 # `downsample` is vestigial (the downsampling feature was removed);
+                 # kept only to preserve this positional signature.
                  plot_types=None, skip_existing=False, rolling_window=10, timezone='US/Mountain',
                  tag_identities=None, use_identities=False, background_image=None,
                  bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False,
-                 output_dir=None, plots_dir=None):
+                 output_dir=None, plots_dir=None, rolling_window_units='Seconds',
+                 plot_layers=None, xml_zones=None, anchor_positions=None,
+                 xml_map_image=None, xml_map_extent=None):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -495,6 +707,7 @@ class PlotSaverWorker(QThread):
         self.output_dir = output_dir
         self.plots_dir = plots_dir  # Subfolder for plot output (PNGs/SVGs)
         self.rolling_window = rolling_window
+        self.rolling_window_units = rolling_window_units
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
         self.use_identities = use_identities
@@ -502,6 +715,24 @@ class PlotSaverWorker(QThread):
         self.bg_width_meters = bg_width_meters
         self.bg_height_meters = bg_height_meters
         self.save_svg = save_svg
+        # Spatial context layer choice + sources for the trajectory plots.
+        self.plot_layers = plot_layers if plot_layers is not None else dict(DEFAULT_PLOT_LAYERS)
+        self.xml_zones = xml_zones or []
+        self.anchor_positions = anchor_positions or []
+        self.xml_map_image = xml_map_image
+        self.xml_map_extent = xml_map_extent
+
+    def _bg_source(self):
+        """(image, extent) for the background layer, or (None, None).
+
+        Prefers the user-loaded floorplan PNG, then falls back to the
+        XML-embedded site map so the map still shows when no PNG was loaded.
+        """
+        if self.background_image is not None and self.bg_width_meters is not None:
+            return self.background_image, [0, self.bg_width_meters, 0, self.bg_height_meters]
+        if self.xml_map_image is not None and self.xml_map_extent is not None:
+            return self.xml_map_image, list(self.xml_map_extent)
+        return None, None
 
     def save_figure(self, fig, output_path):
         """Save figure as PNG, and optionally also as SVG"""
@@ -523,6 +754,8 @@ class PlotSaverWorker(QThread):
                 data['Timestamp'] = pd.to_datetime(data['Timestamp'], format='mixed')
                 
                 self.progress.emit(f"Loaded {len(data)} records from CSV")
+                coord = 'smoothed' if 'smoothed_x' in data.columns else 'raw (unsmoothed)'
+                self.progress.emit(f"Plots will use {coord} coordinates")
             else:
                 # Fallback: Load from database (old behavior)
                 self.progress.emit("Loading data from database...")
@@ -563,12 +796,7 @@ class PlotSaverWorker(QThread):
                 if self.smoothing_method != "None":
                     self.progress.emit("Applying smoothing to full resolution data...")
                     data = self.apply_smoothing(data, self.smoothing_method)
-                
-                # Downsample AFTER smoothing (if requested)
-                if self.downsample:
-                    self.progress.emit("Downsampling to 1Hz...")
-                    data = self.apply_downsampling(data)
-            
+
             # Get output directory
             if self.output_dir:
                 output_dir = self.output_dir
@@ -659,14 +887,7 @@ class PlotSaverWorker(QThread):
             
         except Exception as e:
             self.finished.emit(False, f"Error generating plots: {str(e)}")
-    
-    def apply_downsampling(self, data):
-        """Downsample data to 1Hz"""
-        data = data.copy()
-        data['time_sec'] = (data['Timestamp'].astype(np.int64) // 1_000_000_000).astype(int)
-        data = data.groupby(['shortid', 'time_sec']).first().reset_index()
-        return data
-    
+
     def apply_smoothing(self, data, method):
         """Apply smoothing to trajectory data"""
         def apply_savgol_filter(group):
@@ -681,19 +902,12 @@ class PlotSaverWorker(QThread):
         if method == "Savitzky-Golay":
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol_filter)
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol_filter)
-        elif method == "Rolling Average":
-            # Use rolling window from worker parameter
-            window_size = max(3, self.rolling_window)  # Minimum window of 3
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-        elif method == "Rolling Median":
-            window_size = max(3, self.rolling_window)
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+        elif method in ("Rolling Average", "Rolling Median"):
+            # Same interpretation as the interactive path: window is seconds
+            # (time-based, centred) or a sample count, per the units setting.
+            agg = 'mean' if method == "Rolling Average" else 'median'
+            time_based = self.rolling_window_units == "Seconds"
+            rolling_smooth_xy(data, agg, self.rolling_window, time_based)
         elif method == "Forward-Backward EWMA":
             # No minimum floor here — a span of 1-2 is legitimate for EWMA
             span = max(1, self.rolling_window)
@@ -720,24 +934,26 @@ class PlotSaverWorker(QThread):
         x_min, x_max = data[x_col].min(), data[x_col].max()
         y_min, y_max = data[y_col].min(), data[y_col].max()
         
-        # If background image exists, adjust limits to include it (using meters)
-        if self.background_image is not None and self.bg_width_meters is not None:
-            x_min = min(x_min, 0)
-            x_max = max(x_max, self.bg_width_meters)
-            y_min = min(y_min, 0)
-            y_max = max(y_max, self.bg_height_meters)
-        
+        # Background is the loaded PNG, else the XML-embedded site map. If it
+        # will be drawn, expand the shared axis limits to include its extent.
+        day_bg_image, day_bg_extent = self._bg_source()
+        if self.plot_layers.get('background') and day_bg_extent is not None:
+            x_min = min(x_min, day_bg_extent[0])
+            x_max = max(x_max, day_bg_extent[1])
+            y_min = min(y_min, day_bg_extent[2])
+            y_max = max(y_max, day_bg_extent[3])
+
         # Add padding
         x_range = x_max - x_min
         y_range = y_max - y_min
         x_pad = x_range * 0.05 if x_range > 0 else 1
         y_pad = y_range * 0.05 if y_range > 0 else 1
-        
+
         x_min -= x_pad
         x_max += x_pad
         y_min -= y_pad
         y_max += y_pad
-        
+
         unique_dates = sorted(data['Date'].unique())
         unique_tags = sorted(data['shortid'].unique())
         
@@ -771,13 +987,19 @@ class PlotSaverWorker(QThread):
                 day_data = tag_data[tag_data['Date'] == date]
                 
                 ax = fig.add_subplot(1, num_days, day_idx + 1)
-                
+
+                # Spatial context (background/zones/anchors) per the export choice
+                draw_context_layers(
+                    ax, self.plot_layers,
+                    bg_image=day_bg_image, bg_extent=day_bg_extent,
+                    zones_xml=self.xml_zones, anchors=self.anchor_positions)
+
                 if not day_data.empty:
-                    ax.plot(day_data[x_col], day_data[y_col], 
+                    ax.plot(day_data[x_col], day_data[y_col],
                            linewidth=1.5, alpha=0.8, color='blue')
-                    ax.scatter(day_data[x_col].iloc[0], day_data[y_col].iloc[0], 
+                    ax.scatter(day_data[x_col].iloc[0], day_data[y_col].iloc[0],
                               c='black', s=50, marker='o', zorder=5)
-                    ax.scatter(day_data[x_col].iloc[-1], day_data[y_col].iloc[-1], 
+                    ax.scatter(day_data[x_col].iloc[-1], day_data[y_col].iloc[-1],
                               c='black', s=50, marker='s', zorder=5)
                 
                 # Apply global axis limits
@@ -815,27 +1037,15 @@ class PlotSaverWorker(QThread):
         
         fig = Figure(figsize=(10, 8))
         ax = fig.add_subplot(111)
-        
-        # Display background image if available (with 0,0 at lower-left corner)
-        if self.background_image is not None:
-            if self.bg_width_meters is not None and self.bg_height_meters is not None:
-                # Use scaled dimensions in meters
-                ax.imshow(self.background_image, 
-                         extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
-                         origin='upper',
-                         aspect='auto',
-                         alpha=0.6,
-                         zorder=0)
-            else:
-                # Fallback to pixel dimensions
-                img_height, img_width = self.background_image.shape[:2]
-                ax.imshow(self.background_image, 
-                         extent=[0, img_width, 0, img_height],
-                         origin='upper',
-                         aspect='auto',
-                         alpha=0.6,
-                         zorder=0)
-        
+
+        # Spatial context (background/zones/anchors) per the export choice.
+        # Background is the loaded PNG, else the XML-embedded site map.
+        bg_image, bg_extent = self._bg_source()
+        draw_context_layers(
+            ax, self.plot_layers,
+            bg_image=bg_image, bg_extent=bg_extent,
+            zones_xml=self.xml_zones, anchors=self.anchor_positions)
+
         x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
         y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
         
@@ -1480,6 +1690,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_map_image = None   # site map decoded from the XML
         self.xml_map_extent = None  # (x0, x1, y0, y1) in metres
 
+        # Spatial context layers drawn on exported plots/animation. Chosen per
+        # export via PlotLayersDialog, persisted in the config, and applied to
+        # every spatial output (trajectory plots, animation, occupancy,
+        # last-known). Independent of the Preview Options 'Show ...' toggles,
+        # which only affect the live preview.
+        self.plot_layers = dict(DEFAULT_PLOT_LAYERS)
+
         # Preview state. The timeline spans the whole recording but memory
         # holds at most MAX_CACHED_CHUNKS slices — see the streaming chunk
         # engine below.
@@ -1522,7 +1739,17 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         # Also update legacy status label for compatibility
         self.lbl_status.setText(message)
-    
+
+    def copy_session_logs(self):
+        """Copy the full session log to the clipboard."""
+        text = self.txt_messages.toPlainText()
+        QApplication.clipboard().setText(text)
+        if text.strip():
+            lines = text.count("\n") + 1
+            self.log_message(f"Copied session logs to clipboard ({lines} lines)")
+        else:
+            self.log_message("Session logs are empty — nothing to copy")
+
     def save_message_log(self, output_dir):
         """Save the message log to a text file"""
         try:
@@ -1550,9 +1777,12 @@ class UWBQuickVisualizationWindow(QWidget):
             }
             
             # General info
+            summary_data['Parameter'].append('FNT Version')
+            summary_data['Value'].append(get_fnt_version())
+
             summary_data['Parameter'].append('Run Date')
             summary_data['Value'].append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            
+
             summary_data['Parameter'].append('Database')
             summary_data['Value'].append(os.path.basename(self.db_path))
             
@@ -1567,32 +1797,37 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('Selected Tags')
             summary_data['Value'].append(', '.join([str(t) for t in selected_tags]))
             
-            # Filtering settings
-            summary_data['Parameter'].append('Velocity Filter Enabled')
+            # Thresholding settings (pre-smoothing outlier rejection)
+            summary_data['Parameter'].append('Velocity Threshold Enabled')
             summary_data['Value'].append('Yes' if self.chk_velocity_filter.isChecked() else 'No')
-            
+
             if self.chk_velocity_filter.isChecked():
                 summary_data['Parameter'].append('Velocity Threshold (m/s)')
                 summary_data['Value'].append(self.spin_velocity_threshold.value())
-            
-            summary_data['Parameter'].append('Jump Filter Enabled')
+
+            summary_data['Parameter'].append('Jump Threshold Enabled')
             summary_data['Value'].append('Yes' if self.chk_jump_filter.isChecked() else 'No')
-            
+
             if self.chk_jump_filter.isChecked():
                 summary_data['Parameter'].append('Jump Threshold (m)')
                 summary_data['Value'].append(self.spin_jump_threshold.value())
-            
+
             summary_data['Parameter'].append('Time Gap Threshold (s)')
             summary_data['Value'].append(self.spin_time_gap.value())
             
             # Smoothing settings
             summary_data['Parameter'].append('Smoothing')
             summary_data['Value'].append(self.combo_smoothing.currentText())
-            
-            # Downsampling
-            summary_data['Parameter'].append('Downsample Hz')
-            summary_data['Value'].append(f"{self.spin_downsample_hz.value()} Hz" if self.chk_export_downsampled_csv.isChecked() else 'N/A')
-            
+
+            smoothing_method = self.get_smoothing_method()
+            if smoothing_method in ("Rolling Average", "Rolling Median"):
+                unit = "s" if self.combo_window_units.currentText() == "Seconds" else "samples"
+                summary_data['Parameter'].append('Smoothing Window')
+                summary_data['Value'].append(f"{self.spin_rolling_window.value()} {unit}")
+            elif smoothing_method == "Forward-Backward EWMA":
+                summary_data['Parameter'].append('EWMA Span (samples)')
+                summary_data['Value'].append(self.spin_rolling_window.value())
+
             # Filtering statistics (if available)
             if hasattr(self, 'filter_stats') and self.filter_stats:
                 summary_data['Parameter'].append('')
@@ -1632,18 +1867,23 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('Smoothed CSV Exported')
             summary_data['Value'].append('Yes' if self.chk_export_smoothed_csv.isChecked() else 'No')
 
-            summary_data['Parameter'].append('Downsampled CSV Exported')
-            if self.chk_export_downsampled_csv.isChecked():
-                summary_data['Value'].append(f'Yes ({self.spin_downsample_hz.value()} Hz)')
-            else:
-                summary_data['Value'].append('No')
-
             summary_data['Parameter'].append('Plots Generated')
             summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
             
             summary_data['Parameter'].append('Animation Generated')
             summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
-            
+
+            if self.chk_save_plots.isChecked():
+                summary_data['Parameter'].append('Plot Downsampling')
+                summary_data['Value'].append(
+                    f'{self.spin_plot_downsample_hz.value()} Hz'
+                    if self.chk_downsample_plots.isChecked() else 'Off (full resolution)')
+            if self.chk_save_animation.isChecked():
+                summary_data['Parameter'].append('Animation Downsampling')
+                summary_data['Value'].append(
+                    f'{self.spin_anim_downsample_hz.value()} Hz'
+                    if self.chk_downsample_animation.isChecked() else 'Off (full resolution)')
+
             summary_data['Parameter'].append('Proximity Detection')
             if self.chk_proximity_detection.isChecked():
                 summary_data['Value'].append(f'Yes (threshold: {self.spin_proximity_threshold.value()} m)')
@@ -1809,6 +2049,41 @@ class UWBQuickVisualizationWindow(QWidget):
         for w in (self.chk_velocity_filter, self.chk_jump_filter):
             w.stateChanged.connect(self.invalidate_preview_cache)
         
+    def _make_downsample_control(self, which):
+        """Build a 'Downsample data for <which> to [N] Hz' sub-row.
+
+        Returns (row_widget, checkbox, spinbox). Used to give Save Plots and
+        Save Animation each their own independent downsampling control.
+        """
+        row = QWidget()
+        lay = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        chk = QCheckBox(f"Downsample data for {which} to")
+        chk.setChecked(True)  # on by default
+        chk.setToolTip(
+            f"Thin the data used to render {which} to the chosen rate. Does NOT "
+            "affect the exported smoothed CSV (which stays full resolution) or "
+            "proximity detection.\n"
+            "\n"
+            "UWB tags can log several Hz during movement, so 1 Hz typically cuts "
+            f"{which} time several-fold with no visible change in the tracks. A "
+            "temporary working file is written as the render source and deleted "
+            "when the export finishes.")
+        lay.addWidget(chk)
+        spin = QSpinBox()
+        spin.setRange(1, 5)
+        spin.setValue(1)
+        spin.setSuffix(" Hz")
+        spin.setFixedWidth(70)
+        spin.setToolTip(
+            "Target sample rate: keeps the first fix in each 1/Hz-second bin, "
+            "per tag.")
+        lay.addWidget(spin)
+        lay.addStretch()
+        row.setLayout(lay)
+        chk.toggled.connect(spin.setEnabled)  # spinbox active only when ticked
+        return row, chk, spin
+
     def create_settings_panel(self):
         """Create the settings panel as a single scrollable column"""
         panel = QWidget()
@@ -1885,16 +2160,28 @@ class UWBQuickVisualizationWindow(QWidget):
         self.tag_group.setLayout(self.tag_layout)
         layout.addWidget(self.tag_group)
 
-        # Smoothing & Filtering Options
-        options_group = QGroupBox("Smoothing & Filtering Options")
-        options_layout = QVBoxLayout()
+        # Preview Options group now sits directly under Tag Selection (above the
+        # export controls). It is a checkable "Enable Preview and Playback"
+        # group, off by default, and also hosts the background/anchor toggles.
+        layout.addWidget(self._build_preview_options_group())
+
+        # Export Options. The velocity/jump thresholds and the smoothing
+        # method/window controls lead this group; the CSV / plot / animation
+        # options follow below. (These threshold/smoothing controls formerly
+        # lived in their own "Smoothing & Filtering Options" group.)
+        export_group = QGroupBox("Export Options")
+        export_layout = QVBoxLayout()
 
         velocity_filter_layout = QHBoxLayout()
-        self.chk_velocity_filter = QCheckBox("Velocity filter (remove >")
+        self.chk_velocity_filter = QCheckBox("Velocity threshold (remove >")
         self.chk_velocity_filter.setChecked(True)
         self.chk_velocity_filter.setToolTip(
-            "Discard points where computed velocity exceeds the threshold. "
-            "Catches teleportation artifacts from multipath/reflection errors."
+            "Discard fixes whose computed velocity exceeds the threshold. "
+            "Catches teleportation artifacts from multipath/reflection errors.\n"
+            "\n"
+            "Applied BEFORE smoothing, on the raw fixes — velocity is measured "
+            "between consecutive unsmoothed positions, and offending fixes are "
+            "removed before the smoothing pass runs."
         )
         velocity_filter_layout.addWidget(self.chk_velocity_filter)
         self.spin_velocity_threshold = QDoubleSpinBox()
@@ -1909,14 +2196,18 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         velocity_filter_layout.addWidget(self.spin_velocity_threshold)
         velocity_filter_layout.addStretch()
-        options_layout.addLayout(velocity_filter_layout)
+        export_layout.addLayout(velocity_filter_layout)
 
         jump_filter_layout = QHBoxLayout()
-        self.chk_jump_filter = QCheckBox("Jump filter (remove >")
+        self.chk_jump_filter = QCheckBox("Jump threshold (remove >")
         self.chk_jump_filter.setChecked(True)
         self.chk_jump_filter.setToolTip(
-            "Discard points where the spatial jump between consecutive samples "
-            "exceeds the threshold. Catches single-sample position glitches."
+            "Discard fixes where the spatial jump between consecutive samples "
+            "exceeds the threshold. Catches single-sample position glitches.\n"
+            "\n"
+            "Applied BEFORE smoothing, on the raw fixes — the jump distance is "
+            "measured between consecutive unsmoothed positions, and offending "
+            "fixes are removed before the smoothing pass runs."
         )
         jump_filter_layout.addWidget(self.chk_jump_filter)
         self.spin_jump_threshold = QDoubleSpinBox()
@@ -1931,7 +2222,7 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         jump_filter_layout.addWidget(self.spin_jump_threshold)
         jump_filter_layout.addStretch()
-        options_layout.addLayout(jump_filter_layout)
+        export_layout.addLayout(jump_filter_layout)
 
         time_gap_layout = QHBoxLayout()
         time_gap_layout.addWidget(QLabel("Time gap grouping:"))
@@ -1941,12 +2232,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_time_gap.setSuffix(" sec")
         self.spin_time_gap.setToolTip(
             "Splits data into segments when gaps exceed this duration. "
-            "Prevents velocity/jump filters from comparing points across "
+            "Prevents the velocity/jump thresholds from comparing points across "
             "battery restarts or signal dropouts."
         )
         time_gap_layout.addWidget(self.spin_time_gap)
         time_gap_layout.addStretch()
-        options_layout.addLayout(time_gap_layout)
+        export_layout.addLayout(time_gap_layout)
 
         smoothing_label_layout = QHBoxLayout()
         smoothing_label_layout.addWidget(QLabel("Smoothing method:"))
@@ -1985,83 +2276,68 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_smoothing.setCurrentIndex(1)
         self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
         smoothing_label_layout.addWidget(self.combo_smoothing)
-        options_layout.addLayout(smoothing_label_layout)
+        export_layout.addLayout(smoothing_label_layout)
 
         self.rolling_window_layout = QHBoxLayout()
-        self.lbl_rolling_window = QLabel("Window (seconds):")
+        self.lbl_rolling_window = QLabel("Smoothing Window:")
         self.rolling_window_layout.addWidget(self.lbl_rolling_window)
         self.spin_rolling_window = QSpinBox()
-        self.spin_rolling_window.setRange(1, 60)
+        # Range covers both interpretations: up to 600 s (10 min) of time-based
+        # window, or up to 600 samples.
+        self.spin_rolling_window.setRange(1, 600)
         self.spin_rolling_window.setValue(30)
         self.spin_rolling_window.setEnabled(False)
         self.spin_rolling_window.setToolTip(
-            "Meaning depends on the selected smoothing method:\n"
-            "• Rolling Average / Rolling Median: window length in samples.\n"
-            "• Forward-Backward EWMA: the span, which sets the decay rate "
-            "(alpha = 2 / (span + 1)). To match a Wiser hardware filter "
-            "value F, use span = 2F - 1.\n"
+            "Size of the smoothing window. How it is read depends on the units "
+            "selector to the right and on the smoothing method:\n"
             "\n"
-            "Larger values produce smoother trajectories but lose fine detail."
+            "• Rolling Average / Rolling Median, units = Seconds: a real-time "
+            "window (e.g. 30 = a 30-second window centred on each fix). The "
+            "amount of smoothing is independent of the reporting rate.\n"
+            "• Rolling Average / Rolling Median, units = Samples: a fixed count "
+            "of consecutive fixes (e.g. 30 = 30 fixes). Its wall-clock span "
+            "varies with the reporting rate.\n"
+            "• Forward-Backward EWMA: the span (always in samples), which sets "
+            "the decay rate (alpha = 2 / (span + 1)). To match a Wiser hardware "
+            "filter value F, use span = 2F - 1.\n"
+            "\n"
+            "Larger values produce smoother trajectories but lose fine detail. "
+            "The window is centred in every mode, so smoothing adds no lag."
         )
         self.rolling_window_layout.addWidget(self.spin_rolling_window)
-        options_layout.addLayout(self.rolling_window_layout)
-        self.spin_rolling_window.hide()
-        self.lbl_rolling_window.hide()
 
-        bg_buttons_layout = QHBoxLayout()
-        self.btn_load_background = QPushButton("Load Background")
-        self.btn_load_background.clicked.connect(self.select_background_image)
-        self.btn_load_background.setEnabled(False)
-        self.btn_load_background.setToolTip(
-            "Load a floorplan or arena image to overlay under trajectory plots. "
-            "Requires an XML config in the database folder for spatial scaling."
+        # Units selector: does the number above mean seconds or samples? Only
+        # meaningful for the rolling methods (EWMA/Savitzky-Golay ignore it), so
+        # on_smoothing_changed shows/hides it with the method.
+        self.combo_window_units = QComboBox()
+        self.combo_window_units.addItems(["Seconds", "Samples"])
+        self.combo_window_units.setCurrentText("Seconds")
+        self.combo_window_units.setToolTip(
+            "How to interpret the Smoothing Window value (Rolling Average / "
+            "Rolling Median only):\n"
+            "\n"
+            "• Seconds (default): a real-time window evaluated on each tag's "
+            "timestamps. A value of 30 averages all fixes within a 30-second "
+            "window centred on each point, so the smoothing is the same amount "
+            "of real time everywhere regardless of how many fixes were "
+            "recorded. Robust to the tags' irregular, sub-1 Hz reporting.\n"
+            "• Samples: the window is a fixed number of consecutive fixes. A "
+            "value of 30 averages 30 fixes; the real-time span it covers grows "
+            "and shrinks with the reporting rate, so identical settings smooth "
+            "different amounts of time on sparsely- vs densely-sampled tags."
         )
-        self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
-        bg_buttons_layout.addWidget(self.btn_load_background)
-        self.btn_remove_background = QPushButton("Remove Background")
-        self.btn_remove_background.clicked.connect(self.remove_background)
-        self.btn_remove_background.setEnabled(False)
-        self.btn_remove_background.setToolTip("Clear the loaded background image from all visualizations")
-        self.btn_remove_background.setStyleSheet("padding: 8px; font-size: 11px;")
-        bg_buttons_layout.addWidget(self.btn_remove_background)
-        options_layout.addLayout(bg_buttons_layout)
+        self.combo_window_units.currentTextChanged.connect(self.invalidate_preview_cache)
+        self.rolling_window_layout.addWidget(self.combo_window_units)
+        self.rolling_window_layout.addStretch()
+        export_layout.addLayout(self.rolling_window_layout)
+        # Sync the window control's visibility to the default method now.
+        # setCurrentIndex(1) above ran before the signal was connected, so
+        # on_smoothing_changed never fired — without this call the Smoothing
+        # Window stays hidden on first load even though Rolling Average (the
+        # default) uses it, only appearing once the user toggles the method.
+        self.on_smoothing_changed(self.combo_smoothing.currentText())
 
-        self.lbl_background_status = QLabel("No background image loaded")
-        self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
-        self.lbl_background_status.setWordWrap(True)
-        options_layout.addWidget(self.lbl_background_status)
-
-        self.chk_show_background = QCheckBox("Show background image")
-        self.chk_show_background.setChecked(True)
-        self.chk_show_background.setToolTip(
-            "Toggle the loaded floorplan/background image on the 2D preview and "
-            "in saved plots, without unloading it. The tracking data, zones and "
-            "anchors stay put.")
-        self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
-        options_layout.addWidget(self.chk_show_background)
-
-        self.chk_show_anchors = QCheckBox("Show anchor positions")
-        self.chk_show_anchors.setChecked(True)
-        self.chk_show_anchors.setEnabled(False)
-        self.chk_show_anchors.stateChanged.connect(self.on_show_background_toggled)
-        self.chk_show_anchors.setToolTip(
-            "Draw UWB anchor/antenna positions as triangles on trajectory plots. "
-            "Anchor locations are parsed from the XML config file."
-        )
-        options_layout.addWidget(self.chk_show_anchors)
-
-        options_group.setLayout(options_layout)
-        layout.addWidget(options_group)
-
-        # Preview Options — controls for the live display on the right. Built
-        # here so the whole left column stays a single scrollable settings
-        # stack; the right pane holds only the map and transport.
-        layout.addWidget(self._build_preview_options_group())
-
-        # Export Options
-        export_group = QGroupBox("Export Options")
-        export_layout = QVBoxLayout()
-
+        # ---- CSV / plot / animation export options (continue the same group) --
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
         self.chk_export_raw_csv.setChecked(True)
         self.chk_export_raw_csv.setToolTip(
@@ -2074,36 +2350,30 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_export_smoothed_csv.setToolTip(
             "Export filtered and smoothed data at full temporal resolution. "
-            "Coordinates are in meters, timestamps in your selected timezone."
+            "Coordinates are in meters, timestamps in your selected timezone.\n"
+            "\n"
+            "This is also the data source for plots and animations: when it is "
+            "on, they use the smoothed track; when it is off, they fall back to "
+            "the unsmoothed (filtered) positions. To downsample, do it in your "
+            "own downstream analysis of this CSV."
         )
         export_layout.addWidget(self.chk_export_smoothed_csv)
-
-        downsample_row = QWidget()
-        downsample_layout = QHBoxLayout()
-        downsample_layout.setContentsMargins(0, 0, 0, 0)
-        self.chk_export_downsampled_csv = QCheckBox("Export Smoothed Downsampled CSV")
-        self.chk_export_downsampled_csv.setChecked(True)
-        self.chk_export_downsampled_csv.setToolTip(
-            "Export filtered + smoothed data downsampled to a fixed rate. "
-            "Smaller file size; used as input for plots and animations."
-        )
-        downsample_layout.addWidget(self.chk_export_downsampled_csv)
-        self.spin_downsample_hz = QSpinBox()
-        self.spin_downsample_hz.setRange(1, 5)
-        self.spin_downsample_hz.setValue(1)
-        self.spin_downsample_hz.setSuffix(" Hz")
-        self.spin_downsample_hz.setToolTip("Target sample rate (samples per second) for the downsampled CSV")
-        self.spin_downsample_hz.setFixedWidth(70)
-        downsample_layout.addWidget(self.spin_downsample_hz)
-        downsample_layout.addStretch()
-        downsample_row.setLayout(downsample_layout)
-        export_layout.addWidget(downsample_row)
 
         self.chk_proximity_detection = QCheckBox("Detect Proximity Bouts")
         self.chk_proximity_detection.setChecked(True)
         self.chk_proximity_detection.setToolTip(
             "Detect when pairs of tags are within the proximity threshold. "
-            "Outputs two CSVs: per-sample proximity events and aggregated bouts."
+            "Outputs one CSV of aggregated proximity bouts: for each pair, the "
+            "contiguous periods spent within the threshold, with start/stop, "
+            "duration, mean distance and observation count.\n"
+            "\n"
+            "Computed from the filtered + smoothed data at full temporal "
+            "resolution — NOT the downsampled export — so no fixes are dropped "
+            "before pairwise distances are measured.\n"
+            "\n"
+            "Bouts are threshold-specific: to analyze a different distance, "
+            "re-run with a new threshold. The raw per-timestamp pairwise "
+            "distances are not exported."
         )
         self.chk_proximity_detection.stateChanged.connect(self.on_proximity_detection_toggled)
         export_layout.addWidget(self.chk_proximity_detection)
@@ -2130,10 +2400,11 @@ class UWBQuickVisualizationWindow(QWidget):
         export_layout.addWidget(self.proximity_threshold_widget)
 
         self.chk_save_plots = QCheckBox("Save Plots")
-        self.chk_save_plots.setChecked(True)
+        self.chk_save_plots.setChecked(False)  # off by default; opt in per run
         self.chk_save_plots.stateChanged.connect(self.on_save_plots_toggled)
         self.chk_save_plots.setToolTip(
             "Generate and save visualization plots to the plots/ subfolder. "
+            "Built from the filtered + smoothed data. "
             "PNG is always produced; SVG is optional below."
         )
         export_layout.addWidget(self.chk_save_plots)
@@ -2141,6 +2412,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.plot_types_widget = QWidget()
         plot_types_layout = QVBoxLayout()
         plot_types_layout.setContentsMargins(30, 0, 0, 0)
+        # Per-plots downsampling of the render source (a sub-option of Save Plots).
+        plot_ds_row, self.chk_downsample_plots, self.spin_plot_downsample_hz = \
+            self._make_downsample_control("plots")
+        plot_types_layout.addWidget(plot_ds_row)
         self.plot_type_checkboxes = {}
         plot_types = [
             ("daily_paths", "Daily Paths per Tag",
@@ -2171,7 +2446,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self.plot_type_checkboxes[key] = cb
             plot_types_layout.addWidget(cb)
         self.plot_types_widget.setLayout(plot_types_layout)
-        self.plot_types_widget.setVisible(True)
+        self.plot_types_widget.setVisible(False)  # hidden until Save Plots is on
         export_layout.addWidget(self.plot_types_widget)
 
         self.svg_option_widget = QWidget()
@@ -2186,14 +2461,15 @@ class UWBQuickVisualizationWindow(QWidget):
         svg_option_layout.addWidget(self.chk_save_svg)
         svg_option_layout.addStretch()
         self.svg_option_widget.setLayout(svg_option_layout)
-        self.svg_option_widget.setVisible(True)
+        self.svg_option_widget.setVisible(False)  # hidden until Save Plots is on
         export_layout.addWidget(self.svg_option_widget)
 
         self.chk_save_animation = QCheckBox("Save Animation")
         self.chk_save_animation.setChecked(False)
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
         self.chk_save_animation.setToolTip(
-            "Render an MP4 video of tag trajectories over time. "
+            "Render an MP4 video of tag trajectories over time, from the "
+            "filtered + smoothed data. "
             "Can take a long time for multi-day recordings at high quality."
         )
         export_layout.addWidget(self.chk_save_animation)
@@ -2201,6 +2477,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.animation_options_widget = QWidget()
         animation_options_layout = QVBoxLayout()
         animation_options_layout.setContentsMargins(30, 0, 0, 0)
+
+        # Per-animation downsampling of the render source (a sub-option of
+        # Save Animation), independent of the plots downsampling.
+        anim_ds_row, self.chk_downsample_animation, self.spin_anim_downsample_hz = \
+            self._make_downsample_control("animation")
+        animation_options_layout.addWidget(anim_ds_row)
 
         trail_layout = QHBoxLayout()
         trail_layout.addWidget(QLabel("Trail length (seconds):"))
@@ -2301,7 +2583,7 @@ class UWBQuickVisualizationWindow(QWidget):
         animation_options_layout.addWidget(self.daily_animation_days_widget)
 
         self.animation_options_widget.setLayout(animation_options_layout)
-        self.animation_options_widget.setVisible(True)
+        self.animation_options_widget.setVisible(False)  # hidden until Save Animation is on
         export_layout.addWidget(self.animation_options_widget)
 
         export_group.setLayout(export_layout)
@@ -2353,8 +2635,8 @@ class UWBQuickVisualizationWindow(QWidget):
         export_buttons_layout.addWidget(self.btn_stop_export)
         layout.addLayout(export_buttons_layout)
 
-        # Messages window
-        messages_label = QLabel("Messages:")
+        # Session Logs window
+        messages_label = QLabel("Session Logs:")
         messages_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
         layout.addWidget(messages_label)
 
@@ -2372,6 +2654,12 @@ class UWBQuickVisualizationWindow(QWidget):
             }
         """)
         layout.addWidget(self.txt_messages)
+
+        self.btn_copy_logs = QPushButton("Copy Session Logs to Clipboard")
+        self.btn_copy_logs.setToolTip("Copy the full session log above to the clipboard for pasting into a bug report or notes")
+        self.btn_copy_logs.setStyleSheet("padding: 6px; font-size: 10px;")
+        self.btn_copy_logs.clicked.connect(self.copy_session_logs)
+        layout.addWidget(self.btn_copy_logs)
 
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
@@ -2471,8 +2759,14 @@ class UWBQuickVisualizationWindow(QWidget):
 
         The controls formerly crowded under the map now live here so the right
         pane can be just the map plus its transport bar.
+
+        The group is checkable ("Enable Preview and Playback") and off by
+        default: loading a database no longer starts streaming until the user
+        opts in. Qt disables every child of an unchecked checkable group, so the
+        preview controls (and the background/anchor toggles hosted here) stay
+        greyed out until the preview is enabled.
         """
-        group = QGroupBox("Preview Options")
+        group = QGroupBox("Enable Preview and Playback")
         v = QVBoxLayout()
 
         # View selector + camera shortcuts
@@ -2559,6 +2853,52 @@ class UWBQuickVisualizationWindow(QWidget):
         btn_auto_reg.clicked.connect(self.auto_register_arena)
         offset_row.addWidget(btn_auto_reg)
         v.addLayout(offset_row)
+
+        # Background image + anchor display (relocated here from the old
+        # Smoothing & Filtering group; these are display concerns for the
+        # preview and saved plots).
+        bg_buttons_layout = QHBoxLayout()
+        self.btn_load_background = QPushButton("Load Background")
+        self.btn_load_background.clicked.connect(self.select_background_image)
+        self.btn_load_background.setEnabled(False)
+        self.btn_load_background.setToolTip(
+            "Load a floorplan or arena image to overlay under trajectory plots. "
+            "Requires an XML config in the database folder for spatial scaling."
+        )
+        self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        bg_buttons_layout.addWidget(self.btn_load_background)
+        self.btn_remove_background = QPushButton("Remove Background")
+        self.btn_remove_background.clicked.connect(self.remove_background)
+        self.btn_remove_background.setEnabled(False)
+        self.btn_remove_background.setToolTip("Clear the loaded background image from all visualizations")
+        self.btn_remove_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        bg_buttons_layout.addWidget(self.btn_remove_background)
+        v.addLayout(bg_buttons_layout)
+
+        self.lbl_background_status = QLabel("No background image loaded")
+        self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
+        self.lbl_background_status.setWordWrap(True)
+        v.addWidget(self.lbl_background_status)
+
+        self.chk_show_background = QCheckBox("Show background image")
+        self.chk_show_background.setChecked(True)
+        self.chk_show_background.setToolTip(
+            "Toggle the loaded floorplan/background image in the LIVE PREVIEW "
+            "only, without unloading it. Exported plots and animations take "
+            "their layers from the dialog shown when you click Export.")
+        self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_background)
+
+        self.chk_show_anchors = QCheckBox("Show anchor positions")
+        self.chk_show_anchors.setChecked(True)
+        self.chk_show_anchors.setEnabled(False)
+        self.chk_show_anchors.stateChanged.connect(self.on_show_background_toggled)
+        self.chk_show_anchors.setToolTip(
+            "Draw UWB anchor/antenna positions as triangles in the LIVE PREVIEW "
+            "only. Exported plots/animations take their layers from the dialog "
+            "shown when you click Export. Anchors are parsed from the XML config."
+        )
+        v.addWidget(self.chk_show_anchors)
 
         # Display options: raw overlay + trail length
         disp_row = QHBoxLayout()
@@ -2678,7 +3018,24 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_build_index.clicked.connect(self.rebuild_preview_index)
         v.addWidget(self.btn_build_index)
 
-        group.setLayout(v)
+        # Hold every preview control in a single body widget so the group can
+        # collapse to just its title/checkbox when disabled — Qt only greys a
+        # checkable group's children, so we hide the body ourselves.
+        self.preview_options_body = QWidget()
+        self.preview_options_body.setLayout(v)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.preview_options_body)
+        group.setLayout(outer)
+
+        # Off by default: nothing streams until the user opts in. Wire the
+        # toggle signal only after setting the initial state so the slot does
+        # not fire (and touch not-yet-fully-built state) during construction.
+        group.setCheckable(True)
+        group.setChecked(False)
+        self.preview_options_body.setVisible(False)  # collapsed until enabled
+        group.toggled.connect(self.on_preview_enabled_toggled)
+        self.grp_preview = group
         return group
 
     def activate_preview(self):
@@ -2690,7 +3047,13 @@ class UWBQuickVisualizationWindow(QWidget):
         fresh ~GB copy automatically — reads stream from the original database
         (fast enough: ~1.6 s for the first chunk on a 1 GB file), and the user
         can opt into the index via the 'Fast index' button for instant seeks.
+
+        Gated on the "Enable Preview and Playback" toggle: while it is off the
+        preview stays inert no matter what data is loaded or which tags are
+        selected. Enabling the toggle re-enters here via on_preview_enabled_toggled.
         """
+        if not getattr(self, 'grp_preview', None) or not self.grp_preview.isChecked():
+            return
         if not (self.db_path and self.table_name and self.selected_preview_tags()):
             return
         self._preview_active = True
@@ -2702,6 +3065,32 @@ class UWBQuickVisualizationWindow(QWidget):
             self.preview_playhead_ms = self.preview_t0
             self._sync_timeline_to_playhead()
             self._request_chunk(0, make_current=True)
+
+    def on_preview_enabled_toggled(self, enabled):
+        """Enable/disable the live preview when the group checkbox is toggled.
+
+        Checking it brings the preview to life if a database, table and tags are
+        already loaded; otherwise it waits and the normal tag-selection path
+        activates it later. Unchecking it tears the stream down and drops the
+        pane back to its empty placeholder.
+
+        The controls also collapse when disabled so the group folds down to just
+        its title/checkbox instead of showing a greyed-out wall of options.
+        """
+        if hasattr(self, 'preview_options_body'):
+            self.preview_options_body.setVisible(enabled)
+        if enabled:
+            if self.db_path and self.table_name and self.selected_preview_tags():
+                self.activate_preview()
+            else:
+                self.lbl_preview_status.setText("Load a database and select tags to preview")
+        else:
+            self._preview_active = False
+            self.stop_preview_playback()
+            self.preview_canvas_2d.show_placeholder()
+            if self.preview_canvas_3d is not None:
+                self.preview_canvas_3d.clear()
+            self.lbl_preview_status.setText("Preview disabled — tick 'Enable Preview and Playback' to view data")
 
     def _preview_backend(self):
         """The canvas currently on screen."""
@@ -3124,7 +3513,11 @@ class UWBQuickVisualizationWindow(QWidget):
         hz = int(self.combo_preview_hz.currentText().split()[0])
         bin_ns = int(1_000_000_000 / hz)
         df = df.copy()
-        df['tbin'] = df['Timestamp'].astype(np.int64) // bin_ns
+        # as_unit('ns') forces nanoseconds regardless of the datetime resolution
+        # (pandas 3.0 defaults to microseconds); a bare astype(int64) would yield
+        # microseconds here and make every bin 1000x too wide, collapsing the
+        # whole chunk into a single preview frame.
+        df['tbin'] = df['Timestamp'].dt.as_unit('ns').astype('int64') // bin_ns
 
         sx = 'smoothed_x' if 'smoothed_x' in df.columns else 'location_x'
         sy = 'smoothed_y' if 'smoothed_y' in df.columns else 'location_y'
@@ -3371,6 +3764,49 @@ class UWBQuickVisualizationWindow(QWidget):
         self._sync_timeline_to_playhead()
         self._request_chunk(0, make_current=True)
 
+    def _context_bg_source(self):
+        """(image, extent) for the 'background' layer of main-thread figures.
+
+        Prefers a user-loaded floorplan PNG (scaled via the XML) and falls back
+        to the XML-embedded site map. Returns (None, None) if neither exists.
+        """
+        if self.background_image is not None and self.bg_width_meters is not None:
+            return self.background_image, [0, self.bg_width_meters, 0, self.bg_height_meters]
+        if self.xml_map_image is not None and self.xml_map_extent is not None:
+            return self.xml_map_image, list(self.xml_map_extent)
+        return None, None
+
+    def _prompt_plot_layers(self):
+        """Prompt for the spatial context layers; update self.plot_layers.
+
+        Shared by the Export button and the Occupancy / Last-Known buttons so
+        every spatial output asks the same question each time. Returns True to
+        proceed, False if the user cancelled. If no layer is available, sets all
+        layers off and proceeds without a dialog.
+
+        'Background image' is offered when the user has loaded one (via Load
+        Background) or the site XML carries an embedded map (used as a fallback).
+        """
+        has_background = (self.background_image is not None
+                          or self.xml_map_image is not None)
+        has_zones = bool(self.xml_zones) or (
+            self.arena_zones is not None and not self.arena_zones.empty)
+        has_anchors = bool(self.anchor_positions)
+        if not (has_background or has_zones or has_anchors):
+            self.plot_layers = {'background': False, 'zones': False, 'anchors': False}
+            return True
+        dlg = PlotLayersDialog(has_background, has_zones, has_anchors,
+                               defaults=self.plot_layers, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return False
+        self.plot_layers = dlg.get_layers()
+        self.log_message(
+            "Plot/animation layers — "
+            f"background: {'on' if self.plot_layers['background'] else 'off'}, "
+            f"zones: {'on' if self.plot_layers['zones'] else 'off'}, "
+            f"anchors: {'on' if self.plot_layers['anchors'] else 'off'}")
+        return True
+
     # -- quick snapshot plot ---------------------------------------------- #
     def plot_last_known_locations(self):
         """Save a labelled snapshot of each selected tag's most recent fix.
@@ -3386,6 +3822,10 @@ class UWBQuickVisualizationWindow(QWidget):
         tags = self.selected_preview_tags()
         if not tags:
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
+            return
+
+        # Ask which context layers to draw (background/zones/anchors).
+        if not self._prompt_plot_layers():
             return
 
         try:
@@ -3418,72 +3858,65 @@ class UWBQuickVisualizationWindow(QWidget):
             if shortid not in latest or ts > latest[shortid][2]:
                 latest[shortid] = (lx * 0.0254, ly * 0.0254, ts)
 
-        fig = Figure(figsize=(8, 8))
-        ax = fig.add_subplot(111)
-        pal_bg, pal_fg = "#1e1e1e", "#cccccc"
-        fig.patch.set_facecolor(pal_bg)
-        ax.set_facecolor(pal_bg)
-
-        # Arena context: reuse the XML site map/zones if parsed, else a plain
-        # box fitted to the points.
-        xs = [v[0] for v in latest.values()]
-        ys = [v[1] for v in latest.values()]
-        if self.xml_map_image is not None and self.xml_map_extent is not None:
-            ax.imshow(self.xml_map_image, extent=list(self.xml_map_extent),
-                      origin="upper", zorder=0)
-        for z in self.xml_zones:
-            pts = z["points"]
-            if len(pts) < 3:
-                continue
-            is_bounds = z.get("name", "").strip().lower() == "arena"
-            ax.add_patch(MplPolygon(
-                pts, closed=True, facecolor="none" if is_bounds else z.get("color", "#888"),
-                edgecolor=z.get("color", "#888"), alpha=1.0 if is_bounds else 0.22,
-                linewidth=1.8 if is_bounds else 1.0, zorder=1))
-        if self.anchor_positions:
-            ax.scatter([a["x"] for a in self.anchor_positions],
-                       [a["y"] for a in self.anchor_positions],
-                       marker="^", s=40, c="#f2c24f", edgecolors="none", zorder=2)
-
-        cmap = plt.get_cmap('tab20')
-        for i, (shortid, (x, y, ts)) in enumerate(sorted(latest.items())):
-            label = self._tag_display_label(shortid)
-            local = pd.Timestamp(int(ts), unit='ms', tz='UTC').tz_convert(tz)
-            ax.scatter([x], [y], s=140, color=cmap(i % 20),
-                       edgecolors="white", linewidths=1.0, zorder=5)
-            ax.annotate(f"{label}\n{local:%m-%d %H:%M}", (x, y),
-                        textcoords="offset points", xytext=(8, 6),
-                        color=pal_fg, fontsize=8, zorder=6)
-
-        ax.set_aspect("equal")
-        ax.set_xlabel("X (m)", color=pal_fg)
-        ax.set_ylabel("Y (m)", color=pal_fg)
-        ax.tick_params(colors=pal_fg)
-        for sp in ax.spines.values():
-            sp.set_color("#555555")
-        ax.set_title(f"Last known locations · {len(latest)} tags", color=pal_fg)
-        fig.tight_layout()
-
-        # Save into the analysis folder, matching the export naming.
-        db_dir = os.path.dirname(self.db_path)
-        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-        out_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
-        os.makedirs(out_dir, exist_ok=True)
-        png = os.path.join(out_dir, f"{db_name}_LastKnownLocations.png")
+        # Busy cursor for the figure build + save (all on the GUI thread).
+        # try/finally guarantees the cursor clears even if drawing/saving raises.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            fig.savefig(png, dpi=150, facecolor=pal_bg, bbox_inches="tight")
-            saved = [os.path.basename(png)]
-            if self.chk_save_svg.isChecked():
-                svg = os.path.splitext(png)[0] + ".svg"
-                fig.savefig(svg, facecolor=pal_bg, bbox_inches="tight")
-                saved.append(os.path.basename(svg))
-            self.log_message(f"✓ Saved last-known-locations plot: {', '.join(saved)}")
-            QMessageBox.information(
-                self, "Plot Saved",
-                f"Saved {', '.join(saved)}\n\nin {os.path.basename(out_dir)}/")
-        except Exception as e:
-            self.log_message(f"Could not save last-locations plot: {e}")
-            QMessageBox.critical(self, "Save Failed", str(e))
+            fig = Figure(figsize=(8, 8))
+            ax = fig.add_subplot(111)
+            pal_bg, pal_fg = "#1e1e1e", "#cccccc"
+            fig.patch.set_facecolor(pal_bg)
+            ax.set_facecolor(pal_bg)
+
+            # Arena context (background/zones/anchors) per the export layer choice.
+            xs = [v[0] for v in latest.values()]
+            ys = [v[1] for v in latest.values()]
+            bg_image, bg_extent = self._context_bg_source()
+            draw_context_layers(
+                ax, self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
+                zones_xml=self.xml_zones, anchors=self.anchor_positions)
+
+            cmap = plt.get_cmap('tab20')
+            for i, (shortid, (x, y, ts)) in enumerate(sorted(latest.items())):
+                label = self._tag_display_label(shortid)
+                local = pd.Timestamp(int(ts), unit='ms', tz='UTC').tz_convert(tz)
+                ax.scatter([x], [y], s=140, color=cmap(i % 20),
+                           edgecolors="white", linewidths=1.0, zorder=5)
+                ax.annotate(f"{label}\n{local:%m-%d %H:%M}", (x, y),
+                            textcoords="offset points", xytext=(8, 6),
+                            color=pal_fg, fontsize=8, zorder=6)
+
+            ax.set_aspect("equal")
+            ax.set_xlabel("X (m)", color=pal_fg)
+            ax.set_ylabel("Y (m)", color=pal_fg)
+            ax.tick_params(colors=pal_fg)
+            for sp in ax.spines.values():
+                sp.set_color("#555555")
+            ax.set_title(f"Last known locations · {len(latest)} tags", color=pal_fg)
+            fig.tight_layout()
+
+            # Save into the analysis folder, matching the export naming.
+            db_dir = os.path.dirname(self.db_path)
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+            out_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+            os.makedirs(out_dir, exist_ok=True)
+            png = os.path.join(out_dir, f"{db_name}_LastKnownLocations.png")
+            try:
+                fig.savefig(png, dpi=150, facecolor=pal_bg, bbox_inches="tight")
+                saved = [os.path.basename(png)]
+                if self.chk_save_svg.isChecked():
+                    svg = os.path.splitext(png)[0] + ".svg"
+                    fig.savefig(svg, facecolor=pal_bg, bbox_inches="tight")
+                    saved.append(os.path.basename(svg))
+                self.log_message(f"✓ Saved last-known-locations plot: {', '.join(saved)}")
+                QMessageBox.information(
+                    self, "Plot Saved",
+                    f"Saved {', '.join(saved)}\n\nin {os.path.basename(out_dir)}/")
+            except Exception as e:
+                self.log_message(f"Could not save last-locations plot: {e}")
+                QMessageBox.critical(self, "Save Failed", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _tag_display_label(self, shortid):
         """Identity label for a tag: 'sex-identity' if configured, else HexID."""
@@ -3511,6 +3944,10 @@ class UWBQuickVisualizationWindow(QWidget):
         tags = self.selected_preview_tags()
         if not tags:
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
+            return
+
+        # Ask which context layers to draw (zones/anchors overlay the heatmap).
+        if not self._prompt_plot_layers():
             return
 
         db = self.preview_db_path or self.db_path
@@ -3604,6 +4041,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 total = H.sum()
                 heatmaps.append((H / total * 100.0) if total else None)
                 self.log_message(f"  {labels[-1]}: {int(total):,} fixes binned")
+                # Repaint the progress dialog after this tag's heavy read+bin.
+                QApplication.processEvents()
 
             conn.close()
             progress.setValue(len(tags))
@@ -3666,6 +4105,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                         ha="center", va="center", color="#999")
                 ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[2], extent[3])
+            # Overlay chosen context layers. Background is omitted here — the
+            # density raster already fills the panel and would hide it.
+            draw_context_layers(
+                ax, {'background': False,
+                     'zones': self.plot_layers.get('zones'),
+                     'anchors': self.plot_layers.get('anchors')},
+                zones_xml=self.xml_zones, anchors=self.anchor_positions)
             ax.set_title(lab, fontsize=10)
             ax.set_xlabel("X Position (m)", fontsize=8)
             ax.set_ylabel("Y Position (m)", fontsize=8)
@@ -3933,6 +4379,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_timezone.setCurrentText("US/Mountain")
         self.combo_smoothing.setCurrentIndex(1)  # Rolling Average (default)
         self.spin_rolling_window.setValue(30)
+        self.combo_window_units.setCurrentText("Seconds")
         self.chk_velocity_filter.setChecked(True)
         self.spin_velocity_threshold.setValue(2.0)
         self.chk_jump_filter.setChecked(True)
@@ -3943,11 +4390,13 @@ class UWBQuickVisualizationWindow(QWidget):
         # Export options
         self.chk_export_raw_csv.setChecked(True)
         self.chk_export_smoothed_csv.setChecked(True)
-        self.chk_export_downsampled_csv.setChecked(True)
-        self.spin_downsample_hz.setValue(1)
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
-        self.chk_save_plots.setChecked(True)
+        self.chk_save_plots.setChecked(False)
+        self.chk_downsample_plots.setChecked(True)
+        self.spin_plot_downsample_hz.setValue(1)
+        self.chk_downsample_animation.setChecked(True)
+        self.spin_anim_downsample_hz.setValue(1)
         self.chk_save_svg.setChecked(False)
         for cb in self.plot_type_checkboxes.values():
             cb.setChecked(True)
@@ -4077,8 +4526,9 @@ class UWBQuickVisualizationWindow(QWidget):
         
         db_dir = os.path.dirname(self.db_path)
         
-        # Look for .xml files in the same directory
-        xml_files = [f for f in os.listdir(db_dir) if f.endswith('.xml')]
+        # Look for .xml files in the same directory (skip hidden/AppleDouble
+        # sidecars like '._EchoConfiguration.xml' left by macOS on shares).
+        xml_files = [f for f in list_visible_files(db_dir) if f.lower().endswith('.xml')]
         
         if not xml_files:
             self.log_message("No XML configuration file found in database directory")
@@ -4256,8 +4706,9 @@ class UWBQuickVisualizationWindow(QWidget):
         db_dir = os.path.dirname(self.db_path)
         db_name = os.path.splitext(os.path.basename(self.db_path))[0]
 
-        # Find PNG files in the database directory
-        png_files = [f for f in os.listdir(db_dir) if f.lower().endswith('.png')]
+        # Find PNG files in the database directory (skip hidden/AppleDouble
+        # sidecars like '._floorplan.png' left by macOS on shares).
+        png_files = [f for f in list_visible_files(db_dir) if f.lower().endswith('.png')]
 
         if not png_files:
             return
@@ -4479,14 +4930,18 @@ class UWBQuickVisualizationWindow(QWidget):
         """Handle smoothing method change"""
         clean_method = method.replace(" (default)", "")
         is_ewma = clean_method == "Forward-Backward EWMA"
+        is_rolling = clean_method in ("Rolling Average", "Rolling Median")
         # Savitzky-Golay sizes its own window, so only the rolling methods and
         # EWMA expose the parameter spinbox.
-        needs_param = is_ewma or clean_method in ("Rolling Average", "Rolling Median")
+        needs_param = is_ewma or is_rolling
 
-        self.lbl_rolling_window.setText("Span (samples):" if is_ewma else "Window (seconds):")
+        self.lbl_rolling_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
         self.spin_rolling_window.setEnabled(needs_param)
         self.spin_rolling_window.setVisible(needs_param)
         self.lbl_rolling_window.setVisible(needs_param)
+        # The seconds/samples toggle only applies to the rolling windows; the
+        # EWMA span is always in samples and Savitzky-Golay has no exposed size.
+        self.combo_window_units.setVisible(is_rolling)
 
     def on_save_plots_toggled(self):
         """Handle save plots checkbox toggle"""
@@ -4622,6 +5077,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             self.tag_identities = dialog.get_identities()
             self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
+            # Snapshot the export-details JSON to the analysis folder now, so it
+            # exists and reflects the just-applied identities before any export.
+            self.write_live_config()
             # Update tag checkbox labels to reflect new identities
             self.update_tag_labels()
             # Recolour preview markers by the newly-assigned sex (blue=M, red=F)
@@ -4650,7 +5108,10 @@ class UWBQuickVisualizationWindow(QWidget):
             self.worker.terminate()
             self.worker.wait()
             self.log_message("✗ Plot export cancelled")
-        
+
+        # Drop any temp render CSVs left behind by the cancelled run.
+        self._cleanup_plot_working_files()
+
         # Reset UI
         self.exporting = False
         self.btn_export.setEnabled(True)
@@ -4837,25 +5298,14 @@ class UWBQuickVisualizationWindow(QWidget):
         if method == "Savitzky-Golay":
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol)
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol)
-        elif method == "Rolling Average":
-            # Get window size in seconds from spinbox
-            window_seconds = self.spin_rolling_window.value()
-
-            # Calculate window size in number of samples (assuming 1Hz after downsampling)
-            window_size = max(3, window_seconds)  # Minimum window of 3
-
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).mean())
-        elif method == "Rolling Median":
-            window_seconds = self.spin_rolling_window.value()
-            window_size = max(3, window_seconds)
-
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: x.rolling(window=window_size, center=True, min_periods=1).median())
+        elif method in ("Rolling Average", "Rolling Median"):
+            # The window value is interpreted as seconds (time-based, centred on
+            # each tag's Timestamp) or as a fixed sample count, per the units
+            # selector next to the spinbox. Time-based is the default and is
+            # independent of the irregular, sub-1 Hz reporting rate.
+            agg = 'mean' if method == "Rolling Average" else 'median'
+            time_based = self.combo_window_units.currentText() == "Seconds"
+            rolling_smooth_xy(data, agg, self.spin_rolling_window.value(), time_based)
         elif method == "Forward-Backward EWMA":
             # Spinbox doubles as the EWMA span. No minimum floor — a span of
             # 1-2 is legitimate (span=1 gives alpha=1, i.e. passthrough).
@@ -4997,10 +5447,50 @@ class UWBQuickVisualizationWindow(QWidget):
 
         return data
 
+    def xml_config_summary(self):
+        """Site metadata parsed from the detected XML, or None if there is none.
+
+        Makes the export record self-contained: it captures the anchor/antenna
+        positions, zone polygons, scale and map extent read from the site XML
+        (all lengths already converted to meters). The embedded map *image*
+        itself is not copied — it lives in the XML file referenced by 'path'.
+
+        Every value is coerced to a plain Python type so json.dump never chokes
+        on a numpy scalar.
+        """
+        if not getattr(self, 'xml_config_path', None):
+            return None
+
+        summary = {
+            'path': self.xml_config_path,
+            'filename': os.path.basename(self.xml_config_path),
+            'scale_inches_per_px': (float(self.xml_scale)
+                                    if self.xml_scale is not None else None),
+            'anchor_positions_m': [
+                {'shortid': int(a['shortid']),
+                 'x': float(a['x']), 'y': float(a['y']), 'z': float(a['z'])}
+                for a in (self.anchor_positions or [])
+            ],
+            'zones': [
+                {'name': z.get('name'),
+                 'color': z.get('color'),
+                 'points_m': (z['points'].tolist() if hasattr(z.get('points'), 'tolist')
+                              else z.get('points'))}
+                for z in (getattr(self, 'xml_zones', None) or [])
+            ],
+        }
+        if getattr(self, 'xml_map_extent', None) is not None:
+            summary['map_extent_m'] = [float(v) for v in self.xml_map_extent]
+        if self.bg_width_meters is not None and self.bg_height_meters is not None:
+            summary['background_size_m'] = [float(self.bg_width_meters),
+                                            float(self.bg_height_meters)]
+        return summary
+
     def get_config_dict(self):
         """Get current configuration as dictionary"""
         from datetime import datetime
         config = {
+            'fnt_version': get_fnt_version(),
             'run_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'database_path': self.db_path,
             'database_name': os.path.basename(self.db_path) if self.db_path else None,
@@ -5014,14 +5504,17 @@ class UWBQuickVisualizationWindow(QWidget):
             'time_gap': self.spin_time_gap.value(),
             'smoothing_method': self.combo_smoothing.currentText(),
             'rolling_window': self.spin_rolling_window.value(),
+            'rolling_window_units': self.combo_window_units.currentText(),
             'show_anchors': self.chk_show_anchors.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
-            'export_downsampled_csv': self.chk_export_downsampled_csv.isChecked(),
-            'downsample_hz': self.spin_downsample_hz.value(),
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
             'save_plots': self.chk_save_plots.isChecked(),
+            'downsample_plots': self.chk_downsample_plots.isChecked(),
+            'plot_downsample_hz': self.spin_plot_downsample_hz.value(),
+            'downsample_animation': self.chk_downsample_animation.isChecked(),
+            'anim_downsample_hz': self.spin_anim_downsample_hz.value(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
@@ -5033,8 +5526,12 @@ class UWBQuickVisualizationWindow(QWidget):
             'video_quality': self.combo_video_quality.currentText(),
             'daily_animations': self.chk_daily_animations.isChecked(),
             'tag_identities': self.tag_identities,
+            'plot_layers': dict(self.plot_layers),
             'background_image_path': self.background_image_path,
-            'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None
+            'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None,
+            # Anchor/antenna positions, zones, scale and map extent from the
+            # site XML (all in meters); None when no XML was detected.
+            'xml_config': self.xml_config_summary()
         }
         return config
     
@@ -5049,7 +5546,38 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"Config saved: {os.path.basename(config_path)}")
         except Exception as e:
             self.log_message(f"Warning: Could not save config: {str(e)}")
-    
+
+    def analysis_dir_for_db(self):
+        """Path to the '<db>_FNT_analysis' folder for the loaded database.
+
+        This is the same folder the export writes to and that
+        load_config_if_exists reads back on open, so a config written here is
+        picked up automatically next time the database is loaded. Returns None
+        if no database is selected.
+        """
+        if not self.db_path:
+            return None
+        db_dir = os.path.dirname(self.db_path)
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+        return os.path.join(db_dir, f"{db_name}_FNT_analysis")
+
+    def write_live_config(self):
+        """Write fnt_config.json to the analysis folder right now.
+
+        Config-only (no CSVs/plots/heavy reads): used to snapshot the current
+        settings as soon as the user applies identity assignments, so the
+        export-details JSON exists and stays current before a full export runs.
+        Creates the analysis folder if it does not exist yet.
+        """
+        analysis_dir = self.analysis_dir_for_db()
+        if not analysis_dir:
+            return
+        try:
+            os.makedirs(analysis_dir, exist_ok=True)
+            self.save_config(analysis_dir)
+        except Exception as e:
+            self.log_message(f"Warning: Could not write live config: {str(e)}")
+
     def load_config_if_exists(self):
         """Check for existing config file and load it.
         Returns True if a config was loaded, False otherwise."""
@@ -5090,6 +5618,11 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'rolling_window' in config:
                 self.spin_rolling_window.setValue(config['rolling_window'])
+
+            if 'rolling_window_units' in config:
+                idx = self.combo_window_units.findText(config['rolling_window_units'])
+                if idx >= 0:
+                    self.combo_window_units.setCurrentIndex(idx)
             
             if 'velocity_filter' in config:
                 self.chk_velocity_filter.setChecked(config['velocity_filter'])
@@ -5112,11 +5645,13 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'export_smoothed_csv' in config:
                 self.chk_export_smoothed_csv.setChecked(config['export_smoothed_csv'])
 
-            if 'export_downsampled_csv' in config:
-                self.chk_export_downsampled_csv.setChecked(config['export_downsampled_csv'])
+            # 'export_downsampled_csv' / 'downsample_hz' are obsolete (the
+            # downsampled export was removed); ignored if present in old configs.
 
-            if 'downsample_hz' in config:
-                self.spin_downsample_hz.setValue(config['downsample_hz'])
+            if isinstance(config.get('plot_layers'), dict):
+                self.plot_layers = {
+                    k: bool(config['plot_layers'].get(k, DEFAULT_PLOT_LAYERS[k]))
+                    for k in DEFAULT_PLOT_LAYERS}
 
             if 'proximity_detection' in config:
                 self.chk_proximity_detection.setChecked(config['proximity_detection'])
@@ -5126,6 +5661,15 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
+
+            if 'downsample_plots' in config:
+                self.chk_downsample_plots.setChecked(config['downsample_plots'])
+            if 'plot_downsample_hz' in config:
+                self.spin_plot_downsample_hz.setValue(config['plot_downsample_hz'])
+            if 'downsample_animation' in config:
+                self.chk_downsample_animation.setChecked(config['downsample_animation'])
+            if 'anim_downsample_hz' in config:
+                self.spin_anim_downsample_hz.setValue(config['anim_downsample_hz'])
 
             if 'save_svg' in config:
                 self.chk_save_svg.setChecked(config['save_svg'])
@@ -5183,7 +5727,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 # Ensure XML config is parsed first to get scale
                 if not self.xml_scale and self.db_path:
                     db_dir = os.path.dirname(self.db_path)
-                    xml_files = [f for f in os.listdir(db_dir) if f.lower().endswith('.xml')]
+                    xml_files = [f for f in list_visible_files(db_dir) if f.lower().endswith('.xml')]
                     if xml_files:
                         xml_file = next((f for f in xml_files if 'config' in f.lower()), xml_files[0])
                         self.xml_config_path = os.path.join(db_dir, xml_file)
@@ -5262,12 +5806,12 @@ class UWBQuickVisualizationWindow(QWidget):
             loose_animations = []
 
             if not os.path.exists(plots_subdir):
-                loose_plots = [f for f in os.listdir(analysis_dir)
+                loose_plots = [f for f in list_visible_files(analysis_dir)
                                if os.path.isfile(os.path.join(analysis_dir, f))
                                and f.lower().endswith(('.png', '.svg'))]
 
             if not os.path.exists(animations_subdir):
-                loose_animations = [f for f in os.listdir(analysis_dir)
+                loose_animations = [f for f in list_visible_files(analysis_dir)
                                     if os.path.isfile(os.path.join(analysis_dir, f))
                                     and f.lower().endswith('.mp4')]
 
@@ -5413,7 +5957,10 @@ class UWBQuickVisualizationWindow(QWidget):
             # Use smoothed coordinates if available, otherwise use location
             x_col = 'smoothed_x' if 'smoothed_x' in anim_data.columns else 'location_x'
             y_col = 'smoothed_y' if 'smoothed_y' in anim_data.columns else 'location_y'
-            
+            self.log_message(
+                f"Animation trajectories use "
+                f"{'smoothed' if x_col == 'smoothed_x' else 'raw (unsmoothed)'} coordinates")
+
             if x_col != 'smoothed_x':
                 anim_data['smoothed_x'] = anim_data[x_col]
             if y_col != 'smoothed_y':
@@ -5577,8 +6124,11 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Animation Error", f"Failed to generate animation: {str(e)}")
             self.log_message(f"✗ Animation generation failed: {str(e)}")
-    
-    def create_animation_frames(self, data, output_dir, frame_interval, trailing_window, 
+        finally:
+            # Animation is the last render stage; drop the temp render CSVs.
+            self._cleanup_plot_working_files()
+
+    def create_animation_frames(self, data, output_dir, frame_interval, trailing_window,
                                fps, color_by, use_custom_identities=False,
                                total_export_steps=1, current_export_step=1, day_suffix="", speed_text=""):
         """Create animation frames and compile video with optimization strategies:
@@ -5597,13 +6147,15 @@ class UWBQuickVisualizationWindow(QWidget):
         x_min, x_max = data['smoothed_x'].min(), data['smoothed_x'].max()
         y_min, y_max = data['smoothed_y'].min(), data['smoothed_y'].max()
         
-        # If background image exists, adjust limits to include it (using meters)
-        if self.background_image is not None and self.bg_width_meters is not None:
-            x_min = min(x_min, 0)
-            x_max = max(x_max, self.bg_width_meters)
-            y_min = min(y_min, 0)
-            y_max = max(y_max, self.bg_height_meters)
-        
+        # Background is the loaded PNG, else the XML-embedded site map. If it
+        # will be drawn, expand the limits to include its extent.
+        anim_bg_image, anim_bg_extent = self._context_bg_source()
+        if self.plot_layers.get('background') and anim_bg_extent is not None:
+            x_min = min(x_min, anim_bg_extent[0])
+            x_max = max(x_max, anim_bg_extent[1])
+            y_min = min(y_min, anim_bg_extent[2])
+            y_max = max(y_max, anim_bg_extent[3])
+
         # Add padding
         x_range = x_max - x_min
         y_range = y_max - y_min
@@ -5660,19 +6212,21 @@ class UWBQuickVisualizationWindow(QWidget):
         fig, ax = plt.subplots(figsize=(10, 8), dpi=dpi)
         ax.grid(False)
         
-        # Draw static background once
+        # Draw the chosen static context layers once. The layer choice comes
+        # from the export dialog (self.plot_layers), not the preview toggles.
+        # Background is the loaded PNG, else the XML-embedded site map.
         bg_artist = None
-        if self.background_image is not None and self.bg_width_meters is not None:
-            bg_artist = ax.imshow(self.background_image, 
-                     extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
+        if self.plot_layers.get('background') and anim_bg_image is not None and anim_bg_extent is not None:
+            bg_artist = ax.imshow(anim_bg_image,
+                     extent=list(anim_bg_extent),
                      origin='upper',
                      aspect='auto',
                      alpha=0.6,
                      zorder=0)
-        
-        # Draw arena zones if available (static, drawn once)
-        zone_artists = []
-        if self.arena_zones is not None and not self.arena_zones.empty:
+
+        # Draw arena zones if available (static, drawn once). Keeps the centroid
+        # labels the shared helper omits, so it stays inline.
+        if self.plot_layers.get('zones') and self.arena_zones is not None and not self.arena_zones.empty:
             try:
                 from matplotlib.patches import Polygon
                 for zone_name in self.arena_zones['zone'].unique():
@@ -5681,18 +6235,22 @@ class UWBQuickVisualizationWindow(QWidget):
                     if len(coords) >= 3:  # Need at least 3 points for a polygon
                         poly = Polygon(coords, fill=False, edgecolor='black', linewidth=1.5, linestyle='--', zorder=1)
                         ax.add_patch(poly)
-                        zone_artists.append(poly)
                         # Add zone label at centroid
                         centroid_x = coords[:, 0].mean()
                         centroid_y = coords[:, 1].mean()
-                        text = ax.text(centroid_x, centroid_y, zone_name, 
-                                     fontsize=8, ha='center', va='center', 
-                                     bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
-                                     zorder=1)
-                        zone_artists.append(text)
+                        ax.text(centroid_x, centroid_y, zone_name,
+                                fontsize=8, ha='center', va='center',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
+                                zorder=1)
             except Exception as e:
                 self.log_message(f"Error drawing zones in animation: {str(e)}")
-        
+
+        # Draw anchor/antenna positions if chosen.
+        if self.plot_layers.get('anchors') and self.anchor_positions:
+            ax.scatter([a['x'] for a in self.anchor_positions],
+                       [a['y'] for a in self.anchor_positions],
+                       marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
         ax.set_aspect('equal')
@@ -5824,7 +6382,10 @@ class UWBQuickVisualizationWindow(QWidget):
             self.worker.terminate()
             self.worker.wait()
             self.log_message("✗ Plot export cancelled")
-        
+
+        # Drop any temp render CSVs left behind by the cancelled run.
+        self._cleanup_plot_working_files()
+
         # Reset UI
         self.exporting = False
         self.btn_export.setEnabled(True)
@@ -5833,17 +6394,34 @@ class UWBQuickVisualizationWindow(QWidget):
         self.progress_bar.setValue(0)
         self.lbl_export_progress.setText("")
     
+    def _cleanup_plot_working_files(self):
+        """Delete the temporary downsampled/raw render CSVs written for this run.
+
+        These '<db>_plotdata_*.csv' files exist only so the plot worker and the
+        animation have a source to read; they are removed once those consumers
+        finish. The exported smoothed CSV deliverable is never in this list.
+        """
+        for path in getattr(self, '_plot_working_files', []):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+                    self.log_message(f"Removed temporary render file: {os.path.basename(path)}")
+            except OSError as e:
+                self.log_message(f"Could not remove temp render file {os.path.basename(path)}: {e}")
+        self._plot_working_files = []
+
     def export_data(self):
         """Export data and/or plots based on selected options"""
         if not self.db_path:
             QMessageBox.warning(self, "No Database", "Please select a database first")
             return
-        
+
         # Note: self.data can be None if this is a fresh export
         # This is OK - plots and animations will load data directly from CSV/database
-        
+
         # Initialize export state
         self.export_cancelled = False
+        self._plot_working_files = []  # temp render CSVs to delete when done
         self.exporting = True
         self.btn_export.setEnabled(False)
         self.btn_stop_export.setVisible(True)
@@ -5857,17 +6435,27 @@ class UWBQuickVisualizationWindow(QWidget):
 
         export_raw_csv = self.chk_export_raw_csv.isChecked()
         export_smoothed_csv = self.chk_export_smoothed_csv.isChecked()
-        export_downsampled_csv = self.chk_export_downsampled_csv.isChecked()
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
-        downsample_hz = self.spin_downsample_hz.value()
+        downsample_plots = self.chk_downsample_plots.isChecked()
+        plot_downsample_hz = self.spin_plot_downsample_hz.value()
+        downsample_animation = self.chk_downsample_animation.isChecked()
+        anim_downsample_hz = self.spin_anim_downsample_hz.value()
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
 
-        if not export_raw_csv and not export_smoothed_csv and not export_downsampled_csv and not save_plots and not save_animation and not detect_proximity:
+        if not export_raw_csv and not export_smoothed_csv and not save_plots and not save_animation and not detect_proximity:
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
+
+        # --- Spatial layer choice for plots/animation ---
+        # Prompt for the context layers when there is spatial output to make.
+        # Cancelling the dialog aborts the whole export.
+        if save_plots or save_animation:
+            if not self._prompt_plot_layers():
+                self.log_message("Export cancelled at layer selection.")
+                return
 
         # --- Conflict detection ---
         base_output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
@@ -5899,10 +6487,7 @@ class UWBQuickVisualizationWindow(QWidget):
             predicted_files.append(f'{db_name}_raw.csv')
         if export_smoothed_csv:
             predicted_files.append(f'{db_name}_smoothed.csv')
-        if export_downsampled_csv:
-            predicted_files.append(f'{db_name}_smoothed_{downsample_hz}Hz.csv')
         if detect_proximity:
-            predicted_files.append(f'{db_name}_proximity_events.csv')
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
 
         # Predict animation files (in animations/ subfolder)
@@ -6017,6 +6602,12 @@ class UWBQuickVisualizationWindow(QWidget):
             os.makedirs(animations_dir, exist_ok=True)
 
         try:
+            # Busy cursor for the whole synchronous prep. The heavy pandas /
+            # sqlite calls below run on the GUI thread and cannot be interrupted
+            # mid-call, so the window can still briefly stop repainting; the
+            # cursor plus the finer-grained processEvents() calls keep it from
+            # looking dead. Restored in the finally so every exit path clears it.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
             self.log_message(f"Starting export to {output_dir}")
             self.lbl_export_progress.setText("Initializing export...")
 
@@ -6025,8 +6616,6 @@ class UWBQuickVisualizationWindow(QWidget):
             if export_raw_csv:
                 total_steps += 1
             if export_smoothed_csv:
-                total_steps += 1
-            if export_downsampled_csv:
                 total_steps += 1
             if save_plots:
                 total_steps += 1
@@ -6054,14 +6643,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"Skipped (exists): {raw_csv_filename}")
                 else:
                     self.log_message("Exporting raw database to CSV...")
+                    QApplication.processEvents()
                     conn = sqlite3.connect(self.db_path)
                     raw_data = pd.read_sql_query(f"SELECT * FROM {self.table_name}", conn)
                     conn.close()
                     raw_data.to_csv(raw_csv_path, index=False)
                     self.log_message(f"✓ Raw CSV exported: {raw_csv_filename}")
+                    QApplication.processEvents()
 
-            # Prepare processed data (needed for smoothed CSV, downsampled CSV, plots, animation, behaviors)
-            needs_processed_data = export_smoothed_csv or export_downsampled_csv or save_plots or save_animation or detect_proximity
+            # Prepare processed data (needed for smoothed CSV, plots, animation, behaviors)
+            needs_processed_data = export_smoothed_csv or save_plots or save_animation or detect_proximity
             smoothed_data = None
             csv_path = None  # Path to the CSV that plots/animation will use
 
@@ -6137,6 +6728,10 @@ class UWBQuickVisualizationWindow(QWidget):
                     if smoothing_method != "None" and len(tag_data) > 0:
                         tag_data = self.apply_smoothing_to_data(tag_data, smoothing_method)
 
+                    # Let the window repaint / process the Stop button between
+                    # tags, right after the heaviest per-tag work.
+                    QApplication.processEvents()
+
                     # Identity mapping
                     if tag in self.tag_identities:
                         tag_data['sex'] = self.tag_identities[tag].get('sex', 'M')
@@ -6154,6 +6749,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     smoothed_data = pd.concat(processed_chunks, ignore_index=True)
                     smoothed_data = smoothed_data.sort_values(by=['shortid', 'Timestamp'])
                     self.log_message(f"Total processed: {len(smoothed_data)} points across {len(processed_chunks)} tags")
+                    QApplication.processEvents()
                 else:
                     self.log_message("Warning: No data after processing")
                     smoothed_data = pd.DataFrame()
@@ -6175,44 +6771,63 @@ class UWBQuickVisualizationWindow(QWidget):
                         self.log_message(f"✓ Smoothed CSV exported: {smoothed_csv_filename}")
                         csv_path = smoothed_csv_path  # Use smoothed for plots/animation
 
-                # Export downsampled CSV
-                if export_downsampled_csv:
-                    current_step += 1
-                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting downsampled CSV ({downsample_hz}Hz)...")
-                    self.progress_bar.setValue(int(current_step / total_steps * 100))
-                    QApplication.processEvents()
+                # Render sources for plots and animation. Each is independent of
+                # the full-resolution smoothed CSV deliverable: it can be
+                # downsampled (a big render-cost saver, chosen per-consumer) and
+                # holds the smoothed track if the smoothed CSV was written, else
+                # the raw (unsmoothed) fixes. (The raw CSV export is a verbatim
+                # DB dump in inches with no Timestamp column, so it can't be a
+                # plotting source directly.) Temporary working files are tracked
+                # and deleted once the renderers finish.
+                render_source_cache = {}
 
-                    ds_csv_filename = f'{db_name}_smoothed_{downsample_hz}Hz.csv'
-                    ds_csv_path = os.path.join(output_dir, ds_csv_filename)
-                    if skip_existing and os.path.exists(ds_csv_path):
-                        self.log_message(f"Skipped (exists): {ds_csv_filename}")
-                        csv_path = ds_csv_path  # Still use existing for plots/animation
+                def _build_render_source(downsample, hz):
+                    key = (downsample, hz if downsample else None)
+                    if key in render_source_cache:
+                        return render_source_cache[key]
+                    if export_smoothed_csv:
+                        base = smoothed_data
+                        kind = 'smoothed'
                     else:
-                        downsampled_data = smoothed_data.copy()
-                        # Downsample by grouping into time bins of 1/Hz seconds
-                        bin_ns = int(1_000_000_000 / downsample_hz)
-                        downsampled_data['time_bin'] = (downsampled_data['Timestamp'].astype(np.int64) // bin_ns).astype(int)
-                        downsampled_data = downsampled_data.groupby(['shortid', 'time_bin']).first().reset_index()
-                        if 'time_bin' in downsampled_data.columns:
-                            downsampled_data = downsampled_data.drop(columns=['time_bin'])
+                        base = smoothed_data.drop(
+                            columns=['smoothed_x', 'smoothed_y'], errors='ignore')
+                        kind = 'raw (unsmoothed)'
 
-                        downsampled_data.to_csv(ds_csv_path, index=False)
-                        self.log_message(f"✓ Downsampled CSV exported: {ds_csv_filename}")
-                        csv_path = ds_csv_path  # Prefer downsampled for plots/animation
+                    if downsample and not base.empty:
+                        # Thin to the target rate: first fix per 1/Hz-second bin
+                        # per tag (resolution-safe floor binning).
+                        work = base.copy()
+                        period = pd.Timedelta(seconds=1.0 / hz)
+                        work['time_bin'] = work['Timestamp'].dt.floor(period)
+                        work = work.groupby(['shortid', 'time_bin']).first().reset_index()
+                        work = work.drop(columns=['time_bin'])
+                        fn = f'{db_name}_plotdata_{hz}Hz.csv'
+                        path = os.path.join(output_dir, fn)
+                        work.to_csv(path, index=False)
+                        self._plot_working_files.append(path)
+                        self.log_message(
+                            f"Render source: {hz} Hz downsampled {kind} data "
+                            f"({len(work)} of {len(base)} rows): {fn}")
+                        result = path
+                    elif export_smoothed_csv:
+                        # Full resolution + smoothed CSV written: reuse the
+                        # deliverable directly (not a temp file).
+                        result = smoothed_csv_path
+                    else:
+                        # Full resolution, no smoothed CSV: working copy of the
+                        # raw (unsmoothed) fixes for the renderers.
+                        fn = f'{db_name}_plotdata_raw.csv'
+                        path = os.path.join(output_dir, fn)
+                        base.to_csv(path, index=False)
+                        self._plot_working_files.append(path)
+                        self.log_message(
+                            f"Render source: raw (unsmoothed) full-resolution fixes: {fn}")
+                        result = path
+                    render_source_cache[key] = result
+                    return result
 
-                # If neither CSV was exported but plots/animation need data, create a temp CSV
-                if csv_path is None and (save_plots or save_animation):
-                    csv_filename = f'{db_name}_smoothed_{downsample_hz}Hz.csv'
-                    csv_path = os.path.join(output_dir, csv_filename)
-                    # Downsample for plots/animation
-                    temp_data = smoothed_data.copy()
-                    bin_ns = int(1_000_000_000 / downsample_hz)
-                    temp_data['time_bin'] = (temp_data['Timestamp'].astype(np.int64) // bin_ns).astype(int)
-                    temp_data = temp_data.groupby(['shortid', 'time_bin']).first().reset_index()
-                    if 'time_bin' in temp_data.columns:
-                        temp_data = temp_data.drop(columns=['time_bin'])
-                    temp_data.to_csv(csv_path, index=False)
-                    self.log_message(f"✓ Temporary CSV created for plots/animation")
+                plot_csv_path = _build_render_source(downsample_plots, plot_downsample_hz) if save_plots else None
+                anim_csv_path = _build_render_source(downsample_animation, anim_downsample_hz) if save_animation else None
             
             # Save configuration file
             self.save_config(output_dir)
@@ -6252,22 +6867,19 @@ class UWBQuickVisualizationWindow(QWidget):
                         prox_data = None
 
                     if prox_data is not None:
-                        proximity_events, proximity_bouts = detect_proximity_bouts(
+                        # The per-timestamp events frame is computed internally
+                        # (bouts are derived from it) but intentionally NOT
+                        # written out: bouts is the tool's threshold-based
+                        # deliverable. Anyone needing the raw per-second dyadic
+                        # distances can re-run at a different threshold or
+                        # compute them from the exported smoothed CSV themselves.
+                        _events, proximity_bouts = detect_proximity_bouts(
                             prox_data,
                             threshold=proximity_threshold,
                             gap_s=5,
                             tag_identities=self.tag_identities,
                             log_callback=self.log_message
                         )
-
-                        # Export proximity events
-                        events_path = os.path.join(output_dir, f'{db_name}_proximity_events.csv')
-                        if skip_existing and os.path.exists(events_path):
-                            self.log_message(f"Skipped (exists): {os.path.basename(events_path)}")
-                        else:
-                            proximity_events.to_csv(events_path, index=False)
-                            self.log_message(f"✓ Exported proximity events ({len(proximity_events)} rows): "
-                                             f"{os.path.basename(events_path)}")
 
                         # Export proximity bouts
                         bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
@@ -6324,7 +6936,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.db_path,
                     self.table_name,
                     selected_tags,
-                    False,  # downsample handled in CSV creation
+                    False,  # downsample: vestigial, feature removed
                     self.get_smoothing_method(),
                     plot_types,
                     skip_existing,
@@ -6332,17 +6944,24 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_timezone.currentText(),
                     self.tag_identities,
                     bool(self.tag_identities),  # Use identities if any are configured
-                    # Respect the show/hide toggle so exported plots match the preview
-                    self.background_image if self.chk_show_background.isChecked() else None,
+                    # Always pass the image; whether it is drawn is decided by the
+                    # export layer choice (self.plot_layers), not the preview toggle.
+                    self.background_image,
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height
-                    csv_path,  # Pass CSV path for reuse
+                    plot_csv_path,  # plots render source (possibly downsampled)
                     self.chk_save_svg.isChecked(),  # Save SVG copies
                     output_dir,  # Pass output directory
-                    plots_dir  # Pass plots subfolder
+                    plots_dir,  # Pass plots subfolder
+                    self.combo_window_units.currentText(),  # seconds vs samples
+                    plot_layers=self.plot_layers,
+                    xml_zones=self.xml_zones,
+                    anchor_positions=self.anchor_positions,
+                    xml_map_image=self.xml_map_image,
+                    xml_map_extent=self.xml_map_extent,
                 )
                 self.worker.progress.connect(self.update_status)
-                self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, csv_path, animations_dir))
+                self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, anim_csv_path, animations_dir))
                 self.worker.start()
             
             # Animation will be started from export_finished() after plots complete
@@ -6357,10 +6976,10 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.progress_bar.setValue(int((current_step - 1) / total_steps * 100))
                 QApplication.processEvents()
                 
-                self.generate_animation(output_dir, total_steps, current_step, csv_path, animations_dir)
+                self.generate_animation(output_dir, total_steps, current_step, anim_csv_path, animations_dir)
 
             # If no plots or animation, show success message now
-            any_csv = export_raw_csv or export_smoothed_csv or export_downsampled_csv
+            any_csv = export_raw_csv or export_smoothed_csv
             if (any_csv or detect_proximity) and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
                 msg = f"Export completed to:\n{output_dir}"
@@ -6369,7 +6988,12 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Export failed: {str(e)}")
             self.log_message(f"✗ Export failed: {str(e)}")
-    
+        finally:
+            # Always clear the busy cursor, on success, cancel, or error. The
+            # async plot worker (if started) runs in its own thread and does not
+            # freeze the UI, so restoring here is correct.
+            QApplication.restoreOverrideCursor()
+
     def update_status(self, message):
         """Update status label and messages window"""
         self.log_message(message)
@@ -6395,12 +7019,16 @@ class UWBQuickVisualizationWindow(QWidget):
             else:
                 self.log_message(f"✗ Plot export failed: {message}")
                 QMessageBox.critical(self, "Error", message)
-        
+
+        # Plots are done and no animation follows (that path returned above and
+        # cleans up itself), so drop the temp render CSVs now.
+        self._cleanup_plot_working_files()
+
         # Reset UI state
         self.exporting = False
         self.btn_export.setEnabled(True)
         self.btn_stop_export.setVisible(False)
-        
+
         # Hide progress after a delay
         QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
     
