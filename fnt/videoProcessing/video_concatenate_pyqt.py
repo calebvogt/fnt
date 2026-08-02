@@ -505,6 +505,23 @@ class ConcatenationWorker(QThread):
             pass
         return None
 
+    def _get_video_codec(self, filepath):
+        """Get video codec name via ffprobe. Returns str (e.g. 'hevc', 'h264') or None."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
     def _try_repair_video(self, filepath, folder_path):
         """Attempt to repair a corrupt video by re-muxing it with ffmpeg.
         Returns the path to the repaired file, or None on failure."""
@@ -843,10 +860,11 @@ class ConcatenationWorker(QThread):
         muxer writes chunk files directly.  Pass ``allow_chunking=False``
         from the recovery path so a single file is produced instead.
 
-        When *stream_copy* is True the files have already been transcoded
-        individually and just need to be concatenated via packet copy — no
-        decoding or encoding takes place, so this step is fast and cannot
-        crash from corrupt frame data.
+        When *stream_copy* is True the files are concatenated via packet
+        copy — no decoding or encoding takes place, so this step is fast
+        and cannot crash from corrupt frame data.  Used when all source
+        files already share the same codec and resolution, or after
+        per-file pre-transcoding.
 
         Returns (success: bool, diagnostic_lines: list[str]).
         """
@@ -1363,7 +1381,8 @@ class ConcatenationWorker(QThread):
             # Repair map for incremental recovery (files repaired on-the-fly)
             repaired_map = {}
 
-            # --- Resolution consistency check (skip when preprocessing normalizes resolution) ---
+            # --- Resolution and codec consistency check (skip when preprocessing normalizes) ---
+            can_stream_copy = False
             if self.enable_preprocessing:
                 ps = self.preprocess_settings
                 res_label = ps.get("resolution", "1080p")
@@ -1371,8 +1390,9 @@ class ConcatenationWorker(QThread):
                     f"✅ Preprocessing enabled — all files will be scaled to {res_label}. "
                     f"Skipping resolution consistency check.")
             else:
-                self.progress_update.emit("Checking resolution consistency across files...")
+                self.progress_update.emit("Checking resolution and codec consistency across files...")
                 resolution_map = {}  # (width, height) -> [filepath, ...]
+                codec_set = set()
                 for vf in video_files:
                     if self.should_stop:
                         self._cleanup_repaired(repaired_map)
@@ -1380,6 +1400,9 @@ class ConcatenationWorker(QThread):
                     res = self._get_video_resolution(vf)
                     if res is not None:
                         resolution_map.setdefault(res, []).append(vf)
+                    codec = self._get_video_codec(vf)
+                    if codec is not None:
+                        codec_set.add(codec)
 
                 if len(resolution_map) > 1:
                     # Mixed resolutions detected — report clearly
@@ -1445,6 +1468,13 @@ class ConcatenationWorker(QThread):
                         f"✅ All files have consistent resolution: {res[0]}x{res[1]}")
                 # else: couldn't determine resolution — proceed anyway
 
+                # Stream copy when all files share the same codec and resolution
+                if len(resolution_map) <= 1 and len(codec_set) == 1:
+                    common_codec = next(iter(codec_set))
+                    can_stream_copy = True
+                    self.progress_update.emit(
+                        f"✅ All files share codec '{common_codec}' — using stream copy (no re-encoding)")
+
             # --- Phase 2: Concatenation (with crash-resume for chunking) ---
             output_dir = os.path.join(folder_path, "concatenated_output")
             os.makedirs(output_dir, exist_ok=True)
@@ -1488,6 +1518,9 @@ class ConcatenationWorker(QThread):
                         f"file(s) failed — proceeding with "
                         f"{len(transcoded_files)} file(s).")
                 concat_source_files = transcoded_files
+                stream_copy = True
+            elif can_stream_copy:
+                concat_source_files = video_files
                 stream_copy = True
             else:
                 concat_source_files = video_files
@@ -4031,7 +4064,7 @@ class VideoConcatenationGUI(QMainWindow):
                 f"Grayscale: {preprocess_settings['grayscale']}, "
                 f"Remove Audio: {preprocess_settings['remove_audio']}")
         else:
-            self.log_message("Output settings: default (libx264, CRF 18)")
+            self.log_message("Output settings: default (stream copy if codecs match, else libx264 CRF 18)")
         if enable_chunking:
             self.log_message(f"Chunking: {chunk_duration_minutes} min per chunk")
         else:

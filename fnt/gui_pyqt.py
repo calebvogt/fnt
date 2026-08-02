@@ -466,6 +466,21 @@ class FNTMainWindow(QMainWindow):
         tracking_group.setLayout(tracking_layout)
         layout.addWidget(tracking_group)
 
+        # SLEAP Utilities group
+        sleap_group = QGroupBox("SLEAP Utilities")
+        sleap_layout = QGridLayout()
+
+        sleap_buttons = [
+            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
+            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
+            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
+        ]
+
+        self.create_button_grid(sleap_layout, sleap_buttons)
+        sleap_group.setLayout(sleap_layout)
+        layout.addWidget(sleap_group)
+
         # Behavioral scoring group
         scoring_group = QGroupBox("Behavior Scoring")
         scoring_group_layout = QGridLayout()
@@ -893,21 +908,6 @@ class FNTMainWindow(QMainWindow):
         self.create_button_grid(general_layout, general_buttons)
         general_group.setLayout(general_layout)
         layout.addWidget(general_group)
-
-        # SLEAP Utilities group
-        sleap_group = QGroupBox("SLEAP Utilities")
-        sleap_layout = QGridLayout()
-
-        sleap_buttons = [
-            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
-            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
-            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
-            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
-        ]
-
-        self.create_button_grid(sleap_layout, sleap_buttons)
-        sleap_group.setLayout(sleap_layout)
-        layout.addWidget(sleap_group)
 
         # LabGym Utilities group
         labgym_group = QGroupBox("LabGym Utilities")
