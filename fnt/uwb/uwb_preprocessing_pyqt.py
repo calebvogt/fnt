@@ -6212,44 +6212,36 @@ class UWBQuickVisualizationWindow(QWidget):
         fig, ax = plt.subplots(figsize=(10, 8), dpi=dpi)
         ax.grid(False)
         
-        # Draw the chosen static context layers once. The layer choice comes
-        # from the export dialog (self.plot_layers), not the preview toggles.
-        # Background is the loaded PNG, else the XML-embedded site map.
-        bg_artist = None
-        if self.plot_layers.get('background') and anim_bg_image is not None and anim_bg_extent is not None:
-            bg_artist = ax.imshow(anim_bg_image,
-                     extent=list(anim_bg_extent),
-                     origin='upper',
-                     aspect='auto',
-                     alpha=0.6,
-                     zorder=0)
+        # Draw the chosen static context layers. Layer choice comes from the
+        # export dialog (self.plot_layers), not the preview toggles. Background
+        # is the loaded PNG, else the XML-embedded site map. This MUST be redrawn
+        # every frame because the frame loop calls ax.clear() — drawing it only
+        # once left the zones/anchors erased after frame 0 (only the background
+        # was being redrawn), so nothing but the tracks showed.
+        def _draw_static_context():
+            if self.plot_layers.get('background') and anim_bg_image is not None and anim_bg_extent is not None:
+                ax.imshow(anim_bg_image, extent=list(anim_bg_extent), origin='upper',
+                          aspect='auto', alpha=0.6, zorder=0)
+            if self.plot_layers.get('zones') and self.arena_zones is not None and not self.arena_zones.empty:
+                try:
+                    from matplotlib.patches import Polygon
+                    for zone_name in self.arena_zones['zone'].unique():
+                        coords = self.arena_zones[self.arena_zones['zone'] == zone_name][['x', 'y']].values
+                        if len(coords) >= 3:  # need >=3 points for a polygon
+                            ax.add_patch(Polygon(coords, fill=False, edgecolor='black',
+                                                 linewidth=1.5, linestyle='--', zorder=1))
+                            cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
+                            ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
+                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
+                                    zorder=1)
+                except Exception as e:
+                    self.log_message(f"Error drawing zones in animation: {str(e)}")
+            if self.plot_layers.get('anchors') and self.anchor_positions:
+                ax.scatter([a['x'] for a in self.anchor_positions],
+                           [a['y'] for a in self.anchor_positions],
+                           marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
-        # Draw arena zones if available (static, drawn once). Keeps the centroid
-        # labels the shared helper omits, so it stays inline.
-        if self.plot_layers.get('zones') and self.arena_zones is not None and not self.arena_zones.empty:
-            try:
-                from matplotlib.patches import Polygon
-                for zone_name in self.arena_zones['zone'].unique():
-                    zone_points = self.arena_zones[self.arena_zones['zone'] == zone_name]
-                    coords = zone_points[['x', 'y']].values
-                    if len(coords) >= 3:  # Need at least 3 points for a polygon
-                        poly = Polygon(coords, fill=False, edgecolor='black', linewidth=1.5, linestyle='--', zorder=1)
-                        ax.add_patch(poly)
-                        # Add zone label at centroid
-                        centroid_x = coords[:, 0].mean()
-                        centroid_y = coords[:, 1].mean()
-                        ax.text(centroid_x, centroid_y, zone_name,
-                                fontsize=8, ha='center', va='center',
-                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
-                                zorder=1)
-            except Exception as e:
-                self.log_message(f"Error drawing zones in animation: {str(e)}")
-
-        # Draw anchor/antenna positions if chosen.
-        if self.plot_layers.get('anchors') and self.anchor_positions:
-            ax.scatter([a['x'] for a in self.anchor_positions],
-                       [a['y'] for a in self.anchor_positions],
-                       marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+        _draw_static_context()
 
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
@@ -6299,16 +6291,11 @@ class UWBQuickVisualizationWindow(QWidget):
             
             # Clear previous frame's dynamic content
             ax.clear()
-            
-            # Redraw static background
-            if bg_artist is not None:
-                ax.imshow(self.background_image, 
-                         extent=[0, self.bg_width_meters, 0, self.bg_height_meters],
-                         origin='upper',
-                         aspect='auto',
-                         alpha=0.6,
-                         zorder=0)
-            
+
+            # Redraw ALL static context (background + zones + anchors), not just
+            # the background — ax.clear() removed everything.
+            _draw_static_context()
+
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
             ax.set_aspect('equal')
