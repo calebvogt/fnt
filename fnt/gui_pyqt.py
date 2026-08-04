@@ -550,8 +550,9 @@ class FNTMainWindow(QMainWindow):
 
         quick_buttons = [
             ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_preprocessing),
+            ("UWB Studio", "Explore and animate a preprocessing export folder", self.run_uwb_studio),
         ]
-        
+
         self.create_button_grid(quick_layout, quick_buttons)
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
@@ -1195,7 +1196,17 @@ class FNTMainWindow(QMainWindow):
             self.uwb_quick_viz_window.show()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
-    
+
+    def run_uwb_studio(self):
+        """Launch the UWB Studio (explore/animate a preprocessing export folder)."""
+        try:
+            from fnt.uwb.uwb_studio_pyqt import UWBStudioWindow
+
+            self.uwb_studio_window = UWBStudioWindow()
+            self.uwb_studio_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"UWB Studio failed: {str(e)}")
+
     # Imaging Methods
     def run_czi_viewer(self):
         """Launch CZI Viewer for microscopy images"""

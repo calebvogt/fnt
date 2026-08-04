@@ -8,11 +8,9 @@ import struct
 import numpy as np
 import pandas as pd
 import pytz
-import gc
 import json
 import shutil
 import xml.etree.ElementTree as ET
-import cv2
 from multiprocessing import Pool, cpu_count
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -36,6 +34,7 @@ from PyQt5.QtGui import QFont
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR)
+from fnt.uwb import animation as uwb_animation
 
 
 # Columns the processing pipeline actually consumes. Wiser tables carry ~20
@@ -221,6 +220,66 @@ def rolling_smooth_xy(data, agg, window_value, time_based):
             data[dst] = data.groupby('shortid')[src].transform(
                 lambda x: _agg(x.rolling(window=window_size, center=True, min_periods=1)))
     return data
+
+
+# Shared, math-level description of every smoothing method. Used verbatim as
+# the tooltip for BOTH the Export "Smoothing method" combo and the live-preview
+# "Smoothing method" combo, so the two are guaranteed identical. Keep it in sync
+# with forward_backward_ewma(), rolling_smooth_xy() and apply_smoothing_to_data().
+SMOOTHING_METHODS_TOOLTIP = (
+    "Smoothing is applied per tag, after threshold filtering. Every method here\n"
+    "is symmetric (zero-phase): because this is post-processing, each sample's\n"
+    "future is known, so the window is centred and smoothing adds no temporal\n"
+    "lag — unlike the causal filter the Wiser hardware must run live.\n"
+    "\n"
+    "The Smoothing Window / units control sets the window for the two rolling\n"
+    "methods; Forward-Backward EWMA uses it as a sample span; Savitzky-Golay and\n"
+    "None ignore it.\n"
+    "\n"
+    "• None\n"
+    "    No smoothing. The raw (already threshold-filtered) fixes are used as-is.\n"
+    "\n"
+    "• Rolling Average\n"
+    "    Centred moving mean — each output is the arithmetic mean of the fixes\n"
+    "    inside a window centred on that sample:\n"
+    "        out[i] = mean( x[j] : t[j] within the window around t[i] )\n"
+    "    With units = Seconds the window is a real-time span (e.g. 30 s), so the\n"
+    "    amount of smoothing is independent of the irregular, well-under-1 Hz\n"
+    "    reporting rate; with units = Samples it is a fixed count of consecutive\n"
+    "    fixes (minimum 3). Partial windows at the ends use whatever samples\n"
+    "    exist (min_periods = 1). Good general-purpose smoothing, but sensitive\n"
+    "    to any outliers the thresholds missed.\n"
+    "\n"
+    "• Rolling Median\n"
+    "    Identical windowing to Rolling Average but takes the median:\n"
+    "        out[i] = median( x[j] within the window around t[i] )\n"
+    "    The median ignores a minority of extreme values, so it is far more\n"
+    "    robust to residual spikes/outliers, at the cost of slightly blockier\n"
+    "    output on smoothly curving paths.\n"
+    "\n"
+    "• Savitzky-Golay\n"
+    "    Fits a low-order polynomial to each centred window by least squares and\n"
+    "    evaluates it at the window's centre. Here the window length is\n"
+    "    min(31, n) samples (forced odd) with polynomial order 2 — a local\n"
+    "    quadratic; the Smoothing Window setting does not apply. Because it\n"
+    "    models curvature instead of flattening it, Savitzky-Golay preserves\n"
+    "    peaks, turns and the height of sharp features better than averaging.\n"
+    "\n"
+    "• Forward-Backward EWMA\n"
+    "    A zero-phase exponentially weighted moving average, run as a two-pass\n"
+    "    (filtfilt-style) cascade. One pass is the recursive EWMA\n"
+    "        y[t] = alpha * x[t] + (1 - alpha) * y[t-1],   alpha = 2 / (span + 1)\n"
+    "    which weights the most recent sample most heavily and older samples with\n"
+    "    geometrically decaying weight. A single forward pass lags the true path\n"
+    "    by about (span - 1) / 2 samples; that forward result is then filtered\n"
+    "    again backward, imposing an equal and opposite delay, so the lag cancels\n"
+    "    exactly and the output stays centred on the real trajectory. Filtering\n"
+    "    twice squares the frequency response, so expect noticeably stronger\n"
+    "    smoothing than a single pass at the same span. The span is always in\n"
+    "    samples. This is the same filter family the Wiser hardware applies in\n"
+    "    real time (where it must stay causal, hence laggy); to match a hardware\n"
+    "    filter value F, use span = 2F - 1."
+)
 
 
 class PreviewIndexBuilder(QThread):
@@ -1696,6 +1755,8 @@ class UWBQuickVisualizationWindow(QWidget):
         # last-known). Independent of the Preview Options 'Show ...' toggles,
         # which only affect the live preview.
         self.plot_layers = dict(DEFAULT_PLOT_LAYERS)
+        self._exported_sitemap = None  # {filename, extent_m} once an export writes it
+        self._animation_tags = None    # None = all; else a subset of shortids
 
         # Preview state. The timeline spans the whole recording but memory
         # holds at most MAX_CACHED_CHUNKS slices — see the streaming chunk
@@ -2031,6 +2092,18 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_scrub_timer.setSingleShot(True)
         self.preview_scrub_timer.timeout.connect(self._on_scrub_settled)
 
+        # Changing the trail length redraws instantly from cache, but the chunks
+        # also carry a lead-in overlap sized to the trail; reloading them keeps
+        # the trail continuous across chunk boundaries. Debounced so holding the
+        # spinbox arrow doesn't reload on every step.
+        self.preview_trail_timer = QTimer(self)
+        self.preview_trail_timer.setSingleShot(True)
+        self.preview_trail_timer.timeout.connect(self.invalidate_preview_cache)
+
+        # ← / → arrow scrubbing (1 second per step). App-level filter so the
+        # keys work regardless of which widget has focus.
+        QApplication.instance().installEventFilter(self)
+
         # Select All/None and config loading toggle every tag checkbox in a
         # burst; coalesce them into one preview rebuild.
         self.preview_tag_timer = QTimer(self)
@@ -2242,38 +2315,12 @@ class UWBQuickVisualizationWindow(QWidget):
         smoothing_label_layout = QHBoxLayout()
         smoothing_label_layout.addWidget(QLabel("Smoothing method:"))
         self.combo_smoothing = QComboBox()
-        self.combo_smoothing.setToolTip(
-            "Applied per-tag after filtering. All methods are symmetric "
-            "(zero-phase): because this is post-processing, each sample's "
-            "future is known, so smoothing introduces no temporal lag.\n"
-            "\n"
-            "• None: skip smoothing entirely\n"
-            "• Rolling Average: centered equal-weight window; good "
-            "general-purpose smoothing\n"
-            "• Rolling Median: centered window taking the median; more robust "
-            "to any outliers the filters missed\n"
-            "• Savitzky-Golay: fits a quadratic to a centered window; "
-            "preserves peaks and sharp turns better than averaging\n"
-            "\n"
-            "• Forward-Backward EWMA: exponentially weighted moving average "
-            "run in both directions. Procedure: (1) an EWMA sweeps forward "
-            "through the trajectory, weighting recent samples most heavily; "
-            "(2) a second EWMA sweeps backward over that result. A single "
-            "forward pass lags the true path by roughly (span-1)/2 samples; "
-            "the backward pass imposes an equal and opposite delay, so the "
-            "lag cancels exactly and the output stays centered on the real "
-            "trajectory. Because the signal is filtered twice, the frequency "
-            "response is squared — expect noticeably stronger smoothing than "
-            "a single pass at the same span. This is the same filter family "
-            "the Wiser hardware applies in real time (where it must be "
-            "causal, hence laggy). To match a hardware filter value F, use "
-            "span = 2F - 1."
-        )
+        self.combo_smoothing.setToolTip(SMOOTHING_METHODS_TOOLTIP)
         self.combo_smoothing.addItems([
-            "None", "Rolling Average (default)", "Rolling Median",
-            "Savitzky-Golay", "Forward-Backward EWMA"
+            "None (default)", "Forward-Backward EWMA", "Savitzky-Golay",
+            "Rolling Median", "Rolling Average"
         ])
-        self.combo_smoothing.setCurrentIndex(1)
+        self.combo_smoothing.setCurrentIndex(0)
         self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
         smoothing_label_layout.addWidget(self.combo_smoothing)
         export_layout.addLayout(smoothing_label_layout)
@@ -2331,10 +2378,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.rolling_window_layout.addStretch()
         export_layout.addLayout(self.rolling_window_layout)
         # Sync the window control's visibility to the default method now.
-        # setCurrentIndex(1) above ran before the signal was connected, so
-        # on_smoothing_changed never fired — without this call the Smoothing
-        # Window stays hidden on first load even though Rolling Average (the
-        # default) uses it, only appearing once the user toggles the method.
+        # setCurrentIndex above ran before the signal was connected, so
+        # on_smoothing_changed never fired — sync the Smoothing Window's
+        # visibility to the initial method (hidden for the None default,
+        # shown once a rolling method is chosen).
         self.on_smoothing_changed(self.combo_smoothing.currentText())
 
         # ---- CSV / plot / animation export options (continue the same group) --
@@ -2496,6 +2543,30 @@ class UWBQuickVisualizationWindow(QWidget):
         trail_layout.addWidget(self.spin_animation_trail)
         animation_options_layout.addLayout(trail_layout)
 
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("Color by:"))
+        self.combo_color_by = QComboBox()
+        self.combo_color_by.addItems(["None", "ID", "sex"])
+        self.combo_color_by.setCurrentText("None")
+        self.combo_color_by.setToolTip(
+            "How trajectories are coloured. None: all the same. ID: a unique "
+            "colour per tag. sex: blue = male, red = female (needs identities).")
+        color_layout.addWidget(self.combo_color_by, 1)
+        animation_options_layout.addLayout(color_layout)
+
+        # Which animals to render (default: all configured tags).
+        inctag_layout = QHBoxLayout()
+        inctag_layout.addWidget(QLabel("Include tags:"))
+        self.lbl_anim_tags = QLabel("All configured tags")
+        self.lbl_anim_tags.setStyleSheet("color:#aaaaaa; font-style:italic;")
+        inctag_layout.addWidget(self.lbl_anim_tags, 1)
+        self.btn_anim_tags = QPushButton("Select…")
+        self.btn_anim_tags.setFixedWidth(80)
+        self.btn_anim_tags.setToolTip("Choose a subset of tags to include in the animation")
+        self.btn_anim_tags.clicked.connect(self.select_animation_tags)
+        inctag_layout.addWidget(self.btn_anim_tags)
+        animation_options_layout.addLayout(inctag_layout)
+
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
@@ -2519,29 +2590,6 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         fps_layout.addWidget(self.combo_animation_fps)
         animation_options_layout.addLayout(fps_layout)
-
-        time_window_layout = QHBoxLayout()
-        time_window_layout.addWidget(QLabel("Time window (seconds):"))
-        self.spin_time_window = QSpinBox()
-        self.spin_time_window.setRange(1, 300)
-        self.spin_time_window.setValue(30)
-        self.spin_time_window.setToolTip(
-            "Width of the time slice shown in each animation frame. "
-            "Controls how much data is visible at any moment."
-        )
-        time_window_layout.addWidget(self.spin_time_window)
-        animation_options_layout.addLayout(time_window_layout)
-
-        color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("Color by:"))
-        self.combo_color_by = QComboBox()
-        self.combo_color_by.addItems(["ID", "sex"])
-        self.combo_color_by.setToolTip(
-            "Color each trajectory by individual tag identity or by sex (M/F). "
-            "Requires identities to be configured for sex-based coloring."
-        )
-        color_layout.addWidget(self.combo_color_by)
-        animation_options_layout.addLayout(color_layout)
 
         quality_layout = QHBoxLayout()
         quality_layout.addWidget(QLabel("Video Quality:"))
@@ -2694,6 +2742,7 @@ class UWBQuickVisualizationWindow(QWidget):
         stack_layout = QVBoxLayout()
         stack_layout.setContentsMargins(0, 0, 0, 0)
         self.preview_canvas_2d = UWBPreview2D(self)
+        self.preview_canvas_2d.set_theme("light")   # light is the default view
         stack_layout.addWidget(self.preview_canvas_2d)
         self.preview_canvas_3d = None
         if PREVIEW_HAVE_GL:
@@ -2707,43 +2756,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_stack.setLayout(stack_layout)
         layout.addWidget(self.preview_stack, 1)
 
-        # --- transport (scrubber + play/pause + speed), directly under the map ---
+        # --- transport (scrubber only), directly under the map ---
         self.slider_timeline = QSlider(Qt.Horizontal)
         self.slider_timeline.setRange(0, 0)
         self.slider_timeline.setToolTip(
-            "Scrub the whole recording, first ping to last. Nothing is read "
-            "while you drag — the chunk under the playhead loads once you stop "
-            "moving.")
+            "Scrub the whole recording. Drag, or use the ← / → arrow keys "
+            "(hold to scan) to step back and forth. Nothing is read while you "
+            "move — the chunk under the playhead loads once you stop.")
         self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
         layout.addWidget(self.slider_timeline)
-
-        transport_row = QHBoxLayout()
-        self.btn_preview_rewind = QPushButton("|<")
-        self.btn_preview_rewind.setFixedWidth(40)
-        self.btn_preview_rewind.setToolTip("Jump to the first sample in the recording")
-        self.btn_preview_rewind.clicked.connect(self.rewind_preview)
-        transport_row.addWidget(self.btn_preview_rewind)
-
-        self.btn_preview_play = QPushButton("Play")
-        self.btn_preview_play.setFixedWidth(70)
-        self.btn_preview_play.setToolTip(
-            "Play or pause. Playback runs straight through chunk boundaries — "
-            "the next chunk is fetched in the background before the playhead "
-            "reaches it.")
-        self.btn_preview_play.clicked.connect(self.toggle_preview_play)
-        transport_row.addWidget(self.btn_preview_play)
-
-        transport_row.addWidget(QLabel("Speed:"))
-        self.combo_preview_speed = QComboBox()
-        self.combo_preview_speed.addItems(["1x", "2x", "4x", "8x"])
-        self.combo_preview_speed.setCurrentText("4x")
-        self.combo_preview_speed.setToolTip(
-            "Playback rate relative to real time. At 4x, four seconds of "
-            "tracking data play per second of wall clock.")
-        self.combo_preview_speed.currentTextChanged.connect(self.on_preview_speed_changed)
-        transport_row.addWidget(self.combo_preview_speed)
-        transport_row.addStretch()
-        layout.addLayout(transport_row)
 
         self.lbl_preview_time = QLabel("--")
         self.lbl_preview_time.setStyleSheet("color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
@@ -2760,99 +2781,47 @@ class UWBQuickVisualizationWindow(QWidget):
         The controls formerly crowded under the map now live here so the right
         pane can be just the map plus its transport bar.
 
-        The group is checkable ("Enable Preview and Playback") and off by
-        default: loading a database no longer starts streaming until the user
-        opts in. Qt disables every child of an unchecked checkable group, so the
-        preview controls (and the background/anchor toggles hosted here) stay
-        greyed out until the preview is enabled.
+        The group is checkable ("Enable Preview") and off by default: loading a
+        database does not start streaming until the user opts in. Qt disables
+        every child of an unchecked checkable group, so the preview controls
+        (and the background/zone/anchor toggles hosted here) stay greyed out
+        until the preview is enabled.
+
+        The preview is a streamlined scrubber: drag the timeline to move through
+        the recording as a clean 2D top-down view, with optional zone/background/
+        anchor overlays and identity labels. No playback, no camera, no arena
+        registration — those richer views moved to the UWB Studio.
         """
-        group = QGroupBox("Enable Preview and Playback")
+        group = QGroupBox("Preview")
         v = QVBoxLayout()
 
-        # View selector + camera shortcuts
-        view_row = QHBoxLayout()
-        view_row.addWidget(QLabel("View:"))
+        # The view/arena-registration widgets are retained but hidden: the
+        # streamlined preview is fixed to the 2D idealized top-down view. They
+        # stay instantiated (2D / Auto / zero offset) so the streaming + arena
+        # engine keeps working unchanged.
+        self._legacy_view_holder = QWidget()
+        legacy = QVBoxLayout()
+        legacy.setContentsMargins(0, 0, 0, 0)
         self.combo_view_mode = QComboBox()
         self.combo_view_mode.addItems([self.VIEW_XML, self.VIEW_2D, self.VIEW_3D])
         self.combo_view_mode.setCurrentText(self.VIEW_2D)
-        self.combo_view_mode.setToolTip(
-            "• XML (site map): the real surveyed layout read from the site XML "
-            "— the embedded floorplan image plus every named zone drawn in its "
-            "authored colour. Use this to check tracks against actual arena "
-            "features.\n"
-            "\n"
-            "• 2D Idealized: clean top-down schematic with no site imagery. "
-            "Best for judging smoothing quality without visual clutter.\n"
-            "\n"
-            "• 3D Idealized: orbitable GPU scene — floor grid, enclosure walls, "
-            "support poles, and anchors at their surveyed heights. Drag to "
-            "orbit, scroll to zoom."
-        )
         self.combo_view_mode.currentTextChanged.connect(self.on_preview_backend_changed)
-        view_row.addWidget(self.combo_view_mode, 1)
-        v.addLayout(view_row)
-
-        cam_row = QHBoxLayout()
-        btn_reset_cam = QPushButton("Reset View")
-        btn_reset_cam.setToolTip("Return the camera to the default angled view")
-        btn_reset_cam.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_reset_cam.clicked.connect(lambda: self._preview_backend().reset_camera())
-        cam_row.addWidget(btn_reset_cam)
-        btn_top = QPushButton("Top-Down")
-        btn_top.setToolTip("Look straight down at the arena")
-        btn_top.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_top.clicked.connect(lambda: self._preview_backend().top_down())
-        cam_row.addWidget(btn_top)
-        v.addLayout(cam_row)
-
-        # Arena source + registration offset
-        arena_row = QHBoxLayout()
-        arena_row.addWidget(QLabel("Arena:"))
+        legacy.addWidget(self.combo_view_mode)
         self.combo_arena = QComboBox()
         self.combo_arena.addItem("Auto (fit to data)")
         for name in BUILTIN_ARENAS:
             self.combo_arena.addItem(name)
-        self.combo_arena.setToolTip(
-            "'Auto' sizes a plain rectangle to the loaded samples plus a "
-            "margin, which always works regardless of site.\n"
-            "\n"
-            "A named enclosure draws its real geometry (walls, support poles) "
-            "at true scale. Use the X/Y offset below to register that geometry "
-            "against the data if the tracking origin does not sit at the "
-            "enclosure's south-west corner."
-        )
         self.combo_arena.currentTextChanged.connect(self.refresh_preview_arena)
-        arena_row.addWidget(self.combo_arena, 1)
-        v.addLayout(arena_row)
-
-        offset_row = QHBoxLayout()
-        offset_row.addWidget(QLabel("Offset X:"))
-        self.spin_arena_dx = QDoubleSpinBox()
-        self.spin_arena_dx.setRange(-500.0, 500.0)
-        self.spin_arena_dx.setDecimals(2)
-        self.spin_arena_dx.setSuffix(" m")
-        self.spin_arena_dx.setToolTip(
-            "Moves the arena geometry east/west relative to the tracking data. "
-            "The samples are never transformed — only the drawn enclosure moves.")
+        legacy.addWidget(self.combo_arena)
+        self.spin_arena_dx = QDoubleSpinBox(); self.spin_arena_dx.setRange(-500.0, 500.0)
         self.spin_arena_dx.valueChanged.connect(self.refresh_preview_arena)
-        offset_row.addWidget(self.spin_arena_dx)
-        offset_row.addWidget(QLabel("Y:"))
-        self.spin_arena_dy = QDoubleSpinBox()
-        self.spin_arena_dy.setRange(-500.0, 500.0)
-        self.spin_arena_dy.setDecimals(2)
-        self.spin_arena_dy.setSuffix(" m")
-        self.spin_arena_dy.setToolTip("Moves the arena geometry north/south relative to the data.")
+        legacy.addWidget(self.spin_arena_dx)
+        self.spin_arena_dy = QDoubleSpinBox(); self.spin_arena_dy.setRange(-500.0, 500.0)
         self.spin_arena_dy.valueChanged.connect(self.refresh_preview_arena)
-        offset_row.addWidget(self.spin_arena_dy)
-        btn_auto_reg = QPushButton("Auto-Fit")
-        btn_auto_reg.setToolTip(
-            "Set the offset so the enclosure is centred on the loaded data's "
-            "bounding box. A good starting point when you know the site but "
-            "not the tracking origin.")
-        btn_auto_reg.setStyleSheet("padding: 4px; font-size: 10px;")
-        btn_auto_reg.clicked.connect(self.auto_register_arena)
-        offset_row.addWidget(btn_auto_reg)
-        v.addLayout(offset_row)
+        legacy.addWidget(self.spin_arena_dy)
+        self._legacy_view_holder.setLayout(legacy)
+        self._legacy_view_holder.setVisible(False)
+        v.addWidget(self._legacy_view_holder)
 
         # Background image + anchor display (relocated here from the old
         # Smoothing & Filtering group; these are display concerns for the
@@ -2900,72 +2869,134 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         v.addWidget(self.chk_show_anchors)
 
-        # Display options: raw overlay + trail length
+        self.chk_show_zones = QCheckBox("Show zone coordinates")
+        self.chk_show_zones.setChecked(True)
+        self.chk_show_zones.setEnabled(False)   # enabled once XML zones are parsed
+        self.chk_show_zones.setToolTip(
+            "Draw the XML-derived zone polygons over the 2D preview, in their "
+            "authored colours. Preview only. Zones are parsed from the site XML.")
+        self.chk_show_zones.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_zones)
+
+        self.chk_preview_dark = QCheckBox("Dark mode")
+        self.chk_preview_dark.setChecked(False)   # light by default
+        self.chk_preview_dark.setToolTip(
+            "Dark background for the preview. Off by default — the light theme "
+            "(white background, tan arena floor) is better for figures and "
+            "screenshots.")
+        self.chk_preview_dark.stateChanged.connect(self.on_preview_theme_changed)
+        v.addWidget(self.chk_preview_dark)
+
+        # Preview thresholding toggles — independent of the export thresholds, so
+        # the user can see the track with/without each applied (values come from
+        # the Export Options threshold spinboxes).
+        self.chk_preview_velocity = QCheckBox("Velocity threshold")
+        self.chk_preview_velocity.setChecked(True)
+        self.chk_preview_velocity.setToolTip(
+            "Apply the velocity threshold to the PREVIEW track (uses the value "
+            "in Export Options). Toggle to see its effect live.")
+        self.chk_preview_velocity.stateChanged.connect(self.invalidate_preview_cache)
+        v.addWidget(self.chk_preview_velocity)
+
+        self.chk_preview_jump = QCheckBox("Jump threshold")
+        self.chk_preview_jump.setChecked(True)
+        self.chk_preview_jump.setToolTip(
+            "Apply the jump threshold to the PREVIEW track (uses the value in "
+            "Export Options). Toggle to see its effect live.")
+        self.chk_preview_jump.stateChanged.connect(self.invalidate_preview_cache)
+        v.addWidget(self.chk_preview_jump)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color by:"))
+        self.combo_preview_color = QComboBox()
+        self.combo_preview_color.addItems(["None", "ID", "Sex"])
+        self.combo_preview_color.setCurrentText("None")
+        self.combo_preview_color.setToolTip(
+            "How preview tags are coloured. None: all the same. ID: a unique "
+            "colour per tag. Sex: blue = male, red = female (from identities).")
+        self.combo_preview_color.currentTextChanged.connect(self.on_preview_color_changed)
+        color_row.addWidget(self.combo_preview_color, 1)
+        v.addLayout(color_row)
+
+        # Smoothing method: how the live track is drawn — None (actual fixes) or
+        # a smoothing method, so you can compare before committing to export.
+        smooth_row = QHBoxLayout()
+        smooth_row.addWidget(QLabel("Smoothing method:"))
+        self.combo_preview_smoothing = QComboBox()
+        self.combo_preview_smoothing.addItems([
+            "None", "Forward-Backward EWMA", "Savitzky-Golay",
+            "Rolling Median", "Rolling Average"])
+        self.combo_preview_smoothing.setCurrentText("None")
+        self.combo_preview_smoothing.setToolTip(
+            "Preview only: see how each method looks before committing to one for\n"
+            "export. It reads the same Smoothing Window / units set in Export\n"
+            "Options, so the preview matches the exported result.\n"
+            "\n" + SMOOTHING_METHODS_TOOLTIP)
+        self.combo_preview_smoothing.currentTextChanged.connect(self.on_preview_smoothing_changed)
+        smooth_row.addWidget(self.combo_preview_smoothing, 1)
+        v.addLayout(smooth_row)
+
+        # Smoothing Window for the preview — its own controls (independent of
+        # Export Options) so you can see live how the window size and the
+        # seconds/samples interpretation change the track. on_preview_smoothing_
+        # changed shows/hides these per method (None/Savitzky-Golay expose
+        # nothing, EWMA hides the units since its span is always in samples).
+        pwin_row = QHBoxLayout()
+        self.lbl_preview_window = QLabel("Smoothing Window:")
+        pwin_row.addWidget(self.lbl_preview_window)
+        self.spin_preview_window = QSpinBox()
+        self.spin_preview_window.setRange(1, 600)
+        self.spin_preview_window.setValue(30)
+        self.spin_preview_window.setToolTip(
+            "Size of the preview smoothing window. Read as seconds or samples "
+            "per the units selector; for Forward-Backward EWMA it is the span "
+            "(alpha = 2 / (span + 1)). Larger = smoother, less detail.")
+        self.spin_preview_window.valueChanged.connect(self.invalidate_preview_cache)
+        pwin_row.addWidget(self.spin_preview_window)
+        self.combo_preview_window_units = QComboBox()
+        self.combo_preview_window_units.addItems(["Seconds", "Samples"])
+        self.combo_preview_window_units.setCurrentText("Seconds")
+        self.combo_preview_window_units.setToolTip(
+            "How to read the preview Smoothing Window (Rolling Average / Median "
+            "only): Seconds = a real-time window, independent of the reporting "
+            "rate; Samples = a fixed count of consecutive fixes.")
+        self.combo_preview_window_units.currentTextChanged.connect(self.invalidate_preview_cache)
+        pwin_row.addWidget(self.combo_preview_window_units)
+        pwin_row.addStretch()
+        v.addLayout(pwin_row)
+        # Set initial visibility for the default method (None → hidden).
+        self.on_preview_smoothing_changed()
+
         disp_row = QHBoxLayout()
-        self.chk_preview_raw = QCheckBox("Overlay raw")
-        self.chk_preview_raw.setChecked(False)   # off by default: clean track
-        self.chk_preview_raw.setToolTip(
-            "Off by default for a clean track line. When on, draws every "
-            "unsmoothed fix as a faint grey dot beneath the track — useful for "
-            "judging whether a smoothing method follows the animal or cuts "
-            "corners, but it looks like scattered noise.")
-        self.chk_preview_raw.stateChanged.connect(self.render_preview_frame)
-        disp_row.addWidget(self.chk_preview_raw)
-
-        self.chk_preview_light = QCheckBox("Light mode")
-        self.chk_preview_light.setChecked(False)
-        self.chk_preview_light.setToolTip(
-            "White background with a tan arena floor, matching the ABMA "
-            "VoleTerra 2D light model. Good for figures and print.")
-        self.chk_preview_light.stateChanged.connect(self.on_preview_theme_changed)
-        disp_row.addWidget(self.chk_preview_light)
-        disp_row.addStretch()
-        v.addLayout(disp_row)
-
-        trail_row = QHBoxLayout()
-        trail_row.addWidget(QLabel("Trail:"))
+        disp_row.addWidget(QLabel("Trail:"))
         self.spin_preview_trail = QSpinBox()
         self.spin_preview_trail.setRange(0, 3600)     # up to one hour of path
         self.spin_preview_trail.setValue(60)
         self.spin_preview_trail.setSuffix(" s")
         self.spin_preview_trail.setSingleStep(30)
         self.spin_preview_trail.setToolTip(
-            "Seconds of trailing track drawn behind each tag, up to one hour "
-            "(3600 s). The trail is bounded by the loaded chunk, so to see the "
-            "full hour raise 'Chunk' to 60 min as well.")
-        self.spin_preview_trail.valueChanged.connect(self.render_preview_frame)
-        trail_row.addWidget(self.spin_preview_trail)
-        trail_row.addStretch()
-        v.addLayout(trail_row)
+            "Seconds of trailing track drawn behind each tag's current position.")
+        self.spin_preview_trail.valueChanged.connect(self.on_preview_trail_changed)
+        disp_row.addWidget(self.spin_preview_trail)
+        disp_row.addStretch()
+        v.addLayout(disp_row)
 
-        # Data window: chunk length + playback rate
-        dur_row = QHBoxLayout()
-        dur_row.addWidget(QLabel("Chunk:"))
+        # Chunk length + binning rate are streaming internals: kept at sensible
+        # defaults but hidden so the streamlined preview stays simple.
+        self._preview_stream_holder = QWidget()
+        stream_l = QHBoxLayout(); stream_l.setContentsMargins(0, 0, 0, 0)
         self.spin_preview_minutes = QSpinBox()
         self.spin_preview_minutes.setRange(1, 60)
-        self.spin_preview_minutes.setValue(5)
-        self.spin_preview_minutes.setSuffix(" min")
-        self.spin_preview_minutes.setToolTip(
-            "How much recording time is held in memory at once. The timeline "
-            "spans the whole database, but only a few chunks of this length are "
-            "ever resident — that is what keeps memory flat regardless of "
-            "database size.\n"
-            "\n"
-            "Larger chunks mean fewer loads while scrubbing, at proportionally "
-            "more RAM.")
+        self.spin_preview_minutes.setValue(10)
         self.spin_preview_minutes.valueChanged.connect(self.invalidate_preview_cache)
-        dur_row.addWidget(self.spin_preview_minutes)
-        dur_row.addWidget(QLabel("Rate:"))
+        stream_l.addWidget(self.spin_preview_minutes)
         self.combo_preview_hz = QComboBox()
         self.combo_preview_hz.addItems(["1 Hz", "2 Hz", "5 Hz"])
-        self.combo_preview_hz.setToolTip(
-            "Playback resolution. Each chunk is binned to this rate to build "
-            "frames. These tags report at well under 1 Hz each, so 1 Hz is "
-            "usually the right choice; higher rates mostly add empty frames.")
         self.combo_preview_hz.currentTextChanged.connect(self.invalidate_preview_cache)
-        dur_row.addWidget(self.combo_preview_hz)
-        dur_row.addStretch()
-        v.addLayout(dur_row)
+        stream_l.addWidget(self.combo_preview_hz)
+        self._preview_stream_holder.setLayout(stream_l)
+        self._preview_stream_holder.setVisible(False)
+        v.addWidget(self._preview_stream_holder)
 
         self.lbl_preview_status = QLabel("Load a database and select tags to preview")
         self.lbl_preview_status.setStyleSheet("color: #888888; font-style: italic; font-size: 9px;")
@@ -2974,53 +3005,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.lbl_cache_status = QLabel("")
         self.lbl_cache_status.setStyleSheet("color: #666666; font-size: 9px;")
-        self.lbl_cache_status.setToolTip(
-            "Chunks currently resident in memory. Capped — the oldest is "
-            "evicted as you scrub, so memory does not grow over a session.")
         v.addWidget(self.lbl_cache_status)
 
-        # Quick snapshot plot
-        self.btn_last_locations = QPushButton("Plot Last Known Locations")
-        self.btn_last_locations.setToolTip(
-            "Save a snapshot showing the most recent fix for every selected "
-            "tag, labelled by identity, over the arena. Written as a PNG (and "
-            "SVG if 'Also save as SVG' is on) to the analysis folder — a quick "
-            "way to see where each animal ended up without exporting the full "
-            "run.")
-        self.btn_last_locations.clicked.connect(self.plot_last_known_locations)
-        v.addWidget(self.btn_last_locations)
-
-        self.btn_occupancy = QPushButton("Occupancy Heatmaps")
-        self.btn_occupancy.setToolTip(
-            "Build a space-use (occupancy) heatmap from the ENTIRE recording "
-            "for every selected tag, faceted one panel per animal, and open it "
-            "in a zoomable window. Each panel shows the % of time spent in each "
-            "arena cell. Select a single tag first for one large per-animal "
-            "map. Also saved as a PNG to the analysis folder.")
-        self.btn_occupancy.clicked.connect(self.plot_occupancy_heatmaps)
-        v.addWidget(self.btn_occupancy)
-
-        self.btn_build_index = QPushButton("Fast index: not built")
-        self.btn_build_index.setStyleSheet("padding: 4px; font-size: 10px;")
-        self.btn_build_index.setToolTip(
-            "Wiser databases ship with no index, so every preview read scans "
-            "the whole table. FNT can make an indexed COPY in the analysis "
-            "folder — chunk loads go from ~0.40 s to ~0.005 s (about 80x).\n"
-            "\n"
-            "Your original database is never modified. The copy is identical "
-            "to it plus one index on (shortid, timestamp): nothing filtered, "
-            "no rows changed. It costs roughly 25% extra disk and is safe to "
-            "delete — it rebuilds on demand.\n"
-            "\n"
-            "Note this speeds up preview scrubbing only. Export reads every "
-            "row for a tag and is a full scan either way, so it is unaffected."
-            "\n\nClick to build, or to force a rebuild if the source changed.")
-        self.btn_build_index.clicked.connect(self.rebuild_preview_index)
-        v.addWidget(self.btn_build_index)
-
-        # Hold every preview control in a single body widget so the group can
-        # collapse to just its title/checkbox when disabled — Qt only greys a
-        # checkable group's children, so we hide the body ourselves.
+        # The fast index builds/adopts automatically when the preview loads
+        # (see ensure_preview_index_db) — no manual button needed. _set_index_status
+        # writes into lbl_cache_status when a build is running.
         self.preview_options_body = QWidget()
         self.preview_options_body.setLayout(v)
         outer = QVBoxLayout()
@@ -3028,13 +3017,9 @@ class UWBQuickVisualizationWindow(QWidget):
         outer.addWidget(self.preview_options_body)
         group.setLayout(outer)
 
-        # Off by default: nothing streams until the user opts in. Wire the
-        # toggle signal only after setting the initial state so the slot does
-        # not fire (and touch not-yet-fully-built state) during construction.
-        group.setCheckable(True)
-        group.setChecked(False)
-        self.preview_options_body.setVisible(False)  # collapsed until enabled
-        group.toggled.connect(self.on_preview_enabled_toggled)
+        # No enable toggle — the preview loads automatically when a database and
+        # tags are available (see activate_preview, driven by the tag-selection
+        # and load paths). The body is always visible.
         self.grp_preview = group
         return group
 
@@ -3042,29 +3027,51 @@ class UWBQuickVisualizationWindow(QWidget):
         """Bring the always-visible preview to life once data is available.
 
         The pane is shown from startup (empty), mirroring the other FNT tools.
-        This is called when a database, table and at least one tag exist. It
-        adopts an existing indexed copy if one is present but does NOT build a
-        fresh ~GB copy automatically — reads stream from the original database
-        (fast enough: ~1.6 s for the first chunk on a 1 GB file), and the user
-        can opt into the index via the 'Fast index' button for instant seeks.
+        This is called when a database, table and at least one tag exist.
+        Enabling the preview now builds the indexed copy automatically (for the
+        fastest possible scrubbing); reads stream from the original meanwhile
+        and switch over transparently once the copy is ready.
 
-        Gated on the "Enable Preview and Playback" toggle: while it is off the
-        preview stays inert no matter what data is loaded or which tags are
-        selected. Enabling the toggle re-enters here via on_preview_enabled_toggled.
+        The preview loads automatically once a database, table and at least one
+        tag are available — there is no enable toggle.
         """
-        if not getattr(self, 'grp_preview', None) or not self.grp_preview.isChecked():
-            return
         if not (self.db_path and self.table_name and self.selected_preview_tags()):
             return
         self._preview_active = True
-        if not PREVIEW_HAVE_GL:
-            self.log_message(f"Preview: 3D unavailable ({PREVIEW_GL_ERROR}); 2D and XML views work.")
-        self.adopt_preview_index_db()
+        # Build/adopt the fast index automatically for instant scrubbing.
+        self.ensure_preview_index_db()
         self.refresh_preview_arena()
         if self.init_preview_timeline():
             self.preview_playhead_ms = self.preview_t0
             self._sync_timeline_to_playhead()
             self._request_chunk(0, make_current=True)
+
+    def eventFilter(self, obj, event):
+        """App-level ← / → scrubbing so the arrows work regardless of focus.
+
+        One second per step — including while held (auto-repeat just steps again
+        at the OS repeat rate); no acceleration. The timeline slider's unit is
+        one second. Arrows keep their normal behaviour only while a value editor
+        (spinbox / text field) is focused, or a combo's dropdown is actually
+        open — a merely focused-but-closed combo (e.g. right after picking a
+        smoothing option) does NOT block scrubbing.
+        """
+        from PyQt5.QtCore import QEvent
+        from PyQt5.QtWidgets import QAbstractSpinBox, QComboBox, QLineEdit
+        if (event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)
+                and getattr(self, '_preview_active', False)
+                and self.slider_timeline.maximum() > 0):
+            fw = QApplication.focusWidget()
+            editing = isinstance(fw, (QAbstractSpinBox, QLineEdit))
+            combo_open = isinstance(fw, QComboBox) and fw.view().isVisible()
+            if not editing and not combo_open:
+                delta = -1 if event.key() == Qt.Key_Left else 1
+                self.slider_timeline.setValue(int(np.clip(
+                    self.slider_timeline.value() + delta,
+                    self.slider_timeline.minimum(), self.slider_timeline.maximum())))
+                return True
+        return super().eventFilter(obj, event)
 
     def on_preview_enabled_toggled(self, enabled):
         """Enable/disable the live preview when the group checkbox is toggled.
@@ -3171,16 +3178,38 @@ class UWBQuickVisualizationWindow(QWidget):
                 arena = BUILTIN_ARENAS[name](origin_x=dx, origin_y=dy)
                 arena.anchors = list(self.anchor_positions or [])
             else:
-                xs = ys = None
+                # Frame to the union of everything on screen so the site is
+                # never cropped: data, plus the XML zones and map extent when
+                # present. (fit_arena_to_data already folds in the anchors.)
+                xs_parts, ys_parts = [], []
                 if self.preview_x is not None and len(self.preview_x):
-                    xs = self.preview_x.ravel()
-                    ys = self.preview_y.ravel()
+                    xs_parts.append(self.preview_x.ravel())
+                    ys_parts.append(self.preview_y.ravel())
+                for z in (self.xml_zones or []):
+                    pts = z.get('points')
+                    if pts is not None and len(pts):
+                        pts = np.asarray(pts, float)
+                        xs_parts.append(pts[:, 0]); ys_parts.append(pts[:, 1])
+                if self.xml_map_extent:
+                    mx0, mx1, my0, my1 = self.xml_map_extent
+                    xs_parts.append(np.array([mx0, mx1])); ys_parts.append(np.array([my0, my1]))
+                xs = np.concatenate(xs_parts) if xs_parts else None
+                ys = np.concatenate(ys_parts) if ys_parts else None
                 arena = fit_arena_to_data(xs, ys, self.anchor_positions)
                 arena.origin_x += dx
                 arena.origin_y += dy
 
         if not self.chk_show_anchors.isChecked():
             arena.anchors = []
+
+        # Zone overlay for the streamlined 2D preview: the data-fit arena carries
+        # no zones, so inject the XML zones when the user wants them shown. (In
+        # the retained XML view the arena already has them; re-setting is a
+        # harmless no-op.)
+        if getattr(self, 'chk_show_zones', None) is not None and self.chk_show_zones.isChecked() and self.xml_zones:
+            arena.zones = list(self.xml_zones)
+        elif getattr(self, 'chk_show_zones', None) is not None and not self.chk_show_zones.isChecked():
+            arena.zones = []
 
         self.preview_arena = arena
         self.preview_canvas_2d.set_arena(arena)
@@ -3237,8 +3266,8 @@ class UWBQuickVisualizationWindow(QWidget):
     # The timeline spans the whole recording, but memory holds at most
     # MAX_CACHED_CHUNKS slices. Scrubbing is debounced so dragging costs
     # nothing; only where you stop is fetched, on a background thread.
-    MAX_CACHED_CHUNKS = 4
-    SCRUB_DEBOUNCE_MS = 250
+    MAX_CACHED_CHUNKS = 6
+    SCRUB_DEBOUNCE_MS = 70
 
     def preview_time_bounds(self, selected_tags):
         """(min_ts, max_ts) epoch-ms across the selected tags, or None."""
@@ -3336,6 +3365,10 @@ class UWBQuickVisualizationWindow(QWidget):
         total_s = max(1, (self.preview_t1 - self.preview_t0) // 1000)
         self._timeline_guard = True
         self.slider_timeline.setRange(0, int(total_s))
+        # Arrow-key / hold scrubbing: ~1000 steps across the recording per
+        # single press, ~50 per Page. Fine for fine control, fast when held.
+        self.slider_timeline.setSingleStep(max(1, int(total_s) // 1000))
+        self.slider_timeline.setPageStep(max(1, int(total_s) // 50))
         self._timeline_guard = False
         days = total_s / 86400.0
         self.log_message(
@@ -3356,6 +3389,29 @@ class UWBQuickVisualizationWindow(QWidget):
         c = self._chunk_ms()
         start = self.preview_t0 + idx * c
         return start, start + c
+
+    def _resident_chunk_for(self, ts_ms):
+        """Index of the cached chunk whose span contains ``ts_ms``, else None.
+
+        Chunks are fixed-width and index-aligned, so the only candidate is
+        ``_chunk_index_for(ts_ms)``; return it only when it is actually cached.
+        """
+        idx = self._chunk_index_for(ts_ms)
+        c = self.preview_cache.get(idx)
+        if c is not None and c["t_start"] <= ts_ms <= c["t_end"]:
+            return idx
+        return None
+
+    def _prefetch_neighbors(self, idx):
+        """Warm the chunks on either side so a continuous scrub stays in cache.
+
+        ``_request_chunk`` no-ops for anything already cached or in flight, so
+        calling this on every chunk switch is cheap and self-limiting.
+        """
+        for nb in (idx + 1, idx - 1):
+            if (nb >= 0 and nb not in self.preview_cache
+                    and nb not in self.preview_inflight):
+                self._request_chunk(nb, make_current=False)
 
     def _update_cache_label(self):
         if not hasattr(self, "lbl_cache_status"):
@@ -3386,13 +3442,20 @@ class UWBQuickVisualizationWindow(QWidget):
         start, end = self._chunk_bounds(idx)
         if start > self.preview_t1:
             return
+        # Load a lead-in before the chunk so smoothing and forward-fill are
+        # warmed and the trailing track is continuous across the boundary — a
+        # tag's position and its tail no longer reset when you scrub from one
+        # chunk into the next. Bounded by the chunk width: a trail longer than a
+        # chunk can't be shown in full anyway (frames are chunk-local).
+        lead = min(self.spin_preview_trail.value() * 1000, self._chunk_ms())
+        load_start = max(self.preview_t0, start - lead)
 
         if make_current:
             self.preview_pending_current = idx
             self.lbl_preview_status.setText("Loading…")
 
         loader = PreviewChunkLoader(self.preview_db_path or self.db_path,
-                                    self.table_name, tags, start, end, idx)
+                                    self.table_name, tags, load_start, end, idx)
         loader.loaded.connect(self._on_chunk_loaded)
         loader.failed.connect(self._on_chunk_failed)
         # The inflight dict holds the only strong reference to the thread.
@@ -3429,7 +3492,7 @@ class UWBQuickVisualizationWindow(QWidget):
         the cost (the SQL read dominates).
         """
         try:
-            frames = self._process_chunk(df) if df is not None and len(df) else None
+            frames = self._process_chunk(df, idx) if df is not None and len(df) else None
         except Exception as e:
             self.log_message(f"Preview chunk {idx} processing failed: {e}")
             frames = None
@@ -3476,12 +3539,26 @@ class UWBQuickVisualizationWindow(QWidget):
         self._sync_timeline_to_playhead()
         self._request_chunk(self._chunk_index_for(nxt), make_current=True)
 
-    def _process_chunk(self, df):
-        """Filter, smooth and bin one slice into frame arrays, or None if empty."""
+    def get_preview_smoothing_method(self):
+        """Smoothing method for the LIVE preview (its own 'Smoothing method'
+        selector, independent of the export method). 'None' shows raw fixes."""
+        return (self.combo_preview_smoothing.currentText()
+                if hasattr(self, 'combo_preview_smoothing') else 'None')
+
+    def _process_chunk(self, df, idx=None):
+        """Filter, smooth and bin one slice into frame arrays, or None if empty.
+
+        ``idx`` is the chunk index; when given, the frames' nominal span is set
+        from it (not from the data), so the lead-in overlap the loader prepends
+        stays outside the scrubbable/containment range.
+        """
         tz = pytz.timezone(self.combo_timezone.currentText())
-        smoothing_method = self.get_smoothing_method()
-        do_filter = (self.chk_velocity_filter.isChecked()
-                     or self.chk_jump_filter.isChecked())
+        smoothing_method = self.get_preview_smoothing_method()
+        # Preview thresholding toggles are independent of the export ones, so the
+        # user can compare the track with/without each threshold live.
+        use_vel = self.chk_preview_velocity.isChecked()
+        use_jump = self.chk_preview_jump.isChecked()
+        do_filter = use_vel or use_jump
         tags = self.selected_preview_tags()
 
         chunks = []
@@ -3497,19 +3574,29 @@ class UWBQuickVisualizationWindow(QWidget):
             if do_filter:
                 # collect_stats=False: preview scrubbing must not overwrite the
                 # figures an export writes into runSummary.csv
-                g = self.apply_filters_to_data(g, collect_stats=False)
+                g = self.apply_filters_to_data(g, collect_stats=False,
+                                               velocity=use_vel, jump=use_jump)
             if smoothing_method != "None" and len(g):
-                g = self.apply_smoothing_to_data(g, smoothing_method)
+                # Preview uses its own Smoothing Window / units so the effect can
+                # be tuned live, independent of the Export Options values.
+                g = self.apply_smoothing_to_data(
+                    g, smoothing_method,
+                    window=self.spin_preview_window.value(),
+                    units=self.combo_preview_window_units.currentText())
             if len(g):
                 chunks.append(g)
         if not chunks:
             return None
 
         merged = pd.concat(chunks, ignore_index=True)
-        return self._build_preview_frames(merged, tags)
+        return self._build_preview_frames(merged, tags, idx)
 
-    def _build_preview_frames(self, df, selected_tags):
-        """Bin a slice onto a fixed time grid: one column per selected tag."""
+    def _build_preview_frames(self, df, selected_tags, idx=None):
+        """Bin a slice onto a fixed time grid: one column per selected tag.
+
+        When ``idx`` is given, t_start/t_end are the chunk's nominal bounds so
+        the loader's lead-in overlap is excluded from the resident/scrub range.
+        """
         hz = int(self.combo_preview_hz.currentText().split()[0])
         bin_ns = int(1_000_000_000 / hz)
         df = df.copy()
@@ -3556,10 +3643,17 @@ class UWBQuickVisualizationWindow(QWidget):
         times = pd.to_datetime(grid * bin_ns, utc=True).tz_convert(
             pytz.timezone(self.combo_timezone.currentText()))
 
+        # Nominal chunk bounds when we know the index, so the lead-in overlap the
+        # loader prepends is not treated as scrubbable/resident; else fall back
+        # to the data span.
+        if idx is not None:
+            t_start, t_end = self._chunk_bounds(idx)
+        else:
+            t_start = int(times[0].timestamp() * 1000)
+            t_end = int(times[-1].timestamp() * 1000)
+
         return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, times=times,
-                    tags=cols, hz=hz,
-                    t_start=int(times[0].timestamp() * 1000),
-                    t_end=int(times[-1].timestamp() * 1000),
+                    tags=cols, hz=hz, t_start=t_start, t_end=t_end,
                     nbytes=X.nbytes + Y.nbytes + XF.nbytes + YF.nbytes
                            + RX.nbytes + RY.nbytes)
 
@@ -3569,14 +3663,55 @@ class UWBQuickVisualizationWindow(QWidget):
     # assigns sex/identity in Configure Identities.
     _SEX_BLUE = (0.20, 0.55, 0.90, 1.0)
     _SEX_RED = (0.90, 0.25, 0.25, 1.0)
+    _NEUTRAL = (0.20, 0.55, 0.90, 1.0)   # single colour when "Color by: None"
 
     def _preview_tag_colors(self, tags):
-        """One RGBA per tag: blue=male, red=female, from configured identities."""
-        out = []
-        for tag in tags:
-            sex = (self.tag_identities.get(tag, {}) or {}).get('sex', 'M')
-            out.append(self._SEX_RED if sex == 'F' else self._SEX_BLUE)
-        return np.array(out, dtype=float)
+        """One RGBA per tag, per the preview 'Color by' selector:
+        None → all the same; ID → a unique colour per tag; Sex → blue=M, red=F."""
+        mode = self.combo_preview_color.currentText() if hasattr(self, 'combo_preview_color') else 'None'
+        if mode == 'Sex':
+            out = []
+            for tag in tags:
+                sex = (self.tag_identities.get(tag, {}) or {}).get('sex', 'M')
+                out.append(self._SEX_RED if sex == 'F' else self._SEX_BLUE)
+            return np.array(out, dtype=float)
+        if mode == 'ID':
+            cmap = plt.get_cmap('tab20')
+            return np.array([cmap(i % 20) for i in range(len(tags))], dtype=float)
+        return np.array([self._NEUTRAL] * len(tags), dtype=float)   # None
+
+    def on_preview_smoothing_changed(self, *_):
+        """Preview smoothing method changed: show/hide the preview Smoothing
+        Window controls to match the method, then reload chunks under it.
+
+        Mirrors on_smoothing_changed for the Export combo: None and
+        Savitzky-Golay expose no window; the rolling methods expose window +
+        units; EWMA exposes the window (as its span) but not the units.
+        """
+        method = self.combo_preview_smoothing.currentText()
+        is_ewma = method == "Forward-Backward EWMA"
+        is_rolling = method in ("Rolling Average", "Rolling Median")
+        needs_param = is_ewma or is_rolling
+        self.lbl_preview_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
+        self.spin_preview_window.setVisible(needs_param)
+        self.lbl_preview_window.setVisible(needs_param)
+        self.combo_preview_window_units.setVisible(is_rolling)
+        self.invalidate_preview_cache()
+
+    def on_preview_trail_changed(self, *_):
+        """Trail length changed: redraw now from cached frames (cheap), and —
+        debounced — reload the chunks so their lead-in overlap matches the new
+        trail. Without the reload a longer trail would clip at the chunk's
+        loaded start; within a chunk the redraw alone already extends the tail."""
+        self.render_preview_frame()
+        if getattr(self, '_preview_active', False):
+            self.preview_trail_timer.start(400)
+
+    def on_preview_color_changed(self, *_):
+        """Recolour the preview without reloading chunks (colour is cheap)."""
+        if getattr(self, 'preview_tags', None) is not None and len(self.preview_tags):
+            self.preview_colors = self._preview_tag_colors(self.preview_tags)
+            self.render_preview_frame()
 
     def _show_chunk(self, idx):
         """Make a cached chunk the active one and render the playhead frame."""
@@ -3599,10 +3734,12 @@ class UWBQuickVisualizationWindow(QWidget):
         finite = int(np.isfinite(c["x"]).sum())
         self.lbl_preview_status.setText(
             f"{len(c['x'])} frames · {len(c['tags'])} tags · {finite:,} fixes · "
-            f"{self.get_smoothing_method()}")
+            f"{self.combo_preview_smoothing.currentText()}")
         if self.preview_arena is None:
             self.refresh_preview_arena()
         self.render_preview_frame()
+        # Warm the adjacent chunks so the next scrub crossing is already cached.
+        self._prefetch_neighbors(idx)
 
     # -- timeline / playhead ----------------------------------------------- #
     def on_timeline_moved(self, value):
@@ -3616,7 +3753,22 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         self.preview_playhead_ms = self.preview_t0 + int(value) * 1000
         self._update_time_label()
-        self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
+        # If the playhead is inside ANY resident chunk, redraw instantly — it is
+        # just an array index, no DB read. Because we prefetch the neighbouring
+        # chunks, a continuous hold stays inside cache and the tags keep moving
+        # instead of freezing at the old chunk's edge.
+        resident = self._resident_chunk_for(self.preview_playhead_ms)
+        if resident is not None:
+            if resident != self.preview_current_chunk:
+                self._show_chunk(resident)   # also warms the new neighbours
+            else:
+                self.render_preview_frame()
+        elif not self.preview_scrub_timer.isActive():
+            # Not resident: throttle a background load. Testing isActive() rather
+            # than restarting guarantees the timer still fires while the arrow
+            # key auto-repeats, so a sustained hold keeps advancing instead of
+            # starving the loader until the key is released.
+            self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
 
     def _on_scrub_settled(self):
         self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
@@ -3664,13 +3816,13 @@ class UWBQuickVisualizationWindow(QWidget):
         colors = self.preview_colors
 
         # Build the trailing track: one connected polyline per tag over the
-        # trail window (seconds -> frames). The window can reach back an hour,
-        # but is bounded by the loaded chunk, so a longer trail needs a longer
-        # Chunk. Points are the (smoothed) positions; drawing them as a line is
+        # trail window (seconds -> frames). Chunks are loaded with a lead-in
+        # overlap sized to the trail, so the tail stays continuous across chunk
+        # boundaries; a trail longer than a whole chunk still can't be shown in
+        # full. Points are the (smoothed) positions; drawing them as a line is
         # the "track" the user wants instead of a dot cloud.
         trail_frames = int(self.spin_preview_trail.value() * self.preview_hz)
         tracks = []
-        raw_pts = None
         if trail_frames > 0:
             lo = max(0, idx - trail_frames)
             seg_x = self.preview_x[lo:idx + 1]
@@ -3682,87 +3834,19 @@ class UWBQuickVisualizationWindow(QWidget):
                     tracks.append((np.column_stack([tx[ok], ty[ok]]),
                                    tuple(colors[t])))
 
-            if self.chk_preview_raw.isChecked():
-                rseg_x = self.preview_raw_x[lo:idx + 1]
-                rseg_y = self.preview_raw_y[lo:idx + 1]
-                rok = np.isfinite(rseg_x) & np.isfinite(rseg_y)
-                if rok.any():
-                    raw_pts = np.column_stack([rseg_x[rok], rseg_y[rok]])
-
         self._preview_backend().update_frame(x, y, colors,
-                                             tracks=tracks, raw_pts=raw_pts)
+                                             tracks=tracks, raw_pts=None)
         self._update_time_label()
 
     # -- transport --------------------------------------------------------- #
-    def toggle_preview_play(self):
-        if self.preview_timer is not None and self.preview_timer.isActive():
-            self.stop_preview_playback()
-            return
-        if self.preview_t0 is None:
-            QMessageBox.information(self, "No Preview Data",
-                                    "Select a database and tags, then scrub the timeline.")
-            return
-        if self.preview_timer is None:
-            self.preview_timer = QTimer(self)
-            self.preview_timer.timeout.connect(self.advance_preview_frame)
-        self.btn_preview_play.setText("Pause")
-        self.preview_timer.start(self._preview_interval_ms())
-
     def stop_preview_playback(self):
+        """No-op holdover from the old playback engine (kept for call sites).
+
+        Playback was removed; the preview is now scrub-only. If a stray timer
+        ever exists it is stopped, but none is created anymore.
+        """
         if self.preview_timer is not None:
             self.preview_timer.stop()
-        if hasattr(self, "btn_preview_play"):
-            self.btn_preview_play.setText("Play")
-
-    def _preview_interval_ms(self):
-        """Timer period so playback runs at the chosen multiple of real time."""
-        speed = float(self.combo_preview_speed.currentText().rstrip("x"))
-        hz = max(1, getattr(self, "preview_hz", 1))
-        return max(16, int(1000.0 / (hz * speed)))
-
-    def on_preview_speed_changed(self, _text):
-        if self.preview_timer is not None and self.preview_timer.isActive():
-            self.preview_timer.start(self._preview_interval_ms())
-
-    def advance_preview_frame(self):
-        """Step the playhead one frame, rolling into the next chunk as needed."""
-        if self.preview_t0 is None:
-            return
-        step_ms = int(1000 / max(1, getattr(self, "preview_hz", 1)))
-        self.preview_playhead_ms += step_ms
-
-        if self.preview_playhead_ms >= self.preview_t1:      # end of recording
-            self.stop_preview_playback()
-            self.preview_playhead_ms = self.preview_t1
-            self._sync_timeline_to_playhead()
-            return
-
-        idx = self._chunk_index_for(self.preview_playhead_ms)
-        if idx != self.preview_current_chunk:
-            if idx in self.preview_cache:
-                self._show_chunk(idx)                       # prefetch paid off
-            else:
-                self._request_chunk(idx, make_current=True)
-                self._sync_timeline_to_playhead()
-                return
-        else:
-            # Fetch the next chunk before the playhead gets there, so crossing
-            # a boundary does not stall playback.
-            c = self.preview_cache.get(idx)
-            if c is not None:
-                span = max(1, c["t_end"] - c["t_start"])
-                if (self.preview_playhead_ms - c["t_start"]) / span > 0.7:
-                    self._request_chunk(idx + 1)
-
-        self._sync_timeline_to_playhead()
-        self.render_preview_frame()
-
-    def rewind_preview(self):
-        if self.preview_t0 is None:
-            return
-        self.preview_playhead_ms = self.preview_t0
-        self._sync_timeline_to_playhead()
-        self._request_chunk(0, make_current=True)
 
     def _context_bg_source(self):
         """(image, extent) for the 'background' layer of main-thread figures.
@@ -3775,6 +3859,36 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.xml_map_image is not None and self.xml_map_extent is not None:
             return self.xml_map_image, list(self.xml_map_extent)
         return None, None
+
+    def _export_sitemap(self, output_dir, db_name):
+        """Write the background/site-map image into the export folder.
+
+        Makes the analysis folder a self-contained data product for the planned
+        UWB Studio: it carries the positions (CSV), zones/anchors/identities/scale
+        (config) and now the floorplan image too. Prefers a user-loaded PNG
+        (copied verbatim), else the XML-embedded site map (decoded to PNG).
+        Records filename + meter-extent in self._exported_sitemap for the config;
+        leaves it None when there is no background (that is fine — the Studio then
+        draws zones only, or bare tracks).
+        """
+        self._exported_sitemap = None
+        bg_image, bg_extent = self._context_bg_source()
+        if bg_image is None or bg_extent is None:
+            return
+        filename = f'{db_name}_sitemap.png'
+        dest = os.path.join(output_dir, filename)
+        try:
+            if self.background_image_path and os.path.exists(self.background_image_path):
+                shutil.copyfile(self.background_image_path, dest)
+            else:
+                plt.imsave(dest, bg_image)
+            self._exported_sitemap = {
+                'filename': filename,
+                'extent_m': [float(v) for v in bg_extent],
+            }
+            self.log_message(f"✓ Site-map image exported: {filename}")
+        except Exception as e:
+            self.log_message(f"Warning: could not export site-map image: {e}")
 
     def _prompt_plot_layers(self):
         """Prompt for the spatial context layers; update self.plot_layers.
@@ -4245,10 +4359,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self._set_index_status(f"Fast index: {msg}", "#cc9900")
 
     def _set_index_status(self, text, color):
-        if hasattr(self, "btn_build_index"):
-            self.btn_build_index.setText(text)
-            self.btn_build_index.setStyleSheet(
-                f"padding: 4px; font-size: 10px; color: {color};")
+        # Shown as a small status line under the cache label (no button anymore).
+        if hasattr(self, "lbl_cache_status"):
+            self.lbl_cache_status.setText(text)
+            self.lbl_cache_status.setStyleSheet(f"color: {color}; font-size: 9px;")
 
     def _on_index_ready(self, src_path, path):
         self.preview_index_builder = None
@@ -4377,15 +4491,18 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Reset GUI widgets to defaults
         self.combo_timezone.setCurrentText("US/Mountain")
-        self.combo_smoothing.setCurrentIndex(1)  # Rolling Average (default)
+        self.combo_smoothing.setCurrentIndex(0)  # None (default)
         self.spin_rolling_window.setValue(30)
         self.combo_window_units.setCurrentText("Seconds")
+        if hasattr(self, 'spin_preview_window'):
+            self.spin_preview_window.setValue(30)
+            self.combo_preview_window_units.setCurrentText("Seconds")
         self.chk_velocity_filter.setChecked(True)
         self.spin_velocity_threshold.setValue(2.0)
         self.chk_jump_filter.setChecked(True)
         self.spin_jump_threshold.setValue(2.0)
         self.spin_time_gap.setValue(30)
-        self.combo_color_by.setCurrentIndex(0)  # ID
+        self.combo_color_by.setCurrentIndex(0)  # None
 
         # Export options
         self.chk_export_raw_csv.setChecked(True)
@@ -4404,7 +4521,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_animation_trail.setValue(500)
         self.combo_animation_speed.setCurrentText("80x")
         self.combo_animation_fps.setCurrentText("20")
-        self.spin_time_window.setValue(30)
 
         # Reset background image label
         if hasattr(self, 'lbl_background_status'):
@@ -4500,21 +4616,103 @@ class UWBQuickVisualizationWindow(QWidget):
                 pass
         return False
 
+    def _find_candidate_backgrounds(self):
+        """Visible image files in the DB folder, best name-match candidate first.
+
+        Ranks a filename matching the database name ahead of one matching the
+        XML config name, ahead of everything else, so the first entry is the
+        most likely floorplan.
+        """
+        if not self.db_path:
+            return []
+        db_dir = os.path.dirname(self.db_path)
+        exts = ('.png', '.jpg', '.jpeg', '.bmp')
+        imgs = [f for f in list_visible_files(db_dir) if f.lower().endswith(exts)]
+        if not imgs:
+            return []
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0].lower()
+        xml_name = ''
+        if getattr(self, 'xml_config_path', None):
+            xml_name = os.path.splitext(os.path.basename(self.xml_config_path))[0].lower()
+
+        def rank(f):
+            fname = os.path.splitext(f)[0].lower()
+            if db_name and (db_name in fname or fname in db_name):
+                return 0
+            if xml_name and (xml_name in fname or fname in xml_name):
+                return 1
+            return 2
+
+        return sorted(imgs, key=rank)
+
+    def _confirm_background_preview(self, image_path):
+        """Show ``image_path`` in a preview dialog; return True if the user accepts."""
+        from PyQt5.QtGui import QPixmap
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Use This Background Image?")
+        layout = QVBoxLayout(dlg)
+
+        intro = QLabel(f"Detected an image in the database folder:\n\n{os.path.basename(image_path)}")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        preview = QLabel()
+        preview.setAlignment(Qt.AlignCenter)
+        pix = QPixmap(image_path)
+        if not pix.isNull():
+            pix = pix.scaled(480, 360, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            preview.setPixmap(pix)
+        else:
+            preview.setText("(Could not render a preview of this image.)")
+        layout.addWidget(preview)
+
+        question = QLabel("Use this image as the arena background?")
+        question.setWordWrap(True)
+        layout.addWidget(question)
+
+        btn_row = QHBoxLayout()
+        btn_no = QPushButton("No")
+        btn_yes = QPushButton("Yes, use this image")
+        btn_yes.setDefault(True)
+        btn_no.clicked.connect(dlg.reject)
+        btn_yes.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_no)
+        btn_row.addWidget(btn_yes)
+        layout.addLayout(btn_row)
+
+        return dlg.exec_() == QDialog.Accepted
+
     def prompt_background_image(self):
-        """Offer to load a floorplan/background image for this database."""
-        wiser = self.is_wiser_database()
-        lead = ("This looks like a Wiser UWB database.\n\n" if wiser else "")
-        scale_note = (
-            f"An XML scale ({self.xml_scale} in/px) was found, so the image "
-            f"will be placed at true size with its bottom-left corner at the "
-            f"tracking origin (0, 0)."
-            if self.xml_scale else
-            "No XML scale was found — the image can still be loaded but its "
-            "size may not match the tracking coordinates.")
+        """Detect a floorplan image in the DB folder, preview it, and confirm use.
+
+        If one or more images are present, the best-matching candidate is shown
+        in a preview dialog for the user to accept or decline. Declining (or a
+        folder with no images) falls back to the manual file picker.
+        """
+        if not self.db_path:
+            return
+
+        db_dir = os.path.dirname(self.db_path)
+        candidates = self._find_candidate_backgrounds()
+
+        if candidates:
+            candidate = os.path.join(db_dir, candidates[0])
+            self.log_message(f"Detected candidate background image: {candidates[0]}")
+            if self._confirm_background_preview(candidate):
+                self._apply_background_image(candidate, source="loaded")
+            else:
+                # User declined the detected image — let them browse for another.
+                self.select_background_image()
+            return
+
+        # Nothing detected — say so, then offer the manual picker.
+        self.log_message("No background image (PNG/JPG) detected in the database folder.")
         reply = QMessageBox.question(
-            self, "Load Background Image?",
-            f"{lead}Would you like to load a background floorplan image for "
-            f"the arena?\n\n{scale_note}",
+            self, "No Background Image Found",
+            "No background image (PNG/JPG) was detected in the database folder.\n\n"
+            "Would you like to load one?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.select_background_image()
@@ -4627,6 +4825,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.arena_zones = pd.DataFrame(zone_data)
                     num_zones = len(self.arena_zones['zone'].unique())
                     self.log_message(f"Parsed {num_zones} zones with {len(zone_data)} coordinate points from XML")
+                    if hasattr(self, 'chk_show_zones'):
+                        self.chk_show_zones.setEnabled(True)
                 else:
                     self.log_message("No valid zone coordinates found in XML")
             else:
@@ -4699,123 +4899,99 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"Error parsing XML: {str(e)}")
     
     def auto_load_background(self):
-        """Auto-load background image if a PNG exists in the database directory"""
+        """Silently load a background image whose name clearly matches this DB.
+
+        Only fires on a strong name match (DB name or XML config name); an
+        arbitrary lone image (e.g. an ABMA model config PNG) is left for the
+        preview/confirm prompt so the user picks deliberately.
+        """
         if not self.db_path or self.background_image is not None:
             return  # Already loaded (e.g., from config) or no database
 
         db_dir = os.path.dirname(self.db_path)
         db_name = os.path.splitext(os.path.basename(self.db_path))[0]
 
-        # Find PNG files in the database directory (skip hidden/AppleDouble
-        # sidecars like '._floorplan.png' left by macOS on shares).
-        png_files = [f for f in list_visible_files(db_dir) if f.lower().endswith('.png')]
-
-        if not png_files:
-            return
-
-        # Pick the best match: prefer one matching db name or xml config name, else use only if exactly one
-        selected_png = None
-        for f in png_files:
-            fname = os.path.splitext(f)[0].lower()
-            if db_name.lower() in fname or fname in db_name.lower():
-                selected_png = f
-                break
-        if not selected_png and hasattr(self, 'xml_config_path') and self.xml_config_path:
+        # Candidates ranked by name match; only accept an actual match here.
+        candidates = self._find_candidate_backgrounds()
+        xml_name = ''
+        if getattr(self, 'xml_config_path', None):
             xml_name = os.path.splitext(os.path.basename(self.xml_config_path))[0].lower()
-            for f in png_files:
-                fname = os.path.splitext(f)[0].lower()
-                if xml_name in fname or fname in xml_name:
-                    selected_png = f
-                    break
+        selected = None
+        for f in candidates:
+            fname = os.path.splitext(f)[0].lower()
+            if (db_name.lower() in fname or fname in db_name.lower() or
+                    (xml_name and (xml_name in fname or fname in xml_name))):
+                selected = f
+                break
 
-        # No single-PNG fallback: an arbitrary lone PNG (e.g. an ABMA model
-        # config) is often NOT the floorplan. Without a name match, defer to
-        # the "Load Background Image?" prompt so the user picks deliberately.
-        if not selected_png:
+        if not selected:
             return
 
-        file_path = os.path.join(db_dir, selected_png)
+        self._apply_background_image(os.path.join(db_dir, selected), source="auto-loaded")
+
+    def _apply_background_image(self, file_path, source="loaded"):
+        """Load ``file_path`` as the arena background and refresh UI/preview.
+
+        Computes real-world dimensions from the XML scale when available,
+        updates the status label and preview, and returns True on success.
+        ``source`` is a short verb used in the log line ("loaded"/"auto-loaded").
+        """
         try:
             self.background_image = plt.imread(file_path)
-            self.background_image_path = file_path
-            img_height_px, img_width_px = self.background_image.shape[:2]
-
-            if self.xml_scale:
-                self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
-                self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
-                self.log_message(f"✓ Background auto-loaded: {selected_png} ({self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m)")
-            else:
-                self.bg_width_meters = img_width_px * 0.0254
-                self.bg_height_meters = img_height_px * 0.0254
-                self.log_message(f"✓ Background auto-loaded: {selected_png} (no XML scale — dimensions may be inaccurate)")
-
-            self.lbl_background_status.setText(f"\u2713 Background: {selected_png}")
-            self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
-            self.btn_remove_background.setEnabled(True)
-            if self._preview_active:
-                self.refresh_preview_arena()
-
         except Exception as e:
-            self.log_message(f"Warning: Could not auto-load background {selected_png}: {str(e)}")
+            self.log_message(f"Error loading background image: {str(e)}")
+            self.background_image = None
+            self.background_image_path = None
+            self.bg_width_meters = None
+            self.bg_height_meters = None
+            self.lbl_background_status.setText("Error loading background image")
+            self.lbl_background_status.setStyleSheet("color: #aa0000; font-style: italic; font-size: 9px;")
+            return False
+
+        self.background_image_path = file_path
+        name = os.path.basename(file_path)
+        img_height_px, img_width_px = self.background_image.shape[:2]
+
+        if self.xml_scale:
+            # pixels * inches/pixel * meters/inch (1 inch = 0.0254 m)
+            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
+            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
+            self.log_message(f"✓ Background {source}: {name} ({self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m)")
+        else:
+            self.bg_width_meters = img_width_px * 0.0254  # rough 1 inch/pixel fallback
+            self.bg_height_meters = img_height_px * 0.0254
+            self.log_message(f"✓ Background {source}: {name} (no XML scale — dimensions may be inaccurate)")
+
+        self.lbl_background_status.setText(f"✓ Background: {name}")
+        self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
+        self.btn_remove_background.setEnabled(True)
+
+        # Switch the live preview to 2D (the only view that shows the
+        # background) and redraw so the floorplan appears immediately.
+        if self._preview_active:
+            if self.combo_view_mode.currentText() != self.VIEW_2D:
+                self.combo_view_mode.setCurrentText(self.VIEW_2D)
+            self.refresh_preview_arena()
+        return True
 
     def select_background_image(self):
-        """Allow user to select a background image"""
+        """Allow user to select a background image via the file picker."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Background Image",
             os.path.dirname(self.db_path) if self.db_path else "",
             "Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*.*)"
         )
-        
+
         if file_path and os.path.exists(file_path):
-            self.background_image_path = file_path
-            self.log_message(f"Background image loaded: {os.path.basename(file_path)}")
-            
-            # Load the image for matplotlib
-            try:
-                self.background_image = plt.imread(file_path)
-                self.log_message(f"Background image size: {self.background_image.shape}")
-                
-                # Calculate dimensions in meters using XML scale if available
-                img_height_px, img_width_px = self.background_image.shape[:2]
-                if self.xml_scale:
-                    # Convert: pixels * inches/pixel * meters/inch = meters
-                    # 1 inch = 0.0254 meters
-                    self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
-                    self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
-                    self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m")
-                else:
-                    # No XML scale — warn user that dimensions will be incorrect
-                    self.bg_width_meters = img_width_px * 0.0254  # Assume 1 inch/pixel as rough fallback
-                    self.bg_height_meters = img_height_px * 0.0254
-                    self.log_message("WARNING: No XML scale found — background dimensions may be incorrect. Load an XML configuration for accurate scaling.")
-                    QMessageBox.warning(
-                        self, "No Scale Available",
-                        "No XML scale has been loaded. The background image dimensions "
-                        "may be incorrect.\n\nLoad an XML configuration file first for "
-                        "accurate floorplan scaling."
-                    )
-                
-                # Update status label and enable remove button
-                self.lbl_background_status.setText(f"\u2713 Background: {os.path.basename(file_path)}")
-                self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
-                self.btn_remove_background.setEnabled(True)
-
-                # Switch the live preview to 2D (the only view that shows the
-                # background) and redraw so the floorplan appears immediately.
-                if self._preview_active:
-                    if self.combo_view_mode.currentText() != self.VIEW_2D:
-                        self.combo_view_mode.setCurrentText(self.VIEW_2D)
-                    self.refresh_preview_arena()
-
-            except Exception as e:
-                self.log_message(f"Error loading background image: {str(e)}")
-                self.background_image = None
-                self.background_image_path = None
-                self.bg_width_meters = None
-                self.bg_height_meters = None
-                self.lbl_background_status.setText("Error loading background image")
-                self.lbl_background_status.setStyleSheet("color: #aa0000; font-style: italic; font-size: 9px;")
+            had_scale = bool(self.xml_scale)
+            if self._apply_background_image(file_path, source="loaded") and not had_scale:
+                QMessageBox.warning(
+                    self, "No Scale Available",
+                    "No XML scale has been loaded. The background image dimensions "
+                    "may be incorrect.\n\nLoad an XML configuration file first for "
+                    "accurate floorplan scaling."
+                )
 
     def remove_background(self):
         """Remove the background image from visualizations"""
@@ -4839,8 +5015,9 @@ class UWBQuickVisualizationWindow(QWidget):
             self.refresh_preview_arena()
 
     def on_preview_theme_changed(self, _state=None):
-        """Switch the preview canvases between the dark and light palettes."""
-        theme = "light" if self.chk_preview_light.isChecked() else "dark"
+        """Switch the preview canvases between the dark and light palettes.
+        Light is the default; the checkbox opts into dark."""
+        theme = "dark" if self.chk_preview_dark.isChecked() else "light"
         self.preview_canvas_2d.set_theme(theme)
         if self.preview_canvas_3d is not None:
             self.preview_canvas_3d.set_theme(theme)
@@ -5284,8 +5461,17 @@ class UWBQuickVisualizationWindow(QWidget):
         """Apply smoothing to self.data"""
         self.data = self.apply_smoothing_to_data(self.data, self.get_smoothing_method())
     
-    def apply_smoothing_to_data(self, data, method):
-        """Apply smoothing to a dataframe (works on any dataframe, not just self.data)"""
+    def apply_smoothing_to_data(self, data, method, window=None, units=None):
+        """Apply smoothing to a dataframe (works on any dataframe, not just self.data).
+
+        ``window`` (samples/seconds) and ``units`` ("Seconds"/"Samples")
+        override the Export Options spinbox/selector when given, so the live
+        preview can drive smoothing from its own independent window controls.
+        """
+        win = self.spin_rolling_window.value() if window is None else window
+        use_seconds = ((self.combo_window_units.currentText() == "Seconds")
+                       if units is None else (units == "Seconds"))
+
         def apply_savgol(group):
             window_length = min(31, len(group))
             if window_length % 2 == 0:
@@ -5294,7 +5480,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if len(group) > polyorder:
                 return savgol_filter(group, window_length=window_length, polyorder=polyorder)
             return group
-        
+
         if method == "Savitzky-Golay":
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol)
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol)
@@ -5304,12 +5490,11 @@ class UWBQuickVisualizationWindow(QWidget):
             # selector next to the spinbox. Time-based is the default and is
             # independent of the irregular, sub-1 Hz reporting rate.
             agg = 'mean' if method == "Rolling Average" else 'median'
-            time_based = self.combo_window_units.currentText() == "Seconds"
-            rolling_smooth_xy(data, agg, self.spin_rolling_window.value(), time_based)
+            rolling_smooth_xy(data, agg, win, use_seconds)
         elif method == "Forward-Backward EWMA":
-            # Spinbox doubles as the EWMA span. No minimum floor — a span of
+            # Window doubles as the EWMA span. No minimum floor — a span of
             # 1-2 is legitimate (span=1 gives alpha=1, i.e. passthrough).
-            span = max(1, self.spin_rolling_window.value())
+            span = max(1, win)
 
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
                 lambda x: forward_backward_ewma(x, span))
@@ -5371,8 +5556,15 @@ class UWBQuickVisualizationWindow(QWidget):
         """Clear accumulated filter statistics at the start of an export run."""
         self.filter_stats = {}
 
-    def apply_filters_to_data(self, data, collect_stats=True):
-        """Apply velocity and jump filtering with time window grouping to any dataframe"""
+    def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None):
+        """Apply velocity and jump thresholding with time-window grouping.
+
+        ``velocity``/``jump`` override whether each threshold is applied; when
+        None they follow the export checkboxes. The preview passes its own
+        toggles so the user can compare with/without thresholding live.
+        """
+        use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
+        use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
         initial_count = len(data)
         removed_velocity = 0
         removed_jump = 0
@@ -5396,7 +5588,7 @@ class UWBQuickVisualizationWindow(QWidget):
         data['velocity'] = data['distance'] / data['time_diff']
         
         # Apply velocity filtering if enabled
-        if self.chk_velocity_filter.isChecked():
+        if use_velocity:
             velocity_threshold = self.spin_velocity_threshold.value()
             before_velocity = len(data)
             data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())].copy()
@@ -5405,9 +5597,9 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message(f"  Removed {removed_velocity} points with velocity > {velocity_threshold} m/s")
         else:
             removed_velocity = 0
-        
+
         # Apply jump filtering if enabled
-        if self.chk_jump_filter.isChecked():
+        if use_jump:
             jump_threshold = self.spin_jump_threshold.value()
             before_jump = len(data)
             data['is_jump'] = (data['distance'] > jump_threshold)
@@ -5521,12 +5713,14 @@ class UWBQuickVisualizationWindow(QWidget):
             'animation_trail': self.spin_animation_trail.value(),
             'animation_speed': self.combo_animation_speed.currentText(),
             'animation_fps': self.combo_animation_fps.currentText(),
-            'time_window': self.spin_time_window.value(),
             'color_by': self.combo_color_by.currentText(),
             'video_quality': self.combo_video_quality.currentText(),
             'daily_animations': self.chk_daily_animations.isChecked(),
             'tag_identities': self.tag_identities,
             'plot_layers': dict(self.plot_layers),
+            # Site-map image copied into the analysis folder (filename + extent),
+            # or None. Written by _export_sitemap during export.
+            'sitemap': getattr(self, '_exported_sitemap', None),
             'background_image_path': self.background_image_path,
             'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None,
             # Anchor/antenna positions, zones, scale and map extent from the
@@ -5612,7 +5806,14 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_timezone.setCurrentIndex(index)
             
             if 'smoothing_method' in config:
-                index = self.combo_smoothing.findText(config['smoothing_method'])
+                # Match on the base method name so configs saved under the old
+                # labels (e.g. "Rolling Average (default)") still resolve after
+                # the "(default)" marker moved to None.
+                want = config['smoothing_method'].replace(" (default)", "")
+                index = next(
+                    (i for i in range(self.combo_smoothing.count())
+                     if self.combo_smoothing.itemText(i).replace(" (default)", "") == want),
+                    -1)
                 if index >= 0:
                     self.combo_smoothing.setCurrentIndex(index)
             
@@ -5694,9 +5895,6 @@ class UWBQuickVisualizationWindow(QWidget):
                 index = self.combo_animation_fps.findText(str(config['animation_fps']))
                 if index >= 0:
                     self.combo_animation_fps.setCurrentIndex(index)
-            
-            if 'time_window' in config:
-                self.spin_time_window.setValue(config['time_window'])
             
             if 'color_by' in config:
                 index = self.combo_color_by.findText(config['color_by'])
@@ -5867,6 +6065,59 @@ class UWBQuickVisualizationWindow(QWidget):
                 cb.setChecked(tag in self.pending_tag_selection)
             delattr(self, 'pending_tag_selection')
     
+    def select_animation_tags(self):
+        """Pick which tags the animation includes.
+
+        The list is a sub-selection of the tags currently checked in the
+        top-level Tag Selection — you cannot add tags here that weren't chosen
+        there. Default is all of them.
+        """
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox
+        tags = self.selected_preview_tags()
+        if not tags:
+            QMessageBox.information(
+                self, "No Tags Selected",
+                "Select one or more tags in the Tag Selection section first — "
+                "the animation can only include tags chosen there.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Include Tags in Animation")
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel("Select the tags to include in the animation:"))
+        boxes = {}
+        for t in tags:
+            info = self.tag_identities.get(t, {}) or {}
+            hex_id = hex(int(t)).upper().replace('0X', '')
+            label = (f"{info['sex']}-{info['identity']}  (HexID {hex_id})"
+                     if info else f"HexID {hex_id}")
+            cb = QCheckBox(label)
+            cb.setChecked(self._animation_tags is None or t in self._animation_tags)
+            boxes[t] = cb
+            lay.addWidget(cb)
+
+        sel_row = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_none = QPushButton("Unselect All")
+        btn_all.clicked.connect(lambda: [cb.setChecked(True) for cb in boxes.values()])
+        btn_none.clicked.connect(lambda: [cb.setChecked(False) for cb in boxes.values()])
+        sel_row.addWidget(btn_all)
+        sel_row.addWidget(btn_none)
+        lay.addLayout(sel_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        dlg.setLayout(lay)
+        if dlg.exec_() == QDialog.Accepted:
+            sel = [t for t, cb in boxes.items() if cb.isChecked()]
+            if not sel or len(sel) == len(tags):
+                self._animation_tags = None
+                self.lbl_anim_tags.setText("All configured tags")
+            else:
+                self._animation_tags = sel
+                self.lbl_anim_tags.setText(f"{len(sel)} of {len(tags)} tags")
+
     def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None, animations_dir=None):
         """Generate animation video from tracking data"""
         try:
@@ -5934,69 +6185,26 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message("Using in-memory data for animation...")
                 anim_data = self.data.copy()
             
-            # Map column names to match animate_path expectations
-            if 'shortid' in anim_data.columns:
-                anim_data['ID'] = anim_data['shortid']
-            
-            # Add required columns if they don't exist
-            if 'sex' not in anim_data.columns:
-                anim_data['sex'] = 'M'  # Default to male if sex not available
-            
-            # Apply custom sex and identities if configured
-            if self.tag_identities:
-                for tag_id, info in self.tag_identities.items():
-                    mask = anim_data['ID'] == tag_id
-                    anim_data.loc[mask, 'sex'] = info['sex']
-                    anim_data.loc[mask, 'custom_identity'] = info['identity']
-            
-            if 'Day' not in anim_data.columns:
-                anim_data['Day'] = 1  # Default to day 1
-            if 'trial' not in anim_data.columns:
-                anim_data['trial'] = self.table_name
-            
-            # Use smoothed coordinates if available, otherwise use location
-            x_col = 'smoothed_x' if 'smoothed_x' in anim_data.columns else 'location_x'
-            y_col = 'smoothed_y' if 'smoothed_y' in anim_data.columns else 'location_y'
+            # Report the coordinate basis, then normalise columns (ID/sex/
+            # identities/smoothed-coord fallback) via the shared helper.
             self.log_message(
-                f"Animation trajectories use "
-                f"{'smoothed' if x_col == 'smoothed_x' else 'raw (unsmoothed)'} coordinates")
+                "Animation trajectories use "
+                f"{'smoothed' if 'smoothed_x' in anim_data.columns else 'raw (unsmoothed)'} coordinates")
+            anim_data = uwb_animation.prepare_animation_data(anim_data, self.tag_identities)
 
-            if x_col != 'smoothed_x':
-                anim_data['smoothed_x'] = anim_data[x_col]
-            if y_col != 'smoothed_y':
-                anim_data['smoothed_y'] = anim_data[y_col]
-            
-            # Calculate heading and velocity
-            anim_data = anim_data.sort_values(by=['ID', 'Timestamp'])
-            
-            # Calculate heading (direction of movement)
-            def calc_heading(group):
-                return np.arctan2(group['smoothed_y'].diff(1), group['smoothed_x'].diff(1))
-            
-            anim_data['heading'] = anim_data.groupby('ID', group_keys=False).apply(calc_heading, include_groups=False).reset_index(level=0, drop=True)
-            
-            # Smooth heading with rolling average
-            anim_data['heading'] = anim_data.groupby('ID', group_keys=False)['heading'].transform(
-                lambda x: x.rolling(window=5, min_periods=1).mean()
-            )
-            
-            # Calculate velocity
-            def calc_velocity(group):
-                return np.sqrt(group['smoothed_x'].diff()**2 + group['smoothed_y'].diff()**2) / group['Timestamp'].diff().dt.total_seconds()
-            
-            anim_data['velocity'] = anim_data.groupby('ID', group_keys=False).apply(calc_velocity, include_groups=False).reset_index(level=0, drop=True)
-            
+            # Restrict to the chosen subset of tags (default: all).
+            if self._animation_tags:
+                anim_data = anim_data[anim_data['shortid'].isin(self._animation_tags)]
+                self.log_message(f"Animation limited to {len(self._animation_tags)} selected tag(s)")
+
             # Get animation parameters
-            time_window = self.spin_time_window.value()
             trailing_window = self.spin_animation_trail.value()
             fps = int(self.combo_animation_fps.currentText())
             speed_text = self.combo_animation_speed.currentText()
             speed_multiplier = int(speed_text.replace('x', ''))
             color_by = self.combo_color_by.currentText()
-            
-            # Calculate frame interval: how many real seconds each frame represents
-            # speed_multiplier seconds of real time per second of video / fps frames per second
-            frame_interval = speed_multiplier / fps
+
+            frame_interval = uwb_animation.frame_interval_seconds(speed_multiplier, fps)
             self.log_message(f"Animation: {speed_text} speed at {fps} FPS (each frame = {frame_interval:.2f}s of real time)")
             
             self.log_message("Setting up animation frames...")
@@ -6131,233 +6339,40 @@ class UWBQuickVisualizationWindow(QWidget):
     def create_animation_frames(self, data, output_dir, frame_interval, trailing_window,
                                fps, color_by, use_custom_identities=False,
                                total_export_steps=1, current_export_step=1, day_suffix="", speed_text=""):
-        """Create animation frames and compile video with optimization strategies:
-        1. In-memory rendering (no temp PNG files)
-        2. Configurable DPI for speed vs quality
-        3. Matplotlib blitting for faster redraw
-        4. Parallel frame generation
+        """Render one animation video via the shared ``uwb_animation`` core.
+
+        This is a thin adapter: it gathers the GUI-held settings (quality/DPI,
+        layer choice, background/zones/anchors, identities) and wires the tool's
+        progress bar, cancellation flag and logger into the pure renderer.
         """
-        
-        # Get DPI from quality setting
-        quality_map = {"Draft (Fast)": 75, "Standard": 100, "High Quality": 150}
-        dpi = quality_map.get(self.combo_video_quality.currentText(), 100)
+        dpi = uwb_animation.QUALITY_DPI.get(self.combo_video_quality.currentText(), 100)
         self.log_message(f"Using {dpi} DPI for video generation")
-        
-        # Get global min/max for consistent axis limits
-        x_min, x_max = data['smoothed_x'].min(), data['smoothed_x'].max()
-        y_min, y_max = data['smoothed_y'].min(), data['smoothed_y'].max()
-        
-        # Background is the loaded PNG, else the XML-embedded site map. If it
-        # will be drawn, expand the limits to include its extent.
-        anim_bg_image, anim_bg_extent = self._context_bg_source()
-        if self.plot_layers.get('background') and anim_bg_extent is not None:
-            x_min = min(x_min, anim_bg_extent[0])
-            x_max = max(x_max, anim_bg_extent[1])
-            y_min = min(y_min, anim_bg_extent[2])
-            y_max = max(y_max, anim_bg_extent[3])
 
-        # Add padding
-        x_range = x_max - x_min
-        y_range = y_max - y_min
-        x_pad = x_range * 0.05 if x_range > 0 else 1
-        y_pad = y_range * 0.05 if y_range > 0 else 1
-        x_min -= x_pad
-        x_max += x_pad
-        y_min -= y_pad
-        y_max += y_pad
-        
-        # Calculate time range based on frame_interval
-        start = data['Timestamp'].min()
-        end = data['Timestamp'].max()
-        
-        # Generate time points manually to avoid floating point precision issues with pd.date_range
-        total_seconds = (end - start).total_seconds()
-        num_frames = int(total_seconds / frame_interval) + 1
-        time_starts = [start + pd.Timedelta(seconds=i * frame_interval) for i in range(num_frames)]
-        time_starts = [t for t in time_starts if t <= end]  # Filter to ensure we don't exceed end time
-        
-        total_frames = len(time_starts)
-        self.log_message(f"Creating {total_frames} animation frames (optimized pipeline)...")
-        
-        # Pre-compute all data for each tag to avoid repeated filtering
-        self.log_message("Pre-computing trajectories...")
-        tag_data_dict = {}
-        for tag in data['shortid'].unique():
-            tag_subset = data[data['shortid'] == tag][['Timestamp', 'smoothed_x', 'smoothed_y']].copy()
-            tag_subset = tag_subset.sort_values('Timestamp')
-            tag_data_dict[tag] = tag_subset
-            
-            # Pre-compute label and color
-            if use_custom_identities and tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', 'M')
-                identity = info.get('identity', str(tag))
-                label_text = f"{sex}-{identity}"
-                color = 'blue' if sex == 'M' else 'red'
-            else:
-                hex_id = hex(tag).upper().replace('0X', '')
-                label_text = f"HexID {hex_id}"
-                color = 'blue'
-            tag_data_dict[tag] = {
-                'data': tag_subset,
-                'label': label_text,
-                'color': color
-            }
-        
-        #===========================================
-        # OPTIMIZATION 1 & 3: In-memory rendering with background blitting
-        #===========================================
-        
-        # Create figure once and reuse (blitting optimization)
-        fig, ax = plt.subplots(figsize=(10, 8), dpi=dpi)
-        ax.grid(False)
-        
-        # Draw the chosen static context layers. Layer choice comes from the
-        # export dialog (self.plot_layers), not the preview toggles. Background
-        # is the loaded PNG, else the XML-embedded site map. This MUST be redrawn
-        # every frame because the frame loop calls ax.clear() — drawing it only
-        # once left the zones/anchors erased after frame 0 (only the background
-        # was being redrawn), so nothing but the tracks showed.
-        def _draw_static_context():
-            if self.plot_layers.get('background') and anim_bg_image is not None and anim_bg_extent is not None:
-                ax.imshow(anim_bg_image, extent=list(anim_bg_extent), origin='upper',
-                          aspect='auto', alpha=0.6, zorder=0)
-            if self.plot_layers.get('zones') and self.arena_zones is not None and not self.arena_zones.empty:
-                try:
-                    from matplotlib.patches import Polygon
-                    for zone_name in self.arena_zones['zone'].unique():
-                        coords = self.arena_zones[self.arena_zones['zone'] == zone_name][['x', 'y']].values
-                        if len(coords) >= 3:  # need >=3 points for a polygon
-                            ax.add_patch(Polygon(coords, fill=False, edgecolor='black',
-                                                 linewidth=1.5, linestyle='--', zorder=1))
-                            cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
-                            ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
-                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
-                                    zorder=1)
-                except Exception as e:
-                    self.log_message(f"Error drawing zones in animation: {str(e)}")
-            if self.plot_layers.get('anchors') and self.anchor_positions:
-                ax.scatter([a['x'] for a in self.anchor_positions],
-                           [a['y'] for a in self.anchor_positions],
-                           marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
-
-        _draw_static_context()
-
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_aspect('equal')
-        ax.set_xlabel("X Position (m)", fontsize=12)
-        ax.set_ylabel("Y Position (m)", fontsize=12)
-        
-        # Render figure to get dimensions
-        fig.canvas.draw()
-        width, height = fig.canvas.get_width_height()
-        
-        # Initialize video writer
+        bg_image, bg_extent = self._context_bg_source()
         video_filename = f'animation_temp{day_suffix}.mp4' if day_suffix else 'animation_temp.mp4'
         video_output_path = os.path.join(output_dir, video_filename)
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(video_output_path, fourcc, fps, (width, height))
-        
-        if not video_writer.isOpened():
-            self.log_message("✗ Could not open VideoWriter")
-            plt.close(fig)
-            return None
-        
-        self.log_message(f"Video dimensions: {width}x{height}")
-        
-        #===========================================
-        # Generate and write frames directly to video (in-memory)
-        #===========================================
-        
-        for i, frame_start in enumerate(time_starts):
-            if self.export_cancelled:
-                video_writer.release()
-                plt.close(fig)
-                self.log_message("✗ Animation cancelled")
-                return None
-            
-            # Update progress
-            if i % 10 == 0 or i == total_frames - 1:
-                progress_pct = int(((current_export_step - 1) + (i + 1) / total_frames) / total_export_steps * 100)
-                self.progress_bar.setValue(progress_pct)
-                self.lbl_export_progress.setText(f"Step {current_export_step}/{total_export_steps}: Rendering frame {i+1}/{total_frames}...")
+
+        def _progress(i, total):
+            if i % 10 == 0 or i == total - 1:
+                pct = int(((current_export_step - 1) + (i + 1) / max(1, total)) / max(1, total_export_steps) * 100)
+                self.progress_bar.setValue(pct)
+                self.lbl_export_progress.setText(
+                    f"Step {current_export_step}/{total_export_steps}: Rendering frame {i+1}/{total}...")
                 if i % 50 == 0:
-                    self.log_message(f"Rendering frame {i+1}/{total_frames}...")
+                    self.log_message(f"Rendering frame {i+1}/{total}...")
                 QApplication.processEvents()
-            
-            frame_end = frame_start + pd.Timedelta(seconds=trailing_window)
-            
-            # Clear previous frame's dynamic content
-            ax.clear()
 
-            # Redraw ALL static context (background + zones + anchors), not just
-            # the background — ax.clear() removed everything.
-            _draw_static_context()
-
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-            ax.set_aspect('equal')
-            ax.set_xlabel("X Position (m)", fontsize=12)
-            ax.set_ylabel("Y Position (m)", fontsize=12)
-            
-            # Build title with speed if provided
-            title_text = "UWB Tracking Animation"
-            if speed_text:
-                title_text += f" - Speed: {speed_text}"
-            title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
-            ax.set_title(title_text, fontsize=14, fontweight='bold')
-            
-            # Plot each tag's trajectory
-            for tag, tag_info in tag_data_dict.items():
-                tag_df = tag_info['data']
-                trailing_data = tag_df[(tag_df['Timestamp'] >= frame_start) & 
-                                       (tag_df['Timestamp'] <= frame_end)]
-                
-                if trailing_data.empty:
-                    continue
-                
-                label = tag_info['label']
-                color = tag_info['color']
-                
-                # Plot trailing line
-                ax.plot(trailing_data['smoothed_x'], trailing_data['smoothed_y'], 
-                       color=color, alpha=0.5, linewidth=1)
-                
-                # Plot current position
-                current_x = trailing_data['smoothed_x'].iloc[-1]
-                current_y = trailing_data['smoothed_y'].iloc[-1]
-                ax.plot(current_x, current_y, 'o', color=color, markersize=10)
-                
-                # Add label
-                ax.text(current_x, current_y + (y_range * 0.02), label, 
-                       fontsize=10, ha='center', color=color, fontweight='bold')
-            
-            # Render to numpy array (IN-MEMORY - no disk I/O!)
-            fig.canvas.draw()
-            # Use buffer_rgba for Qt backend compatibility
-            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-            buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-            
-            # Convert RGBA to BGR for OpenCV (drop alpha channel)
-            frame_bgr = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
-            
-            # Write directly to video
-            video_writer.write(frame_bgr)
-        
-        # Clean up
-        video_writer.release()
-        plt.close(fig)
-        gc.collect()
-        
-        # Check if video was created successfully
-        if os.path.exists(video_output_path) and os.path.getsize(video_output_path) > 0:
-            self.log_message(f"✓ Video compilation complete: {os.path.getsize(video_output_path):,} bytes")
-            return video_output_path
-        else:
-            self.log_message("✗ Video file was not created or is empty")
-            return None
+        return uwb_animation.render_animation(
+            data, video_output_path,
+            frame_interval=frame_interval, trailing_window=trailing_window, fps=fps,
+            dpi=dpi, speed_text=speed_text,
+            layers=self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
+            arena_zones=self.arena_zones, anchors=self.anchor_positions,
+            tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
+            color_by=color_by,
+            is_cancelled=lambda: self.export_cancelled,
+            progress=_progress, log=self.log_message,
+        )
     
     def stop_export(self):
         """Cancel ongoing export operations"""
@@ -6816,9 +6831,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 plot_csv_path = _build_render_source(downsample_plots, plot_downsample_hz) if save_plots else None
                 anim_csv_path = _build_render_source(downsample_animation, anim_downsample_hz) if save_animation else None
             
-            # Save configuration file
+            # Write the site-map image (if any) so the analysis folder is a
+            # self-contained data product, then save the config that references it.
+            self._export_sitemap(output_dir, db_name)
             self.save_config(output_dir)
-            
+
             # Save message log and run summary
             self.save_message_log(output_dir)
             self.save_run_summary(output_dir)

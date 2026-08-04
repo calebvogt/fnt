@@ -408,8 +408,65 @@ class UWBPreview2D(FigureCanvas):
         self.background_image = None
         self.bg_extent = None       # (x0, x1, y0, y1) in metres
         self.show_anchors = True
+        # Scroll-wheel zoom: when the user zooms, remember the view so it
+        # persists across scrub frames (which otherwise reset to the arena).
+        # Double-click resets to the full arena.
+        self._user_zoom = None      # ((xmin, xmax), (ymin, ymax)) or None
+        self.mpl_connect('scroll_event', self._on_scroll)
+        self.mpl_connect('button_press_event', self._on_button)
+        # Blitting: the arena / zones / anchors / background never move — only
+        # the tags do. So the static scene is rendered once, cached, and each
+        # scrub frame just restores it and blits the moving tracks + markers on
+        # top. The cache is invalidated when the scene changes (arena, theme,
+        # zoom, resize).
+        self._static_dirty = True
+        self._blit_bg = None
+        self._last_frame = None     # (x, y, colors, tracks, raw_pts) for re-render
         self._apply_theme()
         self.show_placeholder()
+
+    def _arena_view_bounds(self):
+        """Full view bounds: the arena, expanded to include any background."""
+        a = self.arena
+        xmin, xmax = a.origin_x, a.origin_x + a.width
+        ymin, ymax = a.origin_y, a.origin_y + a.height
+        if self.background_image is not None and self.bg_extent is not None:
+            bx0, bx1, by0, by1 = self.bg_extent
+            xmin, xmax = min(xmin, bx0), max(xmax, bx1)
+            ymin, ymax = min(ymin, by0), max(ymax, by1)
+        return xmin, xmax, ymin, ymax
+
+    def _on_scroll(self, event):
+        """Zoom about the cursor (scroll up = in). Persists while scrubbing."""
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        factor = 0.8 if event.button == 'up' else 1.25
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        xd, yd = event.xdata, event.ydata
+        self._user_zoom = ((xd - (xd - x0) * factor, xd + (x1 - xd) * factor),
+                           (yd - (yd - y0) * factor, yd + (y1 - yd) * factor))
+        self._static_dirty = True     # limits changed -> static cache stale
+        self._rerender()
+
+    def _on_button(self, event):
+        """Double-click resets the zoom to the full arena."""
+        if getattr(event, 'dblclick', False):
+            self._user_zoom = None
+            self._static_dirty = True
+            self._rerender()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._static_dirty = True     # a resize invalidates the blit cache
+        self._rerender()
+
+    def _rerender(self):
+        """Redraw the current frame (used after the static scene changes)."""
+        if self._last_frame is not None:
+            self.update_frame(*self._last_frame)
+        else:
+            self.draw_idle()
 
     def show_placeholder(self, msg="Load a database and select tags\nto preview tracking data"):
         """Neutral empty state: no bare 0–1 axes, just a centred hint.
@@ -429,6 +486,11 @@ class UWBPreview2D(FigureCanvas):
         self.ax.text(0.5, 0.5, msg, transform=self.ax.transAxes,
                      ha="center", va="center", color=pal["mpl_grid"],
                      fontsize=13, fontstyle="italic")
+        # The axes were recreated; drop the blit cache so the next real frame
+        # rebuilds the static scene from scratch.
+        self._static_dirty = True
+        self._blit_bg = None
+        self._last_frame = None
         self.draw_idle()
 
     def _apply_theme(self):
@@ -444,17 +506,21 @@ class UWBPreview2D(FigureCanvas):
     def set_theme(self, name):
         self._theme = name if name in _THEMES else "dark"
         self._apply_theme()
-        self.draw_idle()
+        self._static_dirty = True
+        self._rerender()
 
     def set_arena(self, arena):
         self.arena = arena
+        self._user_zoom = None    # new framing drops any scroll-zoom
+        self._static_dirty = True
 
-    def update_frame(self, x, y, colors, tracks=None, raw_pts=None):
-        """Draw one frame.
+    def _draw_static(self):
+        """Render the unchanging scene and cache it for blitting.
 
-        ``tracks``: list of (xy Nx2 array, rgb tuple) — one smoothed polyline
-        per tag, drawn as a fading connected line (the "track").
-        ``raw_pts``: optional Mx2 array of raw fixes, drawn as faint dots.
+        Everything that does NOT move per frame lives here: the arena floor /
+        background image, the zone polygons + labels, support poles and anchors,
+        plus the axis limits/labels. This is the expensive draw, but it only
+        runs when the scene changes — not on every scrub frame.
         """
         pal = _THEMES[self._theme]
         a = self.arena
@@ -462,13 +528,8 @@ class UWBPreview2D(FigureCanvas):
         self._apply_theme()
 
         # Site map from the XML takes precedence; otherwise any separately
-        # loaded background/floorplan image. Both use origin="upper": the image
-        # is drawn UPRIGHT (exactly as the file looks — north at top) with its
-        # bottom-left corner at world (0, 0). This matches the Wiser workflow:
-        # the floorplan is placed at the origin and antennas/tracks are laid
-        # over it in the same metre frame.
-        has_image = (a.map_image is not None and a.map_extent is not None) or \
-                    (self.background_image is not None and self.bg_extent is not None)
+        # loaded floorplan image. Both use origin="upper" (drawn UPRIGHT, north
+        # at top) with the bottom-left corner at world (0, 0) — the Wiser frame.
         if a.map_image is not None and a.map_extent is not None:
             self.ax.imshow(a.map_image, extent=list(a.map_extent),
                            origin="upper", zorder=0)
@@ -476,8 +537,6 @@ class UWBPreview2D(FigureCanvas):
             self.ax.imshow(self.background_image, extent=list(self.bg_extent),
                            origin="upper", zorder=0)
         elif not a.zones:
-            # No image and no zones: fill the arena as a solid floor (tan in
-            # light mode) so the idealized view reads as a real enclosure.
             self.ax.add_patch(Rectangle(
                 (a.origin_x, a.origin_y), a.width, a.height,
                 facecolor=pal["mpl_floor"], edgecolor=pal["mpl_grid"],
@@ -488,8 +547,6 @@ class UWBPreview2D(FigureCanvas):
                 pts = z["points"]
                 if len(pts) < 3:
                     continue
-                # "Arena" is the enclosure boundary -- outline it rather than
-                # filling, so it does not wash out the zones inside it.
                 is_bounds = z.get("name", "").strip().lower() == "arena"
                 self.ax.add_patch(Polygon(
                     pts, closed=True,
@@ -497,9 +554,6 @@ class UWBPreview2D(FigureCanvas):
                     edgecolor=z.get("color", "#888888"),
                     alpha=1.0 if is_bounds else 0.28,
                     linewidth=2.0 if is_bounds else 1.2, zorder=1))
-                # Zone labels sit on top of an arbitrary site photo, so give
-                # them a contrasting outline rather than relying on theme
-                # colours that vanish against a light map.
                 cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
                 self.ax.annotate(
                     z.get("name", ""), (cx, cy), color="#111111", fontsize=7,
@@ -512,22 +566,45 @@ class UWBPreview2D(FigureCanvas):
                 facecolor="#75573b", edgecolor="none", zorder=2))
 
         if self.show_anchors and a.anchors:
-            # Bright gold triangles with a dark edge so they read clearly on top
-            # of the floorplan (whose own grid dots are a similar hue).
             self.ax.scatter([q["x"] for q in a.anchors],
                             [q["y"] for q in a.anchors],
                             marker="^", s=110, c="#ffd21e",
-                            edgecolors="#1a1a1a", linewidths=1.0,
-                            zorder=6, label="anchors")
+                            edgecolors="#1a1a1a", linewidths=1.0, zorder=6)
 
-        # Raw fixes (optional overlay): faint dots showing the actual samples
-        # under the smoothed track.
+        if self._user_zoom is not None:
+            (xmin, xmax), (ymin, ymax) = self._user_zoom
+        else:
+            xmin, xmax, ymin, ymax = self._arena_view_bounds()
+        self.ax.set_xlim(xmin, xmax)
+        self.ax.set_ylim(ymin, ymax)
+        self.ax.set_aspect("equal")
+        self.ax.set_xlabel("X (m)")
+        self.ax.set_ylabel("Y (m)")
+        self.fig.tight_layout()
+        self.draw()                                   # full render (synchronous)
+        self._blit_bg = self.copy_from_bbox(self.ax.bbox)
+        self._static_dirty = False
+
+    def update_frame(self, x, y, colors, tracks=None, raw_pts=None):
+        """Draw one frame by blitting the moving tags over the cached scene.
+
+        ``tracks``: list of (xy Nx2 array, rgb tuple) — one fading polyline per
+        tag. ``raw_pts``: optional Mx2 array of raw fixes drawn as faint dots.
+        Only these dynamic artists are drawn per frame; the arena/zones/anchors
+        come from the cached static background.
+        """
+        self._last_frame = (x, y, colors, tracks, raw_pts)
+        if self._static_dirty or self._blit_bg is None:
+            self._draw_static()
+
+        self.restore_region(self._blit_bg)
+        dynamic = []
+
         if raw_pts is not None and len(raw_pts):
-            self.ax.scatter(raw_pts[:, 0], raw_pts[:, 1], s=4,
-                            c=[(0.5, 0.5, 0.5, 0.30)], edgecolors="none", zorder=3)
+            dynamic.append(self.ax.scatter(
+                raw_pts[:, 0], raw_pts[:, 1], s=4,
+                c=[(0.5, 0.5, 0.5, 0.30)], edgecolors="none", zorder=3))
 
-        # Tracks: one connected line per tag, fading from old (transparent) to
-        # recent (opaque) — the movement path rather than a dot cloud.
         if tracks:
             for xy, rgb in tracks:
                 if len(xy) < 2:
@@ -538,33 +615,26 @@ class UWBPreview2D(FigureCanvas):
                 seg_cols = np.empty((n, 4), float)
                 seg_cols[:, :3] = np.array(rgb[:3])
                 seg_cols[:, 3] = np.linspace(0.12, 0.95, n)
-                self.ax.add_collection(
-                    LineCollection(segs, colors=seg_cols, linewidths=1.7, zorder=4))
+                lc = LineCollection(segs, colors=seg_cols, linewidths=1.7, zorder=4)
+                self.ax.add_collection(lc)
+                dynamic.append(lc)
 
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         ok = np.isfinite(x) & np.isfinite(y)
         if ok.any():
             edge = "white" if self._theme == "dark" else "#333333"
-            self.ax.scatter(x[ok], y[ok], s=42, c=np.asarray(colors)[ok],
-                            edgecolors=edge, linewidths=0.6, zorder=5)
+            dynamic.append(self.ax.scatter(
+                x[ok], y[ok], s=42, c=np.asarray(colors)[ok],
+                edgecolors=edge, linewidths=0.6, zorder=5))
 
-        # View bounds start at the arena, then expand to include the whole
-        # background image so it is never clipped. In the Wiser workflow the
-        # floorplan is the reference frame, so it should be fully visible.
-        xmin, xmax = a.origin_x, a.origin_x + a.width
-        ymin, ymax = a.origin_y, a.origin_y + a.height
-        if self.background_image is not None and self.bg_extent is not None:
-            bx0, bx1, by0, by1 = self.bg_extent
-            xmin, xmax = min(xmin, bx0), max(xmax, bx1)
-            ymin, ymax = min(ymin, by0), max(ymax, by1)
-        self.ax.set_xlim(xmin, xmax)
-        self.ax.set_ylim(ymin, ymax)
-        self.ax.set_aspect("equal")
-        self.ax.set_xlabel("X (m)")
-        self.ax.set_ylabel("Y (m)")
-        self.fig.tight_layout()
-        self.draw_idle()
+        for art in dynamic:
+            self.ax.draw_artist(art)
+        self.blit(self.ax.bbox)
+        # Remove the per-frame artists so they are not baked into the next
+        # static cache (and do not accumulate).
+        for art in dynamic:
+            art.remove()
 
     def clear(self):
         self.show_placeholder()
