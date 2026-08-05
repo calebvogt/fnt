@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import re
 from collections import OrderedDict
 import sys
 import sqlite3
@@ -27,7 +28,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
                              QDateTimeEdit, QTreeWidget, QTreeWidgetItem,
-                             QSplitter, QSlider, QProgressDialog)
+                             QSplitter, QSlider, QProgressDialog, QGridLayout)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QFont
 
@@ -623,7 +624,8 @@ class IdentityAssignmentDialog(QDialog):
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
 
-        # Form for each tag
+        # Form for each tag — placed inside a scroll area so a long tag list
+        # never pushes the OK/Cancel row off-screen (the row stays fixed below).
         form_layout = QFormLayout()
         self.sex_combos = {}
         self.identity_edits = {}
@@ -709,15 +711,29 @@ class IdentityAssignmentDialog(QDialog):
             self.start_edits[tag] = start_edit
             self.stop_edits[tag] = stop_edit
 
-        layout.addLayout(form_layout)
+        form_container = QWidget()
+        form_container.setLayout(form_layout)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(form_container)
+        layout.addWidget(scroll, 1)   # takes the stretch; buttons stay fixed
 
-        # Dialog buttons
+        # Dialog buttons (outside the scroll area — always visible)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
         self.setLayout(layout)
+
+        # Open at a height that fits the current screen (tag list scrolls
+        # inside) and never let the window exceed it, keeping OK/Cancel reachable.
+        try:
+            avail = QApplication.primaryScreen().availableGeometry()
+            self.setMaximumHeight(avail.height())
+            self.resize(760, min(880, int(avail.height() * 0.9)))
+        except Exception:
+            self.resize(760, 800)
 
     def get_identities(self):
         """Return the configured identities with start/stop times"""
@@ -749,7 +765,8 @@ class PlotSaverWorker(QThread):
                  bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False,
                  output_dir=None, plots_dir=None, rolling_window_units='Seconds',
                  plot_layers=None, xml_zones=None, anchor_positions=None,
-                 xml_map_image=None, xml_map_extent=None):
+                 xml_map_image=None, xml_map_extent=None,
+                 bg_offset_x=0.0, bg_offset_y=0.0):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -773,6 +790,8 @@ class PlotSaverWorker(QThread):
         self.background_image = background_image
         self.bg_width_meters = bg_width_meters
         self.bg_height_meters = bg_height_meters
+        self.bg_offset_x = bg_offset_x
+        self.bg_offset_y = bg_offset_y
         self.save_svg = save_svg
         # Spatial context layer choice + sources for the trajectory plots.
         self.plot_layers = plot_layers if plot_layers is not None else dict(DEFAULT_PLOT_LAYERS)
@@ -788,7 +807,9 @@ class PlotSaverWorker(QThread):
         XML-embedded site map so the map still shows when no PNG was loaded.
         """
         if self.background_image is not None and self.bg_width_meters is not None:
-            return self.background_image, [0, self.bg_width_meters, 0, self.bg_height_meters]
+            x0, y0 = self.bg_offset_x, self.bg_offset_y
+            return self.background_image, [x0, x0 + self.bg_width_meters,
+                                           y0, y0 + self.bg_height_meters]
         if self.xml_map_image is not None and self.xml_map_extent is not None:
             return self.xml_map_image, list(self.xml_map_extent)
         return None, None
@@ -1740,14 +1761,28 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_config_path = None
         self.background_image_path = None
         self.background_image = None  # Loaded matplotlib image
-        self.xml_scale = None  # Scale from XML in inches/pixel
+        self.xml_scale = None  # Scale from XML in inches/pixel (first Map element)
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
+        # Manual background-image transform (option (b)): the loaded floorplan is
+        # placed by pixels * bg_scale(in/px), then shifted by (bg_offset_x,
+        # bg_offset_y) metres. Defaults come from the XML but the user can nudge
+        # them live to match the Wiser server frame — needed when the loaded
+        # image is a different render (resolution/decoration) than the one the
+        # XML scale was calibrated against.
+        self.bg_scale = None          # effective in/px for the loaded image
+        self.bg_offset_x = 0.0        # metres: world X of the image's left edge
+        self.bg_offset_y = 0.0        # metres: world Y of the image's bottom edge
         self.arena_zones = None  # DataFrame with zone coordinates from XML
         self.anchor_positions = []  # List of dicts: {'shortid': int, 'x': float, 'y': float, 'z': float}
         self.xml_zones = []         # [{name, color, points:(N,2) m}] from the site XML
         self.xml_map_image = None   # site map decoded from the XML
         self.xml_map_extent = None  # (x0, x1, y0, y1) in metres
+        # Every embedded <Map>/<Image> render, each with its own pixel dims and
+        # scale: Wiser writes several (e.g. 'default' + a decorated 'Dark2d').
+        # Used to pick the correct default scale for a loaded external image by
+        # matching its resolution.
+        self.xml_maps = []          # [{name, scale, w_px, h_px}]
 
         # Spatial context layers drawn on exported plots/animation. Chosen per
         # export via PlotLayersDialog, persisted in the config, and applied to
@@ -2858,6 +2893,58 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_background)
 
+        # Manual background transform (option (b)): scale + X/Y origin offset so
+        # the loaded image can be nudged live onto the anchor/track frame — the
+        # way the Wiser server lets you place a floorplan. Needed when the loaded
+        # image is a different render (resolution / decorated margins) than the
+        # one the XML scale was calibrated for, so pixels*scale is wrong or the
+        # arena content sits inset from the image edges. Defaults seed from the
+        # XML; live values feed the preview AND exported plots/animation.
+        self._bg_transform_box = QGroupBox("Background alignment")
+        self._bg_transform_box.setToolTip(
+            "Rescale and reposition the loaded background image so it lines up "
+            "with the anchors and tracks. Scale is inches per pixel (larger = "
+            "bigger image); offsets shift the image's bottom-left corner in "
+            "metres. Defaults come from the site XML. Anchors/tracks use "
+            "absolute coordinates and never move.")
+        bg_tf = QGridLayout()
+        bg_tf.setContentsMargins(6, 2, 6, 2)
+        bg_tf.addWidget(QLabel("Scale (in/px):"), 0, 0)
+        self.spin_bg_scale = QDoubleSpinBox()
+        self.spin_bg_scale.setRange(0.0001, 1000.0)
+        self.spin_bg_scale.setDecimals(4)
+        self.spin_bg_scale.setSingleStep(0.005)
+        self.spin_bg_scale.setToolTip(
+            "Inches per pixel. The image's physical size = pixels x this x "
+            "0.0254 m. Increase to enlarge the image, decrease to shrink it.")
+        self.spin_bg_scale.valueChanged.connect(self.on_bg_transform_changed)
+        bg_tf.addWidget(self.spin_bg_scale, 0, 1)
+        bg_tf.addWidget(QLabel("Offset X (m):"), 1, 0)
+        self.spin_bg_offx = QDoubleSpinBox()
+        self.spin_bg_offx.setRange(-1000.0, 1000.0)
+        self.spin_bg_offx.setDecimals(2)
+        self.spin_bg_offx.setSingleStep(0.10)
+        self.spin_bg_offx.setToolTip("Shift the image right (+) / left (-), in metres.")
+        self.spin_bg_offx.valueChanged.connect(self.on_bg_transform_changed)
+        bg_tf.addWidget(self.spin_bg_offx, 1, 1)
+        bg_tf.addWidget(QLabel("Offset Y (m):"), 2, 0)
+        self.spin_bg_offy = QDoubleSpinBox()
+        self.spin_bg_offy.setRange(-1000.0, 1000.0)
+        self.spin_bg_offy.setDecimals(2)
+        self.spin_bg_offy.setSingleStep(0.10)
+        self.spin_bg_offy.setToolTip("Shift the image up (+) / down (-), in metres.")
+        self.spin_bg_offy.valueChanged.connect(self.on_bg_transform_changed)
+        bg_tf.addWidget(self.spin_bg_offy, 2, 1)
+        self.btn_bg_reset = QPushButton("Reset to XML")
+        self.btn_bg_reset.setToolTip(
+            "Restore the scale to the XML value (matched to this image's "
+            "resolution) and the offset to (0, 0).")
+        self.btn_bg_reset.clicked.connect(self.reset_bg_transform)
+        bg_tf.addWidget(self.btn_bg_reset, 3, 0, 1, 2)
+        self._bg_transform_box.setLayout(bg_tf)
+        self._bg_transform_box.setEnabled(False)   # enabled once an image loads
+        v.addWidget(self._bg_transform_box)
+
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
         self.chk_show_anchors.setEnabled(False)
@@ -3254,11 +3341,7 @@ class UWBQuickVisualizationWindow(QWidget):
         # user has the background enabled.
         show_bg = self.background_image is not None and self.chk_show_background.isChecked()
         self.preview_canvas_2d.background_image = self.background_image if show_bg else None
-        if show_bg and self.bg_width_meters:
-            self.preview_canvas_2d.bg_extent = (0, self.bg_width_meters,
-                                                0, self.bg_height_meters)
-        else:
-            self.preview_canvas_2d.bg_extent = None
+        self.preview_canvas_2d.bg_extent = self._bg_placed_extent() if show_bg else None
         if self.preview_canvas_3d is not None:
             self.preview_canvas_3d.set_arena(arena)
         self.render_preview_frame()
@@ -3883,8 +3966,9 @@ class UWBQuickVisualizationWindow(QWidget):
         Prefers a user-loaded floorplan PNG (scaled via the XML) and falls back
         to the XML-embedded site map. Returns (None, None) if neither exists.
         """
-        if self.background_image is not None and self.bg_width_meters is not None:
-            return self.background_image, [0, self.bg_width_meters, 0, self.bg_height_meters]
+        ext = self._bg_placed_extent()
+        if ext is not None:
+            return self.background_image, list(ext)
         if self.xml_map_image is not None and self.xml_map_extent is not None:
             return self.xml_map_image, list(self.xml_map_extent)
         return None, None
@@ -4472,6 +4556,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_scale = None
         self.bg_width_meters = None
         self.bg_height_meters = None
+        self.bg_scale = None
+        self.bg_offset_x = 0.0
+        self.bg_offset_y = 0.0
+        self.xml_maps = []
         self.arena_zones = None
         self.anchor_positions = []
 
@@ -4502,6 +4590,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_zones = []
         self.xml_map_image = None
         self.xml_map_extent = None
+        self._sync_bg_transform_controls()
         if hasattr(self, 'slider_timeline'):
             self._timeline_guard = True
             self.slider_timeline.setRange(0, 0)
@@ -4900,6 +4989,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # any other dialect.
             self.xml_map_image = None
             self.xml_map_extent = None
+            self.xml_maps = []
             for elem in root.iter():
                 if elem.tag not in ('Map', 'BackgroundImage', 'Image'):
                     continue
@@ -4914,15 +5004,23 @@ class UWBQuickVisualizationWindow(QWidget):
                     h_px, w_px = img.shape[:2]
                     w_m = w_px * px_scale * 0.0254
                     h_m = h_px * px_scale * 0.0254
-                    self.xml_map_image = img
-                    # origin='upper' when drawn, so y runs top-down from h_m
-                    self.xml_map_extent = (0.0, w_m, 0.0, h_m)
+                    # Record every render so a loaded external image can be
+                    # matched to the map it came from (and its correct scale).
+                    self.xml_maps.append({
+                        'name': elem.get('name', ''),
+                        'scale': px_scale, 'w_px': w_px, 'h_px': h_px})
+                    if self.xml_map_image is None:
+                        # First decodable map drives the XML site view.
+                        self.xml_map_image = img
+                        # origin='upper' when drawn, so y runs top-down from h_m
+                        self.xml_map_extent = (0.0, w_m, 0.0, h_m)
+                    map_label = elem.get('name') or ''
+                    map_label = f" '{map_label}'" if map_label else ''
                     self.log_message(
-                        f"Decoded embedded site map: {w_px}x{h_px} px @ "
-                        f"{px_scale} in/px -> {w_m:.2f} x {h_m:.2f} m")
+                        f"Decoded embedded site map{map_label}: "
+                        f"{w_px}x{h_px} px @ {px_scale} in/px -> {w_m:.2f} x {h_m:.2f} m")
                 except Exception as e:
                     self.log_message(f"Could not decode embedded map: {e}")
-                break
 
             if self.xml_map_image is None:
                 self.log_message("No embedded background image found in XML")
@@ -4961,12 +5059,73 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self._apply_background_image(os.path.join(db_dir, selected), source="auto-loaded")
 
+    @staticmethod
+    def _name_tokens(s):
+        """Significant (len>=2) alnum tokens of a name, lowercased.
+
+        'Dark2d' -> ['dark'] ('2'/'d' dropped as too short); 'default' ->
+        ['default']. Used to loosely match a map name against a filename.
+        """
+        return [t for t in re.findall(r'[a-z]+|\d+', (s or '').lower()) if len(t) >= 2]
+
+    def _default_bg_scale(self, w_px, h_px, filename=None):
+        """Best XML scale (in/px) for an external image about to be placed.
+
+        Wiser writes several embedded renders, each with its own scale (e.g. a
+        plain 'default' map and a decorated 'Dark2d' one at a different
+        resolution). Identify which render the loaded image is, in order:
+
+        1. exact pixel-resolution match to an embedded map (most reliable);
+        2. unambiguous filename<->map-name match (e.g. an FNT ABMA screenshot
+           'ABMA_VoleTerra2D_DarkModel...' -> map 'Dark2d'), for a re-exported
+           image whose resolution no longer matches the embedded render;
+
+        then fall back to the first XML scale, then None (1 in/px upstream).
+        """
+        maps = getattr(self, 'xml_maps', None) or []
+        for m in maps:
+            if m['w_px'] == w_px and m['h_px'] == h_px:
+                return m['scale']
+        if filename:
+            stem = self._name_tokens(os.path.splitext(os.path.basename(filename))[0])
+            fname_norm = ''.join(stem)
+            hits = []
+            for m in maps:
+                toks = self._name_tokens(m.get('name', ''))
+                if toks and all(t in fname_norm for t in toks):
+                    hits.append(m)
+            if len(hits) == 1:   # only trust an unambiguous name match
+                return hits[0]['scale']
+        return self.xml_scale
+
+    def _recompute_bg_size(self):
+        """Set bg_width/height_meters from the current image and bg_scale."""
+        if self.background_image is None or not self.bg_scale:
+            return
+        h_px, w_px = self.background_image.shape[:2]
+        self.bg_width_meters = w_px * self.bg_scale * 0.0254
+        self.bg_height_meters = h_px * self.bg_scale * 0.0254
+
+    def _bg_placed_extent(self):
+        """(x0, x1, y0, y1) metres for the loaded background, honouring offsets.
+
+        The image spans bg_width/height_meters (from pixels * bg_scale) with its
+        bottom-left corner placed at (bg_offset_x, bg_offset_y). Returns None
+        when there is no sized background image.
+        """
+        if self.background_image is None or not self.bg_width_meters:
+            return None
+        x0, y0 = self.bg_offset_x, self.bg_offset_y
+        return (x0, x0 + self.bg_width_meters, y0, y0 + self.bg_height_meters)
+
     def _apply_background_image(self, file_path, source="loaded"):
         """Load ``file_path`` as the arena background and refresh UI/preview.
 
-        Computes real-world dimensions from the XML scale when available,
-        updates the status label and preview, and returns True on success.
-        ``source`` is a short verb used in the log line ("loaded"/"auto-loaded").
+        Seeds the manual transform (scale + offset) from the XML — matching the
+        image resolution to the right embedded map when several exist — then
+        computes real-world dimensions, updates the status label and preview,
+        and returns True on success. ``source`` is a short verb used in the log
+        line ("loaded"/"auto-loaded").
         """
         try:
             self.background_image = plt.imread(file_path)
@@ -4984,19 +5143,28 @@ class UWBQuickVisualizationWindow(QWidget):
         name = os.path.basename(file_path)
         img_height_px, img_width_px = self.background_image.shape[:2]
 
-        if self.xml_scale:
-            # pixels * inches/pixel * meters/inch (1 inch = 0.0254 m)
-            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
-            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
-            self.log_message(f"✓ Background {source}: {name} ({self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m)")
+        # Seed the manual transform: default scale from the matching XML map,
+        # offsets reset to 0 (bottom-left corner at world origin, the Wiser
+        # frame). The user can nudge these live via the Preview controls.
+        self.bg_offset_x = 0.0
+        self.bg_offset_y = 0.0
+        matched = self._default_bg_scale(img_width_px, img_height_px, file_path)
+        self.bg_scale = matched if matched else 1.0
+        self._recompute_bg_size()
+        if matched:
+            self.log_message(
+                f"✓ Background {source}: {name} "
+                f"({self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m "
+                f"@ {self.bg_scale:.4f} in/px)")
         else:
-            self.bg_width_meters = img_width_px * 0.0254  # rough 1 inch/pixel fallback
-            self.bg_height_meters = img_height_px * 0.0254
-            self.log_message(f"✓ Background {source}: {name} (no XML scale — dimensions may be inaccurate)")
+            self.log_message(
+                f"✓ Background {source}: {name} (no XML scale — using 1 in/px; "
+                "dimensions may be inaccurate)")
 
         self.lbl_background_status.setText(f"✓ Background: {name}")
         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
         self.btn_remove_background.setEnabled(True)
+        self._sync_bg_transform_controls()
 
         self._log_background_alignment()
 
@@ -5025,12 +5193,23 @@ class UWBQuickVisualizationWindow(QWidget):
         self.log_message("── Background alignment check ─────────────")
         self.log_message(f"  Image: {w_px} x {h_px} px")
         self.log_message(
-            f"  XML scale: {self.xml_scale} in/px" if self.xml_scale
+            f"  XML scale (first Map): {self.xml_scale} in/px" if self.xml_scale
             else "  XML scale: none — using 1 in/px fallback (likely wrong)")
-        if self.bg_width_meters and self.bg_height_meters:
+        if self.bg_scale:
+            res_match = any(m['w_px'] == w_px and m['h_px'] == h_px
+                            for m in (getattr(self, 'xml_maps', None) or []))
+            matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
+            note = ""
+            if matched and abs(matched - self.bg_scale) < 1e-9 and matched != self.xml_scale:
+                note = (" (matched to XML render of same resolution)" if res_match
+                        else " (matched to XML render by filename)")
+            self.log_message(f"  Effective bg scale: {self.bg_scale:.4f} in/px{note}")
+        ext = self._bg_placed_extent()
+        if ext:
             self.log_message(
-                f"  Image placed extent: {self.bg_width_meters:.2f} x "
-                f"{self.bg_height_meters:.2f} m (bottom-left corner at 0,0)")
+                f"  Image placed extent: x[{ext[0]:.2f}, {ext[1]:.2f}] "
+                f"y[{ext[2]:.2f}, {ext[3]:.2f}] m "
+                f"(offset {self.bg_offset_x:.2f}, {self.bg_offset_y:.2f})")
 
         anchors = self.anchor_positions or []
         if anchors:
@@ -5047,13 +5226,14 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message(
                     f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f} "
                     "(≈1.0–1.3 expected; far from 1 = image mis-scaled)")
-                if self.xml_scale:
+                if self.bg_scale:
                     # Scale that would make the image span exactly the anchor
                     # bbox (the true arena is a bit larger, so nudge from here).
                     self.log_message(
                         f"  Scale to fit image to anchor span: x≈"
-                        f"{self.xml_scale / rx:.4f}, y≈{self.xml_scale / ry:.4f} in/px "
-                        f"(current {self.xml_scale:.4f})")
+                        f"{self.bg_scale / rx:.4f}, y≈{self.bg_scale / ry:.4f} in/px "
+                        f"(current {self.bg_scale:.4f}) — set via the Preview "
+                        "'Bg scale' control")
         else:
             self.log_message("  No anchors parsed — cannot cross-check the image scale.")
 
@@ -5089,9 +5269,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.background_image_path = None
         self.bg_width_meters = None
         self.bg_height_meters = None
+        self.bg_scale = None
+        self.bg_offset_x = 0.0
+        self.bg_offset_y = 0.0
         self.lbl_background_status.setText("No background image loaded")
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.btn_remove_background.setEnabled(False)
+        self._sync_bg_transform_controls()
         self.log_message("Background image removed")
         if self.preview_canvas_2d is not None:
             self.preview_canvas_2d.background_image = None
@@ -5101,6 +5285,58 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def on_show_background_toggled(self, _state=None):
         """Redraw the preview after a display toggle (background or anchors)."""
+        if self._preview_active:
+            self.refresh_preview_arena()
+
+    def _sync_bg_transform_controls(self):
+        """Push the current scale/offset onto the spinboxes without re-firing.
+
+        Enables the control group only when a background image is loaded. Signals
+        are blocked so seeding the widgets does not trigger a redraw loop.
+        """
+        if not hasattr(self, 'spin_bg_scale'):
+            return   # controls not built yet (early call during startup)
+        have_img = self.background_image is not None
+        for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
+            w.blockSignals(True)
+        self.spin_bg_scale.setValue(self.bg_scale if self.bg_scale else 1.0)
+        self.spin_bg_offx.setValue(self.bg_offset_x)
+        self.spin_bg_offy.setValue(self.bg_offset_y)
+        for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
+            w.blockSignals(False)
+        if hasattr(self, '_bg_transform_box'):
+            self._bg_transform_box.setEnabled(have_img)
+
+    def on_bg_transform_changed(self, _value=None):
+        """Apply the manual scale + offset from the spinboxes and redraw.
+
+        Re-sizes the background from the new scale, shifts it by the new offset,
+        and refreshes the live preview so the user sees the alignment update as
+        they nudge. No-op when no image is loaded.
+        """
+        if self.background_image is None:
+            return
+        self.bg_scale = self.spin_bg_scale.value()
+        self.bg_offset_x = self.spin_bg_offx.value()
+        self.bg_offset_y = self.spin_bg_offy.value()
+        self._recompute_bg_size()
+        if self._preview_active:
+            self.refresh_preview_arena()
+
+    def reset_bg_transform(self):
+        """Restore scale to the XML default (matched to this image) and offset to 0."""
+        if self.background_image is None:
+            return
+        h_px, w_px = self.background_image.shape[:2]
+        matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
+        self.bg_scale = matched if matched else 1.0
+        self.bg_offset_x = 0.0
+        self.bg_offset_y = 0.0
+        self._recompute_bg_size()
+        self._sync_bg_transform_controls()
+        self.log_message(
+            f"Background transform reset to XML: scale {self.bg_scale:.4f} in/px, "
+            "offset (0.00, 0.00) m")
         if self._preview_active:
             self.refresh_preview_arena()
 
@@ -5816,6 +6052,10 @@ class UWBQuickVisualizationWindow(QWidget):
             # or None. Written by _export_sitemap during export.
             'sitemap': getattr(self, '_exported_sitemap', None),
             'background_image_path': self.background_image_path,
+            # Manual background transform (option (b)) so the alignment nudge
+            # survives a reload. Scale is in/px; offset is metres.
+            'background_scale_inpx': self.bg_scale,
+            'background_offset_m': [float(self.bg_offset_x), float(self.bg_offset_y)],
             'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None,
             # Anchor/antenna positions, zones, scale and map extent from the
             # site XML (all in meters); None when no XML was detected.
@@ -6028,48 +6268,31 @@ class UWBQuickVisualizationWindow(QWidget):
                         except:
                             pass
                 
-                # Try absolute path first
+                # Resolve the saved path (absolute, else relative to the DB dir),
+                # then load through the shared helper so scale/offset seeding and
+                # the alignment log stay consistent with an interactive load.
+                resolved = None
                 if os.path.exists(bg_path):
-                    self.background_image_path = bg_path
-                    try:
-                        self.background_image = plt.imread(bg_path)
-                        img_height_px, img_width_px = self.background_image.shape[:2]
-                        if self.xml_scale:
-                            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
-                            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
-                            self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
-                        else:
-                            self.bg_width_meters = img_width_px * 0.0254
-                            self.bg_height_meters = img_height_px * 0.0254
-                            self.log_message(f"WARNING: No XML scale — background dimensions may be incorrect")
-                        self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
-                        self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
-                        self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
-                        self.btn_remove_background.setEnabled(True)
-                    except Exception as e:
-                        self.log_message(f"Warning: Could not load background image: {str(e)}")
-                # Try relative to database directory
+                    resolved = bg_path
                 elif os.path.exists(os.path.join(db_dir, os.path.basename(bg_path))):
-                    bg_path = os.path.join(db_dir, os.path.basename(bg_path))
-                    self.background_image_path = bg_path
-                    try:
-                        self.background_image = plt.imread(bg_path)
-                        img_height_px, img_width_px = self.background_image.shape[:2]
-                        if self.xml_scale:
-                            self.bg_width_meters = img_width_px * self.xml_scale * 0.0254
-                            self.bg_height_meters = img_height_px * self.xml_scale * 0.0254
-                            self.log_message(f"Background dimensions: {self.bg_width_meters:.2f}m x {self.bg_height_meters:.2f}m (scale: {self.xml_scale} in/px)")
-                        else:
-                            self.bg_width_meters = img_width_px * 0.0254
-                            self.bg_height_meters = img_height_px * 0.0254
-                            self.log_message(f"WARNING: No XML scale — background dimensions may be incorrect")
-                        self.log_message(f"Background image loaded: {os.path.basename(bg_path)}")
-                        self.lbl_background_status.setText(f"✓ Background: {os.path.basename(bg_path)}")
-                        self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
-                        self.btn_remove_background.setEnabled(True)
-                    except Exception as e:
-                        self.log_message(f"Warning: Could not load background image: {str(e)}")
-                else:
+                    resolved = os.path.join(db_dir, os.path.basename(bg_path))
+
+                if resolved and self._apply_background_image(resolved, source="restored"):
+                    # Honour a saved manual transform (overrides the XML default).
+                    saved_scale = config.get('background_scale_inpx')
+                    saved_off = config.get('background_offset_m')
+                    if saved_scale:
+                        self.bg_scale = float(saved_scale)
+                    if saved_off and len(saved_off) == 2:
+                        self.bg_offset_x = float(saved_off[0])
+                        self.bg_offset_y = float(saved_off[1])
+                    if saved_scale or saved_off:
+                        self._recompute_bg_size()
+                        self._sync_bg_transform_controls()
+                        self.log_message(
+                            f"Restored background transform: scale {self.bg_scale:.4f} in/px, "
+                            f"offset ({self.bg_offset_x:.2f}, {self.bg_offset_y:.2f}) m")
+                elif not resolved:
                     self.log_message(f"Warning: Saved background image not found: {bg_path}")
             
             # Note: selected_tags will be loaded after tags are populated from table
@@ -7057,6 +7280,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     anchor_positions=self.anchor_positions,
                     xml_map_image=self.xml_map_image,
                     xml_map_extent=self.xml_map_extent,
+                    bg_offset_x=self.bg_offset_x,
+                    bg_offset_y=self.bg_offset_y,
                 )
                 self.worker.progress.connect(self.update_status)
                 self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, anim_csv_path, animations_dir))
