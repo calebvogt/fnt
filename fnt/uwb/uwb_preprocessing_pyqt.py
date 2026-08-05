@@ -2887,24 +2887,51 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_preview_dark.stateChanged.connect(self.on_preview_theme_changed)
         v.addWidget(self.chk_preview_dark)
 
-        # Preview thresholding toggles — independent of the export thresholds, so
-        # the user can see the track with/without each applied (values come from
-        # the Export Options threshold spinboxes).
-        self.chk_preview_velocity = QCheckBox("Velocity threshold")
+        # Preview thresholding — independent of the Export thresholds, so you can
+        # see the track with/without each applied AND tune the cutoff live. Each
+        # toggle carries its own value spinbox (defaults match Export: 2.0).
+        pvel_row = QHBoxLayout()
+        self.chk_preview_velocity = QCheckBox("Velocity threshold (remove >")
         self.chk_preview_velocity.setChecked(True)
         self.chk_preview_velocity.setToolTip(
-            "Apply the velocity threshold to the PREVIEW track (uses the value "
-            "in Export Options). Toggle to see its effect live.")
+            "Apply a velocity threshold to the PREVIEW track. Toggle to compare "
+            "with/without; adjust the value to see the cutoff's effect live.")
         self.chk_preview_velocity.stateChanged.connect(self.invalidate_preview_cache)
-        v.addWidget(self.chk_preview_velocity)
+        pvel_row.addWidget(self.chk_preview_velocity)
+        self.spin_preview_velocity = QDoubleSpinBox()
+        self.spin_preview_velocity.setRange(0.1, 10.0)
+        self.spin_preview_velocity.setValue(2.0)
+        self.spin_preview_velocity.setSuffix(" m/s)")
+        self.spin_preview_velocity.setDecimals(1)
+        self.spin_preview_velocity.setSingleStep(0.1)
+        self.spin_preview_velocity.setToolTip(
+            "Remove preview fixes whose speed from the previous fix exceeds this.")
+        self.spin_preview_velocity.valueChanged.connect(self.invalidate_preview_cache)
+        pvel_row.addWidget(self.spin_preview_velocity)
+        pvel_row.addStretch()
+        v.addLayout(pvel_row)
 
-        self.chk_preview_jump = QCheckBox("Jump threshold")
+        pjump_row = QHBoxLayout()
+        self.chk_preview_jump = QCheckBox("Jump threshold (remove >")
         self.chk_preview_jump.setChecked(True)
         self.chk_preview_jump.setToolTip(
-            "Apply the jump threshold to the PREVIEW track (uses the value in "
-            "Export Options). Toggle to see its effect live.")
+            "Apply a distance-jump threshold to the PREVIEW track. Toggle to "
+            "compare with/without; adjust the value to see the cutoff's effect live.")
         self.chk_preview_jump.stateChanged.connect(self.invalidate_preview_cache)
-        v.addWidget(self.chk_preview_jump)
+        pjump_row.addWidget(self.chk_preview_jump)
+        self.spin_preview_jump = QDoubleSpinBox()
+        self.spin_preview_jump.setRange(0.1, 10.0)
+        self.spin_preview_jump.setValue(2.0)
+        self.spin_preview_jump.setSuffix(" m)")
+        self.spin_preview_jump.setDecimals(1)
+        self.spin_preview_jump.setSingleStep(0.1)
+        self.spin_preview_jump.setToolTip(
+            "Remove preview fixes that leap more than this distance from the "
+            "previous fix.")
+        self.spin_preview_jump.valueChanged.connect(self.invalidate_preview_cache)
+        pjump_row.addWidget(self.spin_preview_jump)
+        pjump_row.addStretch()
+        v.addLayout(pjump_row)
 
         color_row = QHBoxLayout()
         color_row.addWidget(QLabel("Color by:"))
@@ -3574,8 +3601,10 @@ class UWBQuickVisualizationWindow(QWidget):
             if do_filter:
                 # collect_stats=False: preview scrubbing must not overwrite the
                 # figures an export writes into runSummary.csv
-                g = self.apply_filters_to_data(g, collect_stats=False,
-                                               velocity=use_vel, jump=use_jump)
+                g = self.apply_filters_to_data(
+                    g, collect_stats=False, velocity=use_vel, jump=use_jump,
+                    velocity_thresh=self.spin_preview_velocity.value(),
+                    jump_thresh=self.spin_preview_jump.value())
             if smoothing_method != "None" and len(g):
                 # Preview uses its own Smoothing Window / units so the effect can
                 # be tuned live, independent of the Export Options values.
@@ -4497,6 +4526,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if hasattr(self, 'spin_preview_window'):
             self.spin_preview_window.setValue(30)
             self.combo_preview_window_units.setCurrentText("Seconds")
+        if hasattr(self, 'spin_preview_velocity'):
+            self.spin_preview_velocity.setValue(2.0)
+            self.spin_preview_jump.setValue(2.0)
         self.chk_velocity_filter.setChecked(True)
         self.spin_velocity_threshold.setValue(2.0)
         self.chk_jump_filter.setChecked(True)
@@ -4966,6 +4998,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_background_status.setStyleSheet("color: #00aa00; font-style: normal; font-size: 9px;")
         self.btn_remove_background.setEnabled(True)
 
+        self._log_background_alignment()
+
         # Switch the live preview to 2D (the only view that shows the
         # background) and redraw so the floorplan appears immediately.
         if self._preview_active:
@@ -4973,6 +5007,62 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.combo_view_mode.setCurrentText(self.VIEW_2D)
             self.refresh_preview_arena()
         return True
+
+    def _log_background_alignment(self):
+        """Log the numbers that expose an image-vs-tracking scale mismatch.
+
+        The background's physical size is ``img_pixels * xml_scale``, but the
+        anchors and zones come from absolute inch coordinates, so they are
+        image-independent. If the loaded image's resolution differs from the map
+        the XML scale was calibrated against (e.g. a re-rendered floorplan), the
+        image ends up the wrong physical size even though its corner still sits
+        at (0, 0). Comparing the image extent to the anchor bounding box makes
+        that visible and suggests the scale that would fit.
+        """
+        if self.background_image is None:
+            return
+        h_px, w_px = self.background_image.shape[:2]
+        self.log_message("── Background alignment check ─────────────")
+        self.log_message(f"  Image: {w_px} x {h_px} px")
+        self.log_message(
+            f"  XML scale: {self.xml_scale} in/px" if self.xml_scale
+            else "  XML scale: none — using 1 in/px fallback (likely wrong)")
+        if self.bg_width_meters and self.bg_height_meters:
+            self.log_message(
+                f"  Image placed extent: {self.bg_width_meters:.2f} x "
+                f"{self.bg_height_meters:.2f} m (bottom-left corner at 0,0)")
+
+        anchors = self.anchor_positions or []
+        if anchors:
+            xs = [a['x'] for a in anchors]
+            ys = [a['y'] for a in anchors]
+            ax0, ax1, ay0, ay1 = min(xs), max(xs), min(ys), max(ys)
+            span_x, span_y = ax1 - ax0, ay1 - ay0
+            self.log_message(
+                f"  Anchors: {len(anchors)} — span x[{ax0:.2f}, {ax1:.2f}] "
+                f"y[{ay0:.2f}, {ay1:.2f}] m = {span_x:.2f} x {span_y:.2f} m")
+            if self.bg_width_meters and span_x > 0 and span_y > 0:
+                rx = self.bg_width_meters / span_x
+                ry = self.bg_height_meters / span_y
+                self.log_message(
+                    f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f} "
+                    "(≈1.0–1.3 expected; far from 1 = image mis-scaled)")
+                if self.xml_scale:
+                    # Scale that would make the image span exactly the anchor
+                    # bbox (the true arena is a bit larger, so nudge from here).
+                    self.log_message(
+                        f"  Scale to fit image to anchor span: x≈"
+                        f"{self.xml_scale / rx:.4f}, y≈{self.xml_scale / ry:.4f} in/px "
+                        f"(current {self.xml_scale:.4f})")
+        else:
+            self.log_message("  No anchors parsed — cannot cross-check the image scale.")
+
+        if getattr(self, 'xml_map_extent', None) is not None:
+            e = self.xml_map_extent
+            self.log_message(
+                f"  Embedded XML site map extent: {e[1]:.2f} x {e[3]:.2f} m "
+                "(what the XML scale actually calibrates)")
+        self.log_message("──────────────────────────────────────────")
 
     def select_background_image(self):
         """Allow user to select a background image via the file picker."""
@@ -5556,12 +5646,14 @@ class UWBQuickVisualizationWindow(QWidget):
         """Clear accumulated filter statistics at the start of an export run."""
         self.filter_stats = {}
 
-    def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None):
+    def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None,
+                              velocity_thresh=None, jump_thresh=None):
         """Apply velocity and jump thresholding with time-window grouping.
 
-        ``velocity``/``jump`` override whether each threshold is applied; when
-        None they follow the export checkboxes. The preview passes its own
-        toggles so the user can compare with/without thresholding live.
+        ``velocity``/``jump`` override whether each threshold is applied and
+        ``velocity_thresh``/``jump_thresh`` override the cutoff values; when None
+        they follow the Export checkboxes/spinboxes. The preview passes its own
+        toggles and values so the user can tune thresholding live.
         """
         use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
@@ -5589,7 +5681,8 @@ class UWBQuickVisualizationWindow(QWidget):
         
         # Apply velocity filtering if enabled
         if use_velocity:
-            velocity_threshold = self.spin_velocity_threshold.value()
+            velocity_threshold = (self.spin_velocity_threshold.value()
+                                  if velocity_thresh is None else velocity_thresh)
             before_velocity = len(data)
             data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())].copy()
             removed_velocity = before_velocity - len(data)
@@ -5600,7 +5693,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Apply jump filtering if enabled
         if use_jump:
-            jump_threshold = self.spin_jump_threshold.value()
+            jump_threshold = (self.spin_jump_threshold.value()
+                              if jump_thresh is None else jump_thresh)
             before_jump = len(data)
             data['is_jump'] = (data['distance'] > jump_threshold)
             data = data[~data['is_jump']].copy()
