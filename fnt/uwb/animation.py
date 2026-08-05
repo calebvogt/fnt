@@ -224,11 +224,13 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     ax = fig.add_subplot(111)
     ax.grid(False)
 
-    def _draw_static():
-        draw_static_context(ax, layers, bg_image=bg_image, bg_extent=bg_extent,
-                            arena_zones=arena_zones, anchors=anchors, log=log)
-
-    _draw_static()
+    # Draw the unchanging scene (background image, zones, anchors, axes) ONCE and
+    # cache it, then blit only the moving markers/trails each frame. The previous
+    # implementation did ax.clear() + redraw the full-resolution background image
+    # on *every* frame — very slow, and a heavy source of per-frame native memory
+    # churn in the Agg/NumPy layer. Caching removes essentially all of that work.
+    draw_static_context(ax, layers, bg_image=bg_image, bg_extent=bg_extent,
+                        arena_zones=arena_zones, anchors=anchors, log=log)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect('equal')
@@ -237,6 +239,23 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
 
     canvas.draw()
     width, height = canvas.get_width_height()
+    static_bg = canvas.copy_from_bbox(fig.bbox)  # cached static scene
+
+    # Persistent per-tag artists, updated in place each frame (set_data/set_text)
+    # rather than created/destroyed — no artist-list growth, minimal allocation.
+    # animated=True keeps them out of canvas.draw(), so they never bake into the
+    # cached background; they are drawn only via draw_artist during blitting.
+    title_artist = ax.set_title("", fontsize=14, fontweight='bold')
+    title_artist.set_animated(True)
+    dyn = {}
+    for tag, tag_info in tag_data_dict.items():
+        color = tag_info['color']
+        (trail_line,) = ax.plot([], [], color=color, alpha=0.5, linewidth=1,
+                                animated=True)
+        (marker,) = ax.plot([], [], 'o', color=color, markersize=10, animated=True)
+        label = ax.text(0, 0, '', fontsize=10, ha='center', color=color,
+                        fontweight='bold', animated=True)
+        dyn[tag] = (trail_line, marker, label)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -258,36 +277,38 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         # marker sits at `current`.
         window_start = frame_start - pd.Timedelta(seconds=trailing_window)
 
-        ax.clear()
-        _draw_static()  # ax.clear() removed everything; redraw all static layers
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_aspect('equal')
-        ax.set_xlabel("X Position (m)", fontsize=12)
-        ax.set_ylabel("Y Position (m)", fontsize=12)
+        canvas.restore_region(static_bg)  # wipe back to the cached scene
 
         title_text = title
         if speed_text:
             title_text += f" - Speed: {speed_text}"
         title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
-        ax.set_title(title_text, fontsize=14, fontweight='bold')
+        title_artist.set_text(title_text)
+        ax.draw_artist(title_artist)
 
-        for tag_info in tag_data_dict.values():
+        for tag, tag_info in tag_data_dict.items():
+            trail_line, marker, label = dyn[tag]
             tag_df = tag_info['data']
             trailing = tag_df[(tag_df['Timestamp'] >= window_start) &
                               (tag_df['Timestamp'] <= frame_start)]
             if trailing.empty:
-                continue
-            color = tag_info['color']
-            ax.plot(trailing['smoothed_x'], trailing['smoothed_y'],
-                    color=color, alpha=0.5, linewidth=1)
-            current_x = trailing['smoothed_x'].iloc[-1]
-            current_y = trailing['smoothed_y'].iloc[-1]
-            ax.plot(current_x, current_y, 'o', color=color, markersize=10)
-            ax.text(current_x, current_y + (y_range * 0.02), tag_info['label'],
-                    fontsize=10, ha='center', color=color, fontweight='bold')
+                # Tag not reporting in this window (e.g. battery dead): hide it.
+                trail_line.set_data([], [])
+                marker.set_data([], [])
+                label.set_text('')
+            else:
+                xs = trailing['smoothed_x'].to_numpy()
+                ys = trailing['smoothed_y'].to_numpy()
+                trail_line.set_data(xs, ys)
+                cx, cy = xs[-1], ys[-1]
+                marker.set_data([cx], [cy])
+                label.set_position((cx, cy + (y_range * 0.02)))
+                label.set_text(tag_info['label'])
+            ax.draw_artist(trail_line)
+            ax.draw_artist(marker)
+            ax.draw_artist(label)
 
-        canvas.draw()
+        canvas.blit(fig.bbox)
         buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
         buf = buf.reshape(canvas.get_width_height()[::-1] + (4,))
         video_writer.write(cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR))

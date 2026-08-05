@@ -1,4 +1,5 @@
 import base64
+import faulthandler
 import io
 import os
 import re
@@ -7373,7 +7374,45 @@ class UWBQuickVisualizationWindow(QWidget):
         self.log_message("Ready for next operation")
 
 
+# Kept alive for the whole process so faulthandler's file target isn't GC'd.
+_FAULT_LOG = None
+
+
+def _install_faulthandler():
+    """Dump a native-crash traceback to a local log file (and the console).
+
+    A hard crash inside a C extension (numpy/MKL/matplotlib) terminates the
+    process with no Python traceback — e.g. the 0xc000001d illegal-instruction
+    crash seen on Python 3.14 during plot export. faulthandler installs a fatal-
+    signal handler that writes every thread's Python stack on the way down, so a
+    recurrence names the exact plot/line (including the export worker thread).
+
+    The trace goes to ~/.fnt/faulthandler_crash.log on the LOCAL disk (never the
+    network share, so it survives even if that share is what hiccuped) and the
+    path is printed at startup.
+    """
+    global _FAULT_LOG
+    try:
+        log_dir = os.path.join(os.path.expanduser("~"), ".fnt")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "faulthandler_crash.log")
+        _FAULT_LOG = open(log_path, "a", buffering=1, encoding="utf-8")
+        from datetime import datetime
+        _FAULT_LOG.write(f"\n===== FNT session {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+        _FAULT_LOG.flush()
+        faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+        print(f"[FNT] Native-crash log enabled: {log_path}")
+    except Exception as e:
+        # Never block startup on logging setup — fall back to stderr-only.
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+        print(f"[FNT] faulthandler on stderr only ({e})")
+
+
 def main():
+    _install_faulthandler()
     app = QApplication(sys.argv)
     window = UWBQuickVisualizationWindow()
     window.show()
