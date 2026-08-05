@@ -6587,6 +6587,35 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._animation_tags = sel
                 self.lbl_anim_tags.setText(f"{len(sel)} of {len(tags)} tags")
 
+    def _snapshot_anim_settings(self):
+        """Freeze every animation setting at export time.
+
+        The export runs plots on a background thread and renders the animation on
+        the main thread with periodic processEvents(), so the window stays live
+        the whole time. Reading widgets during the run let a mid-export click
+        (e.g. changing the speed) leak into a render already in the queue. This
+        captures the values once so the whole export uses a single, consistent
+        set of settings regardless of what the user clicks afterwards.
+        """
+        speed_text = self.combo_animation_speed.currentText()
+        days = [d for d, cb in self.daily_animation_day_checkboxes.items()
+                if cb.isChecked()]
+        return {
+            'trailing_window': self.spin_animation_trail.value(),
+            'fps': int(self.combo_animation_fps.currentText()),
+            'speed_text': speed_text,
+            'speed_multiplier': int(speed_text.replace('x', '')),
+            'color_by': self.combo_color_by.currentText(),
+            'generate_daily': self.chk_daily_animations.isChecked(),
+            'selected_days': days,
+            'video_quality': self.combo_video_quality.currentText(),
+            'tag_size': self.spin_anim_tag_size.value(),
+            'show_battery': self.chk_show_battery_export.isChecked(),
+            'animation_tags': (list(self._animation_tags)
+                               if self._animation_tags else None),
+            'use_identities': bool(self.tag_identities),
+        }
+
     def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None, animations_dir=None):
         """Generate animation video from tracking data"""
         try:
@@ -6661,29 +6690,35 @@ class UWBQuickVisualizationWindow(QWidget):
                 f"{'smoothed' if 'smoothed_x' in anim_data.columns else 'raw (unsmoothed)'} coordinates")
             anim_data = uwb_animation.prepare_animation_data(anim_data, self.tag_identities)
 
-            # Restrict to the chosen subset of tags (default: all).
-            if self._animation_tags:
-                anim_data = anim_data[anim_data['shortid'].isin(self._animation_tags)]
-                self.log_message(f"Animation limited to {len(self._animation_tags)} selected tag(s)")
+            # All animation settings come from the snapshot taken at export time
+            # (see _snapshot_anim_settings) so a mid-export click can't change
+            # this render.
+            s = getattr(self, '_anim_settings', None) or self._snapshot_anim_settings()
 
-            # Get animation parameters
-            trailing_window = self.spin_animation_trail.value()
-            fps = int(self.combo_animation_fps.currentText())
-            speed_text = self.combo_animation_speed.currentText()
-            speed_multiplier = int(speed_text.replace('x', ''))
-            color_by = self.combo_color_by.currentText()
+            # Restrict to the chosen subset of tags (default: all).
+            anim_tags = s['animation_tags']
+            if anim_tags:
+                anim_data = anim_data[anim_data['shortid'].isin(anim_tags)]
+                self.log_message(f"Animation limited to {len(anim_tags)} selected tag(s)")
+
+            # Get animation parameters (from the frozen snapshot)
+            trailing_window = s['trailing_window']
+            fps = s['fps']
+            speed_text = s['speed_text']
+            speed_multiplier = s['speed_multiplier']
+            color_by = s['color_by']
 
             frame_interval = uwb_animation.frame_interval_seconds(speed_multiplier, fps)
             self.log_message(f"Animation: {speed_text} speed at {fps} FPS (each frame = {frame_interval:.2f}s of real time)")
-            
+
             self.log_message("Setting up animation frames...")
-            
+
             # Check if daily animations are requested
-            generate_daily = self.chk_daily_animations.isChecked()
-            
+            generate_daily = s['generate_daily']
+
             if generate_daily:
-                # Get selected days
-                selected_days = [date_str for date_str, cb in self.daily_animation_day_checkboxes.items() if cb.isChecked()]
+                # Get selected days (frozen at export time)
+                selected_days = s['selected_days']
                 if not selected_days:
                     self.log_message("⚠ No days selected for daily animations")
                     return
@@ -6716,24 +6751,20 @@ class UWBQuickVisualizationWindow(QWidget):
                     if len(day_data) == 0:
                         self.log_message(f"⚠ No data for {date_str}, skipping")
                         continue
-                    
-                    # Get speed text for display
-                    speed_text = self.combo_animation_speed.currentText()
-                    
-                    # Generate animation for this day
+
+                    # Generate animation for this day (speed_text frozen above)
                     video_path = self.create_animation_frames(
                         day_data, temp_frames_dir, frame_interval, trailing_window,
-                        fps, color_by, bool(self.tag_identities),
+                        fps, color_by, s['use_identities'],
                         total_export_steps, current_export_step,
                         day_suffix=f"_Day{day_idx + 1}_{date_str}",
                         speed_text=speed_text
                     )
-                    
+
                     if video_path and not self.export_cancelled:
                         # Move video to final location with FPS and speed in filename
                         db_filename = os.path.basename(self.db_path)
                         db_name = os.path.splitext(db_filename)[0]
-                        speed_text = self.combo_animation_speed.currentText()
                         final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
                         
                         # Check if file exists and skip if not overwriting
@@ -6760,17 +6791,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 # Create animation
                 self.log_message("Generating animation frames (this may take a while)...")
-                speed_text = self.combo_animation_speed.currentText()
-                video_path = self.create_animation_frames(anim_data, temp_frames_dir, frame_interval, trailing_window, 
-                                            fps, color_by, bool(self.tag_identities),
+                video_path = self.create_animation_frames(anim_data, temp_frames_dir, frame_interval, trailing_window,
+                                            fps, color_by, s['use_identities'],
                                             total_export_steps, current_export_step,
                                             speed_text=speed_text)
-                
+
                 if video_path and not self.export_cancelled:
                     # Move video to final location with FPS and speed in filename
                     db_filename = os.path.basename(self.db_path)
                     db_name = os.path.splitext(db_filename)[0]
-                    speed_text = self.combo_animation_speed.currentText()
                     final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
                     
                     # Check if file exists and skip if not overwriting
@@ -6814,7 +6843,8 @@ class UWBQuickVisualizationWindow(QWidget):
         layer choice, background/zones/anchors, identities) and wires the tool's
         progress bar, cancellation flag and logger into the pure renderer.
         """
-        dpi = uwb_animation.QUALITY_DPI.get(self.combo_video_quality.currentText(), 100)
+        s = getattr(self, '_anim_settings', None) or self._snapshot_anim_settings()
+        dpi = uwb_animation.QUALITY_DPI.get(s['video_quality'], 100)
         self.log_message(f"Using {dpi} DPI for video generation")
 
         bg_image, bg_extent = self._context_bg_source()
@@ -6838,8 +6868,8 @@ class UWBQuickVisualizationWindow(QWidget):
             layers=self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
             arena_zones=self.arena_zones, anchors=self.anchor_positions,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
-            color_by=color_by, marker_size=self.spin_anim_tag_size.value(),
-            show_battery=self.chk_show_battery_export.isChecked(),
+            color_by=color_by, marker_size=s['tag_size'],
+            show_battery=s['show_battery'],
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
@@ -6899,6 +6929,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_stop_export.setVisible(True)
         self.progress_widget.setVisible(True)
         self.progress_bar.setValue(0)
+
+        # Freeze animation settings NOW, before the (background-threaded) plot
+        # export and the main-thread animation render — both leave the window
+        # interactive — so clicking the controls mid-export can't change a render
+        # already queued. Everything downstream reads this snapshot, not widgets.
+        self._anim_settings = self._snapshot_anim_settings()
         
         # Gather export settings
         db_dir = os.path.dirname(self.db_path)
@@ -6962,14 +6998,14 @@ class UWBQuickVisualizationWindow(QWidget):
         if detect_proximity:
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
 
-        # Predict animation files (in animations/ subfolder)
+        # Predict animation files (in animations/ subfolder). Use the frozen
+        # snapshot so the predicted filenames match what actually gets rendered.
         predicted_animation_files = []
         if save_animation:
-            fps = int(self.combo_animation_fps.currentText())
-            speed_text = self.combo_animation_speed.currentText()
-            if self.chk_daily_animations.isChecked():
-                selected_days = [d for d, cb in self.daily_animation_day_checkboxes.items() if cb.isChecked()]
-                for day_idx, date_str in enumerate(selected_days):
+            fps = self._anim_settings['fps']
+            speed_text = self._anim_settings['speed_text']
+            if self._anim_settings['generate_daily']:
+                for day_idx, date_str in enumerate(self._anim_settings['selected_days']):
                     predicted_animation_files.append(f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
             else:
                 predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
