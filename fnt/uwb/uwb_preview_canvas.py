@@ -585,15 +585,19 @@ class UWBPreview2D(FigureCanvas):
         self._blit_bg = self.copy_from_bbox(self.ax.bbox)
         self._static_dirty = False
 
-    def update_frame(self, x, y, colors, tracks=None, raw_pts=None):
+    def update_frame(self, x, y, colors, tracks=None, raw_pts=None,
+                     labels=None, batteries=None):
         """Draw one frame by blitting the moving tags over the cached scene.
 
         ``tracks``: list of (xy Nx2 array, rgb tuple) — one fading polyline per
         tag. ``raw_pts``: optional Mx2 array of raw fixes drawn as faint dots.
+        ``labels``: optional per-tag ID strings drawn above each marker.
+        ``batteries``: optional per-tag battery voltages drawn under the label in
+        small black font (only shown alongside ``labels``).
         Only these dynamic artists are drawn per frame; the arena/zones/anchors
         come from the cached static background.
         """
-        self._last_frame = (x, y, colors, tracks, raw_pts)
+        self._last_frame = (x, y, colors, tracks, raw_pts, labels, batteries)
         if self._static_dirty or self._blit_bg is None:
             self._draw_static()
 
@@ -624,9 +628,35 @@ class UWBPreview2D(FigureCanvas):
         ok = np.isfinite(x) & np.isfinite(y)
         if ok.any():
             edge = "white" if self._theme == "dark" else "#333333"
+            # ``tag_size`` is a marker *diameter* in points (matching the
+            # animation's markersize); scatter wants an area in points**2, so
+            # square it. Kept in sync with the export so the preview reads true.
+            tag_size = getattr(self, "tag_size", 10)
             dynamic.append(self.ax.scatter(
-                x[ok], y[ok], s=42, c=np.asarray(colors)[ok],
+                x[ok], y[ok], s=float(tag_size) ** 2, c=np.asarray(colors)[ok],
                 edgecolors=edge, linewidths=0.6, zorder=5))
+
+        # Optional per-tag ID label (above the marker) with the battery voltage
+        # directly beneath it in small black font. Both anchor at y+off: the
+        # label grows upward (va="bottom"), the voltage downward (va="top").
+        if labels is not None and ok.any():
+            ylim = self.ax.get_ylim()
+            off = (ylim[1] - ylim[0]) * 0.035
+            lab_color = "white" if self._theme == "dark" else "#111111"
+            for i in range(len(x)):
+                if not ok[i]:
+                    continue
+                lbl = labels[i] if i < len(labels) else None
+                if lbl:
+                    dynamic.append(self.ax.text(
+                        x[i], y[i] + off, str(lbl), fontsize=8, ha="center",
+                        va="bottom", color=lab_color, fontweight="bold", zorder=6))
+                if batteries is not None and i < len(batteries):
+                    bv = batteries[i]
+                    if bv is not None and np.isfinite(bv):
+                        dynamic.append(self.ax.text(
+                            x[i], y[i] + off, f"{bv:.2f} V", fontsize=6,
+                            ha="center", va="top", color="#000000", zorder=6))
 
         for art in dynamic:
             self.ax.draw_artist(art)

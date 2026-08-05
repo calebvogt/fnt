@@ -176,7 +176,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      layers=None, bg_image=None, bg_extent=None,
                      arena_zones=None, anchors=None,
                      tag_identities=None, use_custom_identities=False,
-                     color_by="None",
+                     color_by="None", marker_size=10, show_battery=False,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -211,9 +211,12 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     tags = list(data['shortid'].unique()) if 'shortid' in data.columns else list(data['ID'].unique())
     id_col = 'shortid' if 'shortid' in data.columns else 'ID'
     styles = build_tag_styles(tags, tag_identities, use_custom_identities, color_by)
+    keep_cols = ['Timestamp', 'smoothed_x', 'smoothed_y']
+    if show_battery and 'battery_voltage' in data.columns:
+        keep_cols.append('battery_voltage')
     tag_data_dict = {}
     for tag in tags:
-        sub = data[data[id_col] == tag][['Timestamp', 'smoothed_x', 'smoothed_y']].sort_values('Timestamp')
+        sub = data[data[id_col] == tag][keep_cols].sort_values('Timestamp')
         tag_data_dict[tag] = {'data': sub,
                               'label': styles[tag]['label'],
                               'color': styles[tag]['color']}
@@ -252,10 +255,15 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         color = tag_info['color']
         (trail_line,) = ax.plot([], [], color=color, alpha=0.5, linewidth=1,
                                 animated=True)
-        (marker,) = ax.plot([], [], 'o', color=color, markersize=10, animated=True)
+        (marker,) = ax.plot([], [], 'o', color=color, markersize=marker_size,
+                            animated=True)
         label = ax.text(0, 0, '', fontsize=10, ha='center', color=color,
                         fontweight='bold', animated=True)
-        dyn[tag] = (trail_line, marker, label)
+        # Battery voltage under the ID label, small black font (drawn only when
+        # show_battery is on). va='top' so it hangs beneath the shared anchor.
+        batt_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
+                             color='#000000', animated=True)
+        dyn[tag] = (trail_line, marker, label, batt_label)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -287,7 +295,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         ax.draw_artist(title_artist)
 
         for tag, tag_info in tag_data_dict.items():
-            trail_line, marker, label = dyn[tag]
+            trail_line, marker, label, batt_label = dyn[tag]
             tag_df = tag_info['data']
             trailing = tag_df[(tag_df['Timestamp'] >= window_start) &
                               (tag_df['Timestamp'] <= frame_start)]
@@ -296,17 +304,33 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 trail_line.set_data([], [])
                 marker.set_data([], [])
                 label.set_text('')
+                batt_label.set_text('')
             else:
                 xs = trailing['smoothed_x'].to_numpy()
                 ys = trailing['smoothed_y'].to_numpy()
                 trail_line.set_data(xs, ys)
                 cx, cy = xs[-1], ys[-1]
                 marker.set_data([cx], [cy])
-                label.set_position((cx, cy + (y_range * 0.02)))
-                label.set_text(tag_info['label'])
+                if show_battery:
+                    # Lift the label and hang the voltage beneath it (shared
+                    # anchor at cy+off: label grows up, voltage grows down).
+                    off = y_range * 0.035
+                    label.set_position((cx, cy + off))
+                    label.set_verticalalignment('bottom')
+                    label.set_text(tag_info['label'])
+                    bv = (trailing['battery_voltage'].iloc[-1]
+                          if 'battery_voltage' in trailing.columns else None)
+                    batt_label.set_position((cx, cy + off))
+                    batt_label.set_text(f"{bv:.2f} V" if bv is not None and pd.notna(bv) else '')
+                else:
+                    label.set_position((cx, cy + (y_range * 0.02)))
+                    label.set_verticalalignment('baseline')
+                    label.set_text(tag_info['label'])
+                    batt_label.set_text('')
             ax.draw_artist(trail_line)
             ax.draw_artist(marker)
             ax.draw_artist(label)
+            ax.draw_artist(batt_label)
 
         canvas.blit(fig.bbox)
         buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)

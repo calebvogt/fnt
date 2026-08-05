@@ -1808,6 +1808,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_yf = None
         self.preview_raw_x = None       # same grid, pre-smoothing
         self.preview_raw_y = None
+        self.preview_batt = None        # battery voltage per tag, same grid
         self.preview_colors = None
 
         self.preview_cache = OrderedDict()   # chunk_index -> frame arrays (LRU)
@@ -2422,7 +2423,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # ---- CSV / plot / animation export options (continue the same group) --
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
-        self.chk_export_raw_csv.setChecked(True)
+        self.chk_export_raw_csv.setChecked(False)
         self.chk_export_raw_csv.setToolTip(
             "Dump the raw database table to CSV with no filtering, smoothing, or unit conversion. "
             "Useful as a reference baseline."
@@ -2603,11 +2604,34 @@ class UWBQuickVisualizationWindow(QWidget):
         inctag_layout.addWidget(self.btn_anim_tags)
         animation_options_layout.addLayout(inctag_layout)
 
+        # Marker diameter (points) for the rendered video. Mirrors the preview's
+        # 'Tag Display Size' so a size dialled in during preview matches the export.
+        anim_tagsize_layout = QHBoxLayout()
+        anim_tagsize_layout.addWidget(QLabel("Tag Display Size:"))
+        self.spin_anim_tag_size = QSpinBox()
+        self.spin_anim_tag_size.setRange(2, 40)
+        self.spin_anim_tag_size.setValue(10)
+        self.spin_anim_tag_size.setSuffix(" pts")
+        self.spin_anim_tag_size.setToolTip(
+            "Diameter (in points) of each tag's marker in the exported animation. "
+            "Match this to the preview's 'Tag Display Size' so the video looks "
+            "like what you tuned in the preview window.")
+        anim_tagsize_layout.addWidget(self.spin_anim_tag_size)
+        anim_tagsize_layout.addStretch(1)
+        animation_options_layout.addLayout(anim_tagsize_layout)
+
+        self.chk_show_battery_export = QCheckBox("Display Tag Battery Levels")
+        self.chk_show_battery_export.setChecked(False)
+        self.chk_show_battery_export.setToolTip(
+            "Show each tag's battery voltage in small black text under its ID "
+            "label in the exported animation. Off by default.")
+        animation_options_layout.addWidget(self.chk_show_battery_export)
+
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
-        self.combo_animation_speed.addItems(["1x", "5x", "10x", "20x", "40x", "80x", "100x", "120x", "150x", "160x", "200x", "400x", "500x", "1000x"])
-        self.combo_animation_speed.setCurrentText("80x")
+        self.combo_animation_speed.addItems(["1x", "5x", "15x", "30x", "60x", "120x", "240x"])
+        self.combo_animation_speed.setCurrentText("60x")
         self.combo_animation_speed.setToolTip(
             "How fast real time plays in the video. "
             "80x means 80 seconds of tracking data per 1 second of video."
@@ -2965,6 +2989,41 @@ class UWBQuickVisualizationWindow(QWidget):
             "authored colours. Preview only. Zones are parsed from the site XML.")
         self.chk_show_zones.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_zones)
+
+        self.chk_show_tracking = QCheckBox("Show Tag Tracking Data")
+        self.chk_show_tracking.setChecked(True)
+        self.chk_show_tracking.setToolTip(
+            "Draw the tag position markers and trailing tracks in the LIVE "
+            "PREVIEW. Turn off to inspect just the arena / background / anchors "
+            "without any tracking data on top.")
+        self.chk_show_tracking.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_tracking)
+
+        # Marker diameter in points. Matches the animation export's Tag Display
+        # Size so a size dialled in here reads the same in the rendered video —
+        # the preview marker was previously smaller than the export.
+        tagsize_row = QHBoxLayout()
+        tagsize_row.addWidget(QLabel("Tag Display Size:"))
+        self.spin_tag_size = QSpinBox()
+        self.spin_tag_size.setRange(2, 40)
+        self.spin_tag_size.setValue(10)
+        self.spin_tag_size.setSuffix(" pts")
+        self.spin_tag_size.setToolTip(
+            "Diameter (in points) of each tag's position marker in the preview. "
+            "Set the same value in the animation export's 'Tag Display Size' to "
+            "make the video markers match what you see here.")
+        self.spin_tag_size.valueChanged.connect(self.on_show_background_toggled)
+        tagsize_row.addWidget(self.spin_tag_size)
+        tagsize_row.addStretch(1)
+        v.addLayout(tagsize_row)
+
+        self.chk_show_battery = QCheckBox("Display Tag Battery Levels")
+        self.chk_show_battery.setChecked(False)
+        self.chk_show_battery.setToolTip(
+            "Label each tag in the preview with its ID and, beneath it, the "
+            "current battery voltage (small black text). Off by default.")
+        self.chk_show_battery.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_battery)
 
         self.chk_preview_dark = QCheckBox("Dark mode")
         self.chk_preview_dark.setChecked(False)   # light by default
@@ -3753,6 +3812,17 @@ class UWBQuickVisualizationWindow(QWidget):
         XF = pd.DataFrame(X).ffill().to_numpy()
         YF = pd.DataFrame(Y).ffill().to_numpy()
 
+        # Battery voltage per tag on the same grid, forward-filled so the reading
+        # persists between the tag's sparse fixes. None when the table carries no
+        # battery column. 'last' per bin (battery varies slowly, so any fix does).
+        if 'battery_voltage' in df.columns:
+            pb = df.pivot_table(index='tbin', columns='shortid',
+                                values='battery_voltage', aggfunc='last')
+            pb = pb.reindex(columns=cols).reindex(grid)
+            BAT = pd.DataFrame(pb.to_numpy(float)).ffill().to_numpy()
+        else:
+            BAT = None
+
         times = pd.to_datetime(grid * bin_ns, utc=True).tz_convert(
             pytz.timezone(self.combo_timezone.currentText()))
 
@@ -3765,10 +3835,12 @@ class UWBQuickVisualizationWindow(QWidget):
             t_start = int(times[0].timestamp() * 1000)
             t_end = int(times[-1].timestamp() * 1000)
 
-        return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, times=times,
+        return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, batt=BAT,
+                    times=times,
                     tags=cols, hz=hz, t_start=t_start, t_end=t_end,
                     nbytes=X.nbytes + Y.nbytes + XF.nbytes + YF.nbytes
-                           + RX.nbytes + RY.nbytes)
+                           + RX.nbytes + RY.nbytes
+                           + (BAT.nbytes if BAT is not None else 0))
 
     # Default preview marker colours: blue for male, red for female. Tags with
     # no configured identity default to male (matching the codebase's
@@ -3792,6 +3864,22 @@ class UWBQuickVisualizationWindow(QWidget):
             cmap = plt.get_cmap('tab20')
             return np.array([cmap(i % 20) for i in range(len(tags))], dtype=float)
         return np.array([self._NEUTRAL] * len(tags), dtype=float)   # None
+
+    def _preview_tag_labels(self, tags):
+        """One display label per tag: 'sex-identity' when configured, else HexID.
+
+        Matches the tag naming used elsewhere so the preview labels read the same
+        as the Tag Selection list and the animation.
+        """
+        labels = []
+        for tag in tags:
+            info = self.tag_identities.get(tag, {}) or {}
+            sex, ident = info.get('sex', ''), info.get('identity', '')
+            if sex and ident:
+                labels.append(f"{sex}-{ident}")
+            else:
+                labels.append(f"HexID {hex(tag).upper().replace('0X', '')}")
+        return labels
 
     def on_preview_smoothing_changed(self, *_):
         """Preview smoothing method changed: show/hide the preview Smoothing
@@ -3836,6 +3924,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_x, self.preview_y = c["x"], c["y"]
         self.preview_xf, self.preview_yf = c["xf"], c["yf"]
         self.preview_raw_x, self.preview_raw_y = c["raw_x"], c["raw_y"]
+        self.preview_batt = c.get("batt")
         self.preview_times = c["times"]
         self.preview_hz = c["hz"]
         self.preview_colors = self._preview_tag_colors(self.preview_tags)
@@ -3928,6 +4017,20 @@ class UWBQuickVisualizationWindow(QWidget):
         y = yf[idx]
         colors = self.preview_colors
 
+        backend = self._preview_backend()
+        # Live marker size (diameter, points); see UWBPreview2D.update_frame.
+        if hasattr(self, "spin_tag_size"):
+            backend.tag_size = self.spin_tag_size.value()
+
+        # "Show Tag Tracking Data" off: draw an empty frame so only the arena /
+        # background / anchors remain (no markers, no trails).
+        if hasattr(self, "chk_show_tracking") and not self.chk_show_tracking.isChecked():
+            backend.update_frame(np.full_like(np.asarray(x, float), np.nan),
+                                 np.full_like(np.asarray(y, float), np.nan),
+                                 colors, tracks=None, raw_pts=None)
+            self._update_time_label()
+            return
+
         # Build the trailing track: one connected polyline per tag over the
         # trail window (seconds -> frames). Chunks are loaded with a lead-in
         # overlap sized to the trail, so the tail stays continuous across chunk
@@ -3947,8 +4050,19 @@ class UWBQuickVisualizationWindow(QWidget):
                     tracks.append((np.column_stack([tx[ok], ty[ok]]),
                                    tuple(colors[t])))
 
-        self._preview_backend().update_frame(x, y, colors,
-                                             tracks=tracks, raw_pts=None)
+        # ID label + battery voltage under each dot when enabled. Labels are
+        # only drawn alongside the battery toggle (the preview is otherwise a
+        # clean dot view); the voltage is read from the forward-filled battery
+        # grid at the current frame.
+        labels = batteries = None
+        if getattr(self, "chk_show_battery", None) is not None and self.chk_show_battery.isChecked():
+            labels = self._preview_tag_labels(self.preview_tags)
+            batt = getattr(self, "preview_batt", None)
+            if batt is not None and idx < len(batt):
+                batteries = batt[idx]
+
+        backend.update_frame(x, y, colors, tracks=tracks, raw_pts=None,
+                             labels=labels, batteries=batteries)
         self._update_time_label()
 
     # -- transport --------------------------------------------------------- #
@@ -4355,13 +4469,18 @@ class UWBQuickVisualizationWindow(QWidget):
     # is never written to. Fast scrubbing instead uses a derived, indexed copy
     # kept alongside the other analysis outputs.
     def _preview_index_paths(self):
-        """(analysis_dir, indexed_copy_path, provenance_json_path)."""
+        """(index_dir, indexed_copy_path, provenance_json_path).
+
+        The indexed copy + its provenance JSON live alongside the source
+        database (in the DB's own folder), not in the analysis/export folder, so
+        the fast-scrubbing index travels with the raw data and is reused across
+        exports rather than being duplicated per analysis run.
+        """
         db_dir = os.path.dirname(self.db_path)
         db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-        analysis_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
-        return (analysis_dir,
-                os.path.join(analysis_dir, f"{db_name}_indexed.sqlite"),
-                os.path.join(analysis_dir, f"{db_name}_indexed.json"))
+        return (db_dir,
+                os.path.join(db_dir, f"{db_name}_indexed.sqlite"),
+                os.path.join(db_dir, f"{db_name}_indexed.json"))
 
     def _indexed_copy_is_current(self, copy_path, meta_path):
         """Is an existing copy still faithful to the source database?
@@ -4423,7 +4542,7 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         self.preview_db_path = self.db_path      # usable immediately
 
-        analysis_dir, copy_path, meta_path = self._preview_index_paths()
+        index_dir, copy_path, meta_path = self._preview_index_paths()
         if self._indexed_copy_is_current(copy_path, meta_path):
             self.preview_db_path = copy_path
             self._set_index_status("Fast index: ready ✓", "#00aa00")
@@ -4437,15 +4556,15 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message("Indexed copy is out of date with the source — rebuilding.")
 
         try:
-            os.makedirs(analysis_dir, exist_ok=True)
+            os.makedirs(index_dir, exist_ok=True)
         except Exception as e:
-            self.log_message(f"Could not create analysis folder: {e}")
+            self.log_message(f"Could not create index folder: {e}")
             return
 
         src_mb = os.path.getsize(self.db_path) / 1e6
         self.log_message(
             f"Building indexed copy for fast scrubbing (~{src_mb * 1.25:.0f} MB "
-            f"in {os.path.basename(analysis_dir)}). The original database is "
+            f"in {os.path.basename(index_dir)}). The original database is "
             f"not modified.")
         self._set_index_status("Fast index: building…", "#cc9900")
 
@@ -4585,6 +4704,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_x = self.preview_y = None
         self.preview_xf = self.preview_yf = None
         self.preview_raw_x = self.preview_raw_y = None
+        self.preview_batt = None
         self.preview_times = None
         self.preview_tags = []
         self.preview_arena = None
@@ -4627,7 +4747,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_color_by.setCurrentIndex(0)  # None
 
         # Export options
-        self.chk_export_raw_csv.setChecked(True)
+        self.chk_export_raw_csv.setChecked(False)
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
@@ -4641,8 +4761,15 @@ class UWBQuickVisualizationWindow(QWidget):
             cb.setChecked(True)
         self.chk_save_animation.setChecked(False)
         self.spin_animation_trail.setValue(500)
-        self.combo_animation_speed.setCurrentText("80x")
+        self.spin_anim_tag_size.setValue(10)
+        self.chk_show_battery_export.setChecked(False)
+        self.combo_animation_speed.setCurrentText("60x")
         self.combo_animation_fps.setCurrentText("20")
+
+        # Preview display defaults
+        self.chk_show_tracking.setChecked(True)
+        self.spin_tag_size.setValue(10)
+        self.chk_show_battery.setChecked(False)
 
         # Reset background image label
         if hasattr(self, 'lbl_background_status'):
@@ -6029,6 +6156,9 @@ class UWBQuickVisualizationWindow(QWidget):
             'rolling_window': self.spin_rolling_window.value(),
             'rolling_window_units': self.combo_window_units.currentText(),
             'show_anchors': self.chk_show_anchors.isChecked(),
+            'show_tracking': self.chk_show_tracking.isChecked(),
+            'preview_tag_size': self.spin_tag_size.value(),
+            'show_battery': self.chk_show_battery.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'proximity_detection': self.chk_proximity_detection.isChecked(),
@@ -6042,6 +6172,8 @@ class UWBQuickVisualizationWindow(QWidget):
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
+            'animation_tag_size': self.spin_anim_tag_size.value(),
+            'animation_show_battery': self.chk_show_battery_export.isChecked(),
             'animation_speed': self.combo_animation_speed.currentText(),
             'animation_fps': self.combo_animation_fps.currentText(),
             'color_by': self.combo_color_by.currentText(),
@@ -6179,6 +6311,21 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'time_gap' in config:
                 self.spin_time_gap.setValue(config['time_gap'])
             
+            if 'show_tracking' in config:
+                self.chk_show_tracking.setChecked(config['show_tracking'])
+
+            if 'preview_tag_size' in config:
+                self.spin_tag_size.setValue(config['preview_tag_size'])
+
+            if 'show_battery' in config:
+                self.chk_show_battery.setChecked(config['show_battery'])
+
+            if 'animation_tag_size' in config:
+                self.spin_anim_tag_size.setValue(config['animation_tag_size'])
+
+            if 'animation_show_battery' in config:
+                self.chk_show_battery_export.setChecked(config['animation_show_battery'])
+
             if 'export_raw_csv' in config:
                 self.chk_export_raw_csv.setChecked(config['export_raw_csv'])
 
@@ -6691,7 +6838,8 @@ class UWBQuickVisualizationWindow(QWidget):
             layers=self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
             arena_zones=self.arena_zones, anchors=self.anchor_positions,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
-            color_by=color_by,
+            color_by=color_by, marker_size=self.spin_anim_tag_size.value(),
+            show_battery=self.chk_show_battery_export.isChecked(),
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
