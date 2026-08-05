@@ -634,7 +634,10 @@ class ConcatenationWorker(QThread):
         else:
             width, height = 854, 480
 
-        video_filters = [f"fps={frame_rate}"]
+        video_filters = [
+            "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            f"fps={frame_rate}",
+        ]
         video_filters.append(
             f"scale={width}:{height}:"
             f"force_original_aspect_ratio=decrease:eval=frame")
@@ -718,7 +721,7 @@ class ConcatenationWorker(QThread):
                 "-g", str(gop),
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "10000000",
-                "-vsync", "vfr",
+                "-fps_mode", "vfr",
                 "-movflags", "+faststart",
             ]
             if remove_audio:
@@ -912,7 +915,10 @@ class ConcatenationWorker(QThread):
             else:  # 480p
                 width, height = 854, 480
 
-            video_filters = [f"fps={frame_rate}"]
+            video_filters = [
+                "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+                f"fps={frame_rate}",
+            ]
             video_filters.append(
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame")
             video_filters.append(
@@ -938,8 +944,8 @@ class ConcatenationWorker(QThread):
                 "-vf", ",".join(video_filters),
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "10000000",
-                "-fflags", "+genpts+discardcorrupt+igndts",
-                "-vsync", "vfr",
+                "-fflags", "+genpts+discardcorrupt",
+                "-fps_mode", "vfr",
             ]
             if chunking:
                 command.extend([
@@ -964,9 +970,10 @@ class ConcatenationWorker(QThread):
                 "-preset", "medium",
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
+                "-vf", "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
                 "-avoid_negative_ts", "make_zero",
-                "-fflags", "+genpts+discardcorrupt+igndts",
-                "-vsync", "vfr",
+                "-fflags", "+genpts+discardcorrupt",
+                "-fps_mode", "vfr",
                 "-an",
             ]
             if chunking:

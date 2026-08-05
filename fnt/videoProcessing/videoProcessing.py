@@ -614,9 +614,14 @@ class VideoProcessorWorker(QThread):
             "-pix_fmt", "yuv420p",
         ]
         
-        # Always apply fps filter to match user's requested frame rate
-        # This maintains video duration by duplicating/dropping frames as needed
-        video_filters = [f"fps={self.frame_rate}"]
+        # Override color metadata: some DVRs (e.g. ViewTron) write bogus
+        # values (colorspace=gbr, primaries/trc=reserved) that crash
+        # swscaler during format conversion (especially to grayscale).
+        # setparams only relabels metadata — no pixel reprocessing.
+        video_filters = [
+            "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            f"fps={self.frame_rate}",
+        ]
         
         # Add audio option
         if self.remove_audio:
