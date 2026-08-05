@@ -235,7 +235,7 @@ SMOOTHING_METHODS_TOOLTIP = (
     "lag — unlike the causal filter the Wiser hardware must run live.\n"
     "\n"
     "The Smoothing Window / units control sets the window for the two rolling\n"
-    "methods; Forward-Backward EWMA uses it as a sample span; Savitzky-Golay and\n"
+    "methods; Forward-Backward Exponentially Weighted Moving Average uses it as a sample span; Savitzky-Golay and\n"
     "None ignore it.\n"
     "\n"
     "• None\n"
@@ -267,7 +267,7 @@ SMOOTHING_METHODS_TOOLTIP = (
     "    models curvature instead of flattening it, Savitzky-Golay preserves\n"
     "    peaks, turns and the height of sharp features better than averaging.\n"
     "\n"
-    "• Forward-Backward EWMA\n"
+    "• Forward-Backward Exponentially Weighted Moving Average\n"
     "    A zero-phase exponentially weighted moving average, run as a two-pass\n"
     "    (filtfilt-style) cascade. One pass is the recursive EWMA\n"
     "        y[t] = alpha * x[t] + (1 - alpha) * y[t-1],   alpha = 2 / (span + 1)\n"
@@ -989,7 +989,7 @@ class PlotSaverWorker(QThread):
             agg = 'mean' if method == "Rolling Average" else 'median'
             time_based = self.rolling_window_units == "Seconds"
             rolling_smooth_xy(data, agg, self.rolling_window, time_based)
-        elif method == "Forward-Backward EWMA":
+        elif method == "Forward-Backward Exponentially Weighted Moving Average":
             # No minimum floor here — a span of 1-2 is legitimate for EWMA
             span = max(1, self.rolling_window)
             data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
@@ -1921,7 +1921,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 unit = "s" if self.combo_window_units.currentText() == "Seconds" else "samples"
                 summary_data['Parameter'].append('Smoothing Window')
                 summary_data['Value'].append(f"{self.spin_rolling_window.value()} {unit}")
-            elif smoothing_method == "Forward-Backward EWMA":
+            elif smoothing_method == "Forward-Backward Exponentially Weighted Moving Average":
                 summary_data['Parameter'].append('EWMA Span (samples)')
                 summary_data['Value'].append(self.spin_rolling_window.value())
 
@@ -2353,7 +2353,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_smoothing = QComboBox()
         self.combo_smoothing.setToolTip(SMOOTHING_METHODS_TOOLTIP)
         self.combo_smoothing.addItems([
-            "None (default)", "Forward-Backward EWMA", "Savitzky-Golay",
+            "None (default)", "Forward-Backward Exponentially Weighted Moving Average", "Savitzky-Golay",
             "Rolling Median", "Rolling Average"
         ])
         self.combo_smoothing.setCurrentIndex(0)
@@ -2380,7 +2380,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "• Rolling Average / Rolling Median, units = Samples: a fixed count "
             "of consecutive fixes (e.g. 30 = 30 fixes). Its wall-clock span "
             "varies with the reporting rate.\n"
-            "• Forward-Backward EWMA: the span (always in samples), which sets "
+            "• Forward-Backward Exponentially Weighted Moving Average: the span (always in samples), which sets "
             "the decay rate (alpha = 2 / (span + 1)). To match a Wiser hardware "
             "filter value F, use span = 2F - 1.\n"
             "\n"
@@ -3039,7 +3039,7 @@ class UWBQuickVisualizationWindow(QWidget):
         smooth_row.addWidget(QLabel("Smoothing method:"))
         self.combo_preview_smoothing = QComboBox()
         self.combo_preview_smoothing.addItems([
-            "None", "Forward-Backward EWMA", "Savitzky-Golay",
+            "None", "Forward-Backward Exponentially Weighted Moving Average", "Savitzky-Golay",
             "Rolling Median", "Rolling Average"])
         self.combo_preview_smoothing.setCurrentText("None")
         self.combo_preview_smoothing.setToolTip(
@@ -3064,7 +3064,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_window.setValue(30)
         self.spin_preview_window.setToolTip(
             "Size of the preview smoothing window. Read as seconds or samples "
-            "per the units selector; for Forward-Backward EWMA it is the span "
+            "per the units selector; for Forward-Backward Exponentially Weighted Moving Average it is the span "
             "(alpha = 2 / (span + 1)). Larger = smoother, less detail.")
         self.spin_preview_window.valueChanged.connect(self.invalidate_preview_cache)
         pwin_row.addWidget(self.spin_preview_window)
@@ -3802,7 +3802,7 @@ class UWBQuickVisualizationWindow(QWidget):
         units; EWMA exposes the window (as its span) but not the units.
         """
         method = self.combo_preview_smoothing.currentText()
-        is_ewma = method == "Forward-Backward EWMA"
+        is_ewma = method == "Forward-Backward Exponentially Weighted Moving Average"
         is_rolling = method in ("Rolling Average", "Rolling Median")
         needs_param = is_ewma or is_rolling
         self.lbl_preview_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
@@ -5433,7 +5433,7 @@ class UWBQuickVisualizationWindow(QWidget):
     def on_smoothing_changed(self, method):
         """Handle smoothing method change"""
         clean_method = method.replace(" (default)", "")
-        is_ewma = clean_method == "Forward-Backward EWMA"
+        is_ewma = clean_method == "Forward-Backward Exponentially Weighted Moving Average"
         is_rolling = clean_method in ("Rolling Average", "Rolling Median")
         # Savitzky-Golay sizes its own window, so only the rolling methods and
         # EWMA expose the parameter spinbox.
@@ -5818,7 +5818,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # independent of the irregular, sub-1 Hz reporting rate.
             agg = 'mean' if method == "Rolling Average" else 'median'
             rolling_smooth_xy(data, agg, win, use_seconds)
-        elif method == "Forward-Backward EWMA":
+        elif method == "Forward-Backward Exponentially Weighted Moving Average":
             # Window doubles as the EWMA span. No minimum floor — a span of
             # 1-2 is legitimate (span=1 gives alpha=1, i.e. passthrough).
             span = max(1, win)
@@ -6145,6 +6145,10 @@ class UWBQuickVisualizationWindow(QWidget):
                 # labels (e.g. "Rolling Average (default)") still resolve after
                 # the "(default)" marker moved to None.
                 want = config['smoothing_method'].replace(" (default)", "")
+                # The EWMA option's label was spelled out in full; map the old
+                # abbreviated label so pre-existing configs still restore it.
+                if want == "Forward-Backward EWMA":
+                    want = "Forward-Backward Exponentially Weighted Moving Average"
                 index = next(
                     (i for i in range(self.combo_smoothing.count())
                      if self.combo_smoothing.itemText(i).replace(" (default)", "") == want),
