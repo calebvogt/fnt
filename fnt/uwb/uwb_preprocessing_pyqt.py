@@ -2847,6 +2847,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self.daily_animation_days_widget.setVisible(False)
         animation_options_layout.addWidget(self.daily_animation_days_widget)
 
+        self.chk_full_animation = QCheckBox("Generate full animation (all days)")
+        self.chk_full_animation.setChecked(True)   # on by default (the original behaviour)
+        self.chk_full_animation.setToolTip(
+            "Also render one video spanning the whole recording. Runs after the "
+            "daily animations. If daily animations are on AND every day is "
+            "selected, this is built by simply concatenating the daily videos "
+            "(fast, no re-render); otherwise it is rendered from scratch.")
+        animation_options_layout.addWidget(self.chk_full_animation)
+
         self.animation_options_widget.setLayout(animation_options_layout)
         self.animation_options_widget.setVisible(False)  # hidden until Save Animation is on
         export_layout.addWidget(self.animation_options_widget)
@@ -4956,6 +4965,8 @@ class UWBQuickVisualizationWindow(QWidget):
         for cb in self.plot_type_checkboxes.values():
             cb.setChecked(True)
         self.chk_save_animation.setChecked(False)
+        self.chk_daily_animations.setChecked(False)
+        self.chk_full_animation.setChecked(True)
         self.spin_animation_trail.setValue(500)
         self.spin_anim_tag_size.setValue(10)
         self.chk_show_battery_export.setChecked(False)
@@ -6425,35 +6436,23 @@ class UWBQuickVisualizationWindow(QWidget):
     def _filter_and_smooth(self, data, smoothing_method, *, collect_stats=True,
                            velocity=None, jump=None, velocity_thresh=None,
                            jump_thresh=None, window=None, units=None):
-        """Threshold + smooth in the correct order:
+        """Threshold, then smooth (the original order).
 
-          1. JUMP threshold on the raw coordinates — removes teleport outliers
-             so they don't corrupt the smoother.
-          2. Smoothing.
-          3. VELOCITY threshold on the SMOOTHED coordinates — so the speed cutoff
-             reflects real movement, not the raw per-fix measurement noise
-             (which at high report rates makes almost every fix look 'fast' and
-             was deleting the majority of the data).
-
-        Falls back to raw coordinates for the velocity step when smoothing is
-        off (method 'None'), i.e. the old behaviour.
+        BOTH the velocity and jump thresholds run on the raw coordinates BEFORE
+        smoothing, so the noisy/teleport fixes are removed and the smoother gets
+        clean input. (Thresholding the velocity on the smoothed track instead
+        let the noise into the smoother and produced a jumpy result.)
         """
         use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
 
-        if use_jmp and len(data):
+        if (use_vel or use_jmp) and len(data):
             data = self.apply_filters_to_data(
-                data, collect_stats=collect_stats, velocity=False, jump=True,
-                jump_thresh=jump_thresh)
+                data, collect_stats=collect_stats, velocity=use_vel, jump=use_jmp,
+                velocity_thresh=velocity_thresh, jump_thresh=jump_thresh)
         if smoothing_method != "None" and len(data):
             data = self.apply_smoothing_to_data(data, smoothing_method,
                                                 window=window, units=units)
-        if use_vel and len(data):
-            xc = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
-            yc = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
-            data = self.apply_filters_to_data(
-                data, collect_stats=collect_stats, velocity=True, jump=False,
-                velocity_thresh=velocity_thresh, x_col=xc, y_col=yc)
         return data
 
     def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None,
@@ -6466,12 +6465,8 @@ class UWBQuickVisualizationWindow(QWidget):
         they follow the Export checkboxes/spinboxes. The preview passes its own
         toggles and values so the user can tune thresholding live.
 
-        ``x_col``/``y_col`` choose the coordinates the distance/velocity are
-        measured on. The velocity threshold is applied AFTER smoothing on
-        ``smoothed_x``/``smoothed_y`` so it reflects real movement, not the raw
-        per-fix measurement noise (which, at high report rates, makes almost
-        every fix look fast); the jump threshold runs BEFORE smoothing on the raw
-        coordinates so teleport outliers don't corrupt the smoother.
+        ``x_col``/``y_col`` choose the coordinates distance/velocity are measured
+        on (default the raw location; thresholding runs before smoothing).
         """
         use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
@@ -6648,6 +6643,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'color_by': self.combo_color_by.currentText(),
             'video_quality': self.combo_video_quality.currentText(),
             'daily_animations': self.chk_daily_animations.isChecked(),
+            'full_animation': self.chk_full_animation.isChecked(),
             'tag_identities': self.tag_identities,
             'plot_layers': dict(self.plot_layers),
             # Site-map image copied into the analysis folder (filename + extent),
@@ -6903,6 +6899,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'daily_animations' in config:
                 self.chk_daily_animations.setChecked(config['daily_animations'])
+            if 'full_animation' in config:
+                self.chk_full_animation.setChecked(config['full_animation'])
 
             if 'show_anchors' in config:
                 self.chk_show_anchors.setChecked(config['show_anchors'])
@@ -7107,15 +7105,20 @@ class UWBQuickVisualizationWindow(QWidget):
         set of settings regardless of what the user clicks afterwards.
         """
         speed_text = self.combo_animation_speed.currentText()
-        days = [d for d, cb in self.daily_animation_day_checkboxes.items()
-                if cb.isChecked()]
+        all_cbs = self.daily_animation_day_checkboxes
+        days = [d for d, cb in all_cbs.items() if cb.isChecked()]
+        gen_daily = self.chk_daily_animations.isChecked()
         return {
             'trailing_window': self.spin_animation_trail.value(),
             'fps': int(self.combo_animation_fps.currentText()),
             'speed_text': speed_text,
             'speed_multiplier': int(speed_text.replace('x', '')),
             'color_by': self.combo_color_by.currentText(),
-            'generate_daily': self.chk_daily_animations.isChecked(),
+            'generate_daily': gen_daily,
+            'generate_full': self.chk_full_animation.isChecked(),
+            # Concatenation is only valid when daily is on and EVERY day is chosen.
+            'all_days_selected': (gen_daily and len(all_cbs) > 0
+                                  and len(days) == len(all_cbs)),
             'selected_days': days,
             'video_quality': self.combo_video_quality.currentText(),
             'tag_size': self.spin_anim_tag_size.value(),
@@ -7257,6 +7260,36 @@ class UWBQuickVisualizationWindow(QWidget):
             return os.path.join(custom_dir, 'temp_animation_frames')
         return default_temp_dir
 
+    def _concat_videos_cv2(self, paths, out_path):
+        """Concatenate same-resolution/fps MP4s into one, frame by frame (cv2).
+
+        Used to build the full tracking animation from already-rendered daily
+        videos when every day was selected — no re-render needed.
+        """
+        import cv2
+        writer = None
+        try:
+            for p in paths:
+                if not os.path.exists(p):
+                    continue
+                cap = cv2.VideoCapture(p)
+                fps_v = cap.get(cv2.CAP_PROP_FPS) or 20
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    if writer is None:
+                        h, w = frame.shape[:2]
+                        writer = cv2.VideoWriter(
+                            out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps_v, (w, h))
+                    writer.write(frame)
+                cap.release()
+        finally:
+            if writer is not None:
+                writer.release()
+        return (writer is not None and os.path.exists(out_path)
+                and os.path.getsize(out_path) > 0)
+
     def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None, animations_dir=None):
         """Generate animation video from tracking data"""
         try:
@@ -7320,109 +7353,86 @@ class UWBQuickVisualizationWindow(QWidget):
 
             self.log_message("Setting up animation frames...")
 
-            # Check if daily animations are requested
             generate_daily = s['generate_daily']
+            generate_full = s.get('generate_full', not generate_daily)
+            all_days = s.get('all_days_selected', False)
+            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+            daily_paths = []   # final daily video paths in day order (for concat)
 
+            # ---- Daily animations (one per selected day) ----
             if generate_daily:
-                # Get selected days (frozen at export time)
                 selected_days = s['selected_days']
                 if not selected_days:
                     self.log_message("⚠ No days selected for daily animations")
-                    return
-                
-                self.log_message(f"Generating {len(selected_days)} daily animations...")
-                
-                # Generate one animation per selected day
-                for day_idx, date_str in enumerate(selected_days):
-                    if self.export_cancelled:
-                        return
-                    
-                    self.log_message(f"Processing Day {day_idx + 1}/{len(selected_days)}: {date_str}")
-                    
-                    # Filter data for this specific day (midnight to midnight)
-                    # Get timezone from the data to ensure compatible comparison
-                    data_tz = anim_data['Timestamp'].dt.tz
-                    date_obj = pd.to_datetime(date_str).date()
-                    
-                    if data_tz is not None:
-                        # Create timezone-aware timestamps matching the data's timezone
-                        day_start = pd.Timestamp(date_obj, tz=data_tz)
+                else:
+                    self.log_message(f"Generating {len(selected_days)} daily animations...")
+                    for day_idx, date_str in enumerate(selected_days):
+                        if self.export_cancelled:
+                            return
+                        self.log_message(f"Processing Day {day_idx + 1}/{len(selected_days)}: {date_str}")
+                        data_tz = anim_data['Timestamp'].dt.tz
+                        date_obj = pd.to_datetime(date_str).date()
+                        day_start = (pd.Timestamp(date_obj, tz=data_tz) if data_tz is not None
+                                     else pd.Timestamp(date_obj))
                         day_end = day_start + pd.Timedelta(days=1)
+                        day_data = anim_data[(anim_data['Timestamp'] >= day_start)
+                                             & (anim_data['Timestamp'] < day_end)].copy()
+                        if len(day_data) == 0:
+                            self.log_message(f"⚠ No data for {date_str}, skipping")
+                            continue
+                        video_path = self.create_animation_frames(
+                            day_data, temp_frames_dir, frame_interval, trailing_window,
+                            fps, color_by, s['use_identities'],
+                            total_export_steps, current_export_step,
+                            day_suffix=f"_Day{day_idx + 1}_{date_str}", speed_text=speed_text)
+                        if video_path and not self.export_cancelled:
+                            final_video_path = os.path.join(
+                                animations_dir,
+                                f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
+                            if os.path.exists(final_video_path):
+                                self.log_message(f"⚠ Day {day_idx + 1} animation already exists, skipping: {os.path.basename(final_video_path)}")
+                            elif os.path.exists(video_path):
+                                shutil.move(video_path, final_video_path)
+                                self.log_message(f"✓ Day {day_idx + 1} animation saved: {final_video_path}")
+                            if os.path.exists(final_video_path):
+                                daily_paths.append(final_video_path)
+
+            # ---- Full animation (whole recording), after the dailies ----
+            if generate_full and not self.export_cancelled:
+                full_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
+                if os.path.exists(full_path):
+                    self.log_message(f"⚠ Full animation already exists, skipping: {os.path.basename(full_path)}")
+                elif generate_daily and all_days and len(daily_paths) >= 1:
+                    # Every day was rendered — just stitch the daily videos together.
+                    self.lbl_export_progress.setText("Concatenating daily animations into the full video...")
+                    QApplication.processEvents()
+                    self.log_message(f"Building full animation by concatenating {len(daily_paths)} daily animation(s)...")
+                    if self._concat_videos_cv2(daily_paths, full_path):
+                        self.log_message(f"✓ Full animation saved (concatenated dailies): {os.path.basename(full_path)}")
                     else:
-                        # Data is timezone-naive
-                        day_start = pd.Timestamp(date_obj)
-                        day_end = day_start + pd.Timedelta(days=1)
-                    
-                    day_data = anim_data[(anim_data['Timestamp'] >= day_start) & (anim_data['Timestamp'] < day_end)].copy()
-                    
-                    if len(day_data) == 0:
-                        self.log_message(f"⚠ No data for {date_str}, skipping")
-                        continue
-
-                    # Generate animation for this day (speed_text frozen above)
+                        self.log_message("⚠ Concatenation failed; full animation not produced")
+                else:
+                    # No dailies, or only a subset — render the full span from scratch.
+                    self.log_message("Generating full animation frames (this may take a while)...")
                     video_path = self.create_animation_frames(
-                        day_data, temp_frames_dir, frame_interval, trailing_window,
+                        anim_data, temp_frames_dir, frame_interval, trailing_window,
                         fps, color_by, s['use_identities'],
-                        total_export_steps, current_export_step,
-                        day_suffix=f"_Day{day_idx + 1}_{date_str}",
-                        speed_text=speed_text
-                    )
+                        total_export_steps, current_export_step, speed_text=speed_text)
+                    if video_path and not self.export_cancelled and os.path.exists(video_path):
+                        shutil.move(video_path, full_path)
+                        self.log_message(f"✓ Full animation saved: {os.path.basename(full_path)}")
 
-                    if video_path and not self.export_cancelled:
-                        # Move video to final location with FPS and speed in filename
-                        db_filename = os.path.basename(self.db_path)
-                        db_name = os.path.splitext(db_filename)[0]
-                        final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
-                        
-                        # Check if file exists and skip if not overwriting
-                        if os.path.exists(final_video_path):
-                            self.log_message(f"⚠ Day {day_idx + 1} animation already exists, skipping: {os.path.basename(final_video_path)}")
-                        elif os.path.exists(video_path):
-                            shutil.move(video_path, final_video_path)
-                            self.log_message(f"✓ Day {day_idx + 1} animation saved: {final_video_path}")
-                
-                # Clean up temp frames
-                try:
+            if not generate_daily and not generate_full:
+                self.log_message("No tracking animation selected (neither daily nor full).")
+
+            # ---- Clean up temp frames (once) ----
+            try:
+                if os.path.exists(temp_frames_dir):
                     shutil.rmtree(temp_frames_dir)
                     self.log_message("✓ Temp frames cleaned up")
-                except Exception as e:
-                    self.log_message(f"Warning: Could not clean temp frames: {str(e)}")
-            else:
-                # Generate single animation for all data
-                # Clean existing temp frames
-                if os.path.exists(temp_frames_dir):
-                    for filename in os.listdir(temp_frames_dir):
-                        file_path = os.path.join(temp_frames_dir, filename)
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
-                
-                # Create animation
-                self.log_message("Generating animation frames (this may take a while)...")
-                video_path = self.create_animation_frames(anim_data, temp_frames_dir, frame_interval, trailing_window,
-                                            fps, color_by, s['use_identities'],
-                                            total_export_steps, current_export_step,
-                                            speed_text=speed_text)
+            except Exception as e:
+                self.log_message(f"Warning: Could not clean temp frames: {str(e)}")
 
-                if video_path and not self.export_cancelled:
-                    # Move video to final location with FPS and speed in filename
-                    db_filename = os.path.basename(self.db_path)
-                    db_name = os.path.splitext(db_filename)[0]
-                    final_video_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
-                    
-                    # Check if file exists and skip if not overwriting
-                    if os.path.exists(final_video_path):
-                        self.log_message(f"⚠ Animation already exists, skipping: {os.path.basename(final_video_path)}")
-                    elif os.path.exists(video_path):
-                        shutil.move(video_path, final_video_path)
-                        self.log_message(f"✓ Animation saved: {final_video_path}")
-                    
-                    # Clean up temp frames
-                    try:
-                        shutil.rmtree(temp_frames_dir)
-                        self.log_message("✓ Temp frames cleaned up")
-                    except Exception as e:
-                        self.log_message(f"Warning: Could not clean temp frames: {str(e)}")
-            
             self.log_message("✓ Animation generation complete!")
             
             # Reset UI after animation completes
@@ -7663,7 +7673,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if self._anim_settings['generate_daily']:
                 for day_idx, date_str in enumerate(self._anim_settings['selected_days']):
                     predicted_animation_files.append(f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
-            else:
+            if self._anim_settings.get('generate_full', not self._anim_settings['generate_daily']):
                 predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
 
         # Predict plot files (in plots/ subfolder) — must match PlotSaverWorker filenames exactly
