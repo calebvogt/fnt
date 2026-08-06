@@ -412,8 +412,11 @@ class UWBPreview2D(FigureCanvas):
         # persists across scrub frames (which otherwise reset to the arena).
         # Double-click resets to the full arena.
         self._user_zoom = None      # ((xmin, xmax), (ymin, ymax)) or None
+        self._pan = None            # drag-pan state while a button is held
         self.mpl_connect('scroll_event', self._on_scroll)
         self.mpl_connect('button_press_event', self._on_button)
+        self.mpl_connect('motion_notify_event', self._on_motion)
+        self.mpl_connect('button_release_event', self._on_release)
         # Blitting: the arena / zones / anchors / background never move — only
         # the tags do. So the static scene is rendered once, cached, and each
         # scrub frame just restores it and blits the moving tracks + markers on
@@ -436,25 +439,82 @@ class UWBPreview2D(FigureCanvas):
             ymin, ymax = min(ymin, by0), max(ymax, by1)
         return xmin, xmax, ymin, ymax
 
+    def _clamp_view(self, x0, x1, y0, y1):
+        """Keep a view within the arena/background extent (plus a small margin).
+
+        Bounds how far the user can zoom OUT (never past the whole window) and
+        keeps pans from leaving the scene."""
+        axmin, axmax, aymin, aymax = self._arena_view_bounds()
+        mx = max((axmax - axmin) * 0.05, 0.25)
+        my = max((aymax - aymin) * 0.05, 0.25)
+        axmin, axmax, aymin, aymax = axmin - mx, axmax + mx, aymin - my, aymax + my
+        # Never wider/taller than the full scene.
+        w = min(x1 - x0, axmax - axmin)
+        h = min(y1 - y0, aymax - aymin)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        x0, x1, y0, y1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        # Shift back inside the bounds.
+        if x0 < axmin:
+            x1 += axmin - x0; x0 = axmin
+        if x1 > axmax:
+            x0 -= x1 - axmax; x1 = axmax
+        if y0 < aymin:
+            y1 += aymin - y0; y0 = aymin
+        if y1 > aymax:
+            y0 -= y1 - aymax; y1 = aymax
+        return (max(x0, axmin), min(x1, axmax), max(y0, aymin), min(y1, aymax))
+
     def _on_scroll(self, event):
-        """Zoom about the cursor (scroll up = in). Persists while scrubbing."""
+        """Zoom about the cursor (scroll up = in). Persists while scrubbing.
+        Zoom-out is capped so you cannot zoom past the whole window."""
         if event.inaxes is not self.ax or event.xdata is None:
             return
         factor = 0.8 if event.button == 'up' else 1.25
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         xd, yd = event.xdata, event.ydata
-        self._user_zoom = ((xd - (xd - x0) * factor, xd + (x1 - xd) * factor),
-                           (yd - (yd - y0) * factor, yd + (y1 - yd) * factor))
+        nx0, nx1 = xd - (xd - x0) * factor, xd + (x1 - xd) * factor
+        ny0, ny1 = yd - (yd - y0) * factor, yd + (y1 - yd) * factor
+        nx0, nx1, ny0, ny1 = self._clamp_view(nx0, nx1, ny0, ny1)
+        axmin, axmax, aymin, aymax = self._arena_view_bounds()
+        # If clamped back to (approximately) the whole scene, drop to the
+        # natural full-arena framing instead of pinning an odd rectangle.
+        if (nx1 - nx0) >= (axmax - axmin) and (ny1 - ny0) >= (aymax - aymin):
+            self._user_zoom = None
+        else:
+            self._user_zoom = ((nx0, nx1), (ny0, ny1))
         self._static_dirty = True     # limits changed -> static cache stale
         self._rerender()
 
     def _on_button(self, event):
-        """Double-click resets the zoom to the full arena."""
+        """Double-click resets zoom; left-press starts a drag-pan (when zoomed)."""
         if getattr(event, 'dblclick', False):
             self._user_zoom = None
+            self._pan = None
             self._static_dirty = True
             self._rerender()
+        elif (event.button == 1 and event.inaxes is self.ax
+              and self._user_zoom is not None):
+            # Pan only makes sense when zoomed in.
+            self._pan = (event.x, event.y, self.ax.get_xlim(), self.ax.get_ylim())
+
+    def _on_motion(self, event):
+        """Drag-pan: translate the view by the pixel delta since button-press."""
+        if self._pan is None or event.x is None or event.y is None:
+            return
+        px, py, (x0, x1), (y0, y1) = self._pan
+        bbox = self.ax.get_window_extent()
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+        dx = (x1 - x0) / bbox.width * (px - event.x)
+        dy = (y1 - y0) / bbox.height * (py - event.y)
+        nx0, nx1, ny0, ny1 = self._clamp_view(x0 + dx, x1 + dx, y0 + dy, y1 + dy)
+        self._user_zoom = ((nx0, nx1), (ny0, ny1))
+        self._static_dirty = True
+        self._rerender()
+
+    def _on_release(self, event):
+        self._pan = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -636,21 +696,24 @@ class UWBPreview2D(FigureCanvas):
                 x[ok], y[ok], s=float(tag_size) ** 2, c=np.asarray(colors)[ok],
                 edgecolors=edge, linewidths=0.6, zorder=5))
 
-        # Optional per-tag ID label (above the marker) with the battery voltage
-        # directly beneath it in small black font. Both anchor at y+off: the
-        # label grows upward (va="bottom"), the voltage downward (va="top").
-        if labels is not None and ok.any():
+        # Optional per-tag ID label (above the marker) and/or battery voltage
+        # beneath it — independent overlays. Both anchor at y+off: the label
+        # grows upward (va="bottom"), the voltage downward (va="top").
+        if (labels is not None or batteries is not None) and ok.any():
             ylim = self.ax.get_ylim()
             off = (ylim[1] - ylim[0]) * 0.035
-            lab_color = "white" if self._theme == "dark" else "#111111"
+            colarr = np.asarray(colors)
             for i in range(len(x)):
                 if not ok[i]:
                     continue
-                lbl = labels[i] if i < len(labels) else None
+                lbl = labels[i] if (labels is not None and i < len(labels)) else None
                 if lbl:
+                    # ID label matches the marker colour (so 'Color by: Sex'
+                    # tints labels blue=M / red=F, like the export animation).
                     dynamic.append(self.ax.text(
                         x[i], y[i] + off, str(lbl), fontsize=8, ha="center",
-                        va="bottom", color=lab_color, fontweight="bold", zorder=6))
+                        va="bottom", color=tuple(colarr[i]), fontweight="bold",
+                        zorder=6))
                 if batteries is not None and i < len(batteries):
                     bv = batteries[i]
                     if bv is not None and np.isfinite(bv):

@@ -2430,18 +2430,13 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         export_layout.addWidget(self.chk_export_raw_csv)
 
+        # The filtered + smoothed CSV is ALWAYS exported (it's the canonical
+        # analysis product and the source for plots/animations/proximity), so it
+        # has no toggle. A hidden always-checked box keeps the old references
+        # (config, summary) working without a UI control.
         self.chk_export_smoothed_csv = QCheckBox("Export Smoothed CSV")
         self.chk_export_smoothed_csv.setChecked(True)
-        self.chk_export_smoothed_csv.setToolTip(
-            "Export filtered and smoothed data at full temporal resolution. "
-            "Coordinates are in meters, timestamps in your selected timezone.\n"
-            "\n"
-            "This is also the data source for plots and animations: when it is "
-            "on, they use the smoothed track; when it is off, they fall back to "
-            "the unsmoothed (filtered) positions. To downsample, do it in your "
-            "own downstream analysis of this CSV."
-        )
-        export_layout.addWidget(self.chk_export_smoothed_csv)
+        self.chk_export_smoothed_csv.setVisible(False)
 
         self.chk_proximity_detection = QCheckBox("Detect Proximity Bouts")
         self.chk_proximity_detection.setChecked(True)
@@ -2482,6 +2477,167 @@ class UWBQuickVisualizationWindow(QWidget):
         self.proximity_threshold_widget.setLayout(prox_layout)
         self.proximity_threshold_widget.setVisible(True)
         export_layout.addWidget(self.proximity_threshold_widget)
+
+        # ── Social network analysis (from the proximity threshold) ───────────
+        # Replicates the LID_2020 RFID workflow on UWB data: pairwise edge lists
+        # (event- and time-based), an asnipe-style GBI matrix of chain-rule
+        # proximity flocks, and an optional dynamic social-network animation.
+        self.chk_social_network = QCheckBox("Export social network CSVs (edge lists + GBI)")
+        self.chk_social_network.setChecked(False)
+        self.chk_social_network.setToolTip(
+            "Uses the proximity threshold to write R-ready social-network raw "
+            "materials:\n"
+            "  • edgelist_full / edgelist_daily — per-pair co-occurrence: "
+            "n_events (event-based) and total_duration_s (time-based)\n"
+            "  • GBI — asnipe-style group-by-individual matrix of proximity "
+            "flocks (chain rule), with m_sum/f_sum/mf_sum.\n"
+            "Requires proximity detection (enabled automatically).")
+        self.chk_social_network.stateChanged.connect(self.on_social_network_toggled)
+        export_layout.addWidget(self.chk_social_network)
+
+        self.chk_social_animation = QCheckBox("Render social network animation")
+        self.chk_social_animation.setChecked(False)
+        self.chk_social_animation.setToolTip(
+            "Render a sliding-window dynamic social-network video (node colour = "
+            "sex, size = weighted degree, edge width = pair weight).")
+        self.chk_social_animation.stateChanged.connect(self.on_social_network_toggled)
+        export_layout.addWidget(self.chk_social_animation)
+
+        self.social_animation_widget = QWidget()
+        sna_layout = QGridLayout()
+        sna_layout.setContentsMargins(30, 0, 0, 0)
+        r = 0
+        sna_layout.addWidget(QLabel("Network construction:"), r, 0)
+        self.combo_sna_weighting = QComboBox()
+        self.combo_sna_weighting.addItems(["Total time (s)", "Bout count",
+                                           "Simple Ratio Index (SRI)",
+                                           "Half-weight Index (HWI)"])
+        self.combo_sna_weighting.setToolTip(
+            "How the EDGE WEIGHT between two animals is quantified in each window:\n"
+            "\n"
+            "• Total time (s): total seconds the pair spent within the proximity "
+            "threshold. Raw, absolute — dominated by the most social animals.\n"
+            "• Bout count: number of separate uninterrupted proximity events. "
+            "Counts frequency of contact rather than its duration.\n"
+            "• Simple Ratio Index (SRI): x / (x + yA + yB), where each flocking "
+            "event (a proximity cluster, chain rule) is one observation, x = "
+            "events with BOTH animals, yA/yB = events with only one. Normalised "
+            "0–1; controls for how gregarious each animal is. The asnipe standard.\n"
+            "• Half-weight Index (HWI): 2x / (cA + cB) — like SRI but down-weights "
+            "observations where only one of the pair was in a group. Use when "
+            "detectability is uneven. HWI ≥ SRI.")
+        sna_layout.addWidget(self.combo_sna_weighting, r, 1); r += 1
+        sna_layout.addWidget(QLabel("Window (hours):"), r, 0)
+        self.spin_sna_window = QDoubleSpinBox()
+        self.spin_sna_window.setRange(0.5, 240.0)
+        self.spin_sna_window.setValue(24.0)
+        self.spin_sna_window.setSingleStep(1.0)
+        self.spin_sna_window.setToolTip(
+            "Trailing time window each frame summarises. Each frame shows the "
+            "network built from all associations in the preceding N hours "
+            "(e.g. 24 h = a rolling day). Larger = smoother, more integrated ties.")
+        sna_layout.addWidget(self.spin_sna_window, r, 1); r += 1
+        sna_layout.addWidget(QLabel("Step (hours):"), r, 0)
+        self.spin_sna_step = QDoubleSpinBox()
+        self.spin_sna_step.setRange(0.005, 48.0)
+        self.spin_sna_step.setValue(1.0)
+        self.spin_sna_step.setDecimals(3)
+        self.spin_sna_step.setSingleStep(0.05)
+        self.spin_sna_step.setToolTip(
+            "How far the window advances between frames, in HOURS (e.g. 1.0 = one "
+            "frame per hour; 0.027 ≈ 1.6 min → ~900 frames/day). Smaller step = "
+            "more frames = smoother node motion, but longer render. Watch the "
+            "'Estimated clip' line to hit a target length (e.g. ~30 s/day).")
+        sna_layout.addWidget(self.spin_sna_step, r, 1); r += 1
+        sna_layout.addWidget(QLabel("Frame rate (fps):"), r, 0)
+        self.combo_sna_fps = QComboBox()
+        self.combo_sna_fps.addItems(["2", "5", "10", "15", "30"])
+        self.combo_sna_fps.setCurrentText("10")
+        self.combo_sna_fps.setToolTip(
+            "Playback frames per second of the network video. Note there is no "
+            "'speed' control — pacing is set by Window / Step (e.g. a 24 h window "
+            "stepped 1 h shows one frame per hour regardless of fps); fps only "
+            "sets how fast those frames play back.")
+        sna_layout.addWidget(self.combo_sna_fps, r, 1); r += 1
+        self.lbl_sna_clip = QLabel("Estimated clip: — (load data)")
+        self.lbl_sna_clip.setStyleSheet("color:#3a7; font-style:italic;")
+        self.lbl_sna_clip.setToolTip(
+            "Approximate video length = frames / fps, where frames ≈ span / step. "
+            "Window size sets what each frame shows, not the length. For smooth "
+            "node movement use a small Step (more frames) and a higher fps.")
+        sna_layout.addWidget(self.lbl_sna_clip, r, 0, 1, 2); r += 1
+        for _w in (self.combo_sna_fps, self.spin_sna_step, self.spin_sna_window):
+            _w.currentTextChanged.connect(self._update_sna_clip_estimate) if isinstance(_w, QComboBox) \
+                else _w.valueChanged.connect(self._update_sna_clip_estimate)
+        sna_layout.addWidget(QLabel("Node size by:"), r, 0)
+        self.combo_sna_node = QComboBox()
+        self.combo_sna_node.addItems(["None (uniform)", "Degree", "Strength",
+                                      "Betweenness", "Closeness", "Eigenvector",
+                                      "PageRank"])
+        self.combo_sna_node.setCurrentText("None (uniform)")
+        self.combo_sna_node.setToolTip(
+            "Node centrality metric (igraph) driving each node's size, computed "
+            "per window and rescaled per frame:\n"
+            "• None: all nodes the same size.\n"
+            "• Degree: number of distinct partners (unweighted).\n"
+            "• Strength: weighted degree = sum of the node's edge weights.\n"
+            "• Betweenness: how often the node lies on shortest paths between "
+            "others (a 'broker' / bridge between groups).\n"
+            "• Closeness: inverse mean distance to all others (how quickly it can "
+            "reach the whole network).\n"
+            "• Eigenvector: connection to other WELL-connected nodes (influence).\n"
+            "• PageRank: eigenvector variant with a random-restart (robust to "
+            "disconnected components).")
+        sna_layout.addWidget(self.combo_sna_node, r, 1); r += 1
+        sna_layout.addWidget(QLabel("Layout:"), r, 0)
+        self.combo_sna_layout = QComboBox()
+        self.combo_sna_layout.addItems(["Fruchterman-Reingold", "Kamada-Kawai",
+                                        "Circular"])
+        self.combo_sna_layout.setCurrentText("Fruchterman-Reingold")
+        self.combo_sna_layout.setToolTip(
+            "How node positions are computed (via igraph):\n"
+            "• Fruchterman-Reingold: force-directed spring layout, re-solved each "
+            "frame from the previous positions — so nodes DRIFT and move closer / "
+            "farther as ties change (the LID_2020 R animation style). Default.\n"
+            "• Kamada-Kawai: clean static spread; node positions are FIXED for "
+            "the whole video (only edges/sizes change).\n"
+            "• Circular: nodes evenly on a circle; fixed, guaranteed no overlap, "
+            "but position carries no meaning.")
+        sna_layout.addWidget(self.combo_sna_layout, r, 1); r += 1
+        sna_layout.addWidget(QLabel("Edge width:"), r, 0)
+        self.combo_sna_edge = QComboBox()
+        self.combo_sna_edge.addItems(["Scaled by weight", "Uniform"])
+        self.combo_sna_edge.setToolTip(
+            "Edge line width scaled by the (windowed) edge weight, or drawn at a "
+            "constant width. Edge weight itself is set by 'Network construction'.")
+        sna_layout.addWidget(self.combo_sna_edge, r, 1); r += 1
+        self.btn_sna_preview = QPushButton("Preview Layout…")
+        self.btn_sna_preview.setToolTip(
+            "Render a single network frame with the current settings so you can "
+            "check the look before committing to a full render. The popup has a "
+            "'Random frame' button to sample different times across the recording.")
+        self.btn_sna_preview.clicked.connect(self.open_sna_layout_preview)
+        sna_layout.addWidget(self.btn_sna_preview, r, 0, 1, 2); r += 1
+        self.chk_sna_daily = QCheckBox("Daily social network animations (one per day)")
+        self.chk_sna_daily.setChecked(False)
+        self.chk_sna_daily.setToolTip(
+            "Render one video per calendar day instead of a single video for the "
+            "whole recording. Tick to choose which days.")
+        self.chk_sna_daily.stateChanged.connect(self.on_sna_daily_toggled)
+        sna_layout.addWidget(self.chk_sna_daily, r, 0, 1, 2); r += 1
+        # Per-day checkboxes (populated from the loaded data, default all on).
+        self.sna_daily_days_widget = QWidget()
+        _sna_days_outer = QVBoxLayout()
+        _sna_days_outer.setContentsMargins(20, 0, 0, 4)
+        self.sna_daily_days_inner = QVBoxLayout()
+        self.sna_daily_day_checkboxes = {}
+        _sna_days_outer.addLayout(self.sna_daily_days_inner)
+        self.sna_daily_days_widget.setLayout(_sna_days_outer)
+        self.sna_daily_days_widget.setVisible(False)
+        sna_layout.addWidget(self.sna_daily_days_widget, r, 0, 1, 2); r += 1
+        self.social_animation_widget.setLayout(sna_layout)
+        self.social_animation_widget.setVisible(False)
+        export_layout.addWidget(self.social_animation_widget)
 
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(False)  # off by default; opt in per run
@@ -2548,12 +2704,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.svg_option_widget.setVisible(False)  # hidden until Save Plots is on
         export_layout.addWidget(self.svg_option_widget)
 
-        self.chk_save_animation = QCheckBox("Save Animation")
+        self.chk_save_animation = QCheckBox("Save Tracking Animation")
         self.chk_save_animation.setChecked(False)
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
         self.chk_save_animation.setToolTip(
-            "Render an MP4 video of tag trajectories over time, from the "
-            "filtered + smoothed data. "
+            "Render an MP4 video of tag TRAJECTORIES over time (the arena view "
+            "with moving markers), from the filtered + smoothed data. This is "
+            "separate from the social-network animation above. "
             "Can take a long time for multi-day recordings at high quality."
         )
         export_layout.addWidget(self.chk_save_animation)
@@ -2643,7 +2800,7 @@ class UWBQuickVisualizationWindow(QWidget):
         fps_layout.addWidget(QLabel("FPS:"))
         self.combo_animation_fps = QComboBox()
         self.combo_animation_fps.addItems(["1", "5", "10", "20", "30"])
-        self.combo_animation_fps.setCurrentText("20")
+        self.combo_animation_fps.setCurrentText("30")
         self.combo_animation_fps.setToolTip(
             "Video frames per second. Higher values are smoother but "
             "produce larger files and take longer to render."
@@ -2999,6 +3156,28 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_tracking.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_tracking)
 
+        # Show the tag's ID label above each marker, with a choice of ID format.
+        tagid_row = QHBoxLayout()
+        self.chk_show_tag_id = QCheckBox("Show Tag ID")
+        self.chk_show_tag_id.setChecked(False)
+        self.chk_show_tag_id.setToolTip(
+            "Label each tag in the preview with its ID (above the marker). The "
+            "label is tinted to the marker colour under 'Color by: Sex/ID'.")
+        self.chk_show_tag_id.stateChanged.connect(self.on_show_background_toggled)
+        tagid_row.addWidget(self.chk_show_tag_id)
+        self.combo_tag_id_type = QComboBox()
+        self.combo_tag_id_type.addItems(["Display ID", "HexID", "ShortID"])
+        self.combo_tag_id_type.setCurrentText("Display ID")
+        self.combo_tag_id_type.setToolTip(
+            "Which ID to show:\n"
+            "• Display ID: sex + configured identity (e.g. M9627) — the label "
+            "used throughout the tool.\n"
+            "• HexID: the tag's short address in hexadecimal (e.g. 2A).\n"
+            "• ShortID: the decimal tag id as stored in the SQL database (e.g. 42).")
+        self.combo_tag_id_type.currentTextChanged.connect(self.on_show_background_toggled)
+        tagid_row.addWidget(self.combo_tag_id_type, 1)
+        v.addLayout(tagid_row)
+
         # Marker diameter in points. Matches the animation export's Tag Display
         # Size so a size dialled in here reads the same in the rendered video —
         # the preview marker was previously smaller than the export.
@@ -3020,10 +3199,23 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_battery = QCheckBox("Display Tag Battery Levels")
         self.chk_show_battery.setChecked(False)
         self.chk_show_battery.setToolTip(
-            "Label each tag in the preview with its ID and, beneath it, the "
-            "current battery voltage (small black text). Off by default.")
+            "Show each tag's current battery voltage in small black text under "
+            "its marker. Independent of 'Show Tag ID'. Off by default.")
         self.chk_show_battery.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_battery)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color by:"))
+        self.combo_preview_color = QComboBox()
+        self.combo_preview_color.addItems(["None", "ID", "Sex"])
+        self.combo_preview_color.setCurrentText("None")
+        self.combo_preview_color.setToolTip(
+            "How preview tags are coloured. None: all the same. ID: a unique "
+            "colour per tag. Sex: blue = male, red = female (from identities). "
+            "With Sex/ID the tag's ID label is tinted to match its marker.")
+        self.combo_preview_color.currentTextChanged.connect(self.on_preview_color_changed)
+        color_row.addWidget(self.combo_preview_color, 1)
+        v.addLayout(color_row)
 
         self.chk_preview_dark = QCheckBox("Dark mode")
         self.chk_preview_dark.setChecked(False)   # light by default
@@ -3079,18 +3271,6 @@ class UWBQuickVisualizationWindow(QWidget):
         pjump_row.addWidget(self.spin_preview_jump)
         pjump_row.addStretch()
         v.addLayout(pjump_row)
-
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("Color by:"))
-        self.combo_preview_color = QComboBox()
-        self.combo_preview_color.addItems(["None", "ID", "Sex"])
-        self.combo_preview_color.setCurrentText("None")
-        self.combo_preview_color.setToolTip(
-            "How preview tags are coloured. None: all the same. ID: a unique "
-            "colour per tag. Sex: blue = male, red = female (from identities).")
-        self.combo_preview_color.currentTextChanged.connect(self.on_preview_color_changed)
-        color_row.addWidget(self.combo_preview_color, 1)
-        v.addLayout(color_row)
 
         # Smoothing method: how the live track is drawn — None (actual fixes) or
         # a smoothing method, so you can compare before committing to export.
@@ -3741,20 +3921,18 @@ class UWBQuickVisualizationWindow(QWidget):
             # Keep pre-smoothing fixes so the pane can overlay raw vs smoothed
             g['raw_x'] = g['location_x']
             g['raw_y'] = g['location_y']
-            if do_filter:
-                # collect_stats=False: preview scrubbing must not overwrite the
-                # figures an export writes into runSummary.csv
-                g = self.apply_filters_to_data(
-                    g, collect_stats=False, velocity=use_vel, jump=use_jump,
-                    velocity_thresh=self.spin_preview_velocity.value(),
-                    jump_thresh=self.spin_preview_jump.value())
-            if smoothing_method != "None" and len(g):
-                # Preview uses its own Smoothing Window / units so the effect can
-                # be tuned live, independent of the Export Options values.
-                g = self.apply_smoothing_to_data(
-                    g, smoothing_method,
-                    window=self.spin_preview_window.value(),
-                    units=self.combo_preview_window_units.currentText())
+            # Threshold + smooth in the correct order (jump raw → smooth →
+            # velocity smoothed). collect_stats=False: preview scrubbing must not
+            # overwrite the figures an export writes into runSummary.csv. Preview
+            # uses its own Smoothing Window / units so the effect can be tuned
+            # live, independent of the Export Options values.
+            g = self._filter_and_smooth(
+                g, smoothing_method, collect_stats=False,
+                velocity=use_vel, jump=use_jump,
+                velocity_thresh=self.spin_preview_velocity.value(),
+                jump_thresh=self.spin_preview_jump.value(),
+                window=self.spin_preview_window.value(),
+                units=self.combo_preview_window_units.currentText())
             if len(g):
                 chunks.append(g)
         if not chunks:
@@ -3865,20 +4043,25 @@ class UWBQuickVisualizationWindow(QWidget):
             return np.array([cmap(i % 20) for i in range(len(tags))], dtype=float)
         return np.array([self._NEUTRAL] * len(tags), dtype=float)   # None
 
-    def _preview_tag_labels(self, tags):
-        """One display label per tag: 'sex-identity' when configured, else HexID.
+    def _preview_tag_labels(self, tags, id_type="Display ID"):
+        """One label per tag in the requested format.
 
-        Matches the tag naming used elsewhere so the preview labels read the same
-        as the Tag Selection list and the animation.
+        • Display ID: sex + identity (e.g. 'M9627'), matching the network /
+          proximity labels; falls back to HexID when no identity is configured.
+        • HexID: the tag's short address in hex (e.g. '2A').
+        • ShortID: the decimal tag id from the SQL database.
         """
         labels = []
         for tag in tags:
-            info = self.tag_identities.get(tag, {}) or {}
-            sex, ident = info.get('sex', ''), info.get('identity', '')
-            if sex and ident:
-                labels.append(f"{sex}-{ident}")
-            else:
-                labels.append(f"HexID {hex(tag).upper().replace('0X', '')}")
+            if id_type == "ShortID":
+                labels.append(str(tag))
+            elif id_type == "HexID":
+                labels.append(hex(tag).upper().replace('0X', ''))
+            else:  # Display ID (SexID)
+                info = self.tag_identities.get(tag, {}) or {}
+                sex, ident = info.get('sex', ''), info.get('identity', '')
+                labels.append(f"{sex}{ident}" if (sex and ident)
+                              else hex(tag).upper().replace('0X', ''))
         return labels
 
     def on_preview_smoothing_changed(self, *_):
@@ -4050,13 +4233,14 @@ class UWBQuickVisualizationWindow(QWidget):
                     tracks.append((np.column_stack([tx[ok], ty[ok]]),
                                    tuple(colors[t])))
 
-        # ID label + battery voltage under each dot when enabled. Labels are
-        # only drawn alongside the battery toggle (the preview is otherwise a
-        # clean dot view); the voltage is read from the forward-filled battery
-        # grid at the current frame.
+        # ID label (Show Tag ID) and battery voltage (Display Tag Battery Levels)
+        # are independent overlays. The voltage anchors under the marker whether
+        # or not the ID label is shown.
         labels = batteries = None
+        if getattr(self, "chk_show_tag_id", None) is not None and self.chk_show_tag_id.isChecked():
+            labels = self._preview_tag_labels(
+                self.preview_tags, self.combo_tag_id_type.currentText())
         if getattr(self, "chk_show_battery", None) is not None and self.chk_show_battery.isChecked():
-            labels = self._preview_tag_labels(self.preview_tags)
             batt = getattr(self, "preview_batt", None)
             if batt is not None and idx < len(batt):
                 batteries = batt[idx]
@@ -4751,6 +4935,18 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
+        self.chk_social_network.setChecked(False)
+        self.chk_social_animation.setChecked(False)
+        self.combo_sna_weighting.setCurrentIndex(0)
+        self.spin_sna_window.setValue(24.0)
+        self.spin_sna_step.setValue(1.0)
+        self.chk_sna_daily.setChecked(False)
+        self.combo_sna_node.setCurrentText("None (uniform)")
+        self.combo_sna_edge.setCurrentIndex(0)
+        self.combo_sna_layout.setCurrentIndex(0)
+        self.combo_sna_fps.setCurrentText("10")
+        self.on_social_network_toggled()
+        self.on_sna_daily_toggled()
         self.chk_save_plots.setChecked(False)
         self.chk_downsample_plots.setChecked(True)
         self.spin_plot_downsample_hz.setValue(1)
@@ -4764,10 +4960,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_anim_tag_size.setValue(10)
         self.chk_show_battery_export.setChecked(False)
         self.combo_animation_speed.setCurrentText("60x")
-        self.combo_animation_fps.setCurrentText("20")
+        self.combo_animation_fps.setCurrentText("30")
 
         # Preview display defaults
         self.chk_show_tracking.setChecked(True)
+        self.chk_show_tag_id.setChecked(False)
+        self.combo_tag_id_type.setCurrentText("Display ID")
         self.spin_tag_size.setValue(10)
         self.chk_show_battery.setChecked(False)
 
@@ -5585,6 +5783,218 @@ class UWBQuickVisualizationWindow(QWidget):
         enabled = self.chk_proximity_detection.isChecked()
         self.proximity_threshold_widget.setVisible(enabled)
 
+    def on_social_network_toggled(self):
+        """Show the animation sub-options, and ensure the proximity threshold is
+        visible (social-network output is derived from it)."""
+        self.social_animation_widget.setVisible(self.chk_social_animation.isChecked())
+        if self.chk_social_network.isChecked() or self.chk_social_animation.isChecked():
+            # Proximity is the source; keep its threshold control visible.
+            self.proximity_threshold_widget.setVisible(True)
+
+    def on_sna_daily_toggled(self):
+        """Show/hide the per-day checkboxes for daily social-network animations."""
+        self.sna_daily_days_widget.setVisible(self.chk_sna_daily.isChecked())
+        self._update_sna_clip_estimate()
+
+    def _recording_span_hours(self):
+        """Total recording duration in hours (from the preview timeline, else the
+        number of days), for the clip-length estimate."""
+        t0 = getattr(self, 'preview_t0', None)
+        t1 = getattr(self, 'preview_t1', None)
+        if t0 is not None and t1 is not None and t1 > t0:
+            return (t1 - t0) / 3_600_000.0
+        n = len(getattr(self, 'sna_daily_day_checkboxes', {}) or {})
+        return n * 24.0 if n else 0.0
+
+    def _update_sna_clip_estimate(self, *_):
+        """Refresh the estimated social-network clip length from step / fps.
+
+        length ≈ frames / fps, frames ≈ span / step. Window size only sets what
+        each frame shows, so it does not change the length.
+        """
+        if not hasattr(self, 'lbl_sna_clip'):
+            return
+        try:
+            fps = max(int(self.combo_sna_fps.currentText()), 1)
+            step_h = max(self.spin_sna_step.value(), 1e-6)
+        except Exception:
+            return
+
+        def _fmt(secs):
+            if secs < 90:
+                return f"{secs:.0f} s"
+            return f"{secs/60:.1f} min"
+
+        if self.chk_sna_daily.isChecked():
+            frames = max(round(24.0 / step_h), 1)
+            n_sel = sum(1 for cb in getattr(self, 'sna_daily_day_checkboxes', {}).values()
+                        if cb.isChecked())
+            per = _fmt(frames / fps)
+            extra = f"  ·  {n_sel} day(s) selected" if n_sel else ""
+            self.lbl_sna_clip.setText(
+                f"Estimated clip: ≈ {frames} frames · {per} per full day{extra}")
+        else:
+            span_h = self._recording_span_hours()
+            if span_h <= 0:
+                self.lbl_sna_clip.setText("Estimated clip: — (load data)")
+                return
+            frames = max(round(span_h / step_h), 1)
+            self.lbl_sna_clip.setText(
+                f"Estimated clip: ≈ {frames} frames · {_fmt(frames / fps)} "
+                f"(whole recording, {span_h/24:.1f} days)")
+
+    def _populate_sna_days(self, date_strings):
+        """Mirror the tracking-animation day checkboxes for the SNA animation."""
+        if not hasattr(self, 'sna_daily_day_checkboxes'):
+            return
+        for cb in self.sna_daily_day_checkboxes.values():
+            cb.deleteLater()
+        self.sna_daily_day_checkboxes.clear()
+        for i, date_str in enumerate(date_strings or []):
+            cb = QCheckBox(f"Day {i+1}: {date_str}")
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_sna_clip_estimate)
+            self.sna_daily_day_checkboxes[date_str] = cb
+            self.sna_daily_days_inner.addWidget(cb)
+        self._update_sna_clip_estimate()
+
+    def _sna_db_network(self, window_hours):
+        """Build a network from a RANDOM ``window_hours`` slice of the database.
+
+        Reads one random window of positions straight from the DB (the indexed
+        copy when present), runs proximity + GBI on it, and returns
+        (bouts, gbi, animals, sexes, window_end) — or None. Used by the layout
+        preview so each 'Random frame' samples a genuinely different time.
+        """
+        import random
+        from fnt.uwb.proximity_detection import detect_proximity_bouts
+        from fnt.uwb import social_network as SN
+        dbp = self.preview_db_path or self.db_path
+        if not dbp or not self.table_name:
+            return None
+        try:
+            conn = sqlite3.connect(dbp)
+            tmin, tmax = conn.execute(
+                f"SELECT MIN(timestamp), MAX(timestamp) FROM {self.table_name}").fetchone()
+            if tmin is None:
+                conn.close()
+                return None
+            win_ms = max(int(window_hours * 3600 * 1000), 1000)
+            tmin, tmax = int(tmin), int(tmax)
+            hi = max(tmin, tmax - win_ms)
+            start = random.randint(tmin, hi) if hi > tmin else tmin
+            end = start + win_ms
+            cols = processing_select_clause(conn, self.table_name)
+            tags = self.selected_preview_tags()
+            if tags:
+                ph = ",".join("?" * len(tags))
+                q = (f"SELECT {cols} FROM {self.table_name} WHERE shortid IN ({ph}) "
+                     f"AND timestamp BETWEEN ? AND ? ORDER BY shortid, timestamp")
+                params = list(tags) + [start, end]
+            else:
+                q = (f"SELECT {cols} FROM {self.table_name} "
+                     f"WHERE timestamp BETWEEN ? AND ? ORDER BY shortid, timestamp")
+                params = [start, end]
+            df = pd.read_sql_query(q, conn, params=params)
+            conn.close()
+        except Exception as e:
+            self.log_message(f"Layout preview query failed: {e}")
+            return None
+        if df.empty:
+            return None
+        df['Timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df['smoothed_x'] = df['location_x'] * 0.0254
+        df['smoothed_y'] = df['location_y'] * 0.0254
+        events, bouts = detect_proximity_bouts(
+            df[['Timestamp', 'shortid', 'smoothed_x', 'smoothed_y']],
+            threshold=self.spin_proximity_threshold.value(), gap_s=5,
+            tag_identities=self.tag_identities, log_callback=None)
+        if bouts is None or bouts.empty:
+            return None
+        gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
+        sexmap = SN._label_sex_map(self.tag_identities)
+        animals = sorted(set(bouts['animal1']) | set(bouts['animal2']))
+        sexes = {a: SN._sex_of(a, sexmap) for a in animals}
+        return bouts, gbi, animals, sexes, pd.Timestamp(end, unit='ms')
+
+    def open_sna_layout_preview(self):
+        """Popup that renders a network frame from a RANDOM database window;
+        'Random frame' resamples a new random window each click."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PyQt5.QtGui import QImage, QPixmap
+        from PyQt5.QtCore import Qt
+        from fnt.uwb import social_network as SN
+
+        if not self.db_path or not self.table_name:
+            QMessageBox.information(self, "No database",
+                                    "Select a database first — the layout preview "
+                                    "samples a random window from it.")
+            return
+
+        wmap = {'Total time (s)': 'time', 'Bout count': 'events',
+                'Simple Ratio Index (SRI)': 'sri', 'Half-weight Index (HWI)': 'hwi'}
+        nmap = {'None (uniform)': 'none', 'Degree': 'degree', 'Strength': 'strength',
+                'Betweenness': 'betweenness', 'Closeness': 'closeness',
+                'Eigenvector': 'eigenvector', 'PageRank': 'pagerank'}
+        lmap = {'Kamada-Kawai': 'kamada_kawai',
+                'Fruchterman-Reingold': 'fruchterman_reingold', 'Circular': 'circular'}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Social network — layout preview")
+        v = QVBoxLayout(dlg)
+        img_label = QLabel("Rendering…")
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setMinimumSize(640, 560)
+        v.addWidget(img_label)
+
+        def render():
+            img_label.setText("Sampling a random window from the database…")
+            QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                src = self._sna_db_network(self.spin_sna_window.value())
+            finally:
+                QApplication.restoreOverrideCursor()
+            if src is None:
+                img_label.setText("No proximity network in the sampled window — "
+                                  "try again (Random frame) or lower the window.")
+                return
+            bouts, gbi, animals, sexes, wend = src
+            if len(animals) < 2:
+                img_label.setText("Fewer than two animals in proximity this window "
+                                  "— click Random frame to resample.")
+                return
+            arr, te = SN.render_network_frame(
+                bouts, animals=animals, sexes=sexes,
+                weighting=wmap.get(self.combo_sna_weighting.currentText(), 'time'),
+                window_hours=self.spin_sna_window.value(),
+                node_metric=nmap.get(self.combo_sna_node.currentText(), 'none'),
+                edge_scale=('uniform' if self.combo_sna_edge.currentText() == 'Uniform' else 'weight'),
+                layout=lmap.get(self.combo_sna_layout.currentText(), 'kamada_kawai'),
+                gbi=gbi, window_end=wend, title_prefix='PREVIEW · ')
+            if arr is None:
+                img_label.setText("No network to show for this window.")
+                return
+            h, w, _ = arr.shape
+            qimg = QImage(arr.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
+            img_label.setPixmap(QPixmap.fromImage(qimg).scaled(
+                img_label.width(), img_label.height(), Qt.KeepAspectRatio,
+                Qt.SmoothTransformation))
+
+        btns = QHBoxLayout()
+        b_rand = QPushButton("Random frame")
+        b_rand.setToolTip("Sample a different random window from the database.")
+        b_rand.clicked.connect(render)
+        b_close = QPushButton("Close")
+        b_close.clicked.connect(dlg.accept)
+        btns.addWidget(b_rand)
+        btns.addStretch(1)
+        btns.addWidget(b_close)
+        v.addLayout(btns)
+        render()
+        dlg.resize(720, 680)
+        dlg.exec_()
+
     def on_save_animation_toggled(self):
         """Handle save animation checkbox toggle"""
         enabled = self.chk_save_animation.isChecked()
@@ -5650,7 +6060,9 @@ class UWBQuickVisualizationWindow(QWidget):
             cb.setChecked(True)  # Default to all days selected
             self.daily_animation_day_checkboxes[date_str] = cb
             self.daily_days_layout_inner.addWidget(cb)
-    
+        # Mirror the same days into the social-network animation day picker.
+        self._populate_sna_days(date_strings)
+
     def populate_animation_days(self):
         """Populate day checkboxes based on loaded data (called after preview loads)"""
         # Clear existing checkboxes
@@ -6010,14 +6422,56 @@ class UWBQuickVisualizationWindow(QWidget):
         """Clear accumulated filter statistics at the start of an export run."""
         self.filter_stats = {}
 
+    def _filter_and_smooth(self, data, smoothing_method, *, collect_stats=True,
+                           velocity=None, jump=None, velocity_thresh=None,
+                           jump_thresh=None, window=None, units=None):
+        """Threshold + smooth in the correct order:
+
+          1. JUMP threshold on the raw coordinates — removes teleport outliers
+             so they don't corrupt the smoother.
+          2. Smoothing.
+          3. VELOCITY threshold on the SMOOTHED coordinates — so the speed cutoff
+             reflects real movement, not the raw per-fix measurement noise
+             (which at high report rates makes almost every fix look 'fast' and
+             was deleting the majority of the data).
+
+        Falls back to raw coordinates for the velocity step when smoothing is
+        off (method 'None'), i.e. the old behaviour.
+        """
+        use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
+        use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
+
+        if use_jmp and len(data):
+            data = self.apply_filters_to_data(
+                data, collect_stats=collect_stats, velocity=False, jump=True,
+                jump_thresh=jump_thresh)
+        if smoothing_method != "None" and len(data):
+            data = self.apply_smoothing_to_data(data, smoothing_method,
+                                                window=window, units=units)
+        if use_vel and len(data):
+            xc = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+            yc = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+            data = self.apply_filters_to_data(
+                data, collect_stats=collect_stats, velocity=True, jump=False,
+                velocity_thresh=velocity_thresh, x_col=xc, y_col=yc)
+        return data
+
     def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None,
-                              velocity_thresh=None, jump_thresh=None):
+                              velocity_thresh=None, jump_thresh=None,
+                              x_col='location_x', y_col='location_y'):
         """Apply velocity and jump thresholding with time-window grouping.
 
         ``velocity``/``jump`` override whether each threshold is applied and
         ``velocity_thresh``/``jump_thresh`` override the cutoff values; when None
         they follow the Export checkboxes/spinboxes. The preview passes its own
         toggles and values so the user can tune thresholding live.
+
+        ``x_col``/``y_col`` choose the coordinates the distance/velocity are
+        measured on. The velocity threshold is applied AFTER smoothing on
+        ``smoothed_x``/``smoothed_y`` so it reflects real movement, not the raw
+        per-fix measurement noise (which, at high report rates, makes almost
+        every fix look fast); the jump threshold runs BEFORE smoothing on the raw
+        coordinates so teleport outliers don't corrupt the smoother.
         """
         use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
@@ -6036,13 +6490,16 @@ class UWBQuickVisualizationWindow(QWidget):
             lambda x: (x > time_gap_threshold).cumsum()
         ).reset_index(level=0, drop=True)
         
-        # Calculate distance and velocity within time window groups
+        # Calculate distance and velocity within time window groups, on the
+        # requested coordinate columns (raw for jump, smoothed for velocity).
+        xc = x_col if x_col in data.columns else 'location_x'
+        yc = y_col if y_col in data.columns else 'location_y'
         data['distance'] = np.sqrt(
-            (data['location_x'] - data.groupby(['shortid', 'tw_group'])['location_x'].shift())**2 +
-            (data['location_y'] - data.groupby(['shortid', 'tw_group'])['location_y'].shift())**2
+            (data[xc] - data.groupby(['shortid', 'tw_group'])[xc].shift())**2 +
+            (data[yc] - data.groupby(['shortid', 'tw_group'])[yc].shift())**2
         )
         data['velocity'] = data['distance'] / data['time_diff']
-        
+
         # Apply velocity filtering if enabled
         if use_velocity:
             velocity_threshold = (self.spin_velocity_threshold.value()
@@ -6157,12 +6614,24 @@ class UWBQuickVisualizationWindow(QWidget):
             'rolling_window_units': self.combo_window_units.currentText(),
             'show_anchors': self.chk_show_anchors.isChecked(),
             'show_tracking': self.chk_show_tracking.isChecked(),
+            'show_tag_id': self.chk_show_tag_id.isChecked(),
+            'tag_id_type': self.combo_tag_id_type.currentText(),
             'preview_tag_size': self.spin_tag_size.value(),
             'show_battery': self.chk_show_battery.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
+            'export_social_network': self.chk_social_network.isChecked(),
+            'social_animation': self.chk_social_animation.isChecked(),
+            'sna_weighting': self.combo_sna_weighting.currentText(),
+            'sna_window_h': self.spin_sna_window.value(),
+            'sna_step_h': self.spin_sna_step.value(),
+            'sna_daily': self.chk_sna_daily.isChecked(),
+            'sna_node_metric': self.combo_sna_node.currentText(),
+            'sna_edge_scale': self.combo_sna_edge.currentText(),
+            'sna_layout': self.combo_sna_layout.currentText(),
+            'sna_fps': self.combo_sna_fps.currentText(),
             'save_plots': self.chk_save_plots.isChecked(),
             'downsample_plots': self.chk_downsample_plots.isChecked(),
             'plot_downsample_hz': self.spin_plot_downsample_hz.value(),
@@ -6314,6 +6783,13 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'show_tracking' in config:
                 self.chk_show_tracking.setChecked(config['show_tracking'])
 
+            if 'show_tag_id' in config:
+                self.chk_show_tag_id.setChecked(config['show_tag_id'])
+            if 'tag_id_type' in config:
+                i = self.combo_tag_id_type.findText(config['tag_id_type'])
+                if i >= 0:
+                    self.combo_tag_id_type.setCurrentIndex(i)
+
             if 'preview_tag_size' in config:
                 self.spin_tag_size.setValue(config['preview_tag_size'])
 
@@ -6345,7 +6821,40 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'proximity_threshold' in config:
                 self.spin_proximity_threshold.setValue(config['proximity_threshold'])
-            
+
+            if 'export_social_network' in config:
+                self.chk_social_network.setChecked(config['export_social_network'])
+            if 'social_animation' in config:
+                self.chk_social_animation.setChecked(config['social_animation'])
+            if 'sna_weighting' in config:
+                i = self.combo_sna_weighting.findText(config['sna_weighting'])
+                if i >= 0:
+                    self.combo_sna_weighting.setCurrentIndex(i)
+            if 'sna_window_h' in config:
+                self.spin_sna_window.setValue(config['sna_window_h'])
+            if 'sna_step_h' in config:
+                self.spin_sna_step.setValue(config['sna_step_h'])
+            if 'sna_daily' in config:
+                self.chk_sna_daily.setChecked(config['sna_daily'])
+            if 'sna_node_metric' in config:
+                i = self.combo_sna_node.findText(config['sna_node_metric'])
+                if i >= 0:
+                    self.combo_sna_node.setCurrentIndex(i)
+            if 'sna_edge_scale' in config:
+                i = self.combo_sna_edge.findText(config['sna_edge_scale'])
+                if i >= 0:
+                    self.combo_sna_edge.setCurrentIndex(i)
+            if 'sna_layout' in config:
+                i = self.combo_sna_layout.findText(config['sna_layout'])
+                if i >= 0:
+                    self.combo_sna_layout.setCurrentIndex(i)
+            if 'sna_fps' in config:
+                i = self.combo_sna_fps.findText(str(config['sna_fps']))
+                if i >= 0:
+                    self.combo_sna_fps.setCurrentIndex(i)
+            self.on_social_network_toggled()
+            self.on_sna_daily_toggled()
+
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
 
@@ -6467,7 +6976,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # --- Migration prompt: move loose files into subfolders ---
             plots_subdir = os.path.join(analysis_dir, 'plots')
-            animations_subdir = os.path.join(analysis_dir, 'animations')
+            animations_subdir = os.path.join(analysis_dir, 'animation_Tracking')
 
             loose_plots = []
             loose_animations = []
@@ -6616,6 +7125,138 @@ class UWBQuickVisualizationWindow(QWidget):
             'use_identities': bool(self.tag_identities),
         }
 
+    def _export_social_network(self, events, bouts, output_dir, db_name, *,
+                               write_csvs, animate, skip_existing,
+                               weighting, window_h, step_h, daily, days=None,
+                               node_choice='None (uniform)', edge_choice='Scaled by weight',
+                               layout_choice='Kamada-Kawai', fps=10):
+        """Write the social-network CSVs and/or render the network animation(s).
+
+        ``events`` = per-second pairwise distances (for the chain-rule GBI);
+        ``bouts`` = pairwise proximity bouts (for the edge lists + animation).
+        """
+        from fnt.uwb import social_network as SN
+
+        # The GBI is needed for the CSV export AND for SRI/HWI edge weights, so
+        # build it once here.
+        gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
+
+        if write_csvs:
+            self.log_message("Building social network CSVs (edge lists + GBI)...")
+            full, daily_el = SN.build_edgelists(bouts, self.tag_identities)
+            for fname, df in ((f'{db_name}_network_edgelist_full.csv', full),
+                              (f'{db_name}_network_edgelist_daily.csv', daily_el),
+                              (f'{db_name}_network_GBI.csv', gbi)):
+                p = os.path.join(output_dir, fname)
+                if skip_existing and os.path.exists(p):
+                    self.log_message(f"Skipped (exists): {fname}")
+                else:
+                    df.to_csv(p, index=False)
+                    self.log_message(f"✓ Exported {fname} ({len(df)} rows)")
+
+        if not animate:
+            return
+        if bouts is None or bouts.empty:
+            self.log_message("No proximity bouts — skipping social network animation")
+            return
+
+        sexmap = SN._label_sex_map(self.tag_identities)
+        animals = sorted(set(bouts['animal1']) | set(bouts['animal2']))
+        sexes = {a: SN._sex_of(a, sexmap) for a in animals}
+        sna_dir = os.path.join(output_dir, 'animation_SocialNetworks')
+        os.makedirs(sna_dir, exist_ok=True)
+
+        b = bouts.copy()
+        b['bout_start'] = pd.to_datetime(b['bout_start'], utc=True, errors='coerce').dt.tz_localize(None)
+        b['bout_stop'] = pd.to_datetime(b['bout_stop'], utc=True, errors='coerce').dt.tz_localize(None)
+        g = gbi.copy()
+        if len(g):
+            g['group_start'] = pd.to_datetime(g['group_start'], utc=True, errors='coerce').dt.tz_localize(None)
+
+        node_map = {'None (uniform)': 'none', 'Degree': 'degree',
+                    'Strength': 'strength', 'Betweenness': 'betweenness',
+                    'Closeness': 'closeness', 'Eigenvector': 'eigenvector',
+                    'PageRank': 'pagerank'}
+        weight_map = {'Total time (s)': 'time', 'Bout count': 'events',
+                      'Simple Ratio Index (SRI)': 'sri', 'Half-weight Index (HWI)': 'hwi'}
+        layout_map = {'Kamada-Kawai': 'kamada_kawai',
+                      'Fruchterman-Reingold': 'fruchterman_reingold', 'Circular': 'circular'}
+        node_metric = node_map.get(node_choice, 'none')
+        edge_scale = 'uniform' if edge_choice == 'Uniform' else 'weight'
+        weighting = weight_map.get(weighting, 'time')
+        layout = layout_map.get(layout_choice, 'kamada_kawai')
+
+        # Per-day videos (only the chosen days), or one for the whole recording.
+        jobs = []   # (suffix, span, bouts_subset, gbi_subset)
+        if daily and 'Day' in b.columns:
+            day_dates = None
+            if 'Date' in b.columns:
+                day_dates = {int(d): str(b.loc[b['Day'] == d, 'Date'].iloc[0])
+                             for d in b['Day'].dropna().unique()}
+            for d in sorted(b['Day'].dropna().unique()):
+                d = int(d)
+                if days is not None and day_dates is not None and day_dates.get(d) not in days:
+                    continue
+                sub = b[b['Day'] == d]
+                if sub.empty:
+                    continue
+                gsub = g[g['day'] == d] if len(g) and 'day' in g.columns else g
+                jobs.append((f'_Day{d}',
+                             (sub['bout_start'].min(), sub['bout_stop'].max()), sub, gsub))
+        else:
+            jobs.append(('', (b['bout_start'].min(), b['bout_stop'].max()), b, g))
+
+        for suffix, span, sub, gsub in jobs:
+            if self.export_cancelled:
+                return
+            out = os.path.join(sna_dir, f'{db_name}_SocialNet_{weighting}{suffix}.mp4')
+            if skip_existing and os.path.exists(out):
+                self.log_message(f"Skipped (exists): {os.path.basename(out)}")
+                continue
+            self.lbl_export_progress.setText(f"Rendering social network ({weighting}{suffix})...")
+            QApplication.processEvents()
+            SN.render_network_animation(
+                sub, out, animals=animals, sexes=sexes, weighting=weighting,
+                window_hours=window_h, step_hours=step_h,
+                node_metric=node_metric, edge_scale=edge_scale,
+                layout=layout, gbi=gsub,
+                fps=fps, dpi=100, span=span, title_prefix=f'{db_name} · ',
+                is_cancelled=lambda: self.export_cancelled,
+                progress=lambda i, n: QApplication.processEvents(),
+                log=self.log_message)
+
+    def _prompt_animation_temp_dir(self, animations_dir):
+        """Ask up-front where to write the tracking animation's temp frames.
+
+        Returns the chosen directory, or None if the user cancels (which aborts
+        the export). Called at export start so the prompt isn't sprung on the
+        user minutes into a long run.
+        """
+        default_temp_dir = os.path.join(animations_dir, 'temp_frames')
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Temporary Frames Location")
+        msg.setText(
+            f"The tracking animation writes temporary frame files while it "
+            f"renders.\n\nDefault location:\n{default_temp_dir}\n\n"
+            f"These are deleted when the animation finishes. Use the default "
+            f"location, or choose a different folder?"
+        )
+        msg.addButton("Use Default", QMessageBox.AcceptRole)
+        choose_btn = msg.addButton("Choose Folder...", QMessageBox.ActionRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+        msg.exec_()
+        clicked = msg.clickedButton()
+        if clicked == cancel_btn:
+            return None
+        if clicked == choose_btn:
+            custom_dir = QFileDialog.getExistingDirectory(
+                self, "Select Folder for Temporary Animation Frames",
+                os.path.expanduser("~"))
+            if not custom_dir:
+                return None
+            return os.path.join(custom_dir, 'temp_animation_frames')
+        return default_temp_dir
+
     def generate_animation(self, output_dir, total_export_steps=1, current_export_step=1, csv_path=None, animations_dir=None):
         """Generate animation video from tracking data"""
         try:
@@ -6626,48 +7267,14 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # Resolve animations output directory
             if animations_dir is None:
-                animations_dir = os.path.join(output_dir, 'animations')
+                animations_dir = os.path.join(output_dir, 'animation_Tracking')
             os.makedirs(animations_dir, exist_ok=True)
 
-            # Ask user to confirm temp frames location
-            default_temp_dir = os.path.join(animations_dir, 'temp_frames')
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Temporary Frames Location")
-            msg.setText(
-                f"Animation rendering requires temporary frame files.\n\n"
-                f"Default location:\n{default_temp_dir}\n\n"
-                f"These files will be deleted after the animation is complete. "
-                f"Use the default location, or choose a different folder?"
-            )
-            use_default_btn = msg.addButton("Use Default", QMessageBox.AcceptRole)
-            choose_btn = msg.addButton("Choose Folder...", QMessageBox.ActionRole)
-            cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
-            msg.exec_()
-
-            clicked = msg.clickedButton()
-            if clicked == cancel_btn:
-                self.log_message("Animation cancelled by user")
-                self.exporting = False
-                self.btn_export.setEnabled(True)
-                self.btn_stop_export.setVisible(False)
-                self.progress_widget.setVisible(False)
-                return
-            elif clicked == choose_btn:
-                custom_dir = QFileDialog.getExistingDirectory(
-                    self, "Select Folder for Temporary Animation Frames",
-                    os.path.expanduser("~")
-                )
-                if not custom_dir:
-                    self.log_message("Animation cancelled by user")
-                    self.exporting = False
-                    self.btn_export.setEnabled(True)
-                    self.btn_stop_export.setVisible(False)
-                    self.progress_widget.setVisible(False)
-                    return
-                temp_frames_dir = os.path.join(custom_dir, 'temp_animation_frames')
-            else:
-                temp_frames_dir = default_temp_dir
-
+            # Temp-frames folder was chosen up-front when Export was clicked
+            # (see _prompt_animation_temp_dir); fall back to the default if the
+            # animation is somehow reached without that prompt.
+            temp_frames_dir = (getattr(self, '_anim_temp_frames_dir', None)
+                               or os.path.join(animations_dir, 'temp_frames'))
             os.makedirs(temp_frames_dir, exist_ok=True)
             self.log_message(f"Temp frames location: {temp_frames_dir}")
             
@@ -6899,7 +7506,7 @@ class UWBQuickVisualizationWindow(QWidget):
     def _cleanup_plot_working_files(self):
         """Delete the temporary downsampled/raw render CSVs written for this run.
 
-        These '<db>_plotdata_*.csv' files exist only so the plot worker and the
+        These '<db>_TEMP_renderdata_*.csv' files exist only so the plot worker and the
         animation have a source to read; they are removed once those consumers
         finish. The exported smoothed CSV deliverable is never in this list.
         """
@@ -6942,7 +7549,7 @@ class UWBQuickVisualizationWindow(QWidget):
         db_name = os.path.splitext(db_filename)[0]  # Remove extension
 
         export_raw_csv = self.chk_export_raw_csv.isChecked()
-        export_smoothed_csv = self.chk_export_smoothed_csv.isChecked()
+        export_smoothed_csv = True   # smoothed CSV is always exported
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
         downsample_plots = self.chk_downsample_plots.isChecked()
@@ -6952,8 +7559,23 @@ class UWBQuickVisualizationWindow(QWidget):
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
+        export_social_network = self.chk_social_network.isChecked()
+        social_animation = self.chk_social_animation.isChecked()
+        # Frozen at export start so mid-export clicks can't change them.
+        sna_weighting = self.combo_sna_weighting.currentText()
+        sna_window_h = self.spin_sna_window.value()
+        sna_step_h = self.spin_sna_step.value()
+        sna_daily = self.chk_sna_daily.isChecked()
+        sna_node = self.combo_sna_node.currentText()
+        sna_edge = self.combo_sna_edge.currentText()
+        sna_layout = self.combo_sna_layout.currentText()
+        sna_fps = int(self.combo_sna_fps.currentText())
+        sna_days = ([d for d, cb in self.sna_daily_day_checkboxes.items() if cb.isChecked()]
+                    if sna_daily else None)
 
-        if not export_raw_csv and not export_smoothed_csv and not save_plots and not save_animation and not detect_proximity:
+        if not (export_raw_csv or export_smoothed_csv or save_plots
+                or save_animation or detect_proximity or export_social_network
+                or social_animation):
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
 
@@ -6965,10 +7587,26 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message("Export cancelled at layer selection.")
                 return
 
+        # --- Animation temp-frames location (frontloaded) ---
+        # If a Tracking Animation is requested, ask for its temp-frames folder
+        # NOW so every interactive prompt happens up-front. The user can start
+        # the export and walk away instead of being blocked mid-run.
+        self._anim_temp_frames_dir = None
+        if save_animation:
+            _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
+            self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
+            if self._anim_temp_frames_dir is None:
+                self.log_message("Export cancelled at temp-frames selection.")
+                self.exporting = False
+                self.btn_export.setEnabled(True)
+                self.btn_stop_export.setVisible(False)
+                self.progress_widget.setVisible(False)
+                return
+
         # --- Conflict detection ---
         base_output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
         plots_subdir = os.path.join(base_output_dir, 'plots')
-        animations_subdir = os.path.join(base_output_dir, 'animations')
+        animations_subdir = os.path.join(base_output_dir, 'animation_Tracking')
 
         # --- Build helper to get tag file suffix (matches PlotSaverWorker logic) ---
         def _tag_suffix(tag):
@@ -6997,6 +7635,24 @@ class UWBQuickVisualizationWindow(QWidget):
             predicted_files.append(f'{db_name}_smoothed.csv')
         if detect_proximity:
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
+        if export_social_network:
+            predicted_files.append(f'{db_name}_network_edgelist_full.csv')
+            predicted_files.append(f'{db_name}_network_edgelist_daily.csv')
+            predicted_files.append(f'{db_name}_network_GBI.csv')
+
+        # Predict social-network animation files (animation_SocialNetworks/),
+        # matching _export_social_network's naming: SocialNet_<weighting>[_DayN].
+        predicted_sna_files = []
+        if social_animation:
+            _wkey = {'Total time (s)': 'time', 'Bout count': 'events',
+                     'Simple Ratio Index (SRI)': 'sri',
+                     'Half-weight Index (HWI)': 'hwi'}.get(sna_weighting, 'time')
+            if sna_daily:
+                for i, ds in enumerate(self.sna_daily_day_checkboxes.keys()):
+                    if sna_days is None or ds in sna_days:
+                        predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}_Day{i + 1}.mp4')
+            else:
+                predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}.mp4')
 
         # Predict animation files (in animations/ subfolder). Use the frozen
         # snapshot so the predicted filenames match what actually gets rendered.
@@ -7060,9 +7716,16 @@ class UWBQuickVisualizationWindow(QWidget):
 
         for f in predicted_animation_files:
             if os.path.exists(os.path.join(animations_subdir, f)):
-                all_conflicting.append((f, "animations"))
+                all_conflicting.append((f, "animation_Tracking"))
             else:
-                all_new.append((f, "animations"))
+                all_new.append((f, "animation_Tracking"))
+
+        sna_subdir = os.path.join(base_output_dir, 'animation_SocialNetworks')
+        for f in predicted_sna_files:
+            if os.path.exists(os.path.join(sna_subdir, f)):
+                all_conflicting.append((f, "animation_SocialNetworks"))
+            else:
+                all_new.append((f, "animation_SocialNetworks"))
 
         skip_existing = False
         output_dir = base_output_dir
@@ -7105,7 +7768,7 @@ class UWBQuickVisualizationWindow(QWidget):
         plots_dir = os.path.join(output_dir, 'plots')
         if save_plots:
             os.makedirs(plots_dir, exist_ok=True)
-        animations_dir = os.path.join(output_dir, 'animations')
+        animations_dir = os.path.join(output_dir, 'animation_Tracking')
         if save_animation:
             os.makedirs(animations_dir, exist_ok=True)
 
@@ -7228,13 +7891,10 @@ class UWBQuickVisualizationWindow(QWidget):
                             if trimmed > 0:
                                 self.log_message(f"    Trimmed {trimmed} points outside time window")
 
-                    # Filtering
-                    if do_filter and len(tag_data) > 0:
-                        tag_data = self.apply_filters_to_data(tag_data)
-
-                    # Smoothing
-                    if smoothing_method != "None" and len(tag_data) > 0:
-                        tag_data = self.apply_smoothing_to_data(tag_data, smoothing_method)
+                    # Threshold + smooth: jump threshold (raw) → smooth →
+                    # velocity threshold (on the smoothed track).
+                    if len(tag_data) > 0:
+                        tag_data = self._filter_and_smooth(tag_data, smoothing_method)
 
                     # Let the window repaint / process the Stop button between
                     # tags, right after the heaviest per-tag work.
@@ -7309,7 +7969,7 @@ class UWBQuickVisualizationWindow(QWidget):
                         work['time_bin'] = work['Timestamp'].dt.floor(period)
                         work = work.groupby(['shortid', 'time_bin']).first().reset_index()
                         work = work.drop(columns=['time_bin'])
-                        fn = f'{db_name}_plotdata_{hz}Hz.csv'
+                        fn = f'{db_name}_TEMP_renderdata_{hz}Hz.csv'
                         path = os.path.join(output_dir, fn)
                         work.to_csv(path, index=False)
                         self._plot_working_files.append(path)
@@ -7324,7 +7984,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     else:
                         # Full resolution, no smoothed CSV: working copy of the
                         # raw (unsmoothed) fixes for the renderers.
-                        fn = f'{db_name}_plotdata_raw.csv'
+                        fn = f'{db_name}_TEMP_renderdata_raw.csv'
                         path = os.path.join(output_dir, fn)
                         base.to_csv(path, index=False)
                         self._plot_working_files.append(path)
@@ -7347,7 +8007,9 @@ class UWBQuickVisualizationWindow(QWidget):
             self.save_run_summary(output_dir)
             
             # Detect proximity bouts if requested
-            if detect_proximity:
+            # Proximity is the source for the social-network products, so run it
+            # whenever proximity OR any social-network output is requested.
+            if detect_proximity or export_social_network or social_animation:
                 if self.export_cancelled:
                     self.stop_export()
                     return
@@ -7377,13 +8039,9 @@ class UWBQuickVisualizationWindow(QWidget):
                         prox_data = None
 
                     if prox_data is not None:
-                        # The per-timestamp events frame is computed internally
-                        # (bouts are derived from it) but intentionally NOT
-                        # written out: bouts is the tool's threshold-based
-                        # deliverable. Anyone needing the raw per-second dyadic
-                        # distances can re-run at a different threshold or
-                        # compute them from the exported smoothed CSV themselves.
-                        _events, proximity_bouts = detect_proximity_bouts(
+                        # events = per-second pairwise distances (needed for the
+                        # chain-rule GBI); bouts = the threshold-based deliverable.
+                        prox_events, proximity_bouts = detect_proximity_bouts(
                             prox_data,
                             threshold=proximity_threshold,
                             gap_s=5,
@@ -7391,19 +8049,30 @@ class UWBQuickVisualizationWindow(QWidget):
                             log_callback=self.log_message
                         )
 
-                        # Export proximity bouts
-                        bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
-                        if skip_existing and os.path.exists(bouts_path):
-                            self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
-                        else:
-                            proximity_bouts.to_csv(bouts_path, index=False)
-                            self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
-                                             f"{os.path.basename(bouts_path)}")
+                        # Export proximity bouts (only when explicitly requested)
+                        if detect_proximity:
+                            bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
+                            if skip_existing and os.path.exists(bouts_path):
+                                self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
+                            else:
+                                proximity_bouts.to_csv(bouts_path, index=False)
+                                self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
+                                                 f"{os.path.basename(bouts_path)}")
+                            self.log_message("✓ Proximity detection complete!")
 
-                        self.log_message("✓ Proximity detection complete!")
+                        # ── Social network outputs (edge lists + GBI + anim) ──
+                        if export_social_network or social_animation:
+                            self._export_social_network(
+                                prox_events, proximity_bouts, output_dir, db_name,
+                                write_csvs=export_social_network,
+                                animate=social_animation, skip_existing=skip_existing,
+                                weighting=sna_weighting, window_h=sna_window_h,
+                                step_h=sna_step_h, daily=sna_daily, days=sna_days,
+                                node_choice=sna_node, edge_choice=sna_edge,
+                                layout_choice=sna_layout, fps=sna_fps)
 
                 except Exception as e:
-                    self.log_message(f"Error during proximity detection: {e}")
+                    self.log_message(f"Error during proximity/social-network export: {e}")
                     import traceback
                     traceback.print_exc()
 

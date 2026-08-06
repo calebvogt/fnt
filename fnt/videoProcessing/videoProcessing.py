@@ -12,6 +12,7 @@ import subprocess
 import glob
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 try:
@@ -55,6 +56,66 @@ DEFAULT_SUBTITLE_STYLE = {
 
 
 _VIDEO_EXT_RE = r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$'
+
+
+# ---------------------------------------------------------------------------
+# Network-drive detection
+# ---------------------------------------------------------------------------
+
+_NETWORK_FSTYPES = {
+    'nfs', 'nfs4', 'cifs', 'smb', 'smbfs', 'afpfs', 'ftpfs', 'webdav',
+    'fuse.sshfs', 'fuse.davfs', 'fuse.rclone', 'fuse.gvfsd-fuse', '9p',
+}
+
+
+def _posix_path_is_network(path):
+    """Best-effort network check on POSIX by matching the path to its mount."""
+    try:
+        real = os.path.realpath(path)
+        entries = []
+        if os.path.exists('/proc/mounts'):
+            with open('/proc/mounts', 'r', errors='ignore') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        entries.append((parts[1], parts[2]))
+        else:
+            out = subprocess.run(['mount'], capture_output=True, text=True, timeout=5)
+            for line in out.stdout.splitlines():
+                m = re.search(r' on (.+?) \(([^,) ]+)', line)
+                if m:
+                    entries.append((m.group(1), m.group(2)))
+        best = None
+        for mountpoint, fstype in entries:
+            mp = mountpoint.rstrip('/') or '/'
+            if real == mp or real.startswith(mp + '/'):
+                if best is None or len(mp) > len(best[0]):
+                    best = (mp, fstype)
+        if best:
+            return best[1].lower() in _NETWORK_FSTYPES
+    except Exception:
+        pass
+    return False
+
+
+def is_network_path(path):
+    """True if *path* lives on a network/remote drive."""
+    if not path:
+        return False
+    p = str(path)
+    if p.startswith('\\\\') or p.startswith('//'):
+        return True
+    if os.name == 'nt':
+        import ctypes
+        drive = os.path.splitdrive(os.path.abspath(p))[0]
+        if drive and drive.endswith(':'):
+            DRIVE_REMOTE = 4
+            try:
+                return ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == DRIVE_REMOTE
+            except Exception:
+                return False
+        return False
+    return _posix_path_is_network(p)
 
 # All video extensions the tool understands, as glob patterns.
 DEFAULT_VIDEO_GLOBS = ["*.avi", "*.mp4", "*.mov", "*.mkv",
@@ -443,6 +504,9 @@ class VideoProcessorWorker(QThread):
     
     def process_single_file(self, video_file, out_dir, file_index, attempt=1):
         """Process a single video file"""
+        local_copy = None
+        local_sub_copy = None
+        tmp_dir = None
         try:
             # Get filename and build output path
             video_filename = os.path.basename(video_file)
@@ -450,14 +514,39 @@ class VideoProcessorWorker(QThread):
 
             self.progress_update.emit(f"Processing: {video_filename}")
 
+            # Stage network files locally to avoid transient I/O crashes
+            ffmpeg_input = video_file
+            if is_network_path(video_file):
+                tmp_dir = tempfile.mkdtemp(prefix="fnt_preproc_")
+                local_copy = os.path.join(tmp_dir, video_filename)
+                if attempt == 1:
+                    self.progress_update.emit(
+                        f"  📥 Staging from network drive → local temp…")
+                try:
+                    shutil.copy2(video_file, local_copy)
+                except Exception as e:
+                    self.progress_update.emit(
+                        f"❌ Failed to copy {video_filename} locally: {e}")
+                    return False
+                ffmpeg_input = local_copy
+                if self.burn_subtitles:
+                    sub_file = find_subtitle_file(video_file)
+                    if sub_file:
+                        local_sub_copy = os.path.join(
+                            tmp_dir, os.path.basename(sub_file))
+                        shutil.copy2(sub_file, local_sub_copy)
+
             # Build FFmpeg command based on settings
-            cmd = self.build_ffmpeg_command(video_file, output_file)
+            cmd = self.build_ffmpeg_command(ffmpeg_input, output_file)
 
             # When burning subtitles we run ffmpeg from the video's own folder so
             # the .smi can be referenced by basename in the filtergraph (avoids
             # Windows drive-letter/colon escaping). Input/output use absolute
             # paths, so this cwd is otherwise harmless.
-            run_cwd = os.path.dirname(video_file) if self.burn_subtitles else None
+            if self.burn_subtitles:
+                run_cwd = os.path.dirname(ffmpeg_input)
+            else:
+                run_cwd = None
 
             # Run FFmpeg and capture output for GUI display.
             # stdin=subprocess.DEVNULL prevents FFmpeg from hanging on
@@ -592,6 +681,13 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.progress_update.emit(f"❌ Error processing {video_filename}: {str(e)}")
             return False
+
+        finally:
+            if tmp_dir:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
     
     def build_ffmpeg_command(self, input_file, output_file):
         """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""

@@ -1,0 +1,14 @@
+Collecting python-igraph
+  Downloading python_igraph-1.0.0-py3-none-any.whl.metadata (3.1 kB)
+Collecting igraph==1.0.0 (from python-igraph)
+  Downloading igraph-1.0.0-cp39-abi3-win_amd64.whl.metadata (4.5 kB)
+Collecting texttable>=1.6.2 (from igraph==1.0.0->python-igraph)
+  Downloading texttable-1.7.0-py2.py3-none-any.whl.metadata (9.8 kB)
+Downloading python_igraph-1.0.0-py3-none-any.whl (9.2 kB)
+Downloading igraph-1.0.0-cp39-abi3-win_amd64.whl (3.2 MB)
+   ---------------------------------------- 3.2/3.2 MB 63.0 MB/s  0:00:00
+Downloading texttable-1.7.0-py2.py3-none-any.whl (10 kB)
+Installing collected packages: texttable, igraph, python-igraph
+
+Successfully installed igraph-1.0.0 python-igraph-1.0.0 texttable-1.7.0
+

@@ -1744,7 +1744,16 @@ def main():
     if not PYQT_AVAILABLE:
         print("Error: PyQt5 is not available. Please install it with: pip install PyQt5")
         return
-    
+
+    # Dump a native-crash traceback to ~/.fnt/faulthandler_crash.log. This is
+    # the ACTUAL entry point (the `fnt` console script), so the crash logger
+    # must be installed here — not only in the standalone UWB main().
+    try:
+        from fnt.uwb.uwb_preprocessing_pyqt import _install_faulthandler
+        _install_faulthandler()
+    except Exception as _e:
+        print(f"[FNT] faulthandler not installed: {_e}")
+
     # Windows taskbar icon fix - must be set before creating QApplication
     try:
         import ctypes
