@@ -64,6 +64,11 @@ class VideoTrimConfig:
         self.duration = 300  # seconds (5 minutes default)
         self.crop_polygon = []  # List of (x, y) points
         self.output_filename = ""
+        self.export_gif = False  # True = export a looping .gif instead of .mp4
+        self.stabilize = False   # True = apply FFmpeg deshake stabilization
+        self.stab_range = 16     # deshake rx/ry: max shake (px) to correct
+        self.stab_edge = "mirror"  # deshake border fill: mirror/clamp/original/blank
+        self.stab_zoom = 0       # % zoom-in after deshake to crop off wobbly edges (0 = off)
         self.configured = False
         
         # Video properties
@@ -133,6 +138,13 @@ class BatchTrimWorker(QThread):
             self.output_message.emit(f"  Trim end: {end_time:.2f}s\n")
             self.output_message.emit(f"  Trim duration: {trim_duration:.2f}s\n")
             self.output_message.emit(f"  ⚠️ EXPECTED OUTPUT FRAMES: {expected_frames}\n")
+            if getattr(config, "stabilize", False):
+                _rng = max(16, min(64, int(round(config.stab_range / 16.0)) * 16))
+                _zoom = getattr(config, "stab_zoom", 0)
+                _zoom_str = f", zoom={_zoom}%" if _zoom else ""
+                self.output_message.emit(
+                    f"  Stabilization: ON (deshake rx=ry={_rng}, "
+                    f"edge={config.stab_edge}{_zoom_str})\n")
             self.output_message.emit(f"{'='*80}\n\n")
             
             # Build output path
@@ -154,45 +166,117 @@ class BatchTrimWorker(QThread):
                 "-i", config.video_path,
             ]
 
-            # Add crop filter if defined
+            has_crop = len(config.crop_polygon) >= 3
+            stabilize = getattr(config, "stabilize", False)
             temp_mask_file = None
-            if len(config.crop_polygon) >= 3:
-                temp_mask_file = self.create_mask(config)
 
-                # Use the mask as a looping second input so every video frame
-                # has a corresponding mask frame (without -loop 1 the single-frame
-                # PNG input is exhausted immediately and ffmpeg crashes).
-                command.extend(["-loop", "1", "-i", temp_mask_file])
+            # Assemble the video filter graph compositionally so trim, optional
+            # stabilization, optional crop, and optional GIF palettization can be
+            # freely combined. Graph order is: stabilize -> crop -> GIF.
+            # Stabilizing BEFORE the crop keeps the polygon mask fixed on screen
+            # while the underlying footage is steadied (deshaking the composited
+            # frame would instead drag the black mask edges around).
+            segments = []       # filter sub-strings joined by ';'
+            cur = "0:v"         # label of the current end of the chain
 
-                filter_complex = (
-                    f"[1:v]scale={config.width}:{config.height}[mask];"
-                    f"[0:v][mask]alphamerge[vid_with_alpha];"
-                    f"color=black:s={config.width}x{config.height}[black];"
-                    f"[black][vid_with_alpha]overlay=format=auto"
+            if stabilize:
+                # deshake: FFmpeg's built-in one-pass stabilizer (needs an
+                # --enable-gpl build). rx/ry cap the horizontal/vertical shake
+                # (px) it will correct; edge controls how exposed borders fill.
+                # deshake requires rx/ry to be a multiple of 16, so coerce here
+                # defensively (the UI already snaps, but a stray value would
+                # otherwise abort the whole ffmpeg run).
+                rng = max(16, min(64, int(round(config.stab_range / 16.0)) * 16))
+                deshake = (
+                    f"deshake=rx={rng}:ry={rng}"
+                    f":edge={config.stab_edge}"
                 )
+                segments.append(f"[{cur}]{deshake}[stab]")
+                cur = "stab"
+
+                # Optional zoom-in to push the wobbling stabilization borders
+                # off-screen: scale up by the zoom factor, then centre-crop back
+                # to the original size. Output stays WxH so downstream crop/GIF
+                # stages are unaffected.
+                zoom_pct = getattr(config, "stab_zoom", 0)
+                if zoom_pct and zoom_pct > 0:
+                    z = 1.0 + zoom_pct / 100.0
+                    segments.append(
+                        f"[{cur}]scale=iw*{z}:ih*{z},"
+                        f"crop={config.width}:{config.height}[zoom]")
+                    cur = "zoom"
+
+            if has_crop:
+                temp_mask_file = self.create_mask(config)
+                # The mask is a single PNG; -loop 1 keeps it available for every
+                # video frame (without it the single-frame input is exhausted
+                # immediately and ffmpeg crashes). -t bounds the otherwise-infinite
+                # looping mask to the clip length so the alphamerge/overlay chain
+                # terminates — this is REQUIRED for the GIF path (palettegen must
+                # reach end-of-stream) and harmless for MP4.
+                command.extend(
+                    ["-loop", "1", "-t", str(trim_duration), "-i", temp_mask_file])
+                segments.append(f"[1:v]scale={config.width}:{config.height}[mask]")
+                segments.append(f"[{cur}][mask]alphamerge[vid_with_alpha]")
+                if config.export_gif:
+                    # Give the black background an explicit duration so the graph
+                    # is finite — palettegen must reach end-of-stream to emit a
+                    # palette, and the looping mask input never ends on its own.
+                    segments.append(
+                        f"color=black:s={config.width}x{config.height}"
+                        f":r={config.fps}:d={trim_duration}[black]")
+                else:
+                    segments.append(
+                        f"color=black:s={config.width}x{config.height}[black]")
+                segments.append("[black][vid_with_alpha]overlay=format=auto[cropped]")
+                cur = "cropped"
+
+            if config.export_gif:
+                # A good-looking GIF needs a per-clip color palette; generate and
+                # apply it in one pass with split + palettegen/paletteuse.
+                segments.append(f"[{cur}]split[s0][s1]")
+                segments.append("[s0]palettegen=stats_mode=diff[pal]")
+                segments.append(
+                    "[s1][pal]paletteuse=dither=bayer:bayer_scale=5"
+                    ":diff_mode=rectangle[out]")
+                cur = "out"
+
+            if segments:
+                # The graph's final output must be unlabeled so ffmpeg auto-maps
+                # it to the output file — strip the trailing label off the last
+                # sub-filter.
+                filter_complex = ";".join(segments)
+                if filter_complex.endswith(f"[{cur}]"):
+                    filter_complex = filter_complex[: -len(f"[{cur}]")]
                 command.extend(["-filter_complex", filter_complex])
-            
-            # Add encoding parameters
-            command.extend([
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-avoid_negative_ts", "make_zero",
-                "-fflags", "+genpts",
-                "-an"
-            ])
-            
-            # CRITICAL: Force exact frame count AND framerate if using mask
-            if len(config.crop_polygon) >= 3:
+
+            if config.export_gif:
+                # GIFs carry no audio; -loop 0 => the GIF repeats forever.
+                command.extend(["-an", "-loop", "0", output_file])
+            else:
+                # --- Standard MP4 (H.264) output ---
                 command.extend([
-                    "-r", str(config.fps),
-                    "-frames:v", str(expected_frames),
-                    "-shortest"
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-avoid_negative_ts", "make_zero",
+                    "-fflags", "+genpts",
+                    "-an"
                 ])
-            
-            command.append(output_file)
+
+                # CRITICAL: Force exact frame count AND framerate when the crop
+                # path's looping mask / synthetic color source would otherwise
+                # not terminate.
+                if has_crop:
+                    command.extend([
+                        "-r", str(config.fps),
+                        "-frames:v", str(expected_frames),
+                        "-shortest"
+                    ])
+
+                command.append(output_file)
             
             # Emit the FFmpeg command
             cmd_str = " ".join(command)
@@ -253,7 +337,12 @@ class BatchTrimWorker(QThread):
             self.output_message.emit(f"  Calculated output duration: {calc_duration:.2f}s\n")
             
             if success:
-                if final_frame_count == expected_frames:
+                if config.export_gif:
+                    # palettegen/paletteuse report frame counts differently, so
+                    # the strict expected-vs-actual check doesn't apply to GIFs.
+                    self.output_message.emit(f"  ✅ Looping GIF created\n")
+                    self.output_message.emit(f"✅ Successfully processed: {os.path.basename(config.video_path)}\n")
+                elif final_frame_count == expected_frames:
                     self.output_message.emit(f"  ✅ Frame count matches expected!\n")
                     self.output_message.emit(f"✅ Successfully processed: {os.path.basename(config.video_path)}\n")
                 else:
@@ -288,6 +377,50 @@ class BatchTrimWorker(QThread):
     
     def cancel(self):
         """Cancel processing"""
+        self.cancelled = True
+
+
+class StabPreviewWorker(QThread):
+    """Runs a single FFmpeg command (used for the fast stabilization preview).
+
+    Kept separate from BatchTrimWorker so the preview can use its own fast,
+    downscaled, low-latency encode without touching the batch pipeline.
+    """
+    output_message = pyqtSignal(str)
+    finished_ok = pyqtSignal(bool)
+
+    def __init__(self, command):
+        super().__init__()
+        self.command = command
+        self.cancelled = False
+
+    def run(self):
+        try:
+            self.output_message.emit(
+                "FFmpeg Command:\n" + " ".join(self.command) + "\n" + "-" * 80 + "\n")
+            process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                **_no_window_kwargs()
+            )
+            for line in iter(process.stdout.readline, ''):
+                if self.cancelled:
+                    process.terminate()
+                    break
+                if line.strip():
+                    self.output_message.emit(line.rstrip() + "\n")
+            process.wait()
+            self.finished_ok.emit(process.returncode == 0)
+        except Exception as e:
+            self.output_message.emit(f"❌ Preview exception: {e}\n")
+            self.finished_ok.emit(False)
+
+    def cancel(self):
         self.cancelled = True
 
 
@@ -480,6 +613,11 @@ class VideoTrimTool(QMainWindow):
         self.is_playing = False
         self._playback_media_path = None
         self._pending_seek_ms = None
+
+        # Stabilization preview state
+        self._preview_worker = None
+        self._previewing = False
+        self._preview_out_path = None
 
         self.init_ui()
     
@@ -772,16 +910,162 @@ class VideoTrimTool(QMainWindow):
         self.crop_status_label.setStyleSheet("color: #999999;")
         layout.addWidget(self.crop_status_label)
         
+        # Export as GIF option
+        self.export_gif_check = QCheckBox("Export as GIF (looping, no audio)")
+        self.export_gif_check.setChecked(False)
+        self.export_gif_check.setEnabled(False)
+        self.export_gif_check.setToolTip(
+            "Export a looping .gif instead of an .mp4. Best for short clips — "
+            "GIFs are far larger than video, so trim long videos down first.")
+        self.export_gif_check.stateChanged.connect(self.on_export_gif_toggled)
+        layout.addWidget(self.export_gif_check)
+
         # Output filename
         output_label = QLabel("Output Filename:")
         output_label.setFont(QFont("Arial", 10, QFont.Bold))
         layout.addWidget(output_label)
-        
+
         self.output_filename = QLineEdit()
         self.output_filename.setPlaceholderText("video_trimmed.mp4")
         self.output_filename.setEnabled(False)
         layout.addWidget(self.output_filename)
-        
+
+        # Image stabilization (optional, applied last in the pipeline)
+        stab_label = QLabel("Image Stabilization (Optional):")
+        stab_label.setFont(QFont("Arial", 10, QFont.Bold))
+        layout.addWidget(stab_label)
+
+        self.stabilize_check = QCheckBox("Auto-stabilize shaky video (deshake)")
+        self.stabilize_check.setChecked(False)
+        self.stabilize_check.setEnabled(False)
+        self.stabilize_check.setToolTip(
+            "One-pass FFmpeg 'deshake' stabilization. Good for moderate handheld / "
+            "head-mounted shake. Adds processing time and re-encodes the clip.")
+        self.stabilize_check.stateChanged.connect(self.on_stabilize_toggled)
+        layout.addWidget(self.stabilize_check)
+
+        # Stabilization parameters (hidden until the checkbox is on)
+        self.stab_params_widget = QWidget()
+        stab_params_layout = QVBoxLayout()
+        stab_params_layout.setContentsMargins(20, 0, 0, 0)
+
+        # Shake range (deshake rx/ry). FFmpeg's deshake requires these to be a
+        # multiple of 16, so the slider snaps to 16/32/48/64.
+        range_row = QHBoxLayout()
+        range_lbl = QLabel("Shake range:")
+        range_lbl.setToolTip("Maximum shake (pixels) deshake will try to correct. "
+                             "Higher = handles bigger jumps but crops in more. "
+                             "Snaps to multiples of 16 (16/32/48/64).")
+        range_row.addWidget(range_lbl)
+        self.stab_range_slider = QSlider(Qt.Horizontal)
+        self.stab_range_slider.setMinimum(16)
+        self.stab_range_slider.setMaximum(64)
+        self.stab_range_slider.setSingleStep(16)
+        self.stab_range_slider.setPageStep(16)
+        self.stab_range_slider.setTickInterval(16)
+        self.stab_range_slider.setTickPosition(QSlider.TicksBelow)
+        self.stab_range_slider.setValue(16)
+        self.stab_range_slider.valueChanged.connect(self.on_stab_range_changed)
+        range_row.addWidget(self.stab_range_slider)
+        self.stab_range_value = QLabel("16 px")
+        self.stab_range_value.setMinimumWidth(45)
+        range_row.addWidget(self.stab_range_value)
+        stab_params_layout.addLayout(range_row)
+
+        # Border fill (deshake edge). Stabilization shifts each frame to cancel
+        # shake, exposing empty wedges at the edges; this controls how they fill.
+        edge_help = (
+            "<b>Border fill</b> — how to fill the empty edges that appear when a "
+            "frame is shifted to cancel out shake:<br><br>"
+            "<b>mirror</b>: reflect the pixels just inside the frame outward. "
+            "Usually the most natural-looking fill (recommended).<br><br>"
+            "<b>clamp</b>: stretch the outermost edge pixels outward. Can leave "
+            "slight smears along the borders.<br><br>"
+            "<b>original</b>: fill the exposed borders with the original, "
+            "un-stabilized footage, so the very edges still jitter while the "
+            "center stays steady.<br><br>"
+            "<b>blank</b>: fill the exposed borders with solid black. Cleanest, "
+            "but you'll see thin black bars wobble at the edges."
+        )
+        edge_item_help = {
+            "mirror": "Reflect edge pixels outward — most natural-looking (recommended).",
+            "clamp": "Stretch the outermost pixels outward — can leave slight smears.",
+            "original": "Show the original un-stabilized footage at the edges — borders still jitter.",
+            "blank": "Fill the edges with solid black — clean, but black bars wobble.",
+        }
+
+        edge_row = QHBoxLayout()
+        edge_lbl = QLabel("Border fill:")
+        edge_lbl.setToolTip(edge_help)
+        edge_row.addWidget(edge_lbl)
+        self.stab_edge_combo = QComboBox()
+        self.stab_edge_combo.addItems(["mirror", "clamp", "original", "blank"])
+        self.stab_edge_combo.setCurrentText("mirror")
+        # Widen so the option names aren't clipped, and give the whole control
+        # plus each individual entry an explanatory hover tooltip.
+        self.stab_edge_combo.setMinimumWidth(150)
+        self.stab_edge_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.stab_edge_combo.setToolTip(edge_help)
+        for i in range(self.stab_edge_combo.count()):
+            name = self.stab_edge_combo.itemText(i)
+            self.stab_edge_combo.setItemData(i, edge_item_help[name], Qt.ToolTipRole)
+        self.stab_edge_combo.currentTextChanged.connect(self.on_stab_edge_changed)
+        edge_row.addWidget(self.stab_edge_combo)
+
+        # Small "ⓘ" info marker with the full explanation on hover.
+        edge_info = QLabel("ⓘ")
+        edge_info.setToolTip(edge_help)
+        edge_info.setStyleSheet("color: #0078d4; font-weight: bold;")
+        edge_info.setCursor(Qt.WhatsThisCursor)
+        edge_row.addWidget(edge_info)
+
+        edge_row.addStretch()
+        stab_params_layout.addLayout(edge_row)
+
+        # Zoom to hide edges (crop off the wobbling stabilization borders)
+        zoom_help = (
+            "<b>Zoom to hide edges</b> — instead of filling the exposed borders, "
+            "zoom in slightly and crop them off entirely.<br><br>"
+            "After stabilizing, the frame is scaled up by this amount and "
+            "centre-cropped back to its original size, so the wobbling edges are "
+            "pushed off-screen. The trade-off is a slightly tighter framing and a "
+            "small loss of resolution.<br><br>"
+            "<b>0% = Off</b> (borders are filled using the Border fill mode "
+            "above). Roughly 8–12% is enough to hide the borders at higher "
+            "shake-range settings."
+        )
+        zoom_row = QHBoxLayout()
+        zoom_lbl = QLabel("Zoom to hide edges:")
+        zoom_lbl.setToolTip(zoom_help)
+        zoom_row.addWidget(zoom_lbl)
+        self.stab_zoom_slider = QSlider(Qt.Horizontal)
+        self.stab_zoom_slider.setMinimum(0)
+        self.stab_zoom_slider.setMaximum(20)
+        self.stab_zoom_slider.setSingleStep(1)
+        self.stab_zoom_slider.setPageStep(2)
+        self.stab_zoom_slider.setValue(0)
+        self.stab_zoom_slider.setToolTip(zoom_help)
+        self.stab_zoom_slider.valueChanged.connect(self.on_stab_zoom_changed)
+        zoom_row.addWidget(self.stab_zoom_slider)
+        self.stab_zoom_value = QLabel("Off")
+        self.stab_zoom_value.setMinimumWidth(45)
+        zoom_row.addWidget(self.stab_zoom_value)
+        zoom_info = QLabel("ⓘ")
+        zoom_info.setToolTip(zoom_help)
+        zoom_info.setStyleSheet("color: #0078d4; font-weight: bold;")
+        zoom_info.setCursor(Qt.WhatsThisCursor)
+        zoom_row.addWidget(zoom_info)
+        stab_params_layout.addLayout(zoom_row)
+
+        # Preview button (renders a short stabilized sample and plays it)
+        self.btn_preview_stab = QPushButton("Preview Stabilization (first 8s)")
+        self.btn_preview_stab.clicked.connect(self.preview_stabilization)
+        stab_params_layout.addWidget(self.btn_preview_stab)
+
+        self.stab_params_widget.setLayout(stab_params_layout)
+        self.stab_params_widget.setVisible(False)
+        layout.addWidget(self.stab_params_widget)
+
         # Add to queue button
         layout.addSpacing(10)
         self.btn_add_to_queue = QPushButton("+ Add Video to Processing Queue")
@@ -1177,7 +1461,8 @@ class VideoTrimTool(QMainWindow):
         # Set default output filename
         if not config.output_filename:
             base_name = os.path.splitext(os.path.basename(config.video_path))[0]
-            config.output_filename = f"{base_name}_trimmed.mp4"
+            ext = '.gif' if config.export_gif else '.mp4'
+            config.output_filename = f"{base_name}_trimmed{ext}"
         
         # Update UI
         self.output_filename.setText(config.output_filename)
@@ -1201,6 +1486,8 @@ class VideoTrimTool(QMainWindow):
         self.duration_combo.setEnabled(True)
         self.btn_draw_crop.setEnabled(True)
         self.start_time_input.setEnabled(True)
+        self.export_gif_check.setEnabled(True)
+        self.stabilize_check.setEnabled(True)
         self.btn_add_to_queue.setEnabled(True)
         if HAVE_QT_MULTIMEDIA:
             self.btn_play.setEnabled(True)
@@ -1216,6 +1503,30 @@ class VideoTrimTool(QMainWindow):
     
     def restore_video_settings(self, config: VideoTrimConfig):
         """Restore settings for a video"""
+        # Sync the 'Export as GIF' checkbox without re-triggering the toggle
+        # handler (which would rewrite the filename we just restored).
+        self.export_gif_check.blockSignals(True)
+        self.export_gif_check.setChecked(config.export_gif)
+        self.export_gif_check.blockSignals(False)
+
+        # Sync stabilization controls (block signals so we don't clobber config)
+        self.stabilize_check.blockSignals(True)
+        self.stabilize_check.setChecked(config.stabilize)
+        self.stabilize_check.blockSignals(False)
+        self.stab_params_widget.setVisible(config.stabilize)
+        self.stab_range_slider.blockSignals(True)
+        self.stab_range_slider.setValue(config.stab_range)
+        self.stab_range_slider.blockSignals(False)
+        self.stab_range_value.setText(f"{config.stab_range} px")
+        self.stab_edge_combo.blockSignals(True)
+        self.stab_edge_combo.setCurrentText(config.stab_edge)
+        self.stab_edge_combo.blockSignals(False)
+        self.stab_zoom_slider.blockSignals(True)
+        self.stab_zoom_slider.setValue(config.stab_zoom)
+        self.stab_zoom_slider.blockSignals(False)
+        self.stab_zoom_value.setText(
+            "Off" if config.stab_zoom == 0 else f"{config.stab_zoom}%")
+
         # Update start time display
         self.start_time_input.setText(self.format_time(config.start_time))
         self.time_label.setText(f"Start Time: {self.format_time(config.start_time)}")
@@ -1487,6 +1798,9 @@ class VideoTrimTool(QMainWindow):
             self.media_player.pause()
             return
 
+        # Leaving preview mode: play the real clip's trim window from here on.
+        self._previewing = False
+
         config = self.video_configs[self.current_config_idx]
         start_ms = int(config.start_time * 1000)
         if config.stop_time is not None:
@@ -1524,6 +1838,10 @@ class VideoTrimTool(QMainWindow):
 
     def on_media_position_changed(self, position_ms):
         """Stop playback at the configured stop time (preview the trim window)."""
+        # The stabilization preview plays a standalone temp clip; the real
+        # clip's stop-time window doesn't apply to it.
+        if self._previewing:
+            return
         if not self.is_playing or self.current_config_idx >= len(self.video_configs):
             return
         config = self.video_configs[self.current_config_idx]
@@ -1564,6 +1882,7 @@ class VideoTrimTool(QMainWindow):
         # Scrubbing/crop always uses the still-frame page — pause playback and
         # switch away from the video widget so the updated frame is visible.
         if HAVE_QT_MULTIMEDIA and self.media_player is not None:
+            self._previewing = False
             if self.is_playing:
                 self.media_player.pause()
             if hasattr(self, "preview_stack") and self.preview_stack.currentWidget() is not self.preview_label:
@@ -1611,6 +1930,179 @@ class VideoTrimTool(QMainWindow):
         
         self.preview_label.setPixmap(scaled_pixmap)
     
+    @staticmethod
+    def _with_extension(name: str, ext: str) -> str:
+        """Return `name` with the given extension (.mp4/.gif).
+
+        Swaps a recognized video/gif extension; appends otherwise so a bare
+        name like "clip" becomes "clip.gif".
+        """
+        base, cur_ext = os.path.splitext(name)
+        if cur_ext.lower() in ('.mp4', '.gif'):
+            return base + ext
+        return name + ext
+
+    def on_export_gif_toggled(self, _state):
+        """Swap the output filename extension when 'Export as GIF' changes."""
+        is_gif = self.export_gif_check.isChecked()
+        ext = '.gif' if is_gif else '.mp4'
+
+        text = self.output_filename.text().strip()
+        if text:
+            new_name = self._with_extension(text, ext)
+            self.output_filename.setText(new_name)
+
+        if self.current_config_idx < len(self.video_configs):
+            config = self.video_configs[self.current_config_idx]
+            config.export_gif = is_gif
+            if text:
+                config.output_filename = self.output_filename.text().strip()
+
+    def on_stabilize_toggled(self, _state):
+        """Show/hide stabilization params and store the flag on the config."""
+        on = self.stabilize_check.isChecked()
+        self.stab_params_widget.setVisible(on)
+        if self.current_config_idx < len(self.video_configs):
+            self.video_configs[self.current_config_idx].stabilize = on
+
+    def on_stab_range_changed(self, value):
+        """Snap the shake range to a multiple of 16 (deshake requires it)."""
+        snapped = max(16, min(64, int(round(value / 16.0)) * 16))
+        if snapped != value:
+            self.stab_range_slider.blockSignals(True)
+            self.stab_range_slider.setValue(snapped)
+            self.stab_range_slider.blockSignals(False)
+        self.stab_range_value.setText(f"{snapped} px")
+        if self.current_config_idx < len(self.video_configs):
+            self.video_configs[self.current_config_idx].stab_range = snapped
+
+    def on_stab_edge_changed(self, text):
+        """Store the deshake border-fill mode on the config."""
+        if self.current_config_idx < len(self.video_configs):
+            self.video_configs[self.current_config_idx].stab_edge = text
+
+    def on_stab_zoom_changed(self, value):
+        """Store the post-stabilization zoom (%) and update its label."""
+        self.stab_zoom_value.setText("Off" if value == 0 else f"{value}%")
+        if self.current_config_idx < len(self.video_configs):
+            self.video_configs[self.current_config_idx].stab_zoom = value
+
+    def preview_stabilization(self):
+        """Render a short, downscaled stabilized sample and play it.
+
+        The preview starts at the current Start position and covers the next
+        ~8 seconds. It is deliberately downscaled and encoded with a fast preset
+        so it renders quickly with immediate visible progress — deshake's cost
+        scales with resolution and rx², so full-res previews feel like they hang.
+        """
+        if self.current_config_idx >= len(self.video_configs):
+            return
+
+        if find_ffmpeg() is None:
+            QMessageBox.critical(
+                self, "FFmpeg Not Found",
+                "FFmpeg could not be found on your system PATH.")
+            return
+
+        # Don't run two ffmpeg jobs at once.
+        if (self._preview_worker and self._preview_worker.isRunning()) or \
+                (self.processor and self.processor.isRunning()):
+            return
+
+        src = self.video_configs[self.current_config_idx]
+
+        preview_path = os.path.join(tempfile.gettempdir(), "fnt_stab_preview.mp4")
+        self._preview_out_path = preview_path
+
+        # Preview window: from the current Start position for up to 8 s.
+        start = src.start_time
+        remaining = max(0.5, src.total_duration - start)
+        dur = min(8.0, remaining)
+        end = start + dur
+
+        # Downscale for speed. deshake's rx/ry must stay a multiple of 16, so
+        # scale it by the same ratio and re-snap.
+        preview_w = 640 if (src.width and src.width > 640) else (src.width or 0)
+        ratio = (preview_w / src.width) if (src.width and preview_w) else 1.0
+        rng = max(16, min(64, int(round((src.stab_range * ratio) / 16.0)) * 16))
+
+        downscale = bool(preview_w and src.width and preview_w < src.width)
+        if downscale and src.height:
+            # Explicit even dimensions so the optional zoom crop has a known size.
+            cur_w = preview_w - (preview_w % 2)
+            cur_h = int(round(src.height * cur_w / src.width))
+            cur_h -= cur_h % 2
+        else:
+            cur_w, cur_h = src.width, src.height
+
+        vf_parts = []
+        if downscale:
+            vf_parts.append(f"scale={cur_w}:{cur_h}")
+        vf_parts.append(f"deshake=rx={rng}:ry={rng}:edge={src.stab_edge}")
+        # Optional zoom-in to crop off the wobbling stabilization borders.
+        if src.stab_zoom and src.stab_zoom > 0 and cur_w and cur_h:
+            z = 1.0 + src.stab_zoom / 100.0
+            vf_parts.append(f"scale=iw*{z}:ih*{z}")
+            vf_parts.append(f"crop={cur_w}:{cur_h}")
+        vf = ",".join(vf_parts)
+
+        command = [
+            "ffmpeg", "-y", "-nostdin", "-hwaccel", "none", "-threads", "4",
+            "-ss", str(start), "-to", str(end), "-i", src.video_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+            preview_path,
+        ]
+
+        self.output_text.clear()
+        _zoom_str = f", zoom={src.stab_zoom}%" if src.stab_zoom else ""
+        self.output_text.insertPlainText(
+            f"🎬 STABILIZATION PREVIEW\n"
+            f"  Start: {self.format_time(start)}  Duration: {dur:.1f}s\n"
+            f"  Preview scale: {cur_w or src.width}px wide, "
+            f"deshake rx=ry={rng}, edge={src.stab_edge}{_zoom_str}\n"
+            f"  (downscaled + fast preset for speed; the full export uses your "
+            f"chosen resolution and quality)\n{'-'*80}\n")
+
+        self.btn_preview_stab.setEnabled(False)
+        self.btn_preview_stab.setText("Rendering preview…")
+
+        self._preview_worker = StabPreviewWorker(command)
+        self._preview_worker.output_message.connect(self.on_output_message)
+        self._preview_worker.finished_ok.connect(self.on_preview_finished)
+        self._preview_worker.start()
+
+    def on_preview_finished(self, success):
+        """Play the rendered stabilization preview (or report failure)."""
+        self.btn_preview_stab.setEnabled(True)
+        self.btn_preview_stab.setText("Preview Stabilization (first 8s)")
+
+        if not success or not self._preview_out_path \
+                or not os.path.exists(self._preview_out_path):
+            QMessageBox.warning(
+                self, "Preview Failed",
+                "Could not render the stabilization preview. "
+                "See the FFmpeg output for details.")
+            return
+
+        if not (HAVE_QT_MULTIMEDIA and self.media_player is not None):
+            QMessageBox.information(
+                self, "Preview Ready",
+                f"Stabilized preview written to:\n{self._preview_out_path}\n\n"
+                "(In-app playback is unavailable in this environment.)")
+            return
+
+        # Play the temp preview clip in the video pane.
+        self._previewing = True
+        self.preview_stack.setCurrentWidget(self.video_widget)
+        self.media_player.setMuted(self.mute_check.isChecked())
+        self.media_player.setMedia(
+            QMediaContent(QUrl.fromLocalFile(self._preview_out_path)))
+        self._playback_media_path = self._preview_out_path
+        self._pending_seek_ms = 0
+        self.media_player.play()
+
     def add_to_queue(self):
         """Add current video clip to processing queue"""
         if self.current_config_idx >= len(self.video_configs):
@@ -1620,13 +2112,13 @@ class VideoTrimTool(QMainWindow):
         
         # Get current UI values
         output_filename = self.output_filename.text().strip()
-        
+        is_gif = self.export_gif_check.isChecked()
+
         if not output_filename:
             QMessageBox.warning(self, "Invalid Filename", "Please enter an output filename.")
             return
-        
-        if not output_filename.lower().endswith('.mp4'):
-            output_filename += '.mp4'
+
+        output_filename = self._with_extension(output_filename, '.gif' if is_gif else '.mp4')
         
         # Check for duplicate filenames in queue
         for queued_config in self.processing_queue:
@@ -1649,6 +2141,11 @@ class VideoTrimTool(QMainWindow):
         clip_config.duration = self.get_duration_from_ui()
         clip_config.crop_polygon = config.crop_polygon.copy()  # Keep the crop
         clip_config.output_filename = output_filename
+        clip_config.export_gif = is_gif
+        clip_config.stabilize = config.stabilize
+        clip_config.stab_range = config.stab_range
+        clip_config.stab_edge = config.stab_edge
+        clip_config.stab_zoom = config.stab_zoom
         clip_config.configured = True
         clip_config.width = config.width
         clip_config.height = config.height
@@ -1707,7 +2204,8 @@ class VideoTrimTool(QMainWindow):
         
         # Reset output filename to default (indicates new clip from same video)
         base_name = os.path.splitext(os.path.basename(config.video_path))[0]
-        config.output_filename = f"{base_name}_trimmed.mp4"
+        ext = '.gif' if is_gif else '.mp4'
+        config.output_filename = f"{base_name}_trimmed{ext}"
         self.output_filename.setText(config.output_filename)
         
         # DON'T auto-advance to next video - user can make multiple clips from same video
@@ -1739,10 +2237,10 @@ class VideoTrimTool(QMainWindow):
             new_name = self.queue_table.item(row, column).text().strip()
             
             if new_name:
-                # Ensure .mp4 extension
-                if not new_name.lower().endswith('.mp4'):
-                    new_name += '.mp4'
-                
+                # Ensure the extension matches this clip's output format
+                ext = '.gif' if self.processing_queue[row].export_gif else '.mp4'
+                new_name = self._with_extension(new_name, ext)
+
                 # Update the config
                 self.processing_queue[row].output_filename = new_name
                 

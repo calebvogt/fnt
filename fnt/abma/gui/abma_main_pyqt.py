@@ -386,6 +386,22 @@ class ABMAWindow(QMainWindow):
         self.btn_viewcube.setMenu(vmenu)
         self.btn_viewcube.setEnabled(self.view_3d is not None)
         tl.addWidget(self.btn_viewcube)
+        # slow turntable spin around the arena's central axis (3D only)
+        self.btn_spin = QToolButton()
+        self.btn_spin.setText("⟳")
+        self.btn_spin.setToolTip("Slowly spin the camera around the arena")
+        self.btn_spin.setCheckable(True)
+        self.btn_spin.setEnabled(self.view_3d is not None)
+        self.btn_spin.toggled.connect(self._on_toggle_spin)
+        # right-click the spin button to pick a speed / reverse direction
+        self.btn_spin.setToolTip(
+            "Slowly spin the camera around the arena\n"
+            "(right-click for speed / direction)")
+        self._spin_speed = 12.0          # °/s magnitude; one rev ≈ 30 s
+        self._spin_reverse = False
+        self.btn_spin.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_spin.customContextMenuRequested.connect(self._show_spin_menu)
+        tl.addWidget(self.btn_spin)
         self.btn_follow = QToolButton()
         self.btn_follow.setText("◎")
         self.btn_follow.setToolTip("Follow selected agent")
@@ -405,7 +421,7 @@ class ABMAWindow(QMainWindow):
         self.btn_theme = QToolButton()
         self.btn_theme.setText("🌙")
         self.btn_theme.setToolTip(
-            "Arena theme: dark → light → pure white (for slides)")
+            "Arena theme: dark ↔ light (pure white, for slides)")
         self.btn_theme.setCheckable(True)
         self.btn_theme.clicked.connect(self._cycle_theme)
         tl.addWidget(self.btn_theme)
@@ -461,10 +477,9 @@ class ABMAWindow(QMainWindow):
             if hasattr(v, "set_agents_visible"):
                 v.set_agents_visible(on)
 
-    _THEME_ORDER = ["dark", "light", "white"]
-    _THEME_ICON = {"dark": "🌙", "light": "☀", "white": "⬜"}
-    _THEME_NAME = {"dark": "dark", "light": "light",
-                   "white": "pure white (for slides)"}
+    _THEME_ORDER = ["dark", "light"]
+    _THEME_ICON = {"dark": "🌙", "light": "☀"}
+    _THEME_NAME = {"dark": "dark", "light": "light (pure white, for slides)"}
 
     def _cycle_theme(self, *_):
         order = self._THEME_ORDER
@@ -560,8 +575,54 @@ class ABMAWindow(QMainWindow):
         self.btn_view2d.setChecked(not show3d)
         self.view_stack.setCurrentIndex(
             0 if show3d else self.view_stack.count() - 1)
+        # spin only runs while the 3D view is showing; resume it on return if
+        # the toggle is still on, and don't churn a hidden GL widget in 2D.
+        if self.view_3d is not None and hasattr(self.view_3d, "set_spin"):
+            self.view_3d.set_spin(show3d and self.btn_spin.isChecked())
         if self._last_frame is not None:
             self._push_frame(self._active_view(), self._last_frame)
+
+    def _on_toggle_spin(self, on):
+        v = self.view_3d
+        if v is not None and hasattr(v, "set_spin"):
+            self._apply_spin_speed()
+            v.set_spin(on)
+
+    def _apply_spin_speed(self):
+        """Push the current speed magnitude + direction to the 3D view."""
+        v = self.view_3d
+        if v is not None and hasattr(v, "set_spin_speed"):
+            v.set_spin_speed(-self._spin_speed if self._spin_reverse
+                             else self._spin_speed)
+
+    def _show_spin_menu(self, pos):
+        """Right-click menu on the spin button: pick a speed / reverse."""
+        if self.view_3d is None:
+            return
+        menu = QMenu(self.btn_spin)
+        # (label, °/s) — revolution time ≈ 360 / (°/s)
+        for label, dps in [("Very slow  (~60 s / turn)", 6.0),
+                           ("Slow  (~30 s / turn)", 12.0),
+                           ("Medium  (~15 s / turn)", 24.0),
+                           ("Fast  (~8 s / turn)", 45.0)]:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(abs(self._spin_speed - dps) < 1e-6)
+            act.triggered.connect(lambda _=False, d=dps: self._set_spin_speed(d))
+        menu.addSeparator()
+        rev = menu.addAction("Reverse direction")
+        rev.setCheckable(True)
+        rev.setChecked(self._spin_reverse)
+        rev.triggered.connect(self._toggle_spin_reverse)
+        menu.exec_(self.btn_spin.mapToGlobal(pos))
+
+    def _set_spin_speed(self, dps):
+        self._spin_speed = float(dps)
+        self._apply_spin_speed()
+
+    def _toggle_spin_reverse(self, on):
+        self._spin_reverse = bool(on)
+        self._apply_spin_speed()
 
     # ------------------------------------------------------------------ #
     # Projects — the unit that carries world + population + protocol + runs
