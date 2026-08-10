@@ -17,10 +17,121 @@ import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from pyqtgraph import Vector
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QVector4D, QFont
 
 from ..core.config import ResourceObject
+
+
+def _install_gl_error_capture():
+    """Log the real exception behind pyqtgraph's terse 'Error while drawing
+    item' messages. pyqtgraph swallows the traceback per item; we tee the first
+    few to ~/abma_gl_error.txt so a rendering fault can actually be diagnosed.
+    Pure logging — the original paint behaviour is untouched."""
+    import os
+    import traceback
+    path = os.path.join(os.path.expanduser("~"), "abma_gl_error.txt")
+    try:
+        if os.path.exists(path):
+            os.remove(path)          # fresh log each launch
+    except OSError:
+        pass
+    state = {"n": 0, "path": path}
+    for cls in (gl.GLMeshItem, gl.GLLinePlotItem, gl.GLScatterPlotItem):
+        orig = cls.paint
+        if getattr(orig, "_abma_wrapped", False):
+            continue
+
+        def make(orig_paint, name):
+            def paint(self, *a, **k):
+                try:
+                    return orig_paint(self, *a, **k)
+                except Exception:
+                    if state["n"] < 8:
+                        state["n"] += 1
+                        with open(state["path"], "a") as fh:
+                            fh.write(f"\n=== {name} paint error "
+                                     f"#{state['n']} ===\n")
+                            fh.write(traceback.format_exc())
+                    raise           # let pyqtgraph handle it as before
+            paint._abma_wrapped = True
+            return paint
+        cls.paint = make(orig, cls.__name__)
+
+
+def _install_context_aware_shaders():
+    """Make pyqtgraph's compiled-shader cache per-OpenGL-context.
+
+    pyqtgraph.opengl caches compiled shader-program *ids* in process-global
+    slots: a class-level ``_shaderProgram`` on GLScatterPlotItem / GLLinePlotItem
+    and ``ShaderProgram.prog`` (module registry) for GLMeshItem. A program id is
+    only valid in the GL context that compiled it. FNT runs several independent
+    GLViewWidgets (ABMA's 3D arena, UWB Studio), each with its own context. The
+    first view to paint compiles and caches an id; the next view reuses that
+    stale id in a *different* context, so every draw fails with
+    GLError 1281 'invalid value' (glUseProgram / glGetAttribLocation) and nothing
+    renders. The canonical alternative — AA_ShareOpenGLContexts — makes two live
+    QOpenGLWidgets share one context and hangs the app on macOS, so instead we
+    key the cache by the current context: each context compiles and keeps its
+    own valid program. Idempotent; safe to call more than once."""
+    try:
+        from PyQt5 import sip
+        from PyQt5.QtGui import QOpenGLContext
+    except Exception:
+        return
+
+    def ctx_key():
+        ctx = QOpenGLContext.currentContext()
+        return sip.unwrapinstance(ctx) if ctx is not None else 0
+
+    # --- GLMeshItem: shaders.ShaderProgram.program() (shared module registry) --
+    import pyqtgraph.opengl.shaders as shmod
+    SP = shmod.ShaderProgram
+    if not getattr(SP, "_abma_ctx_aware", False):
+        orig_program = SP.program
+
+        def program(self, *, es2_compat=False):
+            cache = self.__dict__.setdefault("_prog_by_ctx", {})
+            key = ctx_key()
+            prog = cache.get(key)
+            if prog in (None, -1):
+                self.prog = None            # force a recompile in THIS context
+                prog = orig_program(self, es2_compat=es2_compat)
+                cache[key] = prog
+            else:
+                self.prog = prog            # reuse this context's own program
+            return prog
+
+        SP.program = program
+        SP._abma_ctx_aware = True
+
+    # --- GLScatterPlotItem / GLLinePlotItem: staticmethod getShaderProgram -----
+    # (a no-arg @staticmethod that compiles into the class-level _shaderProgram)
+    for cls in (gl.GLScatterPlotItem, gl.GLLinePlotItem):
+        if getattr(cls, "_abma_ctx_aware", False):
+            continue
+        orig_get = cls.getShaderProgram            # staticmethod -> plain fn
+        store = {}                                 # ctx_key -> program, per class
+
+        def make(orig, cache, klass):
+            def getShaderProgram():
+                key = ctx_key()
+                prog = cache.get(key)
+                if prog is None:
+                    klass._shaderProgram = None     # recompile for this context
+                    prog = orig()
+                    cache[key] = prog
+                else:
+                    klass._shaderProgram = prog
+                return prog
+            return staticmethod(getShaderProgram)
+
+        cls.getShaderProgram = make(orig_get, store, cls)
+        cls._abma_ctx_aware = True
+
+
+_install_gl_error_capture()
+_install_context_aware_shaders()
 
 _MALE = (0.29, 0.56, 0.85, 1.0)
 _FEMALE = (0.88, 0.33, 0.60, 1.0)
@@ -46,10 +157,10 @@ _THEMES = {
         compass_n=(235, 90, 90, 255), compass=(220, 224, 230, 255),
         ant_text=(255, 235, 140, 255),
         meas_line=(0.30, 0.82, 0.92, 0.5), meas_text=(120, 210, 230, 255)),
-    # light mode: white surround, tan walls, and the same dark ground as dark
-    # mode — so on-floor marks (grid, outline, measure lines) stay light.
+    # light mode: pure-white surround (stays white through the whole day/night
+    # cycle, so it drops cleanly onto white slides), tan walls, light ground.
     "light": dict(
-        day_bg=(1.0, 1.0, 1.0, 1.0), night_bg=(0.93, 0.94, 0.96, 1.0),
+        day_bg=(1.0, 1.0, 1.0, 1.0), night_bg=(1.0, 1.0, 1.0, 1.0),
         floor=(0.90, 0.92, 0.95, 1.0), grid=(0.30, 0.34, 0.40, 0.18),
         rect=(0.45, 0.48, 0.52, 1.0), wall=(0.80, 0.68, 0.46, 0.32),
         wall_edge=(0.55, 0.44, 0.26, 0.60), pole=(0.46, 0.34, 0.23, 1.0),
@@ -57,11 +168,6 @@ _THEMES = {
         ant_text=(150, 95, 0, 255),
         meas_line=(0.10, 0.45, 0.58, 0.65), meas_text=(12, 95, 125, 255)),
 }
-# "white": light, but the background stays pure white regardless of the
-# day/night cycle — for screenshots dropped onto white slides.
-_THEMES["white"] = dict(_THEMES["light"],
-                        day_bg=(1.0, 1.0, 1.0, 1.0),
-                        night_bg=(1.0, 1.0, 1.0, 1.0))
 
 # mouse body geometry (metres): body box L×W×H, head sphere radius
 _BODY_L, _BODY_W, _BODY_H = 0.09, 0.035, 0.03
@@ -161,6 +267,14 @@ class Arena3DView(gl.GLViewWidget):
         for it in (self._resources, self._trail, self._sel):
             it.setGLOptions("translucent")
             self.addItem(it)
+
+        # slow turntable: orbit the camera around the arena's central axis,
+        # advancing azimuth while keeping the current elevation and distance so
+        # it works from any snap view (iso, side, top, …).
+        self._spin_deg_per_sec = 12.0        # 12°/s → one revolution ≈ 30 s
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(33)     # ~30 fps
+        self._spin_timer.timeout.connect(self._spin_tick)
 
     # ------------------------------------------------------------------ #
     def set_arena(self, arena, chambers=None):
@@ -628,6 +742,39 @@ class Arena3DView(gl.GLViewWidget):
         z = c.z() if c is not None else 0.0
         self.opts["center"] = Vector(float(x), float(y), z)
         self.update()
+
+    # ------------------------------------------------------------------ #
+    # Turntable spin — a slow automatic orbit around the arena's axis.
+    # ------------------------------------------------------------------ #
+    def set_spin(self, on):
+        """Start/stop the slow camera orbit around the arena's central axis.
+
+        Recentres on the arena axis when starting (so a prior pan doesn't make
+        it orbit off-centre), then only advances azimuth — the current
+        elevation and distance are kept, so it spins whatever view you're in."""
+        on = bool(on)
+        if on:
+            if getattr(self, "_cam_center", None) is not None:
+                self.opts["center"] = self._cam_center
+            if not self._spin_timer.isActive():
+                self._spin_timer.start()
+        else:
+            self._spin_timer.stop()
+
+    def is_spinning(self):
+        return self._spin_timer.isActive()
+
+    def set_spin_speed(self, deg_per_sec):
+        """Set the turntable rate in degrees/second; negative = clockwise.
+        Takes effect immediately, whether or not a spin is running."""
+        self._spin_deg_per_sec = float(deg_per_sec)
+
+    def _spin_tick(self):
+        if getattr(self, "_cam_center", None) is None:
+            return
+        dt = self._spin_timer.interval() / 1000.0
+        az = (self.opts["azimuth"] + self._spin_deg_per_sec * dt) % 360.0
+        self.setCameraPosition(azimuth=az)   # keeps elevation/distance/center
 
     def _draw_chamber(self, arena, dx, dy):
         w, h = arena.width, arena.height

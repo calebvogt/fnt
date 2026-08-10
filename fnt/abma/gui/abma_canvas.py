@@ -33,9 +33,6 @@ _THEMES_2D = {
                   compass_n="#c0392b", compass="#33383f", meas="#0e7c99",
                   meas_text="#0b6a86", run_title="#33383f"),
 }
-# "white": same as light — the 2D surround is already pure white and does not
-# follow the day/night cycle.
-_THEMES_2D["white"] = dict(_THEMES_2D["light"])
 
 
 def _bow_xy(a, b, k=0.08, n=14):
