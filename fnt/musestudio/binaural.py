@@ -30,20 +30,54 @@ SAMPLE_RATE = 44100
 MAX_AMPLITUDE = 0.4        # headroom so summed stereo never clips
 
 
-def play_cue(freq=880.0, dur=0.18, volume=0.25):
-    """Play a short beep to mark a protocol phase transition (eyes-closed use).
+def _play_sequence(notes, volume=0.25):
+    """Play ``[(freq_hz, duration_s, gap_s), ...]`` as one short cue.
 
     Best-effort and fire-and-forget; silently no-ops if no audio device.
     """
     try:
         import sounddevice as sd
 
-        t = np.arange(int(dur * SAMPLE_RATE)) / SAMPLE_RATE
-        env = np.clip(np.minimum(t / 0.01, (dur - t) / 0.02), 0, 1)  # fade in/out
-        tone = (np.sin(2 * np.pi * freq * t) * volume * env).astype(np.float32)
+        chunks = []
+        for freq, dur, gap in notes:
+            t = np.arange(int(dur * SAMPLE_RATE)) / SAMPLE_RATE
+            env = np.clip(np.minimum(t / 0.01, (dur - t) / 0.02), 0, 1)
+            chunks.append(np.sin(2 * np.pi * freq * t) * volume * env)
+            if gap > 0:
+                chunks.append(np.zeros(int(gap * SAMPLE_RATE)))
+        tone = np.concatenate(chunks).astype(np.float32)
         sd.play(np.column_stack([tone, tone]), SAMPLE_RATE)
     except Exception:
         pass
+
+
+# Three deliberately distinct cues, because with your eyes closed the sound is
+# the only channel — a slipped electrode must never be mistaken for "you are
+# not synchronizing well".
+def play_cue(freq=880.0, dur=0.18, volume=0.25):
+    """Single clear beep — a protocol phase has changed."""
+    _play_sequence([(freq, dur, 0.0)], volume)
+
+
+def play_alert(volume=0.3):
+    """Low urgent double-beep — something is wrong (lost contact, lost stream)."""
+    _play_sequence([(300.0, 0.14, 0.07), (300.0, 0.14, 0.0)], volume)
+
+
+def play_resolved(volume=0.22):
+    """Rising two-note — the problem just cleared."""
+    _play_sequence([(520.0, 0.10, 0.02), (780.0, 0.14, 0.0)], volume)
+
+
+def play_complete(volume=0.25):
+    """Resolving three-note chime — the session is finished."""
+    _play_sequence([(660.0, 0.16, 0.03), (880.0, 0.16, 0.03),
+                    (1320.0, 0.30, 0.0)], volume)
+
+
+def play_reward(volume=0.18):
+    """Soft high chime — sustained target state reached."""
+    _play_sequence([(1175.0, 0.22, 0.0)], volume)
 BASE_MIN, BASE_MAX = 20, 1500
 BEAT_MIN, BEAT_MAX = 1, 50
 
@@ -52,6 +86,11 @@ DETUNE_HZ = 4.0            # dissonant partial offset -> acoustic roughness
 ROUGH_MAX = 0.5
 NOISE_MAX = 0.35
 REWARD_MAX = 0.35         # consonant perfect-fifth pad when synchronized
+
+# Reward-on-sustain mode: hold the target state this long to earn a chime.
+REWARD_LEVEL = 0.6
+REWARD_HOLD_S = 3.0
+REWARD_BLOOM_S = 2.5
 
 
 class BinauralPlayer:
@@ -197,6 +236,9 @@ class BinauralPanel(QGroupBox):
         self.player = BinauralPlayer()
         self._volume = 0.5
         self._last_level = 0.0
+        self._hold_start = None      # when the target state was first reached
+        self._bloom_until = 0.0      # reward chime decay deadline
+        self._duck = 1.0             # <1 while spoken guidance is talking
         self._fading = False
         self._fade_timer = QTimer(self)
         self._fade_timer.timeout.connect(self._fade_step)
@@ -282,6 +324,26 @@ class BinauralPanel(QGroupBox):
         transport.addStretch()
         grid.addLayout(transport, 4, 0, 1, 3)
 
+        fb = QHBoxLayout()
+        fb.addWidget(QLabel("Feedback"))
+        self.feedback_combo = QComboBox()
+        self.feedback_combo.addItem("Reward on sustain", "reward")
+        self.feedback_combo.addItem("Continuous", "continuous")
+        self.feedback_combo.setToolTip(
+            "How closed-loop feedback reaches you.\n\n"
+            "Reward on sustain (best for eyes-closed meditation): the tone stays\n"
+            "steady and a soft chime arrives only once you hold the target state\n"
+            f"for ~{REWARD_HOLD_S:.0f}s. Quiet and non-distracting.\n\n"
+            "Continuous: roughness and noise track the measure several times a\n"
+            "second, so you always hear exactly where you are — more informative,\n"
+            "but the constant change can pull your attention.\n\n"
+            "Only applies when Closed-loop is ticked."
+        )
+        self.feedback_combo.activated.connect(
+            lambda _i: self._emit_event("feedback_mode"))
+        fb.addWidget(self.feedback_combo, stretch=1)
+        grid.addLayout(fb, 5, 0, 1, 3)
+
         presets = QHBoxLayout()
         presets.addWidget(QLabel("Preset"))
         self.preset_combo = QComboBox()
@@ -296,7 +358,7 @@ class BinauralPanel(QGroupBox):
         self.del_btn.clicked.connect(self._on_delete_preset)
         self.del_btn.setToolTip("Delete the selected preset.")
         presets.addWidget(self.del_btn)
-        grid.addLayout(presets, 5, 0, 1, 3)
+        grid.addLayout(presets, 6, 0, 1, 3)
 
         # Live updates (glide the audio) vs committed events (log to CSV).
         self.base_slider.valueChanged.connect(self.base_spin.setValue)
@@ -364,7 +426,7 @@ class BinauralPanel(QGroupBox):
             self.play_btn.setText("Play")
             self._emit_event("stop")
         else:
-            self.player.set_volume(self._volume)
+            self._push_volume()
             try:
                 self.player.play()
             except Exception as exc:  # noqa: BLE001 - audio device may be missing
@@ -374,6 +436,21 @@ class BinauralPanel(QGroupBox):
             if self.loop_check.isChecked():
                 self.apply_synchrony(self._last_level)
             self._emit_event("play")
+
+    def _push_volume(self):
+        """Send the effective volume (user setting × duck) to the player."""
+        self.player.set_volume(self._volume * self._duck)
+
+    def set_ducked(self, ducked, level=0.25):
+        """Drop the tone under spoken guidance so the voice is intelligible.
+
+        Without this the beats sit at the same loudness as the instruction and
+        you simply miss what was said — which matters most in exactly the
+        situation this exists for: eyes closed, mid-session.
+        """
+        self._duck = level if ducked else 1.0
+        if self.player.is_playing() and not self._fading:
+            self._push_volume()
 
     def is_closed_loop(self):
         return self.loop_check.isChecked()
@@ -389,6 +466,27 @@ class BinauralPanel(QGroupBox):
         self.loop_check.setChecked(bool(closed_loop))
         if not self.player.is_playing():
             self.on_play_toggle()
+
+    def protocol_control_tone(self, base):
+        """Identical tone in both ears — a matched control with no beat.
+
+        Same carrier, same loudness, same "there is a sound" experience, but no
+        interaural frequency difference, so contrasting this against the
+        binaural block isolates the beat itself.
+        """
+        idx = self.stimulus_combo.findData("binaural")
+        if idx >= 0:
+            self.stimulus_combo.setCurrentIndex(idx)
+        self.loop_check.setChecked(False)
+        self.base_spin.setValue(int(base))
+        self.player.set_mode("binaural")
+        self.player.set_frequencies(base, base)      # zero beat
+        self.readout.setText(f"Control tone — {int(base)} Hz both ears (no beat)")
+        if not self.player.is_playing():
+            self.on_play_toggle()
+        else:
+            self._push_volume()
+        self._emit_event("control_tone")
 
     def protocol_audio_off(self):
         self._fade_timer.stop()
@@ -428,24 +526,63 @@ class BinauralPanel(QGroupBox):
             self.player.set_roughness(0.0)
             self.player.set_noise(0.0)
             self.player.set_reward(0.0)
-            self.player.set_volume(self._volume)
+            self._push_volume()
             self._emit_event("closed_loop_off")
 
     def apply_synchrony(self, level):
-        """Map a 0..1 synchrony level onto the feedback audio layers.
+        """Map a 0..1 synchrony level onto the feedback audio.
 
-        Low synchrony -> rough + noisy + quieter; high -> pure + reward + full.
+        Two styles, because they suit different goals:
+
+        *Reward on sustain* (default for meditation) keeps a steady, unchanging
+        tone and only adds a soft chime once you hold the target state — audio
+        that changes four times a second is attention-grabbing, which is the
+        opposite of what you want while settling.
+
+        *Continuous* morphs roughness and noise with the measure in real time:
+        more information per second, better for active training.
         """
         self._last_level = float(np.clip(level, 0.0, 1.0))
         if self._fading:   # don't fight an in-progress fade-out
             return
         if not (self.loop_check.isChecked() and self.player.is_playing()):
             return
-        lv = self._last_level
+        if self.feedback_combo.currentData() == "continuous":
+            self._apply_continuous(self._last_level)
+        else:
+            self._apply_reward(self._last_level)
+
+    def _apply_continuous(self, lv):
         self.player.set_roughness(1.0 - lv)
         self.player.set_noise((1.0 - lv) * 0.9)
         self.player.set_reward(lv)
-        self.player.set_volume(self._volume * (0.4 + 0.6 * lv))
+        self.player.set_volume(self._volume * self._duck * (0.4 + 0.6 * lv))
+
+    def _apply_reward(self, lv):
+        import time as _time
+
+        now = _time.monotonic()
+        # Steady bed — nothing about the base tone tracks the measure.
+        self.player.set_roughness(0.0)
+        self.player.set_noise(0.0)
+        self._push_volume()
+
+        if lv >= REWARD_LEVEL:
+            if self._hold_start is None:
+                self._hold_start = now
+            elif now - self._hold_start >= REWARD_HOLD_S and now >= self._bloom_until:
+                self._bloom_until = now + REWARD_BLOOM_S
+                self._hold_start = None          # re-arm for the next hold
+                play_reward()
+                self._emit_event("reward")
+        else:
+            self._hold_start = None
+
+        # Bloom the consonant partial in, then let it decay away.
+        if now < self._bloom_until:
+            self.player.set_reward((self._bloom_until - now) / REWARD_BLOOM_S)
+        else:
+            self.player.set_reward(0.0)
 
     def _emit_event(self, kind):
         payload = {"event": kind, **self._params()}

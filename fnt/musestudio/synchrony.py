@@ -177,7 +177,10 @@ class SynchronyAnalyzer(QObject):
             sig[e] = x
             p2p[e] = float(np.ptp(x))
 
-        contact_ok = all(p2p[e] < ARTIFACT_P2P_UV and np.std(sig[e]) > 0.5
+        # High-passed contact check: the raw signal's DC offset and drift would
+        # otherwise fail this test even on well-seated electrodes.
+        from fnt.musestudio.dsp import contact_quality
+        contact_ok = all(contact_quality(sig[e], self._fs, ARTIFACT_P2P_UV)
                          for e in ELECTRODES)
 
         # Band-limited analytic phase + power per electrode.

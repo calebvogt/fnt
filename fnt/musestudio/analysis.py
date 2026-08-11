@@ -17,7 +17,8 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 from fnt.musestudio.dsp import (
     BAND_ORDER, RollingSpectrogram, alpha_asymmetry, band_powers,
-    optical_density, relative_band_powers, split_lateral,
+    contact_quality, optical_density, relative_band_powers, scalp_channels,
+    split_lateral,
 )
 
 EEG_WINDOW_SEC = 4.0        # 0.25 Hz resolution — enough for delta/theta
@@ -56,6 +57,8 @@ class BandPowerAnalyzer(QObject):
         super().__init__(parent)
         self._fs = 256.0
         self._names = []
+        self._all_names = []
+        self._cols = {}
         self._buffers = {}
         self._history = {b: deque(maxlen=HISTORY_POINTS) for b in BAND_ORDER}
         self._hist_t = deque(maxlen=HISTORY_POINTS)
@@ -69,11 +72,22 @@ class BandPowerAnalyzer(QObject):
 
     # --- configuration ----------------------------------------------------
     def configure(self, channel_names, fs=None):
+        """Buffer only the real scalp electrodes.
+
+        The EEG stream also carries AUX_1..AUX_4 (unconnected auxiliary inputs
+        that read as noise). Including them would swamp the band mix and make
+        the contact check fail permanently, which in turn silently empties the
+        band history and blocks closed-loop feedback.
+        """
         if fs:
             self._fs = float(fs)
-        names = [str(n) for n in channel_names]
+        all_names = [str(n) for n in channel_names]
+        names = scalp_channels(all_names) or all_names
+        self._all_names = all_names
         if names != self._names:
             self._names = names
+            # Map each kept channel back to its column in the incoming chunk.
+            self._cols = {n: all_names.index(n) for n in names}
             maxlen = int(EEG_WINDOW_SEC * self._fs)
             self._buffers = {n: deque(maxlen=maxlen) for n in names}
 
@@ -104,9 +118,9 @@ class BandPowerAnalyzer(QObject):
         data = np.asarray(data, dtype=float)
         if data.ndim == 1:
             data = data[:, None]
-        for i, name in enumerate(self._names):
-            if i < data.shape[1]:
-                self._buffers[name].extend(data[:, i].tolist())
+        for name, col in self._cols.items():
+            if col < data.shape[1]:
+                self._buffers[name].extend(data[:, col].tolist())
 
     # --- compute ----------------------------------------------------------
     def _compute(self):
@@ -119,7 +133,9 @@ class BandPowerAnalyzer(QObject):
                 return
             arrays[name] = np.fromiter(buf, dtype=float, count=len(buf))
 
-        contact_ok = all(np.ptp(a) < ARTIFACT_P2P_UV and np.std(a) > 0.5
+        # Judged on high-passed data — raw Muse EEG has a large DC offset, so a
+        # peak-to-peak test on the raw signal rejects even good electrodes.
+        contact_ok = all(contact_quality(a, self._fs, ARTIFACT_P2P_UV)
                          for a in arrays.values())
 
         absolute, relative = {}, {}

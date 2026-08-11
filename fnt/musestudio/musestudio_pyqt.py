@@ -16,23 +16,31 @@ from datetime import datetime
 from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QScrollArea, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from fnt.musestudio import theme
 from fnt.musestudio.analysis import BandPowerAnalyzer, HemodynamicsAnalyzer
-from fnt.musestudio.binaural import BinauralPanel, play_cue
+from fnt.musestudio.binaural import (
+    BinauralPanel, play_alert, play_complete, play_cue, play_resolved,
+)
 from fnt.musestudio.channel_table import LiveValuesPanel
+from fnt.musestudio.dsp import curated_channels
 from fnt.musestudio.live_plot import LiveSignalView
+from fnt.musestudio.log_view import LogDialog
+from fnt.musestudio.logbuffer import LOG
 from fnt.musestudio.muse_stream import (
     LSLReaderThread, MuseRecorder, MuseStreamProcess, find_devices,
 )
 from fnt.musestudio.neuro_widgets import NeuroControls, NeuroView
 from fnt.musestudio.protocol import PROTOCOLS, ProtocolRunner
+from fnt.musestudio.questionnaire import QuestionnaireDialog
 from fnt.musestudio.recording import RecordingSession, SessionLogger
 from fnt.musestudio.review_view import ReviewPanel
+from fnt.musestudio.session_summary import SessionSummaryDialog
+from fnt.musestudio.speech import Speaker, list_voices
 from fnt.musestudio.synchrony import SynchronyAnalyzer
 from fnt.musestudio.viz import (
     BandHistoryPlot, BandPowerBars, LateralityView, SpectrogramView,
@@ -49,6 +57,12 @@ def _fmt_time(seconds):
 _SYNC_GATE_LEVEL = 0.6
 _SYNC_GATE_HOLD_S = 10.0
 
+# Stream watchdog: a stream is "stalled" after this long with no samples, and
+# the failure is escalated if it stays down. Bluetooth hiccups of a few hundred
+# ms are normal; multiple seconds means data is being lost.
+_STALL_SECONDS = 2.5
+_STALL_ESCALATE_S = 15.0
+
 
 def _is_eeg(stream_name):
     return "EEG" in stream_name.upper()
@@ -61,6 +75,23 @@ def _is_battery(stream_name):
 def _is_optics(stream_name):
     """The Athena's fNIRS/PPG stream is published as Muse-OPTICS."""
     return "OPTIC" in stream_name.upper() or "NIRS" in stream_name.upper()
+
+
+def _default_recording_dir():
+    """Prefer the repo's gitignored LocalData/Muse when running from source."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))       # …/fnt
+    local = os.path.join(repo, "LocalData", "Muse")
+    if os.path.isdir(local):
+        return local
+    return os.path.join(os.path.expanduser("~"), "Documents")
+
+
+def _short(stream_name):
+    """"Muse-EEG (695A…)" -> "EEG" for status messages."""
+    import re
+    s = re.sub(r"\s*\(.*\)\s*$", "", str(stream_name))
+    return re.sub(r"^Muse[-_]?", "", s) or s
 
 
 _local_clock = None
@@ -165,6 +196,10 @@ class SessionBanner(QFrame):
 class MuseStudioWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Start capturing diagnostics (including native stdout/stderr from
+        # liblsl and OpenCV) before anything else can fail.
+        LOG.install()
+        self._log_dialog = None
         self.stream_proc = None
         self.reader = None
         self.recorder = None
@@ -190,8 +225,7 @@ class MuseStudioWindow(QMainWindow):
 
         # Default recording location persists across launches.
         self._settings = QSettings("FNT", "MuseStudio")
-        default_dir = os.path.join(os.path.expanduser("~"), "Documents")
-        self.output_dir = self._settings.value("recording_dir", default_dir)
+        self.output_dir = self._settings.value("recording_dir", _default_recording_dir())
 
         self.setWindowTitle("MuseStudio - FieldNeuroethologyToolbox")
         self.resize(1480, 900)
@@ -208,6 +242,17 @@ class MuseStudioWindow(QMainWindow):
         self._free_timer = QTimer(self)
         self._free_timer.setInterval(500)
         self._free_timer.timeout.connect(self._on_free_tick)
+
+        # Watchdog for silently-dropped streams (Bluetooth/LSL dropouts would
+        # otherwise leave gaps in a recording with nothing to show for it).
+        self._last_sample = {}      # stream -> monotonic time of last chunk
+        self._stalled = {}          # stream -> monotonic time the stall began
+        self._escalated = {}        # stream -> already warned a second time
+        self._dropouts = []         # (stream, start_wall, seconds) for the summary
+        self._stall_timer = QTimer(self)
+        self._stall_timer.setInterval(1000)
+        self._stall_timer.timeout.connect(self._check_streams)
+        self._stall_timer.start()
 
     # ------------------------------------------------------------------ UI
     def _init_ui(self):
@@ -229,14 +274,31 @@ class MuseStudioWindow(QMainWindow):
         root.addWidget(banner)
 
         main_split = QSplitter(Qt.Horizontal)
-        main_split.addWidget(self._build_left_column())
+        self.left_scroll = self._build_left_column()
+        # Thin always-visible rail to fold the control column away.
+        self.left_toggle = QPushButton("◂")
+        self.left_toggle.setCheckable(True)
+        self.left_toggle.setChecked(True)
+        self.left_toggle.setFixedWidth(18)
+        self.left_toggle.setToolTip(
+            "Collapse the controls column to give the data views the full window.")
+        self.left_toggle.toggled.connect(self._on_left_toggled)
+        left_wrap = QWidget()
+        lw = QHBoxLayout(left_wrap)
+        lw.setContentsMargins(0, 0, 0, 0)
+        lw.setSpacing(0)
+        lw.addWidget(self.left_scroll, stretch=1)
+        lw.addWidget(self.left_toggle)
+
+        main_split.addWidget(left_wrap)
         main_split.addWidget(self._build_right_view())
         main_split.setStretchFactor(0, 0)
         main_split.setStretchFactor(1, 1)
-        main_split.setSizes([360, 1040])
+        main_split.setSizes([380, 1100])
         root.addWidget(main_split, stretch=1)
 
         self._wire_analyzer()
+        self._init_speech()
         self._on_view_changed()   # apply initial Live view
 
     def _build_left_column(self):
@@ -306,6 +368,38 @@ class MuseStudioWindow(QMainWindow):
         self.neuro_controls = NeuroControls()
         col.addWidget(self.neuro_controls)
 
+        # Spoken guidance — the only way a guided protocol can guide you once
+        # your eyes are closed.
+        guide = QGroupBox("Spoken guidance")
+        gg = QVBoxLayout(guide)
+        self.speak_check = QCheckBox("Speak instructions")
+        self.speak_check.setToolTip(
+            "Read each protocol phase aloud when it begins, and announce "
+            "problems and completion.\n\n"
+            "Essential for eyes-closed sessions: the on-screen instructions and "
+            "countdown are invisible once you settle. The binaural tone is "
+            "automatically ducked while speaking so the voice stays clear."
+        )
+        self.speak_check.setChecked(self._settings.value("speech_enabled", True, type=bool))
+        self.speak_check.toggled.connect(self._on_speech_toggled)
+        gg.addWidget(self.speak_check)
+
+        vrow = QHBoxLayout()
+        vrow.addWidget(QLabel("Voice"))
+        self.voice_combo = QComboBox()
+        self.voice_combo.setToolTip(
+            "Which system voice reads the instructions. Calmer, slower voices "
+            "suit meditation protocols better.")
+        vrow.addWidget(self.voice_combo, stretch=1)
+        gg.addLayout(vrow)
+
+        self.test_voice_btn = QPushButton("Test voice")
+        self.test_voice_btn.setToolTip("Speak a sample line so you can set the volume before starting.")
+        self.test_voice_btn.clicked.connect(self._on_test_voice)
+        gg.addWidget(self.test_voice_btn)
+        col.addWidget(guide)
+        self._guidance_group = guide
+
         # Recording controls (shown only in Recording View).
         self.recording_group = QGroupBox("Recording")
         rg = QVBoxLayout(self.recording_group)
@@ -357,9 +451,38 @@ class MuseStudioWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(left)
-        scroll.setMinimumWidth(330)
-        scroll.setMaximumWidth(440)
-        return scroll
+
+        # Diagnostics is pinned *below* the scroll area rather than inside it,
+        # so the troubleshooting buttons are reachable without scrolling —
+        # which is exactly when you need them.
+        diag = QGroupBox("Diagnostics")
+        dg = QVBoxLayout(diag)
+        dg.setSpacing(4)
+        self.logs_btn = QPushButton("Session Logs")
+        self.logs_btn.clicked.connect(self.on_show_logs)
+        self.logs_btn.setToolTip(
+            "Open the diagnostic log: errors, exceptions, Bluetooth/LSL stream\n"
+            "messages and camera problems, including output from the underlying\n"
+            "C libraries that would otherwise only appear in the terminal."
+        )
+        dg.addWidget(self.logs_btn)
+        self.copy_logs_btn = QPushButton("Copy Logs to Clipboard")
+        self.copy_logs_btn.clicked.connect(self.on_copy_logs)
+        self.copy_logs_btn.setToolTip(
+            "Copy the whole log plus platform and package versions to the\n"
+            "clipboard — paste this when reporting a problem."
+        )
+        dg.addWidget(self.copy_logs_btn)
+
+        container = QWidget()
+        cl = QVBoxLayout(container)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(6)
+        cl.addWidget(scroll, stretch=1)
+        cl.addWidget(diag)
+        container.setMinimumWidth(330)
+        container.setMaximumWidth(440)
+        return container
 
     def _build_right_view(self):
         """Data view: session banner + tabbed views, with the raw signal first."""
@@ -373,13 +496,32 @@ class MuseStudioWindow(QMainWindow):
         rlay.addWidget(self.session_banner)
 
         self.view_tabs = QTabWidget()
-        self.view_tabs.addTab(self._build_live_tab(), "Live signal")
+        self._live_tab = self._build_live_tab()
+        self.view_tabs.addTab(self._live_tab, "Live signal")
         self.view_tabs.addTab(self._build_bands_tab(), "Bands")
         self.view_tabs.addTab(self._build_spectrogram_tab(), "Spectrogram")
         self.view_tabs.addTab(self._build_synchrony_tab(), "Synchrony")
         self.view_tabs.addTab(self._build_camera_tab(), "Camera")
         self.review = ReviewPanel()
         self.view_tabs.addTab(self.review, "Review")
+
+        tips = [
+            ("Live signal", "Raw waveforms as they arrive, at a fixed µV scale.\n"
+                            "Use this to check electrode contact and watch the rhythm directly."),
+            ("Bands", "How power is split across delta/theta/alpha/beta/gamma right now\n"
+                      "and over the session, plus left/right hemisphere comparison."),
+            ("Spectrogram", "Time–frequency map of one electrode. A steady bright band\n"
+                            "near 10 Hz is an alpha rhythm; broad high-frequency haze is\n"
+                            "usually muscle tension."),
+            ("Synchrony", "Interhemispheric phase locking (PLV) between the left/right\n"
+                          "electrode pairs — the measure the protocols try to move."),
+            ("Camera", "Webcam preview. Recorded with frame timestamps during a session."),
+            ("Review", "Open a finished recording and compare each protocol phase\n"
+                       "against its baseline."),
+        ]
+        for i, (_, tip) in enumerate(tips):
+            self.view_tabs.setTabToolTip(i, tip)
+        self.view_tabs.currentChanged.connect(self._on_tab_changed)
         rlay.addWidget(self.view_tabs, stretch=1)
 
         self.status_label = QLabel("Ready.")
@@ -392,6 +534,36 @@ class MuseStudioWindow(QMainWindow):
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(6, 8, 6, 6)
+        lay.setSpacing(4)
+
+        # Channel-set toggle: curated (the channels worth watching) vs every channel.
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Channels"))
+        self.channel_set_combo = QComboBox()
+        self.channel_set_combo.addItem("Curated", "curated")
+        self.channel_set_combo.addItem("All channels", "all")
+        self.channel_set_combo.setToolTip(
+            "Curated: the channels worth watching — the 4 scalp electrodes, the\n"
+            "accelerometer, and the outer (cortex-reaching) optical detectors at\n"
+            "the two hemodynamic wavelengths.\n\n"
+            "All channels: everything the headband sends, including unconnected\n"
+            "AUX inputs, gyroscope, inner (scalp) optodes and ambient-light\n"
+            "references. More lanes means each one is drawn smaller.\n\n"
+            "This only changes what is displayed — recording always captures\n"
+            "every channel."
+        )
+        self.channel_set_combo.activated.connect(lambda _i: self._apply_channel_set())
+        top.addWidget(self.channel_set_combo)
+        top.addStretch()
+        self.values_toggle = QPushButton("Values ▸")
+        self.values_toggle.setCheckable(True)
+        self.values_toggle.setChecked(True)
+        self.values_toggle.setToolTip(
+            "Fold the channel list away to give the signal plots the full width.")
+        self.values_toggle.toggled.connect(self._on_values_toggled)
+        top.addWidget(self.values_toggle)
+        lay.addLayout(top)
+
         split = QSplitter(Qt.Horizontal)
         self.plot = LiveSignalView()
         self.plot.setToolTip(
@@ -401,14 +573,32 @@ class MuseStudioWindow(QMainWindow):
         split.addWidget(self.plot)
         self.values_panel = LiveValuesPanel()
         self.values_panel.setToolTip(
-            "Latest value of every channel — the columns written to the per-stream CSVs.")
-        self.values_panel.setMaximumWidth(300)
+            "Latest value of every channel, and which channels are drawn.\n"
+            "Untick a channel to remove it from the plots; hover a channel name "
+            "to see what it measures."
+        )
+        self.values_panel.setMaximumWidth(320)
+        self.values_panel.visibility_changed.connect(self.plot.set_channel_visibility)
         split.addWidget(self.values_panel)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
-        split.setSizes([900, 260])
-        lay.addWidget(split)
+        split.setSizes([900, 280])
+        lay.addWidget(split, stretch=1)
         return page
+
+    def _on_values_toggled(self, shown):
+        self.values_panel.setVisible(shown)
+        self.values_toggle.setText("Values ▸" if shown else "Values ◂")
+
+    def _apply_channel_set(self):
+        """Apply the curated/all channel preset to plots and checkboxes."""
+        mode = self.channel_set_combo.currentData()
+        for stream, names in self.plot.streams().items():
+            visible = (curated_channels(stream, names) if mode == "curated"
+                       else list(names))
+            self.values_panel.set_visible_channels(stream, visible)
+            self.plot.set_channel_visibility(stream, visible)
+        self._log(f"Channel set -> {mode}")
 
     def _build_bands_tab(self):
         """Band power now (bars) and over time (history), plus L/R laterality."""
@@ -524,6 +714,17 @@ class MuseStudioWindow(QMainWindow):
         recording = self.rec_radio.isChecked()
         self.recording_group.setVisible(recording)
 
+    def _on_left_toggled(self, shown):
+        self.left_scroll.setVisible(shown)
+        self.left_toggle.setText("◂" if shown else "▸")
+
+    def _on_tab_changed(self, _index):
+        """Only the visible view redraws — keeps tab switching snappy while
+        streaming (each hidden view would otherwise keep repainting)."""
+        live = self.view_tabs.currentWidget() is self._live_tab
+        self.plot.set_paused(not live)
+        self.values_panel.set_paused(not live)
+
     # --------------------------------------------------------------- actions
     def on_scan(self):
         self.scan_btn.setEnabled(False)
@@ -595,6 +796,12 @@ class MuseStudioWindow(QMainWindow):
         self._set_status("Connecting… (starting OpenMuse stream)")
 
     def _on_connected(self, names):
+        # The reader can be torn down (disconnect, or a stream error) while this
+        # queued signal is still in flight — Qt would then deliver it against a
+        # dead reader. Bail out instead of crashing.
+        if self.reader is None:
+            self._log("Ignored a late 'connected' signal — reader already stopped")
+            return
         ch_names = self.reader.channel_names()
         # Battery is shown as a number, not plotted or listed as a channel.
         plot_names = {k: v for k, v in ch_names.items() if not _is_battery(k)}
@@ -606,6 +813,9 @@ class MuseStudioWindow(QMainWindow):
         self.analyzer.reset()
         self.bands.reset()
         self.hemo.reset()
+        self._last_sample.clear()
+        self._stalled.clear()
+        self._escalated.clear()
 
         # Real sample rates drive the display filters and every analyzer.
         rates = {n: self.reader.sample_rate(n) for n in names}
@@ -622,12 +832,17 @@ class MuseStudioWindow(QMainWindow):
         if optics_stream:
             self.hemo.configure(self._optics_channels, rates.get(optics_stream))
 
+        # Panels are created lazily on first sample, so apply the curated
+        # channel preset once data has actually started flowing.
+        QTimer.singleShot(1200, self._apply_channel_set)
+
         self._set_status(f"Connected. Streaming: {', '.join(names)}")
         self._log(f"Connected — streams: {', '.join(names)}")
 
     def _on_samples(self, stream_name, timestamps, data):
         """Route incoming chunks: battery -> numeric label, everything else ->
         the scrolling plot and the live values table."""
+        self._note_samples(stream_name)
         if _is_battery(stream_name):
             if len(data):
                 pct = float(data[-1][0] if data.ndim == 2 else data[-1])
@@ -642,6 +857,70 @@ class MuseStudioWindow(QMainWindow):
             self.bands.add_eeg(self._eeg_channels, data)
         elif _is_optics(stream_name):
             self.hemo.add_optics(self._optics_channels, data)
+
+    # ------------------------------------------------------------- watchdog
+    def _check_streams(self):
+        """Detect streams that have stopped delivering, warn audibly, recover.
+
+        A dropout mid-session is the worst failure mode here: with your eyes
+        closed nothing on screen can tell you, and the recording quietly gains a
+        hole. So a stall gets a distinct alert tone, a marker in events.csv, and
+        an attempt to restart the streamer if its process died.
+        """
+        if self.reader is None or not self._last_sample:
+            return
+        now = time.monotonic()
+        for stream, last in list(self._last_sample.items()):
+            gap = now - last
+            if gap >= _STALL_SECONDS and stream not in self._stalled:
+                self._stalled[stream] = last
+                LOG.add(f"STREAM STALLED: {stream} (no data for {gap:.1f}s)", "error")
+                self._log(f"Stream stalled: {stream}")
+                self._write_event("dropout", "stall_start", stream)
+                self._set_status(f"⚠ {_short(stream)} stopped sending data…")
+                play_alert()
+                if self._session_active:
+                    self._speak("Signal lost. Check the headband.")
+                self._maybe_restart_streamer()
+            elif gap >= _STALL_SECONDS and stream in self._stalled:
+                if gap >= _STALL_ESCALATE_S and not self._escalated.get(stream):
+                    self._escalated[stream] = True
+                    LOG.add(f"STREAM STILL DOWN: {stream} after {gap:.0f}s", "error")
+                    self._set_status(
+                        f"⚠ {_short(stream)} still down after {gap:.0f}s — "
+                        "check the headband is on and in range.")
+                    play_alert()
+
+    def _note_samples(self, stream_name):
+        """Called on every chunk; clears a stall and reports the gap."""
+        now = time.monotonic()
+        if stream_name in self._stalled:
+            gap = now - self._stalled.pop(stream_name)
+            self._escalated.pop(stream_name, None)
+            self._dropouts.append((stream_name, datetime.now(), gap))
+            LOG.add(f"STREAM RESUMED: {stream_name} after {gap:.1f}s", "log")
+            self._log(f"Stream resumed: {stream_name} (lost {gap:.1f}s)")
+            self._write_event("dropout", "stall_end", f"{stream_name} {gap:.1f}s")
+            self._set_status(f"{_short(stream_name)} resumed (lost {gap:.1f}s)")
+            play_resolved()
+        self._last_sample[stream_name] = now
+
+    def _maybe_restart_streamer(self):
+        """If the OpenMuse process died, that's why data stopped — restart it.
+
+        (liblsl reconnects on its own while the streamer is alive, so we only
+        intervene when the producer itself is gone.)
+        """
+        proc = self.stream_proc
+        if proc is None or proc.is_alive():
+            return
+        LOG.add("OpenMuse streamer process died — restarting", "error")
+        self._log("OpenMuse streamer died; restarting")
+        self._write_event("dropout", "streamer_restart", "")
+        try:
+            proc.start()
+        except Exception as exc:  # noqa: BLE001
+            LOG.add(f"Streamer restart failed: {exc}", "error")
 
     def _on_band_metrics(self, m):
         """Band powers -> bars, history and the EEG half of the laterality view."""
@@ -687,6 +966,7 @@ class MuseStudioWindow(QMainWindow):
 
     def _on_reader_error(self, msg):
         self._set_status("Stream error.")
+        LOG.add(f"STREAM ERROR: {msg}", "error")
         QMessageBox.critical(self, "Stream error", msg)
         self.disconnect_stream()
 
@@ -792,6 +1072,9 @@ class MuseStudioWindow(QMainWindow):
         # playing, to avoid audio-device contention.
         if "audio_on" not in phase.actions and not self.binaural.player.is_playing():
             play_cue()
+        # Speak the instruction — with eyes closed this is the only guidance.
+        # A short delay lets the attention beep finish first.
+        QTimer.singleShot(450, lambda p=phase: self._speak(p.spoken()))
         for action in phase.actions:
             if not self._run_phase_action(action, phase):
                 break   # a failed action aborted the protocol
@@ -823,6 +1106,8 @@ class MuseStudioWindow(QMainWindow):
                 p.get("base", 200), p.get("beat", 10), closed,
                 mode=p.get("mode", "binaural"),
             )
+        elif action == "audio_control":
+            self.binaural.protocol_control_tone(phase.params.get("base", 200))
         elif action == "heterodyne_start":
             # Continue the AM tone open-loop and begin the offset ramp at Δ=0.
             self.binaural.loop_check.setChecked(False)
@@ -850,6 +1135,7 @@ class MuseStudioWindow(QMainWindow):
 
     def _on_runner_finished(self):
         self._log("Protocol complete")
+        play_complete()      # distinct from a phase change, for eyes-closed use
         self._end_session(aborted=False)
         self._set_status("Protocol complete — recording saved.")
 
@@ -906,6 +1192,38 @@ class MuseStudioWindow(QMainWindow):
         self.recorder = None
         self.session = None
         self._set_status(f"Saved to {root} ({summary})")
+        # Surface the result immediately — after an eyes-closed session you
+        # shouldn't have to go hunting to find out whether it worked.
+        self._show_summary(root, counts, frames)
+
+    def _show_summary(self, root, counts, frames):
+        if not root:
+            return
+        # Subjective ratings first — they're only reliable while the session is
+        # still fresh, and drowsiness is needed to interpret the EEG at all.
+        try:
+            key = self.mode_combo.currentData()
+            proto = PROTOCOLS.get(key)
+            if proto is not None:
+                labels = [p.name for p in proto.phases if p.duration]
+                q = QuestionnaireDialog(root, proto.name, labels, self)
+                q.exec_()
+        except Exception as exc:  # noqa: BLE001
+            LOG.add(f"Questionnaire failed: {exc}", "error")
+        dropouts, self._dropouts = list(self._dropouts), []
+        try:
+            dialog = SessionSummaryDialog(root, counts, frames, dropouts, self)
+            dialog.review_btn.clicked.connect(
+                lambda: self._review_path(root, dialog))
+            dialog.show()
+        except Exception as exc:  # noqa: BLE001 - never let this hide a recording
+            LOG.add(f"Session summary failed: {exc}", "error")
+
+    def _review_path(self, path, dialog=None):
+        self.view_tabs.setCurrentWidget(self.review)
+        self.review.load(path)
+        if dialog is not None:
+            dialog.accept()
 
     def _build_config(self):
         """Snapshot of settings + metadata written to recording_config.json."""
@@ -942,6 +1260,77 @@ class MuseStudioWindow(QMainWindow):
                 "events": self.session.events_dir,
             },
         }
+
+    # --------------------------------------------------------------- speech
+    def _init_speech(self):
+        """Wire the speaker, populate voices and restore saved preferences."""
+        self.speaker = Speaker(self)
+        self.speaker.enabled = self.speak_check.isChecked()
+        # Duck the tone whenever the voice is talking, restore when it stops.
+        self.speaker.started.connect(lambda: self.binaural.set_ducked(True))
+        self.speaker.finished.connect(lambda: self.binaural.set_ducked(False))
+
+        voices = list_voices()
+        self.voice_combo.clear()
+        if voices:
+            for label, ident in voices:
+                self.voice_combo.addItem(label, ident)
+            saved = self._settings.value("speech_voice", "")
+            idx = self.voice_combo.findData(saved) if saved else -1
+            # Samantha is the usual macOS default and reads calmly.
+            if idx < 0:
+                idx = max(0, self.voice_combo.findText("Samantha", Qt.MatchStartsWith))
+            self.voice_combo.setCurrentIndex(idx)
+            self.speaker.voice = self.voice_combo.currentData()
+            self.voice_combo.activated.connect(self._on_voice_changed)
+        else:
+            self.voice_combo.addItem("No voices available", None)
+            self.voice_combo.setEnabled(False)
+
+        if not self.speaker.available():
+            self.speak_check.setEnabled(False)
+            self.test_voice_btn.setEnabled(False)
+            self._guidance_group.setToolTip(
+                "No text-to-speech backend found. On macOS this uses the built-in "
+                "'say' command; elsewhere install pyttsx3 (pip install pyttsx3)."
+            )
+        LOG.add(f"Speech backend: {self.speaker.backend_name()}", "log")
+
+    def _on_speech_toggled(self, on):
+        self.speaker.enabled = on
+        self._settings.setValue("speech_enabled", on)
+        if not on:
+            self.speaker.stop()
+            self.binaural.set_ducked(False)
+        self._log(f"Spoken guidance {'on' if on else 'off'}")
+
+    def _on_voice_changed(self, _index):
+        self.speaker.voice = self.voice_combo.currentData()
+        self._settings.setValue("speech_voice", self.speaker.voice or "")
+        self.speaker.say("This is the guidance voice.")
+
+    def _on_test_voice(self):
+        self.speaker.say(
+            "This is the guidance voice. Close your eyes and breathe normally.")
+
+    def _speak(self, text):
+        """Speak if guidance is enabled; harmless no-op otherwise."""
+        speaker = getattr(self, "speaker", None)
+        if speaker is not None:
+            speaker.say(text)
+
+    # ------------------------------------------------------------ diagnostics
+    def on_show_logs(self):
+        if getattr(self, "_log_dialog", None) is None:
+            self._log_dialog = LogDialog(self)
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def on_copy_logs(self):
+        QApplication.clipboard().setText(LOG.report())
+        n = LOG.count()
+        self._set_status(f"Diagnostic report copied to clipboard ({n} log lines).")
 
     def on_review_recording(self):
         """Jump to the Review tab and open a recording folder."""
@@ -1092,12 +1481,21 @@ class MuseStudioWindow(QMainWindow):
         self.status_label.setText(msg)
 
     def _log(self, msg):
-        """Record a timestamped GUI action to the session log (buffered)."""
+        """Record a timestamped GUI action to the session log (buffered).
+
+        Also mirrored into the diagnostic buffer so the Session Logs window
+        shows user actions interleaved with errors — that ordering is usually
+        what explains a failure.
+        """
         self.logger.log(msg)
+        LOG.add(msg, "session")
 
     def closeEvent(self, event):
         self.disconnect_stream()
         self._stop_camera()
+        speaker = getattr(self, "speaker", None)
+        if speaker is not None:
+            speaker.shutdown()
         self.binaural.close_audio()
         if self.scan_thread is not None and self.scan_thread.isRunning():
             self.scan_thread.wait(2000)

@@ -20,12 +20,18 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 @dataclass
 class Phase:
     name: str
-    instruction: str
+    instruction: str                  # shown on screen
     duration: float | None            # seconds; None = wait for user Continue
     actions: list = field(default_factory=list)
     params: dict = field(default_factory=dict)
     gate: str = ""                    # e.g. "synced": advance early once condition holds
     ramp: dict = None                 # e.g. {"param": "heterodyne_offset", "to": 1.0}
+    # Spoken version. Written for listening, not reading — no "click", no line
+    # breaks, and it says how long the phase lasts since you can't see the timer.
+    speech: str = ""
+
+    def spoken(self):
+        return self.speech or self.instruction.replace("\n", " ")
 
 
 @dataclass
@@ -49,6 +55,9 @@ def _binaural_10min():
                 "(watch the head map on the right). Put in your earphones, sit "
                 "comfortably, and relax your jaw.\n\nClick Continue when you are ready.",
                 None,
+                speech="Put on the Muse headband and adjust it until contact is "
+                       "good. Put in your earphones, sit comfortably, and relax "
+                       "your jaw. Press continue when you are ready.",
             ),
             Phase(
                 "Baseline",
@@ -56,6 +65,9 @@ def _binaural_10min():
                 "We are measuring your resting brain rhythm for 2 minutes.",
                 120,
                 actions=["start_recording", "calibrate"],
+                speech="Baseline. Close your eyes, stay still, and breathe "
+                       "normally for two minutes while we measure your resting "
+                       "rhythm.",
             ),
             Phase(
                 "Stimulation",
@@ -65,6 +77,9 @@ def _binaural_10min():
                 360,
                 actions=["audio_on"],
                 params={"base": 200, "beat": 10, "closed_loop": True},
+                speech="Stimulation. Keep your eyes closed and relax. The tones "
+                       "are starting now. Let the sound settle for the next six "
+                       "minutes.",
             ),
             Phase(
                 "Recovery",
@@ -72,6 +87,8 @@ def _binaural_10min():
                 "for 2 more minutes.",
                 120,
                 actions=["audio_fade_out"],
+                speech="Recovery. The tones are fading out. Keep your eyes "
+                       "closed and rest quietly for two more minutes.",
             ),
             Phase(
                 "Done",
@@ -79,6 +96,8 @@ def _binaural_10min():
                 "Your recording has been saved.",
                 None,
                 actions=["stop_recording"],
+                speech="Protocol complete. You can open your eyes and remove the "
+                       "headband. Your recording has been saved.",
             ),
         ],
     )
@@ -98,6 +117,9 @@ def _heterodyne():
                 "earphones. Sit comfortably and relax your jaw.\n\nClick Continue "
                 "when you are ready.",
                 None,
+                speech="Put on the Muse headband and check the contact is good. "
+                       "Put in your earphones, sit comfortably, and relax your "
+                       "jaw. Press continue when you are ready.",
             ),
             Phase(
                 "Baseline",
@@ -105,6 +127,8 @@ def _heterodyne():
                 "resting rhythm for 2 minutes.",
                 120,
                 actions=["start_recording", "calibrate"],
+                speech="Baseline. Close your eyes, stay still, and breathe "
+                       "normally for two minutes.",
             ),
             Phase(
                 "Sync induction",
@@ -116,6 +140,9 @@ def _heterodyne():
                 params={"base": 200, "beat": 10, "closed_loop": True,
                         "mode": "monaural_am"},
                 gate="synced",
+                speech="Sync induction. Eyes closed. Both ears are now pulsing "
+                       "together at ten hertz. Let your hemispheres fall into "
+                       "sync. This stage ends on its own once you hold it.",
             ),
             Phase(
                 "Heterodyne",
@@ -124,6 +151,9 @@ def _heterodyne():
                 240,
                 actions=["heterodyne_start"],
                 ramp={"param": "heterodyne_offset", "to": 1.0},  # 0→1 Hz over the stage
+                speech="Heterodyne. One side is now drifting slightly faster than "
+                       "the other. Notice the slow pulsing between them. Stay "
+                       "relaxed for the next four minutes.",
             ),
             Phase(
                 "Recovery",
@@ -131,6 +161,8 @@ def _heterodyne():
                 "quietly for 2 minutes.",
                 120,
                 actions=["audio_fade_out"],
+                speech="Recovery. The tones are fading out. Keep your eyes closed "
+                       "and rest quietly for two minutes.",
             ),
             Phase(
                 "Done",
@@ -138,12 +170,108 @@ def _heterodyne():
                 "headband.\n\nYour recording has been saved.",
                 None,
                 actions=["stop_recording"],
+                speech="Protocol complete. You can open your eyes and remove the "
+                       "headband. Your recording has been saved.",
             ),
         ],
     )
 
 
-PROTOCOLS = {p.key: p for p in [_binaural_10min(), _heterodyne()]}
+def _hemisync_probe_a():
+    """Session 1 of the hemi-sync iteration: a controlled 9-minute probe.
+
+    This is deliberately *not* "listen to beats and hope PLV rises". Without
+    controls, a null result is uninterpretable — bad electrodes, an insensitive
+    metric, and a genuinely ineffective stimulus all look identical. So the run
+    carries three internal controls:
+
+    1. **Eyes-open → eyes-closed** is a positive control. Alpha reliably rises
+       on eye closure (Berger effect); if it doesn't, the recording is bad and
+       nothing else in the session should be believed.
+    2. **A matched control tone** (same carrier, both ears, no frequency
+       difference) precedes the binaural block, so the primary contrast
+       isolates *the beat* rather than "hearing a tone" or "paying attention".
+    3. **Rest blocks bracket the intervention**, so a change that is really
+       time-on-task or growing drowsiness shows up as rest-late ≈ binaural.
+
+    Audio is open-loop throughout — closed-loop feedback would make the
+    stimulus depend on the measurement, which is circular when the measurement
+    is the thing being evaluated.
+    """
+    return Protocol(
+        key="probe_a",
+        name="Hemi-Sync Probe A  (9 min, controlled)",
+        description=("Controlled probe: eyes-open → eyes-closed → control tone "
+                     "→ 10 Hz binaural → rest. Open loop, for measurement."),
+        phases=[
+            Phase(
+                "Set up",
+                "Put on the headband and adjust until contact is good, put in "
+                "your earphones, and sit comfortably.\n\nClick Continue when ready.",
+                None,
+                speech="Put on the headband and adjust it until the contact is "
+                       "good. Put in your earphones and sit comfortably. Press "
+                       "continue when you are ready.",
+            ),
+            Phase(
+                "Eyes open",
+                "Eyes OPEN. Rest your gaze on one spot and stay still.\n\n"
+                "This is the control block — please don't close your eyes yet.",
+                60,
+                actions=["start_recording"],
+                speech="Block one. Keep your eyes open and rest your gaze on one "
+                       "spot. Stay still and breathe normally for one minute.",
+            ),
+            Phase(
+                "Eyes closed rest",
+                "Now CLOSE your eyes and rest. No sound this block.",
+                90,
+                actions=["calibrate"],
+                speech="Block two. Now close your eyes and simply rest. There "
+                       "will be no sound for the next ninety seconds.",
+            ),
+            Phase(
+                "Control tone",
+                "Eyes closed. A steady tone plays in both ears — no beat.",
+                120,
+                actions=["audio_control"],
+                params={"base": 200},
+                speech="Block three. Keep your eyes closed. A steady tone is "
+                       "starting now. Just rest with it for two minutes.",
+            ),
+            Phase(
+                "Binaural 10 Hz",
+                "Eyes closed. 10 Hz binaural beat (200 / 210 Hz).\n\n"
+                "Let the pulsing settle; don't try to force anything.",
+                180,
+                actions=["audio_on"],
+                params={"base": 200, "beat": 10, "closed_loop": False},
+                speech="Block four. The tone now has a ten hertz pulse in it. "
+                       "Keep your eyes closed and let the pulsing settle. Don't "
+                       "try to force anything. Three minutes.",
+            ),
+            Phase(
+                "Rest again",
+                "Eyes closed, sound fading. Rest exactly as in block two.",
+                90,
+                actions=["audio_fade_out"],
+                speech="Block five. The sound is fading out. Keep your eyes "
+                       "closed and rest for a final ninety seconds.",
+            ),
+            Phase(
+                "Done",
+                "Probe complete. Open your eyes — a short questionnaire follows.",
+                None,
+                actions=["stop_recording"],
+                speech="Probe complete. You can open your eyes. There is a short "
+                       "questionnaire on screen.",
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_hemisync_probe_a(), _binaural_10min(),
+                                _heterodyne()]}
 
 
 class ProtocolRunner(QObject):

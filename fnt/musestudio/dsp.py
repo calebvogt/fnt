@@ -13,7 +13,7 @@ Two important separations of concern:
 """
 
 import numpy as np
-from scipy.signal import butter, iirnotch, sosfilt, tf2sos, welch
+from scipy.signal import butter, hilbert, iirnotch, sosfilt, tf2sos, welch
 
 # Canonical EEG bands (Hz). Order matters for display.
 BANDS = {
@@ -24,6 +24,114 @@ BANDS = {
     "gamma": (30.0, 50.0),
 }
 BAND_ORDER = ["delta", "theta", "alpha", "beta", "gamma"]
+
+# --------------------------------------------------------------------------
+# Channel semantics (verified against a real Muse S Athena)
+# --------------------------------------------------------------------------
+# The four scalp electrodes. Everything else on the EEG stream (AUX_1..AUX_4)
+# is an auxiliary input for an external electrode; with nothing plugged into
+# the accessory port those pins float and read as noise, so they must be kept
+# out of band power, contact checks and synchrony.
+EEG_ELECTRODES = ("TP9", "AF7", "AF8", "TP10")
+
+# Optics channels are named OPTICS_<side><depth>_<wavelength>, e.g.
+# OPTICS_LI_NIR = left, inner detector, near-infrared.
+OPTICS_SIDES = {"L": "left", "R": "right"}
+OPTICS_DEPTHS = {"I": "inner", "O": "outer"}
+OPTICS_WAVELENGTHS = {
+    "NIR": "near-infrared (~850 nm)",
+    "IR": "infrared (~730 nm)",
+    "RED": "red (~660 nm)",
+    "AMB": "ambient (LEDs off)",
+}
+
+
+def is_scalp_eeg(name):
+    """True for the four real electrodes, False for AUX and anything else."""
+    upper = str(name).upper()
+    return any(e in upper for e in EEG_ELECTRODES)
+
+
+def scalp_channels(names):
+    """Subset of ``names`` that are real scalp electrodes, in the given order."""
+    return [n for n in names if is_scalp_eeg(n)]
+
+
+def parse_optics_channel(name):
+    """``OPTICS_LI_NIR`` -> ``{'side': 'left', 'depth': 'inner', 'wavelength': 'NIR'}``.
+
+    Returns ``None`` when the name doesn't follow the Athena convention.
+    """
+    parts = str(name).upper().split("_")
+    if len(parts) < 3 or parts[0] != "OPTICS":
+        return None
+    code, wavelength = parts[1], parts[2]
+    if len(code) != 2 or wavelength not in OPTICS_WAVELENGTHS:
+        return None
+    side = OPTICS_SIDES.get(code[0])
+    depth = OPTICS_DEPTHS.get(code[1])
+    if side is None or depth is None:
+        return None
+    return {"side": side, "depth": depth, "wavelength": wavelength}
+
+
+def describe_optics_channel(name):
+    """Human-readable explanation for tooltips."""
+    info = parse_optics_channel(name)
+    if info is None:
+        return str(name)
+    depth_note = ("short separation — mostly scalp/skin blood flow"
+                  if info["depth"] == "inner" else
+                  "long separation — reaches cortex")
+    return (f"{info['side']} {info['depth']} detector, "
+            f"{OPTICS_WAVELENGTHS[info['wavelength']]} · {depth_note}")
+
+
+def curated_channels(stream_name, channel_names):
+    """The channels worth watching by default, per stream.
+
+    Rationale:
+    * **EEG** — the four scalp electrodes. AUX_1..AUX_4 are unconnected
+      auxiliary inputs and read as noise.
+    * **ACC/GYRO** — accelerometer only. It shows head movement, which is the
+      main source of EEG artifact; gyro rarely adds anything when seated.
+    * **Optics** — outer (long-separation) detectors at the two wavelengths
+      used for hemodynamics. Inner detectors mostly see scalp blood flow and
+      ambient channels measure background light, not tissue.
+    """
+    upper = str(stream_name).upper()
+    names = [str(n) for n in channel_names]
+    if "EEG" in upper:
+        return scalp_channels(names) or names
+    if "ACC" in upper or "GYRO" in upper:
+        acc = [n for n in names if "ACC" in n.upper()]
+        return acc or names
+    if "OPTIC" in upper or "NIRS" in upper:
+        keep = []
+        for n in names:
+            info = parse_optics_channel(n)
+            if info and info["depth"] == "outer" and info["wavelength"] in ("NIR", "RED"):
+                keep.append(n)
+        return keep or names
+    return names
+
+
+def contact_quality(x, fs, p2p_limit=250.0, min_std=0.5):
+    """Is this electrode making usable contact?
+
+    The check runs on a high-passed copy: raw Muse EEG carries a large DC
+    offset and slow drift, so a peak-to-peak test on the raw signal fails even
+    on a perfectly good electrode.
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < 16:
+        return False
+    sos = design_display_sos(fs, low=1.0, high=None, notch=None)
+    y = sosfilt(sos, x - np.mean(x)) if sos is not None else x - np.mean(x)
+    y = y[len(y) // 4:]           # drop the filter start-up transient
+    if len(y) == 0:
+        return False
+    return bool(np.ptp(y) < p2p_limit and np.std(y) > min_std)
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +222,57 @@ def relative_band_powers(absolute):
     return {k: v / total for k, v in absolute.items()}
 
 
+def band_connectivity(x, y, fs, band, nperseg=None):
+    """Coupling between two channels in ``band``: ``(plv, imag_coh)``.
+
+    Both are reported because they fail in different ways:
+
+    * **PLV** is sensitive but, on a headband where every electrode shares one
+      reference (Fpz), common-mode signal — reference noise, blinks, a single
+      source seen by both sensors — inflates it. A high PLV alone is weak
+      evidence of genuine interhemispheric coupling.
+    * **Imaginary coherence** keeps only the part of the cross-spectrum with a
+      non-zero phase lag, so zero-lag common-mode contributions cancel. It is
+      conservative (it also discards genuine zero-lag coupling), but a change
+      in imaginary coherence is much harder to explain away as artifact.
+
+    If an intervention moves PLV but not imaginary coherence, suspect artifact.
+    """
+    from scipy.signal import csd
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = min(len(x), len(y))
+    if n < 64:
+        return float("nan"), float("nan")
+    x, y = x[:n] - np.mean(x[:n]), y[:n] - np.mean(y[:n])
+    lo, hi = band
+
+    # --- PLV via the analytic signal of the band-passed pair ---
+    sos = butter(4, [lo, hi], btype="band", fs=fs, output="sos")
+    px = np.angle(hilbert(sosfilt(sos, x)))
+    py = np.angle(hilbert(sosfilt(sos, y)))
+    skip = min(len(px) // 4, int(fs))          # drop filter start-up
+    dphi = px[skip:] - py[skip:]
+    plv = float(np.abs(np.mean(np.exp(1j * dphi)))) if len(dphi) else float("nan")
+
+    # --- imaginary coherence via cross-spectral density ---
+    if nperseg is None:
+        nperseg = int(min(n, fs * 4))
+    nperseg = max(64, min(nperseg, n))
+    f, pxy = csd(x, y, fs=fs, nperseg=nperseg)
+    _, pxx = welch(x, fs=fs, nperseg=nperseg)
+    _, pyy = welch(y, fs=fs, nperseg=nperseg)
+    mask = (f >= lo) & (f < hi)
+    if not mask.any():
+        return plv, float("nan")
+    denom = np.sqrt(pxx[mask] * pyy[mask])
+    denom[denom <= 0] = np.nan
+    coherency = pxy[mask] / denom
+    imag = float(np.nanmean(np.abs(np.imag(coherency))))
+    return plv, imag
+
+
 def alpha_asymmetry(alpha_left, alpha_right):
     """Frontal alpha asymmetry: ``ln(right) - ln(left)``.
 
@@ -195,14 +354,37 @@ def optical_density(intensity, baseline):
     return -np.log10(ratio)
 
 
-def split_lateral(channel_names):
-    """Best-effort split of optics channels into (left_idx, right_idx).
+def split_lateral(channel_names, prefer_outer=True, exclude_ambient=True):
+    """Split optics channels into ``(left_idx, right_idx)``.
 
-    The Athena's optode layout is not published, so this uses name hints
-    (``L``/``R``, ``1``/``2``) and otherwise falls back to splitting the channel
-    list in half. Treat laterality from optics as provisional.
+    Uses the Athena's ``OPTICS_<side><depth>_<wavelength>`` naming when present.
+    By default this keeps only the **outer** (long-separation) detectors, which
+    are the ones that actually reach cortex — inner/short channels mostly see
+    scalp blood flow — and drops **ambient** channels, which measure background
+    light with the LEDs off rather than tissue.
+
+    Falls back to loose name hints, then to splitting the list in half, for
+    devices or firmwares that name things differently.
     """
     left, right = [], []
+    parsed_any = False
+    for i, raw in enumerate(channel_names):
+        info = parse_optics_channel(raw)
+        if info is None:
+            continue
+        parsed_any = True
+        if exclude_ambient and info["wavelength"] == "AMB":
+            continue
+        if prefer_outer and info["depth"] != "outer":
+            continue
+        (left if info["side"] == "left" else right).append(i)
+    if left and right:
+        return left, right
+    if parsed_any and prefer_outer:
+        # No outer channels present — retry including the inner ones.
+        return split_lateral(channel_names, prefer_outer=False,
+                             exclude_ambient=exclude_ambient)
+
     for i, raw in enumerate(channel_names):
         name = str(raw).upper()
         if any(tag in name for tag in ("_L", "L_", "LEFT", "-L")):

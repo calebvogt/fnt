@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
+from fnt.musestudio import theme
 from fnt.musestudio.synchrony import BANDS, PAIRS
 
 # Electrode positions in a top-down unit head (nose up); (x, y) in 0..1.
@@ -223,10 +224,63 @@ class NeuroView(QGroupBox):
             "Interhemispheric phase-locking (PLV): bottom = desynchronized, "
             "top = synchronized. 'raw' means no baseline set yet."
         )
-        body = QHBoxLayout(self)
+        root = QVBoxLayout(self)
+        body = QHBoxLayout()
         body.addWidget(self.headmap, stretch=1)
         body.addWidget(self.meter)
+        root.addLayout(body, stretch=1)
+
+        # Numeric readouts — the head map shows shape, these give the values.
+        stats = QHBoxLayout()
+        stats.setSpacing(18)
+        self._stat_labels = {}
+        for key, title, tip in (
+            ("frontal", "Frontal AF7↔AF8",
+             "Phase-locking between the two forehead electrodes (0–1).\n"
+             "Most sensitive to frontal-midline activity, but also the pair\n"
+             "most affected by blinks and brow movement."),
+            ("temporal", "Temporal TP9↔TP10",
+             "Phase-locking between the two behind-the-ear electrodes (0–1).\n"
+             "Usually the steadier pair — less blink contamination, but more\n"
+             "affected by jaw tension."),
+            ("drift", "Heterodyne drift",
+             "How fast the left/right phase difference is rotating, in Hz.\n"
+             "Near zero means the hemispheres hold a fixed phase relationship.\n"
+             "A sustained non-zero value during the heterodyne protocol is the\n"
+             "effect that protocol is trying to induce."),
+            ("state", "Signal",
+             "Whether the current reading is trustworthy. 'poor contact' means\n"
+             "an electrode is loose or you moved; 'raw' means no resting\n"
+             "baseline has been recorded yet, so the meter shows absolute PLV\n"
+             "rather than change from your own baseline."),
+        ):
+            box = QVBoxLayout()
+            cap = QLabel(title)
+            cap.setStyleSheet(f"color: {theme.TEXT_FAINT}; font-size: 10px;")
+            cap.setToolTip(tip)
+            val = QLabel("—")
+            val.setStyleSheet(f"color: {theme.TEXT}; font-size: 15px; font-weight: 700;")
+            val.setToolTip(tip)
+            box.addWidget(cap)
+            box.addWidget(val)
+            stats.addLayout(box)
+            self._stat_labels[key] = val
+        stats.addStretch()
+        root.addLayout(stats)
 
     def update_metrics(self, metrics):
         self.headmap.update_metrics(metrics)
         self.meter.update_metrics(metrics)
+        plv = metrics.plv or {}
+        self._stat_labels["frontal"].setText(f"{plv.get('frontal', 0.0):.2f}")
+        self._stat_labels["temporal"].setText(f"{plv.get('temporal', 0.0):.2f}")
+        self._stat_labels["drift"].setText(f"{metrics.drift_hz:+.2f} Hz")
+        if not metrics.contact_ok:
+            state, colour = "poor contact", theme.WARN
+        elif not metrics.calibrated:
+            state, colour = "raw (uncalibrated)", theme.TEXT_DIM
+        else:
+            state, colour = "good", theme.GOOD
+        self._stat_labels["state"].setText(state)
+        self._stat_labels["state"].setStyleSheet(
+            f"color: {colour}; font-size: 15px; font-weight: 700;")
