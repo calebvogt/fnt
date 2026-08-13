@@ -131,6 +131,14 @@ class UpdateCheckerThread(QThread):
             print(f"Update check failed: {e}")
 
 
+def _proc_alive(proc):
+    """True if a spawned subprocess.Popen is still running."""
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
+
 class FNTMainWindow(QMainWindow):
     """Main PyQt GUI window for FieldNeuroethologyToolbox"""
     
@@ -1187,15 +1195,81 @@ class FNTMainWindow(QMainWindow):
     
     # UWB Processing Methods
     def run_uwb_preprocessing(self):
-        """Launch UWB PreProcessing Tool"""
-        try:
-            from fnt.uwb.uwb_preprocessing_pyqt import UWBQuickVisualizationWindow
+        """Launch UWB PreProcessing Tool.
 
-            # Create and show the UWB PreProcessing Tool window
-            self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
-            self.uwb_quick_viz_window.show()
+        The FIRST window opens in-process for a fast, instant launch. If one is
+        already open, additional windows are spawned as SEPARATE OS processes so
+        a heavy export/animation in one window can't starve the others (each gets
+        its own Python interpreter + GIL + Qt event loop). Spawned children are
+        tracked and terminated when FNT closes.
+        """
+        # Is an in-process UWB window already alive and on screen?
+        inproc_alive = False
+        try:
+            w = getattr(self, 'uwb_quick_viz_window', None)
+            inproc_alive = w is not None and w.isVisible()
+        except RuntimeError:
+            inproc_alive = False  # underlying C++ object was deleted
+
+        if not inproc_alive:
+            # Fast path: open the first window in this process.
+            try:
+                from fnt.uwb.uwb_preprocessing_pyqt import UWBQuickVisualizationWindow
+                self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
+                self.uwb_quick_viz_window.show()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
+            return
+
+        # A window already exists -> spawn an isolated process for the extra one.
+        self._spawn_uwb_process()
+
+    def _spawn_uwb_process(self):
+        """Launch a standalone UWB PreProcessing Tool as a separate OS process."""
+        import subprocess
+
+        # Frozen/packaged builds can't run `-m`; fall back to another in-process
+        # window so the button still works (just without process isolation).
+        if getattr(sys, 'frozen', False):
+            try:
+                from fnt.uwb.uwb_preprocessing_pyqt import UWBQuickVisualizationWindow
+                win = UWBQuickVisualizationWindow()
+                win.show()
+                if not hasattr(self, '_uwb_extra_windows'):
+                    self._uwb_extra_windows = []
+                self._uwb_extra_windows.append(win)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
+            return
+
+        # Prefer pythonw.exe on Windows so no console window flashes up.
+        exe = sys.executable
+        if os.name == 'nt':
+            cand = os.path.join(os.path.dirname(exe), 'pythonw.exe')
+            if os.path.exists(cand):
+                exe = cand
+
+        env = dict(os.environ)
+        env['PYTHONIOENCODING'] = 'utf-8'  # avoid cp1252 console-encoding crashes
+
+        kwargs = {}
+        if os.name == 'nt':
+            # Don't allocate a console for the child.
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+        try:
+            proc = subprocess.Popen(
+                [exe, '-m', 'fnt.uwb.uwb_preprocessing_pyqt'],
+                env=env, **kwargs
+            )
+            if not hasattr(self, '_uwb_child_procs'):
+                self._uwb_child_procs = []
+            self._uwb_child_procs.append(proc)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to launch a separate UWB window: {e}"
+            )
 
     def run_uwb_studio(self):
         """Launch the UWB Studio (explore/animate a preprocessing export folder)."""
@@ -1717,6 +1791,47 @@ class FNTMainWindow(QMainWindow):
         if hasattr(self, 'fed_window') and self.fed_window is not None:
             try:
                 self.fed_window.close()
+            except Exception:
+                pass
+
+        # Separate-process UWB windows get hard-terminated on quit, with no
+        # chance to save an in-progress export. We can't see inside another
+        # process to know whether it's mid-export, so warn if any are still
+        # alive and let the user cancel the quit. (The in-process window runs
+        # its own close prompt below, so it's excluded here.)
+        alive_children = [p for p in getattr(self, '_uwb_child_procs', [])
+                          if _proc_alive(p)]
+        if alive_children:
+            n = len(alive_children)
+            reply = QMessageBox.question(
+                self, 'Close Application',
+                f"{n} separate UWB PreProcessing window{'s are' if n > 1 else ' is'} "
+                f"still open. Quitting FNT will close {'them' if n > 1 else 'it'} and "
+                f"cancel any export or animation still in progress.\n\nQuit anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        # User confirmed (or nothing was running): close the in-process UWB
+        # window, any frozen-fallback windows, and terminate spawned children.
+        try:
+            w = getattr(self, 'uwb_quick_viz_window', None)
+            if w is not None:
+                w.close()
+        except Exception:
+            pass
+        for win in getattr(self, '_uwb_extra_windows', []):
+            try:
+                win.close()
+            except Exception:
+                pass
+        for proc in getattr(self, '_uwb_child_procs', []):
+            try:
+                if _proc_alive(proc):
+                    proc.terminate()
             except Exception:
                 pass
 

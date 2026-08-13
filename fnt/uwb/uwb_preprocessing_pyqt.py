@@ -146,6 +146,41 @@ def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
 
+def connect_ro(path):
+    """Open a SQLite database read-only for querying, safely over a network drive.
+
+    FNT's source databases (and the index/preview DBs written alongside them)
+    frequently live on mapped/network drives. SQLite explicitly warns against
+    network filesystems: its normal file locking and memory-mapped reads are
+    unreliable over SMB and can fault the whole process with a native access
+    violation instead of a catchable error (see ~/.fnt/faulthandler_crash.log,
+    the crash inside pandas ``_fetchall_as_list``).
+
+    This opens the file with ``mode=ro&immutable=1``: SQLite treats it as stable
+    read-only media, skipping ALL locking and change-detection and never touching
+    ``-wal``/``-shm``/journal side files on the share. ``PRAGMA mmap_size=0`` then
+    forces plain ``read()`` I/O, so a bad remote page surfaces as a normal
+    ``sqlite3`` exception rather than a segfault.
+
+    Caveat: ``immutable=1`` means writes to the file while it is open are NOT
+    detected. Only use this for databases FNT treats purely as read-only sources
+    (all query paths). Writers must keep using ``sqlite3.connect`` directly.
+    """
+    import pathlib
+    try:
+        uri = pathlib.Path(path).absolute().as_uri() + "?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
+    except Exception:
+        # If URI construction/open fails for any reason, fall back to the legacy
+        # plain connection so behavior never regresses versus before this fix.
+        conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA mmap_size=0")
+    except Exception:
+        pass
+    return conn
+
+
 def processing_select_clause(conn, table_name):
     """SELECT list covering PROCESSING_COLUMNS present in ``table_name``.
 
@@ -384,7 +419,7 @@ class PreviewChunkLoader(QThread):
         try:
             # The connection must be created in this thread; sqlite3 objects
             # cannot be shared across threads.
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path)
             cols = processing_select_clause(conn, self.table_name)
             placeholders = ",".join(["?"] * len(self.tags))
             df = pd.read_sql_query(
@@ -842,7 +877,7 @@ class PlotSaverWorker(QThread):
                 self.progress.emit("Loading data from database...")
                 
                 # Connect to database
-                conn = sqlite3.connect(self.db_path)
+                conn = connect_ro(self.db_path)
                 query = (f"SELECT {processing_select_clause(conn, self.table_name)} "
                          f"FROM {self.table_name}")
                 data = pd.read_sql_query(query, conn)
@@ -3631,7 +3666,7 @@ class UWBQuickVisualizationWindow(QWidget):
     def preview_time_bounds(self, selected_tags):
         """(min_ts, max_ts) epoch-ms across the selected tags, or None."""
         try:
-            conn = sqlite3.connect(self.preview_db_path or self.db_path)
+            conn = connect_ro(self.preview_db_path or self.db_path)
             placeholders = ",".join(["?"] * len(selected_tags))
             row = conn.execute(
                 f"SELECT MIN(timestamp), MAX(timestamp) FROM {self.table_name} "
@@ -3881,7 +3916,7 @@ class UWBQuickVisualizationWindow(QWidget):
         tags = self.selected_preview_tags()
         start, _ = self._chunk_bounds(idx)
         try:
-            conn = sqlite3.connect(self.preview_db_path or self.db_path)
+            conn = connect_ro(self.preview_db_path or self.db_path)
             nxt = self._nearest_sample_ts(conn, tags, start)
             conn.close()
         except Exception:
@@ -4366,7 +4401,7 @@ class UWBQuickVisualizationWindow(QWidget):
         try:
             tz = pytz.timezone(self.combo_timezone.currentText())
             db = self.preview_db_path or self.db_path
-            conn = sqlite3.connect(db)
+            conn = connect_ro(db)
             placeholders = ",".join(["?"] * len(tags))
             # Last fix per tag: join each tag's MAX(timestamp) back to its row.
             rows = conn.execute(
@@ -4497,7 +4532,7 @@ class UWBQuickVisualizationWindow(QWidget):
         QApplication.processEvents()
 
         try:
-            conn = sqlite3.connect(db)
+            conn = connect_ro(db)
 
             # Common spatial extent so every facet shares one grid. Prefer the
             # anchor footprint (the true arena); UWB data carries stray fixes
@@ -4999,7 +5034,7 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         
         try:
-            conn = sqlite3.connect(file_path)
+            conn = connect_ro(file_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = [row[0] for row in cursor.fetchall()]
@@ -5066,7 +5101,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 pass
         if self.db_path and self.table_name:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = connect_ro(self.db_path)
                 cols = {r[1].lower() for r in conn.execute(f"PRAGMA table_info({self.table_name})")}
                 conn.close()
                 return {"shortid", "location_x", "location_y", "timestamp"}.issubset(cols)
@@ -5702,7 +5737,7 @@ class UWBQuickVisualizationWindow(QWidget):
         
         try:
             # Load first 100 rows for preview
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path)
             query = f"SELECT * FROM {self.table_name} LIMIT 100"
             df = pd.read_sql_query(query, conn)
             conn.close()
@@ -5884,7 +5919,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not dbp or not self.table_name:
             return None
         try:
-            conn = sqlite3.connect(dbp)
+            conn = connect_ro(dbp)
             tmin, tmax = conn.execute(
                 f"SELECT MIN(timestamp), MAX(timestamp) FROM {self.table_name}").fetchone()
             if tmin is None:
@@ -6110,7 +6145,7 @@ class UWBQuickVisualizationWindow(QWidget):
         tag_time_ranges = {}
         try:
             tz = pytz.timezone(self.combo_timezone.currentText())
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path)
             placeholders = ','.join(['?'] * len(selected_tags))
             query = f"SELECT shortid, MIN(timestamp) as first_ts, MAX(timestamp) as last_ts FROM {self.table_name} WHERE shortid IN ({placeholders}) GROUP BY shortid"
             cursor = conn.execute(query, selected_tags)
@@ -6180,7 +6215,7 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path)
             query = f"SELECT DISTINCT shortid FROM {self.table_name} ORDER BY shortid"
             df = pd.read_sql_query(query, conn)
             conn.close()
@@ -6203,7 +6238,7 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_ro(self.db_path)
             # Query for distinct dates
             query = f"""
                 SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), 'localtime') as date
@@ -7825,7 +7860,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 else:
                     self.log_message("Exporting raw database to CSV...")
                     QApplication.processEvents()
-                    conn = sqlite3.connect(self.db_path)
+                    conn = connect_ro(self.db_path)
                     raw_data = pd.read_sql_query(f"SELECT * FROM {self.table_name}", conn)
                     conn.close()
                     raw_data.to_csv(raw_csv_path, index=False)
@@ -7855,7 +7890,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.reset_filter_stats()
 
                 processed_chunks = []
-                conn = sqlite3.connect(self.db_path)
+                conn = connect_ro(self.db_path)
 
                 # Read only the columns the pipeline uses. The unused TEXT
                 # columns dominate memory, so this is the difference between
