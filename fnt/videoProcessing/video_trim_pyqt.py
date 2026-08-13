@@ -13,11 +13,31 @@ Matches SLEAP ROI Tool styling and workflow.
 import os
 import sys
 import cv2
+import ctypes
 import shutil
+import datetime
 import subprocess
 import numpy as np
 import tempfile
 from typing import List, Tuple, Optional
+
+
+def is_network_path(path):
+    """True if *path* lives on a network/remote drive (UNC or mapped drive)."""
+    if not path:
+        return False
+    p = str(path)
+    if p.startswith('\\\\') or p.startswith('//'):
+        return True
+    if os.name == 'nt':
+        drive = os.path.splitdrive(os.path.abspath(p))[0]
+        if drive and drive.endswith(':'):
+            DRIVE_REMOTE = 4
+            try:
+                return ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == DRIVE_REMOTE
+            except Exception:
+                return False
+    return False
 
 
 def _no_window_kwargs():
@@ -39,19 +59,83 @@ from PyQt5.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QGroupBox, QComboBox,
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QApplication,
     QProgressBar, QCheckBox, QScrollArea, QFrame, QTableWidget,
-    QTableWidgetItem, QHeaderView, QSplitter, QSizePolicy, QStackedWidget
+    QTableWidgetItem, QHeaderView, QSplitter, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QBrush, QColor
 
-# Optional audio/video playback (QtMultimedia). Guarded so the tool still works
-# for scrubbing/cropping if the multimedia plugins aren't available.
-try:
-    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-    from PyQt5.QtMultimediaWidgets import QVideoWidget
-    HAVE_QT_MULTIMEDIA = True
-except Exception:
-    HAVE_QT_MULTIMEDIA = False
+# Playback is driven by OpenCV frame stepping into the preview label rather than
+# QtMultimedia. QMediaPlayer's Windows backends (DirectShow/WMF) report
+# themselves as "available" but fail to load media in common conda/pip Qt
+# installs — and because errorString() comes back empty there is nothing to
+# surface, so the video pane just sat black. Decoding with OpenCV reuses the
+# same path that already renders the scrub preview, so it works for every codec
+# the rest of the tool can already read (notably HEVC). Trade-off: video only,
+# no audio track.
+
+
+def describe_exit_code(code):
+    """Human-readable hint for the FFmpeg/Windows exit codes we actually see."""
+    known = {
+        3221225477: "0xC0000005 ACCESS_VIOLATION — FFmpeg crashed mid-read, "
+                    "almost always a transient network/mapped-drive read error",
+        -1073741819: "0xC0000005 ACCESS_VIOLATION — FFmpeg crashed mid-read, "
+                     "almost always a transient network/mapped-drive read error",
+        3221225615: "0xC000008F FLOAT_INEXACT_RESULT — FFmpeg crashed on a "
+                    "floating-point fault, usually following corrupt input data",
+        3221225781: "0xC0000135 — a required DLL was not found",
+        1: "generic FFmpeg error (bad input, unreadable file, or write failure)",
+    }
+    hint = known.get(code)
+    return f"code {code} ({hint})" if hint else f"code {code}"
+
+
+BLUE_BUTTON_STYLE = """
+    QPushButton {
+        background-color: #0078d4;
+        color: #ffffff;
+        padding: 5px 10px;
+        font-size: 8pt;
+        border: none;
+    }
+    QPushButton:hover {
+        background-color: #1a88e0;
+    }
+    QPushButton:pressed {
+        background-color: #006cbe;
+    }
+"""
+
+
+class ElidingLabel(QLabel):
+    """QLabel that truncates long text to its own width with an ellipsis and
+    keeps the full string in the tooltip (hover to read it in full).
+
+    Uses an Ignored horizontal size policy so a long filename shrinks with the
+    panel instead of forcing the whole left column wider.
+    """
+
+    def __init__(self, text="", mode=Qt.ElideMiddle, parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        self._update_elided()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided()
+
+    def _update_elided(self):
+        fm = self.fontMetrics()
+        super().setText(
+            fm.elidedText(self._full_text, self._mode, max(0, self.width() - 2)))
 
 
 class VideoTrimConfig:
@@ -86,39 +170,125 @@ class BatchTrimWorker(QThread):
     video_finished = pyqtSignal(int, bool, str)  # video_idx, success, message
     all_finished = pyqtSignal(bool, str)
     output_message = pyqtSignal(str)  # For FFmpeg output
+    session_message = pyqtSignal(str, str)  # message, level — for Session Logs
     
+    # Extra attempts after the first for a clip that fails. Reads straight off a
+    # network share intermittently hand FFmpeg corrupt data and segfault it
+    # (0xC0000005) at a random frame, so a retry usually succeeds.
+    MAX_RETRIES = 2
+
     def __init__(self, video_configs: List[VideoTrimConfig]):
         super().__init__()
         self.video_configs = video_configs
         self.cancelled = False
-    
+        self._staged = {}      # original source path -> local staged copy
+        self._stage_dir = None
+
+    def _local_source(self, video_path):
+        """Return a local path for *video_path*, staging it off the network once.
+
+        Every clip cut from the same source reuses one staged copy, so a batch
+        of six clips from one recording copies the file a single time.
+        """
+        if video_path in self._staged:
+            return self._staged[video_path]
+        if not is_network_path(video_path):
+            return video_path
+
+        if self._stage_dir is None:
+            self._stage_dir = tempfile.mkdtemp(prefix="fnt_trim_")
+
+        local = os.path.join(self._stage_dir, os.path.basename(video_path))
+        size_mb = 0
+        try:
+            size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        except OSError:
+            pass
+        self.session_message.emit(
+            f"Staging source off the network drive before trimming "
+            f"({size_mb:.0f} MB): {os.path.basename(video_path)}", "info")
+        self.output_message.emit(
+            f"\n📥 Copying source to local temp ({size_mb:.0f} MB)…\n")
+        try:
+            shutil.copy2(video_path, local)
+        except Exception as e:
+            self.session_message.emit(
+                f"Could not stage source locally ({e}); reading from the "
+                f"network directly — crashes are more likely.", "warn")
+            self._staged[video_path] = video_path
+            return video_path
+
+        self._staged[video_path] = local
+        self.session_message.emit("Staged locally — trimming from local disk.", "ok")
+        return local
+
+    def _cleanup_stage(self):
+        if self._stage_dir:
+            shutil.rmtree(self._stage_dir, ignore_errors=True)
+            self._stage_dir = None
+        self._staged.clear()
+
     def run(self):
         """Process all videos in the batch"""
         total_videos = len(self.video_configs)
         successful = 0
         failed = 0
-        
-        for video_idx, config in enumerate(self.video_configs):
-            if self.cancelled:
-                break
-            
-            self.status.emit(f"Processing video {video_idx + 1}/{total_videos}: {os.path.basename(config.video_path)}")
-            
-            try:
-                success = self.process_video(config, video_idx)
+
+        try:
+            for video_idx, config in enumerate(self.video_configs):
+                if self.cancelled:
+                    break
+
+                name = os.path.basename(config.output_filename or config.video_path)
+                self.status.emit(
+                    f"Processing video {video_idx + 1}/{total_videos}: "
+                    f"{os.path.basename(config.video_path)}")
+                self.session_message.emit(
+                    f"[{video_idx + 1}/{total_videos}] Trimming {name} "
+                    f"({config.start_time:.1f}s → "
+                    f"{min(config.start_time + config.duration, config.total_duration):.1f}s)",
+                    "info")
+
+                success = False
+                for attempt in range(1, self.MAX_RETRIES + 2):
+                    if self.cancelled:
+                        break
+                    if attempt > 1:
+                        self.session_message.emit(
+                            f"Retry {attempt - 1}/{self.MAX_RETRIES} for {name}…", "warn")
+                    try:
+                        success = self.process_video(config, video_idx)
+                    except Exception as e:
+                        self.session_message.emit(
+                            f"Error while trimming {name}: {e}", "error")
+                        success = False
+                    if success:
+                        if attempt > 1:
+                            self.session_message.emit(
+                                f"Succeeded on retry {attempt - 1}: {name}", "ok")
+                        break
+
                 if success:
                     successful += 1
-                    self.video_finished.emit(video_idx, True, f"✅ Completed: {os.path.basename(config.video_path)}")
+                    self.session_message.emit(f"Wrote {name}", "ok")
+                    self.video_finished.emit(
+                        video_idx, True,
+                        f"✅ Completed: {os.path.basename(config.video_path)}")
                 else:
                     failed += 1
-                    self.video_finished.emit(video_idx, False, f"❌ Failed: {os.path.basename(config.video_path)}")
-            except Exception as e:
-                failed += 1
-                self.video_finished.emit(video_idx, False, f"❌ Error: {str(e)}")
-        
+                    self.session_message.emit(
+                        f"Gave up on {name} after {self.MAX_RETRIES + 1} attempts.",
+                        "error")
+                    self.video_finished.emit(
+                        video_idx, False,
+                        f"❌ Failed: {os.path.basename(config.video_path)}")
+        finally:
+            self._cleanup_stage()
+
         summary = f"Batch complete: {successful} successful, {failed} failed"
+        self.session_message.emit(summary, "ok" if failed == 0 else "warn")
         self.all_finished.emit(failed == 0, summary)
-    
+
     def process_video(self, config: VideoTrimConfig, video_idx: int) -> bool:
         """Process a single video"""
         try:
@@ -147,23 +317,40 @@ class BatchTrimWorker(QThread):
                     f"edge={config.stab_edge}{_zoom_str})\n")
             self.output_message.emit(f"{'='*80}\n\n")
             
-            # Build output path
-            output_dir = os.path.dirname(config.video_path)
-            output_file = os.path.join(output_dir, config.output_filename)
-            
+            # Build output path. When the destination is a network share we
+            # encode to a local temp file first and move it into place at the
+            # end — writing directly over the network (especially the
+            # +faststart rewrite pass) is a second 0xC0000005 crash vector.
+            final_output = os.path.join(
+                os.path.dirname(config.video_path), config.output_filename)
+            if is_network_path(final_output):
+                if self._stage_dir is None:
+                    self._stage_dir = tempfile.mkdtemp(prefix="fnt_trim_")
+                output_file = os.path.join(
+                    self._stage_dir, "out_" + config.output_filename)
+            else:
+                output_file = final_output
+
             # Build FFmpeg command
             # -hwaccel none: force software decoding to avoid GPU memory
             #   contention when inference (e.g. mask tracker) is running
-            # -threads 4: cap CPU usage so ffmpeg doesn't starve other processes
+            # -threads 1 (BEFORE -i): force single-threaded HEVC *decoding*.
+            #   Multi-threaded (frame-parallel) HEVC decode is the actual cause
+            #   of the random-frame 0xC0000005 / 0xC000009D crashes — it's a
+            #   decoder race, not a network problem. Encoder threads are set
+            #   separately after the input so libx264 still uses the CPU.
+            # Read from a local copy when the source lives on a network share.
+            source_path = self._local_source(config.video_path)
+
             command = [
                 "ffmpeg",
                 "-y",
                 "-nostdin",
                 "-hwaccel", "none",
-                "-threads", "4",
+                "-threads", "1",
                 "-ss", str(config.start_time),
                 "-to", str(end_time),
-                "-i", config.video_path,
+                "-i", source_path,
             ]
 
             has_crop = len(config.crop_polygon) >= 3
@@ -257,6 +444,7 @@ class BatchTrimWorker(QThread):
                 # --- Standard MP4 (H.264) output ---
                 command.extend([
                     "-c:v", "libx264",
+                    "-threads", "4",
                     "-preset", "medium",
                     "-crf", "18",
                     "-pix_fmt", "yuv420p",
@@ -326,7 +514,19 @@ class BatchTrimWorker(QThread):
                     pass
             
             success = process.returncode == 0
-            
+
+            # Move the locally-encoded file onto the network share now that the
+            # (crash-prone) encode is fully finished on local disk.
+            if success and output_file != final_output:
+                try:
+                    os.makedirs(os.path.dirname(final_output), exist_ok=True)
+                    shutil.move(output_file, final_output)
+                except Exception as e:
+                    self.session_message.emit(
+                        f"Encoded {os.path.basename(final_output)} but could not "
+                        f"move it to the network drive: {e}", "error")
+                    success = False
+
             # Output final diagnostics
             self.output_message.emit(f"\n{'='*80}\n")
             self.output_message.emit(f"📊 PROCESSING RESULTS:\n")
@@ -349,9 +549,18 @@ class BatchTrimWorker(QThread):
                     frame_diff = final_frame_count - expected_frames
                     self.output_message.emit(f"  ⚠️ WARNING: Frame count mismatch by {frame_diff} frames!\n")
                     self.output_message.emit(f"  ⚠️ Processed with unexpected frame count: {os.path.basename(config.video_path)}\n")
+                    # A ±1 frame difference is just rounding on the trim
+                    # boundary and doesn't warrant alarming the user.
+                    if abs(frame_diff) > 1:
+                        self.session_message.emit(
+                            f"{config.output_filename}: got {final_frame_count} frames, "
+                            f"expected {expected_frames} ({frame_diff:+d}).", "warn")
             else:
                 self.output_message.emit(f"  ❌ FFmpeg returned error code: {process.returncode}\n")
                 self.output_message.emit(f"❌ Failed to process: {os.path.basename(config.video_path)}\n")
+                self.session_message.emit(
+                    f"FFmpeg exited {describe_exit_code(process.returncode)} after "
+                    f"{final_frame_count}/{expected_frames} frames.", "error")
             
             self.output_message.emit(f"{'='*80}\n\n")
             
@@ -607,17 +816,27 @@ class VideoTrimTool(QMainWindow):
         # Worker thread
         self.processor = None
 
-        # Playback (audio+video) state
-        self.media_player = None
-        self.video_widget = None
+        # Playback state (OpenCV frame stepping — see the import-block note)
         self.is_playing = False
-        self._playback_media_path = None
-        self._pending_seek_ms = None
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self._on_playback_tick)
+        self._playback_cap = None       # VideoCapture currently being played
+        self._playback_fps = 30.0
+        self._playback_stop_time = None
+        self._playback_pos_time = None  # where a pause left off, for resuming
+        self._playback_owns_cap = False  # release the cap on stop (stab preview)
 
         # Stabilization preview state
         self._preview_worker = None
         self._previewing = False
         self._preview_out_path = None
+
+        # Session log state — dedupe repeated FFmpeg errors so one bad file
+        # doesn't flood the pane with the same line hundreds of times.
+        self._session_seen_errors = set()
+
+        # Per-clip pass/fail results for the running batch (indexed by queue position).
+        self._batch_results = []
 
         self.init_ui()
     
@@ -741,7 +960,7 @@ class VideoTrimTool(QMainWindow):
 
         # Left panel (video list and settings)
         left_panel = self.create_left_panel()
-        left_panel.setMinimumWidth(380)
+        left_panel.setMinimumWidth(300)
         splitter.addWidget(left_panel)
 
         # Right panel (preview)
@@ -817,9 +1036,13 @@ class VideoTrimTool(QMainWindow):
         
         layout.addLayout(button_layout)
         
-        # Video list
+        # Video list. Elide long filenames to the panel width (full name on
+        # hover) rather than letting them force the whole left column wider.
         self.video_list = QListWidget()
         self.video_list.setMinimumHeight(150)
+        self.video_list.setTextElideMode(Qt.ElideMiddle)
+        self.video_list.setWordWrap(False)
+        self.video_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.video_list.currentRowChanged.connect(self.on_video_selected)
         layout.addWidget(self.video_list)
         
@@ -908,6 +1131,7 @@ class VideoTrimTool(QMainWindow):
         
         self.crop_status_label = QLabel("No crop region defined")
         self.crop_status_label.setStyleSheet("color: #999999;")
+        self.crop_status_label.setWordWrap(True)  # wrap instructions, don't widen the column
         layout.addWidget(self.crop_status_label)
         
         # Export as GIF option
@@ -926,9 +1150,17 @@ class VideoTrimTool(QMainWindow):
         layout.addWidget(output_label)
 
         self.output_filename = QLineEdit()
-        self.output_filename.setPlaceholderText("video_trimmed.mp4")
+        self.output_filename.setPlaceholderText("video_trimmed  (no extension needed)")
         self.output_filename.setEnabled(False)
+        self.output_filename.textChanged.connect(self.update_filename_preview)
         layout.addWidget(self.output_filename)
+
+        # Shows the full filename (with the extension we'll actually write) so
+        # the user doesn't have to type — or worry about — .mp4 / .gif. Elides
+        # when long; hover for the full name.
+        self.output_filename_preview = ElidingLabel("")
+        self.output_filename_preview.setStyleSheet("color: #888; font-style: italic;")
+        layout.addWidget(self.output_filename_preview)
 
         # Image stabilization (optional, applied last in the pipeline)
         stab_label = QLabel("Image Stabilization (Optional):")
@@ -1115,12 +1347,13 @@ class VideoTrimTool(QMainWindow):
         self.queue_table.setMinimumHeight(150)  # Show at least 5 rows
         self.queue_table.setEditTriggers(QTableWidget.DoubleClicked)  # Allow double-click editing on clip name
         self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.queue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.queue_table.horizontalHeader().setStretchLastSection(False)
-        self.queue_table.setColumnWidth(0, 30)   # Remove button
-        self.queue_table.setColumnWidth(1, 140)  # Clip Name
-        self.queue_table.setColumnWidth(2, 70)   # Duration
-        self.queue_table.setColumnWidth(3, 120)  # Origin Video
+        header = self.queue_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.queue_table.setColumnWidth(0, 28)   # Remove button
+        self.queue_table.setColumnWidth(2, 62)   # Duration
         self.queue_table.verticalHeader().setDefaultSectionSize(22)  # Smaller row height
         self.queue_table.setStyleSheet("""
             QTableWidget {
@@ -1150,7 +1383,9 @@ class VideoTrimTool(QMainWindow):
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
         
-        self.progress_label = QLabel("")
+        # Elide the long "Processing video N/M: <filename>" status so it can't
+        # force the whole left column wider (full text on hover).
+        self.progress_label = ElidingLabel("", mode=Qt.ElideRight)
         self.progress_label.setStyleSheet("color: #999999;")
         layout.addWidget(self.progress_label)
         
@@ -1184,32 +1419,14 @@ class VideoTrimTool(QMainWindow):
         
         layout.addLayout(button_layout)
         
-        # Output window
-        output_header_layout = QHBoxLayout()
+        # --- FFmpeg output (raw, verbose) ---
         output_label = QLabel("FFmpeg Output:")
         output_label.setFont(QFont("Arial", 9, QFont.Bold))
-        output_header_layout.addWidget(output_label)
-        output_header_layout.addStretch()
-
-        self.btn_copy_logs = QPushButton("Copy Output Logs to Clipboard")
-        self.btn_copy_logs.clicked.connect(self.copy_logs_to_clipboard)
-        self.btn_copy_logs.setStyleSheet("""
-            QPushButton {
-                background-color: #3f3f3f;
-                color: #cccccc;
-                padding: 4px 10px;
-                font-size: 8pt;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-        """)
-        output_header_layout.addWidget(self.btn_copy_logs)
-        layout.addLayout(output_header_layout)
+        layout.addWidget(output_label)
 
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
-        self.output_text.setMinimumHeight(250)  # Increased from 150
+        self.output_text.setMinimumHeight(200)
         self.output_text.setStyleSheet("""
             QTextEdit {
                 background-color: #1e1e1e;
@@ -1219,7 +1436,35 @@ class VideoTrimTool(QMainWindow):
             }
         """)
         layout.addWidget(self.output_text)
-        
+
+        self.btn_copy_logs = QPushButton("Copy FFmpeg Output Logs to Clipboard")
+        self.btn_copy_logs.clicked.connect(self.copy_logs_to_clipboard)
+        self.btn_copy_logs.setStyleSheet(BLUE_BUTTON_STYLE)
+        layout.addWidget(self.btn_copy_logs)
+
+        # --- Session log (high-level actions + distilled errors) ---
+        session_label = QLabel("Session Logs:")
+        session_label.setFont(QFont("Arial", 9, QFont.Bold))
+        layout.addWidget(session_label)
+
+        self.session_text = QTextEdit()
+        self.session_text.setReadOnly(True)
+        self.session_text.setMinimumHeight(200)
+        self.session_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: 9pt;
+            }
+        """)
+        layout.addWidget(self.session_text)
+
+        self.btn_copy_session = QPushButton("Copy Session Logs to Clipboard")
+        self.btn_copy_session.clicked.connect(self.copy_session_to_clipboard)
+        self.btn_copy_session.setStyleSheet(BLUE_BUTTON_STYLE)
+        layout.addWidget(self.btn_copy_session)
+
         group.setLayout(layout)
         return group
     
@@ -1236,25 +1481,11 @@ class VideoTrimTool(QMainWindow):
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet("background-color: black; border: 2px solid #0078d4;")
-        self.preview_label.setMinimumSize(960, 540)  # Larger preview (16:9 aspect ratio)
+        self.preview_label.setMinimumSize(480, 270)  # 16:9 floor; stretches to fill
         self.preview_label.setText("Select a video to begin")
 
-        # Stack the still-frame preview (scrub/crop) with a video widget used for
-        # actual playback (with audio). Page 0 = still frame, page 1 = playback.
-        self.preview_stack = QStackedWidget()
-        self.preview_stack.addWidget(self.preview_label)
-        if HAVE_QT_MULTIMEDIA:
-            self.video_widget = QVideoWidget()
-            self.video_widget.setStyleSheet("background-color: black;")
-            self.preview_stack.addWidget(self.video_widget)
-
-            self.media_player = QMediaPlayer(self)
-            self.media_player.setVideoOutput(self.video_widget)
-            self.media_player.stateChanged.connect(self.on_media_state_changed)
-            self.media_player.positionChanged.connect(self.on_media_position_changed)
-            self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
-            self.media_player.error.connect(self.on_media_error)
-        preview_layout.addWidget(self.preview_stack, stretch=1)
+        # Scrubbing, cropping and playback all render into this one label.
+        preview_layout.addWidget(self.preview_label, stretch=1)
         
         # Start position controls (moved inside preview group, closer to video)
         position_controls = QVBoxLayout()
@@ -1292,25 +1523,11 @@ class VideoTrimTool(QMainWindow):
         self.time_range_slider.handleActivated.connect(self.on_range_handle_activated)
         position_controls.addWidget(self.time_range_slider)
         
-        # Playback controls (audio + video)
-        playback_row = QHBoxLayout()
-        playback_row.addStretch()
-        self.btn_play = QPushButton("▶ Play")
-        self.btn_play.setFixedWidth(120)
-        self.btn_play.setEnabled(False)
-        self.btn_play.clicked.connect(self.toggle_playback)
-        playback_row.addWidget(self.btn_play)
-        self.mute_check = QCheckBox("Mute")
-        self.mute_check.setChecked(False)
-        self.mute_check.stateChanged.connect(self.on_mute_changed)
-        playback_row.addWidget(self.mute_check)
-        playback_row.addStretch()
-        position_controls.addLayout(playback_row)
-
-        if not HAVE_QT_MULTIMEDIA:
-            self.btn_play.setToolTip(
-                "Playback unavailable: PyQt5 QtMultimedia is not installed in this environment.")
-            self.mute_check.setEnabled(False)
+        # Scrub with the range slider and the ±time buttons below. (There is no
+        # play button: QtMultimedia playback was unreliable here — see the
+        # import-block note — so the tool navigates by stepping to still
+        # frames. The stabilization preview still animates via the internal
+        # OpenCV playback engine.)
 
         # Adjustment buttons
         button_layout = QHBoxLayout()
@@ -1324,6 +1541,10 @@ class VideoTrimTool(QMainWindow):
             btn = QPushButton(label)
             btn.setFixedWidth(60)
             btn.clicked.connect(lambda checked, s=seconds: self.adjust_position(s))
+            # Hold the button down to keep stepping instead of clicking repeatedly.
+            btn.setAutoRepeat(True)
+            btn.setAutoRepeatDelay(400)      # ms before the repeat kicks in
+            btn.setAutoRepeatInterval(120)   # ms between repeated steps
             btn.setEnabled(False)
             button_layout.addWidget(btn)
             self.adjustment_buttons.append(btn)
@@ -1369,9 +1590,13 @@ class VideoTrimTool(QMainWindow):
         # Create config
         config = VideoTrimConfig(video_path)
         self.video_configs.append(config)
+        net = " (network drive — will be staged locally when trimming)" \
+            if is_network_path(video_path) else ""
+        self.log_session(f"Added video: {os.path.basename(video_path)}{net}")
         
-        # Add to list widget
+        # Add to list widget (full path on hover, since the name is elided)
         item = QListWidgetItem(f"📹 {os.path.basename(video_path)}")
+        item.setToolTip(video_path)
         self.video_list.addItem(item)
         
         # Enable navigation
@@ -1415,12 +1640,11 @@ class VideoTrimTool(QMainWindow):
         
         config = self.video_configs[self.current_config_idx]
 
-        # Stop any playback and release the previous media so file handles free up.
-        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
-            self.media_player.stop()
-            self.media_player.setMedia(QMediaContent())
-            self._playback_media_path = None
-            self._pending_seek_ms = None
+        # Stop any playback before swapping the capture out from under it.
+        if self.is_playing:
+            self._stop_playback()
+        self._playback_cap = None
+        self._playback_pos_time = None
 
         # Release previous video
         if self.preview_cap:
@@ -1464,8 +1688,9 @@ class VideoTrimTool(QMainWindow):
             ext = '.gif' if config.export_gif else '.mp4'
             config.output_filename = f"{base_name}_trimmed{ext}"
         
-        # Update UI
-        self.output_filename.setText(config.output_filename)
+        # Update UI (show the bare name; the extension appears in the preview)
+        self.output_filename.setText(
+            os.path.splitext(config.output_filename)[0])
         self.output_filename.setEnabled(True)
         
         # Enable controls
@@ -1489,8 +1714,6 @@ class VideoTrimTool(QMainWindow):
         self.export_gif_check.setEnabled(True)
         self.stabilize_check.setEnabled(True)
         self.btn_add_to_queue.setEnabled(True)
-        if HAVE_QT_MULTIMEDIA:
-            self.btn_play.setEnabled(True)
 
         # Trigger UI mode update (show correct slider for current duration mode)
         self.on_duration_changed(self.duration_combo.currentText())
@@ -1693,11 +1916,9 @@ class VideoTrimTool(QMainWindow):
         if self.current_config_idx >= len(self.video_configs):
             return
         
-        # Crop drawing happens on the still-frame page — stop playback and show it.
-        if HAVE_QT_MULTIMEDIA and self.media_player is not None and self.is_playing:
-            self.media_player.pause()
-        if hasattr(self, "preview_stack"):
-            self.preview_stack.setCurrentWidget(self.preview_label)
+        # Crop drawing happens on the still frame — stop playback and restore it.
+        if self.is_playing:
+            self._stop_playback(rewind=True)
 
         self.drawing_crop = True
         config = self.video_configs[self.current_config_idx]
@@ -1787,107 +2008,104 @@ class VideoTrimTool(QMainWindow):
         self.preview_label.setMouseTracking(False)
         self.update_preview()
     
-    def toggle_playback(self):
-        """Play/pause the current video (with audio) between start and stop times."""
-        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
-            return
-        if self.current_config_idx >= len(self.video_configs):
-            return
+    def _playback_interval_ms(self):
+        """Timer interval for the current fps (real-time, 1x)."""
+        fps = self._playback_fps if self._playback_fps and self._playback_fps > 0 else 30.0
+        return max(10, int(round(1000.0 / fps)))
 
-        if self.is_playing:
-            self.media_player.pause()
-            return
+    def _start_playback(self, cap, fps, start_time, stop_time, owns_cap=False):
+        """Begin frame-stepping *cap* from start_time up to stop_time."""
+        self._playback_cap = cap
+        self._playback_fps = fps if fps and fps > 0 else 30.0
+        self._playback_stop_time = stop_time
+        self._playback_owns_cap = owns_cap
 
-        # Leaving preview mode: play the real clip's trim window from here on.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * self._playback_fps))
+
+        self.is_playing = True
+        self.playback_timer.start(self._playback_interval_ms())
+
+    def _stop_playback(self, rewind=False):
+        """Stop the playback timer. With rewind=True, snap back to the config frame."""
+        self.playback_timer.stop()
+        self.is_playing = False
+
+        if self._playback_owns_cap and self._playback_cap is not None:
+            self._playback_cap.release()
+            self._playback_cap = None
+            self._playback_owns_cap = False
+
+        was_previewing = self._previewing
         self._previewing = False
 
-        config = self.video_configs[self.current_config_idx]
-        start_ms = int(config.start_time * 1000)
-        if config.stop_time is not None:
-            stop_ms = int(config.stop_time * 1000)
-        else:
-            stop_ms = int(config.total_duration * 1000)
-
-        # Show the video widget for playback.
-        self.preview_stack.setCurrentWidget(self.video_widget)
-        self.media_player.setMuted(self.mute_check.isChecked())
-
-        # (Re)load media if this is a different file. setMedia is async, so defer
-        # the seek to the trim start until the media reports it has loaded.
-        if self._playback_media_path != config.video_path:
-            self.media_player.setMedia(
-                QMediaContent(QUrl.fromLocalFile(config.video_path)))
-            self._playback_media_path = config.video_path
-            self._pending_seek_ms = start_ms
-        else:
-            pos = self.media_player.position()
-            # Restart from the trim start if we're outside the [start, stop] window.
-            if pos < start_ms or pos >= stop_ms:
-                self.media_player.setPosition(start_ms)
-
-        self.media_player.play()
-
-    def on_media_status_changed(self, status):
-        """Apply a deferred seek once freshly-loaded media is ready."""
-        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
-            return
-        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) \
-                and self._pending_seek_ms is not None:
-            self.media_player.setPosition(self._pending_seek_ms)
-            self._pending_seek_ms = None
-
-    def on_media_position_changed(self, position_ms):
-        """Stop playback at the configured stop time (preview the trim window)."""
-        # The stabilization preview plays a standalone temp clip; the real
-        # clip's stop-time window doesn't apply to it.
-        if self._previewing:
-            return
-        if not self.is_playing or self.current_config_idx >= len(self.video_configs):
-            return
-        config = self.video_configs[self.current_config_idx]
-        if config.stop_time is not None:
-            stop_ms = int(config.stop_time * 1000)
-        else:
-            stop_ms = int(config.total_duration * 1000)
-        if position_ms >= stop_ms:
-            self.media_player.pause()
-            self.media_player.setPosition(stop_ms)
-
-    def on_media_state_changed(self, state):
-        """Keep the Play/Pause button in sync with the player state."""
-        self.is_playing = (state == QMediaPlayer.PlayingState)
-        self.btn_play.setText("⏸ Pause" if self.is_playing else "▶ Play")
-
-    def on_mute_changed(self, _state):
-        """Toggle audio mute during playback."""
-        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
-            self.media_player.setMuted(self.mute_check.isChecked())
-
-    def on_media_error(self, *_args):
-        """Surface playback errors and fall back to the still-frame preview."""
-        if not HAVE_QT_MULTIMEDIA or self.media_player is None:
-            return
-        err = self.media_player.errorString()
-        if err:
-            if hasattr(self, "output_text") and self.output_text is not None:
-                self.output_text.append(f"⚠️ Playback error: {err}")
-            self.preview_stack.setCurrentWidget(self.preview_label)
+        if rewind:
+            self._playback_pos_time = None
+            # Restore the still frame for the configured trim position.
             self.update_preview()
+        elif was_previewing:
+            self._playback_pos_time = None
+            self.update_preview()
+
+    def _on_playback_tick(self):
+        """Render the next frame; stop at the trim stop time or end of stream."""
+        cap = self._playback_cap
+        if cap is None:
+            self._stop_playback(rewind=True)
+            return
+
+        ret, frame = cap.read()
+        if not ret:
+            self._stop_playback(rewind=True)
+            return
+
+        fps = self._playback_fps if self._playback_fps > 0 else 30.0
+        cur_time = cap.get(cv2.CAP_PROP_POS_FRAMES) / fps
+
+        if self._playback_stop_time is not None and cur_time >= self._playback_stop_time:
+            self._stop_playback(rewind=True)
+            return
+
+        self._playback_pos_time = cur_time
+        self.current_frame = frame.copy()
+
+        # Overlay the crop polygon on the real clip, but not on the standalone
+        # stabilization preview (its geometry no longer matches the source).
+        polygon = ()
+        if not self._previewing and self.current_config_idx < len(self.video_configs):
+            polygon = self.video_configs[self.current_config_idx].crop_polygon
+
+        self._render_frame_to_label(frame, polygon)
+
+    def _render_frame_to_label(self, frame, polygon=()):
+        """Draw *frame* (plus an optional crop polygon) into the preview label."""
+        frame_display = frame.copy()
+
+        if len(polygon) > 0:
+            for i in range(len(polygon)):
+                pt1 = polygon[i]
+                pt2 = polygon[(i + 1) % len(polygon)]
+                cv2.line(frame_display, pt1, pt2, (0, 255, 0), 2)
+            for pt in polygon:
+                cv2.circle(frame_display, pt, 5, (0, 255, 0), -1)
+
+        frame_rgb = cv2.cvtColor(frame_display, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        qt_image = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_image)
+        self.preview_label.setPixmap(pixmap.scaled(
+            self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def update_preview(self):
         """Update video preview"""
         if self.current_config_idx >= len(self.video_configs) or not self.preview_cap:
             return
 
-        # Scrubbing/crop always uses the still-frame page — pause playback and
-        # switch away from the video widget so the updated frame is visible.
-        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
-            self._previewing = False
-            if self.is_playing:
-                self.media_player.pause()
-            if hasattr(self, "preview_stack") and self.preview_stack.currentWidget() is not self.preview_label:
-                self.preview_stack.setCurrentWidget(self.preview_label)
-        
+        # Scrubbing/crop shows a still frame — stop playback so the two don't
+        # fight over the capture's read position.
+        if self.is_playing:
+            self._stop_playback()
+            self._playback_pos_time = None
+
         config = self.video_configs[self.current_config_idx]
 
         # Determine which time to preview: stop frame when stop handle is active
@@ -1902,33 +2120,12 @@ class VideoTrimTool(QMainWindow):
         frame_number = int(preview_time * config.fps)
         self.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ret, frame = self.preview_cap.read()
-        
+
         if not ret:
             return
-        
+
         self.current_frame = frame.copy()
-        frame_display = frame.copy()
-        
-        # Draw crop polygon if defined
-        if len(config.crop_polygon) > 0:
-            for i in range(len(config.crop_polygon)):
-                pt1 = config.crop_polygon[i]
-                pt2 = config.crop_polygon[(i + 1) % len(config.crop_polygon)]
-                cv2.line(frame_display, pt1, pt2, (0, 255, 0), 2)
-            
-            for pt in config.crop_polygon:
-                cv2.circle(frame_display, pt, 5, (0, 255, 0), -1)
-        
-        # Convert to Qt format
-        frame_rgb = cv2.cvtColor(frame_display, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        
-        self.preview_label.setPixmap(scaled_pixmap)
+        self._render_frame_to_label(frame, config.crop_polygon)
     
     @staticmethod
     def _with_extension(name: str, ext: str) -> str:
@@ -1943,20 +2140,30 @@ class VideoTrimTool(QMainWindow):
         return name + ext
 
     def on_export_gif_toggled(self, _state):
-        """Swap the output filename extension when 'Export as GIF' changes."""
+        """Update the shown extension when 'Export as GIF' changes."""
         is_gif = self.export_gif_check.isChecked()
         ext = '.gif' if is_gif else '.mp4'
 
         text = self.output_filename.text().strip()
-        if text:
-            new_name = self._with_extension(text, ext)
-            self.output_filename.setText(new_name)
+        self.update_filename_preview()
 
         if self.current_config_idx < len(self.video_configs):
             config = self.video_configs[self.current_config_idx]
             config.export_gif = is_gif
             if text:
-                config.output_filename = self.output_filename.text().strip()
+                config.output_filename = self._with_extension(text, ext)
+
+    def update_filename_preview(self):
+        """Show the full output filename (with extension) below the text box."""
+        text = self.output_filename.text().strip()
+        ext = '.gif' if self.export_gif_check.isChecked() else '.mp4'
+        if text:
+            full = self._with_extension(text, ext)
+            self.output_filename_preview.setText(f"Saves as:  {full}")
+            self.output_filename.setToolTip(full)
+        else:
+            self.output_filename_preview.setText("")
+            self.output_filename.setToolTip("")
 
     def on_stabilize_toggled(self, _state):
         """Show/hide stabilization params and store the flag on the config."""
@@ -2086,22 +2293,25 @@ class VideoTrimTool(QMainWindow):
                 "See the FFmpeg output for details.")
             return
 
-        if not (HAVE_QT_MULTIMEDIA and self.media_player is not None):
-            QMessageBox.information(
-                self, "Preview Ready",
-                f"Stabilized preview written to:\n{self._preview_out_path}\n\n"
-                "(In-app playback is unavailable in this environment.)")
+        # Play the temp preview clip in the preview pane.
+        if self.is_playing:
+            self._stop_playback()
+
+        cap = cv2.VideoCapture(self._preview_out_path)
+        if not cap.isOpened():
+            QMessageBox.warning(
+                self, "Preview Failed",
+                f"Rendered the preview but could not open it for playback:\n"
+                f"{self._preview_out_path}")
             return
 
-        # Play the temp preview clip in the video pane.
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        duration = (frames / fps) if fps else None
+
+        self.log_session(f"Playing stabilization preview ({self.format_time(duration or 0)})")
         self._previewing = True
-        self.preview_stack.setCurrentWidget(self.video_widget)
-        self.media_player.setMuted(self.mute_check.isChecked())
-        self.media_player.setMedia(
-            QMediaContent(QUrl.fromLocalFile(self._preview_out_path)))
-        self._playback_media_path = self._preview_out_path
-        self._pending_seek_ms = 0
-        self.media_player.play()
+        self._start_playback(cap, fps, 0.0, duration, owns_cap=True)
 
     def add_to_queue(self):
         """Add current video clip to processing queue"""
@@ -2154,7 +2364,19 @@ class VideoTrimTool(QMainWindow):
         
         # Add to queue
         self.processing_queue.append(clip_config)
-        
+
+        extras = []
+        if clip_config.crop_polygon:
+            extras.append(f"crop ({len(clip_config.crop_polygon)} pts)")
+        if clip_config.stabilize:
+            extras.append("stabilize")
+        if clip_config.export_gif:
+            extras.append("GIF")
+        suffix = f" [{', '.join(extras)}]" if extras else ""
+        self.log_session(
+            f"Queued {output_filename}: {self.format_time(clip_config.start_time)} "
+            f"+{self.format_time(clip_config.duration)}{suffix}")
+
         # Add to queue table
         row_position = self.queue_table.rowCount()
         self.queue_table.insertRow(row_position)
@@ -2180,9 +2402,10 @@ class VideoTrimTool(QMainWindow):
         remove_btn.clicked.connect(lambda checked, row=row_position: self.remove_clip_from_queue(row))
         self.queue_table.setCellWidget(row_position, 0, remove_btn)
         
-        # Clip Name (editable by double-click)
+        # Clip Name (editable by double-click; full name on hover)
         clip_name_item = QTableWidgetItem(output_filename)
         clip_name_item.setFlags(clip_name_item.flags() | Qt.ItemIsEditable)
+        clip_name_item.setToolTip(output_filename)
         self.queue_table.setItem(row_position, 1, clip_name_item)
         
         # Duration (read-only)
@@ -2191,10 +2414,11 @@ class VideoTrimTool(QMainWindow):
         duration_item.setFlags(duration_item.flags() & ~Qt.ItemIsEditable)
         self.queue_table.setItem(row_position, 2, duration_item)
         
-        # Origin Video (read-only)
+        # Origin Video (read-only; full path on hover)
         origin_video = os.path.basename(config.video_path)
         origin_item = QTableWidgetItem(origin_video)
         origin_item.setFlags(origin_item.flags() & ~Qt.ItemIsEditable)
+        origin_item.setToolTip(config.video_path)
         self.queue_table.setItem(row_position, 3, origin_item)
         
         # Re-enable signals
@@ -2206,8 +2430,8 @@ class VideoTrimTool(QMainWindow):
         base_name = os.path.splitext(os.path.basename(config.video_path))[0]
         ext = '.gif' if is_gif else '.mp4'
         config.output_filename = f"{base_name}_trimmed{ext}"
-        self.output_filename.setText(config.output_filename)
-        
+        self.output_filename.setText(f"{base_name}_trimmed")
+
         # DON'T auto-advance to next video - user can make multiple clips from same video
         # Crop stays applied for next clip
     
@@ -2272,10 +2496,16 @@ class VideoTrimTool(QMainWindow):
 
         # Clear output window
         self.output_text.clear()
-        
+        self._session_seen_errors.clear()
+
         # processing_queue now contains VideoTrimConfig objects directly
         configs_to_process = self.processing_queue
-        
+
+        self._batch_results = [None] * len(configs_to_process)
+
+        self.log_session(
+            f"Started batch processing — {len(configs_to_process)} clip(s) queued.")
+
         # Start worker
         self.processor = BatchTrimWorker(configs_to_process)
         self.processor.progress.connect(self.on_batch_progress)
@@ -2283,6 +2513,7 @@ class VideoTrimTool(QMainWindow):
         self.processor.video_finished.connect(self.on_video_finished)
         self.processor.all_finished.connect(self.on_batch_finished)
         self.processor.output_message.connect(self.on_output_message)
+        self.processor.session_message.connect(self.log_session)
         self.processor.start()
         
         # Update UI
@@ -2293,6 +2524,7 @@ class VideoTrimTool(QMainWindow):
     def cancel_batch_processing(self):
         """Cancel batch processing"""
         if self.processor and self.processor.isRunning():
+            self.log_session("Batch cancelled by user.", "warn")
             self.processor.cancel()
     
     def on_batch_progress(self, video_idx, percent):
@@ -2310,8 +2542,31 @@ class VideoTrimTool(QMainWindow):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.output_text.toPlainText())
         self.btn_copy_logs.setText("Copied!")
-        from PyQt5.QtCore import QTimer
-        QTimer.singleShot(2000, lambda: self.btn_copy_logs.setText("Copy Output Logs to Clipboard"))
+        QTimer.singleShot(2000, lambda: self.btn_copy_logs.setText(
+            "Copy FFmpeg Output Logs to Clipboard"))
+
+    def copy_session_to_clipboard(self):
+        """Copy the session log to clipboard"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.session_text.toPlainText())
+        self.btn_copy_session.setText("Copied!")
+        QTimer.singleShot(2000, lambda: self.btn_copy_session.setText(
+            "Copy Session Logs to Clipboard"))
+
+    def log_session(self, message, level="info"):
+        """Append a high-level entry to the Session Logs pane.
+
+        This is the human-readable narrative of the session — what the user did
+        and what went wrong — deliberately kept free of raw FFmpeg progress
+        spam so it stays useful for troubleshooting.
+        """
+        if not hasattr(self, "session_text") or self.session_text is None:
+            return
+        prefix = {"info": "", "ok": "✅ ", "warn": "⚠️ ", "error": "❌ "}.get(level, "")
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.session_text.append(f"[{stamp}] {prefix}{message}")
+        self.session_text.verticalScrollBar().setValue(
+            self.session_text.verticalScrollBar().maximum())
 
     def on_output_message(self, message):
         """Handle FFmpeg output message"""
@@ -2320,25 +2575,121 @@ class VideoTrimTool(QMainWindow):
         self.output_text.verticalScrollBar().setValue(
             self.output_text.verticalScrollBar().maximum()
         )
+        self._scan_ffmpeg_line_for_session_log(message)
+
+    # FFmpeg lines worth promoting into the Session Log, with a plain-English
+    # explanation of what each one actually means for the user.
+    _FFMPEG_DIAGNOSTICS = [
+        ("Invalid data found when processing input",
+         "FFmpeg hit undecodable data in the source — the read was corrupted or "
+         "the source is damaged at that point."),
+        ("error while decoding",
+         "A frame failed to decode; output may be short or contain glitches."),
+        ("Conversion failed",
+         "FFmpeg aborted the conversion before finishing."),
+        ("No such file or directory",
+         "FFmpeg could not find the input or output path."),
+        ("Permission denied",
+         "FFmpeg could not write the output (file locked, or no write access)."),
+        ("moov atom not found",
+         "The source MP4 has no index — it is truncated or still being written."),
+        ("Output file is empty",
+         "Nothing was encoded — check the trim start/stop against the source duration."),
+        ("non monotonically increasing dts",
+         "Timestamps are out of order in the source; output timing may drift."),
+    ]
+
+    def _scan_ffmpeg_line_for_session_log(self, message):
+        """Promote meaningful FFmpeg errors into the Session Log.
+
+        Progress lines ("frame= ... fps= ...") and the banner/config dump are
+        skipped — only lines that explain a failure are surfaced.
+        """
+        for line in message.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("frame="):
+                continue
+            for needle, explanation in self._FFMPEG_DIAGNOSTICS:
+                if needle.lower() in stripped.lower():
+                    if stripped not in self._session_seen_errors:
+                        self._session_seen_errors.add(stripped)
+                        self.log_session(f"FFmpeg: {stripped}", level="warn")
+                        self.log_session(f"    → {explanation}")
+                    break
     
     def on_video_finished(self, video_idx, success, message):
-        """Handle individual video completion"""
+        """Handle individual video completion — mark the row green/red."""
         self.progress_label.setText(message)
-    
+        if video_idx < len(self._batch_results):
+            self._batch_results[video_idx] = success
+
+        # Colour the row so the user can see at a glance which clips made it.
+        if video_idx < self.queue_table.rowCount():
+            colour = QColor("#1a3d1a") if success else QColor("#3d1a1a")
+            for col in range(self.queue_table.columnCount()):
+                item = self.queue_table.item(video_idx, col)
+                if item:
+                    item.setBackground(colour)
+
     def on_batch_finished(self, success, message):
-        """Handle batch completion"""
+        """Handle batch completion — let the user choose what stays in the queue."""
         self.btn_start_batch.setEnabled(True)
         self.btn_cancel_batch.setEnabled(False)
         self.progress_bar.setValue(100)
-        
+
+        failed_indices = [
+            i for i, ok in enumerate(self._batch_results) if not ok]
+
         if success:
+            # Everything passed — just clear and confirm.
             QMessageBox.information(self, "Success", message)
+            self.processing_queue = []
+            self.queue_table.setRowCount(0)
+            self.update_queue_status()
+            return
+
+        # Some clips failed — ask how to handle the queue.
+        n_failed = len(failed_indices)
+        n_ok = len(self._batch_results) - n_failed
+        box = QMessageBox(self)
+        box.setWindowTitle("Batch Complete")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(message)
+        box.setInformativeText(
+            f"{n_ok} clip(s) succeeded, {n_failed} failed.\n\n"
+            "What would you like to do with the queue?")
+        btn_keep_failed = box.addButton(
+            f"Keep {n_failed} Failed Clip(s)", QMessageBox.AcceptRole)
+        btn_clear_all = box.addButton("Clear All", QMessageBox.DestructiveRole)
+        box.setDefaultButton(btn_keep_failed)
+        box.exec_()
+
+        if box.clickedButton() == btn_clear_all:
+            self.processing_queue = []
+            self.queue_table.setRowCount(0)
         else:
-            QMessageBox.warning(self, "Batch Complete", message)
-        
-        # Clear queue
-        self.processing_queue = []
-        self.queue_table.setRowCount(0)  # Clear all rows from table
+            # Remove succeeded rows (iterate from bottom so indices stay valid)
+            for i in sorted(
+                    (i for i, ok in enumerate(self._batch_results) if ok),
+                    reverse=True):
+                self.queue_table.removeRow(i)
+                del self.processing_queue[i]
+
+            # Reset row background colours and reconnect remove buttons
+            for row in range(self.queue_table.rowCount()):
+                for col in range(self.queue_table.columnCount()):
+                    item = self.queue_table.item(row, col)
+                    if item:
+                        item.setBackground(QColor("#2d2d2d"))
+                widget = self.queue_table.cellWidget(row, 0)
+                if widget is not None:
+                    try:
+                        widget.clicked.disconnect()
+                    except TypeError:
+                        pass
+                    widget.clicked.connect(
+                        lambda _checked, r=row: self.remove_clip_from_queue(r))
+
         self.update_queue_status()
     
     def format_time(self, seconds):
@@ -2350,9 +2701,10 @@ class VideoTrimTool(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close"""
-        if HAVE_QT_MULTIMEDIA and self.media_player is not None:
-            self.media_player.stop()
-            self.media_player.setMedia(QMediaContent())
+        self.playback_timer.stop()
+        if self._playback_owns_cap and self._playback_cap is not None:
+            self._playback_cap.release()
+        self._playback_cap = None
         if self.preview_cap:
             self.preview_cap.release()
         event.accept()
