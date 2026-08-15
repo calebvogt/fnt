@@ -23,10 +23,12 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
 from PyQt5.QtCore import (
-    Qt, QEvent, QObject, QSettings, QThread, QTimer, QRectF, QPointF, pyqtSignal,
+    Qt, QEvent, QObject, QSettings, QSize, QThread, QTimer, QRectF, QPointF,
+    pyqtSignal,
 )
 from PyQt5.QtGui import (
-    QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF, QPalette,
+    QIcon, QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
+    QPalette,
 )
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -352,6 +354,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self.mask_alpha = 0.45
         # Render mode: 'spec' | 'overlay' | 'mask_only'
         self.view_mode: str = 'overlay'
+        # Display-only confidence floor for pending predictions (0 = off).
+        self.min_score: float = 0.0
 
         # Inference loading overlay
         self._infer_loading = False
@@ -1052,6 +1056,23 @@ class MADSpectrogramWidget(SpectrogramWidget):
             self.zoom_requested.emit(1.25, center_time)
         event.accept()
 
+    # --- score filtering -------------------------------------------------
+    def set_min_score(self, v: float) -> None:
+        """Hide pending predictions scoring below ``v`` (0 = show everything).
+
+        Display-only: the annotations stay in the list and on disk. Reviewed
+        calls are never hidden — a decision is not a guess.
+        """
+        v = max(0.0, min(1.0, float(v)))
+        if v != self.min_score:
+            self.min_score = v
+            self.update()
+
+    def _score_hidden(self, ann: dict) -> bool:
+        return (self.min_score > 0.0
+                and ann.get('status') == 'prediction'
+                and float(ann.get('score') or 0.0) < self.min_score)
+
     # --- overlay colors -------------------------------------------------
     def palette_colors(self) -> dict:
         """Review-overlay colors matched to the loaded spectrogram colormap."""
@@ -1146,6 +1167,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
             st = ann.get('status')
             code = 2 if st == 'prediction' else (3 if st == 'rejected' else 0)
             if not code:
+                continue
+            if self._score_hidden(ann):
                 continue
             af0 = max(ann['f0'], f_start); af1 = min(ann['f1'], f_end)
             at0 = max(ann['t0'], t_start); at1 = min(ann['t1'], t_end)
@@ -1254,6 +1277,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 and overlays_visible):
             for ai, ann in enumerate(self.annotations):
                 if ai == self._editing_ann_idx:
+                    continue
+                if self._score_hidden(ann):
                     continue
                 if (ann['t1'] <= t_start or ann['t0'] >= t_end or
                         ann['f1'] <= f_start or ann['f0'] >= f_end):
@@ -2407,6 +2432,635 @@ class MADTrainGraphDialog(QDialog):
         self._main._on_train_dialog_close(event)
 
 
+class MADGalleryDialog(QDialog):
+    """Contact sheet of pending detections — accept or reject by clicking tiles.
+
+    Reviewing one call at a time in the spectrogram is the throughput ceiling
+    after a large batch run. This shows a grid of mask crops instead, so a
+    screenful of decisions replaces a screenful of navigation.
+
+    It costs almost nothing to build: the per-call crops are already stored in
+    each recording's ``_FNT_masks.h5`` (that is why MAD saves crops rather than
+    the probability grid), so a page is a few hundred KB of reads and no audio
+    is touched.
+    """
+
+    TILE = 132
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Detection Gallery")
+        self.resize(980, 700)
+        self._tiles: List[dict] = []
+        self._page = 0
+        self._per_page = 48
+        self._marks: Dict[str, str] = {}   # ann id -> 'accept' | 'reject'
+
+        v = QVBoxLayout(self)
+        head = QLabel(
+            "Pending detections for the current file, newest inference first. "
+            "<b>Click</b> a tile to cycle accept → reject → undecided, then "
+            "<b>Apply</b>. Sorted by confidence so the model's weakest guesses "
+            "come last.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        v.addWidget(head)
+
+        bar = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev page")
+        self.btn_prev.clicked.connect(lambda: self._go(-1))
+        bar.addWidget(self.btn_prev)
+        self.lbl_page = QLabel("")
+        self.lbl_page.setAlignment(Qt.AlignCenter)
+        bar.addWidget(self.lbl_page, 1)
+        self.btn_next = QPushButton("Next page ▶")
+        self.btn_next.clicked.connect(lambda: self._go(1))
+        bar.addWidget(self.btn_next)
+        v.addLayout(bar)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self._grid_host = QWidget()
+        self.scroll.setWidget(self._grid_host)
+        v.addWidget(self.scroll, 1)
+
+        row = QHBoxLayout()
+        self.lbl_marks = QLabel("Nothing marked")
+        self.lbl_marks.setStyleSheet("font-size: 10px; color: #bbbbbb;")
+        row.addWidget(self.lbl_marks, 1)
+        btn_all_acc = QPushButton("Mark page Accept")
+        btn_all_acc.clicked.connect(lambda: self._mark_page('accept'))
+        row.addWidget(btn_all_acc)
+        btn_all_rej = QPushButton("Mark page Reject")
+        btn_all_rej.clicked.connect(lambda: self._mark_page('reject'))
+        row.addWidget(btn_all_rej)
+        btn_clear = QPushButton("Clear marks")
+        btn_clear.clicked.connect(self._clear_marks)
+        row.addWidget(btn_clear)
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setStyleSheet(
+            MADMainWindow._review_btn_qss("#2d6cdf", "#3b7ae8"))
+        self.btn_apply.clicked.connect(self._apply)
+        row.addWidget(self.btn_apply)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+    # -- data ----------------------------------------------------------
+    def reload(self):
+        """Collect the current file's pending predictions, best score first."""
+        m = self._main
+        sg = m.spectrogram
+        self._marks.clear()
+        self._page = 0
+        tiles = []
+        for i, ann in enumerate(sg.annotations):
+            if ann.get('status') != 'prediction':
+                continue
+            if sg._score_hidden(ann):
+                continue
+            mask = ann.get('mask')
+            if mask is None or not np.any(mask):
+                continue
+            tiles.append({'idx': i, 'id': ann.get('id'),
+                          'score': float(ann.get('score') or 0.0),
+                          'mask': mask, 'ann': ann})
+        tiles.sort(key=lambda t: -t['score'])
+        self._tiles = tiles
+        self._render()
+
+    def _pages(self) -> int:
+        return max(1, (len(self._tiles) + self._per_page - 1) // self._per_page)
+
+    def _go(self, delta: int):
+        self._page = max(0, min(self._pages() - 1, self._page + delta))
+        self._render()
+
+    def _tile_pixmap(self, mask) -> 'QPixmap':
+        """Render one call's mask crop as a small image, scaled to the tile.
+
+        Aspect is not preserved: calls are extremely wide or tall depending on
+        zoom, and squashing every crop into the same box makes the *shape* of
+        the call comparable at a glance, which is what the eye is scanning for.
+        """
+        from PyQt5.QtGui import QPixmap
+        pal = self._main._overlay_palette()
+        h, w = mask.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = pal['halo']
+        rgba[..., 3] = 255
+        r, g, b = pal['pending']
+        m = mask > 0
+        rgba[m] = (r, g, b, 255)
+        # flipud returns a view, so make it contiguous *after* the flip — QImage
+        # needs a contiguous buffer (frequency also increases upward on screen).
+        rgba = np.ascontiguousarray(np.flipud(rgba))
+        img = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        return QPixmap.fromImage(img).scaled(
+            self.TILE, self.TILE - 26, Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation)
+
+    def _render(self):
+        self._grid_host = QWidget()
+        from PyQt5.QtWidgets import QGridLayout
+        grid = QGridLayout(self._grid_host)
+        grid.setSpacing(6)
+        start = self._page * self._per_page
+        page = self._tiles[start:start + self._per_page]
+        cols = max(1, (self.scroll.viewport().width() - 20) // (self.TILE + 8))
+        for n, t in enumerate(page):
+            btn = QPushButton()
+            btn.setFixedSize(self.TILE, self.TILE)
+            btn.setIcon(QIcon(self._tile_pixmap(t['mask'])))
+            btn.setIconSize(QSize(self.TILE - 8, self.TILE - 30))
+            btn.setText(f"{t['score']:.2f}")
+            btn.setStyleSheet(self._tile_qss(self._marks.get(t['id'])))
+            btn.setToolTip(
+                f"score {t['score']:.3f} · {t['mask'].shape[1]}×"
+                f"{t['mask'].shape[0]} px\nClick to cycle "
+                "accept → reject → undecided")
+            btn.clicked.connect(lambda _c=False, tid=t['id']: self._cycle(tid))
+            grid.addWidget(btn, n // cols, n % cols)
+        grid.setRowStretch(grid.rowCount(), 1)
+        # setWidget takes ownership and destroys the previous widget, so the old
+        # host must NOT also be deleteLater()'d — that double-frees it.
+        self.scroll.setWidget(self._grid_host)
+        self.lbl_page.setText(
+            f"{len(self._tiles)} pending · page {self._page + 1}/{self._pages()}"
+            if self._tiles else "No pending detections on this file")
+        self.btn_prev.setEnabled(self._page > 0)
+        self.btn_next.setEnabled(self._page < self._pages() - 1)
+        self._update_marks_label()
+
+    @staticmethod
+    def _tile_qss(mark: Optional[str]) -> str:
+        border = {'accept': "#3fbf5f", 'reject': "#d64545"}.get(mark, "#4a4a4a")
+        width = 3 if mark else 1
+        return (f"QPushButton {{ border: {width}px solid {border}; "
+                f"border-radius: 4px; background: #232323; color: #cccccc; "
+                f"font-size: 9px; text-align: bottom; padding-bottom: 2px; }}")
+
+    # -- marking -------------------------------------------------------
+    def _cycle(self, tid):
+        cur = self._marks.get(tid)
+        nxt = {None: 'accept', 'accept': 'reject', 'reject': None}[cur]
+        if nxt is None:
+            self._marks.pop(tid, None)
+        else:
+            self._marks[tid] = nxt
+        self._render()
+
+    def _mark_page(self, what: str):
+        start = self._page * self._per_page
+        for t in self._tiles[start:start + self._per_page]:
+            self._marks[t['id']] = what
+        self._render()
+
+    def _clear_marks(self):
+        self._marks.clear()
+        self._render()
+
+    def _update_marks_label(self):
+        n_a = sum(1 for v in self._marks.values() if v == 'accept')
+        n_r = sum(1 for v in self._marks.values() if v == 'reject')
+        self.lbl_marks.setText(
+            f"{n_a} to accept · {n_r} to reject" if (n_a or n_r)
+            else "Nothing marked")
+        self.btn_apply.setEnabled(bool(self._marks))
+
+    # -- apply ---------------------------------------------------------
+    def _apply(self):
+        """Commit the marks through the main window's normal review paths, so
+        training examples, CSV status and undo all behave exactly as they do
+        when reviewing one call at a time."""
+        if not self._marks:
+            return
+        n = self._main._apply_gallery_marks(dict(self._marks))
+        self._marks.clear()
+        self.reload()
+        self._main.status_bar.showMessage(f"Gallery: applied {n} decision(s)")
+
+
+class MADEvalWorker(QThread):
+    """Run a call-level threshold sweep off the UI thread."""
+    progress_signal = pyqtSignal(int, int, str)
+    finished_signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, cfg, wav_paths, iou_min=0.3, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.wav_paths = list(wav_paths)
+        self.iou_min = iou_min
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            from fnt.usv.usv_detector.mad_eval import evaluate_wavs
+            res = evaluate_wavs(
+                self.wav_paths, self.cfg, iou_min=self.iou_min,
+                progress=lambda i, n, name: self.progress_signal.emit(i, n, name),
+                should_stop=lambda: self._stop,
+            )
+            self.finished_signal.emit(res)
+        except Exception as e:
+            import traceback
+            self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+class MADEvalDialog(QDialog):
+    """Call-level evaluation of the selected model, swept across thresholds.
+
+    Answers the question that decides whether to commit hours of compute: how
+    many real calls will this model find, and how much junk will I reject? Tile
+    Dice (what training reports) cannot answer that.
+    """
+
+    COLS = ["Threshold", "Precision", "Recall", "F1", "TP", "FP", "FN"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self._worker = None
+        self._result = None
+        self.setModal(False)
+        self.setWindowTitle("Evaluate Model (call-level)")
+        self.resize(760, 560)
+        v = QVBoxLayout(self)
+
+        blurb = QLabel(
+            "Scores the selected model against your <b>hand-labeled</b> calls, "
+            "one call at a time — not pixel Dice. Every threshold is evaluated "
+            "from a single inference pass, so the whole curve costs one run.<br>"
+            "<i>Use recordings you have labeled but that the model has not been "
+            "trained on; otherwise the numbers flatter the model.</i>")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        v.addWidget(blurb)
+
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Evaluate on:"))
+        self.combo_scope = QComboBox()
+        self.combo_scope.addItem("Training data files", 'training')
+        self.combo_scope.addItem("Session audio files", 'session')
+        self.combo_scope.setToolTip(
+            "Which loaded recordings to score. Only files that carry "
+            "hand-labels are used; the rest are reported as skipped.")
+        opts.addWidget(self.combo_scope, 1)
+        opts.addWidget(QLabel("Match IoU ≥"))
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.05, 0.95)
+        self.spin_iou.setSingleStep(0.05)
+        self.spin_iou.setValue(0.30)
+        self.spin_iou.setToolTip(
+            "How much a prediction's time/frequency box must overlap a "
+            "hand-labeled call to count as the same call. 0.3 is forgiving "
+            "about exact mask edges while still requiring the right call.")
+        opts.addWidget(self.spin_iou)
+        v.addLayout(opts)
+
+        self.btn_run = QPushButton("Run Evaluation")
+        self.btn_run.clicked.connect(self._run)
+        v.addWidget(self.btn_run)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        v.addWidget(self.progress)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_status.setWordWrap(True)
+        v.addWidget(self.lbl_status)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(self.COLS)
+        self.table.setRootIsDecorated(False)
+        self.table.setAllColumnsShowFocus(True)
+        self.table.header().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+
+        self.lbl_best = QLabel("")
+        self.lbl_best.setWordWrap(True)
+        self.lbl_best.setStyleSheet("font-size: 10px;")
+        v.addWidget(self.lbl_best)
+
+        row = QHBoxLayout()
+        self.btn_apply = QPushButton("Use Selected Threshold")
+        self.btn_apply.setToolTip(
+            "Copy the highlighted threshold into the Run Inference settings.")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self._apply_threshold)
+        row.addWidget(self.btn_apply)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+    def _targets(self):
+        m = self._main
+        if self.combo_scope.currentData() == 'session':
+            return [p for p in m.audio_files if os.path.isfile(p)]
+        return [p for p in m.deploy_files if not m._is_missing(p)]
+
+    def _run(self):
+        m = self._main
+        model = m._selected_deploy_model_path() or m._default_model_path()
+        if not model or not os.path.isfile(model):
+            QMessageBox.warning(self, "Model missing",
+                                "Select a trained model first.")
+            return
+        wavs = self._targets()
+        if not wavs:
+            QMessageBox.warning(
+                self, "No files",
+                "No recordings available in the chosen scope.")
+            return
+        from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
+        cfg = MADInferenceConfig(
+            model_path=model,
+            threshold=0.2,          # sweep floor; higher cutoffs re-score it
+            min_blob_pixels=m.spin_infer_min_blob.value(),
+            device=m._device_value(m.combo_infer_device),
+            save_blob_csv=False,    # evaluation must never touch stored results
+            preserve_labels=False,  # score the raw model, not a shielded re-run
+            **m._infer_perf_kwargs(),
+        )
+        self.btn_run.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(wavs))
+        self.progress.setValue(0)
+        self.lbl_status.setText(f"Evaluating {len(wavs)} file(s)…")
+        self._worker = MADEvalWorker(cfg, wavs, self.spin_iou.value(), self)
+        self._worker.progress_signal.connect(self._on_progress)
+        self._worker.finished_signal.connect(self._on_done)
+        self._worker.error_signal.connect(self._on_error)
+        self._worker.start()
+
+    def _on_progress(self, i, n, name):
+        self.progress.setValue(i)
+        self.lbl_status.setText(f"[{i + 1}/{n}] {name}")
+
+    def _on_error(self, msg):
+        self.btn_run.setEnabled(True)
+        self.progress.setVisible(False)
+        self.lbl_status.setText("Evaluation failed.")
+        QMessageBox.warning(self, "Evaluation failed", msg[:2000])
+
+    def _on_done(self, res):
+        self._worker = None
+        self._result = res
+        self.btn_run.setEnabled(True)
+        self.progress.setVisible(False)
+        skipped = [f for f in res.files if f.get('skipped')]
+        self.lbl_status.setText(
+            f"Scored {res.n_files} file(s) / {res.n_labels} hand-labeled call(s)"
+            + (f" · {len(skipped)} file(s) skipped (no hand-labels)"
+               if skipped else ""))
+        self.table.clear()
+        if not res.per_threshold or res.n_labels == 0:
+            self.lbl_best.setText(
+                "<span style='color:#c8a05a;'>No hand-labeled calls found in "
+                "the chosen scope — label some calls first, or switch scope."
+                "</span>")
+            self.btn_apply.setEnabled(False)
+            return
+        best = res.best('f1') or {}
+        for d in res.per_threshold:
+            none_found = int(d.get('n_pred', 0)) == 0
+            item = SortableTreeWidgetItem([
+                f"{d['threshold']:.2f}",
+                "—" if none_found else f"{d['precision']:.3f}",
+                f"{d['recall']:.3f}",
+                "—" if none_found else f"{d['f1']:.3f}",
+                str(d['tp']), str(d['fp']), str(d['fn']),
+            ])
+            item.setData(0, Qt.UserRole, d['threshold'])
+            if none_found:
+                item.setToolTip(
+                    0, "No detections at this threshold — precision is "
+                       "undefined, not zero.")
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(150, 150, 150))
+            elif d is best:
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(120, 230, 150))
+            self.table.addTopLevelItem(item)
+            if d is best:
+                self.table.setCurrentItem(item)
+        self.btn_apply.setEnabled(True)
+        self.lbl_best.setText(
+            f"Best F1 <b>{best.get('f1', 0):.3f}</b> at threshold "
+            f"<b>{best.get('threshold', 0):.2f}</b> "
+            f"(precision {best.get('precision', 0):.3f}, recall "
+            f"{best.get('recall', 0):.3f}).<br>"
+            "<i>Raise the threshold when false positives cost you review time; "
+            "lower it when missed calls matter more.</i>")
+
+    def _apply_threshold(self):
+        item = self.table.currentItem()
+        if item is None:
+            return
+        thr = item.data(0, Qt.UserRole)
+        if thr is None:
+            return
+        self._main.spin_infer_threshold.setValue(float(thr))
+        self._main._log(f"Probability threshold set to {float(thr):.2f} "
+                        "from evaluation")
+        self._main.status_bar.showMessage(
+            f"Inference threshold set to {float(thr):.2f}")
+
+
+class MADRunSummaryDialog(QDialog):
+    """Per-file results of a finished (or interrupted) batch run.
+
+    After a few thousand recordings the bottleneck stops being compute and
+    becomes "which of these actually contain calls?". This reads the run
+    manifest — never the audio or the mask crops — so it opens instantly on a
+    3,000-file run, sorts by detection count or rate, and hands a chosen file
+    straight to the reviewer.
+    """
+
+    COLS = ["File", "Detections", "Calls/min", "Duration", "Scan time",
+            "× realtime", "Status"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Batch Run Summary")
+        self.resize(880, 560)
+        v = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Run:"))
+        self.combo_run = QComboBox()
+        self.combo_run.setToolTip("Batch runs recorded for this project, "
+                                  "newest first.")
+        self.combo_run.currentIndexChanged.connect(lambda _i: self._reload())
+        top.addWidget(self.combo_run, 1)
+        v.addLayout(top)
+
+        self.lbl_stats = QLabel("")
+        self.lbl_stats.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        self.lbl_stats.setWordWrap(True)
+        v.addWidget(self.lbl_stats)
+
+        filt = QHBoxLayout()
+        self.chk_only_calls = QCheckBox("Only files with detections")
+        self.chk_only_calls.setToolTip(
+            "Hide silent recordings. On a 24/7 set most files are empty, and "
+            "this is usually the first thing you want.")
+        self.chk_only_calls.toggled.connect(lambda _b: self._render())
+        filt.addWidget(self.chk_only_calls)
+        self.chk_only_errors = QCheckBox("Only failures")
+        self.chk_only_errors.toggled.connect(lambda _b: self._render())
+        filt.addWidget(self.chk_only_errors)
+        filt.addStretch(1)
+        v.addLayout(filt)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(self.COLS)
+        self.table.setRootIsDecorated(False)
+        self.table.setSortingEnabled(True)
+        self.table.setAllColumnsShowFocus(True)
+        self.table.header().setStretchLastSection(True)
+        self.table.itemDoubleClicked.connect(self._open_selected)
+        v.addWidget(self.table, 1)
+
+        hint = QLabel("Double-click a row to open that recording for review.")
+        hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
+        v.addWidget(hint)
+
+        row = QHBoxLayout()
+        btn_open = QPushButton("Open for Review")
+        btn_open.clicked.connect(lambda: self._open_selected(
+            self.table.currentItem(), 0))
+        row.addWidget(btn_open)
+        btn_folder = QPushButton("Reveal Run Folder")
+        btn_folder.clicked.connect(self._reveal)
+        row.addWidget(btn_folder)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+        self._records: List[dict] = []
+        self._populate_runs()
+
+    # -- data ----------------------------------------------------------
+    def _populate_runs(self):
+        from fnt.usv.usv_detector.mad_batch import RunManifest, list_runs
+        root = self._main._batch_run_root()
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        runs = list_runs(root) if root else []
+        for rd in runs:
+            info = RunManifest(rd).read_info()
+            model = info.get('model_name', '?')
+            n = info.get('n_files', '?')
+            self.combo_run.addItem(
+                f"{os.path.basename(rd)}  —  {model}, {n} file(s)", rd)
+        self.combo_run.blockSignals(False)
+        if runs:
+            self._reload()
+        else:
+            self.lbl_stats.setText(
+                "No batch runs recorded yet. Run inference over a folder or the "
+                "training set and the run is logged automatically.")
+
+    def _reload(self):
+        from fnt.usv.usv_detector.mad_batch import RunManifest, summarize
+        rd = self.combo_run.currentData()
+        if not rd:
+            return
+        m = RunManifest(rd)
+        self._records = m.records()
+        info = m.read_info()
+        s = summarize(self._records)
+        self.lbl_stats.setText(
+            f"<b>{s['n_detections']:,}</b> detection(s) across "
+            f"<b>{s['n_files_with_calls']:,}</b> of {s['n_ok']:,} analyzed "
+            f"file(s) &nbsp;·&nbsp; {s['n_error']} failed, {s['n_skipped']} "
+            f"skipped<br>"
+            f"{s['audio_hours']:.1f} h audio in {s['wall_hours']:.2f} h "
+            f"({s['realtime_factor']:.0f}× realtime) &nbsp;·&nbsp; "
+            f"model <b>{info.get('model_name', '?')}</b>, threshold "
+            f"{info.get('threshold', '?')}, min blob "
+            f"{info.get('min_blob_pixels', '?')}px")
+        self._render()
+
+    def _render(self):
+        only_calls = self.chk_only_calls.isChecked()
+        only_err = self.chk_only_errors.isChecked()
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        for r in self._records:
+            status = r.get('status', '')
+            n_det = int(r.get('n_detections') or 0)
+            if only_err and status != 'error':
+                continue
+            if only_calls and (status == 'error' or n_det == 0):
+                continue
+            dur = float(r.get('audio_dur_s') or 0.0)
+            wall = float(r.get('t_total') or 0.0)
+            rt = float(r.get('realtime_factor') or 0.0)
+            rate = (n_det / (dur / 60.0)) if dur > 0 else 0.0
+            item = SortableTreeWidgetItem([
+                r.get('name', ''),
+                f"{n_det:,}" if status != 'error' else "—",
+                f"{rate:.2f}" if dur > 0 else "—",
+                f"{dur:.0f}s" if dur else "—",
+                f"{wall:.1f}s" if wall else "—",
+                f"{rt:.0f}×" if rt else "—",
+                status,
+            ])
+            item.setData(0, _SORT_ROLE, r.get('name', '').lower())
+            item.setData(1, _SORT_ROLE, float(n_det))
+            item.setData(2, _SORT_ROLE, rate)
+            item.setData(3, _SORT_ROLE, dur)
+            item.setData(4, _SORT_ROLE, wall)
+            item.setData(5, _SORT_ROLE, rt)
+            item.setData(0, Qt.UserRole, r.get('wav_path', ''))
+            if status == 'error':
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(235, 90, 90))
+                item.setToolTip(0, str(r.get('error') or 'failed'))
+            elif n_det == 0:
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(150, 150, 150))
+            self.table.addTopLevelItem(item)
+        self.table.setSortingEnabled(True)
+        # Most detections first — the files worth a human's attention.
+        self.table.sortByColumn(1, Qt.DescendingOrder)
+        for c in range(len(self.COLS) - 1):
+            self.table.resizeColumnToContents(c)
+
+    # -- actions -------------------------------------------------------
+    def _open_selected(self, item, _col=0):
+        if item is None:
+            return
+        wav = item.data(0, Qt.UserRole)
+        if not wav or not os.path.isfile(wav):
+            QMessageBox.information(
+                self, "Open for Review",
+                f"Recording not found:\n{wav}")
+            return
+        self._main._open_wav_for_review(wav)
+
+    def _reveal(self):
+        rd = self.combo_run.currentData()
+        if rd and os.path.isdir(rd):
+            os.startfile(rd) if hasattr(os, 'startfile') else None
+
+
 class MADPreviewDialog(QDialog):
     """Non-modal window showing per-epoch prediction previews. Each epoch adds a
     page of tiles (spectrogram + ground-truth outline + predicted-mask overlay);
@@ -3440,6 +4094,16 @@ class MADMainWindow(QMainWindow):
         src_row.addWidget(self.btn_quick_infer)
         vbox.addLayout(src_row)
 
+        self.btn_eval_model = QPushButton("Evaluate Model…")
+        self.btn_eval_model.setToolTip(
+            "Score this model against your hand-labeled calls at call level — "
+            "precision / recall / F1 swept across probability thresholds.\n\n"
+            "Training reports pixel Dice on tiles, which does not tell you how "
+            "many real calls you'll catch. Run this before committing hours to "
+            "a large batch.")
+        self.btn_eval_model.clicked.connect(self._show_eval_dialog)
+        src_row.addWidget(self.btn_eval_model)
+
         self.lbl_deploy_model_info = QLabel("No model selected")
         self.lbl_deploy_model_info.setStyleSheet(
             "color: #999999; font-size: 9px;")
@@ -3895,6 +4559,32 @@ class MADMainWindow(QMainWindow):
         filter_row.addWidget(self.combo_det_filter, 1)
         vbox.addLayout(filter_row)
 
+        # Score filter. MAD deliberately does not persist the probability grid
+        # (see MAD_README), so the threshold is baked in at inference time —
+        # but every prediction stores its own mean-probability score, so
+        # filtering the review list by score gives call-level re-thresholding
+        # for free, with no re-run. Hidden calls are only hidden: nothing is
+        # deleted, and clearing the filter brings them straight back.
+        score_row = QHBoxLayout()
+        score_row.setSpacing(4)
+        score_row.addWidget(QLabel("Min score:"))
+        self.slider_min_score = QSlider(Qt.Horizontal)
+        self.slider_min_score.setRange(0, 100)
+        self.slider_min_score.setValue(0)
+        self.slider_min_score.setToolTip(
+            "Hide predictions scoring below this confidence.\n\n"
+            "Free call-level re-thresholding: the score is already stored per "
+            "detection, so raising this hides marginal calls instantly without "
+            "re-running the model. It only affects what you see — nothing is "
+            "deleted, and accepted/rejected calls are never hidden.")
+        self.slider_min_score.valueChanged.connect(self._on_min_score_changed)
+        score_row.addWidget(self.slider_min_score, 1)
+        self.lbl_min_score = QLabel("off")
+        self.lbl_min_score.setFixedWidth(58)
+        self.lbl_min_score.setStyleSheet("font-size: 9px; color: #999999;")
+        score_row.addWidget(self.lbl_min_score)
+        vbox.addLayout(score_row)
+
         self.annotation_list = QTreeWidget()
         self.annotation_list.setMaximumHeight(200)
         self.annotation_list.setToolTip(
@@ -3999,6 +4689,18 @@ class MADMainWindow(QMainWindow):
         # Count label (e.g. "0 detections")
         if count_label is not None:
             vbox.addWidget(count_label)
+
+        if not hasattr(self, 'btn_gallery'):
+            self.btn_gallery = QPushButton("Detection Gallery (G)")
+            self.btn_gallery.setToolTip(
+                "Review this file's pending detections as a grid of mask "
+                "thumbnails instead of one at a time — click tiles to mark "
+                "accept/reject, then Apply.\n\nFar faster after a batch run; "
+                "the crops are already stored, so it opens instantly.\n"
+                "Shortcut: G")
+            self.btn_gallery.setFocusPolicy(Qt.NoFocus)
+            self.btn_gallery.clicked.connect(self._show_gallery)
+            vbox.addWidget(self.btn_gallery)
 
         # Review label header
         if review_label is not None:
@@ -4262,7 +4964,9 @@ class MADMainWindow(QMainWindow):
         sr = self.sample_rate or 1
         dt = self.spectrogram.hop / float(sr) if self.spectrogram.hop else 0
         df = (sr / 2.0) / (sp['nfft'] // 2) if sp.get('nfft') else 0
+        min_score = self._min_score()
         entries = []
+        n_score_hidden = 0
         if dt:
             for ann in self.spectrogram.annotations:
                 st = ann.get('status')
@@ -4274,7 +4978,16 @@ class MADMainWindow(QMainWindow):
                     continue
                 if flt == "Rejected" and not is_rej:
                     continue
+                # Score filtering applies to *pending predictions only*. A call
+                # you already accepted or rejected is a decision, not a guess —
+                # hiding it behind a confidence slider would silently drop your
+                # own work out of the list.
+                if is_pred and min_score > 0.0:
+                    if float(ann.get('score') or 0.0) < min_score:
+                        n_score_hidden += 1
+                        continue
                 entries.append(ann)
+        self._n_score_hidden = n_score_hidden
         entries.sort(key=lambda a: a['t0'])
         n_confirmed, n_pred, n_rej = 0, 0, 0
         ncols = tree.columnCount()
@@ -4373,6 +5086,11 @@ class MADMainWindow(QMainWindow):
             f"{n_confirmed + n_pred + n_rej + n_draw} detection(s)" +
             (f" ({', '.join(parts)})" if len(parts) > 1 else "")
         )
+        # Always say when the score slider is hiding something — a filtered list
+        # that silently under-reports is how a user concludes a file is clean
+        # when it isn't.
+        if getattr(self, '_n_score_hidden', 0):
+            count_text += f"  ·  {self._n_score_hidden} below min score"
         if lbl:
             lbl.setText(count_text)
         self._update_pred_review_widgets()
@@ -4380,6 +5098,22 @@ class MADMainWindow(QMainWindow):
         self._update_file_list_counts()
         self._update_active_training_count()
         self._update_overview_marks()
+
+    def _min_score(self) -> float:
+        """Current minimum-score filter as a probability in [0, 1]. 0 = off."""
+        s = getattr(self, 'slider_min_score', None)
+        return (s.value() / 100.0) if s is not None else 0.0
+
+    def _on_min_score_changed(self, value: int):
+        """Apply the score filter to the review list and the canvas."""
+        self.lbl_min_score.setText("off" if value <= 0 else f"≥ {value / 100:.2f}")
+        self.lbl_min_score.setStyleSheet(
+            "font-size: 9px; color: #999999;" if value <= 0
+            else "font-size: 9px; color: #7ec87e;")
+        # The canvas hides the same calls, so what you review and what you see
+        # can't disagree.
+        self.spectrogram.set_min_score(value / 100.0)
+        self._refresh_annotation_list()
 
     def _update_active_training_count(self):
         """Live-update the active Training Data list row's mask count from the
@@ -4556,14 +5290,18 @@ class MADMainWindow(QMainWindow):
                              if a.get('status') == 'prediction'}
                 return [id_to_ann[eid] for eid in ordered_ids
                         if eid in id_to_ann]
-        return [i for i, a in enumerate(self.spectrogram.annotations)
-                if a.get('status') == 'prediction']
+        # Fallback (list not built yet): honor the score filter here too, or
+        # Back/Next would walk through calls the user can't see.
+        sg = self.spectrogram
+        return [i for i, a in enumerate(sg.annotations)
+                if a.get('status') == 'prediction' and not sg._score_hidden(a)]
 
     def _review_order(self) -> List[int]:
         """ALL annotation indices in the detection table's display order — the
         order Back/Next walk through (any status, not just pending)."""
         tree = self._active_annotation_tree()
-        anns = self.spectrogram.annotations
+        sg = self.spectrogram
+        anns = sg.annotations
         if tree is not None:
             id_to_idx = {a.get('id'): i for i, a in enumerate(anns)}
             ordered = []
@@ -4573,7 +5311,7 @@ class MADMainWindow(QMainWindow):
                     ordered.append(id_to_idx[data[2]])
             if ordered:
                 return ordered
-        return list(range(len(anns)))
+        return [i for i, a in enumerate(anns) if not sg._score_hidden(a)]
 
     def _selected_review_pos(self, order=None):
         """Position of the selected annotation within ``_review_order``."""
@@ -5170,6 +5908,82 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(f"Rejected {len(preds)} prediction(s)")
         self._reviewed_count += len(preds)
         self._maybe_prompt_next_file()
+
+    def _apply_gallery_marks(self, marks: Dict[str, str]) -> int:
+        """Commit a batch of gallery accept/reject decisions.
+
+        Routed through the same persistence the one-at-a-time reviewer uses —
+        training examples in train mode, batched CSV status writes, one undo
+        snapshot for the whole batch — so a gallery decision is indistinguishable
+        from a keyboard one afterward.
+        """
+        sg = self.spectrogram
+        if not marks:
+            return 0
+        by_id = {a.get('id'): a for a in sg.annotations}
+        to_accept = [by_id[i] for i, v in marks.items()
+                     if v == 'accept' and i in by_id]
+        to_reject = [by_id[i] for i, v in marks.items()
+                     if v == 'reject' and i in by_id]
+        if not to_accept and not to_reject:
+            return 0
+        self._snapshot_for_undo("Gallery review", crops=False)
+        self._log(f"Gallery: {len(to_accept)} accept, {len(to_reject)} reject "
+                  f"[{self._review_mode}]")
+
+        if to_reject:
+            self._batch_write_pred_csv_status(to_reject, 'rejected')
+            for ann in to_reject:
+                ann['status'] = 'rejected'
+
+        n_acc = 0
+        if to_accept:
+            if self._review_mode == 'deploy' or self.audio_data is None:
+                # Review-only mode: record the decision, don't mint training
+                # examples (that's what train mode is for).
+                self._batch_write_pred_csv_status(to_accept, 'accepted')
+                for ann in to_accept:
+                    ann['status'] = 'accepted'
+                n_acc = len(to_accept)
+            else:
+                cls_name = ((self._project.last_class if self._project
+                             else self._session_last_class) or 'USV')
+                done = []
+                for ann in to_accept:
+                    comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'],
+                            ann['mask'])
+                    try:
+                        ex_id = self._save_component_example(cls_name, comp)
+                    except Exception:
+                        continue
+                    ann['status'] = 'accepted'
+                    ann['id'] = ex_id
+                    done.append(ann)
+                self._batch_write_pred_csv_status(done, 'accepted')
+                n_acc = len(done)
+
+        sg._rebuild_confirmed_mask()
+        sg.update()
+        self._pred_review_idx = None
+        self._refresh_annotation_list()
+        self._update_pred_review_widgets()
+        n = n_acc + len(to_reject)
+        self._reviewed_count += n
+        return n
+
+    def _show_gallery(self):
+        """Open (or refresh) the detection gallery for the current file."""
+        if self.audio_data is None:
+            self.status_bar.showMessage("Load a file first")
+            return
+        dlg = getattr(self, '_gallery_dialog', None)
+        if dlg is None:
+            dlg = MADGalleryDialog(self)
+            self._gallery_dialog = dlg
+        dlg.reload()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _migrate_legacy_prob(self, h5_path, sp, rows=None):
         """One-time upgrade of a legacy ``/prob`` file: read the full grid
@@ -6668,6 +7482,14 @@ class MADMainWindow(QMainWindow):
         self.act_locate_missing.setEnabled(False)
         file_menu.addAction(self.act_locate_missing)
 
+        self.act_run_summary = QAction("Batch Run &Summary…", self)
+        self.act_run_summary.setShortcut("Ctrl+B")
+        self.act_run_summary.setToolTip(
+            "Per-file results of a batch run — which recordings have calls, "
+            "how many, and how fast the run went.")
+        self.act_run_summary.triggered.connect(self._show_run_summary)
+        file_menu.addAction(self.act_run_summary)
+
         self.act_pack_project = QAction("&Pack Project (embed audio)…", self)
         self.act_pack_project.setToolTip(
             "Copy every referenced recording into the project so it is fully "
@@ -6978,6 +7800,7 @@ class MADMainWindow(QMainWindow):
         # instead of QShortcuts, so they work even when a scrollbar, list, or
         # button holds focus and would otherwise swallow the arrow key. Up/Down
         # are fully dedicated to zoom; B/N step Back/Next through detections.
+        make(Qt.Key_G, self._show_gallery)         # Gallery (grid review)
         make(Qt.Key_B, self._shortcut_pred_prev)   # Back (previous detection)
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
@@ -9672,6 +10495,57 @@ class MADMainWindow(QMainWindow):
         self._update_file_list_counts()
         self.status_bar.showMessage(
             f"Found {n_added} detection(s) in current view")
+
+    def _open_wav_for_review(self, wav_path: str):
+        """Load an arbitrary recording into the reviewer and show its detections.
+
+        Used by the run-summary table: a batch run's files usually aren't in
+        either list (that's the point of the folder target), so the file is
+        appended to the session list on demand rather than requiring the user to
+        go find and import it.
+        """
+        if not wav_path or not os.path.isfile(wav_path):
+            return
+        ap = os.path.abspath(wav_path)
+        idx = next((i for i, p in enumerate(self.audio_files)
+                    if os.path.normcase(os.path.abspath(p))
+                    == os.path.normcase(ap)), None)
+        if idx is None:
+            self.audio_files.append(ap)
+            self._refresh_file_list()
+            idx = len(self.audio_files) - 1
+        self._active_source = 'session'
+        self._review_mode = 'deploy'
+        self._clear_training_selection()
+        self._deploy_file_idx = None
+        self.current_file_idx = idx
+        self.file_list.setCurrentRow(idx)
+        n = self._load_predictions_as_annotations(wav=ap) or 0
+        self.status_bar.showMessage(
+            f"{os.path.basename(ap)} — {n} detection(s) loaded"
+            if n else f"{os.path.basename(ap)} — no detections recorded")
+
+    def _show_eval_dialog(self):
+        """Open (or re-focus) the call-level model evaluation window."""
+        dlg = getattr(self, '_eval_dialog', None)
+        if dlg is None:
+            dlg = MADEvalDialog(self)
+            self._eval_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _show_run_summary(self):
+        """Open (or re-focus) the batch run summary window."""
+        dlg = getattr(self, '_run_summary_dialog', None)
+        if dlg is None:
+            dlg = MADRunSummaryDialog(self)
+            self._run_summary_dialog = dlg
+        else:
+            dlg._populate_runs()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _close_manifest(self):
         """Flush and release the batch-run manifest, if one is open."""
