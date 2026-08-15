@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -1461,20 +1462,34 @@ class MADSpectrogramWidget(SpectrogramWidget):
 # ======================================================================
 # Helpers
 # ======================================================================
-def _list_wavs_in_folder(folder: str) -> List[str]:
-    """Non-recursive: just .wav files directly inside ``folder``."""
+def _list_wavs_in_folder(folder: str, recursive: bool = False) -> List[str]:
+    """``.wav`` files in ``folder`` — directly inside it, or in the whole tree.
+
+    24/7 multi-mic recording sets are nested (experiment / mic / day), so a
+    non-recursive scan silently finds nothing at the level a user naturally
+    points at. ``recursive`` walks the tree, skipping dot-directories and the
+    project's own ``models``/``datasets``/``batch_runs`` folders so re-scanning a
+    project directory doesn't pick up its internals.
+    """
     root = Path(folder)
     if not root.exists() or not root.is_dir():
         return []
+    _SKIP_DIRS = {'models', 'datasets', 'batch_runs', '.scratch',
+                  'legacy_pre_h5'}
     out: List[str] = []
-    for p in sorted(root.iterdir()):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() != ".wav":
-            continue
-        if p.name.startswith("."):
-            continue
-        out.append(str(p))
+    if not recursive:
+        for p in sorted(root.iterdir()):
+            if (p.is_file() and p.suffix.lower() == ".wav"
+                    and not p.name.startswith(".")):
+                out.append(str(p))
+        return out
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = sorted(d for d in dirnames
+                             if not d.startswith('.')
+                             and d.lower() not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fn.lower().endswith('.wav') and not fn.startswith('.'):
+                out.append(os.path.join(dirpath, fn))
     return out
 
 
@@ -2712,6 +2727,10 @@ class MADMainWindow(QMainWindow):
         # Normcased absolute paths of registered training recordings whose audio
         # can't be found right now. A soft state — see _rescan_project_wavs.
         self._missing_training: set = set()
+        # Batch-scale inference target: a folder tree scanned once, kept as a
+        # plain path list so thousands of recordings never become list widgets.
+        self._infer_folder: Optional[str] = None
+        self._infer_folder_wavs: List[str] = []
         self._deploy_file_idx: Optional[int] = None
         self._infer_model_project_dir: Optional[str] = None
         # Which list owns the single preview: 'session' or 'training'. Drives
@@ -3643,6 +3662,31 @@ class MADMainWindow(QMainWindow):
             self._update_run_button)
         train_row.addWidget(self.combo_scope_training, 1)
         vbox.addLayout(train_row)
+
+        # Folder target — the batch-scale path. Deliberately NOT routed through
+        # the session list: loading 3,000 recordings there means 3,000 list rows
+        # plus a sibling-CSV stat per row before anything runs. Here the folder
+        # is scanned once and the paths are streamed straight to the worker.
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(4)
+        self.chk_scope_folder = QCheckBox("Folder")
+        self.chk_scope_folder.setToolTip(
+            "Run the model over every .wav in a folder tree, without loading "
+            "them into the session list. This is the path for large batches — "
+            "thousands of recordings scan in seconds because nothing is "
+            "rendered until you review results.\n\n"
+            "Detections save as a standalone CSV next to each recording.")
+        self.chk_scope_folder.toggled.connect(self._update_run_button)
+        folder_row.addWidget(self.chk_scope_folder)
+        self.btn_pick_infer_folder = QPushButton("Choose Folder…")
+        self.btn_pick_infer_folder.clicked.connect(self._pick_inference_folder)
+        folder_row.addWidget(self.btn_pick_infer_folder, 1)
+        vbox.addLayout(folder_row)
+
+        self.lbl_infer_folder = QLabel("No folder chosen")
+        self.lbl_infer_folder.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_infer_folder.setWordWrap(True)
+        vbox.addWidget(self.lbl_infer_folder)
 
         iform = QFormLayout()
         self.spin_infer_threshold = QDoubleSpinBox()
@@ -5988,12 +6032,43 @@ class MADMainWindow(QMainWindow):
         :meth:`_update_run_button` now."""
         self._update_run_button()
 
+    def _pick_inference_folder(self):
+        """Choose a folder tree to run inference over, and cache its wav list."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder of recordings to analyze",
+            self._default_browse_dir())
+        if not folder:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            wavs = _list_wavs_in_folder(folder, recursive=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._infer_folder = folder
+        self._infer_folder_wavs = wavs
+        if wavs:
+            self.chk_scope_folder.setChecked(True)
+            self.lbl_infer_folder.setText(
+                f"{len(wavs):,} .wav file(s) under {folder}")
+            self.lbl_infer_folder.setStyleSheet(
+                "color: #7ec87e; font-size: 9px;")
+            self._log(f"Batch target: {len(wavs)} wav(s) under {folder}")
+        else:
+            self.chk_scope_folder.setChecked(False)
+            self.lbl_infer_folder.setText(f"No .wav files found under {folder}")
+            self.lbl_infer_folder.setStyleSheet(
+                "color: #c8a05a; font-size: 9px;")
+        self._update_run_button()
+
     def _gather_inference_targets(self) -> List[str]:
-        """Wav paths to run inference on, from the Session/Training scope
+        """Wav paths to run inference on, from the Session/Training/Folder scope
         checkboxes (All vs Current file each). De-duplicated, order preserved."""
         if not hasattr(self, 'chk_scope_session'):
             return []
         targets: List[str] = []
+        if (getattr(self, 'chk_scope_folder', None) is not None
+                and self.chk_scope_folder.isChecked()):
+            targets.extend(getattr(self, '_infer_folder_wavs', []) or [])
         if self.chk_scope_session.isChecked():
             if self.combo_scope_session.currentText().startswith("Current"):
                 if (self.audio_files and
@@ -7186,19 +7261,43 @@ class MADMainWindow(QMainWindow):
 
     def _menu_add_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Add folder of .wav files (non-recursive)",
+            self, "Add folder of .wav files",
             self._default_browse_dir()
         )
         if not folder:
             return
-        # Browse the folder in place for this session only — files are not
-        # copied or persisted; a file joins the project once a call is accepted
-        # on it. (Re-add the folder next session to keep browsing.)
-        wavs = _list_wavs_in_folder(folder)
+        # Recording sets are nested (experiment / mic / day), so offer the whole
+        # tree — but only when there's actually something deeper to find, so the
+        # common flat-folder case stays a single click.
+        flat = _list_wavs_in_folder(folder)
+        deep = _list_wavs_in_folder(folder, recursive=True)
+        wavs = flat
+        if len(deep) > len(flat):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Include subfolders?")
+            box.setText(
+                f"{os.path.basename(folder) or folder} contains "
+                f"{len(flat)} .wav file(s) directly, and {len(deep)} including "
+                "subfolders.")
+            box.setInformativeText("Which do you want to load?")
+            b_deep = box.addButton(f"All {len(deep)} (recursive)",
+                                   QMessageBox.AcceptRole)
+            box.addButton(f"Just these {len(flat)}", QMessageBox.AcceptRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+                return
+            wavs = deep if clicked is b_deep else flat
+        if not wavs:
+            self.status_bar.showMessage(f"No .wav files found in {folder}")
+            return
+        # Browsed in place for this session — files are never copied, and their
+        # labels/predictions save next to the source audio.
         added = self._append_audio_paths(wavs)
         self.status_bar.showMessage(
-            f"Browsing folder in place: {folder} (+{added} wavs, "
-            f"not copied until you accept a call)")
+            f"Loaded {added} wav(s) from {folder} — referenced in place")
 
     def _append_audio_paths(self, paths, persist_files: bool = False) -> int:
         """Load wav paths into the session list (in place — never copied into
@@ -9574,13 +9673,123 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Found {n_added} detection(s) in current view")
 
+    def _close_manifest(self):
+        """Flush and release the batch-run manifest, if one is open."""
+        m = getattr(self, '_manifest', None)
+        if m is not None:
+            try:
+                m.close()
+            except Exception:
+                pass
+        self._manifest = None
+
+    def _batch_run_root(self) -> Optional[str]:
+        """Where to keep batch-run manifests: the project if one is open, else
+        the chosen inference folder. None when neither exists (a one-off run on
+        loose session files needs no run record)."""
+        if self._project is not None:
+            return self._project.project_dir
+        folder = getattr(self, '_infer_folder', None)
+        return folder if folder and os.path.isdir(folder) else None
+
+    def _resume_filter(self, cfg, wav_paths: List[str]) -> List[str]:
+        """Drop files already analyzed by this model at these settings.
+
+        Turns a re-run — after a crash, a stop, or pointing at an overlapping
+        folder — into a resume rather than a restart. Skipped entirely when
+        'Re-detect from scratch' is on, since that explicitly means redo
+        everything.
+        """
+        from fnt.usv.usv_detector.mad_batch import RunSettings, partition_done
+        if getattr(self, 'chk_infer_redetect', None) is not None and \
+                self.chk_infer_redetect.isChecked():
+            return wav_paths
+        if len(wav_paths) < 2:
+            return wav_paths
+        settings = RunSettings.from_config(cfg)
+        manifest_done: set = set()
+        root = self._batch_run_root()
+        if root:
+            try:
+                from fnt.usv.usv_detector.mad_batch import RunManifest, list_runs
+                for rd in list_runs(root):
+                    manifest_done |= {
+                        os.path.normcase(p)
+                        for p in RunManifest(rd).completed_paths()}
+            except Exception:
+                pass
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            todo, done = partition_done(wav_paths, settings, manifest_done)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not done:
+            return wav_paths
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Resume batch run?")
+        box.setText(
+            f"{len(done):,} of {len(wav_paths):,} file(s) already have "
+            f"detections from '{settings.model_name}' at threshold "
+            f"{settings.threshold:g} / min blob {settings.min_blob_pixels}px.")
+        box.setInformativeText(
+            f"Analyze only the remaining {len(todo):,}, or redo all "
+            f"{len(wav_paths):,}?")
+        b_resume = box.addButton(f"Resume ({len(todo):,})",
+                                 QMessageBox.AcceptRole)
+        box.addButton(f"Redo all ({len(wav_paths):,})", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_resume)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+            return []
+        if clicked is b_resume:
+            self._log(f"Resuming: skipping {len(done)} already-analyzed file(s)")
+            return todo
+        return wav_paths
+
     def _start_inference(self, cfg, wav_paths: List[str], reporter=None):
+        wav_paths = self._resume_filter(cfg, wav_paths)
+        if not wav_paths:
+            self.status_bar.showMessage("Nothing to analyze")
+            self._update_infer_run_enabled()
+            return
         owns_modal = reporter is None
         progress = reporter or MADRunProgressDialog(self, "MAD Inference")
         progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
         progress.append(f"Model: {cfg.model_path}")
         progress.append(f"Threshold: {cfg.threshold}  "
                         f"Min blob: {cfg.min_blob_pixels}px")
+
+        # Open a run manifest. Every completed file is appended and flushed
+        # immediately, so a crash at file 2,800 of 3,000 leaves a manifest that
+        # is valid up to 2,799 and the next run resumes from there.
+        self._manifest = None
+        root = self._batch_run_root()
+        if root and len(wav_paths) > 1:
+            try:
+                from fnt.usv.usv_detector.mad_batch import (
+                    RunManifest, new_run_dir)
+                run_dir = new_run_dir(root)
+                self._manifest = RunManifest(run_dir).open()
+                self._manifest.write_info({
+                    'started': time.time(),
+                    'model_path': cfg.model_path,
+                    'model_name': Path(cfg.model_path).stem,
+                    'threshold': cfg.threshold,
+                    'min_blob_pixels': cfg.min_blob_pixels,
+                    'n_files': len(wav_paths),
+                    'device': cfg.device,
+                    'batch_size': cfg.batch_size,
+                    'amp': cfg.amp,
+                    'preserve_labels': cfg.preserve_labels,
+                })
+                progress.append(f"Run log: {run_dir}")
+                self._log(f"Batch run log: {run_dir}")
+            except Exception as e:
+                self._log(f"Could not open run manifest: {e}")
+                self._manifest = None
 
         worker = MADInferenceWorker(cfg, wav_paths, parent=self)
         self._infer_worker = worker
@@ -9645,6 +9854,7 @@ class MADMainWindow(QMainWindow):
 
         def on_finished(results):
             self._infer_worker = None
+            self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")
                 self.btn_infer_pause.setEnabled(False)
@@ -9708,6 +9918,7 @@ class MADMainWindow(QMainWindow):
 
         def on_error(msg: str):
             self._infer_worker = None
+            self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")
                 self.btn_infer_pause.setEnabled(False)
@@ -9733,6 +9944,14 @@ class MADMainWindow(QMainWindow):
             self._log(line)
 
         def on_file_done(summary: dict):
+            # Record before logging: the manifest is the durable artifact, and
+            # it must be flushed even if this file errored or the run is killed
+            # a moment later.
+            if self._manifest is not None:
+                try:
+                    self._manifest.record(summary)
+                except Exception:
+                    pass
             t = summary.get('timing')
             name = os.path.basename(str(summary.get('wav_path', '')))
             if not t:

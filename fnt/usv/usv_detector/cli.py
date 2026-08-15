@@ -20,16 +20,38 @@ import sys
 from typing import List, Optional
 
 
-def _expand_inputs(inputs: List[str]) -> List[str]:
+_SKIP_DIRS = {'models', 'datasets', 'batch_runs', '.scratch', 'legacy_pre_h5'}
+
+
+def _walk_wavs(root: str) -> List[str]:
+    """Every ``.wav`` under ``root``, skipping dot-dirs and project internals."""
+    out: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames
+                             if not d.startswith('.')
+                             and d.lower() not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fn.lower().endswith('.wav') and not fn.startswith('.'):
+                out.append(os.path.join(dirpath, fn))
+    return out
+
+
+def _expand_inputs(inputs: List[str], recursive: bool = True) -> List[str]:
     """Expand a mix of .wav files and folders into a sorted, de-duped wav list.
-    Folders are scanned non-recursively for ``*.wav`` (case-insensitive)."""
+
+    Folders are walked recursively by default — 24/7 multi-mic sets are nested
+    (experiment / mic / day), so a flat scan finds nothing at the level a user
+    naturally points at. Pass ``recursive=False`` for the old flat behavior.
+    """
     out: List[str] = []
     seen = set()
     for item in inputs:
         if os.path.isdir(item):
-            hits = (glob.glob(os.path.join(item, '*.wav'))
-                    + glob.glob(os.path.join(item, '*.WAV')))
-            paths = sorted(hits)
+            if recursive:
+                paths = _walk_wavs(item)
+            else:
+                paths = sorted(glob.glob(os.path.join(item, '*.wav'))
+                               + glob.glob(os.path.join(item, '*.WAV')))
         elif os.path.isfile(item):
             paths = [item]
         else:
@@ -68,7 +90,40 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         amp=not args.no_amp,
     )
 
+    # Resume: skip recordings this model already analyzed at these settings.
+    # Provenance lives in each file's own CSV, so this works across runs and
+    # survives losing the manifest.
+    from .mad_batch import RunManifest, RunSettings, new_run_dir, partition_done
+    manifest = None
+    if not args.no_resume:
+        settings = RunSettings.from_config(cfg)
+        todo, done = partition_done(wavs, settings)
+        if done:
+            print(f"  Resuming — {len(done)} file(s) already analyzed with "
+                  f"these settings, {len(todo)} to go.")
+        wavs = todo
+        if not wavs:
+            print("Nothing to do — every file is already analyzed.")
+            return 0
+
+    run_dir = args.run_dir or new_run_dir(
+        args.log_root or os.path.dirname(os.path.abspath(args.model)))
+    manifest = RunManifest(run_dir).open()
+    manifest.write_info({
+        'model_path': args.model, 'model_name': os.path.splitext(
+            os.path.basename(args.model))[0],
+        'threshold': cfg.threshold, 'min_blob_pixels': cfg.min_blob_pixels,
+        'n_files': len(wavs), 'device': cfg.device,
+        'batch_size': cfg.batch_size, 'amp': cfg.amp,
+    })
+    print(f"  Run log: {run_dir}")
+
     def _on_done(summary: dict):
+        # Flushed per file, so a killed run resumes from exactly here.
+        try:
+            manifest.record(summary)
+        except Exception:
+            pass
         wav = os.path.basename(summary.get('wav_path', '?'))
         if 'error' in summary:
             print(f"  [FAIL] {wav}: {summary['error']}", file=sys.stderr)
@@ -77,8 +132,11 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"  [ok]   {wav}: {summary.get('n_blobs', 0)} detection(s) "
               f"in {t.get('t_total', '?')}s ({t.get('device', '?')})")
 
-    results = run_inference_on_files(cfg=cfg, wav_paths=wavs,
-                                     on_file_done=_on_done)
+    try:
+        results = run_inference_on_files(cfg=cfg, wav_paths=wavs,
+                                         on_file_done=_on_done)
+    finally:
+        manifest.close()
 
     n_fail = sum(1 for r in results if 'error' in r)
     total = sum(r.get('n_blobs', 0) for r in results if 'error' not in r)
@@ -212,6 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "on a GPU with spare VRAM; does not change results.")
     pa.add_argument('--no-amp', action='store_true',
                     help="Disable fp16 mixed precision (CUDA only).")
+    pa.add_argument('--no-resume', action='store_true',
+                    help="Re-analyze files that already carry detections from "
+                         "this model at these settings (default is to skip "
+                         "them, so an interrupted run resumes).")
+    pa.add_argument('--run-dir', default='',
+                    help="Directory for this run's manifest.jsonl (default: a "
+                         "timestamped folder under --log-root).")
+    pa.add_argument('--log-root', default='',
+                    help="Where timestamped run folders are created (default: "
+                         "beside the model).")
     pa.add_argument('--training-data-dir', default='',
                     help="Example store, to preserve confirmed labels.")
     pa.add_argument('--no-preserve-labels', action='store_true',
