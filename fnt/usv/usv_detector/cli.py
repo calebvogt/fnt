@@ -4,7 +4,7 @@ Exposes MAD's train / analyze / embeddings pipeline as a headless CLI so it can
 be scripted into batch and HPC workflows without the GUI. Installed as the
 ``mad`` console script (see ``pyproject.toml``)::
 
-    mad analyze    --model weights.pt --input recordings/ --export raven
+    mad analyze    --model weights.pt --input recordings/
     mad train      --project my_project/ --epochs 30
     mad embeddings --model weights.pt --input recordings/ --out emb.npz
 
@@ -46,9 +46,7 @@ def _expand_inputs(inputs: List[str]) -> List[str]:
 # analyze
 # ----------------------------------------------------------------------
 def _cmd_analyze(args: argparse.Namespace) -> int:
-    from .mad_inference import (
-        MADInferenceConfig, run_inference_on_files, read_blob_csv,
-        write_raven_selection_table, write_audacity_labels)
+    from .mad_inference import MADInferenceConfig, run_inference_on_files
 
     wavs = _expand_inputs(args.input)
     if not wavs:
@@ -66,6 +64,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         merge_consecutive=args.merge_consecutive,
         merge_max_gap_s=args.merge_gap_s,
         merge_require_freq_overlap=not args.merge_ignore_freq,
+        batch_size=args.batch_size,
+        amp=not args.no_amp,
     )
 
     def _on_done(summary: dict):
@@ -79,22 +79,6 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     results = run_inference_on_files(cfg=cfg, wav_paths=wavs,
                                      on_file_done=_on_done)
-
-    n_export = 0
-    if args.export:
-        for res in results:
-            csv_path = res.get('csv_path')
-            if not csv_path or not os.path.isfile(csv_path):
-                continue
-            rows = read_blob_csv(csv_path)
-            stem = os.path.splitext(res['wav_path'])[0]
-            if args.export == 'raven':
-                write_raven_selection_table(
-                    f"{stem}.Table.1.selections.txt", rows)
-            else:
-                write_audacity_labels(f"{stem}.labels.txt", rows)
-            n_export += 1
-        print(f"Exported {n_export} file(s) to {args.export} format.")
 
     n_fail = sum(1 for r in results if 'error' in r)
     total = sum(r.get('n_blobs', 0) for r in results if 'error' not in r)
@@ -223,8 +207,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "0.01).")
     pa.add_argument('--merge-ignore-freq', action='store_true',
                     help="When merging, don't require frequency overlap.")
-    pa.add_argument('--export', choices=['raven', 'audacity'],
-                    help="Also write an interchange table per file.")
+    pa.add_argument('--batch-size', type=int, default=8,
+                    help="Tiles per forward pass (default 8). Higher is faster "
+                         "on a GPU with spare VRAM; does not change results.")
+    pa.add_argument('--no-amp', action='store_true',
+                    help="Disable fp16 mixed precision (CUDA only).")
     pa.add_argument('--training-data-dir', default='',
                     help="Example store, to preserve confirmed labels.")
     pa.add_argument('--no-preserve-labels', action='store_true',

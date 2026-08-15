@@ -81,11 +81,20 @@ class FileCountDelegate(QStyledItemDelegate):
     ``_ROLE_FILE_LABEL`` and the ``(a, p, r)`` tuple in ``_ROLE_FILE_COUNTS``
     (None → just the name). The row's DisplayRole text is kept as a plain
     ``name (a, p, r)`` string so column sizing / fallback rendering still work;
-    this delegate only recolors the segments."""
+    this delegate only recolors the segments.
 
-    _ACC = QColor(90, 210, 120)
-    _PEND = QColor(240, 210, 70)
-    _REJ = QColor(235, 90, 90)
+    ``palette_fn`` returns the active overlay palette so these counts use the
+    same colors as the spectrogram masks — otherwise the list would still say
+    "green = accepted" after the canvas switched accepted to white."""
+
+    def __init__(self, parent=None, palette_fn=None):
+        super().__init__(parent)
+        self._palette_fn = palette_fn
+
+    def _colors(self):
+        pal = self._palette_fn() if self._palette_fn else _DEFAULT_PALETTE
+        return (QColor(*pal['confirmed']), QColor(*pal['pending']),
+                QColor(*pal['rejected']))
 
     def paint(self, painter, option, index):
         label = index.data(_ROLE_FILE_LABEL)
@@ -121,12 +130,13 @@ class FileCountDelegate(QStyledItemDelegate):
         draw(("✓  " if has_counts else "") + str(label), base_col)
         if has_counts:
             a, p, r = counts
+            c_acc, c_pend, c_rej = self._colors()
             draw("  (", base_col)
-            draw(str(a), self._ACC)
+            draw(str(a), c_acc)
             draw(", ", base_col)
-            draw(str(p), self._PEND)
+            draw(str(p), c_pend)
             draw(", ", base_col)
-            draw(str(r), self._REJ)
+            draw(str(r), c_rej)
             draw(")", base_col)
         painter.restore()
 
@@ -162,6 +172,87 @@ MASK_POSITIVE = 1   # user-painted target
 MASK_NEGATIVE = 2   # auto-assigned inside committed time bands
 
 LABEL_SUFFIX = "_FNT_MAD_labels.png"
+
+
+# ======================================================================
+# Review-overlay palettes (per spectrogram colormap)
+# ======================================================================
+# Each colormap occupies a narrow slice of color space, so a fixed overlay
+# palette is guaranteed to collide with *some* map: green confirmed masks
+# vanish into viridis's green midtones, yellow predictions vanish into its
+# bright end. These palettes instead draw each state from hues the active map
+# never produces, and every outline is stroked over a ``halo`` under-pen so it
+# stays legible across the map's full dark→bright range.
+#
+# Two rules keep the scheme readable as you switch maps:
+#   • ``rejected`` stays red wherever the map allows it — it's an audit trail,
+#     so stable semantics matter more than maximum pop.
+#   • ``confirmed`` always gets the map's single most contrasting hue; it's
+#     the state you scan for.
+_OVERLAY_PALETTES = {
+    # violet → blue → teal → green → yellow. Free: white, magenta, red.
+    'viridis': {
+        'confirmed': (255, 255, 255),
+        'pending':   (255, 95, 235),
+        'drawing':   (255, 150, 240),
+        'rejected':  (255, 60, 60),
+        'selected':  (255, 175, 45),
+        'edit':      (90, 170, 255),
+        'prob':      (255, 95, 235),
+        'halo':      (0, 0, 0),
+    },
+    # black → purple → magenta → orange → cream. Free: cyan, green, white.
+    'magma': {
+        'confirmed': (255, 255, 255),
+        'pending':   (60, 240, 255),
+        'drawing':   (150, 245, 255),
+        'rejected':  (255, 55, 55),
+        'selected':  (90, 255, 140),
+        'edit':      (90, 170, 255),
+        'prob':      (60, 240, 255),
+        'halo':      (0, 0, 0),
+    },
+    # black → purple → red → orange → yellow → near-white. Free: cyan, green.
+    'inferno': {
+        'confirmed': (255, 255, 255),
+        'pending':   (60, 240, 255),
+        'drawing':   (150, 245, 255),
+        'rejected':  (255, 55, 55),
+        'selected':  (90, 255, 140),
+        'edit':      (90, 170, 255),
+        'prob':      (60, 240, 255),
+        'halo':      (0, 0, 0),
+    },
+    # black → white: every neutral is taken, so all three states are saturated.
+    'grayscale': {
+        'confirmed': (60, 240, 255),
+        'pending':   (255, 95, 235),
+        'drawing':   (255, 150, 240),
+        'rejected':  (255, 60, 60),
+        'selected':  (110, 255, 120),
+        'edit':      (90, 170, 255),
+        'prob':      (255, 95, 235),
+        'halo':      (0, 0, 0),
+    },
+    # white → black: the background is *light*, so colors go dark/saturated and
+    # the halo flips to white.
+    'grayscale_inv': {
+        'confirmed': (0, 80, 235),
+        'pending':   (190, 0, 200),
+        'drawing':   (215, 60, 220),
+        'rejected':  (200, 0, 0),
+        'selected':  (215, 110, 0),
+        'edit':      (0, 110, 190),
+        'prob':      (190, 0, 200),
+        'halo':      (255, 255, 255),
+    },
+}
+_DEFAULT_PALETTE = _OVERLAY_PALETTES['viridis']
+
+
+def overlay_palette(colormap_name: Optional[str]) -> dict:
+    """Review-overlay colors for a spectrogram colormap (viridis if unknown)."""
+    return _OVERLAY_PALETTES.get(colormap_name or 'viridis', _DEFAULT_PALETTE)
 
 
 class _WheelEater(QObject):
@@ -960,6 +1051,38 @@ class MADSpectrogramWidget(SpectrogramWidget):
             self.zoom_requested.emit(1.25, center_time)
         event.accept()
 
+    # --- overlay colors -------------------------------------------------
+    def palette_colors(self) -> dict:
+        """Review-overlay colors matched to the loaded spectrogram colormap."""
+        return overlay_palette(getattr(self, 'colormap_name', None))
+
+    @staticmethod
+    def _stroke_polys(painter, polys, color, width: int, halo,
+                      style=Qt.SolidLine):
+        """Stroke ``polys`` twice — a wider ``halo`` pen underneath, then the
+        colored pen on top. The halo is what actually guarantees the outline
+        reads over both the darkest and brightest parts of any colormap."""
+        if not polys:
+            return
+        painter.setBrush(Qt.NoBrush)
+        for col, w in ((halo, width + 2), (color, width)):
+            pen = QPen(QColor(*col))
+            pen.setWidth(w)
+            pen.setStyle(style)
+            painter.setPen(pen)
+            for poly in polys:
+                painter.drawPolygon(poly)
+
+    @staticmethod
+    def _draw_haloed_text(painter, pos, text, color, halo):
+        """Draw ``text`` with a 1px ``halo`` offset ring so class labels stay
+        readable wherever they land on the spectrogram."""
+        painter.setPen(QPen(QColor(*halo)))
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            painter.drawText(QPointF(pos.x() + dx, pos.y() + dy), text)
+        painter.setPen(QPen(QColor(*color)))
+        painter.drawText(pos, text)
+
     # --- overlay render -----------------------------------------------
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1038,41 +1161,46 @@ class MADSpectrogramWidget(SpectrogramWidget):
               if pend_view is not None else None)
         rgba = np.zeros((h, w_img, 4), dtype=np.uint8)
 
+        # Overlay fills come from the colormap-matched palette so masks never
+        # blend into the spectrogram underneath them (see _OVERLAY_PALETTES).
+        pal = self.palette_colors()
         if self.view_mode == 'mask_only':
             rgba[:] = (32, 32, 32, 255)
-            rgba[tm == 1] = (40, 200, 90, 255)
-            rgba[tm == 2] = (255, 230, 90, 255)
-            rgba[tm == 3] = (255, 70, 70, 255)
+            rgba[tm == 1] = (*pal['confirmed'], 255)
+            rgba[tm == 2] = (*pal['pending'], 255)
+            rgba[tm == 3] = (*pal['rejected'], 255)
             if pv is not None:
-                rgba[pv] = (255, 230, 90, 255)
+                rgba[pv] = (*pal['drawing'], 255)
         elif self.view_mode == 'overlay':
             pos_alpha = int(self.mask_alpha * 255)
-            rgba[tm == 1] = (40, 200, 90, pos_alpha)
-            rgba[tm == 2] = (255, 230, 90, max(60, pos_alpha - 50))
-            rgba[tm == 3] = (255, 70, 70, max(60, pos_alpha - 50))
+            faint = max(60, pos_alpha - 50)
+            rgba[tm == 1] = (*pal['confirmed'], pos_alpha)
+            rgba[tm == 2] = (*pal['pending'], faint)
+            rgba[tm == 3] = (*pal['rejected'], faint)
             if pv is not None:
-                rgba[pv] = (255, 230, 90, max(60, pos_alpha - 50))
+                rgba[pv] = (*pal['drawing'], faint)
         # else: 'spec' — leave rgba all-zero so only the spec shows.
 
-        # Predicted blob mask shading (cyan, low alpha) if present.
+        # Predicted probability shading (low alpha) if present.
         if (self.view_mode != 'spec' and self.pred_mask is not None and
                 self.pred_mask.shape == self.mask.shape):
             pview = self.pred_mask[f_start:f_end, t_start:t_end]
             if pview.size > 0:
                 pview = _ds(pview)
                 active = pview > 0
-                cyan_alpha = (pview[active] * 180).astype(np.uint8)
+                prob_alpha = (pview[active] * 180).astype(np.uint8)
+                pr, pg, pb = pal['prob']
                 if active.any():
                     rgba[active, 0] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 0], 0
+                        rgba[active, 3] > 0, rgba[active, 0], pr
                     )
                     rgba[active, 1] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 1], 220
+                        rgba[active, 3] > 0, rgba[active, 1], pg
                     )
                     rgba[active, 2] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 2], 255
+                        rgba[active, 3] > 0, rgba[active, 2], pb
                     )
-                    rgba[active, 3] = np.maximum(rgba[active, 3], cyan_alpha)
+                    rgba[active, 3] = np.maximum(rgba[active, 3], prob_alpha)
 
         rgba = np.flipud(rgba).copy()
         qimg = QImage(rgba.data, w_img, h, 4 * w_img,
@@ -1092,20 +1220,16 @@ class MADSpectrogramWidget(SpectrogramWidget):
             frac = (f - f_start) / max(1, (f_end - f_start))
             return spec_rect.bottom() - frac * spec_rect.height()
 
-        # Dotted yellow outline tracing the actively-drawn (SAM/Paint) pending
-        # mask — dotted distinguishes it from inference predictions (solid
-        # yellow), so you can tell what you're labeling vs reviewing.
+        # Dotted outline tracing the actively-drawn (SAM/Paint) pending mask —
+        # dotted distinguishes it from inference predictions (solid), so you
+        # can tell what you're labeling vs reviewing.
         if (HAS_CV2 and overlays_visible and self._pending is not None
                 and pend_view is not None and pend_view.any()):
             cnts, _ = cv2.findContours(
                 pend_view.astype(np.uint8), cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
-            pen = QPen(QColor(255, 225, 60))
-            pen.setWidth(2)
-            pen.setStyle(Qt.DotLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
+            polys = []
             for cnt in cnts:
                 if len(cnt) < 2:
                     continue
@@ -1116,7 +1240,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         _t_to_x(t_start + int(pt[0])),
                         _f_to_y(f_start + int(pt[1])),
                     ))
-                painter.drawPolygon(poly)
+                polys.append(poly)
+            self._stroke_polys(painter, polys, pal['drawing'], 2, pal['halo'],
+                               style=Qt.DotLine)
 
         # (SAM prompt clicks are not drawn — only the proposed mask is shown.)
 
@@ -1135,18 +1261,14 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 is_rej = ann.get('status') == 'rejected'
                 is_sel = (ai == self._selected_ann_idx)
                 if is_sel:
-                    # Selected detection: mask outline AND label both white so
-                    # tiny detections are easy to spot.
-                    outline_color = QColor(255, 255, 255)
-                    label_color = QColor(255, 255, 255)
+                    # Selected detection: outline AND label take the palette's
+                    # selection hue so tiny detections are easy to spot.
+                    outline_color = pal['selected']
                 elif is_rej:
-                    outline_color = QColor(255, 80, 80)
-                    label_color = QColor(255, 110, 110)
+                    outline_color = pal['rejected']
                 else:
-                    outline_color = (QColor(255, 225, 60) if is_pred
-                                     else QColor(60, 210, 110))   # green confirmed
-                    label_color = (QColor(255, 230, 100) if is_pred
-                                   else QColor(130, 235, 150))
+                    outline_color = pal['pending'] if is_pred else pal['confirmed']
+                label_color = outline_color
                 # Thin outline around the mask contour.
                 lf0 = max(ann['f0'], f_start) - f_start
                 lf1 = min(ann['f1'], f_end) - f_start
@@ -1167,10 +1289,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         view_ann[:, :] = msk[af0:af1, at0:at1].astype(np.uint8)
                     cnts, _ = cv2.findContours(
                         view_ann, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    pen = QPen(outline_color)
-                    pen.setWidth(2)
-                    painter.setPen(pen)
-                    painter.setBrush(Qt.NoBrush)
+                    polys = []
                     for cnt in cnts:
                         if len(cnt) < 2:
                             continue
@@ -1181,9 +1300,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                                 _t_to_x(t_start + lt0 + int(pt[0])),
                                 _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
-                        painter.drawPolygon(poly)
+                        polys.append(poly)
+                    self._stroke_polys(painter, polys, outline_color, 2,
+                                       pal['halo'])
                 # Class label centered horizontally over the mask, just above it.
-                painter.setPen(QPen(label_color))
                 f = painter.font()
                 f.setPointSize(8)
                 painter.setFont(f)
@@ -1196,9 +1316,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 tw = painter.fontMetrics().horizontalAdvance(label)
                 lx = cx - tw / 2.0
                 ly = _f_to_y(min(ann['f1'], f_end)) - 3
-                painter.drawText(QPointF(lx, ly), label)
+                self._draw_haloed_text(painter, QPointF(lx, ly), label,
+                                       label_color, pal['halo'])
 
-        # White highlight outline on the selected annotation(s) — the single
+        # Highlight outline on the selected annotation(s) — the single
         # click-selected one plus any rubber-band multi-selection. Drawn even
         # when zoomed out (per-call overlays hidden) so the selection stays
         # visible; bbox-sized alloc keeps it cheap.
@@ -1229,10 +1350,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         view_sel[:, :] = smsk[sf0:sf1, st0:st1].astype(np.uint8)
                     scnts, _ = cv2.findContours(
                         view_sel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    pen = QPen(QColor(255, 255, 255))
-                    pen.setWidth(3)
-                    painter.setPen(pen)
-                    painter.setBrush(Qt.NoBrush)
+                    polys = []
                     for cnt in scnts:
                         if len(cnt) < 2:
                             continue
@@ -1242,32 +1360,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
                                 _t_to_x(t_start + lt0 + int(pt[0])),
                                 _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
-                        painter.drawPolygon(poly)
+                        polys.append(poly)
+                    self._stroke_polys(painter, polys, pal['selected'], 3,
+                                       pal['halo'])
 
-        # Blue draggable outline + vertices for the annotation being edited.
+        # Draggable outline + vertices for the annotation being edited.
         if (self._editing_ann_idx is not None and
                 0 <= self._editing_ann_idx < len(self.annotations) and
                 self._edit_points):
-            pen = QPen(QColor(60, 150, 255))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
             poly = QPolygonF()
             for (tt, ff) in self._edit_points:
                 poly.append(QPointF(_t_to_x(tt), _f_to_y(ff)))
-            painter.drawPolygon(poly)
-            painter.setBrush(QBrush(QColor(60, 150, 255)))
+            self._stroke_polys(painter, [poly], pal['edit'], 2, pal['halo'])
+            painter.setPen(QPen(QColor(*pal['halo'])))
+            painter.setBrush(QBrush(QColor(*pal['edit'])))
             for (tt, ff) in self._edit_points:
                 cx, cy = _t_to_x(tt), _f_to_y(ff)
                 painter.drawEllipse(QRectF(cx - 4, cy - 4, 8, 8))
 
-        # Rubber-band selection rectangle (dotted) while dragging.
+        # Rubber-band selection rectangle (dotted) while dragging. Uses the
+        # palette's contrast color so it shows on light maps too.
+        guide = (0, 0, 0) if pal['halo'] == (255, 255, 255) else (255, 255, 255)
         if self._rubber_start is not None and self._rubber_cur is not None:
-            pen = QPen(QColor(255, 255, 255))
+            pen = QPen(QColor(*guide))
             pen.setStyle(Qt.DashLine)
             pen.setWidth(1)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(255, 255, 255, 30)))
+            painter.setBrush(QBrush(QColor(*guide, 30)))
             painter.drawRect(QRectF(self._rubber_start, self._rubber_cur))
 
         # Brush / eraser cursor preview circle.
@@ -1285,9 +1404,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 (px_per_tframe * px_per_fbin) ** 0.5
             )
             radius_screen = max(2.0, radius_screen)
-            color = (QColor(255, 255, 255, 220)
-                     if self.paint_mode == 'brush'
-                     else QColor(255, 80, 80, 220))
+            color = QColor(*(pal['confirmed'] if self.paint_mode == 'brush'
+                             else pal['rejected']), 220)
             pen = QPen(color)
             pen.setWidth(1)
             painter.setPen(pen)
@@ -1329,7 +1447,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # horizontal middle of the spectrogram. Auto-advance centers the
         # selected call on this line, giving a fixed marker to read against.
         cx_mid = int(spec_rect.center().x())
-        pen = QPen(QColor(255, 255, 255, 150))
+        pen = QPen(QColor(*guide, 150))
         pen.setStyle(Qt.DashLine)
         pen.setWidth(2)
         painter.setPen(pen)
@@ -1820,12 +1938,16 @@ class MADViewInferenceWorker(QThread):
             tile_time = int(ckpt.get('tile_time_frames', 256))
 
             self.progress_signal.emit(0.3)
+            # float32 here: this is one visible window (a few MB), and the
+            # downstream overlay/threshold code reads probabilities directly.
+            # The full-file path uses the default uint8 grid instead.
             prob = infer_probability_mask(
                 model, spec,
                 tile_freq_bins=tile_freq,
                 tile_time_frames=tile_time,
                 overlap_fraction=0.25,
                 device=device,
+                out_dtype=np.float32,
                 progress=lambda i, n: self.progress_signal.emit(
                     0.3 + 0.6 * (i / max(1, n))),
             )
@@ -2488,7 +2610,7 @@ class MADDeviceProbeWorker(QThread):
                 if nv:
                     name = nv
                     note = (f"{nv} present, but this PyTorch is CPU-only — will "
-                            "run on CPU. Reinstall a CUDA build to use the GPU.")
+                            "run on CPU. Fix: Help ▸ Check GPU / CUDA setup.")
                 else:
                     note = "No GPU detected — will run on CPU."
         except Exception:
@@ -2669,8 +2791,8 @@ class MADMainWindow(QMainWindow):
 
         # Single scrolled left column (no tabs): everything acts on the one
         # shared spectrogram canvas. Order top→bottom mirrors the workflow:
-        # open project → load session audio → curate Training Data → review
-        # detections → label → train/infer → logs.
+        # open project → load session audio → curate Training Data → label →
+        # review detections → train/infer → logs.
         self.left_column = QScrollArea()
         self.left_column.setWidgetResizable(True)
         self.left_column.setMinimumWidth(_min_w)
@@ -2682,9 +2804,9 @@ class MADMainWindow(QMainWindow):
         _page_layout.setSpacing(8)
         for build in (
             self._create_session_audio_section,
+            self._create_training_data_list_section, # Training Data
             self._create_paint_tools_section,        # Labeling Tools
             self._create_annotation_list_section,    # Detections
-            self._create_training_data_list_section, # Training Data
             self._create_model_section,
             self._create_session_log_section,
         ):
@@ -2957,7 +3079,8 @@ class MADMainWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setMaximumHeight(180)
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.file_list.setItemDelegate(FileCountDelegate(self.file_list))
+        self.file_list.setItemDelegate(
+            FileCountDelegate(self.file_list, palette_fn=self._overlay_palette))
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
         vbox.addWidget(self.file_list)
@@ -3128,20 +3251,60 @@ class MADMainWindow(QMainWindow):
         view_row.addStretch()
         vbox.addLayout(view_row)
 
-        hint = QLabel(
-            "Yellow = pending (solid = prediction, dotted = you're drawing; "
-            "Enter to confirm) · Green = confirmed · Red = rejected. Confirmed "
-            "calls save as self-contained training examples."
-        )
-        hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
+        # Legend. Colors are colormap-dependent (see _OVERLAY_PALETTES), so the
+        # text is generated rather than hard-coded — otherwise it would lie
+        # about which color means what as soon as you switch color maps.
+        self.lbl_legend = QLabel()
+        self.lbl_legend.setStyleSheet("font-size: 9px;")
+        self.lbl_legend.setWordWrap(True)
+        vbox.addWidget(self.lbl_legend)
+        self._update_legend()
 
         # Quick Inference lives in the Model Training & Inference section now
         # (next to Load Project Models), sharing that section's model dropdown.
 
         group.setLayout(vbox)
         layout.addWidget(group)
+
+    def _infer_perf_kwargs(self) -> dict:
+        """Performance-only inference settings, shared by every place that
+        builds a MADInferenceConfig so the two paths can't drift apart."""
+        return {
+            'batch_size': self.spin_infer_batch.value(),
+            'amp': self.chk_infer_amp.isChecked(),
+        }
+
+    def _overlay_palette(self) -> dict:
+        """Review colors for the loaded spectrogram colormap. Shared by the
+        canvas overlays, the detections list, the file-count badges and the
+        legend so every surface agrees on what each color means."""
+        sp = getattr(self, 'spectrogram', None)
+        if sp is None:
+            return overlay_palette(None)
+        return sp.palette_colors()
+
+    def _update_legend(self):
+        """Rewrite the Labeling Tools legend for the active palette."""
+        lbl = getattr(self, 'lbl_legend', None)
+        if lbl is None:
+            return
+        pal = self._overlay_palette()
+
+        def swatch(key, text):
+            r, g, b = pal[key]
+            return (f"<span style='color:rgb({r},{g},{b}); "
+                    f"font-weight:bold;'>{text}</span>")
+
+        lbl.setText(
+            swatch('drawing', "▬ dotted") + " = you're drawing (Enter to "
+            "confirm) · " +
+            swatch('pending', "▬ solid") + " = prediction, pending review · " +
+            swatch('confirmed', "▬") + " = confirmed · " +
+            swatch('rejected', "▬") + " = rejected."
+            "<br><i style='color:#888888;'>Confirmed calls save as "
+            "self-contained training examples. Colors follow the Color Map "
+            "so masks stay visible.</i>"
+        )
 
     def _set_view_mode(self, mode: str):
         if mode == 'mask_only':  # retired view — fall back to overlay
@@ -3170,7 +3333,9 @@ class MADMainWindow(QMainWindow):
         self.deploy_list = QListWidget()
         self.deploy_list.setMaximumHeight(150)
         self.deploy_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.deploy_list.setItemDelegate(FileCountDelegate(self.deploy_list))
+        self.deploy_list.setItemDelegate(
+            FileCountDelegate(self.deploy_list,
+                              palette_fn=self._overlay_palette))
         self.deploy_list.setToolTip(
             "Training Data recordings (stored in the project). Click to preview "
             "and review; edits modify this training copy's csv/h5.")
@@ -3497,6 +3662,25 @@ class MADMainWindow(QMainWindow):
             "<b>Compute device</b> for inference: <b>auto</b> picks CUDA &gt; "
             "MPS &gt; CPU.")
         iform.addRow("Device:", self.combo_infer_device)
+
+        self.spin_infer_batch = QSpinBox()
+        self.spin_infer_batch.setRange(1, 64)
+        self.spin_infer_batch.setValue(8)
+        self.spin_infer_batch.setToolTip(
+            "<b>Tiles per forward pass.</b> Higher keeps the GPU busy and is a "
+            "near-linear throughput win on a card with spare VRAM (try 16-32 on "
+            "a 16 GB GPU); lower it if you hit out-of-memory. <b>Does not change "
+            "results</b> — only speed.")
+        iform.addRow("Inference batch size:", self.spin_infer_batch)
+
+        self.chk_infer_amp = QCheckBox("Mixed precision (fp16)")
+        self.chk_infer_amp.setChecked(True)
+        self.chk_infer_amp.setToolTip(
+            "Run the model in fp16 on CUDA — typically 1.5-2x faster on modern "
+            "NVIDIA cards. Ignored on CPU/MPS. The probability grid is stored at "
+            "1/255 resolution regardless, so fp16 costs nothing that survives to "
+            "the detections. Turn off only to rule it out when debugging.")
+        iform.addRow("", self.chk_infer_amp)
         self.lbl_infer_device_info = QLabel("Detecting compute device…")
         self.lbl_infer_device_info.setStyleSheet("color: #999999; font-size: 9px;")
         self.lbl_infer_device_info.setWordWrap(True)
@@ -4005,6 +4189,8 @@ class MADMainWindow(QMainWindow):
     def _refresh_annotation_list(self):
         if not hasattr(self, 'annotation_list'):
             return
+        # Row colors track the canvas overlay palette (colormap-dependent).
+        _lpal = self._overlay_palette()
         self.spectrogram._selected_ann_idx = None
 
         tree = self.annotation_list
@@ -4072,9 +4258,9 @@ class MADMainWindow(QMainWindow):
             kind = ('prediction' if is_pred
                     else 'rejected' if is_rej else 'confirmed')
             item.setData(0, Qt.UserRole, (cur_wav, t0, ann.get('id', ''), kind))
-            color = (QColor(255, 230, 90) if is_pred
-                     else QColor(255, 90, 90) if is_rej
-                     else QColor(80, 210, 120))   # green confirmed
+            color = QColor(*(_lpal['pending'] if is_pred
+                             else _lpal['rejected'] if is_rej
+                             else _lpal['confirmed']))
             for c in range(ncols):
                 item.setForeground(c, color)
             new_items.append(item)
@@ -4114,7 +4300,7 @@ class MADMainWindow(QMainWindow):
                 # '__pending__' id never matches a real annotation, so clicking
                 # just pans to the mask without trying to select an annotation.
                 item.setData(0, Qt.UserRole, (cur_wav, t0, '__pending__', 'pending'))
-                color = QColor(255, 230, 90)  # same yellow as predictions
+                color = QColor(*_lpal['drawing'])
                 for c in range(ncols):
                     item.setForeground(c, color)
                 new_items.append(item)
@@ -4175,9 +4361,10 @@ class MADMainWindow(QMainWindow):
             self.waveform_overview.set_status_marks([])
             return
         dt = hop / float(sr)
-        pending = QColor(255, 225, 60)
-        rejected = QColor(255, 80, 80)
-        confirmed = QColor(60, 210, 110)   # green
+        pal = self._overlay_palette()
+        pending = QColor(*pal['pending'])
+        rejected = QColor(*pal['rejected'])
+        confirmed = QColor(*pal['confirmed'])
         marks = []
         for ann in self.spectrogram.annotations:
             st = ann.get('status')
@@ -6242,6 +6429,7 @@ class MADMainWindow(QMainWindow):
             preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
+            **self._infer_perf_kwargs(),
         )
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()
@@ -6299,7 +6487,6 @@ class MADMainWindow(QMainWindow):
             # the list count reads them live (and doesn't show the prior file's
             # number mid-load).
             self._loaded_wav_path = filepath
-            self.menu_export.setEnabled(True)
             self._update_active_training_count()
             self._sync_scrollbar_from_view()
             suffix = f"  |  {n_pred} prediction(s)" if n_pred else ""
@@ -6315,62 +6502,6 @@ class MADMainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self._update_paint_buttons_enabled()
         self._update_playback_buttons_enabled()
-
-    def _export_detections(self, fmt: str):
-        """Export the current file's persisted detections to an interchange
-        format. ``fmt`` is 'raven' (Raven Pro selection table) or 'audacity'
-        (Audacity label track). Reads the sibling CSV so the export reflects
-        what's saved on disk, then writes the chosen format next to it."""
-        wav = getattr(self, '_loaded_wav_path', None)
-        if not wav:
-            QMessageBox.information(
-                self, "Export Detections",
-                "Load a file first — there are no detections to export.")
-            return
-        csv_path = pred_csv_sibling_path(wav)
-        if not os.path.isfile(csv_path):
-            QMessageBox.information(
-                self, "Export Detections",
-                "This file has no saved detections yet. Run inference or "
-                "confirm labels, then export.")
-            return
-        from fnt.usv.usv_detector.mad_inference import (
-            read_blob_csv, write_raven_selection_table, write_audacity_labels)
-        try:
-            rows = read_blob_csv(csv_path)
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Export Detections", f"Could not read detections:\n{e}")
-            return
-        if not rows:
-            QMessageBox.information(
-                self, "Export Detections", "No detections to export.")
-            return
-        stem = os.path.splitext(os.path.basename(wav))[0]
-        if fmt == 'raven':
-            default = os.path.join(
-                os.path.dirname(wav), f"{stem}.Table.1.selections.txt")
-            caption, filt, writer = (
-                "Export Raven Selection Table",
-                "Raven selection table (*.txt)", write_raven_selection_table)
-        else:
-            default = os.path.join(os.path.dirname(wav), f"{stem}.labels.txt")
-            caption, filt, writer = (
-                "Export Audacity Labels",
-                "Audacity label track (*.txt)", write_audacity_labels)
-        out_path, _ = QFileDialog.getSaveFileName(self, caption, default, filt)
-        if not out_path:
-            return
-        try:
-            writer(out_path, rows)
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Export Detections", f"Export failed:\n{e}")
-            return
-        n = sum(1 for r in rows
-                if (r.get('status') or 'pending') != 'rejected')
-        self.status_bar.showMessage(
-            f"Exported {n} detection(s) → {os.path.basename(out_path)}")
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -6413,23 +6544,6 @@ class MADMainWindow(QMainWindow):
         file_menu.addAction(self.act_close_project)
 
         file_menu.addSeparator()
-
-        # Export the current file's detections to interchange formats that open
-        # directly in common bioacoustics tools.
-        self.menu_export = file_menu.addMenu("&Export Detections")
-        self.menu_export.setEnabled(False)
-        act_export_raven = QAction("Raven Selection Table…", self)
-        act_export_raven.setToolTip(
-            "Export current file's detections as a Raven Pro selection table")
-        act_export_raven.triggered.connect(
-            lambda: self._export_detections('raven'))
-        self.menu_export.addAction(act_export_raven)
-        act_export_audacity = QAction("Audacity Labels…", self)
-        act_export_audacity.setToolTip(
-            "Export current file's detections as an Audacity label track")
-        act_export_audacity.triggered.connect(
-            lambda: self._export_detections('audacity'))
-        self.menu_export.addAction(act_export_audacity)
 
         # The Labels and Predict menus are hidden — every command is reachable
         # from the GUI itself. We still register their keyboard shortcuts (and
@@ -6522,72 +6636,154 @@ class MADMainWindow(QMainWindow):
     # GPU / CUDA readiness
     # ------------------------------------------------------------------
     @staticmethod
-    def _detect_nvidia_gpu() -> Optional[str]:
-        """Return an NVIDIA GPU name via nvidia-smi, or None if absent."""
+    def _nvidia_driver_info() -> Optional[dict]:
+        """Query ``nvidia-smi`` for the GPU name, driver version and the highest
+        CUDA runtime that driver supports. None when nvidia-smi is absent.
+
+        The supported-CUDA number is what decides which PyTorch wheel index to
+        recommend — an NVIDIA driver runs any CUDA runtime at or below it, so a
+        13.x driver can run cu126 wheels but a 12.6 driver cannot run cu130."""
+        import re
         import subprocess
+        info: dict = {}
         try:
             out = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                ['nvidia-smi',
+                 '--query-gpu=name,driver_version', '--format=csv,noheader'],
                 capture_output=True, text=True, timeout=6)
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip().splitlines()[0].strip()
+            if out.returncode != 0 or not out.stdout.strip():
+                return None
+            first = out.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first.split(',')]
+            info['name'] = parts[0]
+            info['driver'] = parts[1] if len(parts) > 1 else '?'
+        except Exception:
+            return None
+        # The max supported CUDA runtime only appears in the banner, not in the
+        # --query-gpu fields, so parse it out of the plain nvidia-smi output.
+        try:
+            banner = subprocess.run(['nvidia-smi'], capture_output=True,
+                                    text=True, timeout=6)
+            m = re.search(r'CUDA Version:\s*([0-9]+\.[0-9]+)', banner.stdout)
+            if m:
+                info['cuda'] = float(m.group(1))
         except Exception:
             pass
-        return None
+        return info
+
+    @staticmethod
+    def _detect_nvidia_gpu() -> Optional[str]:
+        """Return an NVIDIA GPU name via nvidia-smi, or None if absent."""
+        info = MADMainWindow._nvidia_driver_info()
+        return info.get('name') if info else None
+
+    @staticmethod
+    def _recommended_cuda_tag(driver_cuda: Optional[float]) -> str:
+        """PyTorch wheel index tag for a driver's max CUDA runtime.
+
+        Kept conservative: every tag here is one PyTorch publishes Windows +
+        Linux wheels for. When the driver version is unknown, cu126 is the
+        safest broadly-available choice."""
+        if driver_cuda is None:
+            return 'cu126'
+        if driver_cuda >= 13.0:
+            return 'cu130'
+        if driver_cuda >= 12.6:
+            return 'cu126'
+        if driver_cuda >= 12.1:
+            return 'cu121'
+        return 'cu118'
 
     def _gpu_status(self):
         """Return ``(ready: bool, title, message)`` describing GPU readiness."""
+        import sys as _sys
+        pyver = f"{_sys.version_info.major}.{_sys.version_info.minor}"
+        env = os.environ.get('CONDA_DEFAULT_ENV') or Path(_sys.prefix).name
         try:
             import torch
         except Exception:
-            return (False, "PyTorch not found",
-                    "PyTorch isn't installed in this environment, so training "
-                    "and inference can't run at all. Install it (see the CUDA "
-                    "command below) in your 'fnt' conda env.")
-        ver = getattr(torch, '__version__', '?')
-        if torch.cuda.is_available():
+            torch = None
+
+        if torch is not None and torch.cuda.is_available():
             try:
                 name = torch.cuda.get_device_name(0)
             except Exception:
                 name = "CUDA GPU"
             return (True, "GPU ready ✓",
-                    f"PyTorch {ver} can use your GPU:\n\n    {name}\n\n"
+                    f"PyTorch {torch.__version__} can use your GPU:\n\n"
+                    f"    {name}\n\n"
                     "Training and inference will run on CUDA (Device = auto).")
-        nv = self._detect_nvidia_gpu()
-        import sys as _sys
-        pyver = f"{_sys.version_info.major}.{_sys.version_info.minor}"
-        cuda_cmd = (
-            "    conda activate fnt\n"
+
+        nv = self._nvidia_driver_info()
+        driver_cuda = (nv or {}).get('cuda')
+        tag = self._recommended_cuda_tag(driver_cuda)
+        # torch's own version string carries the build variant: '2.13.0+cpu' is
+        # a CPU-only wheel, '2.13.0+cu130' a CUDA one. This is the single most
+        # useful line for diagnosing "my GPU is there but torch won't use it".
+        ver = getattr(torch, '__version__', None) if torch is not None else None
+        built_cuda = getattr(getattr(torch, 'version', None), 'cuda', None)
+
+        cmds = (
+            f"    conda activate {env}\n"
             "    pip uninstall -y torch torchvision\n"
-            "    pip install torch torchvision --index-url "
-            "https://download.pytorch.org/whl/cu124\n")
+            f"    pip install torch torchvision --index-url "
+            f"https://download.pytorch.org/whl/{tag}\n")
         guidance = (
-            "Get the EXACT command for your setup from:\n"
-            "    https://pytorch.org/get-started/locally/\n"
-            "(choose Stable · Windows · Pip · Python · your CUDA version)\n\n"
-            "Or run, in the 'fnt' env:\n\n" + cuda_cmd +
-            "\nNotes:\n"
-            f"  • Match the CUDA tag to what's offered — cu124/cu126 are current; "
-            "an old tag like cu121 may have no wheels (that's the\n"
-            "    'Could not find a version… (from versions: none)' error).\n"
-            "  • Double-check the URL host is exactly 'download.pytorch.org'.\n"
-            f"  • Your Python is {pyver}; the chosen torch must publish wheels "
-            "for it.\n"
-            "  • You only need a recent NVIDIA driver — not the full CUDA "
-            "Toolkit.\n"
-            "  • If the GPU install fails, get back to a working CPU setup with:"
-            "  pip install torch torchvision")
+            "HOW TO FIX\n"
+            "Install a CUDA build of PyTorch into this environment:\n\n"
+            + cmds + "\n"
+            "Then fully restart MAD and re-open this dialog — it should say "
+            "'GPU ready'.\n\n"
+            "WHY THIS HAPPENS\n"
+            "  • Plain 'pip install torch' pulls the default PyPI wheel, which "
+            "on Windows is CPU-only.\n"
+            "    The CUDA builds live on PyTorch's own index, which is what the "
+            "--index-url above selects.\n"
+            f"  • The CUDA tag must be <= what your driver supports"
+            + (f" (yours: CUDA {driver_cuda:g})" if driver_cuda else "")
+            + f"; '{tag}' is the right one here.\n"
+            f"  • Your Python is {pyver} — the chosen torch must publish wheels "
+            "for it. If pip reports\n"
+            "    'Could not find a version … (from versions: none)', the tag or "
+            "the Python version has no wheels;\n"
+            "    check https://pytorch.org/get-started/locally/ for the current "
+            "combination.\n"
+            "  • You only need a recent NVIDIA driver — the full CUDA Toolkit is "
+            "NOT required.\n"
+            "  • To go back to a working CPU setup:  pip install torch "
+            "torchvision")
+
+        if torch is None:
+            return (False, "PyTorch not found",
+                    f"PyTorch isn't installed in this environment ({env}), so "
+                    "training and inference can't run at all.\n\n" + guidance)
+
         if nv:
+            detail = [
+                f"Detected NVIDIA GPU:      {nv.get('name', '?')}",
+                f"Driver version:           {nv.get('driver', '?')}",
+            ]
+            if driver_cuda:
+                detail.append(f"Driver supports up to:    CUDA {driver_cuda:g}")
+            detail += [
+                f"Installed PyTorch:        {ver}",
+                f"PyTorch built against:    "
+                + (f"CUDA {built_cuda}" if built_cuda
+                   else "CPU only (no CUDA)"),
+                f"Environment:              {env}  (Python {pyver})",
+            ]
             return (False, "GPU present, but PyTorch is CPU-only",
-                    f"Detected NVIDIA GPU:\n\n    {nv}\n\n"
-                    f"…but the installed PyTorch ({ver}) is a CPU-only build, "
-                    "so training/inference run on the CPU (slow).\n\n"
-                    + guidance + "\n\nRestart MAD afterward and re-check here.")
+                    "\n".join(detail) +
+                    "\n\nThe GPU and driver are fine — the PyTorch wheel is the "
+                    "problem. It has no CUDA support\ncompiled in, so training "
+                    "and inference fall back to the CPU (typically 10-50x "
+                    "slower).\n\n" + guidance)
+
         return (False, "No NVIDIA GPU detected",
                 "No NVIDIA GPU was found (nvidia-smi isn't available), so "
                 "training/inference will use the CPU.\n\nIf this machine does "
                 "have an NVIDIA GPU, install its driver first, then a CUDA "
-                "build of PyTorch:\n\n" + guidance)
+                "build of PyTorch.\n\n" + guidance)
 
     def _show_gpu_setup_dialog(self, force: bool = False):
         """Show the GPU readiness dialog. When ``force`` is False it only shows
@@ -7280,7 +7476,6 @@ class MADMainWindow(QMainWindow):
             # In-memory annotations now belong to this file — record it so the
             # session-list count reads them live rather than the prior file's.
             self._loaded_wav_path = filepath
-            self.menu_export.setEnabled(True)
             self._sync_scrollbar_from_view()
             if self._project is not None:
                 self._project.last_opened_file = filepath
@@ -8337,6 +8532,15 @@ class MADMainWindow(QMainWindow):
     def _on_colormap_changed(self, _index: int = 0):
         name = self.combo_colormap.currentData() or 'viridis'
         self.spectrogram.set_colormap(name)
+        # The overlay palette is derived from the colormap, so every surface
+        # that paints review colors has to be repainted with the new one.
+        self._update_legend()
+        self._refresh_annotation_list()
+        self._update_overview_marks()
+        for lst in (getattr(self, 'file_list', None),
+                    getattr(self, 'deploy_list', None)):
+            if lst is not None:
+                lst.viewport().update()
 
     def _on_wheel_zoom(self, factor: float, center_time: float):
         if self.spectrogram.total_duration <= 0:
@@ -8826,6 +9030,7 @@ class MADMainWindow(QMainWindow):
             preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
+            **self._infer_perf_kwargs(),
         )
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()

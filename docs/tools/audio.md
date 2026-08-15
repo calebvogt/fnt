@@ -14,7 +14,7 @@ Project-based spectrogram labeling, training, and inference tool. See the [MAD O
 - **Training** — train a U-Net segmentation model on labeled examples within the GUI
 - **Inference** — run trained models on new recordings; review and correct predictions
 - **Project system** — organizes session audio, training data, and models in a single project folder
-- **Export** — detections to CSV, Raven selection tables, and Audacity label tracks
+- **Output** — one standalone detections CSV per recording, written beside the wav
 
 ## Classic Audio Detector (CAD)
 

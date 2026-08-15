@@ -65,11 +65,12 @@ Per recording `<wav>`:
   - `call_number` — 1…N display index, renumbered by onset time on every write.
   - `call_id` — stable join key to the h5 mask (int for predictions, string id
     for hand-labels).
-  - `status` — `pending` (yellow, unreviewed) · `accepted` (green; hand-labels
-    write accepted, and accepting a prediction in train mode also saves a
-    training example) · `rejected` (a **recorded** human "no", kept visible red
-    as an audit trail; *not* used as negative training data). **Delete** drops
-    the row + mask entirely (no `deleted` status).
+  - `status` — `pending` (unreviewed) · `accepted` (hand-labels write accepted,
+    and accepting a prediction in train mode also saves a training example) ·
+    `rejected` (a **recorded** human "no", kept visible as an audit trail;
+    *not* used as negative training data). **Delete** drops the row + mask
+    entirely (no `deleted` status). The on-screen color of each status depends
+    on the active spectrogram colormap — see *Review colors* below.
   - `source` — `prediction` or `label`.
   - `class` — call type (e.g. `USV`); `score` — mean model probability (`1.0`
     for hand-labels). Inference preserves existing label rows and replaces only
@@ -233,6 +234,33 @@ re-run inference to regenerate predictions in the new format.
 > as slack in the file. `fnt_mask_store.delete_prob()` therefore *repacks*
 > (copies everything except `/prob` into a fresh file and atomically replaces
 > the original) so the disk is actually freed.
+
+---
+
+## Review colors
+
+Overlay colors are **not fixed** — they're chosen per spectrogram colormap
+(`_OVERLAY_PALETTES` in `mad_pyqt.py`). A fixed palette always collides with
+some map: green confirmed masks disappear into viridis's green midtones and
+yellow predictions disappear into its bright end. Each palette therefore draws
+from hues the active map never produces, and every outline is stroked over a
+contrast **halo** pen, which is what actually keeps it legible across the map's
+full dark→bright range.
+
+| Colormap | confirmed | pending | rejected |
+|---|---|---|---|
+| Viridis | white | magenta | red |
+| Magma / Inferno | white | cyan | red |
+| Grayscale | cyan | magenta | red |
+| Grayscale Inverted | blue | purple | dark red |
+
+Two rules keep it readable while switching maps: `rejected` stays red wherever
+the map allows (it's an audit trail — stable semantics beat maximum pop), and
+`confirmed` always takes the map's most contrasting hue, since that's the state
+you scan for. The legend under **Labeling Tools** is generated from the active
+palette, and the detections list, waveform-overview marks and per-file
+`(A, P, R)` badges all read from the same source, so no surface can drift out
+of sync.
 
 ---
 

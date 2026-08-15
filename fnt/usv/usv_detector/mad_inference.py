@@ -27,6 +27,13 @@ from .mad_labels import pred_csv_sibling_path
 from .spectrogram import load_audio
 
 
+# Default accumulator budget, in time frames. The float32 accumulator for one
+# chunk costs n_freq_bins x chunk_frames x 4 bytes: at 513 bins this is ~270 MB
+# for the default, regardless of how long the recording is. See
+# infer_probability_mask for why the whole grid is no longer materialized.
+DEFAULT_CHUNK_FRAMES = 131072
+
+
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
@@ -39,6 +46,17 @@ class MADInferenceConfig:
     tile_freq_bins: int = 512
     tile_overlap_fraction: float = 0.25
     device: str = "auto"
+    # Tiles per forward pass. 8 keeps a modest GPU busy; raise to 16-32 on a
+    # card with plenty of VRAM for a near-linear throughput win, lower it on
+    # out-of-memory. Has no effect on results.
+    batch_size: int = 8
+    # Mixed precision (fp16 autocast). CUDA only — ignored on CPU/MPS. Roughly
+    # 1.5-2x faster on modern NVIDIA cards; the probability grid is quantized to
+    # 1/255 anyway, so fp16 costs nothing that survives to the output.
+    amp: bool = True
+    # Time-column budget for the per-chunk float32 accumulator; bounds peak RAM
+    # independently of recording length. See infer_probability_mask.
+    chunk_frames: int = DEFAULT_CHUNK_FRAMES
     save_blob_csv: bool = True
     # If True (default), the probability mask is zeroed out in any time
     # column that already contains a confirmed call for this file (rebuilt
@@ -142,25 +160,53 @@ def _hann_weight_1d(n: int) -> np.ndarray:
     return w.astype(np.float32)
 
 
+def prob_threshold_u8(threshold: float) -> int:
+    """A [0,1] probability threshold in the uint8 domain used by prob grids."""
+    return int(round(max(0.0, min(1.0, threshold)) * 255.0))
+
+
 def infer_probability_mask(
     model, spec_image: np.ndarray,
     tile_freq_bins: int, tile_time_frames: int,
     overlap_fraction: float, device: str,
-    batch_size: int = 4,
+    batch_size: int = 8,
+    use_amp: bool = True,
+    chunk_frames: int = DEFAULT_CHUNK_FRAMES,
+    out_dtype=np.uint8,
     progress: Optional[Callable[[int, int], None]] = None,
     wait_if_paused: Optional[Callable[[], None]] = None,
 ) -> np.ndarray:
     """Tile-and-stitch inference over a full-file spectrogram image.
 
-    Returns a float32 probability mask with the **same shape** as
-    ``spec_image`` (n_freq_bins, n_time_frames). Tiles are blended with
-    a cosine weighting along time so tile seams don't show.
+    Returns a probability mask with the **same shape** as ``spec_image``
+    (n_freq_bins, n_time_frames). Tiles are blended with a cosine weighting
+    along time so tile seams don't show.
+
+    ``out_dtype`` is ``np.uint8`` by default, storing probability x 255. A
+    10-minute 250 kHz recording is ~1.17M frames x 513 bins; as float32 that
+    single grid is 2.4 GB, and the old implementation held three of them plus a
+    same-shape float32 ``weight_sum`` — ~9.6 GB for one file, which is what put
+    long recordings at risk of OOM. uint8 costs 600 MB, and 1/255 resolution is
+    far finer than anything thresholding or mean-probability scores need. Pass
+    ``out_dtype=np.float32`` for small windows (the interactive view path) where
+    the grid is a few MB and exact probabilities are convenient.
+
+    Memory is bounded three ways:
+      * the full-resolution float32 accumulator is per **chunk** of at most
+        ``chunk_frames`` columns, not per file;
+      * ``weight_sum`` is 1-D — the Hann blend varies only along time, so the
+        old (n_freq, n_time) weight array stored the same value in every row;
+      * normalization happens in place.
+
+    Chunks are cut on tile boundaries and the un-finalized tail is carried into
+    the next chunk, so the result is bit-identical to accumulating the whole
+    grid at once — no seam artifacts at chunk edges.
     """
     import torch
 
     H, W = spec_image.shape
-    prob_sum = np.zeros((H, W), dtype=np.float32)
-    weight_sum = np.zeros((H, W), dtype=np.float32)
+    out = np.zeros((H, W), dtype=out_dtype)
+    quantize = np.dtype(out_dtype) == np.uint8
 
     # Freq axis: we centered tiles at bin 0 during training, so crop the
     # top tile_freq_bins here too. If tile_freq_bins < H, we miss bins
@@ -171,36 +217,92 @@ def infer_probability_mask(
     t_starts = _sliding_tile_starts(W, tile_time_frames, overlap_fraction)
     time_w = _hann_weight_1d(tile_time_frames)
 
-    total_batches = (len(t_starts) + batch_size - 1) // batch_size
+    # Group tiles into chunks whose accumulator stays within the frame budget.
+    # A chunk always holds at least one tile, however small the budget.
+    chunk_frames = max(int(chunk_frames), tile_time_frames)
+    groups: List[List[int]] = []
+    cur: List[int] = []
+    for t0 in t_starts:
+        if cur and (min(W, t0 + tile_time_frames) - cur[0]) > chunk_frames:
+            groups.append(cur)
+            cur = []
+        cur.append(t0)
+    if cur:
+        groups.append(cur)
+
+    amp_on = bool(use_amp) and str(device).startswith('cuda')
+    total_batches = sum(
+        (len(g) + batch_size - 1) // batch_size for g in groups) or 1
     batch_i = 0
 
-    for b0 in range(0, len(t_starts), batch_size):
-        if wait_if_paused is not None:
-            wait_if_paused()  # blocks here while the user has paused the run
-        starts = t_starts[b0:b0 + batch_size]
-        tiles = np.zeros((len(starts), 1, tile_freq_bins, tile_time_frames), dtype=np.float32)
-        for k, t0 in enumerate(starts):
-            t1 = min(W, t0 + tile_time_frames)
-            tiles[k, 0, :f_crop, :t1 - t0] = spec_image[:f_crop, t0:t1]
-        xb = torch.from_numpy(tiles).to(device)
-        with torch.no_grad():
-            logits = model(xb)
-            probs = torch.sigmoid(logits).cpu().numpy()[:, 0]  # (B, H, W)
+    # Un-finalized tail of the previous chunk: columns the next chunk's tiles
+    # still contribute to. At most one tile wide.
+    carry_acc: Optional[np.ndarray] = None
+    carry_w: Optional[np.ndarray] = None
 
-        for k, t0 in enumerate(starts):
-            t1 = min(W, t0 + tile_time_frames)
-            tp = probs[k, :f_crop, :t1 - t0]
-            w = time_w[:t1 - t0]
-            prob_sum[:f_crop, t0:t1] += tp * w[None, :]
-            weight_sum[:f_crop, t0:t1] += w[None, :]
+    for gi, starts in enumerate(groups):
+        g0 = starts[0]
+        g1 = min(W, starts[-1] + tile_time_frames)
+        acc = np.zeros((f_crop, g1 - g0), dtype=np.float32)
+        wacc = np.zeros(g1 - g0, dtype=np.float32)
+        if carry_acc is not None:
+            cw = carry_acc.shape[1]
+            acc[:, :cw] += carry_acc
+            wacc[:cw] += carry_w
+            carry_acc = carry_w = None
 
-        batch_i += 1
-        if progress is not None:
-            progress(batch_i, total_batches)
+        for b0 in range(0, len(starts), batch_size):
+            if wait_if_paused is not None:
+                wait_if_paused()  # blocks while the user has paused the run
+            bstarts = starts[b0:b0 + batch_size]
+            tiles = np.zeros(
+                (len(bstarts), 1, tile_freq_bins, tile_time_frames),
+                dtype=np.float32)
+            for k, t0 in enumerate(bstarts):
+                t1 = min(W, t0 + tile_time_frames)
+                tiles[k, 0, :f_crop, :t1 - t0] = spec_image[:f_crop, t0:t1]
+            xb = torch.from_numpy(tiles).to(device)
+            with torch.no_grad():
+                if amp_on:
+                    with torch.autocast(device_type='cuda',
+                                        dtype=torch.float16):
+                        logits = model(xb)
+                    probs = torch.sigmoid(logits.float()).cpu().numpy()[:, 0]
+                else:
+                    logits = model(xb)
+                    probs = torch.sigmoid(logits).cpu().numpy()[:, 0]
 
-    out = np.zeros_like(prob_sum)
-    nz = weight_sum > 0
-    out[nz] = prob_sum[nz] / weight_sum[nz]
+            for k, t0 in enumerate(bstarts):
+                t1 = min(W, t0 + tile_time_frames)
+                n = t1 - t0
+                a0 = t0 - g0
+                acc[:, a0:a0 + n] += probs[k, :f_crop, :n] * time_w[None, :n]
+                wacc[a0:a0 + n] += time_w[:n]
+
+            batch_i += 1
+            if progress is not None:
+                progress(batch_i, total_batches)
+
+        # Columns before the next chunk's first tile are final; the rest still
+        # awaits that chunk's contributions and becomes the carry.
+        final_end = groups[gi + 1][0] if gi + 1 < len(groups) else g1
+        fw = final_end - g0
+        done = acc[:, :fw]
+        w = wacc[:fw]
+        nz = w > 0
+        if nz.any():
+            done[:, nz] /= w[nz]
+        if quantize:
+            np.clip(done, 0.0, 1.0, out=done)
+            done *= 255.0
+            out[:f_crop, g0:final_end] = done.astype(np.uint8)
+        else:
+            out[:f_crop, g0:final_end] = done
+        if fw < acc.shape[1]:
+            carry_acc = acc[:, fw:].copy()
+            carry_w = wacc[fw:].copy()
+        del acc, wacc
+
     return out
 
 
@@ -226,9 +328,16 @@ def extract_blobs(
     cropped boolean pixel mask of that blob (shape
     ``[f_high_exclusive - f_low, t_end_exclusive - t_start]``), so callers can
     persist the exact call shape without re-thresholding the full grid later.
+
+    ``prob_mask`` may be float in [0,1] or the memory-efficient uint8 grid
+    (probability x 255) returned by :func:`infer_probability_mask`; ``threshold``
+    is a [0,1] probability either way and ``score`` always comes back in [0,1].
     """
     from scipy import ndimage as ndi
-    binary = (prob_mask >= threshold).astype(np.uint8)
+    u8 = prob_mask.dtype == np.uint8
+    cut = prob_threshold_u8(threshold) if u8 else threshold
+    score_scale = (1.0 / 255.0) if u8 else 1.0
+    binary = (prob_mask >= cut).astype(np.uint8)
     if binary.sum() == 0:
         return []
 
@@ -251,7 +360,7 @@ def extract_blobs(
         if area < min_blob_pixels:
             continue
         sub_probs = prob_mask[fs, ts]
-        score = float(sub_probs[sub_mask].mean())
+        score = float(sub_probs[sub_mask].mean()) * score_scale
         blob = {
             't_start': int(ts.start),
             't_end_exclusive': int(ts.stop),
@@ -712,71 +821,6 @@ def read_blob_csv(path: str) -> List[Dict]:
 
 
 # ----------------------------------------------------------------------
-# Interchange exports — Raven selection tables and Audacity label tracks.
-# Both take the same internal ``rows`` format as :func:`write_blob_csv`
-# (keys: blob_id, class, start_s, stop_s, min_freq_hz, max_freq_hz, score)
-# and, like it, drop rejected detections and sort by onset time. These are
-# the two formats the bioacoustics community reaches for first (Raven Pro
-# selection tables, Audacity label import), so MAD output opens directly in
-# those tools without a manual conversion step.
-# ----------------------------------------------------------------------
-
-def _export_rows(rows: List[Dict]) -> List[Dict]:
-    """Rejected detections dropped, remainder sorted by onset (stable)."""
-    keep = [r for r in rows
-            if (r.get('status') or 'pending') != 'rejected']
-    return [r for _, r in sorted(
-        enumerate(keep),
-        key=lambda kv: (_safe_float(kv[1].get('start_s')), kv[0]))]
-
-
-def write_raven_selection_table(path: str, rows: List[Dict]) -> None:
-    """Write a Raven Pro selection table (tab-delimited .txt).
-
-    Columns follow Raven's spectrogram-selection convention so the file can be
-    dropped straight onto a sound in Raven Pro. ``class`` maps to Annotation and
-    ``score`` to a trailing Score column (both ignored by Raven's core but shown
-    in the selection table view)."""
-    header = [
-        'Selection', 'View', 'Channel',
-        'Begin Time (s)', 'End Time (s)',
-        'Low Freq (Hz)', 'High Freq (Hz)',
-        'Annotation', 'Score',
-    ]
-    with open(path, 'w', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(header)
-        for n, r in enumerate(_export_rows(rows), start=1):
-            score = r.get('score', '')
-            writer.writerow([
-                n, 'Spectrogram 1', 1,
-                round(_safe_float(r.get('start_s')), 6),
-                round(_safe_float(r.get('stop_s')), 6),
-                round(_safe_float(r.get('min_freq_hz')), 2),
-                round(_safe_float(r.get('max_freq_hz')), 2),
-                (r.get('class') or '').strip(),
-                round(_safe_float(score), 4) if score not in (None, '') else '',
-            ])
-
-
-def write_audacity_labels(path: str, rows: List[Dict]) -> None:
-    """Write an Audacity label track (tab-delimited .txt).
-
-    Uses Audacity's extended frequency-label format: each label is a start/stop/
-    text line followed by a ``\\t<low>\\t<high>`` continuation line carrying the
-    frequency range, so the labels land on the spectrogram at the right band."""
-    with open(path, 'w', newline='') as f:
-        for r in _export_rows(rows):
-            label = (r.get('class') or '').strip() or 'call'
-            start = round(_safe_float(r.get('start_s')), 6)
-            stop = round(_safe_float(r.get('stop_s')), 6)
-            low = round(_safe_float(r.get('min_freq_hz')), 2)
-            high = round(_safe_float(r.get('max_freq_hz')), 2)
-            f.write(f"{start}\t{stop}\t{label}\n")
-            f.write(f"\\\t{low}\t{high}\n")
-
-
-# ----------------------------------------------------------------------
 # Call embeddings — fixed-length feature vectors per detection.
 #
 # Each detection's spectrogram patch is pushed through the trained model's
@@ -974,6 +1018,9 @@ def run_inference_on_file(
         tile_time_frames=tile_time_frames,
         overlap_fraction=cfg.tile_overlap_fraction,
         device=device,
+        batch_size=cfg.batch_size,
+        use_amp=cfg.amp,
+        chunk_frames=cfg.chunk_frames,
         progress=(lambda i, n: progress('infer', i, n)) if progress else None,
         wait_if_paused=wait_if_paused,
     )

@@ -18,12 +18,9 @@ Launch from the FNT main GUI **Audio** tab → **Mask Audio Detector (MAD)**.
 
 MAD organizes work into a project folder holding session audio references, the training-data store, and trained model checkpoints. Detections are saved as a sibling CSV next to each recording, cross-readable with the Classic Audio Detector (CAD) output.
 
-## Exporting detections
+## Detection output
 
-Beyond the native CSV, MAD exports detections to two interchange formats used widely in bioacoustics. Both are available from **File → Export Detections** and operate on the currently loaded file (rejected detections are dropped, and the remainder are sorted by onset time):
-
-- **Raven selection table** (`*.selections.txt`) — a tab-delimited table that opens directly on a sound in [Raven Pro](https://www.ravensoundsoftware.com/). Call type maps to the Annotation column and model confidence to a Score column.
-- **Audacity label track** (`*.labels.txt`) — an Audacity label file using the extended frequency-label format, so labels land on the spectrogram at the correct frequency band.
+Every recording gets its own standalone `<wav>_FNT_MAD_predictions.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. There is no aggregate run-level table and no interchange export: MAD is deliberately self-contained for both analysis and review, and third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
 
 ## Consecutive-detection merging
 
@@ -42,9 +39,8 @@ MAD's train / analyze / embeddings pipeline is also available headless as the
 `mad` console script, for scripting into batch and HPC workflows:
 
 ```bash
-# Run a trained model over a folder, merging split calls, exporting Raven tables
-mad analyze --model weights.pt --input recordings/ \
-    --merge-consecutive --export raven
+# Run a trained model over a folder (recursive), merging split calls
+mad analyze --model weights.pt --input recordings/ --merge-consecutive
 
 # Train a model from a MAD project directory
 mad train --project my_project/ --epochs 30 --device cuda
