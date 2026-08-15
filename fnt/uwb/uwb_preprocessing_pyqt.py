@@ -2006,17 +2006,6 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('Animation Generated')
             summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
 
-            if self.chk_save_plots.isChecked():
-                summary_data['Parameter'].append('Plot Downsampling')
-                summary_data['Value'].append(
-                    f'{self.spin_plot_downsample_hz.value()} Hz'
-                    if self.chk_downsample_plots.isChecked() else 'Off (full resolution)')
-            if self.chk_save_animation.isChecked():
-                summary_data['Parameter'].append('Animation Downsampling')
-                summary_data['Value'].append(
-                    f'{self.spin_anim_downsample_hz.value()} Hz'
-                    if self.chk_downsample_animation.isChecked() else 'Off (full resolution)')
-
             summary_data['Parameter'].append('Proximity Detection')
             if self.chk_proximity_detection.isChecked():
                 summary_data['Value'].append(f'Yes (threshold: {self.spin_proximity_threshold.value()} m)')
@@ -2194,41 +2183,6 @@ class UWBQuickVisualizationWindow(QWidget):
         for w in (self.chk_velocity_filter, self.chk_jump_filter):
             w.stateChanged.connect(self.invalidate_preview_cache)
         
-    def _make_downsample_control(self, which):
-        """Build a 'Downsample data for <which> to [N] Hz' sub-row.
-
-        Returns (row_widget, checkbox, spinbox). Used to give Save Plots and
-        Save Animation each their own independent downsampling control.
-        """
-        row = QWidget()
-        lay = QHBoxLayout()
-        lay.setContentsMargins(0, 0, 0, 0)
-        chk = QCheckBox(f"Downsample data for {which} to")
-        chk.setChecked(True)  # on by default
-        chk.setToolTip(
-            f"Thin the data used to render {which} to the chosen rate. Does NOT "
-            "affect the exported smoothed CSV (which stays full resolution) or "
-            "proximity detection.\n"
-            "\n"
-            "UWB tags can log several Hz during movement, so 1 Hz typically cuts "
-            f"{which} time several-fold with no visible change in the tracks. A "
-            "temporary working file is written as the render source and deleted "
-            "when the export finishes.")
-        lay.addWidget(chk)
-        spin = QSpinBox()
-        spin.setRange(1, 5)
-        spin.setValue(1)
-        spin.setSuffix(" Hz")
-        spin.setFixedWidth(70)
-        spin.setToolTip(
-            "Target sample rate: keeps the first fix in each 1/Hz-second bin, "
-            "per tag.")
-        lay.addWidget(spin)
-        lay.addStretch()
-        row.setLayout(lay)
-        chk.toggled.connect(spin.setEnabled)  # spinbox active only when ticked
-        return row, chk, spin
-
     def create_settings_panel(self):
         """Create the settings panel as a single scrollable column"""
         panel = QWidget()
@@ -2482,8 +2436,8 @@ class UWBQuickVisualizationWindow(QWidget):
             "duration, mean distance and observation count.\n"
             "\n"
             "Computed from the filtered + smoothed data at full temporal "
-            "resolution — NOT the downsampled export — so no fixes are dropped "
-            "before pairwise distances are measured.\n"
+            "resolution, so no fixes are dropped before pairwise distances are "
+            "measured.\n"
             "\n"
             "Bouts are threshold-specific: to analyze a different distance, "
             "re-run with a new threshold. The raw per-timestamp pairwise "
@@ -2687,10 +2641,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.plot_types_widget = QWidget()
         plot_types_layout = QVBoxLayout()
         plot_types_layout.setContentsMargins(30, 0, 0, 0)
-        # Per-plots downsampling of the render source (a sub-option of Save Plots).
-        plot_ds_row, self.chk_downsample_plots, self.spin_plot_downsample_hz = \
-            self._make_downsample_control("plots")
-        plot_types_layout.addWidget(plot_ds_row)
         self.plot_type_checkboxes = {}
         plot_types = [
             ("daily_paths", "Daily Paths per Tag",
@@ -2753,12 +2703,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.animation_options_widget = QWidget()
         animation_options_layout = QVBoxLayout()
         animation_options_layout.setContentsMargins(30, 0, 0, 0)
-
-        # Per-animation downsampling of the render source (a sub-option of
-        # Save Animation), independent of the plots downsampling.
-        anim_ds_row, self.chk_downsample_animation, self.spin_anim_downsample_hz = \
-            self._make_downsample_control("animation")
-        animation_options_layout.addWidget(anim_ds_row)
 
         trail_layout = QHBoxLayout()
         trail_layout.addWidget(QLabel("Trail length (seconds):"))
@@ -4992,10 +4936,6 @@ class UWBQuickVisualizationWindow(QWidget):
         self.on_social_network_toggled()
         self.on_sna_daily_toggled()
         self.chk_save_plots.setChecked(False)
-        self.chk_downsample_plots.setChecked(True)
-        self.spin_plot_downsample_hz.setValue(1)
-        self.chk_downsample_animation.setChecked(True)
-        self.spin_anim_downsample_hz.setValue(1)
         self.chk_save_svg.setChecked(False)
         for cb in self.plot_type_checkboxes.values():
             cb.setChecked(True)
@@ -6641,7 +6581,13 @@ class UWBQuickVisualizationWindow(QWidget):
             'time_gap': self.spin_time_gap.value(),
             'smoothing_method': self.combo_smoothing.currentText(),
             'rolling_window': self.spin_rolling_window.value(),
-            'rolling_window_units': self.combo_window_units.currentText(),
+            # EWMA span is always in samples and ignores the units control (which
+            # is hidden for EWMA, so its combo keeps a stale value). Serialize
+            # "Samples" here so the saved config matches what was actually applied.
+            'rolling_window_units': (
+                'Samples'
+                if self.combo_smoothing.currentText() == "Forward-Backward Exponentially Weighted Moving Average"
+                else self.combo_window_units.currentText()),
             'show_anchors': self.chk_show_anchors.isChecked(),
             'show_tracking': self.chk_show_tracking.isChecked(),
             'show_tag_id': self.chk_show_tag_id.isChecked(),
@@ -6663,10 +6609,6 @@ class UWBQuickVisualizationWindow(QWidget):
             'sna_layout': self.combo_sna_layout.currentText(),
             'sna_fps': self.combo_sna_fps.currentText(),
             'save_plots': self.chk_save_plots.isChecked(),
-            'downsample_plots': self.chk_downsample_plots.isChecked(),
-            'plot_downsample_hz': self.spin_plot_downsample_hz.value(),
-            'downsample_animation': self.chk_downsample_animation.isChecked(),
-            'anim_downsample_hz': self.spin_anim_downsample_hz.value(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
@@ -6888,15 +6830,6 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
-
-            if 'downsample_plots' in config:
-                self.chk_downsample_plots.setChecked(config['downsample_plots'])
-            if 'plot_downsample_hz' in config:
-                self.spin_plot_downsample_hz.setValue(config['plot_downsample_hz'])
-            if 'downsample_animation' in config:
-                self.chk_downsample_animation.setChecked(config['downsample_animation'])
-            if 'anim_downsample_hz' in config:
-                self.spin_anim_downsample_hz.setValue(config['anim_downsample_hz'])
 
             if 'save_svg' in config:
                 self.chk_save_svg.setChecked(config['save_svg'])
@@ -7549,11 +7482,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_export_progress.setText("")
     
     def _cleanup_plot_working_files(self):
-        """Delete the temporary downsampled/raw render CSVs written for this run.
+        """Delete any temporary render CSVs tracked for this run.
 
-        These '<db>_TEMP_renderdata_*.csv' files exist only so the plot worker and the
-        animation have a source to read; they are removed once those consumers
-        finish. The exported smoothed CSV deliverable is never in this list.
+        Plots and animation now render straight from the exported smoothed CSV,
+        so no temp render files are written and this list is normally empty. The
+        method is kept as a defensive no-op safety net (and to clean anything a
+        future render stage might register). The smoothed CSV deliverable is
+        never added here.
         """
         for path in getattr(self, '_plot_working_files', []):
             try:
@@ -7575,7 +7510,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Initialize export state
         self.export_cancelled = False
-        self._plot_working_files = []  # temp render CSVs to delete when done
+        self._plot_working_files = []  # defensive: normally stays empty now
         self.exporting = True
         self.btn_export.setEnabled(False)
         self.btn_stop_export.setVisible(True)
@@ -7597,10 +7532,6 @@ class UWBQuickVisualizationWindow(QWidget):
         export_smoothed_csv = True   # smoothed CSV is always exported
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
-        downsample_plots = self.chk_downsample_plots.isChecked()
-        plot_downsample_hz = self.spin_plot_downsample_hz.value()
-        downsample_animation = self.chk_downsample_animation.isChecked()
-        anim_downsample_hz = self.spin_anim_downsample_hz.value()
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
@@ -7984,63 +7915,13 @@ class UWBQuickVisualizationWindow(QWidget):
                         self.log_message(f"✓ Smoothed CSV exported: {smoothed_csv_filename}")
                         csv_path = smoothed_csv_path  # Use smoothed for plots/animation
 
-                # Render sources for plots and animation. Each is independent of
-                # the full-resolution smoothed CSV deliverable: it can be
-                # downsampled (a big render-cost saver, chosen per-consumer) and
-                # holds the smoothed track if the smoothed CSV was written, else
-                # the raw (unsmoothed) fixes. (The raw CSV export is a verbatim
-                # DB dump in inches with no Timestamp column, so it can't be a
-                # plotting source directly.) Temporary working files are tracked
-                # and deleted once the renderers finish.
-                render_source_cache = {}
-
-                def _build_render_source(downsample, hz):
-                    key = (downsample, hz if downsample else None)
-                    if key in render_source_cache:
-                        return render_source_cache[key]
-                    if export_smoothed_csv:
-                        base = smoothed_data
-                        kind = 'smoothed'
-                    else:
-                        base = smoothed_data.drop(
-                            columns=['smoothed_x', 'smoothed_y'], errors='ignore')
-                        kind = 'raw (unsmoothed)'
-
-                    if downsample and not base.empty:
-                        # Thin to the target rate: first fix per 1/Hz-second bin
-                        # per tag (resolution-safe floor binning).
-                        work = base.copy()
-                        period = pd.Timedelta(seconds=1.0 / hz)
-                        work['time_bin'] = work['Timestamp'].dt.floor(period)
-                        work = work.groupby(['shortid', 'time_bin']).first().reset_index()
-                        work = work.drop(columns=['time_bin'])
-                        fn = f'{db_name}_TEMP_renderdata_{hz}Hz.csv'
-                        path = os.path.join(output_dir, fn)
-                        work.to_csv(path, index=False)
-                        self._plot_working_files.append(path)
-                        self.log_message(
-                            f"Render source: {hz} Hz downsampled {kind} data "
-                            f"({len(work)} of {len(base)} rows): {fn}")
-                        result = path
-                    elif export_smoothed_csv:
-                        # Full resolution + smoothed CSV written: reuse the
-                        # deliverable directly (not a temp file).
-                        result = smoothed_csv_path
-                    else:
-                        # Full resolution, no smoothed CSV: working copy of the
-                        # raw (unsmoothed) fixes for the renderers.
-                        fn = f'{db_name}_TEMP_renderdata_raw.csv'
-                        path = os.path.join(output_dir, fn)
-                        base.to_csv(path, index=False)
-                        self._plot_working_files.append(path)
-                        self.log_message(
-                            f"Render source: raw (unsmoothed) full-resolution fixes: {fn}")
-                        result = path
-                    render_source_cache[key] = result
-                    return result
-
-                plot_csv_path = _build_render_source(downsample_plots, plot_downsample_hz) if save_plots else None
-                anim_csv_path = _build_render_source(downsample_animation, anim_downsample_hz) if save_animation else None
+                # Plots and animation render directly from the full-resolution
+                # smoothed CSV — the exact same data product the user inspects.
+                # This is deliberate: a downsampled render would look artificially
+                # coarser/jerkier than the smoothed track and could mislead the
+                # user into over-smoothing. No temporary render files are written.
+                plot_csv_path = smoothed_csv_path if save_plots else None
+                anim_csv_path = smoothed_csv_path if save_animation else None
             
             # Write the site-map image (if any) so the analysis folder is a
             # self-contained data product, then save the config that references it.
@@ -8173,7 +8054,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.background_image,
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height
-                    plot_csv_path,  # plots render source (possibly downsampled)
+                    plot_csv_path,  # plots render source (full-resolution smoothed CSV)
                     self.chk_save_svg.isChecked(),  # Save SVG copies
                     output_dir,  # Pass output directory
                     plots_dir,  # Pass plots subfolder
