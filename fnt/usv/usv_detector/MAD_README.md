@@ -171,27 +171,50 @@ Project-wide:
 - `.scratch/` — temporary masks/predictions for files you're **browsing in
   place** but haven't accepted a call on yet. Wiped on close (see below).
 
-### Browse-in-place ingestion (finding calls in big recording sets)
+### Recordings are referenced, not copied
 
-When recording 24/7 you may have hundreds of wavs and not know which contain
-USVs. Adding a folder to **Label & Train** does **not** copy those files into
-the project. Instead they're **browsed in place**:
+A project does **not** store your audio. `mad_project_info.json` holds a
+`training_files` table of *references*: absolute path, basename, size, and a
+cheap content fingerprint (size + first and last 1 MiB).
 
-- Their masks/predictions are redirected to `<project>/.scratch/` (so the
-  original recording folders stay clean — no stray `.h5`/`.csv` siblings). This
-  redirect is implemented as a path override consulted by
-  `fnt_mask_store.masks_sibling_path` / `mad_labels.pred_csv_sibling_path`.
-- A file is **graduated** — copied into `recordings/`, with its scratch masks
-  moved alongside and the file recorded in the project — only when you **accept
-  a call** on it (hand-label + confirm, or change a prediction to accepted, via
-  `_ensure_wav_in_project`). Reject/pending/delete do **not** graduate a file.
-- On close, `.scratch/` is discarded, so files you never accepted leave no
-  trace. Browsing is **session-only**: reopening the project shows just the
-  graduated files; re-add the folder to keep searching.
+This is safe because of where training data actually lives. Every confirmed call
+is baked into `training_data.h5` as a self-contained spectrogram patch + mask,
+and `mad_training` reads only that store — **it never opens a wav**. The audio is
+needed for exactly one thing: re-opening a file to look at it.
 
-So you can point MAD at 500 raw recordings, run post-training inference, accept
-calls in the handful that have USVs, and only those few wavs (plus their masks)
-ever land in the project — no bulk copying of files you'll discard.
+That is a much weaker dependency than SLEAP has on its videos. SLEAP stores frame
+indices and coordinates, so a missing video means it cannot train at all; MAD's
+model, labels and detections are all unaffected. So a missing recording is a
+**soft** state, not an error:
+
+- The Training Data row shows `⚠` and preview/playback are unavailable.
+- Training, the example store, and every saved detection keep working.
+- Batch inference silently skips missing files rather than aborting the run.
+
+**Finding files again.** `mad_registry.resolve_entries` tries, cheapest first:
+the stored path; then the same basename in a directory where another entry *did*
+resolve (files move in groups, so a resolved sibling is the best hint) or in one
+of the project's `source_folders`. A candidate is accepted only if the size — and
+the fingerprint, when known — matches, so a same-named different recording is
+never silently swapped in.
+
+When automatic resolution fails, **File ▸ Locate Missing Recordings…** asks for
+one file and infers the prefix change from it (`D:/exp/mic2/a.wav` →
+`E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`), then repoints every sibling
+that moved the same way. Fix one, fix two hundred. Prefix matching compares whole
+path components, so a neighbouring `exp_backup/` tree is never dragged along, and
+only files that are *currently missing* and whose rewritten path *exists* are
+changed — a wrong guess is a no-op.
+
+**Portability.** **File ▸ Pack Project (embed audio)…** copies every referenced
+recording into `recordings/`, making the project fully self-contained for
+archiving or handing to a collaborator. Packed files are marked `embedded=True`
+and become project-owned: removing one from the Training Data set deletes it,
+whereas removing a *referenced* file only unregisters it and never touches disk.
+
+**Legacy projects.** Projects with `recordings/` copies still work. Those wavs are
+adopted into the registry on open as `embedded=True`, so nothing changes for them
+unless you delete the copies yourself.
 
 ### Why we do NOT store the full probability grid
 

@@ -29,7 +29,8 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
                              QDateTimeEdit, QTreeWidget, QTreeWidgetItem,
-                             QSplitter, QSlider, QProgressDialog, QGridLayout)
+                             QSplitter, QSlider, QProgressDialog, QGridLayout,
+                             QListWidget)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QFont
 
@@ -319,6 +320,33 @@ SMOOTHING_METHODS_TOOLTIP = (
 )
 
 
+class DbQueryWorker(QThread):
+    """Run a read-only database query off the GUI thread.
+
+    ``fn`` is a zero-arg callable that opens its OWN connection (via
+    ``connect_ro``), runs its queries, and returns a result object. It must
+    never touch Qt widgets — the result is delivered back to the main thread
+    through the ``done`` signal, where UI updates are safe. Used to keep the
+    on-load metadata scans (DISTINCT tags/days, MIN/MAX time bounds) — which are
+    slow on a large, not-yet-indexed database over a network drive — from
+    freezing the window.
+    """
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.done.emit(result)
+
+
 class PreviewIndexBuilder(QThread):
     """Build an indexed *copy* of the database for fast preview scrubbing.
 
@@ -350,6 +378,10 @@ class PreviewIndexBuilder(QThread):
         tmp = self.dst_path + ".partial"
         try:
             self.progress.emit("Copying database…")
+            # Ensure the destination folder (the analysis/export subfolder)
+            # exists — the caller normally creates it, but this keeps the
+            # builder self-contained if invoked another way.
+            os.makedirs(os.path.dirname(self.dst_path), exist_ok=True)
             # Write to a temp name first so an interrupted build can never be
             # mistaken for a finished cache.
             if os.path.exists(tmp):
@@ -1789,7 +1821,14 @@ class UWBQuickVisualizationWindow(QWidget):
         # Export control flags
         self.export_cancelled = False
         self.exporting = False
-        
+        self._last_export_failed = False
+
+        # Batch queue: preprocess many trials sequentially (bounded memory).
+        self._batch_items = []          # [{'path': str, 'status': str}]
+        self._batch_active = False
+        self._batch_index = 0
+        self._batch_stop_requested = False
+
         # Tag identity and sex mapping
         self.tag_identities = {}  # {tag_id: {'sex': 'M', 'identity': 'Animal1'}}
         
@@ -2206,6 +2245,25 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_config_status.setStyleSheet("color: #ff4444; font-style: italic; font-size: 9px;")
         self.lbl_config_status.setVisible(False)
         db_layout.addWidget(self.lbl_config_status)
+
+        # Background-work feedback, right under the Select button so the user
+        # sees that work is happening instead of a frozen window. Used for the
+        # on-load metadata reads (tags/days/time-bounds) AND the fast-index
+        # build. The bar is indeterminate (busy) because these durations are
+        # unknown; it animates via the event loop while the work runs on a
+        # background thread. Shown/hidden through a ref-counted message stack
+        # (_show_busy/_hide_busy) so overlapping tasks don't hide each other.
+        self.lbl_busy = QLabel("")
+        self.lbl_busy.setStyleSheet("color: #cc9900; font-style: italic; font-size: 9px;")
+        self.lbl_busy.setVisible(False)
+        db_layout.addWidget(self.lbl_busy)
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setRange(0, 0)  # indeterminate / busy marquee
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(8)
+        self.busy_bar.setVisible(False)
+        db_layout.addWidget(self.busy_bar)
+        self._busy_msgs = []  # LIFO stack of active busy messages
 
         table_layout = QHBoxLayout()
         table_layout.addWidget(QLabel("Table:"))
@@ -2869,24 +2927,73 @@ class UWBQuickVisualizationWindow(QWidget):
         self.progress_widget.setVisible(False)
         layout.addWidget(self.progress_widget)
 
-        # Export buttons
-        export_buttons_layout = QHBoxLayout()
-        self.btn_export = QPushButton("Export")
+        # The standalone Export button is retired: the single export path is now
+        # the Batch Queue's "Export Batch" (queue one DB or many, then export).
+        # These button objects are still created — hidden — so the shared
+        # export_data / stop_export code can keep toggling their enabled/visible
+        # state without being special-cased.
+        self.btn_export = QPushButton("Export", panel)
         self.btn_export.clicked.connect(self.export_data)
         self.btn_export.setEnabled(False)
-        self.btn_export.setToolTip(
-            "Run the full preprocessing pipeline: filter, smooth, export CSVs, "
-            "generate plots/animations, and save config to the output folder."
-        )
-        self.btn_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold;")
-        export_buttons_layout.addWidget(self.btn_export)
-        self.btn_stop_export = QPushButton("Stop Export")
+        self.btn_export.setVisible(False)
+        self.btn_stop_export = QPushButton("Stop Export", panel)
         self.btn_stop_export.clicked.connect(self.stop_export)
-        self.btn_stop_export.setToolTip("Cancel the current export operation")
-        self.btn_stop_export.setStyleSheet("padding: 8px; font-size: 11px; font-weight: bold; background-color: #d41100;")
         self.btn_stop_export.setVisible(False)
-        export_buttons_layout.addWidget(self.btn_stop_export)
-        layout.addLayout(export_buttons_layout)
+
+        # --- Batch queue: preprocess several trials unattended --------------
+        batch_group = QGroupBox("Export Queue")
+        batch_group.setToolTip(
+            "Queue several trials and preprocess them one at a time, unattended. "
+            "Workflow: load a database up top, set its options, then 'Add current "
+            "to Queue' — that captures THIS database with THESE settings as a job. "
+            "Repeat for other databases (each can have its own settings), then Run "
+            "Batch. One trial at a time keeps memory bounded, so a batch won't "
+            "exhaust RAM the way several windows at once can.")
+        batch_layout = QVBoxLayout()
+        # Two rows so the four buttons never force the left column to scroll
+        # horizontally: queue-management on top, the export/stop action below.
+        batch_btns_row1 = QHBoxLayout()
+        self.btn_add_batch = QPushButton("Add to Queue")
+        self.btn_add_batch.setToolTip(
+            "Add current to Queue: snapshot the currently loaded database and "
+            "the settings/export options shown now as one queued job. Then load "
+            "another database up top, adjust its settings, and add it too.")
+        self.btn_add_batch.clicked.connect(self.add_current_to_batch)
+        batch_btns_row1.addWidget(self.btn_add_batch)
+        self.btn_clear_batch = QPushButton("Clear")
+        self.btn_clear_batch.setToolTip("Remove all databases from the queue")
+        self.btn_clear_batch.clicked.connect(self.clear_batch)
+        self.btn_clear_batch.setEnabled(False)
+        batch_btns_row1.addWidget(self.btn_clear_batch)
+        batch_layout.addLayout(batch_btns_row1)
+
+        batch_btns_row2 = QHBoxLayout()
+        self.btn_run_batch = QPushButton("Export Batch")
+        self.btn_run_batch.setToolTip(
+            "Export every queued job sequentially, each with its own captured "
+            "settings. This is the export button — queue a single database or "
+            "several, then export them here.")
+        self.btn_run_batch.clicked.connect(self.run_batch)
+        self.btn_run_batch.setEnabled(False)
+        self.btn_run_batch.setStyleSheet(
+            "padding: 8px; font-size: 11px; font-weight: bold; "
+            "background-color: #2ea043; color: white;")
+        batch_btns_row2.addWidget(self.btn_run_batch)
+        self.btn_stop_batch = QPushButton("Stop Batch")
+        self.btn_stop_batch.setToolTip("Stop after tearing down the current trial")
+        self.btn_stop_batch.clicked.connect(self.stop_batch)
+        self.btn_stop_batch.setVisible(False)
+        self.btn_stop_batch.setStyleSheet(
+            "padding: 8px; font-size: 11px; font-weight: bold; "
+            "background-color: #d41100; color: white;")
+        batch_btns_row2.addWidget(self.btn_stop_batch)
+        batch_layout.addLayout(batch_btns_row2)
+        self.batch_list = QListWidget()
+        self.batch_list.setToolTip("Queued databases and their status")
+        self.batch_list.setMaximumHeight(120)
+        batch_layout.addWidget(self.batch_list)
+        batch_group.setLayout(batch_layout)
+        layout.addWidget(batch_group)
 
         # Session Logs window
         messages_label = QLabel("Session Logs:")
@@ -3379,14 +3486,19 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         if not (self.db_path and self.table_name and self.selected_preview_tags()):
             return
+        # During a batch run we only export — never scrub — so skip bringing the
+        # live preview up (and, crucially, skip building the multi-GB fast-scrub
+        # index copy for every trial).
+        if getattr(self, '_batch_active', False):
+            return
         self._preview_active = True
         # Build/adopt the fast index automatically for instant scrubbing.
         self.ensure_preview_index_db()
         self.refresh_preview_arena()
-        if self.init_preview_timeline():
-            self.preview_playhead_ms = self.preview_t0
-            self._sync_timeline_to_playhead()
-            self._request_chunk(0, make_current=True)
+        # Size the timeline + seed the first chunk on a background thread — the
+        # first-load MIN/MAX over the unindexed network DB is the slow part that
+        # used to freeze the window (see _load_timeline_async / _on_timeline_loaded).
+        self._load_timeline_async()
 
     def eventFilter(self, obj, event):
         """App-level ← / → scrubbing so the arrows work regardless of focus.
@@ -3633,6 +3745,10 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         if self._tag_selection_guard:
             return
+        # During a batch run the preview is never shown; skip the refresh timer
+        # entirely so nothing races with the sequential trial stepping.
+        if getattr(self, '_batch_active', False):
+            return
         # First tags for a freshly-loaded database bring the preview to life;
         # later changes just refresh it.
         if not self._preview_active:
@@ -3689,16 +3805,11 @@ class UWBQuickVisualizationWindow(QWidget):
             self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
                                 make_current=True)
 
-    def init_preview_timeline(self):
-        """Size the timeline slider to the full recording for the selected tags."""
-        tags = self.selected_preview_tags()
-        if not self.db_path or not self.table_name or not tags:
-            return False
-        bounds = self.preview_time_bounds(tags)
+    def _apply_timeline_bounds(self, bounds):
+        """Size the timeline slider to (min_ts, max_ts) epoch-ms. Returns success."""
         if not bounds:
             self.lbl_preview_status.setText("No records for the selected tags")
             return False
-
         self.preview_t0, self.preview_t1 = bounds
         total_s = max(1, (self.preview_t1 - self.preview_t0) // 1000)
         self._timeline_guard = True
@@ -3714,6 +3825,59 @@ class UWBQuickVisualizationWindow(QWidget):
             f"({pd.Timestamp(self.preview_t0, unit='ms', tz='UTC').tz_convert(self.combo_timezone.currentText()):%Y-%m-%d %H:%M} "
             f"to {pd.Timestamp(self.preview_t1, unit='ms', tz='UTC').tz_convert(self.combo_timezone.currentText()):%Y-%m-%d %H:%M})")
         return True
+
+    def init_preview_timeline(self):
+        """Size the timeline slider synchronously (fast path, e.g. tag changes).
+
+        Used once the fast index already exists, where MIN/MAX is quick. The
+        first-load path uses _load_timeline_async instead, because that MIN/MAX
+        runs against the not-yet-indexed original and would freeze the window.
+        """
+        tags = self.selected_preview_tags()
+        if not self.db_path or not self.table_name or not tags:
+            return False
+        return self._apply_timeline_bounds(self.preview_time_bounds(tags))
+
+    def _load_timeline_async(self):
+        """Size the timeline off the GUI thread, then seed the first chunk.
+
+        The first-load MIN/MAX runs against the unindexed original over the
+        network — slow enough to freeze the UI — so it is computed on a
+        DbQueryWorker. On completion (_on_timeline_loaded) the slider is sized
+        and the initial chunk requested.
+        """
+        tags = self.selected_preview_tags()
+        if not (self.db_path and self.table_name and tags):
+            return
+        db = self.preview_db_path or self.db_path
+        table = self.table_name
+        tags_snap = list(tags)
+
+        def _query():
+            conn = connect_ro(db)
+            try:
+                ph = ",".join("?" * len(tags_snap))
+                row = conn.execute(
+                    f"SELECT MIN(timestamp), MAX(timestamp) FROM {table} "
+                    f"WHERE shortid IN ({ph})", tags_snap).fetchone()
+            finally:
+                conn.close()
+            bounds = (int(row[0]), int(row[1])) if row and row[0] is not None else None
+            return {'table': table, 'tags': tags_snap, 'bounds': bounds}
+
+        self._show_busy("Reading recording time range…")
+        self._start_db_query(_query, self._on_timeline_loaded, self._on_meta_load_failed)
+
+    def _on_timeline_loaded(self, res):
+        self._hide_busy()
+        # Stale if the table changed or the tag selection moved on while loading;
+        # a newer selection will have launched its own load.
+        if res['table'] != self.table_name or res['tags'] != self.selected_preview_tags():
+            return
+        if self._apply_timeline_bounds(res['bounds']):
+            self.preview_playhead_ms = self.preview_t0
+            self._sync_timeline_to_playhead()
+            self._request_chunk(0, make_current=True)
 
     def _chunk_ms(self):
         return self.spin_preview_minutes.value() * 60 * 1000
@@ -4639,20 +4803,23 @@ class UWBQuickVisualizationWindow(QWidget):
     # -- indexed preview copy ---------------------------------------------- #
     # The original Wiser database is treated as a read-only primary record and
     # is never written to. Fast scrubbing instead uses a derived, indexed copy
-    # kept alongside the other analysis outputs.
+    # kept in the analysis/export folder with the other analysis outputs.
     def _preview_index_paths(self):
         """(index_dir, indexed_copy_path, provenance_json_path).
 
-        The indexed copy + its provenance JSON live alongside the source
-        database (in the DB's own folder), not in the analysis/export folder, so
-        the fast-scrubbing index travels with the raw data and is reused across
-        exports rather than being duplicated per analysis run.
+        The indexed copy + its provenance JSON live in the analysis/export
+        folder (``<db>_FNT_analysis``, in the source DB's directory) alongside
+        the other analysis outputs, so every derived product for a run is
+        collected in one place rather than scattered next to the raw database.
+        The folder is created on demand before the index is built
+        (see ensure_preview_index_db).
         """
         db_dir = os.path.dirname(self.db_path)
         db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-        return (db_dir,
-                os.path.join(db_dir, f"{db_name}_indexed.sqlite"),
-                os.path.join(db_dir, f"{db_name}_indexed.json"))
+        analysis_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+        return (analysis_dir,
+                os.path.join(analysis_dir, f"{db_name}_indexed.sqlite"),
+                os.path.join(analysis_dir, f"{db_name}_indexed.json"))
 
     def _indexed_copy_is_current(self, copy_path, meta_path):
         """Is an existing copy still faithful to the source database?
@@ -4739,6 +4906,7 @@ class UWBQuickVisualizationWindow(QWidget):
             f"in {os.path.basename(index_dir)}). The original database is "
             f"not modified.")
         self._set_index_status("Fast index: building…", "#cc9900")
+        self._show_busy("Building fast-scrubbing index (original DB untouched)…")
 
         b = PreviewIndexBuilder(self.db_path, self.table_name, copy_path, meta_path)
         b.progress.connect(self._on_index_progress)
@@ -4762,6 +4930,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not self._index_build_is_current(self.preview_index_builder.src_path):
             return
         self._set_index_status(f"Fast index: {msg}", "#cc9900")
+        self._set_busy_msg(f"Building fast-scrubbing index: {msg}")
 
     def _set_index_status(self, text, color):
         # Shown as a small status line under the cache label (no button anymore).
@@ -4769,8 +4938,63 @@ class UWBQuickVisualizationWindow(QWidget):
             self.lbl_cache_status.setText(text)
             self.lbl_cache_status.setStyleSheet(f"color: {color}; font-size: 9px;")
 
+    def _show_busy(self, msg):
+        """Reveal the busy bar + label under the Select-DB button and paint once.
+
+        Ref-counted via a LIFO message stack so several overlapping background
+        tasks (e.g. the metadata read and the index build) can each show/hide
+        it without prematurely hiding the others. The single processEvents()
+        forces an immediate repaint so the feedback appears right away.
+        """
+        if not hasattr(self, "busy_bar"):
+            return
+        self._busy_msgs.append(msg)
+        self.lbl_busy.setText(msg)
+        self.lbl_busy.setVisible(True)
+        self.busy_bar.setVisible(True)
+        QApplication.processEvents()
+
+    def _set_busy_msg(self, msg):
+        """Update the visible busy text (top of stack) without changing count."""
+        if hasattr(self, "busy_bar") and self._busy_msgs:
+            self._busy_msgs[-1] = msg
+            self.lbl_busy.setText(msg)
+
+    def _hide_busy(self):
+        """Pop one busy task; hide the bar only when none remain."""
+        if not hasattr(self, "busy_bar"):
+            return
+        if self._busy_msgs:
+            self._busy_msgs.pop()
+        if self._busy_msgs:
+            self.lbl_busy.setText(self._busy_msgs[-1])
+        else:
+            self.busy_bar.setVisible(False)
+            self.lbl_busy.setVisible(False)
+
+    def _start_db_query(self, fn, on_done, on_failed):
+        """Run ``fn`` on a DbQueryWorker and route its result to the main thread.
+
+        Keeps a reference to each live worker so it isn't garbage-collected
+        mid-run, and drops it when finished.
+        """
+        w = DbQueryWorker(fn)
+        if not hasattr(self, "_db_workers"):
+            self._db_workers = []
+        self._db_workers.append(w)
+        w.done.connect(on_done)
+        w.failed.connect(on_failed)
+        w.finished.connect(lambda: self._db_workers.remove(w)
+                           if w in self._db_workers else None)
+        w.start()
+
+    def _on_meta_load_failed(self, err):
+        self._hide_busy()
+        self.log_message(f"Could not read database metadata: {err}")
+
     def _on_index_ready(self, src_path, path):
         self.preview_index_builder = None
+        self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             # The user moved to another database while this was building. The
             # copy on disk is still valid for its own database and will be
@@ -4790,6 +5014,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def _on_index_failed(self, src_path, err):
         self.preview_index_builder = None
+        self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             return
         self._set_index_status("Fast index: unavailable (using original)", "#cc5555")
@@ -4964,26 +5189,38 @@ class UWBQuickVisualizationWindow(QWidget):
             self.chk_show_anchors.setChecked(False)
 
     def select_database(self):
-        """Select SQLite database"""
+        """Select a SQLite database via a file dialog, then load it."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select SQLite Database", "",
             "SQLite Files (*.sqlite *.db *.sql);;All Files (*.*)"
         )
-        
         if not file_path:
             return
-        
+        self._load_database_path(file_path)
+
+    def _load_database_path(self, file_path):
+        """Load a database by path — shared by the file picker and the batch queue.
+
+        Returns True if the database opened and a table was selected. In batch
+        mode (``self._batch_active``) the interactive background-image prompt and
+        the error/warning dialogs are suppressed so an unattended run never
+        blocks on a modal box.
+        """
+        batch = getattr(self, '_batch_active', False)
         try:
             conn = connect_ro(file_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = [row[0] for row in cursor.fetchall()]
             conn.close()
-            
+
             if not tables:
-                QMessageBox.warning(self, "No Tables", "No tables found in database")
-                return
-            
+                if not batch:
+                    QMessageBox.warning(self, "No Tables", "No tables found in database")
+                else:
+                    self.log_message(f"✗ No tables in {os.path.basename(file_path)}")
+                return False
+
             self.db_path = file_path
             self.lbl_db.setText(f"Selected: {os.path.basename(file_path)}")
 
@@ -5018,13 +5255,19 @@ class UWBQuickVisualizationWindow(QWidget):
             self.load_xml_config()
 
             # Auto-load a background image only if one clearly belongs to this
-            # database (name match). Otherwise offer to pick one.
+            # database (name match). Otherwise offer to pick one (interactive only).
             self.auto_load_background()
-            if self.background_image is None:
+            if self.background_image is None and not batch:
                 self.prompt_background_image()
 
+            return True
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
+            if not batch:
+                QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
+            else:
+                self.log_message(f"✗ Failed to open database {os.path.basename(file_path)}: {e}")
+            return False
 
     def is_wiser_database(self):
         """Heuristic: does this look like a Wiser UWB export?
@@ -5163,11 +5406,12 @@ class UWBQuickVisualizationWindow(QWidget):
         
         if not xml_files:
             self.log_message("No XML configuration file found in database directory")
-            QMessageBox.warning(
-                self, "XML Configuration Not Found",
-                "No XML configuration file found in the database folder.\n\n"
-                "Anchor positions and floorplan scale will not be available."
-            )
+            if not getattr(self, '_batch_active', False):
+                QMessageBox.warning(
+                    self, "XML Configuration Not Found",
+                    "No XML configuration file found in the database folder.\n\n"
+                    "Anchor positions and floorplan scale will not be available."
+                )
             return
         
         # If multiple XML files, use the first one or one matching config/Config pattern
@@ -6150,27 +6394,55 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_export_progress.setText("")
     
     def load_tags_from_table(self):
-        """Load tags from selected table"""
+        """Load the tag list + unique days for the selected table, off the GUI thread.
+
+        DISTINCT scans over a large, not-yet-indexed database on a network drive
+        can take many seconds; running them on a background DbQueryWorker keeps
+        the window responsive (with a busy indicator under the Select button)
+        instead of freezing. UI population happens in _on_tags_days_loaded once
+        the result comes back on the main thread.
+        """
         if not self.db_path or not self.table_name:
             return
-        
-        try:
-            conn = connect_ro(self.db_path)
-            query = f"SELECT DISTINCT shortid FROM {self.table_name} ORDER BY shortid"
-            df = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            self.available_tags = df['shortid'].tolist()
-            self.update_tag_selection()
+        db_path = self.db_path
+        table = self.table_name
 
-            # Enable export button
-            self.btn_export.setEnabled(True)
+        def _query():
+            conn = connect_ro(db_path)
+            try:
+                tags = [r[0] for r in conn.execute(
+                    f"SELECT DISTINCT shortid FROM {table} ORDER BY shortid")]
+                days = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), "
+                    f"'localtime') FROM {table} ORDER BY 1")]
+            finally:
+                conn.close()
+            return {'db_path': db_path, 'table': table, 'tags': tags, 'days': days}
 
-            # Load unique days for daily animation options
-            self.load_unique_days_from_database()
+        # In an unattended batch there is no UI to keep responsive, and the
+        # background worker + preview timers race with the fast sequential trial
+        # stepping — so load synchronously and skip the async path entirely.
+        if getattr(self, '_batch_active', False):
+            try:
+                self._on_tags_days_loaded(_query())
+            except Exception as e:
+                self.log_message(f"Could not read tags/days: {e}")
+            return
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load tags: {str(e)}")
+        self._show_busy("Reading tags and days from database…")
+        self._start_db_query(_query, self._on_tags_days_loaded, self._on_meta_load_failed)
+
+    def _on_tags_days_loaded(self, res):
+        self._hide_busy()
+        # Ignore a result for a database/table the user has navigated away from.
+        if res['db_path'] != self.db_path or res['table'] != self.table_name:
+            return
+        self.available_tags = res['tags']
+        self.update_tag_selection()
+        self.btn_export.setEnabled(True)
+        if res['days']:
+            self.populate_animation_days_from_list(res['days'])
+            self.log_message(f"Found {len(res['days'])} unique days in database")
     
     def load_unique_days_from_database(self):
         """Load unique days from database without loading full data"""
@@ -6693,13 +6965,23 @@ class UWBQuickVisualizationWindow(QWidget):
         analysis_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
         config_path = os.path.join(analysis_dir, 'fnt_config.json')
 
-        if not os.path.exists(config_path):
+        # The batch queue captures the settings shown in the UI at add-time and
+        # replays them here via an in-memory override, instead of reading the
+        # DB's saved fnt_config.json. Consume-once so it never leaks to a later
+        # interactive load.
+        override = getattr(self, '_pending_config_override', None)
+        self._pending_config_override = None
+
+        if override is None and not os.path.exists(config_path):
             return False
-        
+
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            
+            if override is not None:
+                config = override
+            else:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+
             # Load configuration into GUI
             if 'table_name' in config and config['table_name']:
                 # Store for deferred application after combo_table is populated
@@ -7409,15 +7691,21 @@ class UWBQuickVisualizationWindow(QWidget):
             self.btn_stop_export.setVisible(False)
             self.progress_bar.setValue(100)
             self.lbl_export_progress.setText("All exports complete!")
-            QMessageBox.information(self, "Success", "All exports completed successfully!")
+            self._notify_done('info', "Success", "All exports completed successfully!")
             QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
             
         except Exception as e:
-            QMessageBox.critical(self, "Animation Error", f"Failed to generate animation: {str(e)}")
+            self._last_export_failed = True
+            self._notify_done('error', "Animation Error", f"Failed to generate animation: {str(e)}")
             self.log_message(f"✗ Animation generation failed: {str(e)}")
         finally:
-            # Animation is the last render stage; drop the temp render CSVs.
+            # Animation is the last render stage; drop the temp render CSVs and
+            # make sure the export flag is cleared even if rendering raised (the
+            # batch queue waits on it to advance to the next trial).
             self._cleanup_plot_working_files()
+            self.exporting = False
+            self.btn_export.setEnabled(True)
+            self.btn_stop_export.setVisible(False)
 
     def create_animation_frames(self, data, output_dir, frame_interval, trailing_window,
                                fps, color_by, use_custom_identities=False,
@@ -7480,7 +7768,253 @@ class UWBQuickVisualizationWindow(QWidget):
         self.progress_widget.setVisible(False)
         self.progress_bar.setValue(0)
         self.lbl_export_progress.setText("")
-    
+
+    # ---- Batch queue: preprocess many trials one at a time --------------- #
+    # Runs each queued database through the exact interactive load + export
+    # path, one at a time, so peak memory stays bounded (helped by the per-tag
+    # streamed CSV). Per-trial dialogs and the preview index build are
+    # suppressed (see _batch_active). A Python-level failure in one trial marks
+    # it Failed and the batch moves on; only a hard native crash would stop it.
+
+    def add_current_to_batch(self):
+        """Snapshot the currently loaded database + current settings as a job.
+
+        This captures everything shown in the UI right now — table, tag
+        selection, thresholds, smoothing, and every export option — so the
+        queued job is self-contained. The user can then load a different
+        database up top, give it different settings, and add that as another
+        job. Run Batch replays each job with its own captured settings.
+        """
+        if not self.db_path or not self.table_name:
+            QMessageBox.warning(
+                self, "No Database Loaded",
+                "Load a database and select a table first, adjust the settings "
+                "and export options you want, then add it to the queue.")
+            return
+
+        save_plots = self.chk_save_plots.isChecked()
+        save_animation = self.chk_save_animation.isChecked()
+
+        # Make ALL interactive decisions NOW, at add-to-queue time, so the batch
+        # run itself never blocks on a dialog. (1) Plot/animation spatial layers
+        # — sets self.plot_layers, which get_config_dict captures below.
+        if save_plots or save_animation:
+            if not self._prompt_plot_layers():
+                self.log_message("Add to queue cancelled at layer selection.")
+                return
+
+        # Freeze the animation snapshot so conflict prediction matches what will
+        # actually be rendered for this job.
+        self._anim_settings = self._snapshot_anim_settings()
+
+        # (2) Overwrite conflict — decided PER JOB against files on disk now.
+        conflict_choice = ExportConflictDialog.OVERWRITE   # default when nothing exists
+        all_conflicting, all_new = self._predict_export_conflicts()
+        if all_conflicting:
+            dlg = ExportConflictDialog(all_conflicting, all_new, parent=self)
+            result = dlg.exec_()
+            if result not in (ExportConflictDialog.SKIP, ExportConflictDialog.OVERWRITE,
+                              ExportConflictDialog.NEW_FOLDER):
+                self.log_message("Add to queue cancelled at overwrite prompt.")
+                return
+            conflict_choice = result
+
+        job = {
+            'path': self.db_path,
+            'table': self.table_name,
+            'config': self.get_config_dict(),      # full snapshot (incl. plot_layers)
+            'conflict_choice': conflict_choice,     # per-job overwrite decision
+            'status': 'Queued',
+        }
+        self._batch_items.append(job)
+        n_tags = len(job['config'].get('selected_tags', []))
+        self.log_message(
+            f"Added to queue: {os.path.basename(self.db_path)} "
+            f"(table {self.table_name}, {n_tags} tag(s); layers + overwrite choices captured)")
+        self._refresh_batch_list()
+
+    def clear_batch(self):
+        """Empty the batch queue (ignored while a batch is running)."""
+        if self._batch_active:
+            return
+        self._batch_items = []
+        self._refresh_batch_list()
+
+    def _refresh_batch_list(self):
+        if not hasattr(self, 'batch_list'):
+            return
+        self.batch_list.clear()
+        for i, it in enumerate(self._batch_items, 1):
+            cfg = it.get('config', {})
+            outs = []
+            if cfg.get('export_smoothed_csv', True): outs.append('smoothed')
+            if cfg.get('save_plots'): outs.append('plots')
+            if cfg.get('save_animation'): outs.append('anim')
+            if cfg.get('proximity_detection'): outs.append('prox')
+            if cfg.get('export_social_network'): outs.append('SNA')
+            ntags = len(cfg.get('selected_tags', []))
+            summary = f"{ntags} tags · {', '.join(outs) or 'no outputs'}"
+            self.batch_list.addItem(
+                f"{i}. [{it['status']}]  {os.path.basename(it['path'])}  ({summary})")
+        has_items = len(self._batch_items) > 0
+        self.btn_run_batch.setEnabled(has_items and not self._batch_active)
+        self.btn_add_batch.setEnabled(not self._batch_active)
+        self.btn_clear_batch.setEnabled(has_items and not self._batch_active)
+        self.btn_stop_batch.setVisible(self._batch_active)
+
+    def _suppress_dialogs(self):
+        """Replace modal QMessageBox pop-ups with logging for the batch run.
+
+        An unattended batch must never block on a modal box. The explicit
+        _batch_active guards cover the paths we know about; this catch-all makes
+        sure a stray dialog anywhere in the load/export chain can't stall the
+        queue. Restored in _restore_dialogs().
+        """
+        if getattr(self, '_saved_dialogs', None) is not None:
+            return
+        self._saved_dialogs = (QMessageBox.information, QMessageBox.warning,
+                               QMessageBox.critical, QMessageBox.question)
+
+        def _silent(*a, **k):
+            title = a[1] if len(a) > 1 else ''
+            text = a[2] if len(a) > 2 else ''
+            self.log_message(f"[batch] suppressed dialog — {title}: {text}")
+            return QMessageBox.Ok
+
+        QMessageBox.information = staticmethod(_silent)
+        QMessageBox.warning = staticmethod(_silent)
+        QMessageBox.critical = staticmethod(_silent)
+        QMessageBox.question = staticmethod(_silent)
+
+    def _restore_dialogs(self):
+        saved = getattr(self, '_saved_dialogs', None)
+        if saved is None:
+            return
+        (QMessageBox.information, QMessageBox.warning,
+         QMessageBox.critical, QMessageBox.question) = saved
+        self._saved_dialogs = None
+
+    def run_batch(self):
+        """Start processing the queued databases sequentially."""
+        if self._batch_active or not self._batch_items:
+            return
+
+        # The ONE decision shared across the whole run: where tracking-animation
+        # temp frames are written (reused per trial, emptied between them). Ask
+        # it here — before the run starts and before dialogs are suppressed — so
+        # the user can then walk away. Everything else was decided per-job at
+        # add-to-queue time.
+        self._batch_temp_frames_dir = None
+        anim_jobs = [it for it in self._batch_items
+                     if (it.get('config') or {}).get('save_animation')]
+        if anim_jobs:
+            first = anim_jobs[0]
+            db_dir = os.path.dirname(first['path'])
+            db_name = os.path.splitext(os.path.basename(first['path']))[0]
+            default_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
+            chosen = self._prompt_animation_temp_dir(default_dir)
+            if chosen is None:
+                self.log_message("Batch cancelled at temp-frames selection.")
+                return
+            self._batch_temp_frames_dir = chosen
+
+        for it in self._batch_items:          # fresh run: reset all statuses
+            it['status'] = 'Queued'
+        self._batch_active = True
+        self._batch_stop_requested = False
+        self._batch_index = 0
+        self._suppress_dialogs()
+        self.log_message("=" * 50)
+        self.log_message(f"BATCH START: {len(self._batch_items)} database(s) queued")
+        self._refresh_batch_list()
+        QTimer.singleShot(0, self._batch_step)
+
+    def stop_batch(self):
+        """Request the batch to stop after the current trial is torn down."""
+        if not self._batch_active:
+            return
+        self.log_message("⚠ Batch stop requested — cancelling current trial...")
+        self._batch_stop_requested = True
+        self.export_cancelled = True
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+
+    def _batch_step(self):
+        """Load + export the next queued database, or finish the batch."""
+        if self._batch_stop_requested or self._batch_index >= len(self._batch_items):
+            self._finish_batch()
+            return
+        it = self._batch_items[self._batch_index]
+        it['status'] = 'Loading'
+        self._refresh_batch_list()
+        self.log_message(
+            f"BATCH [{self._batch_index + 1}/{len(self._batch_items)}]: "
+            f"{os.path.basename(it['path'])}")
+        # Replay the settings captured when this job was queued (not the DB's
+        # on-disk config). load_config_if_exists consumes this override.
+        self._pending_config_override = it.get('config')
+        if not self._load_database_path(it['path']):
+            it['status'] = 'Failed'
+            self._refresh_batch_list()
+            self._batch_index += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
+        it['status'] = 'Running'
+        self._refresh_batch_list()
+        self._batch_wait_tags_then_export()
+
+    def _batch_wait_tags_then_export(self):
+        """Wait for the async tag load to finish, then start the export."""
+        if self._batch_stop_requested:
+            self._finish_batch()
+            return
+        if getattr(self, '_db_workers', None):   # tag/day scan still running
+            QTimer.singleShot(150, self._batch_wait_tags_then_export)
+            return
+        # If the saved config selected no tags, default to all so the trial
+        # actually produces output.
+        if not any(cb.isChecked() for cb in self.tag_checkboxes.values()):
+            for cb in self.tag_checkboxes.values():
+                cb.setChecked(True)
+        # Replay this job's overwrite decision (captured at add-to-queue time).
+        it = self._batch_items[self._batch_index]
+        self._batch_conflict_choice = it.get('conflict_choice', ExportConflictDialog.OVERWRITE)
+        self.export_data()
+        QTimer.singleShot(300, self._batch_poll_export)
+
+    def _batch_poll_export(self):
+        """Wait for the current export to fully finish, then advance."""
+        if self.exporting:
+            QTimer.singleShot(300, self._batch_poll_export)
+            return
+        it = self._batch_items[self._batch_index]
+        it['status'] = 'Failed' if getattr(self, '_last_export_failed', False) else 'Done'
+        self.log_message(f"BATCH item {self._batch_index + 1}: {it['status']}")
+        self._refresh_batch_list()
+        self._batch_index += 1
+        import gc
+        gc.collect()   # reclaim the trial's memory before the next one
+        QTimer.singleShot(0, self._batch_step)
+
+    def _finish_batch(self):
+        self._batch_active = False
+        self._restore_dialogs()   # before the summary box, and re-enable normal UI dialogs
+        for it in self._batch_items:
+            if it['status'] in ('Queued', 'Loading', 'Running'):
+                it['status'] = 'Cancelled'
+        self._refresh_batch_list()
+        done = sum(1 for it in self._batch_items if it['status'] == 'Done')
+        failed = sum(1 for it in self._batch_items if it['status'] == 'Failed')
+        cancelled = sum(1 for it in self._batch_items if it['status'] == 'Cancelled')
+        self.log_message(
+            f"BATCH FINISHED: {done} done, {failed} failed, {cancelled} cancelled")
+        self._batch_stop_requested = False
+        QMessageBox.information(
+            self, "Batch complete",
+            f"Batch finished.\n\n{done} succeeded, {failed} failed, "
+            f"{cancelled} cancelled.")
+
     def _cleanup_plot_working_files(self):
         """Delete any temporary render CSVs tracked for this run.
 
@@ -7499,6 +8033,122 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message(f"Could not remove temp render file {os.path.basename(path)}: {e}")
         self._plot_working_files = []
 
+    def _predict_export_conflicts(self):
+        """Predict output files and split into (conflicting, new) vs. what's on disk.
+
+        Reads the current UI settings + ``self._anim_settings`` + ``db_path`` so
+        it is valid both at add-to-queue time (to show the conflict dialog) and
+        at export time (to apply a stored choice). Returns
+        (all_conflicting, all_new); each is a list of (filename, subfolder_label)
+        with "" meaning the analysis-folder root.
+        """
+        db_dir = os.path.dirname(self.db_path)
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+        base_output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+        plots_subdir = os.path.join(base_output_dir, 'plots')
+        animations_subdir = os.path.join(base_output_dir, 'animation_Tracking')
+        sna_subdir = os.path.join(base_output_dir, 'animation_SocialNetworks')
+
+        export_raw_csv = self.chk_export_raw_csv.isChecked()
+        export_smoothed_csv = True
+        detect_proximity = self.chk_proximity_detection.isChecked()
+        export_social_network = self.chk_social_network.isChecked()
+        social_animation = self.chk_social_animation.isChecked()
+        save_animation = self.chk_save_animation.isChecked()
+        save_plots = self.chk_save_plots.isChecked()
+        save_svg = self.chk_save_svg.isChecked()
+        sna_weighting = self.combo_sna_weighting.currentText()
+        sna_daily = self.chk_sna_daily.isChecked()
+        sna_days = ([d for d, cb in self.sna_daily_day_checkboxes.items() if cb.isChecked()]
+                    if sna_daily else None)
+        anim = getattr(self, '_anim_settings', None) or self._snapshot_anim_settings()
+
+        def _tag_suffix(tag):
+            if self.tag_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                return f"{info.get('sex', 'M')}-{info.get('identity', str(tag))}"
+            return f"HexID{hex(tag).upper().replace('0X', '')}"
+
+        def _add_with_svg(lst, basename):
+            lst.append(basename + '.png')
+            if save_svg:
+                lst.append(basename + '.svg')
+
+        predicted_files = []
+        if export_raw_csv:
+            predicted_files.append(f'{db_name}_raw.csv')
+        if export_smoothed_csv:
+            predicted_files.append(f'{db_name}_smoothed.csv')
+        if detect_proximity:
+            predicted_files.append(f'{db_name}_proximity_bouts.csv')
+        if export_social_network:
+            predicted_files += [f'{db_name}_network_edgelist_full.csv',
+                                f'{db_name}_network_edgelist_daily.csv',
+                                f'{db_name}_network_GBI.csv']
+
+        predicted_sna_files = []
+        if social_animation:
+            _wkey = {'Total time (s)': 'time', 'Bout count': 'events',
+                     'Simple Ratio Index (SRI)': 'sri',
+                     'Half-weight Index (HWI)': 'hwi'}.get(sna_weighting, 'time')
+            if sna_daily:
+                for i, ds in enumerate(self.sna_daily_day_checkboxes.keys()):
+                    if sna_days is None or ds in sna_days:
+                        predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}_Day{i + 1}.mp4')
+            else:
+                predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}.mp4')
+
+        predicted_animation_files = []
+        if save_animation:
+            fps = anim['fps']
+            speed_text = anim['speed_text']
+            if anim['generate_daily']:
+                for day_idx, date_str in enumerate(anim['selected_days']):
+                    predicted_animation_files.append(
+                        f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
+            if anim.get('generate_full', not anim['generate_daily']):
+                predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
+
+        predicted_plot_files = []
+        if save_plots:
+            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
+            plot_types = {k: self.plot_type_checkboxes[k].isChecked() for k in self.plot_type_checkboxes}
+            if plot_types.get('daily_paths', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_DailyPaths_{_tag_suffix(tag)}')
+            if plot_types.get('trajectory_overview', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_TrajectoryOverview')
+            if plot_types.get('battery_levels', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_BatteryLevels')
+            if plot_types.get('3d_occupancy', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_3D_Occupancy_{_tag_suffix(tag)}')
+            if plot_types.get('activity_timeline', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_ActivityTimeline')
+            if plot_types.get('velocity_distribution', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_VelocityDistribution')
+            if plot_types.get('cumulative_distance', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_CumulativeDistance')
+            if plot_types.get('velocity_timeline', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_VelocityTimeline_{_tag_suffix(tag)}')
+            if plot_types.get('actogram', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_Actogram_{_tag_suffix(tag)}')
+            if plot_types.get('data_quality', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_DataQuality')
+
+        all_conflicting, all_new = [], []
+        for f in predicted_files:
+            (all_conflicting if os.path.exists(os.path.join(base_output_dir, f)) else all_new).append((f, ""))
+        for f in predicted_plot_files:
+            (all_conflicting if os.path.exists(os.path.join(plots_subdir, f)) else all_new).append((f, "plots"))
+        for f in predicted_animation_files:
+            (all_conflicting if os.path.exists(os.path.join(animations_subdir, f)) else all_new).append((f, "animation_Tracking"))
+        for f in predicted_sna_files:
+            (all_conflicting if os.path.exists(os.path.join(sna_subdir, f)) else all_new).append((f, "animation_SocialNetworks"))
+        return all_conflicting, all_new
+
     def export_data(self):
         """Export data and/or plots based on selected options"""
         if not self.db_path:
@@ -7510,6 +8160,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Initialize export state
         self.export_cancelled = False
+        self._last_export_failed = False  # set by error handlers; read by the batch queue
         self._plot_working_files = []  # defensive: normally stays empty now
         self.exporting = True
         self.btn_export.setEnabled(False)
@@ -7555,160 +8206,60 @@ class UWBQuickVisualizationWindow(QWidget):
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
 
+        batch = getattr(self, '_batch_active', False)
+
         # --- Spatial layer choice for plots/animation ---
-        # Prompt for the context layers when there is spatial output to make.
-        # Cancelling the dialog aborts the whole export.
-        if save_plots or save_animation:
+        # Interactively: prompt for the context layers when there is spatial
+        # output. In a batch this was chosen at add-to-queue time and is already
+        # in self.plot_layers (restored from the job's captured config), so no
+        # prompt here. Cancelling the dialog aborts the whole export.
+        if (save_plots or save_animation) and not batch:
             if not self._prompt_plot_layers():
                 self.log_message("Export cancelled at layer selection.")
                 return
 
-        # --- Animation temp-frames location (frontloaded) ---
-        # If a Tracking Animation is requested, ask for its temp-frames folder
-        # NOW so every interactive prompt happens up-front. The user can start
-        # the export and walk away instead of being blocked mid-run.
+        # --- Animation temp-frames location ---
+        # Interactively: ask up-front so the user can start and walk away. In a
+        # batch: one shared location was chosen when Export Batch was clicked
+        # (self._batch_temp_frames_dir); reuse it for every trial.
         self._anim_temp_frames_dir = None
         if save_animation:
-            _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
-            self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
-            if self._anim_temp_frames_dir is None:
-                self.log_message("Export cancelled at temp-frames selection.")
-                self.exporting = False
-                self.btn_export.setEnabled(True)
-                self.btn_stop_export.setVisible(False)
-                self.progress_widget.setVisible(False)
-                return
+            if batch:
+                self._anim_temp_frames_dir = (
+                    getattr(self, '_batch_temp_frames_dir', None)
+                    or os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking'))
+            else:
+                _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
+                self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
+                if self._anim_temp_frames_dir is None:
+                    self.log_message("Export cancelled at temp-frames selection.")
+                    self.exporting = False
+                    self.btn_export.setEnabled(True)
+                    self.btn_stop_export.setVisible(False)
+                    self.progress_widget.setVisible(False)
+                    return
 
         # --- Conflict detection ---
         base_output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
         plots_subdir = os.path.join(base_output_dir, 'plots')
         animations_subdir = os.path.join(base_output_dir, 'animation_Tracking')
 
-        # --- Build helper to get tag file suffix (matches PlotSaverWorker logic) ---
-        def _tag_suffix(tag):
-            if self.tag_identities and tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', 'M')
-                identity = info.get('identity', str(tag))
-                return f"{sex}-{identity}"
-            else:
-                hex_id = hex(tag).upper().replace('0X', '')
-                return f"HexID{hex_id}"
-
-        save_svg = self.chk_save_svg.isChecked()
-
-        def _add_with_svg(lst, basename):
-            """Append a .png filename and optionally the .svg counterpart."""
-            lst.append(basename + '.png')
-            if save_svg:
-                lst.append(basename + '.svg')
-
-        # Predict which files will be produced (root-level CSVs and behavior files)
-        predicted_files = []  # filenames in root output_dir
-        if export_raw_csv:
-            predicted_files.append(f'{db_name}_raw.csv')
-        if export_smoothed_csv:
-            predicted_files.append(f'{db_name}_smoothed.csv')
-        if detect_proximity:
-            predicted_files.append(f'{db_name}_proximity_bouts.csv')
-        if export_social_network:
-            predicted_files.append(f'{db_name}_network_edgelist_full.csv')
-            predicted_files.append(f'{db_name}_network_edgelist_daily.csv')
-            predicted_files.append(f'{db_name}_network_GBI.csv')
-
-        # Predict social-network animation files (animation_SocialNetworks/),
-        # matching _export_social_network's naming: SocialNet_<weighting>[_DayN].
-        predicted_sna_files = []
-        if social_animation:
-            _wkey = {'Total time (s)': 'time', 'Bout count': 'events',
-                     'Simple Ratio Index (SRI)': 'sri',
-                     'Half-weight Index (HWI)': 'hwi'}.get(sna_weighting, 'time')
-            if sna_daily:
-                for i, ds in enumerate(self.sna_daily_day_checkboxes.keys()):
-                    if sna_days is None or ds in sna_days:
-                        predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}_Day{i + 1}.mp4')
-            else:
-                predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}.mp4')
-
-        # Predict animation files (in animations/ subfolder). Use the frozen
-        # snapshot so the predicted filenames match what actually gets rendered.
-        predicted_animation_files = []
-        if save_animation:
-            fps = self._anim_settings['fps']
-            speed_text = self._anim_settings['speed_text']
-            if self._anim_settings['generate_daily']:
-                for day_idx, date_str in enumerate(self._anim_settings['selected_days']):
-                    predicted_animation_files.append(f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
-            if self._anim_settings.get('generate_full', not self._anim_settings['generate_daily']):
-                predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
-
-        # Predict plot files (in plots/ subfolder) — must match PlotSaverWorker filenames exactly
-        predicted_plot_files = []
-        if save_plots:
-            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
-            plot_types = {k: self.plot_type_checkboxes[k].isChecked() for k in self.plot_type_checkboxes}
-
-            if plot_types.get('daily_paths', False):
-                for tag in selected_tags:
-                    _add_with_svg(predicted_plot_files, f'{db_name}_DailyPaths_{_tag_suffix(tag)}')
-            if plot_types.get('trajectory_overview', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_TrajectoryOverview')
-            if plot_types.get('battery_levels', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_BatteryLevels')
-            if plot_types.get('3d_occupancy', False):
-                for tag in selected_tags:
-                    _add_with_svg(predicted_plot_files, f'{db_name}_3D_Occupancy_{_tag_suffix(tag)}')
-            if plot_types.get('activity_timeline', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_ActivityTimeline')
-            if plot_types.get('velocity_distribution', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_VelocityDistribution')
-            if plot_types.get('cumulative_distance', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_CumulativeDistance')
-            if plot_types.get('velocity_timeline', False):
-                for tag in selected_tags:
-                    _add_with_svg(predicted_plot_files, f'{db_name}_VelocityTimeline_{_tag_suffix(tag)}')
-            if plot_types.get('actogram', False):
-                for tag in selected_tags:
-                    _add_with_svg(predicted_plot_files, f'{db_name}_Actogram_{_tag_suffix(tag)}')
-            if plot_types.get('data_quality', False):
-                _add_with_svg(predicted_plot_files, f'{db_name}_DataQuality')
-
-        # Check for conflicts against existing files and build categorized lists
-        # Each entry is (filename, subfolder_label) — subfolder_label is "" for root
-        all_conflicting = []
-        all_new = []
-
-        for f in predicted_files:
-            if os.path.exists(os.path.join(base_output_dir, f)):
-                all_conflicting.append((f, ""))
-            else:
-                all_new.append((f, ""))
-
-        for f in predicted_plot_files:
-            if os.path.exists(os.path.join(plots_subdir, f)):
-                all_conflicting.append((f, "plots"))
-            else:
-                all_new.append((f, "plots"))
-
-        for f in predicted_animation_files:
-            if os.path.exists(os.path.join(animations_subdir, f)):
-                all_conflicting.append((f, "animation_Tracking"))
-            else:
-                all_new.append((f, "animation_Tracking"))
-
-        sna_subdir = os.path.join(base_output_dir, 'animation_SocialNetworks')
-        for f in predicted_sna_files:
-            if os.path.exists(os.path.join(sna_subdir, f)):
-                all_conflicting.append((f, "animation_SocialNetworks"))
-            else:
-                all_new.append((f, "animation_SocialNetworks"))
+        # Predict which files this export would produce and which already exist
+        # (shared with add-to-queue, which shows the same dialog up-front).
+        all_conflicting, all_new = self._predict_export_conflicts()
 
         skip_existing = False
         output_dir = base_output_dir
 
         if all_conflicting:
-            dialog = ExportConflictDialog(all_conflicting, all_new, parent=self)
-            result = dialog.exec_()
+            if getattr(self, '_batch_active', False):
+                # Per-job choice was recorded when the job was queued; replay it
+                # silently so the batch never blocks on this dialog.
+                result = getattr(self, '_batch_conflict_choice',
+                                 ExportConflictDialog.OVERWRITE)
+            else:
+                dialog = ExportConflictDialog(all_conflicting, all_new, parent=self)
+                result = dialog.exec_()
 
             if result == ExportConflictDialog.SKIP:
                 skip_existing = True
@@ -7800,7 +8351,6 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # Prepare processed data (needed for smoothed CSV, plots, animation, behaviors)
             needs_processed_data = export_smoothed_csv or save_plots or save_animation or detect_proximity
-            smoothed_data = None
             csv_path = None  # Path to the CSV that plots/animation will use
 
             if needs_processed_data:
@@ -7820,7 +8370,32 @@ class UWBQuickVisualizationWindow(QWidget):
                 # behind (a preview chunk, or a previous export).
                 self.reset_filter_stats()
 
-                processed_chunks = []
+                # Stream the smoothed CSV one tag at a time rather than holding
+                # the whole processed dataset in RAM and writing it in one shot.
+                # The old concat -> sort -> to_csv path peaked at ~3x the full
+                # dataset in memory; on a large trial that peak (inside to_csv)
+                # is what corrupted the heap (0xc0000374) when a second FNT
+                # process pushed the machine out of memory. Tags are processed in
+                # ascending shortid order and each chunk is time-sorted, so the
+                # streamed file matches the old global (shortid, Timestamp) sort.
+                selected_tags = sorted(selected_tags)
+                smoothed_csv_filename = f'{db_name}_smoothed.csv'
+                smoothed_csv_path = os.path.join(output_dir, smoothed_csv_filename)
+                csv_path = smoothed_csv_path  # plots/animation/proximity read this
+                stream_smoothed = export_smoothed_csv and not (
+                    skip_existing and os.path.exists(smoothed_csv_path))
+                if export_smoothed_csv and not stream_smoothed:
+                    self.log_message(f"Skipped (exists): {smoothed_csv_filename}")
+                elif stream_smoothed and os.path.exists(smoothed_csv_path):
+                    # Clear a stale/partial file so append mode starts clean.
+                    try:
+                        os.remove(smoothed_csv_path)
+                    except OSError:
+                        pass
+
+                total_points = 0
+                tags_with_data = 0
+                smoothed_header_written = False
                 conn = connect_ro(self.db_path)
 
                 # Read only the columns the pipeline uses. The unused TEXT
@@ -7835,6 +8410,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 for i, tag in enumerate(selected_tags):
                     if self.export_cancelled:
                         conn.close()
+                        # A cancelled stream leaves a partial CSV — drop it.
+                        if smoothed_header_written and os.path.exists(smoothed_csv_path):
+                            try:
+                                os.remove(smoothed_csv_path)
+                            except OSError:
+                                pass
                         self.stop_export()
                         return
 
@@ -7884,36 +8465,39 @@ class UWBQuickVisualizationWindow(QWidget):
                         tag_data['sex'] = 'M'
                         tag_data['identity'] = f'Tag{tag}'
 
-                    processed_chunks.append(tag_data)
-                    self.log_message(f"    {len(tag_data)} points after processing")
+                    # Stream this tag straight to the CSV, then release it so
+                    # peak memory stays at ~one tag rather than the whole trial.
+                    n = len(tag_data)
+                    if stream_smoothed and n:
+                        tag_data.to_csv(smoothed_csv_path, index=False, mode='a',
+                                        header=not smoothed_header_written)
+                        smoothed_header_written = True
+                    total_points += n
+                    tags_with_data += 1
+                    self.log_message(f"    {n} points after processing")
+                    del tag_data
 
                 conn.close()
 
-                if processed_chunks:
-                    smoothed_data = pd.concat(processed_chunks, ignore_index=True)
-                    smoothed_data = smoothed_data.sort_values(by=['shortid', 'Timestamp'])
-                    self.log_message(f"Total processed: {len(smoothed_data)} points across {len(processed_chunks)} tags")
-                    QApplication.processEvents()
+                if total_points:
+                    self.log_message(
+                        f"Total processed: {total_points} points across {tags_with_data} tags")
                 else:
                     self.log_message("Warning: No data after processing")
-                    smoothed_data = pd.DataFrame()
+                QApplication.processEvents()
 
-                # Export smoothed CSV
+                # The smoothed CSV was streamed per-tag above; just advance the
+                # progress step and report (keeps total_steps accounting intact
+                # — increment whenever the smoothed CSV was requested, matching
+                # the pre-streaming behaviour even when the write was skipped).
                 if export_smoothed_csv:
                     current_step += 1
-                    self.lbl_export_progress.setText(f"Step {current_step}/{total_steps}: Exporting smoothed CSV...")
+                    self.lbl_export_progress.setText(
+                        f"Step {current_step}/{total_steps}: Smoothed CSV exported")
                     self.progress_bar.setValue(int(current_step / total_steps * 100))
-                    QApplication.processEvents()
-
-                    smoothed_csv_filename = f'{db_name}_smoothed.csv'
-                    smoothed_csv_path = os.path.join(output_dir, smoothed_csv_filename)
-                    if skip_existing and os.path.exists(smoothed_csv_path):
-                        self.log_message(f"Skipped (exists): {smoothed_csv_filename}")
-                        csv_path = smoothed_csv_path  # Still use existing for plots/animation
-                    else:
-                        smoothed_data.to_csv(smoothed_csv_path, index=False)
+                    if smoothed_header_written:
                         self.log_message(f"✓ Smoothed CSV exported: {smoothed_csv_filename}")
-                        csv_path = smoothed_csv_path  # Use smoothed for plots/animation
+                    QApplication.processEvents()
 
                 # Plots and animation render directly from the full-resolution
                 # smoothed CSV — the exact same data product the user inspects.
@@ -7954,10 +8538,11 @@ class UWBQuickVisualizationWindow(QWidget):
                                          "Proximity output will use raw shortid values. "
                                          "Configure identities in Tag Configuration for sex-ID labels.")
 
-                    # Use the smoothed full-resolution data (not downsampled)
-                    if smoothed_data is not None:
-                        prox_data = smoothed_data.copy()
-                    elif csv_path and os.path.exists(csv_path):
+                    # Read the smoothed full-resolution data back from the CSV
+                    # (streamed per-tag above). Proximity needs every tag together
+                    # for pairwise distances, so it is loaded as one frame here —
+                    # only when proximity/SNA is actually requested.
+                    if csv_path and os.path.exists(csv_path):
                         prox_data = pd.read_csv(csv_path, low_memory=False)
                         prox_data['Timestamp'] = pd.to_datetime(prox_data['Timestamp'], format='ISO8601')
                     else:
@@ -8090,11 +8675,24 @@ class UWBQuickVisualizationWindow(QWidget):
             if (any_csv or detect_proximity) and not save_plots and not save_animation:
                 self.log_message("✓ Export completed successfully")
                 msg = f"Export completed to:\n{output_dir}"
-                QMessageBox.information(self, "Success", msg)
-                
+                # No async plot worker / animation follows on this path, so the
+                # export is fully done here — clear the flag the batch waits on.
+                self.exporting = False
+                self.btn_export.setEnabled(True)
+                self.btn_stop_export.setVisible(False)
+                self._notify_done('info', "Success", msg)
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Export failed: {str(e)}")
+            self._last_export_failed = True
+            self._notify_done('error', "Error", f"Export failed: {str(e)}")
             self.log_message(f"✗ Export failed: {str(e)}")
+            # If we failed before the async plot worker started, the export is
+            # over now — clear the flag the batch waits on. (If a worker IS
+            # running, export_finished will clear it instead.)
+            if not (getattr(self, 'worker', None) and self.worker.isRunning()):
+                self.exporting = False
+                self.btn_export.setEnabled(True)
+                self.btn_stop_export.setVisible(False)
         finally:
             # Always clear the busy cursor, on success, cancel, or error. The
             # async plot worker (if started) runs in its own thread and does not
@@ -8104,6 +8702,20 @@ class UWBQuickVisualizationWindow(QWidget):
     def update_status(self, message):
         """Update status label and messages window"""
         self.log_message(message)
+
+    def _notify_done(self, kind, title, text):
+        """Show an export completion/error dialog, unless a batch is running.
+
+        During a batch the per-trial popups are suppressed (they would each
+        block the unattended run on a modal box); the batch shows one summary at
+        the end instead. ``kind`` is 'info' or 'error'.
+        """
+        if getattr(self, '_batch_active', False):
+            return
+        if kind == 'info':
+            QMessageBox.information(self, title, text)
+        else:
+            QMessageBox.critical(self, title, text)
     
     def export_finished(self, success, message, start_animation=False, output_dir=None, total_steps=1, current_step=1, csv_path=None, animations_dir=None):
         """Handle export completion"""
@@ -8122,10 +8734,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 else:
                     self.progress_bar.setValue(100)
                     self.lbl_export_progress.setText("Export complete!")
-                    QMessageBox.information(self, "Success", "Export completed successfully!")
+                    self._notify_done('info', "Success", "Export completed successfully!")
             else:
+                self._last_export_failed = True
                 self.log_message(f"✗ Plot export failed: {message}")
-                QMessageBox.critical(self, "Error", message)
+                self._notify_done('error', "Error", message)
 
         # Plots are done and no animation follows (that path returned above and
         # cleans up itself), so drop the temp render CSVs now.

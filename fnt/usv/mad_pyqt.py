@@ -2709,6 +2709,9 @@ class MADMainWindow(QMainWindow):
         # Training Data list (project recordings the model trains on). Backed
         # by deploy_files/deploy_list (repurposed from the old inference queue).
         self.deploy_files: List[str] = []
+        # Normcased absolute paths of registered training recordings whose audio
+        # can't be found right now. A soft state — see _rescan_project_wavs.
+        self._missing_training: set = set()
         self._deploy_file_idx: Optional[int] = None
         self._infer_model_project_dir: Optional[str] = None
         # Which list owns the single preview: 'session' or 'training'. Drives
@@ -3097,13 +3100,15 @@ class MADMainWindow(QMainWindow):
         self.btn_remove_files.setEnabled(False)
         btn_row.addWidget(self.btn_remove_files)
 
-        self.btn_copy_to_training = QPushButton("Copy File(s) → Training Data")
+        self.btn_copy_to_training = QPushButton("Add File(s) → Training Data")
         self.btn_copy_to_training.setToolTip(
-            "Copy the selected file(s) — the .wav plus its sibling csv/h5 "
-            "labels/predictions — into the project's Training Data set. The "
-            "model trains on the Training Data set. Copies are independent "
-            "snapshots; re-copying a file already present asks before "
-            "overwriting. Needs an open project."
+            "Add the selected file(s) to the project's Training Data set — the "
+            "model trains on that set.\n\n"
+            "The wav is REFERENCED IN PLACE, not copied: labels and detections "
+            "stay beside the original recording, and the project stays small. "
+            "Confirmed calls are baked into the project's own training store, "
+            "so if a recording later moves, only its preview is affected — "
+            "never the model or your labels. Needs an open project."
         )
         self.btn_copy_to_training.clicked.connect(self._copy_to_training_data)
         self.btn_copy_to_training.setEnabled(False)
@@ -3321,9 +3326,11 @@ class MADMainWindow(QMainWindow):
         vbox.setSpacing(4)
 
         hint = QLabel(
-            "Recordings copied into the project — the model trains on these. "
-            "Add files with 'Copy File(s) → Training Data' above. Click a row "
-            "to preview/review it (edits modify the training copy).")
+            "Recordings the model trains on — referenced in place, not copied. "
+            "Add them with 'Add File(s) → Training Data' above; click a row to "
+            "preview/review. A ⚠ row means the audio moved: training and saved "
+            "detections are fine, use File ▸ Locate Missing Recordings… to "
+            "restore preview.")
         hint.setStyleSheet("color: #999999; font-size: 9px;")
         hint.setWordWrap(True)
         vbox.addWidget(hint)
@@ -6001,9 +6008,13 @@ class MADMainWindow(QMainWindow):
                     targets.append(self.deploy_files[self._deploy_file_idx])
             else:
                 targets.extend(self.deploy_files)
+        # Drop referenced training recordings whose audio can't be found —
+        # inference needs the wav, unlike training. Silently skipping keeps a
+        # 3,000-file run from aborting on one unplugged drive; the Training Data
+        # list already flags them with ⚠.
         seen, out = set(), []
         for p in targets:
-            if p and p not in seen:
+            if p and p not in seen and not self._is_missing(p):
                 seen.add(p)
                 out.append(p)
         return out
@@ -6086,19 +6097,38 @@ class MADMainWindow(QMainWindow):
             return
         self.deploy_list.blockSignals(True)
         self.deploy_list.clear()
+        n_missing = 0
         for p in self.deploy_files:
             base = os.path.basename(p)
-            counts = self._file_status_counts(p)
             item = QListWidgetItem()
-            self._apply_file_row(item, base, counts)
-            if any(counts):
+            if self._is_missing(p):
+                # Soft state: the recording moved or is on an unmounted drive.
+                # Training and saved detections are unaffected — only preview is.
+                n_missing += 1
+                item.setData(_ROLE_FILE_LABEL, None)
+                item.setData(_ROLE_FILE_COUNTS, None)
+                item.setText(f"⚠  {base}")
+                item.setForeground(QColor(180, 150, 90))
                 item.setToolTip(
-                    "Calls recorded (accepted, pending, rejected) — "
-                    "click to review")
+                    f"Recording not found at:\n{p}\n\nTraining examples and "
+                    "detections for this file are safe — only preview and "
+                    "playback need the audio. Use File ▸ Locate Missing "
+                    "Recordings… to repoint it.")
+            else:
+                counts = self._file_status_counts(p)
+                self._apply_file_row(item, base, counts)
+                if any(counts):
+                    item.setToolTip(
+                        "Calls recorded (accepted, pending, rejected) — "
+                        "click to review")
+                else:
+                    item.setToolTip(p)
             self.deploy_list.addItem(item)
         self.deploy_list.blockSignals(False)
+        n = len(self.deploy_files)
         self.lbl_deploy_queue.setText(
-            f"{len(self.deploy_files)} file(s) in training set")
+            f"{n} file(s) in training set"
+            + (f" — {n_missing} missing" if n_missing else ""))
         self._update_infer_run_enabled()
         self._update_train_button_count()
 
@@ -6150,6 +6180,7 @@ class MADMainWindow(QMainWindow):
         """Empty the Training Data list (used on project close)."""
         self.deploy_files = []
         self._deploy_file_idx = None
+        self._missing_training = set()
         self._refresh_deploy_queue()
 
     def _prompt_make_project_for_training(self) -> bool:
@@ -6174,118 +6205,123 @@ class MADMainWindow(QMainWindow):
         return self._project is not None
 
     def _copy_to_training_data(self):
-        """Copy the selected Session-audio file(s) — wav + sibling csv/h5 — into
-        the project's Training Data set (recordings/). Independent snapshots:
-        re-copying a name already present prompts before overwriting."""
+        """Add the selected Session-audio file(s) to the project's Training Data
+        set **by reference** — the wav is not copied.
+
+        MAD bakes each confirmed call into training_data.h5 as a self-contained
+        spec patch + mask, and training reads only that store, so the project has
+        no training-time dependency on the wav. Referencing keeps projects
+        lightweight (a 10-min 250 kHz recording is ~300 MB) and leaves one source
+        of truth per recording. See mad_registry for how moved files are found
+        again."""
         # Capture the selection up front — creating/opening a project below may
         # rebuild the session list, but the source files stay put on disk.
         rows = sorted({i.row() for i in self.file_list.selectedIndexes()})
         srcs = [self.audio_files[r] for r in rows
                 if 0 <= r < len(self.audio_files)]
         if not srcs:
-            self.status_bar.showMessage("Select session file(s) to copy first")
+            self.status_bar.showMessage("Select session file(s) to add first")
             return
         if not self._project:
             if not self._prompt_make_project_for_training():
                 return
             # Re-load the session files (closing the old project cleared the
-            # list) so they stay visible after the copy.
+            # list) so they stay visible afterward.
             self._append_audio_paths(srcs)
-        dest_dir = self._project.recordings_dir
-        os.makedirs(dest_dir, exist_ok=True)
-        copied, overwrite_all, skip_all = 0, False, False
-        for src in srcs:
-            base = os.path.basename(src)
-            dest = os.path.join(dest_dir, base)
-            if os.path.exists(dest) and os.path.normpath(dest) != os.path.normpath(src):
-                if skip_all:
-                    continue
-                if not overwrite_all:
-                    box = QMessageBox(self)
-                    box.setIcon(QMessageBox.Question)
-                    box.setWindowTitle("Already in Training Data")
-                    box.setText(
-                        f"“{base}” is already in the Training Data set.\n\n"
-                        "Overwrite the training copy (wav + csv/h5) with the "
-                        "current session version?")
-                    bt_yes = box.addButton("Overwrite", QMessageBox.YesRole)
-                    bt_all = box.addButton("Overwrite All", QMessageBox.YesRole)
-                    bt_skip = box.addButton("Skip", QMessageBox.NoRole)
-                    box.addButton("Skip All", QMessageBox.NoRole)
-                    box.exec_()
-                    clicked = box.clickedButton()
-                    if clicked is bt_skip:
-                        continue
-                    if clicked is bt_all:
-                        overwrite_all = True
-                    elif clicked is not bt_yes:  # Skip All
-                        skip_all = True
-                        continue
-            self._copy_one_to_training(src, dest)
-            if dest not in self.deploy_files:
-                self.deploy_files.append(dest)
-            copied += 1
-        if copied:
-            self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
+        added = self._register_training_files(srcs)
+        if added:
             self._refresh_deploy_queue()
-            self._log(f"Copied {copied} file(s) to Training Data")
+            self._log(f"Added {added} file(s) to Training Data (by reference)")
             self.status_bar.showMessage(
-                f"Copied {copied} file(s) to Training Data")
+                f"Added {added} file(s) to Training Data — referenced in place, "
+                "not copied")
             self._update_train_button_enabled()
+        else:
+            self.status_bar.showMessage(
+                "Already in Training Data — nothing added")
 
-    def _copy_one_to_training(self, src: str, dest: str):
-        """Copy a wav and its sibling csv/h5 from ``src`` to ``dest``."""
-        import shutil
-        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-        if os.path.normpath(src) != os.path.normpath(dest):
-            shutil.copy2(src, dest)
-        # Prediction CSV.
-        for src_side, dest_side in (
-            (pred_csv_sibling_path(src), pred_csv_sibling_path(dest)),
-            (masks_sibling_path(src), masks_sibling_path(dest)),
-        ):
-            try:
-                if (os.path.isfile(src_side) and
-                        os.path.normpath(src_side) != os.path.normpath(dest_side)):
-                    shutil.copy2(src_side, dest_side)
-            except Exception as e:
-                self._log(f"copy sibling failed ({os.path.basename(src_side)}): {e}")
+    def _register_training_files(self, paths, embedded: bool = False) -> int:
+        """Register wavs in the project's Training Data set. Returns how many
+        were new (already-registered paths are skipped, not duplicated)."""
+        from fnt.usv.usv_detector.mad_registry import RegisteredFile
+        if self._project is None:
+            return 0
+        entries = self._project.training_entries()
+        known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
+        added = 0
+        for p in paths:
+            ap = os.path.abspath(p)
+            if os.path.normcase(ap) in known:
+                continue
+            entries.append(RegisteredFile.from_path(ap, embedded=embedded))
+            known.add(os.path.normcase(ap))
+            if ap not in self.deploy_files:
+                self.deploy_files.append(ap)
+            added += 1
+        if added:
+            entries.sort(key=lambda e: e.basename.lower())
+            self._project.set_training_entries(entries)
+            self._project.save()
+            self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
+        return added
 
     def _remove_from_training_data(self):
-        """Delete the selected recording(s) from the project's Training Data —
-        the copied wav + its csv/h5. Leaves the original session source alone."""
+        """Unregister the selected recording(s) from the Training Data set.
+
+        Referenced files are only *unregistered* — the wav and its csv/h5 stay
+        exactly where they are on disk. Only project-owned audio (a legacy
+        recordings/ copy, or one embedded by Pack Project) is deleted, and that
+        is spelled out in the prompt."""
         rows = sorted({i.row() for i in self.deploy_list.selectedIndexes()},
                       reverse=True)
         victims = [self.deploy_files[r] for r in rows
                    if 0 <= r < len(self.deploy_files)]
-        if not victims:
+        if not victims or self._project is None:
             return
         from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        entries = self._project.training_entries()
+        by_path = {os.path.normcase(os.path.abspath(e.path)): e
+                   for e in entries}
+        owned = [v for v in victims
+                 if getattr(by_path.get(os.path.normcase(os.path.abspath(v))),
+                            'embedded', False)]
         names = "\n".join(f"   • {os.path.basename(v)}" for v in victims[:10])
+        detail = (
+            "The recordings are referenced, not copied, so nothing is deleted "
+            "from disk — they are just dropped from this project's training set."
+            if not owned else
+            f"{len(owned)} of these are stored inside the project and WILL be "
+            "deleted from disk (wav + csv/h5). The rest are only unregistered.")
         reply = QMessageBox.question(
             self, "Remove from Training Data",
-            f"Delete {len(victims)} recording(s) from the project's Training "
-            f"Data set?\n\n{names}\n\n"
-            "This removes the copied wav + csv/h5 from the project. The "
-            "original session files are not touched.",
+            f"Remove {len(victims)} recording(s) from the Training Data set?\n\n"
+            f"{names}\n\n{detail}\n\nConfirmed calls already saved as training "
+            "examples are kept — remove those from the Detections list instead.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        for v in victims:
+        victim_keys = {os.path.normcase(os.path.abspath(v)) for v in victims}
+        for v in owned:
             for path in (v, pred_csv_sibling_path(v), masks_sibling_path(v)):
                 try:
                     if os.path.isfile(path):
                         os.remove(path)
                 except Exception as e:
                     self._log(f"remove failed ({os.path.basename(path)}): {e}")
+        for v in victims:
             try:
                 self.deploy_files.remove(v)
             except ValueError:
                 pass
+        self._project.set_training_entries(
+            [e for e in entries
+             if os.path.normcase(os.path.abspath(e.path)) not in victim_keys])
+        self._project.save()
         self._deploy_file_idx = None
         self._refresh_deploy_queue()
         self._update_train_button_enabled()
-        self._log(f"Removed {len(victims)} file(s) from Training Data")
+        self._log(f"Removed {len(victims)} file(s) from Training Data"
+                  + (f" ({len(owned)} deleted from disk)" if owned else ""))
 
     def _file_source_label(self, w) -> str:
         """'Session' / 'Training Data' / '' — which list a wav belongs to."""
@@ -6440,7 +6476,15 @@ class MADMainWindow(QMainWindow):
 
         Loads audio + grid only; deploy-mode prediction correction is added in
         Phase 3. Does not touch the training example store."""
-        if not filepath or not os.path.isfile(filepath):
+        if not filepath:
+            return
+        if not os.path.isfile(filepath):
+            # Referenced recording moved. Say so plainly and point at the fix
+            # instead of failing silently — nothing else about the project is
+            # broken by this.
+            self.status_bar.showMessage(
+                f"{os.path.basename(filepath)} not found — File ▸ Locate "
+                "Missing Recordings… to repoint it")
             return
         self._stop_playback()
         self._clear_predictions()
@@ -6535,6 +6579,27 @@ class MADMainWindow(QMainWindow):
         self.act_add_files = QAction("Add &Files…", self)
         self.act_add_files.triggered.connect(self._add_audio_files)
         file_menu.addAction(self.act_add_files)
+
+        file_menu.addSeparator()
+
+        # Training recordings are referenced by path, so a moved recording tree
+        # is repaired here rather than by re-importing files.
+        self.act_locate_missing = QAction("&Locate Missing Recordings…", self)
+        self.act_locate_missing.setToolTip(
+            "Repoint the project at training recordings that moved. Pick one "
+            "file and every sibling that moved with it is fixed too.")
+        self.act_locate_missing.triggered.connect(
+            self._locate_missing_recordings)
+        self.act_locate_missing.setEnabled(False)
+        file_menu.addAction(self.act_locate_missing)
+
+        self.act_pack_project = QAction("&Pack Project (embed audio)…", self)
+        self.act_pack_project.setToolTip(
+            "Copy every referenced recording into the project so it is fully "
+            "self-contained — for archiving, or moving to another machine.")
+        self.act_pack_project.triggered.connect(self._pack_project)
+        self.act_pack_project.setEnabled(False)
+        file_menu.addAction(self.act_pack_project)
 
         file_menu.addSeparator()
 
@@ -7172,6 +7237,8 @@ class MADMainWindow(QMainWindow):
         self.act_add_folder.setEnabled(True)
         self.act_add_files.setEnabled(True)
         self.act_close_project.setEnabled(True)
+        self.act_locate_missing.setEnabled(True)
+        self.act_pack_project.setEnabled(True)
         self.act_run_training.setEnabled(True)
         self.act_run_inference.setEnabled(True)
         self.act_load_pred.setEnabled(True)
@@ -7244,6 +7311,8 @@ class MADMainWindow(QMainWindow):
         # Add Folder / Add Files stay enabled — loading audio doesn't require
         # a project.
         self.act_close_project.setEnabled(False)
+        self.act_locate_missing.setEnabled(False)
+        self.act_pack_project.setEnabled(False)
         self.act_run_training.setEnabled(False)
         self.act_run_inference.setEnabled(False)
         self.act_load_pred.setEnabled(False)
@@ -7281,26 +7350,199 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(msg)
 
     def _rescan_project_wavs(self) -> int:
-        """Load the project's Training Data set — every wav in recordings/ —
-        into the Training Data list. Session audio is loaded separately by the
-        user and is never auto-populated on open."""
+        """Load the project's Training Data set into the Training Data list.
+
+        Files are referenced by path, so each registered entry is resolved
+        against disk first (see mad_registry.resolve_entries — a moved file is
+        found again by basename + fingerprint in a sibling's directory). Any wav
+        sitting in a legacy ``recordings/`` copy is adopted into the registry as
+        project-owned. Unresolved entries stay in the list as a soft "missing"
+        state: training still works, only preview is unavailable."""
         if self._project is None:
             return 0
+        from fnt.usv.usv_detector.mad_registry import (
+            RegisteredFile, resolve_entries)
+
+        entries = self._project.training_entries()
+        # Adopt legacy recordings/ copies the registry doesn't know about yet.
         rdir = self._project.recordings_dir
-        os.makedirs(rdir, exist_ok=True)
-        existing = {os.path.normpath(p) for p in self.deploy_files}
-        added = 0
-        for w in _list_wavs_in_folder(rdir):
-            if os.path.normpath(w) not in existing:
-                self.deploy_files.append(w)
-                existing.add(os.path.normpath(w))
-                added += 1
-        self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
+        known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
+        adopted = 0
+        if os.path.isdir(rdir):
+            for w in _list_wavs_in_folder(rdir):
+                if os.path.normcase(os.path.abspath(w)) not in known:
+                    entries.append(RegisteredFile.from_path(w, embedded=True))
+                    known.add(os.path.normcase(os.path.abspath(w)))
+                    adopted += 1
+
+        resolved = resolve_entries(
+            entries, extra_roots=list(self._project.source_folders or []))
+        moved = 0
+        for e in entries:
+            found = resolved.get(e.path)
+            if found and os.path.normcase(found) != os.path.normcase(e.path):
+                e.path = found
+                e.basename = os.path.basename(found)
+                moved += 1
+
+        entries.sort(key=lambda e: e.basename.lower())
+        self._project.set_training_entries(entries)
+        if adopted or moved:
+            self._project.save()
+
+        self.deploy_files = [e.path for e in entries]
+        self._missing_training = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
         self._refresh_deploy_queue()
         self._update_train_button_enabled()
         self._update_scope_labels()
         self._update_project_state()
-        return added
+        if moved:
+            self._log(f"Relocated {moved} training recording(s) automatically")
+        if self._missing_training:
+            n = len(self._missing_training)
+            self._log(f"{n} training recording(s) missing — "
+                      "File ▸ Locate Missing Recordings…")
+            self.status_bar.showMessage(
+                f"{n} training recording(s) could not be found — training and "
+                "existing detections are unaffected; use File ▸ Locate Missing "
+                "Recordings… to restore preview")
+        return len(entries)
+
+    def _is_missing(self, path: str) -> bool:
+        """True when a Training Data entry's audio can't be found on disk."""
+        return (os.path.normcase(os.path.abspath(path))
+                in getattr(self, '_missing_training', set()))
+
+    def _locate_missing_recordings(self):
+        """Point the project at one relocated recording, then repoint every
+        sibling that moved with it.
+
+        Recordings move as whole trees, so deducing the prefix change from a
+        single file and applying it in bulk is what keeps referencing cheap —
+        fix one, fix all of them."""
+        if self._project is None:
+            return
+        from fnt.usv.usv_detector.mad_registry import (
+            infer_prefix_change, remap_prefix, resolve_entries)
+        entries = self._project.training_entries()
+        missing = [e for e in entries if not e.exists()]
+        if not missing:
+            QMessageBox.information(
+                self, "Locate Recordings",
+                "Every training recording in this project was found.")
+            return
+        first = missing[0]
+        QMessageBox.information(
+            self, "Locate Recordings",
+            f"{len(missing)} recording(s) are missing.\n\n"
+            f"Pick the new location of:\n    {first.basename}\n\n"
+            "Every other missing file that moved the same way will be "
+            "repointed automatically.")
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, f"Locate {first.basename}",
+            self._default_browse_dir(), "WAV files (*.wav)")
+        if not new_path:
+            return
+        old_path = first.path
+        first.path = os.path.abspath(new_path)
+        first.basename = os.path.basename(new_path)
+        fixed = 1
+        change = infer_prefix_change(old_path, new_path)
+        if change:
+            fixed += remap_prefix(entries, change[0], change[1])
+        # Second pass: anything still missing may live beside a file we just
+        # fixed, so re-run the normal resolver over the updated set.
+        resolved = resolve_entries(
+            entries, extra_roots=list(self._project.source_folders or []))
+        for e in entries:
+            found = resolved.get(e.path)
+            if found and os.path.normcase(found) != os.path.normcase(e.path):
+                e.path = found
+                e.basename = os.path.basename(found)
+                fixed += 1
+        self._project.set_training_entries(entries)
+        self._project.save()
+        self.deploy_files = [e.path for e in entries]
+        self._missing_training = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
+        self._refresh_deploy_queue()
+        still = len(self._missing_training)
+        self._log(f"Located {fixed} recording(s); {still} still missing")
+        QMessageBox.information(
+            self, "Locate Recordings",
+            f"Relocated {fixed} recording(s)."
+            + (f"\n\n{still} still missing — run this again to fix another "
+               "group that moved somewhere else." if still else ""))
+
+    def _pack_project(self):
+        """Copy every referenced recording into the project (recordings/).
+
+        The escape hatch for the reference-by-path default: use it to archive a
+        project, hand it to a collaborator, or move it to a machine that can't
+        see the original recording tree. After packing, the project is fully
+        self-contained again and the copies are project-owned."""
+        if self._project is None:
+            return
+        import shutil
+        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        entries = self._project.training_entries()
+        outside = [e for e in entries if e.exists() and not e.embedded]
+        if not outside:
+            QMessageBox.information(
+                self, "Pack Project",
+                "Every available recording is already stored in the project.")
+            return
+        total_mb = sum(e.size for e in outside) / (1024 * 1024)
+        reply = QMessageBox.question(
+            self, "Pack Project",
+            f"Copy {len(outside)} recording(s) into the project "
+            f"({total_mb:,.0f} MB)?\n\n"
+            "The project becomes fully self-contained — portable to another "
+            "machine or archive — but stops tracking the originals. The source "
+            "files are not modified.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        rdir = self._project.recordings_dir
+        os.makedirs(rdir, exist_ok=True)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        packed = 0
+        try:
+            for e in outside:
+                dest = os.path.join(rdir, e.basename)
+                try:
+                    if os.path.normcase(os.path.abspath(dest)) != \
+                            os.path.normcase(os.path.abspath(e.path)):
+                        shutil.copy2(e.path, dest)
+                        for src_side, dst_side in (
+                            (pred_csv_sibling_path(e.path),
+                             pred_csv_sibling_path(dest)),
+                            (masks_sibling_path(e.path),
+                             masks_sibling_path(dest)),
+                        ):
+                            if os.path.isfile(src_side):
+                                shutil.copy2(src_side, dst_side)
+                    e.path = os.path.abspath(dest)
+                    e.embedded = True
+                    packed += 1
+                except Exception as ex:
+                    self._log(f"pack failed ({e.basename}): {ex}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._project.set_training_entries(entries)
+        self._project.save()
+        self.deploy_files = [e.path for e in entries]
+        self._missing_training = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
+        self._refresh_deploy_queue()
+        self._log(f"Packed {packed} recording(s) into the project")
+        QMessageBox.information(
+            self, "Pack Project",
+            f"Copied {packed} recording(s) into:\n{rdir}")
 
     def _refresh_file_list(self):
         self.file_list.blockSignals(True)

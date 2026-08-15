@@ -40,6 +40,14 @@ class MADProjectConfig:
     audio_files: List[str] = field(default_factory=list)
     last_opened_file: Optional[str] = None
 
+    # Training Data set — recordings the project *references* by path rather
+    # than copies into recordings/. Serialized RegisteredFile dicts; see
+    # fnt.usv.usv_detector.mad_registry for why referencing is safe here
+    # (training reads training_data.h5, never the wav) and how missing files
+    # are re-resolved. Legacy projects with recordings/ copies are adopted into
+    # this list on open, with embedded=True so they stay project-owned.
+    training_files: List[Dict] = field(default_factory=list)
+
     # Spectrogram parameters — must match between label, train, and inference.
     nperseg: int = 512
     noverlap: int = 384
@@ -80,8 +88,22 @@ class MADProjectConfig:
 
     @property
     def recordings_dir(self) -> str:
-        """Audio files copied into the project for portability."""
+        """Project-owned audio: legacy copies, and anything embedded by
+        "Pack project". New training files are referenced in place instead —
+        see ``training_files``."""
         return os.path.join(self.project_dir, 'recordings')
+
+    # ------------------------------------------------------------------
+    # Training-file registry
+    # ------------------------------------------------------------------
+    def training_entries(self):
+        """The Training Data set as :class:`RegisteredFile` objects."""
+        from .mad_registry import entries_from_dicts
+        return entries_from_dicts(self.training_files)
+
+    def set_training_entries(self, entries) -> None:
+        from .mad_registry import entries_to_dicts
+        self.training_files = entries_to_dicts(entries)
 
     def save(self, path: Optional[str] = None) -> None:
         """Save config to ``<project_dir>/mad_project_info.json``."""
