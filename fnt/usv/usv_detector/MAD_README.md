@@ -260,6 +260,81 @@ re-run inference to regenerate predictions in the new format.
 
 ---
 
+## Batch runs at scale
+
+The target workflow is one model applied to thousands of recordings, so the
+batch path is built around three properties.
+
+**Recursive folder targets.** 24/7 multi-mic sets are nested
+(experiment / mic / day), so folder scans walk the tree. The **Folder** target in
+Run Inference is deliberately *not* routed through the session list: loading
+3,000 recordings there would mean 3,000 list widgets plus a sibling-CSV stat per
+row before anything runs. The folder is scanned once and paths stream to the
+worker.
+
+**Resumable runs.** Two independent mechanisms, answering different questions:
+
+- `batch_runs/<timestamp>/manifest.jsonl` — the run's own append-only log, one
+  JSON line per file, flushed immediately. A crash at file 2,800 of 3,000 leaves
+  a manifest valid up to 2,799; a torn final line is skipped on read.
+- **Provenance skipping** asks whether a recording already carries detections
+  from *this* model at *these* settings. That lives in the recording's own CSV
+  (`model_name`, `threshold`, `min_blob_pixels`), so it survives losing the
+  manifest and works across runs when two folders overlap.
+
+Only settings that change *detections* invalidate prior work — `batch_size`,
+`amp` and `device` deliberately do not, so raising the batch size never forces a
+redo. Zero-detection files write no prediction rows and so can't be proven done
+from the CSV alone; the manifest covers them, which matters because quiet files
+dominate 24/7 recordings.
+
+**Bounded memory.** `infer_probability_mask` never materializes the whole
+probability grid as float32. The output grid is uint8 (probability x 255), the
+Hann weight accumulator is 1-D (it never varied along frequency), and the float32
+accumulator is per-chunk with the un-finalized tail carried across chunk
+boundaries — so the result is identical to whole-grid accumulation with no seam
+artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
+
+`mad analyze` has the same behavior headless (`--no-resume`, `--run-dir`,
+`--log-root`, `--batch-size`, `--no-amp`) for HPC or overnight runs.
+
+---
+
+## Knowing when a model is ready
+
+Training reports validation **Dice** — a *pixel* score on *tiles*. It does not
+answer the question that decides whether to spend hours of compute: how many real
+calls will this find, and how much junk will I have to reject?
+
+**Evaluate Model…** answers that at call level. It matches predicted blobs
+against hand-labeled calls (time and frequency IoU, greedy by score, one-to-one —
+the same accounting a human does) and reports precision / recall / F1 across a
+threshold sweep. Because every prediction stores its own score, the whole curve
+comes from **one** inference pass: run once at a permissive threshold, then
+re-score the same detections at each cutoff. Picking a threshold stops being a
+guess. Use held-out labeled files — scoring on training files flatters the model.
+
+---
+
+## Reviewing at scale
+
+After a large run the bottleneck is human attention, not compute.
+
+- **Run Summary** (Ctrl+B) — per-file results from the manifest: which
+  recordings have calls, how many, calls/min. Reads no audio, so it opens
+  instantly. Double-click to review a file.
+- **Detection Gallery** (G) — a contact sheet of mask crops; click tiles to
+  cycle accept -> reject, then Apply. This is what the per-call crop storage
+  buys: a page is a few hundred KB and touches no audio. Decisions commit
+  through the same paths as one-at-a-time review, so training examples, CSV
+  status and undo behave identically.
+- **Min score slider** — hides pending predictions below a confidence.
+  Call-level re-thresholding for free, with no re-run, using the stored score.
+  It never hides accepted or rejected calls (a decision is not a guess), and the
+  count label always reports how many are hidden.
+
+---
+
 ## Review colors
 
 Overlay colors are **not fixed** — they're chosen per spectrogram colormap
