@@ -200,7 +200,7 @@ class Simulation:
         inside. Seek target and feeding region are therefore separate: aiming
         at the centre would just press the animal against the outside wall.
         """
-        food, food_seek, frects = [], [], []
+        food, food_seek, frects, fdoors = [], [], [], []
         # what each food entry is made of, in the same order: circles first,
         # then zone rectangles. Drives energy yield and depletion.
         self._food_meta = []
@@ -215,6 +215,7 @@ class Simulation:
             # animals "feed" through the corners from outside the walls)
             frects.append((z.x, z.y, z.w / 2.0, z.d / 2.0))
             food_seek.append(_zone_door(z))
+            fdoors.append(_zone_door(z))
             # a resource zone holds the standard provisioned diet, unlimited
             self._food_meta.append((get_food(DEFAULT_FOOD), None))
         water, water_seek = [], []
@@ -233,8 +234,17 @@ class Simulation:
         self.food_r = np.array([r for _, _, r in food], float)
         self.water_r = np.array([r for _, _, r in water], float)
         self.food_rects = np.array(frects, float).reshape(-1, 4)  # cx,cy,hw,hd
+        # the one gap in each zone's wall — an animal inside can only leave
+        # through it, so it has to be steered for explicitly
+        self.zone_doors = np.array(fdoors, float).reshape(-1, 2)
         self.food_seek = np.array(food_seek, float).reshape(-1, 2)
         self.water_seek = np.array(water_seek, float).reshape(-1, 2)
+        # Grams left at each food entry, inf = never runs out. This is the
+        # authority at run time: `amount_g == 0` means "unlimited" in a config
+        # but "empty" once eaten, so the two cannot share one number.
+        self._food_left = np.array(
+            [(obj.amount_g if (obj is not None and obj.amount_g > 0)
+              else np.inf) for _, obj in self._food_meta], float)
 
     # ------------------------------------------------------------------ #
     # Founder construction (initial release AND protocol additions)
@@ -734,9 +744,7 @@ class Simulation:
                                  * e_cap[eating])
             grams = np.minimum(grams, room_kj / np.maximum(1e-9, dens[who]))
             # a finite pile can run out; share what is left among the feeders
-            remaining = np.array(
-                [(m[1].amount_g if (m[1] is not None and m[1].amount_g > 0)
-                  else np.inf) for m in self._food_meta])
+            remaining = self._food_left
             if np.isfinite(remaining).any():
                 want = np.zeros(len(self._food_meta))
                 np.add.at(want, who, grams)
@@ -746,9 +754,13 @@ class Simulation:
                 grams = grams * scale[who]
                 taken = np.zeros(len(self._food_meta))
                 np.add.at(taken, who, grams)
+                fin = np.isfinite(self._food_left)
+                self._food_left[fin] = np.maximum(
+                    0.0, self._food_left[fin] - taken[fin])
+                # mirror onto the resource so the remaining amount is visible
                 for k, (_, obj) in enumerate(self._food_meta):
-                    if obj is not None and obj.amount_g > 0:
-                        obj.amount_g = max(0.0, obj.amount_g - taken[k])
+                    if obj is not None and np.isfinite(self._food_left[k]):
+                        obj.amount_g = float(self._food_left[k])
             kj_in[eating] = grams * dens[who]
             ml_food[eating] = grams * wfrac[who]
             self.food_eaten_g[eating] += grams
@@ -907,26 +919,54 @@ class Simulation:
         moved = tmin < 1.0
         if moved.any():
             scale = np.where(moved, np.maximum(tmin - 0.02, 0.0), 1.0)
-            P_new = P_old + (P_new - P_old) * scale[:, None]
-        # push out anything that began the step already inside a solid
-        C = self._obs_circles
-        if len(C):
-            cxa, cya, cra = C.T
-            for _ in range(2):
-                dx = P_new[:, 0][:, None] - cxa[None, :]
-                dy = P_new[:, 1][:, None] - cya[None, :]
-                dist = np.hypot(dx, dy)
-                inside = dist < cra[None, :]
-                if not inside.any():
+            step = P_new - P_old
+            P_new = P_old + step * scale[:, None]
+            # Slide along the obstacle instead of stopping dead against it.
+            # Without this an animal whose target is on the far side of a wall
+            # presses into that wall indefinitely — which is how agents end up
+            # pinned beside a resource zone, or trapped inside one, until they
+            # starve. Retrying the blocked remainder one axis at a time lets
+            # them skirt the wall and find the doorway.
+            resid = step * (1.0 - scale)[:, None]
+            blocked = np.nonzero(moved)[0]
+            for axis in (0, 1):
+                if not len(blocked):
                     break
-                dm = np.where(inside, dist, np.inf)
-                j = np.argmin(dm, axis=1)
-                for i in np.where(np.isfinite(dm[np.arange(n), j]))[0]:
-                    k = j[i]
-                    d = max(dist[i, k], 1e-9)
-                    P_new[i] = [cxa[k] + dx[i, k] / d * cra[k],
-                                cya[k] + dy[i, k] / d * cra[k]]
+                cand = P_new[blocked].copy()
+                cand[:, axis] += resid[blocked, axis]
+                free = self._first_hit(P_new[blocked], cand) >= 1.0
+                if free.any():
+                    idx = blocked[free]
+                    P_new[idx] = cand[free]
+        self._push_out_solids(P_new)
         return P_new
+
+    def _push_out_solids(self, P) -> None:
+        """Eject anything sitting inside a solid, in place.
+
+        Called after obstacle resolution *and* again after boundary handling:
+        a reflective wall can bounce an animal straight into a pole, which the
+        sweep never sees because the reflected position is not on the path.
+        """
+        C = self._obs_circles
+        if not len(C):
+            return
+        n = len(P)
+        cxa, cya, cra = C.T
+        for _ in range(2):
+            dx = P[:, 0][:, None] - cxa[None, :]
+            dy = P[:, 1][:, None] - cya[None, :]
+            dist = np.hypot(dx, dy)
+            inside = dist < cra[None, :]
+            if not inside.any():
+                break
+            dm = np.where(inside, dist, np.inf)
+            j = np.argmin(dm, axis=1)
+            for i in np.where(np.isfinite(dm[np.arange(n), j]))[0]:
+                k = j[i]
+                d = max(dist[i, k], 1e-9)
+                P[i] = [cxa[k] + dx[i, k] / d * cra[k],
+                        cya[k] + dy[i, k] / d * cra[k]]
 
     def _first_hit(self, A, B):
         """Earliest fraction along A->B that crosses a wall or enters a solid."""
@@ -979,6 +1019,8 @@ class Simulation:
                 self.P[hi, ax] = 2 * lim - self.P[hi, ax]
             self.P[:, 0] = np.clip(self.P[:, 0], 0, w)
             self.P[:, 1] = np.clip(self.P[:, 1], 0, h)
+        # a bounce can land an animal inside a pole or tower — undo that
+        self._push_out_solids(self.P)
 
     def _fight_power(self, i) -> float:
         """Resource-holding potential: bigger, healthier, bolder, calmer wins."""

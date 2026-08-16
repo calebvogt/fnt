@@ -14,8 +14,35 @@ from typing import Callable
 from .config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, Zone, Pole, AntennaBox, AntennaLayout, WaterTower,
-    ResourceZone, Hut, GrassSpec, blank_experiment, default_vole_experiment,
+    ResourceZone, Hut, GrassSpec, ScentParams, blank_experiment,
+    default_vole_experiment,
 )
+from .physiology import preset_params
+
+
+def _live_world(cfg: ExperimentConfig,
+                half_life_h: float = 24.0) -> ExperimentConfig:
+    """Switch on the mechanisms an enclosure experiment is actually about.
+
+    Scent marking (so territory emerges rather than being prescribed) and the
+    energy/water budget (so eating, drinking and moving cost something). Both
+    stay off by default elsewhere, which keeps configs saved before they
+    existed reproducing exactly — but a preset that mirrors a real enclosure
+    should arrive with the real mechanisms running.
+    """
+    cfg.scent = ScentParams(enabled=True, half_life_h=half_life_h)
+    cfg.physiology = preset_params("Standard")
+    return cfg
+
+def vole_anosmia() -> ExperimentConfig:
+    """The saline-vs-methimazole vole design, with marking and metabolism live.
+
+    This is the paradigm scent marking exists for: methimazole takes the nose
+    away, so the animal can no longer read whose ground it is standing on and
+    territorial spacing degrades — without any home-range size being changed.
+    """
+    return _live_world(default_vole_experiment())
+
 
 FT = 0.3048   # feet -> metres
 IN = 0.0254   # inches -> metres
@@ -152,10 +179,10 @@ def voleterra() -> ExperimentConfig:
                                        exploration=0.5, base_speed=0.11),
                    dists={"mass": "N(38,4)"}),
     ]
-    return ExperimentConfig(
+    return _live_world(ExperimentConfig(
         name="voleterra", arena=arena, groups=voles,
         days=10.0, dt=2.0, record_interval=10.0, n_trials=1,
-        start_datetime="2025-11-07T18:00:00")
+        start_datetime="2025-11-07T18:00:00"))
 
 
 def voleterra_2026_t001() -> ExperimentConfig:
@@ -276,10 +303,10 @@ def liddell_echo_t1() -> ExperimentConfig:
                                        exploration=0.65, base_speed=0.13),
                    dists={"mass": "N(21,2)"}),
     ]
-    return ExperimentConfig(
+    return _live_world(ExperimentConfig(
         name="liddell_echo_t1", arena=arena, groups=mice,
         days=3.0, dt=1.0, record_interval=5.0, n_trials=1,
-        start_datetime="2025-01-01T18:00:00")
+        start_datetime="2025-01-01T18:00:00"))
 
 
 liddell_echo = liddell_echo_t1      # backwards-compatible alias
@@ -377,10 +404,10 @@ def liddell_echo_t2() -> ExperimentConfig:
                                        exploration=0.85, base_speed=0.15),
                    dists={"mass": "N(25,2)"}),
     ]
-    return ExperimentConfig(
+    return _live_world(ExperimentConfig(
         name="liddell_echo_t2", arena=arena, groups=mice,
         days=3.0, dt=1.0, record_interval=5.0, n_trials=1,
-        start_datetime="2025-01-01T18:00:00")
+        start_datetime="2025-01-01T18:00:00"))
 
 
 # Ordered registry of built-in presets shown in the GUI picker.
@@ -392,8 +419,9 @@ PRESETS: list[Preset] = [
            "Single subject, 10 min, centre/periphery zones.",
            open_field_test, abbr="OFT"),
     Preset("Prairie vole — anosmia",
-           "2.2 m enclosure, 4M/4F, saline vs methimazole.",
-           default_vole_experiment, abbr="Vole"),
+           "2.2 m enclosure, 4M/4F, saline vs methimazole. Scent marking on: "
+           "territory emerges from marks, so anosmia degrades it.",
+           vole_anosmia, abbr="Vole"),
     Preset("VoleTerra enclosure (75×75 ft)",
            "Semi-natural field enclosure: 3 ft walls, 25 support poles (5×5).",
            voleterra, abbr="VoleTerra",

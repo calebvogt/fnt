@@ -39,6 +39,10 @@ from ..core.presets import (
 )
 from ..core.project import Project, list_projects, default_root
 from ..core.biology import genes_for_species
+from ..core.physiology import (
+    PhysiologyParams, PHYSIOLOGY_PRESETS, preset_params, preset_name_for,
+    get_food, food_by_name, DEFAULT_FOOD,
+)
 from ..core.species import get_species, apply_species, by_name as by_species_name
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
@@ -67,7 +71,7 @@ _TRAIT_DEFAULT = {
     "mass": 40.0, "aggression": 0.5, "boldness": 0.5, "sociability": 0.5,
     "smell_ability": 1.0, "identity_signal": 1.0, "home_range_r": 0.55,
 }
-OBJ_COLS = ["kind", "x", "y", "radius", "label"]
+OBJ_COLS = ["kind", "x", "y", "radius", "label", "food type", "amount (g)"]
 IV_COLS = ["at_day", "target", "attribute", "op", "value"]
 DYN_COLS = ["source", "target", "effect", "gain", "scale_by", "when",
             "threshold", "note"]
@@ -1256,6 +1260,70 @@ class ABMAWindow(QMainWindow):
         self.in_scent_on.toggled.connect(self._on_arena_edit)
         lay.addWidget(scent_box)
 
+        # ---- physiology: energy in / energy out, water in / urine out ----
+        phys_box = QGroupBox("Physiology")
+        yl = QVBoxLayout(phys_box)
+        self.in_phys_on = QCheckBox(
+            "Energy and water are real budgets (eating, drinking, "
+            "movement cost)")
+        self.in_phys_on.setToolTip(
+            "Animals gain energy only by eating (grams × the diet's energy "
+            "density) and spend it on metabolism, movement and fighting.\n"
+            "Drinking fills the bladder, which is what pays for scent marks.\n"
+            "Hunger and thirst are then what the stores are missing.")
+        yl.addWidget(self.in_phys_on)
+        y_hint = QLabel(
+            "All condition bars are 0-100. With this off, the "
+            "Attribute-dynamics table drives hunger/thirst/energy instead.")
+        y_hint.setWordWrap(True)
+        y_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        yl.addWidget(y_hint)
+        pf = QFormLayout()
+        self.in_phys_preset = QComboBox()
+        self.in_phys_preset.addItems(list(PHYSIOLOGY_PRESETS) + ["Custom"])
+        self.in_phys_preset.setToolTip(
+            "Standard is the flat, neutral setting; the others shift the "
+            "energy or water trade-off without hand-editing every rate.")
+        self.in_phys_preset.currentTextChanged.connect(self._apply_phys_preset)
+        pf.addRow("Preset", self.in_phys_preset)
+        self._phys_fields = {}
+        for lab, attr, lo, hi, step, suffix, tip in [
+            ("Feeding rate", "feed_rate_g_min", 0.001, 5.0, 0.01, " g/min",
+             "grams eaten per minute while at a food source"),
+            ("Drinking rate", "drink_rate_ml_min", 0.001, 10.0, 0.05, " mL/min",
+             "mL drunk per minute while at water"),
+            ("Resting cost", "basal_kj_h", 0.05, 50.0, 0.1, " kJ/h",
+             "basal metabolism for a 40 g animal; scales as mass^0.75"),
+            ("Movement cost", "locomotion_kj_per_kg_m", 0.0, 5.0, 0.005,
+             " kJ/kg·m", "energy per metre travelled, per kg of body mass"),
+            ("Fight cost", "fight_kj", 0.0, 50.0, 0.5, " kJ",
+             "energy a contestant spends per fight (the loser pays double)"),
+            ("Energy store", "energy_store_kj_per_g", 0.1, 40.0, 0.5, " kJ/g",
+             "usable reserve per gram of body mass — how long it can fast"),
+            ("Water loss", "water_loss_ml_h", 0.0, 5.0, 0.02, " mL/h",
+             "evaporative and faecal water loss per hour"),
+            ("Bladder size", "bladder_ml_per_g", 0.0005, 0.2, 0.002, " mL/g",
+             "bladder volume per gram of body mass — caps marking"),
+            ("Urine per mark", "mark_volume_ul", 0.5, 500.0, 1.0, " µL",
+             "urine spent on one scent mark"),
+        ]:
+            fld = _dspin(lo, hi, getattr(PhysiologyParams(), attr), step,
+                         suffix)
+            fld.setDecimals(4)
+            fld.setToolTip(tip)
+            fld.valueChanged.connect(self._mark_phys_custom)
+            self._phys_fields[attr] = fld
+            pf.addRow(lab, fld)
+        yl.addLayout(pf)
+        self._phys_widgets = [self.in_phys_preset] + list(
+            self._phys_fields.values())
+        for fld in self._phys_widgets:
+            fld.setEnabled(False)
+        self.in_phys_on.toggled.connect(
+            lambda on: [f.setEnabled(on) for f in self._phys_widgets])
+        self.in_phys_on.toggled.connect(self._on_arena_edit)
+        lay.addWidget(phys_box)
+
         # ---- advanced knobs (collapsed by default) ----
         self.in_dt = _dspin(0.1, 60, 2.0, 0.5, " s")
         self.in_rec = _dspin(1, 3600, 10.0, 1.0, " s")
@@ -1372,6 +1440,32 @@ class ABMAWindow(QMainWindow):
         lay.addWidget(out_box)
         lay.addStretch(1)
         return w
+
+    def _apply_phys_preset(self, name):
+        """Stamp a named physiology preset onto the rate fields."""
+        if name not in PHYSIOLOGY_PRESETS:
+            return                       # "Custom" — leave the values alone
+        p = preset_params(name)
+        for attr, w in self._phys_fields.items():
+            w.blockSignals(True)
+            w.setValue(getattr(p, attr))
+            w.blockSignals(False)
+        self._on_arena_edit()
+
+    def _mark_phys_custom(self, *_):
+        """Hand-editing any rate drops the preset label to Custom."""
+        if self.in_phys_preset.currentText() != "Custom":
+            self.in_phys_preset.blockSignals(True)
+            self.in_phys_preset.setCurrentText("Custom")
+            self.in_phys_preset.blockSignals(False)
+        self._on_arena_edit()
+
+    def _physiology_from_ui(self) -> PhysiologyParams:
+        p = copy.deepcopy(self._physiology)
+        p.enabled = self.in_phys_on.isChecked()
+        for attr, w in self._phys_fields.items():
+            setattr(p, attr, w.value())
+        return p
 
     def _apply_fidelity(self, name):
         preset = self._FIDELITY.get(name)
@@ -1610,6 +1704,7 @@ class ABMAWindow(QMainWindow):
                 counter_mark=self._scent.counter_mark,
                 anonymous_weight=self.in_scent_anon.value(),
             ),
+            physiology=self._physiology_from_ui(),
         )
 
     def _load_config(self, cfg: ExperimentConfig):
@@ -1619,6 +1714,21 @@ class ABMAWindow(QMainWindow):
         self._policy = copy.deepcopy(cfg.policy)
         # likewise the scent knobs that aren't on screen (cost/strength/counter)
         self._scent = copy.deepcopy(cfg.scent)
+        self._physiology = copy.deepcopy(cfg.physiology)
+        if hasattr(self, "in_phys_on"):
+            for attr, w in self._phys_fields.items():
+                w.blockSignals(True)
+                w.setValue(getattr(cfg.physiology, attr))
+                w.blockSignals(False)
+                w.setEnabled(cfg.physiology.enabled)
+            self.in_phys_preset.blockSignals(True)
+            self.in_phys_preset.setCurrentText(
+                preset_name_for(cfg.physiology))
+            self.in_phys_preset.blockSignals(False)
+            self.in_phys_preset.setEnabled(cfg.physiology.enabled)
+            self.in_phys_on.blockSignals(True)
+            self.in_phys_on.setChecked(cfg.physiology.enabled)
+            self.in_phys_on.blockSignals(False)
         if hasattr(self, "in_scent_on"):
             for fld, v in ((self.in_scent_hl, cfg.scent.half_life_h),
                            (self.in_scent_pr, cfg.scent.perception_r),
@@ -1695,8 +1805,21 @@ class ABMAWindow(QMainWindow):
         t = self.obj_table
         r = t.rowCount()
         t.insertRow(r)
-        for c, val in enumerate([o.kind, o.x, o.y, o.radius, o.label]):
-            t.setItem(r, c, QTableWidgetItem(str(val)))
+        ft = get_food(getattr(o, "food_type", "")).name if o.kind == "food" else ""
+        amt = getattr(o, "amount_g", 0.0)
+        cells = [o.kind, o.x, o.y, o.radius, o.label, ft,
+                 ("" if o.kind != "food" else
+                  ("unlimited" if not amt else f"{amt:g}"))]
+        for c, val in enumerate(cells):
+            it = QTableWidgetItem(str(val))
+            if c == 5 and o.kind == "food":
+                it.setToolTip("Diet at this station — sets kJ per gram "
+                              "(Standard chow / High-fat / Low-energy / "
+                              "Seeds / Fresh greens)")
+            if c == 6 and o.kind == "food":
+                it.setToolTip("Grams available; blank or 'unlimited' never "
+                              "runs out. A finite pile depletes as animals eat.")
+            t.setItem(r, c, it)
 
     def _arena_from_table(self) -> ArenaConfig:
         objs = []
@@ -1710,7 +1833,16 @@ class ABMAWindow(QMainWindow):
                 lbl = t.item(r, 4).text() if t.item(r, 4) else ""
             except (AttributeError, ValueError):
                 continue
-            objs.append(ResourceObject(kind, x, y, rad, label=lbl))
+            ft_txt = t.item(r, 5).text().strip() if t.item(r, 5) else ""
+            ft = food_by_name(ft_txt)
+            amt_txt = t.item(r, 6).text().strip() if t.item(r, 6) else ""
+            try:
+                amt = float(amt_txt)
+            except ValueError:
+                amt = 0.0        # blank / "unlimited"
+            objs.append(ResourceObject(
+                kind, x, y, rad, label=lbl,
+                food_type=(ft.key if ft else DEFAULT_FOOD), amount_g=amt))
         return ArenaConfig(
             width=self.in_width.value(), height=self.in_height.value(),
             boundary=self.in_boundary.currentText(), objects=objs,

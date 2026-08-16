@@ -71,6 +71,56 @@ def test_scent_params_survive_gui_roundtrip(qapp):
     assert out.scent.counter_mark == 3.0
 
 
+def test_physiology_survives_gui_roundtrip(qapp):
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import default_vole_experiment
+    from fnt.abma.core.physiology import preset_params
+
+    cfg = default_vole_experiment()
+    cfg.physiology = preset_params("Arid (water-limited)")
+    win = ABMAWindow()
+    win._load_config(cfg)
+    assert win.in_phys_preset.currentText() == "Arid (water-limited)"
+    out = win._collect_config()
+    assert out.physiology.enabled is True
+    assert out.physiology.water_loss_ml_h == cfg.physiology.water_loss_ml_h
+    assert out.physiology.bladder_ml_per_g == cfg.physiology.bladder_ml_per_g
+
+
+def test_food_type_and_amount_survive_gui_roundtrip(qapp):
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import default_vole_experiment
+
+    cfg = default_vole_experiment()
+    food = [o for o in cfg.arena.objects if o.kind == "food"][0]
+    food.food_type = "high_fat"
+    food.amount_g = 250.0
+    win = ABMAWindow()
+    win._load_config(cfg)
+    out = win._collect_config()
+    got = [o for o in out.arena.objects if o.kind == "food"][0]
+    assert got.food_type == "high_fat"
+    assert got.amount_g == 250.0
+    # non-food rows must not acquire a stray finite pile
+    water = [o for o in out.arena.objects if o.kind == "water"][0]
+    assert water.amount_g == 0.0
+
+
+def test_editing_a_rate_marks_the_preset_custom(qapp):
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import default_vole_experiment
+    from fnt.abma.core.physiology import preset_params
+
+    cfg = default_vole_experiment()
+    cfg.physiology = preset_params("Standard")
+    win = ABMAWindow()
+    win._load_config(cfg)
+    assert win.in_phys_preset.currentText() == "Standard"
+    win._phys_fields["basal_kj_h"].setValue(9.9)
+    assert win.in_phys_preset.currentText() == "Custom"
+    assert win._collect_config().physiology.basal_kj_h == 9.9
+
+
 def test_agent_builder_species_card_sets_body_not_home_range(qapp):
     from fnt.abma.gui.abma_main_pyqt import AgentBuilderDialog
     from fnt.abma.core.species import get_species

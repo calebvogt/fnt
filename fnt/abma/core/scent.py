@@ -142,17 +142,23 @@ class ScentField:
         other = (o >= 0) & ~mine
         w = s * self._sw[None, :]
 
+        # Normalised by the stencil's total weight, so these come back as
+        # O(1) steering vectors. Without it the pull grows with how heavily an
+        # area is marked and a heavy marker gets trapped in its own patch —
+        # unable to out-vote its own scent even when starving.
+        norm = max(1e-9, float(self._sw.sum()))
+
         # own marks: attraction toward the patch you have been maintaining
         wo = np.where(mine, w, 0.0)
         own_vec = np.stack([(wo * self._sux[None, :]).sum(1),
-                            (wo * self._suy[None, :]).sum(1)], axis=1)
+                            (wo * self._suy[None, :]).sum(1)], axis=1) / norm
         # foreign marks: repulsion, discounted when the signature is unreadable
         anon = float(self.p.anonymous_weight)
         wf = np.where(other, w * (anon + (1.0 - anon) * idn), 0.0)
         foreign_vec = -np.stack([(wf * self._sux[None, :]).sum(1),
-                                 (wf * self._suy[None, :]).sum(1)], axis=1)
+                                 (wf * self._suy[None, :]).sum(1)],
+                                axis=1) / norm
 
-        norm = max(1e-9, float(self._sw.sum()))
         own_level = np.clip(wo.sum(1) / norm, 0, 1)
         foreign_level = np.clip(np.where(other, w, 0.0).sum(1) / norm, 0, 1)
         return own_vec, foreign_vec, own_level, foreign_level
