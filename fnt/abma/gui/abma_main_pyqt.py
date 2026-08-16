@@ -30,6 +30,7 @@ from ..core.config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
     default_dynamics, GrassSpec, blank_experiment, default_vole_experiment,
+    ScentParams,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -37,9 +38,12 @@ from ..core.presets import (
     all_presets, save_user_preset, suggest_preset_name,
 )
 from ..core.project import Project, list_projects, default_root
+from ..core.biology import genes_for_species
+from ..core.species import get_species, apply_species, by_name as by_species_name
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
 from .protocol_timeline import ProtocolTimeline, describe as describe_event
+from .species_picker import SpeciesPicker
 
 try:  # 3D live view needs pyqtgraph.opengl (PyOpenGL); fall back if absent
     from .pg_canvas import Arena3DView
@@ -1210,6 +1214,48 @@ class ABMAWindow(QMainWindow):
         lay.addWidget(proto_box)
         self.in_days.valueChanged.connect(self.timeline.set_days)
 
+        # ---- scent marking: the substrate territoriality emerges from ----
+        scent_box = QGroupBox("Scent marking")
+        sl = QVBoxLayout(scent_box)
+        self.in_scent_on = QCheckBox(
+            "Animals leave urine marks that carry identity and fade")
+        self.in_scent_on.setToolTip(
+            "With marking on, site fidelity and territory come from the marks "
+            "themselves — no home-range size is prescribed anywhere.")
+        sl.addWidget(self.in_scent_on)
+        s_hint = QLabel(
+            "How long a mark stays informative is the headline knob: short "
+            "half-lives mean only very recent presence is legible; long ones "
+            "let a stable defended mosaic build up.")
+        s_hint.setWordWrap(True)
+        s_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        sl.addWidget(s_hint)
+        sf = QFormLayout()
+        self.in_scent_hl = _dspin(0.1, 720, 24.0, 1.0, " h")
+        self.in_scent_hl.setToolTip("Mark half-life — try 2 h vs 7 d (168 h)")
+        self.in_scent_pr = _dspin(0.05, 5.0, 0.5, 0.05, " m")
+        self.in_scent_pr.setToolTip("How far an animal can read marks")
+        self.in_scent_cell = _dspin(0.02, 1.0, 0.10, 0.01, " m")
+        self.in_scent_cell.setToolTip("Grid resolution of the scent map")
+        self.in_scent_anon = _dspin(0.0, 1.0, 0.25, 0.05)
+        self.in_scent_anon.setToolTip(
+            "Territorial weight of a mark with NO individual signature "
+            "(a MUP-knockout animal still urinates). 0 = ignored entirely")
+        for lab, wdg in [("Mark half-life", self.in_scent_hl),
+                         ("Read radius", self.in_scent_pr),
+                         ("Map cell size", self.in_scent_cell),
+                         ("Anonymous-mark weight", self.in_scent_anon)]:
+            sf.addRow(lab, wdg)
+        sl.addLayout(sf)
+        self._scent_fields = (self.in_scent_hl, self.in_scent_pr,
+                              self.in_scent_cell, self.in_scent_anon)
+        for fld in self._scent_fields:
+            fld.setEnabled(False)
+        self.in_scent_on.toggled.connect(
+            lambda on: [f.setEnabled(on) for f in self._scent_fields])
+        self.in_scent_on.toggled.connect(self._on_arena_edit)
+        lay.addWidget(scent_box)
+
         # ---- advanced knobs (collapsed by default) ----
         self.in_dt = _dspin(0.1, 60, 2.0, 0.5, " s")
         self.in_rec = _dspin(1, 3600, 10.0, 1.0, " s")
@@ -1554,6 +1600,16 @@ class ABMAWindow(QMainWindow):
             n_workers=self.in_workers.value(),
             trial_prefix="S",
             policy=copy.deepcopy(self._policy),
+            scent=ScentParams(
+                enabled=self.in_scent_on.isChecked(),
+                cell_size=self.in_scent_cell.value(),
+                half_life_h=self.in_scent_hl.value(),
+                perception_r=self.in_scent_pr.value(),
+                deposit_cost=self._scent.deposit_cost,
+                mark_strength=self._scent.mark_strength,
+                counter_mark=self._scent.counter_mark,
+                anonymous_weight=self.in_scent_anon.value(),
+            ),
         )
 
     def _load_config(self, cfg: ExperimentConfig):
@@ -1561,6 +1617,20 @@ class ABMAWindow(QMainWindow):
         # policy params have no editor widgets (yet) — carry them through so a
         # tuned config's movement weights survive the GUI round-trip
         self._policy = copy.deepcopy(cfg.policy)
+        # likewise the scent knobs that aren't on screen (cost/strength/counter)
+        self._scent = copy.deepcopy(cfg.scent)
+        if hasattr(self, "in_scent_on"):
+            for fld, v in ((self.in_scent_hl, cfg.scent.half_life_h),
+                           (self.in_scent_pr, cfg.scent.perception_r),
+                           (self.in_scent_cell, cfg.scent.cell_size),
+                           (self.in_scent_anon, cfg.scent.anonymous_weight)):
+                fld.blockSignals(True)
+                fld.setValue(v)
+                fld.blockSignals(False)
+                fld.setEnabled(cfg.scent.enabled)
+            self.in_scent_on.blockSignals(True)
+            self.in_scent_on.setChecked(cfg.scent.enabled)
+            self.in_scent_on.blockSignals(False)
         # arena attributes without a table cell ride along on the window
         self._zones = list(cfg.arena.zones)
         self._poles = list(cfg.arena.poles)
@@ -1927,6 +1997,7 @@ class ABMAWindow(QMainWindow):
             "hunger": float(fr["hunger"][idx]),
             "thirst": float(fr["thirst"][idx]),
             "stress": float(fr["stress"][idx]),
+            "bladder": float(fr["bladder"][idx]) if "bladder" in fr else 0.0,
             "mass": float(fr["mass"][idx]),
             "activity": int(fr["activity"][idx]),
             "anosmic": bool(fr["anosmic"][idx]),
@@ -2258,23 +2329,101 @@ class CollapsibleSection(QWidget):
 class AgentBuilderDialog(QDialog):
     """Build/edit one agent TYPE: appearance, movement, attributes, biology."""
 
+    #: (label, trait, tooltip) for the body panel — things you could measure
+    _BODY_ROWS = [
+        ("Body mass (g)", "mass", "adult body mass; drifts with energy balance"),
+        ("Body length (cm)", "body_length_cm",
+         "nose-to-rump length; also sets how large it is drawn"),
+        ("Travel speed (m/s)", "base_speed", "locomotor speed when active"),
+        ("Metabolic rate ×", "metabolism", "energy burn multiplier"),
+        ("Olfactory acuity", "smell_ability",
+         "how well the nose works. 0 = anosmic (e.g. methimazole)"),
+        ("Scent signature", "identity_signal",
+         "how individually identifiable its marks are. 0 = no signature "
+         "(e.g. MUP knockout) — others smell that someone passed, not who"),
+        ("Marking capacity (marks/h)", "scent_rate",
+         "urine-mark production. Marking is a limited resource: the reserve "
+         "refills at this rate and each mark spends some of it"),
+    ]
+    #: (label, trait, tooltip) for the personality panel — dispositions
+    _PERSONALITY_ROWS = [
+        ("Aggression (P attack)", "aggression",
+         "probability of attacking on a same-sex encounter. 0 = never "
+         "attacks, 1 = always. Enter 0.45 for 45%"),
+        ("Boldness", "boldness", "willingness to escalate and use open ground"),
+        ("Sociability", "sociability", "attraction to other animals"),
+        ("Exploration", "exploration", "drive to leave familiar ground"),
+        ("Wander", "wander", "random-walk drive — exploratory movement"),
+        ("Turn rate", "turn_rate", "path tortuosity (heading diffusion)"),
+    ]
+
     def __init__(self, group=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Agent Builder")
-        self.setMinimumWidth(470)
-        g = group or AgentGroup(label="agent_type", species="mouse", sex="M",
+        self.setMinimumWidth(620)
+        g = group or AgentGroup(label="agent_type", species="", sex="M",
                                 count=1)
+        self._group = copy.deepcopy(g)
         self._color = g.appearance.color
 
+        lay = QVBoxLayout(self)
+
+        # ---- species cards: pick the animal first ----
+        self.picker = SpeciesPicker()
+        sp0 = by_species_name(g.species)
+        #: which card's suggestions the personality fields currently reflect
+        self._applied_species = sp0.key if sp0 else None
+        self.picker.set_key(self._applied_species)
+        self.picker.species_picked.connect(self._on_species)
+        lay.addWidget(self.picker)
+
         tabs = QTabWidget()
+        # ---- Body (biophysical) ----
+        bd = QWidget()
+        bdf = QFormLayout(bd)
+        self._body_fields = {}
+        for lab, tname, tip in self._BODY_ROWS:
+            e = QLineEdit(str(g.dists.get(tname, getattr(g.traits, tname))))
+            e.setToolTip(tip)
+            self._body_fields[tname] = e
+            bdf.addRow(lab, e)
+        hb = QLabel("Fixed value or a per-animal distribution, e.g. "
+                    "<b>N(45,4)</b> or <b>U(38,52)</b>. Picking a species "
+                    "fills these in; edit any of them to match your colony.")
+        hb.setStyleSheet("color:#8a9099; font-size:10px;")
+        hb.setWordWrap(True)
+        bdf.addRow(hb)
+        tabs.addTab(bd, "Body")
+
+        # ---- Personality ----
+        pe = QWidget()
+        pef = QFormLayout(pe)
+        self._pers_fields = {}
+        for lab, tname, tip in self._PERSONALITY_ROWS:
+            e = QLineEdit(str(g.dists.get(tname, getattr(g.traits, tname))))
+            e.setToolTip(tip)
+            self._pers_fields[tname] = e
+            pef.addRow(lab, e)
+        hp = QLabel("Dispositions, not outcomes. Species cards suggest a "
+                    "starting spread — overwrite them with your own measured "
+                    "values.<br><b>Home-range size is deliberately absent:</b> "
+                    "where an animal settles and how much ground it holds "
+                    "emerge from marking, olfaction and competition.")
+        hp.setStyleSheet("color:#8a9099; font-size:10px;")
+        hp.setWordWrap(True)
+        pef.addRow(hp)
+        tabs.addTab(pe, "Personality")
+
         # ---- Appearance & basics ----
         ap = QWidget()
         apf = QFormLayout(ap)
         self.in_name = QLineEdit(g.label)
         self.in_species = QLineEdit(g.species)
+        self.in_species.setPlaceholderText("set by the species card above")
         self.in_sex = QComboBox()
         self.in_sex.addItems(["M", "F"])
         self.in_sex.setCurrentText(g.sex)
+        self.in_sex.currentTextChanged.connect(self._on_sex)
         self.in_count = _ispin(1, 999, g.count)
         self.in_shape = QComboBox()
         self.in_shape.addItems(["rodent", "blob", "bird"])
@@ -2283,46 +2432,13 @@ class AgentBuilderDialog(QDialog):
         self.btn_color.clicked.connect(self._pick_color)
         self._update_color_btn()
         self.in_size = _dspin(0.2, 5.0, g.appearance.size, 0.1)
-        for lab, wdg in [("Type name", self.in_name), ("Species", self.in_species),
+        for lab, wdg in [("Type name", self.in_name),
+                         ("Species", self.in_species),
                          ("Sex", self.in_sex), ("Count", self.in_count),
                          ("Shape", self.in_shape), ("Colour", self.btn_color),
                          ("Size ×", self.in_size)]:
             apf.addRow(lab, wdg)
         tabs.addTab(ap, "Appearance")
-
-        # ---- Movement ----
-        mv = QWidget()
-        mvf = QFormLayout(mv)
-        self._move_fields = {}
-        for lab, tname, tip in [
-            ("Base speed (m/s)", "base_speed", "locomotor speed when active"),
-            ("Wander", "wander", "random-walk drive — exploratory movement"),
-            ("Turn rate", "turn_rate", "heading jitter — path tortuosity"),
-            ("Home-range r (m)", "home_range_r", "site-fidelity radius")]:
-            e = QLineEdit(str(g.dists.get(tname, getattr(g.traits, tname))))
-            e.setToolTip(tip)
-            self._move_fields[tname] = e
-            mvf.addRow(lab, e)
-        tabs.addTab(mv, "Movement")
-
-        # ---- Attributes ----
-        at = QWidget()
-        atf = QFormLayout(at)
-        self._attr_fields = {}
-        for lab, tname in [("Mass (g)", "mass"), ("Aggression", "aggression"),
-                           ("Boldness", "boldness"), ("Sociability", "sociability"),
-                           ("Exploration", "exploration"),
-                           ("Smell ability", "smell_ability"),
-                           ("Identity signal", "identity_signal"),
-                           ("Metabolism", "metabolism")]:
-            e = QLineEdit(str(g.dists.get(tname, getattr(g.traits, tname))))
-            self._attr_fields[tname] = e
-            atf.addRow(lab, e)
-        h = QLabel("Fixed value or distribution per animal, e.g. mass N(33,3).")
-        h.setStyleSheet("color:#8a9099; font-size:10px;")
-        h.setWordWrap(True)
-        atf.addRow(h)
-        tabs.addTab(at, "Attributes")
 
         # ---- Biology ----
         bio = QWidget()
@@ -2335,18 +2451,88 @@ class AgentBuilderDialog(QDialog):
         self.in_drug.setCurrentText(g.treatment.drug)
         self.in_dose = _dspin(0, 1, g.treatment.dose, 0.1)
         self.in_onset = _dspin(-30, 60, g.treatment.day_offset, 1)
-        for lab, wdg in [("Genes", self.in_genes), ("Drug", self.in_drug),
+        self.lbl_genes = QLabel("")
+        self.lbl_genes.setStyleSheet("color:#8a9099; font-size:10px;")
+        self.lbl_genes.setWordWrap(True)
+        for lab, wdg in [("Genes", self.in_genes), ("", self.lbl_genes),
+                         ("Drug", self.in_drug),
                          ("Dose", self.in_dose), ("Onset day", self.in_onset)]:
             bf.addRow(lab, wdg)
+        self._refresh_gene_hint(g.species)
         tabs.addTab(bio, "Biology")
 
-        lay = QVBoxLayout(self)
         lay.addWidget(tabs)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("Save Agent")
         bb.accepted.connect(self._validate_accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+
+    # ---- species -------------------------------------------------------- #
+    def _personality_is_tuned(self) -> bool:
+        """True once the user has edited personality away from what a card set.
+
+        Swapping the body underneath hand-tuned dispositions should not throw
+        them away, but on a fresh dialog (or one still showing a card's own
+        suggestions) there is nothing to protect and nothing to ask about.
+        """
+        prev = get_species(self._applied_species or "")
+        if prev is None:
+            return False
+        for tname, e in self._pers_fields.items():
+            if tname in prev.personality:
+                if e.text().strip() != prev.personality[tname]:
+                    return True
+        return False
+
+    def _on_species(self, key: str):
+        """A species card was clicked: stamp its body onto the fields."""
+        sp = get_species(key)
+        if sp is None:
+            return
+        ask_personality = True
+        if self._personality_is_tuned():
+            ask_personality = QMessageBox.question(
+                self, "Keep your personality values?",
+                f"Set the body from <b>{sp.name}</b>.<br><br>You have edited "
+                f"the personality values — replace them with this species' "
+                f"suggested spread as well?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) == QMessageBox.Yes
+        g = AgentGroup(label=self.in_name.text().strip() or sp.key,
+                       sex=self.in_sex.currentText())
+        apply_species(g, sp, personality=ask_personality)
+        self._applied_species = key if ask_personality else self._applied_species
+        self.picker.set_key(key)      # keeps the card highlit when called directly
+        self.in_species.setText(g.species)
+        self.in_size.setValue(g.appearance.size)
+        self._fill_from_group(g, personality=ask_personality)
+        self._refresh_gene_hint(g.species)
+
+    def _on_sex(self, _sex):
+        """Mass distributions are sex-specific — re-stamp body mass on switch."""
+        sp = (get_species(self.picker.key() or "")
+              or by_species_name(self.in_species.text().strip()))
+        if sp is None:
+            return
+        spec = sp.mass_g.get(self.in_sex.currentText())
+        if spec:
+            self._body_fields["mass"].setText(spec)
+
+    def _fill_from_group(self, g: AgentGroup, personality: bool = True):
+        groups = [self._body_fields]
+        if personality:
+            groups.append(self._pers_fields)
+        for fields in groups:
+            for tname, e in fields.items():
+                e.setText(str(g.dists.get(tname, getattr(g.traits, tname))))
+
+    def _refresh_gene_hint(self, species: str):
+        genes = genes_for_species(species)
+        self.lbl_genes.setText(
+            f"Genes modelled for this species: {', '.join(genes)} "
+            f"(status WT / HET / KO)" if genes else
+            "No genes registered for this species — leave blank.")
 
     def _pick_color(self):
         from PyQt5.QtWidgets import QColorDialog
@@ -2383,8 +2569,11 @@ class AgentBuilderDialog(QDialog):
             if spec.kind != "fixed":
                 dists[tname] = spec.to_str()
 
-        for tname, e in {**self._move_fields, **self._attr_fields}.items():
+        for tname, e in {**self._body_fields, **self._pers_fields}.items():
             apply(tname, e.text())
+        # home_range_r is legacy: carry whatever the group already had rather
+        # than exposing it as a dial (space use emerges from scent marking)
+        traits.home_range_r = self._group.traits.home_range_r
         genes = {}
         for tok in self.in_genes.text().split(";"):
             if ":" in tok:
@@ -2392,7 +2581,7 @@ class AgentBuilderDialog(QDialog):
                 genes[k.strip()] = v.strip().upper()
         return AgentGroup(
             label=self.in_name.text().strip() or "agent_type",
-            species=self.in_species.text().strip() or "mouse",
+            species=self.in_species.text().strip() or "Generic rodent",
             sex=self.in_sex.currentText(), count=self.in_count.value(),
             genotype=Genotype(genes),
             treatment=Treatment(self.in_drug.currentText(),

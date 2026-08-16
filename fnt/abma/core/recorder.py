@@ -101,13 +101,18 @@ class EventRecorder:
 
 CONDITION_HEADER = [
     "Trial", "Species", "sex", "sexid", "shortid", "Date", "Day", "Timestamp",
-    "time_sec", "health", "energy", "hunger", "thirst", "stress", "mass",
-    "status",
+    "time_sec", "health", "energy", "hunger", "thirst", "stress", "bladder",
+    "mass", "status",
 ]
 
 
 class ConditionRecorder:
-    """Streams each agent's condition (0–100 bars, mass in g) over time."""
+    """Streams each agent's condition over time.
+
+    Every bar is on the same 0-100 scale the engine and the GUI use, so a
+    number in this file means exactly what it means on screen. ``mass`` is in
+    grams.
+    """
 
     def __init__(self, path: str, trial_id: str, start_dt: datetime, agents):
         self.trial_id = trial_id
@@ -119,7 +124,7 @@ class ConditionRecorder:
         self._w.writerow(CONDITION_HEADER)
 
     def record(self, elapsed_s, health, energy, hunger, thirst, stress, mass,
-               anosmic):
+               anosmic, bladder=None):
         ts = self.start_dt + timedelta(seconds=elapsed_s)
         iso = _iso_z(ts)
         epoch = int(ts.timestamp())
@@ -137,9 +142,11 @@ class ConditionRecorder:
             rows.append([
                 self.trial_id, a.species, a.sex, a.sexid, a.shortid, date, day,
                 iso, epoch,
-                round(float(health[i]) * 100, 1), round(float(energy[i]) * 100, 1),
-                round(float(hunger[i]) * 100, 1), round(float(thirst[i]) * 100, 1),
-                round(float(stress[i]) * 100, 1), round(float(mass[i]), 2), status,
+                round(float(health[i]), 1), round(float(energy[i]), 1),
+                round(float(hunger[i]), 1), round(float(thirst[i]), 1),
+                round(float(stress[i]), 1),
+                round(float(bladder[i]), 1) if bladder is not None else "",
+                round(float(mass[i]), 2), status,
             ])
         self._w.writerows(rows)
 

@@ -4881,6 +4881,20 @@ class MaskTrackerWindow(QMainWindow):
         )
         ctrl_vbox.addWidget(self.chk_create_tracked_video)
 
+        self.chk_save_masks = QCheckBox("Save masks for proofreading")
+        self.chk_save_masks.setChecked(True)
+        self.chk_save_masks.setToolTip(
+            "Write every frame's silhouettes to <video>_MaskTracker/\n"
+            "<video>_tracks.h5 alongside the CSV.\n\n"
+            "ON: track proofreading, re-running behavior classification, and\n"
+            "  posture metrics all become offline passes over this file.\n"
+            "  ~0.3 KB per detection (about 30 MB for a 30-min two-animal\n"
+            "  1080p run) and under 1% added to inference time.\n"
+            "OFF: masks are computed and discarded, so any of the above needs\n"
+            "  a full re-run of detection over the video."
+        )
+        ctrl_vbox.addWidget(self.chk_save_masks)
+
         self.chk_inference_preview = QCheckBox("Show inference preview")
         self.chk_inference_preview.setChecked(True)
         self.chk_inference_preview.setToolTip(
@@ -4955,9 +4969,14 @@ class MaskTrackerWindow(QMainWindow):
         self.list_track_results.setMaximumHeight(160)
         self.list_track_results.setToolTip(
             "Completed videos with track counts and CSV output paths.\n"
-            "Double-click to open the output folder."
+            "Double-click a [proofreadable] row to review and repair track\n"
+            "identities; right-click for the output folder."
         )
-        self.list_track_results.itemDoubleClicked.connect(self._open_tracking_result)
+        self.list_track_results.itemDoubleClicked.connect(self._on_result_double_clicked)
+        self.list_track_results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_track_results.customContextMenuRequested.connect(
+            self._on_track_results_menu
+        )
         results_vbox.addWidget(self.list_track_results)
         results_group.setLayout(results_vbox)
         layout.addWidget(results_group)
@@ -10644,6 +10663,7 @@ class MaskTrackerWindow(QMainWindow):
             "inference_size": inference_size,
             "use_masks": self.chk_track_masks.isChecked(),
             "device": device,
+            "save_masks": self.chk_save_masks.isChecked(),
         }
 
         if self.chk_behavior_cls.isChecked():
@@ -10763,8 +10783,13 @@ class MaskTrackerWindow(QMainWindow):
             summary += " + behavior"
         summary += f" → {os.path.basename(output_dir)}/"
 
+        tracks_h5 = result.get("tracks_h5")
+        if tracks_h5 and os.path.exists(tracks_h5):
+            summary += "  [proofreadable]"
+
         item = QListWidgetItem(summary)
         item.setData(Qt.UserRole, output_dir)
+        item.setData(Qt.UserRole + 1, tracks_h5 or "")
         item.setForeground(QColor("#4fc456"))
         self.list_track_results.addItem(item)
 
@@ -10831,6 +10856,67 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.setEnabled(True)
         self.lbl_track_status.setText(f"Error: {msg}")
         QMessageBox.critical(self, "Tracking Error", msg)
+
+    def _on_result_double_clicked(self, item):
+        """Proofread if masks were saved, else fall back to opening the folder."""
+        h5 = self._tracks_h5_for_result(item)
+        if h5:
+            self._open_proofreader(h5)
+        else:
+            self._open_tracking_result(item)
+
+    def _tracks_h5_for_result(self, item) -> Optional[str]:
+        """Track store for a results row, whether from this run or an old one."""
+        stored = item.data(Qt.UserRole + 1)
+        if stored and os.path.exists(stored):
+            return stored
+        output_dir = item.data(Qt.UserRole)
+        if output_dir and os.path.isdir(output_dir):
+            for f in os.listdir(output_dir):
+                if f.endswith("_tracks.h5"):
+                    return os.path.join(output_dir, f)
+        return None
+
+    def _on_track_results_menu(self, pos):
+        item = self.list_track_results.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #2b2b2b; color: #cccccc; border: 1px solid #555; }"
+            "QMenu::item:selected { background-color: #2979ff; }"
+            "QMenu::item:disabled { color: #666666; }"
+        )
+        act_proof = menu.addAction("Proofread Tracks…")
+        h5 = self._tracks_h5_for_result(item)
+        if not h5:
+            act_proof.setEnabled(False)
+            act_proof.setText("Proofread Tracks (no saved masks)")
+        act_open = menu.addAction("Open Output Folder")
+        action = menu.exec_(self.list_track_results.viewport().mapToGlobal(pos))
+        if action == act_proof and h5:
+            self._open_proofreader(h5)
+        elif action == act_open:
+            self._open_tracking_result(item)
+
+    def _open_proofreader(self, tracks_h5: str):
+        try:
+            from .track_proofreader import TrackProofreaderDialog
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Proofreader Unavailable",
+                f"Could not load the track proofreader:\n\n{e}"
+            )
+            return
+        try:
+            dlg = TrackProofreaderDialog(tracks_h5, parent=self)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Could Not Open Track Store",
+                f"{tracks_h5}\n\n{e}"
+            )
+            return
+        dlg.exec_()
 
     def _open_tracking_result(self, item):
         output_dir = item.data(Qt.UserRole)

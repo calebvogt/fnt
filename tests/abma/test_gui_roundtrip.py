@@ -51,6 +51,55 @@ def test_groups_and_scalars_survive_gui_roundtrip(qapp):
     assert out.groups[0].dists == cfg.groups[0].dists
 
 
+def test_scent_params_survive_gui_roundtrip(qapp):
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import default_vole_experiment, ScentParams
+
+    cfg = default_vole_experiment()
+    cfg.scent = ScentParams(enabled=True, half_life_h=6.0, perception_r=0.75,
+                            cell_size=0.05, anonymous_weight=0.4,
+                            deposit_cost=0.2, counter_mark=3.0)
+    win = ABMAWindow()
+    win._load_config(cfg)
+    out = win._collect_config()
+    assert out.scent.enabled is True
+    assert out.scent.half_life_h == 6.0
+    assert out.scent.perception_r == 0.75
+    assert out.scent.anonymous_weight == 0.4
+    # knobs without widgets must ride through untouched
+    assert out.scent.deposit_cost == 0.2
+    assert out.scent.counter_mark == 3.0
+
+
+def test_agent_builder_species_card_sets_body_not_home_range(qapp):
+    from fnt.abma.gui.abma_main_pyqt import AgentBuilderDialog
+    from fnt.abma.core.species import get_species
+
+    dlg = AgentBuilderDialog()
+    dlg.in_name.setText("wild_mice")
+    dlg.in_sex.setCurrentText("M")
+    dlg._on_species("house_mouse")
+    sp = get_species("house_mouse")
+    g = dlg.result_group()
+    assert g.species == sp.name
+    assert g.traits.body_length_cm == sp.body_length_cm
+    assert g.traits.scent_rate == sp.scent_rate
+    assert g.dists["mass"] == sp.mass_g["M"]
+    assert "home_range_r" not in g.dists, \
+        "the builder must not let a species prescribe space use"
+
+
+def test_agent_builder_sex_switch_updates_mass_distribution(qapp):
+    from fnt.abma.gui.abma_main_pyqt import AgentBuilderDialog
+    from fnt.abma.core.species import get_species
+
+    dlg = AgentBuilderDialog()
+    dlg._on_species("prairie_vole")
+    sp = get_species("prairie_vole")
+    dlg.in_sex.setCurrentText("F")
+    assert dlg._body_fields["mass"].text() == sp.mass_g["F"]
+
+
 def test_protocol_survives_gui_roundtrip(qapp):
     from fnt.abma.gui.abma_main_pyqt import ABMAWindow
     from fnt.abma.core.config import (default_vole_experiment, ProtocolEvent,

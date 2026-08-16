@@ -32,6 +32,8 @@ import numpy as np
 from copy import deepcopy
 
 from .config import ExperimentConfig, AgentGroup
+from .scent import ScentField
+from .physiology import get_food, DEFAULT_FOOD
 from .biology import (
     resolve_traits, apply_drug, TRAIT_TO_ARRAY, _TRAIT_RANGES,
 )
@@ -105,7 +107,8 @@ class Simulation:
     # per-step probability via p = 1 - exp(-rate*dt) so results don't depend on
     # the integration timestep. 0.01/s matches the old 0.02-per-tick at dt=2.
     mate_rate_hz = 0.01
-    aggr_rate = 0.6       # per-encounter contest probability scaler (× aggr_i × aggr_j)
+    #: fraction of its own marks around it that counts as "in my patch"
+    at_home_scent = 0.05
     fight_cooldown_s = 3600.0   # min interval between contests for a dyad
     mate_cooldown_s = 3600.0    # min interval between matings for a dyad
 
@@ -151,6 +154,14 @@ class Simulation:
         self._build_obstacles()
         self._cur_day = 1
 
+        # ---- scent-mark field (territoriality emerges from this) ----
+        sp = getattr(cfg, "scent", None)
+        self.scent = (ScentField(cfg.arena.width, cfg.arena.height, sp)
+                      if sp is not None and sp.enabled else None)
+        # ---- mechanistic energy/water budget ----
+        self._physio_on = bool(getattr(getattr(cfg, "physiology", None),
+                                       "enabled", False))
+
         # ---- protocol events (timed add/remove of animals and resources) ----
         self._proto_schedule = sorted(
             [(p.at_day * 86400.0, p) for p in getattr(cfg, "protocol", [])],
@@ -190,16 +201,22 @@ class Simulation:
         at the centre would just press the animal against the outside wall.
         """
         food, food_seek, frects = [], [], []
+        # what each food entry is made of, in the same order: circles first,
+        # then zone rectangles. Drives energy yield and depletion.
+        self._food_meta = []
         for o in self._res_objects:
             if o.kind == "food":
                 food.append((o.x, o.y, o.radius))
                 food_seek.append((o.x, o.y))
+                self._food_meta.append((get_food(getattr(o, "food_type", "")), o))
         for z in self._res_zones:
             # anywhere inside the box counts as being at the chow pile — a
             # rectangle containment test (the old circumscribing circle let
             # animals "feed" through the corners from outside the walls)
             frects.append((z.x, z.y, z.w / 2.0, z.d / 2.0))
             food_seek.append(_zone_door(z))
+            # a resource zone holds the standard provisioned diet, unlimited
+            self._food_meta.append((get_food(DEFAULT_FOOD), None))
         water, water_seek = [], []
         for o in self._res_objects:
             if o.kind == "water":
@@ -271,12 +288,14 @@ class Simulation:
         return {
             "home": np.array([a.home for a in metas], float).reshape(-1, 2),
             "H": rng.uniform(0, 2 * np.pi, m),
-            # ---- condition (dynamic 0..1 bars; presented ×100) ----
-            "hunger": rng.uniform(0, 0.3, m),
-            "thirst": rng.uniform(0, 0.3, m),
-            "energy": np.ones(m),
-            "health": np.ones(m),
-            "stress": np.full(m, 0.1),
+            # ---- condition: every bar is 0-100, here and in the CSVs ----
+            "hunger": rng.uniform(0, 30, m),
+            "thirst": rng.uniform(0, 30, m),
+            "energy": np.full(m, 100.0),
+            "health": np.full(m, 100.0),
+            "stress": np.full(m, 10.0),
+            # bladder fills by drinking and is spent on scent marks
+            "bladder": np.full(m, 50.0),
             "alive": np.ones(m, bool),
             "estrus_phase": rng.uniform(0, 1, m),
             # ---- behaviour counters / bookkeeping ----
@@ -295,7 +314,15 @@ class Simulation:
             "explore": np.array([a.traits.exploration for a in metas]),
             "smell": np.array([a.traits.smell_ability for a in metas]),
             "identity": np.array([a.traits.identity_signal for a in metas]),
+            # how often it *wants* to mark; whether it *can* is the bladder
+            "scent_rate": np.array([getattr(a.traits, "scent_rate", 20.0)
+                                    for a in metas]),
+            "marks_made": np.zeros(m, int),
+            "food_eaten_g": np.zeros(m),
+            "water_drunk_ml": np.zeros(m),
             "speed": np.array([a.traits.base_speed for a in metas]),
+            "body_len": np.array([getattr(a.traits, "body_length_cm", 9.0)
+                                  for a in metas]),
             "home_r": np.array([a.traits.home_range_r for a in metas]),
             "mass": np.array([a.traits.mass for a in metas]),
             "metabolism": np.array([a.traits.metabolism for a in metas]),
@@ -475,9 +502,14 @@ class Simulation:
         activity = self._activity(elapsed_s)
         # energy -> speed coupling (low energy is sluggish); config-driven
         f = cfg.energy_speed_coupling
-        spd = self.speed * activity * (1.0 - f + f * self.energy)
-        satiated = (self.hunger < 0.5) & (self.thirst < 0.5) & \
-                   (dist_home < self.home_r)
+        spd = self.speed * activity * (1.0 - f + f * self.energy / 100.0)
+        # "settled" = fed, watered, and standing on familiar ground. With scent
+        # marking that means inside its own marked patch (emergent); without
+        # it, inside the prescribed home-range radius (legacy).
+        own_lvl = perc.get("scent_own")
+        at_home = (own_lvl > self.at_home_scent if own_lvl is not None
+                   else dist_home < self.home_r)
+        satiated = (self.hunger < 50.0) & (self.thirst < 50.0) & at_home
         spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
         self.P = self._resolve_obstacles(P, P + move_dir * spd[:, None] * dt,
                                          fwd=move_dir)
@@ -499,16 +531,29 @@ class Simulation:
         self.home[self.alive] += ((self.P[self.alive] - self.home[self.alive])
                                   * (dt / self._settle_tau_s))
 
-        # --- condition dynamics (data-driven interaction rules) ---
+        # --- scent marking (marks fade, then animals lay new ones) ---
+        if self.scent is not None:
+            self._update_scent(dt, perc.get("scent_foreign"))
+
+        # --- condition dynamics ---
         on_food = self._on_food()
         on_water = (self._on_resource(self.P, self.water, self.water_r)
                     if self.water.shape[0] else np.zeros(n, bool))
-        self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
-                             on_food, on_water)
+        if self._physio_on:
+            # a real energy/water budget owns energy, hunger, thirst and the
+            # bladder; the rules table is left to stress and health
+            self._apply_physiology(dt, step_dist, on_water)
+            self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
+                                 on_food, on_water,
+                                 only_targets=("stress", "health"))
+        else:
+            self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
+                                 on_food, on_water)
 
         # --- body mass drifts with energy balance, within a physiological band ---
-        self.mass = np.clip(self.mass + dt * 1.5e-5 * (self.energy - 0.7),
-                            0.7 * self.mass0, 1.3 * self.mass0)
+        self.mass = np.clip(
+            self.mass + dt * 1.5e-5 * (self.energy / 100.0 - 0.7),
+            0.7 * self.mass0, 1.3 * self.mass0)
 
         # --- baseline activity label (events may override to flee/mate) ---
         self.activity = np.where(
@@ -543,16 +588,38 @@ class Simulation:
 
     def _on_food(self):
         """At a chow pile: inside a food object's radius or a resource zone's box."""
-        hit = (self._on_resource(self.P, self.food, self.food_r)
-               if self.food.shape[0] else np.zeros(self.n, bool))
+        return self._food_index() >= 0
+
+    def _food_index(self):
+        """Which food entry each agent is feeding at (-1 = none).
+
+        Indexes ``self._food_meta``: point sources first, then resource zones,
+        matching the order ``_rebuild_resources`` builds them in.
+        """
+        n = self.n
+        idx = np.full(n, -1, int)
+        n_circ = self.food.shape[0]
+        if n_circ:
+            d = np.linalg.norm(self.P[:, None, :] - self.food[None, :, :],
+                               axis=2)
+            inside = d < self.food_r[None, :]
+            near = np.where(inside, d, np.inf)
+            best = np.argmin(near, axis=1)
+            got = np.isfinite(near[np.arange(n), best])
+            idx[got] = best[got]
         if len(self.food_rects):
             cx, cy, hw, hd = self.food_rects.T
             inx = np.abs(self.P[:, 0][:, None] - cx[None, :]) <= hw[None, :]
             iny = np.abs(self.P[:, 1][:, None] - cy[None, :]) <= hd[None, :]
-            hit |= np.any(inx & iny, axis=1)
-        return hit
+            inz = inx & iny
+            any_z = inz.any(axis=1)
+            first = np.argmax(inz, axis=1) + n_circ
+            take = any_z & (idx < 0)          # a point source wins if both
+            idx[take] = first[take]
+        return idx
 
-    def _apply_dynamics(self, dt, step_dist, activity, n_near, on_food, on_water):
+    def _apply_dynamics(self, dt, step_dist, activity, n_near, on_food, on_water,
+                        only_targets=None):
         """Apply the editable interaction rules to the condition variables.
 
         Each rule: target += gain × source × (dt/hour), or (effect='set')
@@ -590,11 +657,11 @@ class Simulation:
             elif name == "metabolism":
                 v = self.metabolism
             elif name == "fed":
-                v = 1.0 - snap["hunger"]
+                v = 100.0 - snap["hunger"]
             elif name == "hydrated":
-                v = 1.0 - snap["thirst"]
+                v = 100.0 - snap["thirst"]
             elif name == "rested":
-                v = 1.0 - snap["stress"]
+                v = 100.0 - snap["stress"]
             elif name in snap:
                 v = snap[name]
             else:
@@ -603,6 +670,8 @@ class Simulation:
             return v
 
         for c in self.dynamics:
+            if only_targets is not None and c.target not in only_targets:
+                continue
             tgt = getattr(self, c.target, None)
             if tgt is None:
                 continue
@@ -626,7 +695,157 @@ class Simulation:
 
         for k in snap:
             arr = getattr(self, k)
-            np.clip(arr, 0.0, 1.0, out=arr)
+            np.clip(arr, 0.0, 100.0, out=arr)
+
+    # ------------------------------------------------------------------ #
+    # Mechanistic energy & water budget
+    # ------------------------------------------------------------------ #
+    def _apply_physiology(self, dt: float, step_dist, on_water) -> None:
+        """Move real kilojoules and millilitres, then read the bars off them.
+
+        Energy in comes only from eating (grams × the diet's energy density);
+        energy out is basal metabolism + locomotion (charged in
+        ``_resolve_events`` for fights and matings). Water in comes from
+        drinking and from moisture in food; a share of it is routed to the
+        bladder, which is what pays for scent marks. Hunger and thirst are not
+        integrated — they are what the stores are missing.
+        """
+        p = self.cfg.physiology
+        alive = self.alive
+        mass = self.mass
+        e_cap = np.maximum(1e-6, p.energy_capacity(mass))     # kJ
+        w_cap = np.maximum(1e-6, p.water_capacity(mass))      # mL
+        b_cap = np.maximum(1e-6, p.bladder_capacity(mass))    # mL
+
+        # ---- eating ---------------------------------------------------- #
+        fidx = self._food_index()
+        eating = (fidx >= 0) & alive
+        kj_in = np.zeros(self.n)
+        ml_food = np.zeros(self.n)
+        if eating.any() and self._food_meta:
+            dens = np.array([m[0].energy_density for m in self._food_meta])
+            wfrac = np.array([m[0].water_fraction for m in self._food_meta])
+            pal = np.array([m[0].palatability for m in self._food_meta])
+            who = fidx[eating]
+            grams = p.feed_rate_g_min * (dt / 60.0) * pal[who]
+            # an animal stops when it is full: cap intake at the room left in
+            # the energy store, so a satiated animal does not strip a pile
+            room_kj = np.maximum(0.0, (100.0 - self.energy[eating]) / 100.0
+                                 * e_cap[eating])
+            grams = np.minimum(grams, room_kj / np.maximum(1e-9, dens[who]))
+            # a finite pile can run out; share what is left among the feeders
+            remaining = np.array(
+                [(m[1].amount_g if (m[1] is not None and m[1].amount_g > 0)
+                  else np.inf) for m in self._food_meta])
+            if np.isfinite(remaining).any():
+                want = np.zeros(len(self._food_meta))
+                np.add.at(want, who, grams)
+                scale = np.ones(len(self._food_meta))
+                lim = np.isfinite(remaining) & (want > 0)
+                scale[lim] = np.minimum(1.0, remaining[lim] / want[lim])
+                grams = grams * scale[who]
+                taken = np.zeros(len(self._food_meta))
+                np.add.at(taken, who, grams)
+                for k, (_, obj) in enumerate(self._food_meta):
+                    if obj is not None and obj.amount_g > 0:
+                        obj.amount_g = max(0.0, obj.amount_g - taken[k])
+            kj_in[eating] = grams * dens[who]
+            ml_food[eating] = grams * wfrac[who]
+            self.food_eaten_g[eating] += grams
+
+        # ---- energy out ------------------------------------------------- #
+        kj_out = p.basal_kj(mass, self.metabolism, dt)
+        kj_out = kj_out + p.locomotion_kj(mass, step_dist)
+        kj_out[~alive] = 0.0
+
+        self.energy = np.clip(
+            self.energy + (kj_in - kj_out) / e_cap * 100.0, 0.0, 100.0)
+        # hunger IS the energy deficit — nothing writes to it directly
+        self.hunger = 100.0 - self.energy
+
+        # ---- water ------------------------------------------------------ #
+        drinking = on_water & alive
+        ml_in = np.where(drinking, p.drink_rate_ml_min * (dt / 60.0), 0.0)
+        ml_in = ml_in + ml_food
+        self.water_drunk_ml += ml_in
+        ml_out = np.where(alive, p.water_loss_ml_h * (dt / 3600.0), 0.0)
+        self.thirst = np.clip(
+            self.thirst + (ml_out - ml_in) / w_cap * 100.0, 0.0, 100.0)
+
+        # ---- bladder: what marking is actually paid for with ------------ #
+        self.bladder = np.clip(
+            self.bladder + (ml_in * p.urine_fraction) / b_cap * 100.0,
+            0.0, 100.0)
+
+        # ---- an empty store costs health -------------------------------- #
+        dth = dt / 3600.0
+        starving = alive & (self.energy <= 0.0)
+        parched = alive & (self.thirst >= 100.0)
+        if starving.any():
+            self.health[starving] -= p.starvation_health_h * dth
+        if parched.any():
+            self.health[parched] -= p.dehydration_health_h * dth
+        np.clip(self.health, 0.0, 100.0, out=self.health)
+
+    def _spend_energy_kj(self, idxs, kj: float) -> None:
+        """Charge an action (a fight, a mating) against the energy store."""
+        p = self.cfg.physiology
+        if not getattr(p, "enabled", False):
+            return
+        for i in idxs:
+            cap = max(1e-6, p.energy_capacity(self.mass[i]))
+            self.energy[i] = max(0.0, self.energy[i] - kj / cap * 100.0)
+            self.hunger[i] = 100.0 - self.energy[i]
+
+    def _update_scent(self, dt: float, foreign_level=None) -> None:
+        """Fade existing marks, refill bladders, and lay new marks.
+
+        Marking is deliberately a *limited resource*: the reserve refills at the
+        animal's ``scent_rate`` (marks/hour) and each mark spends
+        ``deposit_cost``, so an animal cannot saturate an arena. Animals also
+        counter-mark — marking rate is multiplied where foreign scent is
+        detected, which is what turns a chance encounter into a contested
+        boundary rather than a uniform smear.
+        """
+        sp = self.cfg.scent
+        self.scent.decay(dt)
+
+        p = self.cfg.physiology
+        if self._physio_on:
+            # marking is paid for out of the bladder, which is filled by
+            # drinking — so water availability is a territorial constraint
+            b_cap_ml = np.maximum(1e-6, p.bladder_capacity(self.mass))
+            cost = (p.mark_volume_ul / 1000.0) / b_cap_ml * 100.0
+            reserve = self.bladder
+        else:
+            # legacy: an abstract reserve refilling at the animal's scent_rate
+            self.bladder = np.clip(
+                self.bladder
+                + self.scent_rate * sp.deposit_cost * (dt / 36.0), 0.0, 100.0)
+            cost = np.full(self.n, sp.deposit_cost * 100.0)
+            reserve = self.bladder
+
+        rate_h = float(self.cfg.policy.mark_rate_h)
+        boost = np.ones(self.n)
+        if foreign_level is not None and len(foreign_level) == self.n:
+            boost = 1.0 + (sp.counter_mark - 1.0) * np.clip(foreign_level, 0, 1)
+        # dt-invariant hazard, as elsewhere in the engine
+        p_mark = 1.0 - np.exp(-(rate_h / 3600.0) * boost * dt)
+        can = self.alive & (reserve >= cost)
+        fire = can & (self.rng.random(self.n) < p_mark)
+        idxs = np.nonzero(fire)[0]
+        if len(idxs) == 0:
+            return
+        self.scent.deposit(idxs, self.P, sp.mark_strength,
+                           self.identity[idxs])
+        self.bladder[idxs] = np.maximum(0.0, self.bladder[idxs] - cost[idxs])
+        self.marks_made[idxs] += 1
+
+    def territory_area(self) -> np.ndarray:
+        """Emergent territory area per agent (m²), or zeros without marking."""
+        if self.scent is None:
+            return np.zeros(self.n)
+        return self.scent.area_by_owner(self.n)
 
     def _receptivity(self, elapsed_s):
         days = elapsed_s / 86400.0
@@ -763,8 +982,10 @@ class Simulation:
 
     def _fight_power(self, i) -> float:
         """Resource-holding potential: bigger, healthier, bolder, calmer wins."""
-        return float(self.aggr[i] * np.sqrt(self.mass[i]) * (0.3 + self.health[i])
-                     * (1.0 + self.bold[i]) * (1.0 - 0.3 * self.stress[i]))
+        return float(self.aggr[i] * np.sqrt(self.mass[i])
+                     * (0.3 + self.health[i] / 100.0)
+                     * (1.0 + self.bold[i])
+                     * (1.0 - 0.3 * self.stress[i] / 100.0))
 
     def _resolve_events(self, elapsed_s, dt, dist, rec_j, events):
         # per-step mating probability from the per-second hazard (dt-invariant)
@@ -787,7 +1008,11 @@ class Simulation:
                     self.matings[i] += 1
                     self.matings[j] += 1
                     self.activity[i] = self.activity[j] = 4
-                    self.energy[[i, j]] = np.clip(self.energy[[i, j]] - 0.01, 0, 1)
+                    if self._physio_on:
+                        self._spend_energy_kj((i, j), self.cfg.physiology.mate_kj)
+                    else:
+                        self.energy[[i, j]] = np.clip(
+                            self.energy[[i, j]] - 1.0, 0, 100)
             else:
                 # --- same-sex contest -> winner/loser, damage, dominance ---
                 # Contests happen during active patrol — not while nesting/huddling
@@ -804,21 +1029,30 @@ class Simulation:
                 # one evaluation per encounter window, so the outcome probability
                 # reflects aggression rather than saturating over many ticks.
                 self._last_fight[(i, j)] = elapsed_s
-                prov = (self.aggr_rate * self.aggr[i] * self.aggr[j]
-                        * (0.5 + 0.5 * self.bold[i]))
-                if self.rng.random() >= prov:
+                # aggression IS the attack probability on a same-sex encounter
+                # (0 = never attacks, 1 = always), modulated by willingness to
+                # escalate. Keeping this literal is what makes the personality
+                # dial mean something an experimenter can reason about.
+                p_attack = self.aggr[i] * (0.5 + 0.5 * self.bold[i])
+                if self.rng.random() >= p_attack:
                     continue
                 fi, fj = self._fight_power(i), self._fight_power(j)
                 if self.rng.random() < fi / (fi + fj + 1e-9):
                     w, l = i, j
                 else:
                     w, l = j, i
-                dmg = 0.05 * self.aggr[w] * (self.mass[w] / 40.0)
+                dmg = 5.0 * self.aggr[w] * (self.mass[w] / 40.0)
                 self.health[l] = max(0.0, self.health[l] - dmg)
-                self.energy[w] = max(0.0, self.energy[w] - 0.02)
-                self.energy[l] = max(0.0, self.energy[l] - 0.04)
-                self.stress[l] = min(1.0, self.stress[l] + 0.25)
-                self.stress[w] = max(0.0, self.stress[w] - 0.05)
+                if self._physio_on:
+                    # a contest is metabolically expensive; the loser more so
+                    fkj = self.cfg.physiology.fight_kj
+                    self._spend_energy_kj((w,), fkj)
+                    self._spend_energy_kj((l,), fkj * 2.0)
+                else:
+                    self.energy[w] = max(0.0, self.energy[w] - 2.0)
+                    self.energy[l] = max(0.0, self.energy[l] - 4.0)
+                self.stress[l] = min(100.0, self.stress[l] + 25.0)
+                self.stress[w] = max(0.0, self.stress[w] - 5.0)
                 self.fights_won[w] += 1
                 self.fights_lost[l] += 1
                 self.activity[l] = 3  # flee
@@ -897,7 +1131,7 @@ class Simulation:
                 if k % cond_every == 0:
                     cond.record(elapsed, self.health, self.energy, self.hunger,
                                 self.thirst, self.stress, self.mass,
-                                self.smell < 0.5)
+                                self.smell < 0.5, self.bladder)
                 if frame_cb is not None and k % frame_every == 0:
                     frame_cb(self._frame(elapsed))
                 if progress_cb is not None and k % report_every == 0:
@@ -926,6 +1160,7 @@ class Simulation:
             "health": self.health.copy(), "energy": self.energy.copy(),
             "hunger": self.hunger.copy(), "thirst": self.thirst.copy(),
             "stress": self.stress.copy(), "mass": self.mass.copy(),
+            "bladder": self.bladder.copy(),
             "anosmic": (self.smell < 0.5).copy(),
             "estrus": (self._receptivity(elapsed) > 0.3),
             "activity": self.activity.copy(),

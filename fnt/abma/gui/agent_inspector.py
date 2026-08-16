@@ -149,6 +149,7 @@ class AgentInspector(QFrame):
             "Energy": StatBar("Energy", "#4a90d9"),
             "Hunger": StatBar("Hunger", "#e0a23a"),
             "Thirst": StatBar("Thirst", "#3ab0c4"),
+            "Bladder": StatBar("Bladder", "#c9b458"),
             "Stress": StatBar("Stress", "#d9534f"),
         }
         for b in self.bars.values():
@@ -216,12 +217,13 @@ class AgentInspector(QFrame):
         if self._idx is None:
             return
         m = self._pop.get(self._idx, {})
-        self.bars["Health"].set_value(st["health"] * 100)
-        self.bars["Energy"].set_value(st["energy"] * 100)
-        self.bars["Hunger"].set_value(st["hunger"] * 100)
-        self.bars["Thirst"].set_value(st["thirst"] * 100)
-        self.bars["Stress"].set_value(st["stress"] * 100)
-        self.spark.push(st["health"] * 100, st["energy"] * 100)
+        # every bar is already 0-100 in the engine — no rescaling here
+        for name, key in (("Health", "health"), ("Energy", "energy"),
+                          ("Hunger", "hunger"), ("Thirst", "thirst"),
+                          ("Bladder", "bladder"), ("Stress", "stress")):
+            if key in st:
+                self.bars[name].set_value(st[key])
+        self.spark.push(st["health"], st["energy"])
         self._set_badges(m, anosmic=st.get("anosmic", False),
                          estrus=st.get("estrus", False),
                          dead=not st.get("alive", True))

@@ -39,6 +39,11 @@ class MaskInferenceConfig:
     matching_algorithm: str = "hungarian"
     inference_size: int = 0
     use_masks: bool = False
+    # Persist per-frame silhouettes to <video>_MaskTracker/<video>_tracks.h5.
+    # Without this the masks are computed and thrown away, so proofreading an
+    # identity swap or re-running behavior classification means re-detecting
+    # the whole video.
+    save_masks: bool = True
 
 
 _SYSTEM_PROFILE_CACHE: Optional[Dict] = None
@@ -707,6 +712,7 @@ def run_inference_on_video(
         except OSError:
             _saved_fd = None
 
+    mask_writer = None
     try:
         architecture = _detect_architecture(model_dir)
         if architecture == "yolov11-seg":
@@ -744,6 +750,21 @@ def run_inference_on_video(
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(annotated_path, fourcc, fps, (w, h))
 
+        if config.save_masks:
+            from .track_store import TrackMaskWriter, tracks_path_for
+            try:
+                mask_writer = TrackMaskWriter(
+                    tracks_path_for(video_path, output_dir),
+                    video_path=video_path, fps=fps, frame_count=total_frames,
+                    width=w, height=h, model_dir=model_dir,
+                    has_masks=config.use_masks,
+                )
+            except Exception as e:
+                # Never let mask persistence take the run down — the CSV and
+                # annotated video are the primary outputs.
+                print(f"[MTT Inference] Mask store disabled ({e})")
+                mask_writer = None
+
         tracker = MultiObjectTracker(config)
         frame_idx = 0
         t_start = time.time()
@@ -769,6 +790,8 @@ def run_inference_on_video(
             t2 = time.time()
 
             matched = tracker.update(detections, frame_idx, fps, frame_hw=(h, w))
+            if mask_writer is not None and matched:
+                mask_writer.add_frame(frame_idx, matched)
             t3 = time.time()
 
             behavior_labels = None
@@ -824,6 +847,14 @@ def run_inference_on_video(
         cap.release()
         if writer:
             writer.release()
+        tracks_h5 = None
+        if mask_writer is not None:
+            tracks_h5 = mask_writer.path
+            n_mask_rows = mask_writer.n_rows
+            mask_writer.close()
+            size_mb = os.path.getsize(tracks_h5) / (1024 * 1024)
+            print(f"[MTT Inference] Masks: {n_mask_rows} detections -> "
+                  f"{os.path.basename(tracks_h5)} ({size_mb:.1f} MB)")
 
         elapsed = time.time() - t_start
         fps_actual = frame_idx / elapsed if elapsed > 0 else 0
@@ -844,12 +875,20 @@ def run_inference_on_video(
         return {
             "output_dir": output_dir,
             "csv_path": csv_path,
+            "tracks_h5": tracks_h5,
             "annotated_video": annotated_path if writer else None,
             "num_tracks": n_tracks,
             "total_frames": frame_idx,
         }
 
     finally:
+        # close() is idempotent, so the normal path having already closed the
+        # writer is fine; this is here for the crash path.
+        if mask_writer is not None:
+            try:
+                mask_writer.close()
+            except Exception:
+                pass
         if _saved_fd is not None:
             os.dup2(_saved_fd, 2)
             os.close(_saved_fd)

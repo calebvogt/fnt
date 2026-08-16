@@ -42,13 +42,24 @@ GENE_EFFECTS: dict[str, dict[str, list[tuple[str, str, float]]]] = {
     },
 }
 
-# Which genes are meaningful for which species (for GUI menus).
+# Which genes are meaningful for which species (for GUI menus). Matched on a
+# lowercase substring so both the library's display names ("Prairie vole") and
+# hand-typed free text ("prairie") resolve.
 SPECIES_GENES: dict[str, list[str]] = {
     "prairie": ["OXTR", "AVPR1A"],
     "meadow": ["OXTR", "AVPR1A"],
+    "vole": ["OXTR", "AVPR1A"],
     "mouse": ["MUP"],
-    "house mouse": ["MUP"],
 }
+
+
+def genes_for_species(species: str) -> list[str]:
+    """Genes worth offering for ``species``; empty if nothing is registered."""
+    s = (species or "").strip().lower()
+    for key, genes in SPECIES_GENES.items():
+        if key in s:
+            return list(genes)
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -72,13 +83,15 @@ DRUG_EFFECTS = {
 # Resolution
 # --------------------------------------------------------------------------- #
 _TRAIT_RANGES = {
-    "aggression": (0.0, 2.0),
+    "aggression": (0.0, 1.0),        # probability of attacking on encounter
     "boldness": (0.0, 2.0),
     "sociability": (0.0, 2.0),
     "exploration": (0.0, 2.0),
     "smell_ability": (0.0, 1.0),
     "identity_signal": (0.0, 1.0),
+    "scent_rate": (0.0, 200.0),      # marks per hour
     "base_speed": (0.0, 1.0),
+    "body_length_cm": (1.0, 200.0),
     "home_range_r": (0.05, 5.0),
     "mass": (3.0, 500.0),
     "metabolism": (0.2, 5.0),
@@ -145,7 +158,9 @@ TRAIT_TO_ARRAY = {
     "exploration": "explore",
     "smell_ability": "smell",
     "identity_signal": "identity",
+    "scent_rate": "scent_rate",
     "base_speed": "speed",
+    "body_length_cm": "body_len",
     "home_range_r": "home_r",
     "mass": "mass",
     "metabolism": "metabolism",

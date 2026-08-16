@@ -180,7 +180,7 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
                 for sim, r in zip(sims, recs):
                     r["cond"].record(elapsed, sim.health, sim.energy, sim.hunger,
                                      sim.thirst, sim.stress, sim.mass,
-                                     sim.smell < 0.5)
+                                     sim.smell < 0.5, sim.bladder)
             if frame_cb is not None and k % frame_every == 0:
                 frame_cb(_combined_frame(sims, offsets, elapsed))
             if progress_cb is not None and k % report_every == 0:
@@ -196,9 +196,9 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
 
 
 _FRAME_KEYS = ("heading", "sex_m", "alive", "color", "size", "shape",
-               "health", "energy", "hunger", "thirst", "stress", "mass",
-               "anosmic", "estrus", "activity", "fights_won", "fights_lost",
-               "matings", "dist_today")
+               "health", "energy", "hunger", "thirst", "stress", "bladder",
+               "mass", "anosmic", "estrus", "activity", "fights_won",
+               "fights_lost", "matings", "dist_today")
 
 
 def _combined_frame(sims, offsets, elapsed):

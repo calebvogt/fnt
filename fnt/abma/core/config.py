@@ -14,6 +14,8 @@ import json
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from .physiology import PhysiologyParams
+
 
 # --------------------------------------------------------------------------- #
 # Arena
@@ -25,13 +27,19 @@ class ResourceObject:
     kind: 'nest' | 'food' | 'water'
     x, y: centre position in arena units (metres)
     radius: interaction radius (metres)
+    food_type: for 'food', which diet this station holds — sets what a gram of
+               it is worth (see :mod:`fnt.abma.core.physiology`).
+    amount_g: grams remaining at this station; 0 = never runs out. A finite
+              pile is depleted by feeding and refilled by a protocol event.
     """
     kind: str = "nest"
     x: float = 0.0
     y: float = 0.0
     radius: float = 0.15
-    capacity: float = 1.0
+    capacity: float = 1.0            # legacy; unused
     label: str = ""
+    food_type: str = "standard_chow"
+    amount_g: float = 0.0            # 0 = unlimited
 
 
 @dataclass
@@ -175,6 +183,30 @@ class ResourceZone:
 
 
 @dataclass
+class ScentParams:
+    """The scent-marking substrate that territoriality emerges from.
+
+    ``half_life_h`` is the headline experimental knob: how long a urine mark
+    stays informative. Short half-lives give a world where only very recent
+    presence is legible; long ones let a stable, defended mosaic build up. That
+    contrast is a whole experiment on its own, which is why it is a config
+    parameter and not a constant.
+
+    ``anonymous_weight`` is how much territorial weight a mark carries when it
+    has *no* individual signature (a MUP-knockout animal still urinates). 0
+    means an unreadable mark is ignored; 1 means identity does not matter.
+    """
+    enabled: bool = False        # off unless a config asks for it (old runs reproduce)
+    cell_size: float = 0.10      # grid resolution (m)
+    half_life_h: float = 24.0    # mark half-life (hours)
+    perception_r: float = 0.5    # how far an animal reads marks (m)
+    deposit_cost: float = 0.12   # reserve spent per mark (reserve is 0..1)
+    mark_strength: float = 0.6   # salience of a fresh mark (0..1)
+    counter_mark: float = 2.5    # marking-rate multiplier on foreign scent
+    anonymous_weight: float = 0.25   # weight of a signature-less mark
+
+
+@dataclass
 class PolicyParams:
     """Free parameters of the rule-based movement policy.
 
@@ -196,7 +228,20 @@ class PolicyParams:
     k_territory: float = 2.0    # scent-marked territory avoidance gain
     k_random: float = 0.5       # exploratory noise gain
     perception_r: float = 0.6   # neighbour perception radius (m)
-    forage_threshold: float = 0.5   # hunger/thirst at which seeking switches on
+    # hunger/thirst (0-100) at which the animal starts seeking food or water
+    forage_threshold: float = 50.0
+    # --- scent-driven structure (used when ExperimentConfig.scent.enabled) --- #
+    # With marks switched on these REPLACE the geometric home spring and the
+    # home_range_r territory proxy: site fidelity is "stay where my own marks
+    # are" and territoriality is "avoid where someone else's are", so home-range
+    # size and territory boundaries are outcomes rather than inputs.
+    k_scent_home: float = 1.2      # pull toward the animal's own marks
+    k_scent_avoid: float = 2.2     # push away from other animals' marks
+    mark_rate_h: float = 12.0      # baseline marking attempts per hour
+    # Non-olfactory site fidelity ("I remember where I live"), pulling toward
+    # realised occupancy rather than a prescribed radius. Keeps anosmic animals
+    # anchored while they lose territorial *structure*.
+    k_memory: float = 0.35
 
 
 @dataclass
@@ -236,26 +281,51 @@ class ArenaConfig:
 # --------------------------------------------------------------------------- #
 @dataclass
 class TraitProfile:
-    """Baseline behavioural traits. Most are 0..1 dimensionless dials.
+    """What an animal *is*, split into body and personality.
 
-    smell_ability   : olfactory sensitivity. 0 = fully anosmic.
-    identity_signal : how identifiable this animal's scent is to others.
-                      0 = no individual signature (e.g. MUP knockout).
-    base_speed      : locomotor speed (m/s) when active.
-    home_range_r    : preferred home-range radius (m); sets territory size.
+    BODY (biophysical) — facts you could in principle measure on a real animal:
+      mass            : body mass (g); drifts over the run with energy balance
+      body_length_cm  : nose-to-rump length; also sets how big it is drawn
+      base_speed      : locomotor speed (m/s) when active
+      metabolism      : metabolic-rate multiplier
+      smell_ability   : olfactory acuity. 0 = fully anosmic (e.g. methimazole)
+      identity_signal : how individually distinctive this animal's scent is.
+                        0 = marks carry no signature (e.g. MUP knockout)
+      scent_rate      : urine-mark production capacity, marks per hour. Marking
+                        is a limited resource: an animal that has just marked
+                        heavily cannot keep marking.
+
+    PERSONALITY — dispositions, sampled per individual:
+      aggression      : probability of attacking on a same-sex encounter (0..1,
+                        shown as 0-100% in the GUI)
+      boldness        : willingness to escalate and to use open ground
+      sociability     : attraction to conspecifics
+      exploration     : drive to leave familiar ground
+      turn_rate       : path tortuosity (heading diffusion)
+      wander          : random-walk drive gain
+
+    Deliberately absent from the species library: home-range size. Where an
+    animal settles and how much ground it holds are *results* of marking,
+    olfaction and competition — see :class:`ScentParams`. ``home_range_r``
+    survives only for configs predating scent marking.
     """
+    # ---- body ---------------------------------------------------------- #
+    mass: float = 40.0        # body mass (g)
+    body_length_cm: float = 9.0
+    base_speed: float = 0.12  # m/s
+    metabolism: float = 1.0
+    smell_ability: float = 1.0
+    identity_signal: float = 1.0
+    scent_rate: float = 20.0  # marks per hour the animal can produce
+    # ---- personality ---------------------------------------------------- #
     aggression: float = 0.5
     boldness: float = 0.5
     sociability: float = 0.5
     exploration: float = 0.5
-    smell_ability: float = 1.0
-    identity_signal: float = 1.0
-    base_speed: float = 0.12
+    turn_rate: float = 0.5
+    wander: float = 0.5
+    # ---- legacy: prescribed home range (pre-scent configs only) --------- #
     home_range_r: float = 0.55
-    mass: float = 40.0        # body mass (g); initial value, drifts over the run
-    metabolism: float = 1.0   # metabolic-rate multiplier
-    turn_rate: float = 0.5    # heading jitter per step (rad) — path tortuosity
-    wander: float = 0.5       # random-walk drive gain — exploratory movement
 
 
 @dataclass
@@ -360,6 +430,12 @@ class Coupling:
 
     ``target += gain × source × (dt / hour)`` each step, or with ``effect='set'``
     the target is set to ``gain`` wherever the source is active. Gains are per-hour.
+
+    All condition bars are on a **0-100** scale, so a gain of 15 on a
+    dimensionless source moves the bar 15 points per hour. (Configs written
+    against the old 0..1 scale are migrated on load — see
+    ``ExperimentConfig.from_dict``.)
+
       source   : time | movement | activity | crowding | on_food | on_water |
                  mass | metabolism | fed | hydrated | rested |
                  energy | hunger | thirst | stress | health
@@ -373,45 +449,78 @@ class Coupling:
     gain: float = 0.0
     scale_by: str = "none"
     only_when: str = "always"
-    threshold: float = 0.5
+    threshold: float = 50.0
     note: str = ""
 
 
+#: sources that are themselves 0-100 condition bars (or derived from them).
+#: Used by the v1 -> v2 scale migration and by threshold interpretation.
+BAR_SOURCES = {"energy", "hunger", "thirst", "stress", "health",
+               "fed", "hydrated", "rested"}
+
+
 def default_dynamics() -> list["Coupling"]:
-    """The built-in metabolic model as editable interaction rules.
+    """The built-in metabolic model as editable interaction rules (0-100 bars).
 
     Reproduces sensible physiology: needs rise (faster when moving), moving and
     metabolism spend energy, being well-fed/hydrated restores it, deprivation
     drains energy and eventually erodes health; crowding raises stress.
+
+    When :class:`PhysiologyParams` is enabled these rules no longer drive
+    energy, hunger or thirst — a real energy and water budget does (see
+    :mod:`fnt.abma.core.physiology`) — and only the stress/health rules apply.
     """
     C = Coupling
     return [
-        C("time", "hunger", "rate", 0.15, note="hunger rises over time"),
-        C("movement", "hunger", "rate", 1.5, note="moving builds hunger"),
+        C("time", "hunger", "rate", 15.0, note="hunger rises over time"),
+        C("movement", "hunger", "rate", 150.0, note="moving builds hunger"),
         C("on_food", "hunger", "set", 0.0, note="eating resets hunger"),
-        C("time", "thirst", "rate", 0.18, note="thirst rises over time"),
-        C("movement", "thirst", "rate", 1.8, note="moving builds thirst"),
+        C("time", "thirst", "rate", 18.0, note="thirst rises over time"),
+        C("movement", "thirst", "rate", 180.0, note="moving builds thirst"),
         C("on_water", "thirst", "set", 0.0, note="drinking resets thirst"),
         C("fed", "energy", "rate", 0.5, note="recover energy when well-fed"),
         C("hydrated", "energy", "rate", 0.25, note="recover energy when hydrated"),
-        C("time", "energy", "rate", -0.10, scale_by="metabolism",
+        C("time", "energy", "rate", -10.0, scale_by="metabolism",
           note="baseline metabolism"),
-        C("movement", "energy", "rate", -1.2, scale_by="mass",
+        C("movement", "energy", "rate", -120.0, scale_by="mass",
           note="locomotion cost ∝ mass × speed"),
-        C("hunger", "energy", "rate", -0.4, only_when="source_high", threshold=0.5,
-          note="hunger drains energy"),
-        C("thirst", "energy", "rate", -0.4, only_when="source_high", threshold=0.5,
-          note="thirst drains energy"),
-        C("energy", "health", "rate", 0.05, only_when="source_high", threshold=0.3,
-          note="heal when energy is high"),
+        C("hunger", "energy", "rate", -0.4, only_when="source_high",
+          threshold=50.0, note="hunger drains energy"),
+        C("thirst", "energy", "rate", -0.4, only_when="source_high",
+          threshold=50.0, note="thirst drains energy"),
+        C("energy", "health", "rate", 0.05, only_when="source_high",
+          threshold=30.0, note="heal when energy is high"),
         C("hunger", "health", "rate", -0.15, only_when="source_high",
-          threshold=0.9, note="starvation erodes health"),
+          threshold=90.0, note="starvation erodes health"),
         C("thirst", "health", "rate", -0.15, only_when="source_high",
-          threshold=0.9, note="dehydration erodes health"),
+          threshold=90.0, note="dehydration erodes health"),
         C("stress", "health", "rate", -0.03, note="chronic stress erodes health"),
-        C("crowding", "stress", "rate", 0.006, note="crowding raises stress"),
-        C("time", "stress", "rate", -0.05, note="stress decays when calm"),
+        C("crowding", "stress", "rate", 0.6, note="crowding raises stress"),
+        C("time", "stress", "rate", -5.0, note="stress decays when calm"),
     ]
+
+
+def _migrate_dynamics_to_0_100(rows: list[dict]) -> list["Coupling"]:
+    """Rescale a v1 (0..1 bars) dynamics table to the 0-100 scale.
+
+    Targets are always condition bars, so every rule's output scales ×100.
+    A source that was itself a 0..1 bar is now 0-100 too, which cancels the
+    target's ×100 — those gains are left alone and only their thresholds move.
+    Dimensionless / physical sources (time, movement, crowding, …) keep their
+    magnitude, so their gains take the full ×100.
+    """
+    out = []
+    for r in rows:
+        c = Coupling(**r)
+        src_is_bar = c.source in BAR_SOURCES
+        if c.effect == "set":
+            c.gain *= 100.0            # a target value, always rescaled
+        elif not src_is_bar:
+            c.gain *= 100.0
+        if src_is_bar:
+            c.threshold *= 100.0
+        out.append(c)
+    return out
 
 
 def _group_from_dict(g: dict) -> AgentGroup:
@@ -457,6 +566,12 @@ class ExperimentConfig:
     energy_speed_coupling: float = 0.6  # how much low energy slows movement (0=none)
     rest_speed_factor: float = 0.15     # speed × this when satiated near home (1=off)
     policy: PolicyParams = field(default_factory=PolicyParams)
+    scent: ScentParams = field(default_factory=ScentParams)
+    physiology: PhysiologyParams = field(default_factory=PhysiologyParams)
+
+    #: 1 = condition bars were 0..1; 2 = bars are 0-100 (current). Configs
+    #: written before the change carry no version and are migrated on load.
+    schema_version: int = 2
 
     # Output / execution
     trial_prefix: str = "S"            # trial id prefix, e.g. S001, S002 ...
@@ -527,11 +642,22 @@ class ExperimentConfig:
         }
         scalars = {k: d[k] for k in known if k in d}
         interventions = [Intervention(**iv) for iv in d.get("interventions", [])]
-        dynamics = ([Coupling(**c) for c in d["dynamics"]]
-                    if "dynamics" in d else default_dynamics())
+        # v1 configs describe condition bars on a 0..1 scale; rescale their
+        # dynamics so an old project still behaves the way it did.
+        version = int(d.get("schema_version", 1))
+        if "dynamics" not in d:
+            dynamics = default_dynamics()
+        elif version < 2:
+            dynamics = _migrate_dynamics_to_0_100(d["dynamics"])
+        else:
+            dynamics = [Coupling(**c) for c in d["dynamics"]]
         return ExperimentConfig(arena=arena, groups=groups, protocol=protocol,
                                 interventions=interventions, dynamics=dynamics,
                                 policy=PolicyParams(**d.get("policy", {})),
+                                scent=ScentParams(**d.get("scent", {})),
+                                physiology=PhysiologyParams(
+                                    **d.get("physiology", {})),
+                                schema_version=2,
                                 **scalars)
 
     @staticmethod
