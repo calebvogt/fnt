@@ -1839,10 +1839,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self._last_export_failed = False
 
         # Batch queue: preprocess many trials sequentially (bounded memory).
-        self._batch_items = []          # [{'path': str, 'status': str}]
+        self._batch_items = []          # [{'path','table','config','conflict_choice','status'}]
         self._batch_active = False
         self._batch_index = 0
         self._batch_stop_requested = False
+        self._batch_proc = None         # isolated worker process for the running trial
+        self._batch_log_path = None
+        self._batch_log_pos = 0
 
         # Tag identity and sex mapping
         self.tag_identities = {}  # {tag_id: {'sex': 'M', 'identity': 'Animal1'}}
@@ -8031,29 +8034,104 @@ class UWBQuickVisualizationWindow(QWidget):
         QTimer.singleShot(0, self._batch_step)
 
     def stop_batch(self):
-        """Request the batch to stop after the current trial is torn down."""
+        """Stop the batch, terminating the trial currently running."""
         if not self._batch_active:
             return
-        self.log_message("⚠ Batch stop requested — cancelling current trial...")
+        self.log_message("⚠ Batch stop requested — stopping the current trial...")
         self._batch_stop_requested = True
+        # Kill the isolated worker process, if one is running.
+        proc = getattr(self, '_batch_proc', None)
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        # In-process fallback path.
         self.export_cancelled = True
         if getattr(self, 'worker', None) and self.worker.isRunning():
             self.worker.terminate()
             self.worker.wait()
 
     def _batch_step(self):
-        """Load + export the next queued database, or finish the batch."""
+        """Launch the next queued job in its OWN process, or finish the batch.
+
+        Each trial runs in a separate worker process (see fnt.uwb.uwb_batch_worker).
+        A UWB export is a long, native-heavy pipeline, and a memory-safety fault
+        anywhere in that native stack kills the whole interpreter — when every
+        trial shared one process, one such fault destroyed the rest of the queue.
+        Isolating trials bounds the damage to a single job and gives each one a
+        fresh heap, so nothing accumulates across an overnight run.
+        """
         if self._batch_stop_requested or self._batch_index >= len(self._batch_items):
             self._finish_batch()
             return
+
         it = self._batch_items[self._batch_index]
-        it['status'] = 'Loading'
+        it['status'] = 'Running'
         self._refresh_batch_list()
         self.log_message(
             f"BATCH [{self._batch_index + 1}/{len(self._batch_items)}]: "
-            f"{os.path.basename(it['path'])}")
-        # Replay the settings captured when this job was queued (not the DB's
-        # on-disk config). load_config_if_exists consumes this override.
+            f"{os.path.basename(it['path'])} — starting worker process")
+
+        # Frozen builds can't run `python -m`; fall back to the in-process path
+        # so the queue still works (without crash isolation).
+        if getattr(sys, 'frozen', False):
+            self._batch_run_in_process(it)
+            return
+
+        import json as _json
+        import subprocess
+        import tempfile
+
+        job = {
+            'path': it['path'],
+            'table': it.get('table'),
+            'config': it.get('config'),
+            'conflict_choice': it.get('conflict_choice', ExportConflictDialog.OVERWRITE),
+            'temp_frames_dir': getattr(self, '_batch_temp_frames_dir', None),
+        }
+        job_dir = tempfile.mkdtemp(prefix='fnt_batch_')
+        job_path = os.path.join(job_dir, 'job.json')
+        try:
+            with open(job_path, 'w', encoding='utf-8') as f:
+                _json.dump(job, f, default=str)
+        except Exception as e:
+            self.log_message(f"✗ Could not write batch job file: {e}")
+            it['status'] = 'Failed'
+            self._refresh_batch_list()
+            self._batch_index += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
+
+        env = dict(os.environ)
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['QT_QPA_PLATFORM'] = 'offscreen'   # worker renders headless
+        kwargs = {}
+        if os.name == 'nt':
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+        log_path = os.path.join(job_dir, 'worker.log')
+        try:
+            self._batch_log_fh = open(log_path, 'w', encoding='utf-8')
+            self._batch_proc = subprocess.Popen(
+                [sys.executable, '-m', 'fnt.uwb.uwb_batch_worker', job_path],
+                stdout=self._batch_log_fh, stderr=subprocess.STDOUT,
+                env=env, **kwargs)
+        except Exception as e:
+            self.log_message(f"✗ Could not start worker process: {e}")
+            it['status'] = 'Failed'
+            self._refresh_batch_list()
+            self._batch_index += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
+
+        self._batch_log_path = log_path
+        self._batch_log_pos = 0
+        QTimer.singleShot(500, self._batch_poll_export)
+
+    def _batch_run_in_process(self, it):
+        """Fallback for frozen builds: export in this process (no isolation)."""
         self._pending_config_override = it.get('config')
         if not self._load_database_path(it['path']):
             it['status'] = 'Failed'
@@ -8061,41 +8139,68 @@ class UWBQuickVisualizationWindow(QWidget):
             self._batch_index += 1
             QTimer.singleShot(0, self._batch_step)
             return
-        it['status'] = 'Running'
-        self._refresh_batch_list()
-        self._batch_wait_tags_then_export()
-
-    def _batch_wait_tags_then_export(self):
-        """Wait for the async tag load to finish, then start the export."""
-        if self._batch_stop_requested:
-            self._finish_batch()
-            return
-        if getattr(self, '_db_workers', None):   # tag/day scan still running
-            QTimer.singleShot(150, self._batch_wait_tags_then_export)
-            return
-        # If the saved config selected no tags, default to all so the trial
-        # actually produces output.
         if not any(cb.isChecked() for cb in self.tag_checkboxes.values()):
             for cb in self.tag_checkboxes.values():
                 cb.setChecked(True)
-        # Replay this job's overwrite decision (captured at add-to-queue time).
-        it = self._batch_items[self._batch_index]
         self._batch_conflict_choice = it.get('conflict_choice', ExportConflictDialog.OVERWRITE)
+        self._batch_proc = None
         self.export_data()
         QTimer.singleShot(300, self._batch_poll_export)
 
-    def _batch_poll_export(self):
-        """Wait for the current export to fully finish, then advance."""
-        if self.exporting:
-            QTimer.singleShot(300, self._batch_poll_export)
+    def _drain_worker_log(self):
+        """Copy new worker stdout into the session log so progress stays visible."""
+        path = getattr(self, '_batch_log_path', None)
+        if not path or not os.path.exists(path):
             return
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(self._batch_log_pos)
+                chunk = f.read()
+                self._batch_log_pos = f.tell()
+        except Exception:
+            return
+        for line in chunk.splitlines():
+            line = line.strip()
+            # Frame-by-frame render spam would flood the log; keep every 500th.
+            if line.startswith('Rendering frame'):
+                if '00/' not in line:
+                    continue
+            if line:
+                self.log_message(f"  [worker] {line}")
+
+    def _batch_poll_export(self):
+        """Wait for the current job to finish, then advance to the next."""
+        proc = getattr(self, '_batch_proc', None)
+
+        if proc is None:
+            # In-process fallback path.
+            if self.exporting:
+                QTimer.singleShot(300, self._batch_poll_export)
+                return
+            failed = bool(getattr(self, '_last_export_failed', False))
+        else:
+            self._drain_worker_log()
+            if proc.poll() is None:            # still running
+                QTimer.singleShot(1000, self._batch_poll_export)
+                return
+            self._drain_worker_log()           # final flush
+            rc = proc.returncode
+            failed = (rc != 0)
+            try:
+                self._batch_log_fh.close()
+            except Exception:
+                pass
+            self._batch_proc = None
+            if failed:
+                self.log_message(
+                    f"✗ Worker exited with code {rc} — this trial failed, "
+                    f"continuing with the rest of the queue.")
+
         it = self._batch_items[self._batch_index]
-        it['status'] = 'Failed' if getattr(self, '_last_export_failed', False) else 'Done'
+        it['status'] = 'Failed' if failed else 'Done'
         self.log_message(f"BATCH item {self._batch_index + 1}: {it['status']}")
         self._refresh_batch_list()
         self._batch_index += 1
-        import gc
-        gc.collect()   # reclaim the trial's memory before the next one
         QTimer.singleShot(0, self._batch_step)
 
     def _finish_batch(self):
@@ -8472,27 +8577,34 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.reset_filter_stats()
 
                 # Stream the smoothed CSV one tag at a time rather than holding
-                # the whole processed dataset in RAM and writing it in one shot.
-                # The old concat -> sort -> to_csv path peaked at ~3x the full
-                # dataset in memory; on a large trial that peak (inside to_csv)
-                # is what corrupted the heap (0xc0000374) when a second FNT
-                # process pushed the machine out of memory. Tags are processed in
-                # ascending shortid order and each chunk is time-sorted, so the
-                # streamed file matches the old global (shortid, Timestamp) sort.
+                # the whole processed dataset in RAM and writing it in one shot
+                # (the old concat -> sort -> to_csv path peaked at ~3x the full
+                # dataset in memory). Tags are processed in ascending shortid
+                # order and each chunk is time-sorted, so the streamed file
+                # matches the old global (shortid, Timestamp) sort.
+                #
+                # Written to '<name>.partial' and renamed only after the last
+                # tag succeeds. A hard crash (or power loss) mid-run therefore
+                # leaves a .partial file, never a truncated '<name>_smoothed.csv'
+                # that later runs would mistake for a complete export — the
+                # failure mode seen when a crash killed a batch mid-write.
                 selected_tags = sorted(selected_tags)
                 smoothed_csv_filename = f'{db_name}_smoothed.csv'
                 smoothed_csv_path = os.path.join(output_dir, smoothed_csv_filename)
+                smoothed_partial_path = smoothed_csv_path + '.partial'
                 csv_path = smoothed_csv_path  # plots/animation/proximity read this
                 stream_smoothed = export_smoothed_csv and not (
                     skip_existing and os.path.exists(smoothed_csv_path))
                 if export_smoothed_csv and not stream_smoothed:
                     self.log_message(f"Skipped (exists): {smoothed_csv_filename}")
-                elif stream_smoothed and os.path.exists(smoothed_csv_path):
-                    # Clear a stale/partial file so append mode starts clean.
-                    try:
-                        os.remove(smoothed_csv_path)
-                    except OSError:
-                        pass
+                elif stream_smoothed:
+                    # Clear any stale partial from an earlier interrupted run.
+                    for _p in (smoothed_partial_path, smoothed_csv_path):
+                        try:
+                            if os.path.exists(_p):
+                                os.remove(_p)
+                        except OSError:
+                            pass
 
                 total_points = 0
                 tags_with_data = 0
@@ -8512,11 +8624,11 @@ class UWBQuickVisualizationWindow(QWidget):
                     if self.export_cancelled:
                         conn.close()
                         # A cancelled stream leaves a partial CSV — drop it.
-                        if smoothed_header_written and os.path.exists(smoothed_csv_path):
-                            try:
-                                os.remove(smoothed_csv_path)
-                            except OSError:
-                                pass
+                        try:
+                            if os.path.exists(smoothed_partial_path):
+                                os.remove(smoothed_partial_path)
+                        except OSError:
+                            pass
                         self.stop_export()
                         return
 
@@ -8570,7 +8682,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     # peak memory stays at ~one tag rather than the whole trial.
                     n = len(tag_data)
                     if stream_smoothed and n:
-                        tag_data.to_csv(smoothed_csv_path, index=False, mode='a',
+                        tag_data.to_csv(smoothed_partial_path, index=False, mode='a',
                                         header=not smoothed_header_written)
                         smoothed_header_written = True
                     total_points += n
@@ -8586,6 +8698,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 else:
                     self.log_message("Warning: No data after processing")
                 QApplication.processEvents()
+
+                # Every tag streamed successfully — publish the finished file by
+                # renaming the .partial into place. Until this point a crash
+                # leaves only a .partial, never a CSV that looks complete.
+                if stream_smoothed and smoothed_header_written:
+                    os.replace(smoothed_partial_path, smoothed_csv_path)
 
                 # The smoothed CSV was streamed per-tag above; just advance the
                 # progress step and report (keeps total_steps accounting intact
