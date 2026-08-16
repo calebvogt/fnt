@@ -1846,6 +1846,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_proc = None         # isolated worker process for the running trial
         self._batch_log_path = None
         self._batch_log_pos = 0
+        self._batch_plan = []           # [(job_index, 'data'|'animation')] — data pass first
+        self._batch_plan_pos = 0
+        self._batch_phase = 'data'
+        self._batch_reuse_smoothed = False
 
         # Tag identity and sex mapping
         self.tag_identities = {}  # {tag_id: {'sex': 'M', 'identity': 'Animal1'}}
@@ -8024,12 +8028,26 @@ class UWBQuickVisualizationWindow(QWidget):
 
         for it in self._batch_items:          # fresh run: reset all statuses
             it['status'] = 'Queued'
+
+        # Two-phase plan: every trial's DATA products (CSVs, proximity, social
+        # network, plots) run first, for the whole queue; only then do the video
+        # renders. A tracking animation takes hours while the CSVs take minutes,
+        # so this gets every trial's data out in the first hour instead of
+        # trickling one trial per day.
+        self._batch_plan = [(i, 'data') for i in range(len(self._batch_items))]
+        anim_idx = [i for i, it in enumerate(self._batch_items)
+                    if (it.get('config') or {}).get('save_animation')
+                    or (it.get('config') or {}).get('social_animation')]
+        self._batch_plan += [(i, 'animation') for i in anim_idx]
+        self._batch_plan_pos = 0
+
         self._batch_active = True
         self._batch_stop_requested = False
-        self._batch_index = 0
         self._suppress_dialogs()
         self.log_message("=" * 50)
-        self.log_message(f"BATCH START: {len(self._batch_items)} database(s) queued")
+        self.log_message(
+            f"BATCH START: {len(self._batch_items)} database(s) — "
+            f"data products first, then {len(anim_idx)} animation render(s)")
         self._refresh_batch_list()
         QTimer.singleShot(0, self._batch_step)
 
@@ -8063,21 +8081,47 @@ class UWBQuickVisualizationWindow(QWidget):
         Isolating trials bounds the damage to a single job and gives each one a
         fresh heap, so nothing accumulates across an overnight run.
         """
-        if self._batch_stop_requested or self._batch_index >= len(self._batch_items):
+        if self._batch_stop_requested or self._batch_plan_pos >= len(self._batch_plan):
             self._finish_batch()
             return
 
-        it = self._batch_items[self._batch_index]
-        it['status'] = 'Running'
+        job_idx, phase = self._batch_plan[self._batch_plan_pos]
+        self._batch_index = job_idx
+        self._batch_phase = phase
+        it = self._batch_items[job_idx]
+
+        # A trial whose data pass failed has no smoothed CSV to render from.
+        if phase == 'animation' and it.get('data_failed'):
+            self.log_message(
+                f"Skipping animation for {os.path.basename(it['path'])} — its data pass failed.")
+            self._batch_plan_pos += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
+
+        it['status'] = 'Processing data' if phase == 'data' else 'Rendering animation'
         self._refresh_batch_list()
         self.log_message(
-            f"BATCH [{self._batch_index + 1}/{len(self._batch_items)}]: "
+            f"BATCH [{self._batch_plan_pos + 1}/{len(self._batch_plan)}] "
+            f"({'data' if phase == 'data' else 'animation'}): "
             f"{os.path.basename(it['path'])} — starting worker process")
+
+        # Split the captured settings into the two phases.
+        cfg = dict(it.get('config') or {})
+        if phase == 'data':
+            # Everything except the video renders.
+            cfg['save_animation'] = False
+            cfg['social_animation'] = False
+        else:
+            # Renders only — the data products already exist from the data pass.
+            cfg['export_raw_csv'] = False
+            cfg['save_plots'] = False
+            cfg['proximity_detection'] = False      # bouts CSV already written
+            cfg['export_social_network'] = False    # network CSVs already written
 
         # Frozen builds can't run `python -m`; fall back to the in-process path
         # so the queue still works (without crash isolation).
         if getattr(sys, 'frozen', False):
-            self._batch_run_in_process(it)
+            self._batch_run_in_process(it, cfg, phase)
             return
 
         import json as _json
@@ -8087,9 +8131,11 @@ class UWBQuickVisualizationWindow(QWidget):
         job = {
             'path': it['path'],
             'table': it.get('table'),
-            'config': it.get('config'),
+            'config': cfg,
             'conflict_choice': it.get('conflict_choice', ExportConflictDialog.OVERWRITE),
             'temp_frames_dir': getattr(self, '_batch_temp_frames_dir', None),
+            # The animation pass renders from the CSV the data pass wrote.
+            'reuse_smoothed': (phase == 'animation'),
         }
         job_dir = tempfile.mkdtemp(prefix='fnt_batch_')
         job_path = os.path.join(job_dir, 'job.json')
@@ -8099,8 +8145,10 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"✗ Could not write batch job file: {e}")
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -8121,8 +8169,10 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"✗ Could not start worker process: {e}")
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -8130,13 +8180,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_log_pos = 0
         QTimer.singleShot(500, self._batch_poll_export)
 
-    def _batch_run_in_process(self, it):
+    def _batch_run_in_process(self, it, cfg=None, phase='data'):
         """Fallback for frozen builds: export in this process (no isolation)."""
-        self._pending_config_override = it.get('config')
+        self._pending_config_override = cfg if cfg is not None else it.get('config')
+        self._batch_reuse_smoothed = (phase == 'animation')
         if not self._load_database_path(it['path']):
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
         if not any(cb.isChecked() for cb in self.tag_checkboxes.values()):
@@ -8161,12 +8214,17 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         for line in chunk.splitlines():
             line = line.strip()
-            # Frame-by-frame render spam would flood the log; keep every 500th.
+            if not line:
+                continue
+            # The renderer emits a progress line every 50 frames — thousands over
+            # a long animation. Thin them to every 20th (≈ every 1000 frames) so
+            # the log stays readable but never goes silent: a multi-hour render
+            # with no output at all reads as a hang.
             if line.startswith('Rendering frame'):
-                if '00/' not in line:
+                self._worker_frame_lines = getattr(self, '_worker_frame_lines', 0) + 1
+                if self._worker_frame_lines % 20 != 1:
                     continue
-            if line:
-                self.log_message(f"  [worker] {line}")
+            self.log_message(f"  [worker] {line}")
 
     def _batch_poll_export(self):
         """Wait for the current job to finish, then advance to the next."""
@@ -8197,22 +8255,35 @@ class UWBQuickVisualizationWindow(QWidget):
                     f"continuing with the rest of the queue.")
 
         it = self._batch_items[self._batch_index]
-        it['status'] = 'Failed' if failed else 'Done'
-        self.log_message(f"BATCH item {self._batch_index + 1}: {it['status']}")
+        phase = getattr(self, '_batch_phase', 'data')
+        has_anim = bool((it.get('config') or {}).get('save_animation')
+                        or (it.get('config') or {}).get('social_animation'))
+        if failed:
+            it['status'] = f'Failed ({phase})'
+            if phase == 'data':
+                it['data_failed'] = True
+        elif phase == 'data':
+            # Data products are on disk now; the render (if any) comes later.
+            it['status'] = 'Data ✓ — animation queued' if has_anim else 'Done'
+        else:
+            it['status'] = 'Done'
+        self.log_message(f"BATCH {os.path.basename(it['path'])} [{phase}]: {it['status']}")
         self._refresh_batch_list()
-        self._batch_index += 1
+        self._batch_plan_pos += 1
         QTimer.singleShot(0, self._batch_step)
 
     def _finish_batch(self):
         self._batch_active = False
         self._restore_dialogs()   # before the summary box, and re-enable normal UI dialogs
         for it in self._batch_items:
-            if it['status'] in ('Queued', 'Loading', 'Running'):
-                it['status'] = 'Cancelled'
+            if it['status'] in ('Queued', 'Loading', 'Running', 'Processing data',
+                                'Rendering animation', 'Data ✓ — animation queued'):
+                it['status'] = 'Cancelled' if it['status'] != 'Data ✓ — animation queued' \
+                    else 'Data ✓ (animation cancelled)'
         self._refresh_batch_list()
         done = sum(1 for it in self._batch_items if it['status'] == 'Done')
-        failed = sum(1 for it in self._batch_items if it['status'] == 'Failed')
-        cancelled = sum(1 for it in self._batch_items if it['status'] == 'Cancelled')
+        failed = sum(1 for it in self._batch_items if str(it['status']).startswith('Failed'))
+        cancelled = sum(1 for it in self._batch_items if 'ancelled' in str(it['status']))
         self.log_message(
             f"BATCH FINISHED: {done} done, {failed} failed, {cancelled} cancelled")
         self._batch_stop_requested = False
@@ -8558,6 +8629,25 @@ class UWBQuickVisualizationWindow(QWidget):
             # Prepare processed data (needed for smoothed CSV, plots, animation, behaviors)
             needs_processed_data = export_smoothed_csv or save_plots or save_animation or detect_proximity
             csv_path = None  # Path to the CSV that plots/animation will use
+            plot_csv_path = None
+            anim_csv_path = None
+
+            # Animation pass of a two-phase batch: the smoothed CSV was already
+            # written by the data pass, so render straight from it instead of
+            # re-reading and re-smoothing every tag (minutes of pure waste).
+            if getattr(self, '_batch_reuse_smoothed', False):
+                _existing = os.path.join(output_dir, f'{db_name}_smoothed.csv')
+                if os.path.exists(_existing):
+                    csv_path = _existing
+                    plot_csv_path = _existing if save_plots else None
+                    anim_csv_path = _existing if save_animation else None
+                    needs_processed_data = False
+                    self.log_message(
+                        f"Animation pass: reusing existing {os.path.basename(_existing)} "
+                        f"(no re-processing).")
+                else:
+                    self.log_message(
+                        "Animation pass: smoothed CSV missing — reprocessing from the database.")
 
             if needs_processed_data:
                 if self.export_cancelled:
