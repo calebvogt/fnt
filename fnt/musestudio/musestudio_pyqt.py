@@ -60,8 +60,21 @@ _SYNC_GATE_HOLD_S = 10.0
 # Stream watchdog: a stream is "stalled" after this long with no samples, and
 # the failure is escalated if it stays down. Bluetooth hiccups of a few hundred
 # ms are normal; multiple seconds means data is being lost.
+#
+# The threshold must be per-stream: Muse-BATTERY legitimately delivers one
+# sample every ~5 s, so a flat 2.5 s cutoff would fire a false "signal lost"
+# alarm (with tones and speech) every battery sample, all session long.
 _STALL_SECONDS = 2.5
 _STALL_ESCALATE_S = 15.0
+_STALL_UNKNOWN_RATE_S = 12.0     # streams whose rate we couldn't resolve
+
+
+def _stall_threshold(rate):
+    """Seconds of silence that counts as a stall, given a nominal rate (Hz)."""
+    if not rate or rate <= 0:
+        return _STALL_UNKNOWN_RATE_S
+    # Three missed sample periods, but never tighter than the BLE-hiccup floor.
+    return max(_STALL_SECONDS, 3.0 / float(rate))
 
 
 def _is_eeg(stream_name):
@@ -248,6 +261,7 @@ class MuseStudioWindow(QMainWindow):
         self._last_sample = {}      # stream -> monotonic time of last chunk
         self._stalled = {}          # stream -> monotonic time the stall began
         self._escalated = {}        # stream -> already warned a second time
+        self._stall_limits = {}     # stream -> seconds of silence = stall
         self._dropouts = []         # (stream, start_wall, seconds) for the summary
         self._stall_timer = QTimer(self)
         self._stall_timer.setInterval(1000)
@@ -820,6 +834,9 @@ class MuseStudioWindow(QMainWindow):
         # Real sample rates drive the display filters and every analyzer.
         rates = {n: self.reader.sample_rate(n) for n in names}
         self.plot.set_sample_rates(rates)
+        # Watchdog thresholds scale with each stream's nominal rate (battery
+        # sends one sample per ~5 s and must not trip false alarms).
+        self._stall_limits = {n: _stall_threshold(rates.get(n)) for n in names}
         if self._eeg_stream:
             fs = rates.get(self._eeg_stream)
             if fs:
@@ -872,7 +889,8 @@ class MuseStudioWindow(QMainWindow):
         now = time.monotonic()
         for stream, last in list(self._last_sample.items()):
             gap = now - last
-            if gap >= _STALL_SECONDS and stream not in self._stalled:
+            limit = self._stall_limits.get(stream, _STALL_UNKNOWN_RATE_S)
+            if gap >= limit and stream not in self._stalled:
                 self._stalled[stream] = last
                 LOG.add(f"STREAM STALLED: {stream} (no data for {gap:.1f}s)", "error")
                 self._log(f"Stream stalled: {stream}")
@@ -882,7 +900,7 @@ class MuseStudioWindow(QMainWindow):
                 if self._session_active:
                     self._speak("Signal lost. Check the headband.")
                 self._maybe_restart_streamer()
-            elif gap >= _STALL_SECONDS and stream in self._stalled:
+            elif gap >= limit and stream in self._stalled:
                 if gap >= _STALL_ESCALATE_S and not self._escalated.get(stream):
                     self._escalated[stream] = True
                     LOG.add(f"STREAM STILL DOWN: {stream} after {gap:.0f}s", "error")
@@ -1193,8 +1211,11 @@ class MuseStudioWindow(QMainWindow):
         self.session = None
         self._set_status(f"Saved to {root} ({summary})")
         # Surface the result immediately — after an eyes-closed session you
-        # shouldn't have to go hunting to find out whether it worked.
-        self._show_summary(root, counts, frames)
+        # shouldn't have to go hunting to find out whether it worked. Deferred
+        # one event-loop turn: this method can run inside a protocol phase's
+        # action loop, and opening a modal questionnaire from there would block
+        # the remaining actions and the banner update mid-phase.
+        QTimer.singleShot(0, lambda: self._show_summary(root, counts, frames))
 
     def _show_summary(self, root, counts, frames):
         if not root:

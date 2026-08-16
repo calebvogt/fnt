@@ -10,6 +10,7 @@ All code written from scratch for FieldNeuroethologyToolbox.
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import json
 import math
 import os
@@ -32,7 +33,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
     QTextEdit, QSplitter,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer, QSettings
 from PyQt5.QtGui import (
     QIcon, QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
     QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent, QPainterPath,
@@ -101,6 +102,8 @@ DARK_STYLESHEET = """
     QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background-color: #1e1e1e; }
     QStatusBar { background-color: #252525; color: #999999; }
     QLabel { color: #cccccc; }
+    QToolTip { background-color: #1e1e1e; color: #dddddd;
+               border: 1px solid #2979ff; border-radius: 3px; padding: 4px 6px; }
 """
 
 CLASS_COLORS = [
@@ -117,6 +120,16 @@ CLASS_COLORS = [
 
 def _class_color(index: int) -> Tuple[int, int, int]:
     return CLASS_COLORS[index % len(CLASS_COLORS)]
+
+
+def _tipped_label(text: str, tooltip: str) -> QLabel:
+    """Row label carrying the same tooltip as the control beside it.
+
+    Users hover the label as often as the widget, so both need the hint.
+    """
+    lbl = QLabel(text)
+    lbl.setToolTip(tooltip)
+    return lbl
 
 
 BEHAVIOR_PRESETS = {
@@ -280,6 +293,9 @@ class AnnotationPreviewWidget(QWidget):
     delete_annotation_requested = pyqtSignal(int)
     approve_annotation_requested = pyqtSignal(int)
     edit_mode_blocked = pyqtSignal()
+    edit_cancelled = pyqtSignal()
+    category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
+    reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -317,6 +333,9 @@ class AnnotationPreviewWidget(QWidget):
         self._dragging_point = False
 
         self._editing_obj_idx: Optional[int] = None
+
+        # Kept in sync by the window; used for the Change Class context menu.
+        self.available_categories: List[str] = []
 
         self.annotations: List[AnnotationObject] = []
 
@@ -608,6 +627,17 @@ class AnnotationPreviewWidget(QWidget):
         act_approve = menu.addAction("✔ Approve Mask")
         act_edit = menu.addAction("Edit Mask")
         act_delete = menu.addAction("Delete Mask")
+        class_menu = None
+        class_actions = {}
+        if hit_idx is not None and self.available_categories:
+            class_menu = menu.addMenu("Change Class")
+            current_cat = self.annotations[hit_idx].category
+            for cat in self.available_categories:
+                a = class_menu.addAction(cat)
+                if cat == current_cat:
+                    a.setCheckable(True)
+                    a.setChecked(True)
+                class_actions[a] = cat
         if hit_idx is None:
             act_approve.setEnabled(False)
             act_edit.setEnabled(False)
@@ -642,11 +672,15 @@ class AnnotationPreviewWidget(QWidget):
         elif action == act_edit and hit_idx is not None:
             if self.annotations[hit_idx].inferred:
                 self.approve_annotation_requested.emit(hit_idx)
+            # Drop any half-drawn mask so the edit starts from a clean slate.
+            self._clear_drawing()
             self._editing_obj_idx = hit_idx
             self.mode_changed.emit("Editing Mask")
             self.update()
         elif action == act_delete and hit_idx is not None:
             self.delete_annotation_requested.emit(hit_idx)
+        elif action in class_actions and hit_idx is not None:
+            self.reassign_annotation_requested.emit(hit_idx, class_actions[action])
         elif action == act_clear_all and act_clear_all is not None:
             for i in range(len(self.annotations) - 1, -1, -1):
                 self.delete_annotation_requested.emit(i)
@@ -696,6 +730,7 @@ class AnnotationPreviewWidget(QWidget):
                 self._editing_obj_idx = None
                 self.mode_changed.emit("Navigate")
                 self.update()
+                self.edit_cancelled.emit()
             elif self.drawing_mode == "ai" and self._drawing_active:
                 # Cancel current AI prediction but stay in AI mode
                 self._clear_drawing()
@@ -713,6 +748,8 @@ class AnnotationPreviewWidget(QWidget):
                 for i in range(len(self.annotations) - 1, -1, -1):
                     if self.annotations[i].inferred:
                         self.approve_annotation_requested.emit(i)
+        elif Qt.Key_1 <= event.key() <= Qt.Key_9:
+            self.category_hotkey.emit(event.key() - Qt.Key_1)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
             self._zoom = min(20.0, self._zoom * 1.2)
             self.zoom_changed.emit(self._zoom)
@@ -771,8 +808,11 @@ class AnnotationPreviewWidget(QWidget):
         contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             largest = max(contours, key=cv2.contourArea)
-            eps = 0.005 * cv2.arcLength(largest, True)
-            approx = cv2.approxPolyDP(largest, eps, True)
+            # Same tolerance as storage (MASK_SIMPLIFY_EPS): the displayed
+            # contour becomes ground truth if the user edits it, so a coarse
+            # display polygon would silently degrade the saved mask.
+            from .mask_tracker_annotator import MASK_SIMPLIFY_EPS
+            approx = cv2.approxPolyDP(largest, MASK_SIMPLIFY_EPS, True)
             self._ai_mask_contour_pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
         else:
             self._ai_mask_contour_pts = []
@@ -1109,25 +1149,39 @@ class PostTrainInferenceWorker(QThread):
                     if result.get("masks") is not None and j < len(result["masks"]):
                         mask = result["masks"][j]
 
+                    from .mask_tracker_annotator import (
+                        mask_to_coco_polygons, mask_bbox, mask_to_rle,
+                    )
                     if mask is not None:
-                        from .mask_tracker_annotator import mask_to_coco_polygons, mask_bbox
-                        polygons = mask_to_coco_polygons(mask)
-                        if not polygons:
+                        # Store the predicted mask itself — approving one of
+                        # these promotes it to ground truth, so it must not
+                        # arrive already coarsened into a polygon.
+                        if not mask_to_coco_polygons(mask):
                             continue
-                        bbox = list(mask_bbox(mask))
-                        area = int(mask.sum())
+                        mask_bool = np.asarray(mask).astype(bool)
+                        segmentation = mask_to_rle(mask_bool)
+                        bbox = list(mask_bbox(mask_bool))
+                        area = int(mask_bool.sum())
                     else:
-                        # Use bounding box as a rectangle polygon
+                        # Box-only model: rectangle mask covering the box.
                         box = result["boxes"][j]
                         x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-                        polygons = [[x1, y1, x2, y1, x2, y2, x1, y2]]
+                        h_img, w_img = img_rgb.shape[:2]
+                        rect = np.zeros((h_img, w_img), dtype=bool)
+                        rect[
+                            max(0, int(round(y1))):max(0, int(round(y2))),
+                            max(0, int(round(x1))):max(0, int(round(x2))),
+                        ] = True
+                        if not rect.any():
+                            continue
+                        segmentation = mask_to_rle(rect)
                         bbox = [x1, y1, x2 - x1, y2 - y1]
-                        area = int((x2 - x1) * (y2 - y1))
+                        area = int(rect.sum())
 
                     label = int(result["labels"][j])
                     score = float(result["scores"][j])
                     detections.append({
-                        "segmentation": polygons,
+                        "segmentation": segmentation,
                         "bbox": bbox,
                         "area": area,
                         "category_id": label,
@@ -2496,6 +2550,47 @@ class FrameExtractWorker(QThread):
             return list(range(0, total_frames, max(1, n)))
         return []
 
+    @staticmethod
+    def _diverse_indices(cap, total_frames: int, n: int) -> List[int]:
+        """Pick n visually diverse frames via k-means over downscaled pixels.
+
+        Long fixed-camera recordings (e.g. open field) yield hundreds of
+        near-identical uniform samples; clustering a candidate pool and taking
+        one frame per cluster covers distinct postures/positions instead.
+        """
+        if total_frames <= 0:
+            return []
+        n = min(n, total_frames)
+        # Candidate pool: 8x oversampled, capped so seeks stay cheap.
+        n_cand = min(total_frames, max(n * 8, n + 1), 240)
+        step = total_frames / n_cand
+        candidates = sorted({int(i * step) for i in range(n_cand)})
+
+        feats, kept = [], []
+        for fidx in candidates:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            g = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA)
+            feats.append(g.astype(np.float32).ravel() / 255.0)
+            kept.append(fidx)
+        if len(kept) <= n:
+            return kept
+
+        from sklearn.cluster import KMeans
+        X = np.asarray(feats)
+        km = KMeans(n_clusters=n, n_init=4, random_state=0).fit(X)
+        picks = []
+        for c in range(n):
+            members = np.where(km.labels_ == c)[0]
+            if len(members) == 0:
+                continue
+            dists = np.linalg.norm(X[members] - km.cluster_centers_[c], axis=1)
+            picks.append(kept[members[int(np.argmin(dists))]])
+        return sorted(set(picks))
+
     def _process_one(self, vpath):
         """Open a single video, compute its frame indices, and extract them.
 
@@ -2510,7 +2605,11 @@ class FrameExtractWorker(QThread):
         try:
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             stem = Path(vpath).stem
-            for fidx in self._compute_indices(total, self.method, self.count):
+            if self.method == 3:
+                indices = self._diverse_indices(cap, total, self.count)
+            else:
+                indices = self._compute_indices(total, self.method, self.count)
+            for fidx in indices:
                 fname = f"{stem}_frame_{fidx:06d}.png"
                 out_path = os.path.join(self.output_dir, fname)
                 if os.path.exists(out_path):
@@ -2613,13 +2712,18 @@ class MaskTrackerWindow(QMainWindow):
         self._ai_enabled = False
 
         self._inference_worker: Optional[InferenceWorker] = None
-        self._track_model_dirs: List[str] = []
+        self._track_model_dirs: List[Optional[str]] = []
         self._cls_model_dirs: List[str] = []
+        self._behavior_model_dirs: List[Optional[str]] = []
 
         from .mask_tracker_annotator import COCOAnnotationManager
         self._coco = COCOAnnotationManager()
         self._categories: List[str] = []
         self._last_used_category: str = ""
+
+        # Undo/redo over annotation operations (Mask tab only)
+        self._undo_stack: List[Dict] = []
+        self._redo_stack: List[Dict] = []
 
         self._build_menu_bar()
         self._build_ui()
@@ -2748,6 +2852,9 @@ class MaskTrackerWindow(QMainWindow):
         act_open.triggered.connect(self._open_project)
         file_menu.addAction(act_open)
 
+        self._recent_menu = file_menu.addMenu("Open Recent")
+        self._recent_menu.aboutToShow.connect(self._populate_recent_menu)
+
         act_save = QAction("Save Project", self)
         act_save.setShortcut("Ctrl+S")
         act_save.triggered.connect(self._save_project)
@@ -2762,6 +2869,22 @@ class MaskTrackerWindow(QMainWindow):
         act_import = QAction("Import COCO JSON...", self)
         act_import.triggered.connect(self._import_coco)
         file_menu.addAction(act_import)
+
+        file_menu.addSeparator()
+
+        act_locate = QAction("Locate Missing Videos...", self)
+        act_locate.triggered.connect(self._locate_missing_videos)
+        file_menu.addAction(act_locate)
+
+        edit_menu = menu_bar.addMenu("Edit")
+        self.act_undo = QAction("Undo", self)
+        self.act_undo.setShortcut("Ctrl+Z")
+        self.act_undo.triggered.connect(self._undo)
+        edit_menu.addAction(self.act_undo)
+        self.act_redo = QAction("Redo", self)
+        self.act_redo.setShortcut("Ctrl+Shift+Z")
+        self.act_redo.triggered.connect(self._redo)
+        edit_menu.addAction(self.act_redo)
 
     # ==================================================================
     # UI construction
@@ -2832,6 +2955,9 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
         self.preview.edit_mode_blocked.connect(self._on_edit_mode_blocked)
+        self.preview.edit_cancelled.connect(self._on_edit_cancelled)
+        self.preview.category_hotkey.connect(self._on_category_hotkey)
+        self.preview.reassign_annotation_requested.connect(self._on_reassign_annotation)
         right_layout.addWidget(self.preview, 1)
 
         # Info row below preview
@@ -2845,17 +2971,43 @@ class MaskTrackerWindow(QMainWindow):
         self.lbl_mode.setStyleSheet(
             "color: #2979ff; font-weight: bold; font-size: 11px; padding: 2px 8px;"
         )
+        self.lbl_mode.setToolTip(
+            "What a click does right now.\n"
+            "Navigate: drag pans, scroll zooms.\n"
+            "Manual Mask: click places polygon vertices, Enter accepts.\n"
+            "AI-Assisted Mask: double-click adds a SAM point, right-click excludes.\n"
+            "Editing Mask: drag vertices of one mask; Enter commits, Esc cancels."
+        )
         info_layout.addWidget(self.lbl_mode)
 
         self.lbl_frame_info = QLabel("Frame: — / —")
         self.lbl_frame_info.setStyleSheet("color: #999999;")
+        self.lbl_frame_info.setToolTip(
+            "Position in the source video, or the extracted frame being labeled."
+        )
         info_layout.addWidget(self.lbl_frame_info)
 
         self.lbl_ann_stats = QLabel("")
         self.lbl_ann_stats.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_ann_stats.setToolTip(
+            "Masks on this frame, and the project-wide labeled-frame total."
+        )
         info_layout.addWidget(self.lbl_ann_stats)
 
         info_layout.addStretch()
+
+        self.lbl_active_class = QLabel("Class:")
+        _tip_active_class = (
+            "Class assigned to each new mask you accept — no dialog per mask.\n"
+            "Press 1–9 to switch class while annotating; right-click a mask\n"
+            "for Change Class if you picked the wrong one."
+        )
+        self.lbl_active_class.setToolTip(_tip_active_class)
+        info_layout.addWidget(self.lbl_active_class)
+        self.combo_active_class = QComboBox()
+        self.combo_active_class.setToolTip(_tip_active_class)
+        self.combo_active_class.setMinimumWidth(90)
+        info_layout.addWidget(self.combo_active_class)
 
         self.btn_sam_toggle = QPushButton("SAM Labeling")
         self.btn_sam_toggle.setCheckable(True)
@@ -2895,17 +3047,23 @@ class MaskTrackerWindow(QMainWindow):
             "padding: 3px 6px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #448aff; }"
         )
+        self.btn_edit_classes.setToolTip(
+            "Add, rename, or remove the object classes you draw masks for\n"
+            "(e.g. 'mouse'). These become the segmentation model's classes."
+        )
         self.btn_edit_classes.clicked.connect(self._edit_classes)
         info_layout.addWidget(self.btn_edit_classes)
 
         self.lbl_zoom_info = QLabel("100%")
         self.lbl_zoom_info.setStyleSheet("color: #999999;")
+        self.lbl_zoom_info.setToolTip("Current zoom. Scroll to zoom, 0 resets, +/- step.")
         info_layout.addWidget(self.lbl_zoom_info)
         right_layout.addWidget(info_row)
 
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
+            self.lbl_active_class, self.combo_active_class,
             self.btn_sam_toggle, self.btn_sam_model, self.btn_edit_classes,
             self.lbl_zoom_info,
         ]
@@ -2945,6 +3103,7 @@ class MaskTrackerWindow(QMainWindow):
         self._cls_frame_slider.setMaximum(0)
         self._cls_frame_slider.valueChanged.connect(self._on_cls_slider_changed)
         self._cls_frame_slider.sliderPressed.connect(self._on_cls_slider_pressed)
+        self._cls_frame_slider.setToolTip("Scrub through the loaded video or clip.")
         self._cls_frame_slider.setStyleSheet(
             "QSlider::groove:horizontal { background: #3c3c3c; height: 6px; "
             "border-radius: 3px; }"
@@ -3015,6 +3174,7 @@ class MaskTrackerWindow(QMainWindow):
             "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
             "QPushButton:hover { background-color: #4a4a4a; }"
         )
+        btn_copy_seg_log.setToolTip("Copy the full training log above to the clipboard.")
         btn_copy_seg_log.clicked.connect(self._copy_seg_train_log)
         training_viz_layout.addWidget(btn_copy_seg_log)
 
@@ -3045,6 +3205,7 @@ class MaskTrackerWindow(QMainWindow):
             "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
             "QPushButton:hover { background-color: #4a4a4a; }"
         )
+        btn_copy_log.setToolTip("Copy the full classifier training log to the clipboard.")
         btn_copy_log.clicked.connect(self._copy_cls_train_log)
         cls_train_viz_layout.addWidget(btn_copy_log)
 
@@ -3072,6 +3233,7 @@ class MaskTrackerWindow(QMainWindow):
             "border-radius: 3px; padding: 4px 10px; color: #cccccc; font-size: 10px; }"
             "QPushButton:hover { background-color: #4a4a4a; }"
         )
+        btn_copy_infer_log.setToolTip("Copy the full inference log to the clipboard.")
         btn_copy_infer_log.clicked.connect(self._copy_infer_log)
         infer_log_layout.addWidget(btn_copy_infer_log)
 
@@ -3091,6 +3253,26 @@ class MaskTrackerWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("File > New Project to begin, or load videos directly")
+
+        self._propagate_row_tooltips()
+
+    def _propagate_row_tooltips(self):
+        """Give bare row labels the tooltip of the control they describe.
+
+        Users hover "Confidence:" as readily as the spin box beside it. Any
+        horizontal row carrying exactly one distinct tooltip shares it with the
+        row's untooltipped labels; ambiguous rows are left alone.
+        """
+        for row in self.findChildren(QHBoxLayout):
+            widgets = [row.itemAt(i).widget() for i in range(row.count())]
+            widgets = [w for w in widgets if w is not None]
+            tips = {w.toolTip() for w in widgets if w.toolTip()}
+            if len(tips) != 1:
+                continue
+            tip = tips.pop()
+            for w in widgets:
+                if isinstance(w, QLabel) and not w.toolTip():
+                    w.setToolTip(tip)
 
     def _build_annotator_tab(self):
         # Blue arrow buttons for spin boxes — generate tiny arrow PNGs
@@ -3152,7 +3334,10 @@ class MaskTrackerWindow(QMainWindow):
             "Manual: click to place vertices, Enter to accept.\n"
             "SAM: toggle SAM Labeling button, double-click to place points,\n"
             "  right-click to exclude, Enter to accept.\n"
+            "Editing: drag vertices, right-click to insert one.\n"
+            "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Space/Enter = next frame.\n"
+            "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
             "E = extract current video frame to Training Frames Queue.\n"
             "Arrow keys scrub video (Shift ±10, Ctrl ±100)."
         )
@@ -3528,6 +3713,9 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_scale_min.setSingleStep(0.05)
         self.spin_aug_scale_min.setDecimals(2)
         self.spin_aug_scale_min.setStyleSheet(aug_spin_style)
+        self.spin_aug_scale_min.setToolTip(
+            "Smallest zoom factor applied. 0.80 shrinks the frame to 80%."
+        )
         lbl_smax = QLabel("max:")
         lbl_smax.setStyleSheet(aug_lbl_style)
         self.spin_aug_scale_max = QDoubleSpinBox()
@@ -3536,6 +3724,9 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_scale_max.setSingleStep(0.05)
         self.spin_aug_scale_max.setDecimals(2)
         self.spin_aug_scale_max.setStyleSheet(aug_spin_style)
+        self.spin_aug_scale_max.setToolTip(
+            "Largest zoom factor applied. 1.20 enlarges the frame to 120%."
+        )
         scale_row.addWidget(lbl_smin)
         scale_row.addWidget(self.spin_aug_scale_min)
         scale_row.addWidget(lbl_smax)
@@ -3554,6 +3745,10 @@ class MaskTrackerWindow(QMainWindow):
         self.chk_aug_brightness = QCheckBox("Brightness")
         self.chk_aug_brightness.setChecked(False)
         self.chk_aug_brightness.setStyleSheet(aug_lbl_style)
+        self.chk_aug_brightness.setToolTip(
+            "Randomly brighten or darken training images.\n"
+            "Helps with lighting that drifts across sessions or time of day."
+        )
         bright_row = QHBoxLayout()
         bright_row.setSpacing(4)
         bright_row.addWidget(self.chk_aug_brightness)
@@ -3564,6 +3759,7 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_bright_min.setValue(-10)
         self.spin_aug_bright_min.setSuffix("%")
         self.spin_aug_bright_min.setStyleSheet(aug_spin_style)
+        self.spin_aug_bright_min.setToolTip("Darkest shift applied, as % of original brightness.")
         lbl_bmax = QLabel("max:")
         lbl_bmax.setStyleSheet(aug_lbl_style)
         self.spin_aug_bright_max = QSpinBox()
@@ -3571,6 +3767,7 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_bright_max.setValue(10)
         self.spin_aug_bright_max.setSuffix("%")
         self.spin_aug_bright_max.setStyleSheet(aug_spin_style)
+        self.spin_aug_bright_max.setToolTip("Brightest shift applied, as % of original brightness.")
         bright_row.addWidget(lbl_bmin)
         bright_row.addWidget(self.spin_aug_bright_min)
         bright_row.addWidget(lbl_bmax)
@@ -3603,6 +3800,7 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_contrast_min.setValue(-10)
         self.spin_aug_contrast_min.setSuffix("%")
         self.spin_aug_contrast_min.setStyleSheet(aug_spin_style)
+        self.spin_aug_contrast_min.setToolTip("Lowest contrast shift applied, as % of original.")
         lbl_cmax = QLabel("max:")
         lbl_cmax.setStyleSheet(aug_lbl_style)
         self.spin_aug_contrast_max = QSpinBox()
@@ -3610,6 +3808,7 @@ class MaskTrackerWindow(QMainWindow):
         self.spin_aug_contrast_max.setValue(10)
         self.spin_aug_contrast_max.setSuffix("%")
         self.spin_aug_contrast_max.setStyleSheet(aug_spin_style)
+        self.spin_aug_contrast_max.setToolTip("Highest contrast shift applied, as % of original.")
         contrast_row.addWidget(lbl_cmin)
         contrast_row.addWidget(self.spin_aug_contrast_min)
         contrast_row.addWidget(lbl_cmax)
@@ -3728,10 +3927,16 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton:hover { background-color: #448aff; }"
             "QPushButton:disabled { background-color: #333333; color: #666666; }"
         )
+        self.btn_train.setToolTip(
+            "Train a segmentation model on every accepted mask in this project.\n"
+            "Inferred masks must be approved first — they are not used as ground truth.\n"
+            "The result lands in <project>/models/ and appears in the Inference tab."
+        )
         self.btn_train.clicked.connect(self._start_training)
         train_vbox.addWidget(self.btn_train)
 
         self.train_progress = QProgressBar()
+        self.train_progress.setToolTip("Training progress across the configured iterations.")
         self.train_progress.setVisible(False)
         train_vbox.addWidget(self.train_progress)
 
@@ -3746,6 +3951,7 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton { background-color: #f57c00; color: white; font-weight: bold; }"
             "QPushButton:hover { background-color: #fb8c00; }"
         )
+        self.btn_pause.setToolTip("Suspend training between iterations; resume where it left off.")
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_pause.setVisible(False)
         btn_row.addWidget(self.btn_pause)
@@ -3755,6 +3961,7 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
             "QPushButton:hover { background-color: #e53935; }"
         )
+        self.btn_stop.setToolTip("End training early and keep the best checkpoint so far.")
         self.btn_stop.clicked.connect(self._stop_training)
         self.btn_stop.setVisible(False)
         btn_row.addWidget(self.btn_stop)
@@ -4296,6 +4503,7 @@ class MaskTrackerWindow(QMainWindow):
             "padding: 4px 12px; color: #ffffff; font-size: 11px; font-weight: bold; }"
             "QPushButton:hover { background-color: #e53935; }"
         )
+        self.btn_cls_stop.setToolTip("End classifier training early and keep the best epoch so far.")
         self.btn_cls_stop.clicked.connect(self._stop_cls_training)
         self.btn_cls_stop.setVisible(False)
         cls_train_btn_row.addWidget(self.btn_cls_stop)
@@ -4312,7 +4520,7 @@ class MaskTrackerWindow(QMainWindow):
 
         layout.addStretch()
         scroll.setWidget(widget)
-        self.tab_widget.addTab(scroll, "Actions")
+        self.tab_widget.addTab(scroll, "Behavior")
 
     def _build_tracking_tab(self):
         scroll = QScrollArea()
@@ -4366,8 +4574,10 @@ class MaskTrackerWindow(QMainWindow):
         model_row.addWidget(lbl_model)
         self.combo_track_model = QComboBox()
         self.combo_track_model.setToolTip(
-            "Select a trained detection/segmentation model from this project.\n"
-            "Models are saved in the project's models/ directory after training."
+            "Select a trained detection/segmentation model.\n"
+            "Models from this project's models/ directory are listed\n"
+            "automatically; 'Browse…' points at a model trained in another\n"
+            "project — models are standalone, so any run folder works."
         )
         self.combo_track_model.currentIndexChanged.connect(self._on_track_model_changed)
         model_row.addWidget(self.combo_track_model, 1)
@@ -4493,7 +4703,7 @@ class MaskTrackerWindow(QMainWindow):
             "When enabled, each tracked object accumulates mask data\n"
             "over a sliding window, generates a silhouette composite,\n"
             "and classifies the behavior using the selected model.\n\n"
-            "Requires a trained classifier model from the Classifier tab."
+            "Requires a trained classifier model from the Behavior tab."
         )
         self.chk_behavior_cls.toggled.connect(self._on_behavior_cls_toggled)
         cls_vbox.addWidget(self.chk_behavior_cls)
@@ -4511,7 +4721,11 @@ class MaskTrackerWindow(QMainWindow):
         self.combo_behavior_model.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.combo_behavior_model.setToolTip(
             "Select a trained behavior classifier model.\n"
-            "Models are saved in action_classifier/model/ after training."
+            "Models are saved in action_classifier/model/ after training.\n"
+            "'Browse…' points at a classifier trained in another project."
+        )
+        self.combo_behavior_model.currentIndexChanged.connect(
+            self._on_behavior_model_changed
         )
         row_bcm.addWidget(self.combo_behavior_model, 1)
         btn_refresh_cls = QPushButton("Refresh")
@@ -4695,6 +4909,7 @@ class MaskTrackerWindow(QMainWindow):
             "padding: 8px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #ff9800; }"
         )
+        self.btn_track_pause.setToolTip("Suspend inference between frames; resume where it left off.")
         self.btn_track_pause.clicked.connect(self._toggle_tracking_pause)
         self.btn_track_pause.setVisible(False)
         btn_row.addWidget(self.btn_track_pause)
@@ -4705,6 +4920,7 @@ class MaskTrackerWindow(QMainWindow):
             "padding: 8px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #e53935; }"
         )
+        self.btn_track_stop.setToolTip("Abort the run. Videos already finished keep their output.")
         self.btn_track_stop.clicked.connect(self._stop_tracking)
         self.btn_track_stop.setVisible(False)
         btn_row.addWidget(self.btn_track_stop)
@@ -4806,32 +5022,48 @@ class MaskTrackerWindow(QMainWindow):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
         self.btn_add_folder = QPushButton("Add Folder(s)...")
+        self.btn_add_folder.setToolTip(
+            "Add every video in a folder to this project.\n"
+            "Videos are referenced by path — nothing is copied."
+        )
         self.btn_add_folder.clicked.connect(self._add_video_folder)
         btn_row.addWidget(self.btn_add_folder)
         self.btn_add_files = QPushButton("Add File(s)...")
+        self.btn_add_files.setToolTip("Add individual video files to this project.")
         self.btn_add_files.clicked.connect(self._add_video_files)
         btn_row.addWidget(self.btn_add_files)
         vbox.addLayout(btn_row)
 
         self.video_list = QListWidget()
         self.video_list.setMaximumHeight(120)
+        self.video_list.setToolTip(
+            "Source videos for this project. Select one to scrub it in the\n"
+            "preview; press E to pull the current frame into the queue."
+        )
         self.video_list.currentRowChanged.connect(self._on_video_selected)
         vbox.addWidget(self.video_list)
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(2)
         self.btn_prev_video = QPushButton("< Prev")
+        self.btn_prev_video.setToolTip("Open the previous video in the list.")
         self.btn_prev_video.clicked.connect(self._prev_video)
         nav_row.addWidget(self.btn_prev_video)
         self.lbl_video_num = QLabel("0 / 0")
         self.lbl_video_num.setAlignment(Qt.AlignCenter)
+        self.lbl_video_num.setToolTip("Position of the open video within the project list.")
         nav_row.addWidget(self.lbl_video_num, 1)
         self.btn_next_video = QPushButton("Next >")
+        self.btn_next_video.setToolTip("Open the next video in the list.")
         self.btn_next_video.clicked.connect(self._next_video)
         nav_row.addWidget(self.btn_next_video)
         vbox.addLayout(nav_row)
 
         self.btn_remove_video = QPushButton("Remove Selected")
+        self.btn_remove_video.setToolTip(
+            "Drop this video from the project.\n"
+            "The file on disk and any frames already extracted from it are kept."
+        )
         self.btn_remove_video.clicked.connect(self._remove_selected_video)
         vbox.addWidget(self.btn_remove_video)
 
@@ -4843,39 +5075,78 @@ class MaskTrackerWindow(QMainWindow):
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
+        tip_method = (
+            "How frames are picked out of each video.\n"
+            "Uniform sample: evenly spaced across the whole video.\n"
+            "Random sample: random frames, so repeat runs give different frames.\n"
+            "Every Nth frame: fixed stride; frame count depends on video length.\n"
+            "Diverse sample: clusters candidate frames by appearance and keeps\n"
+            "  one per cluster — best labeling value per frame on fixed-camera\n"
+            "  recordings, at the cost of a slower scan."
+        )
         row = QHBoxLayout()
-        row.addWidget(QLabel("Method:"))
+        row.addWidget(_tipped_label("Method:", tip_method))
         self.combo_method = QComboBox()
-        self.combo_method.addItems(["Uniform sample", "Random sample", "Every Nth frame"])
+        self.combo_method.addItems([
+            "Uniform sample", "Random sample", "Every Nth frame",
+            "Diverse sample (visual)",
+        ])
+        self.combo_method.setToolTip(tip_method)
         self.combo_method.currentIndexChanged.connect(self._on_method_changed)
         row.addWidget(self.combo_method, 1)
         vbox.addLayout(row)
 
+        tip_target = (
+            "Which videos to extract from.\n"
+            "All videos: every video in the project list.\n"
+            "Current video: only the one selected above."
+        )
         row = QHBoxLayout()
-        row.addWidget(QLabel("Target:"))
+        row.addWidget(_tipped_label("Target:", tip_target))
         self.combo_target = QComboBox()
         self.combo_target.addItems(["All videos", "Current video"])
+        self.combo_target.setToolTip(tip_target)
         row.addWidget(self.combo_target, 1)
         vbox.addLayout(row)
 
+        self._tip_count_frames = (
+            "How many frames to pull from each video.\n"
+            "20–50 per video across several videos is usually enough to train\n"
+            "a first model; add more where the model does badly."
+        )
+        self._tip_count_stride = (
+            "Take one frame every N frames.\n"
+            "At 30 fps, N=30 is one frame per second. Long videos will\n"
+            "produce a lot of frames at small strides."
+        )
         row = QHBoxLayout()
         self.lbl_count = QLabel("Frames per video:")
+        self.lbl_count.setToolTip(self._tip_count_frames)
         row.addWidget(self.lbl_count)
         self.spin_count = QSpinBox()
         self.spin_count.setRange(1, 10000)
         self.spin_count.setValue(20)
         self.spin_count.setStyleSheet(self._spin_style)
+        self.spin_count.setToolTip(self._tip_count_frames)
         row.addWidget(self.spin_count)
         vbox.addLayout(row)
 
+        tip_output = (
+            "Folder the extracted .png frames are written to.\n"
+            "Defaults to <project>/training_frames, which is also the folder\n"
+            "the Training Frames Queue reads and the trainer trains on.\n"
+            "Only point this elsewhere if you want frames outside the project."
+        )
         row = QHBoxLayout()
-        row.addWidget(QLabel("Output:"))
+        row.addWidget(_tipped_label("Output:", tip_output))
         self.lbl_output_dir = QLabel("(auto)")
         self.lbl_output_dir.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_output_dir.setWordWrap(True)
+        self.lbl_output_dir.setToolTip(tip_output)
         row.addWidget(self.lbl_output_dir, 1)
         self.btn_browse_output = QPushButton("...")
         self.btn_browse_output.setFixedWidth(30)
+        self.btn_browse_output.setToolTip("Choose a different folder for extracted frames.")
         self.btn_browse_output.clicked.connect(self._browse_output_dir)
         row.addWidget(self.btn_browse_output)
         vbox.addLayout(row)
@@ -4886,11 +5157,16 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton:hover { background-color: #448aff; }"
             "QPushButton:disabled { background-color: #333333; color: #666666; }"
         )
+        self.btn_generate.setToolTip(
+            "Extract frames now using the settings above and add them to the\n"
+            "Training Frames Queue. Frames already extracted are not duplicated."
+        )
         self.btn_generate.clicked.connect(self._generate_frames)
         vbox.addWidget(self.btn_generate)
 
         self.extract_progress = QProgressBar()
         self.extract_progress.setVisible(False)
+        self.extract_progress.setToolTip("Extraction progress across the targeted videos.")
         vbox.addWidget(self.extract_progress)
 
         group.setLayout(vbox)
@@ -4908,6 +5184,14 @@ class MaskTrackerWindow(QMainWindow):
         self.frame_list.setMaximumHeight(320)
         self.frame_list.setColumnCount(3)
         self.frame_list.setHeaderLabels(["Frame", "Annotations", "Conf"])
+        self.frame_list.setToolTip(
+            "Frames available for labeling and training.\n"
+            "Green name = has accepted masks, yellow = inferred masks awaiting\n"
+            "review, grey = unlabeled. Conf is the lowest model confidence on\n"
+            "the frame — sort by it to find the frames the model struggles with.\n"
+            "Italic = no source video linked; still trainable, but Show in\n"
+            "Source Video needs the video added back to the project."
+        )
         header = self.frame_list.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -4919,17 +5203,24 @@ class MaskTrackerWindow(QMainWindow):
         self.frame_list.setSortingEnabled(True)
         self.frame_list.sortByColumn(0, Qt.AscendingOrder)
         self.frame_list.currentItemChanged.connect(self._on_frame_item_changed)
+        self.frame_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.frame_list.customContextMenuRequested.connect(
+            self._on_frame_list_context_menu
+        )
         vbox.addWidget(self.frame_list)
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(2)
         self.btn_prev_frame = QPushButton("< Prev")
+        self.btn_prev_frame.setToolTip("Go to the previous frame in the queue.")
         self.btn_prev_frame.clicked.connect(self._prev_frame)
         nav_row.addWidget(self.btn_prev_frame)
         self.lbl_frame_num = QLabel("0 / 0")
         self.lbl_frame_num.setAlignment(Qt.AlignCenter)
+        self.lbl_frame_num.setToolTip("Position of the open frame within the queue.")
         nav_row.addWidget(self.lbl_frame_num, 1)
         self.btn_next_frame = QPushButton("Next >")
+        self.btn_next_frame.setToolTip("Go to the next frame in the queue (Space / Enter).")
         self.btn_next_frame.clicked.connect(self._next_frame)
         nav_row.addWidget(self.btn_next_frame)
 
@@ -5038,6 +5329,7 @@ class MaskTrackerWindow(QMainWindow):
         }
         self._coco.auto_save_path = os.path.join(d, "annotations", "annotations.json")
         self._save_project_config()
+        self._add_recent_project(os.path.join(d, "project_config.json"))
         self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(d)}")
         self.status_bar.showMessage(f"Created project: {d}")
 
@@ -5049,6 +5341,101 @@ class MaskTrackerWindow(QMainWindow):
         if not path:
             return
         self._load_project(path)
+
+    # ------------------------------------------------------------------
+    # Recent projects
+    # ------------------------------------------------------------------
+    _RECENT_MAX = 10
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("FNT", "MaskTrackerTool")
+
+    def _add_recent_project(self, config_path: str):
+        config_path = os.path.abspath(config_path)
+        s = self._settings()
+        recent = s.value("recent_projects", [], type=list) or []
+        recent = [p for p in recent if p != config_path]
+        recent.insert(0, config_path)
+        s.setValue("recent_projects", recent[: self._RECENT_MAX])
+
+    def _populate_recent_menu(self):
+        self._recent_menu.clear()
+        recent = self._settings().value("recent_projects", [], type=list) or []
+        recent = [p for p in recent if isinstance(p, str)]
+        if not recent:
+            empty = self._recent_menu.addAction("(no recent projects)")
+            empty.setEnabled(False)
+            return
+        for path in recent:
+            name = os.path.basename(os.path.dirname(path)) or path
+            act = self._recent_menu.addAction(name)
+            act.setToolTip(path)
+            if os.path.exists(path):
+                act.triggered.connect(
+                    lambda _=False, p=path: self._load_project(p)
+                )
+            else:
+                act.setText(f"{name}  (missing)")
+                act.setEnabled(False)
+        self._recent_menu.addSeparator()
+        act_clear = self._recent_menu.addAction("Clear Menu")
+        act_clear.triggered.connect(
+            lambda: self._settings().setValue("recent_projects", [])
+        )
+
+    # ------------------------------------------------------------------
+    # Missing-video relink
+    # ------------------------------------------------------------------
+    def _prompt_missing_videos(self, missing: List[str]):
+        names = "\n".join(f"  • {os.path.basename(p)}" for p in missing[:10])
+        if len(missing) > 10:
+            names += f"\n  … and {len(missing) - 10} more"
+        reply = QMessageBox.question(
+            self, "Missing Videos",
+            f"{len(missing)} project video(s) were not found on disk:\n\n"
+            f"{names}\n\n"
+            "If the files moved, you can point at the folder that now\n"
+            "contains them (searched recursively, matched by filename).",
+            QMessageBox.Open | QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Open:
+            self._locate_missing_videos()
+
+    def _locate_missing_videos(self):
+        missing_idx = [
+            i for i, p in enumerate(self.video_paths) if not os.path.exists(p)
+        ]
+        if not missing_idx:
+            QMessageBox.information(
+                self, "No Missing Videos", "All project videos were found on disk."
+            )
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder Containing the Moved Videos"
+        )
+        if not folder:
+            return
+        by_name = {}
+        for root, _dirs, files in os.walk(folder):
+            for f in files:
+                if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                    by_name.setdefault(f, os.path.join(root, f))
+        relinked = 0
+        for i in missing_idx:
+            base = os.path.basename(self.video_paths[i])
+            if base in by_name:
+                self.video_paths[i] = by_name[base]
+                relinked += 1
+        if relinked:
+            self._refresh_video_list()
+            self._relink_frame_provenance()
+            self._autosave_project_config()
+        still = len(missing_idx) - relinked
+        msg = f"Relinked {relinked} video(s)."
+        if still:
+            msg += f" {still} still missing."
+        self.status_bar.showMessage(msg, 5000)
 
     def _migrate_classifier_dir(self):
         old = os.path.join(self._project_dir, "behavior_classifier")
@@ -5130,12 +5517,14 @@ class MaskTrackerWindow(QMainWindow):
         self._cls_data_loaded = False
         self._project_config = cfg
 
+        # Keep missing videos in the list (shown in red) instead of silently
+        # dropping them — the user can relink after moving data or drives.
         saved_paths = cfg.get("video_paths", [])
-        self.video_paths = [p for p in saved_paths if os.path.exists(p)]
-        if len(self.video_paths) < len(saved_paths):
-            n_missing = len(saved_paths) - len(self.video_paths)
-            print(f"[MTT] Skipped {n_missing} video path(s) that no longer exist.")
-        self._refresh_video_list(auto_select=bool(self.video_paths))
+        self.video_paths = list(saved_paths)
+        missing = [p for p in saved_paths if not os.path.exists(p)]
+        self._refresh_video_list(
+            auto_select=any(os.path.exists(p) for p in self.video_paths)
+        )
 
         for cat in cfg.get("categories", []):
             if cat not in self._categories:
@@ -5156,6 +5545,9 @@ class MaskTrackerWindow(QMainWindow):
             self._coco.load(ann_path)
             self._categories = [c["name"] for c in self._coco.categories]
         self._coco.auto_save_path = ann_path
+        self._refresh_active_class_combo()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
         self._rebuild_frame_confidence()
         self._refresh_frame_list()
@@ -5163,6 +5555,9 @@ class MaskTrackerWindow(QMainWindow):
         self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(self._project_dir)}")
         self.status_bar.showMessage(f"Opened project: {self._project_dir}")
         self._update_ann_stats()
+        self._add_recent_project(config_path)
+        if missing:
+            self._prompt_missing_videos(missing)
 
         # Refresh whichever tab is currently visible
         current_tab_idx = self.tab_widget.currentIndex()
@@ -5197,6 +5592,46 @@ class MaskTrackerWindow(QMainWindow):
         with open(path, "w") as f:
             json.dump(self._project_config, f, indent=2)
 
+    def _autosave_project_config(self):
+        """Persist video list + classes immediately, like annotations already do.
+
+        Ctrl+S-only saving quietly lost added videos and class edits whenever
+        the app was closed without an explicit save.
+        """
+        if self._project_dir is None:
+            return
+        self._project_config["video_paths"] = list(self.video_paths)
+        self._project_config["categories"] = list(self._categories)
+        self._save_project_config()
+
+    def _relink_frame_provenance(self):
+        """Re-match queue frames to source videos after the video list changes.
+
+        In-place update of (video, frame_idx) on each queue entry so "Show in
+        Source Video" starts working as soon as the videos are (re)added —
+        no project reload needed.
+        """
+        import re
+        stem_map = {Path(vp).stem: vp for vp in self.video_paths}
+        pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
+        changed = 0
+        for i, (vpath, fidx, png) in enumerate(self._extracted_frames):
+            if vpath and os.path.exists(vpath):
+                continue
+            m = pat.match(Path(png).stem)
+            if m and m.group("stem") in stem_map:
+                self._extracted_frames[i] = (
+                    stem_map[m.group("stem")], int(m.group("idx")), png
+                )
+                changed += 1
+        if changed:
+            # Rows carry the italic "no source" marker, so redraw them.
+            for row in range(len(self._extracted_frames)):
+                self._update_frame_list_item(row)
+            self.status_bar.showMessage(
+                f"Linked {changed} queue frame(s) to their source video.", 4000
+            )
+
     # ==================================================================
     # Videos logic
     # ==================================================================
@@ -5215,6 +5650,8 @@ class MaskTrackerWindow(QMainWindow):
             QMessageBox.information(self, "No Videos", "No video files found in selected folder.")
             return
         self._refresh_video_list()
+        self._relink_frame_provenance()
+        self._autosave_project_config()
         self.status_bar.showMessage(f"Added {added} video(s) from {os.path.basename(folder)}")
 
     def _add_video_files(self):
@@ -5230,18 +5667,32 @@ class MaskTrackerWindow(QMainWindow):
                 self.video_paths.append(f)
                 added += 1
         self._refresh_video_list()
+        self._relink_frame_provenance()
+        self._autosave_project_config()
         self.status_bar.showMessage(f"Added {added} video(s)")
 
     def _refresh_video_list(self, auto_select: bool = True):
         self.video_list.blockSignals(True)
         self.video_list.clear()
         for vp in self.video_paths:
-            item = QListWidgetItem(os.path.basename(vp))
-            item.setToolTip(vp)
+            if os.path.exists(vp):
+                item = QListWidgetItem(os.path.basename(vp))
+                item.setToolTip(vp)
+            else:
+                item = QListWidgetItem(f"{os.path.basename(vp)}  (missing)")
+                item.setForeground(QColor("#e05252"))
+                item.setToolTip(
+                    f"{vp}\n\nFile not found. Use File > Locate Missing "
+                    "Videos... after moving data."
+                )
             self.video_list.addItem(item)
         self.video_list.blockSignals(False)
         if auto_select and self.video_paths and self.current_video_idx < 0:
-            self.video_list.setCurrentRow(0)
+            first_ok = next(
+                (i for i, p in enumerate(self.video_paths) if os.path.exists(p)), None
+            )
+            if first_ok is not None:
+                self.video_list.setCurrentRow(first_ok)
         self._update_nav_state()
 
     def _remove_selected_video(self):
@@ -5252,11 +5703,22 @@ class MaskTrackerWindow(QMainWindow):
         self._close_video()
         self.current_video_idx = -1
         self._refresh_video_list()
+        # Frames extracted from it stay in the queue (still trainable), but
+        # they lose their source link — repaint so the marker appears.
+        for frame_row in range(len(self._extracted_frames)):
+            self._update_frame_list_item(frame_row)
+        self._autosave_project_config()
         if self.video_paths:
             self.video_list.setCurrentRow(min(row, len(self.video_paths) - 1))
 
     def _on_video_selected(self, row: int):
         if row < 0 or row >= len(self.video_paths):
+            return
+        if not os.path.exists(self.video_paths[row]):
+            self.status_bar.showMessage(
+                "Video file is missing — File > Locate Missing Videos... to relink.",
+                5000,
+            )
             return
         self.current_video_idx = row
         self._annot_in_video_mode = True
@@ -5369,9 +5831,13 @@ class MaskTrackerWindow(QMainWindow):
         if idx == 2:
             self.lbl_count.setText("Stride (N):")
             self.spin_count.setValue(30)
+            tip = self._tip_count_stride
         else:
             self.lbl_count.setText("Frames per video:")
             self.spin_count.setValue(20)
+            tip = self._tip_count_frames
+        self.lbl_count.setToolTip(tip)
+        self.spin_count.setToolTip(tip)
 
     def _browse_output_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -5485,10 +5951,13 @@ class MaskTrackerWindow(QMainWindow):
         single-row update (_update_frame_list_item) so both stay in sync.
         Frame name is green if it has any accepted mask, yellow if it only
         has pending (inferred) masks, grey if none. The Annotations column
-        breaks the mask count down by state.
+        breaks the mask count down by state. Frames whose source video is
+        unlinked are italicised — they stay fully usable for training, which
+        reads the .png and annotations only.
         """
-        _, _, fp = self._extracted_frames[idx]
+        vpath, _, fp = self._extracted_frames[idx]
         filename = os.path.basename(fp)
+        has_source = self._frame_source_available(vpath)
         n_total, n_inferred = self._count_annotations_for_file(filename)
         n_approved = n_total - n_inferred
 
@@ -5502,6 +5971,26 @@ class MaskTrackerWindow(QMainWindow):
         item.setText(0, filename)
         item.setData(0, Qt.UserRole, idx)
         item.setForeground(0, name_color)
+
+        # "No source" marker. Italic rather than appended text: the Frame
+        # column truncates in a narrow panel, so a suffix would be invisible
+        # exactly when the panel is small, and colour is already spoken for
+        # by the annotation state above.
+        name_font = item.font(0)
+        name_font.setItalic(not has_source)
+        item.setFont(0, name_font)
+        if has_source:
+            item.setToolTip(
+                0, f"{filename}\nSource: {os.path.basename(vpath)}"
+            )
+        else:
+            item.setToolTip(
+                0,
+                f"{filename}\n\nNo source video linked (shown in italic).\n"
+                "The frame is still fully usable for training — training reads\n"
+                "the .png and its annotations, not the video. Add or relink the\n"
+                "video to re-enable Show in Source Video."
+            )
 
         # Annotations column: number of masks, broken down by state.
         if n_approved and n_inferred:
@@ -5599,11 +6088,28 @@ class MaskTrackerWindow(QMainWindow):
         return (total, n_inferred)
 
     def _scan_frames_dir(self, folder: str):
-        paths = sorted(
-            os.path.join(folder, f) for f in os.listdir(folder)
-            if Path(f).suffix.lower() in IMAGE_EXTENSIONS
-        )
-        self._extracted_frames = [("", 0, p) for p in paths]
+        """Rebuild the frame queue, recovering each frame's source video.
+
+        Extracted frames are named ``{video_stem}_frame_{idx:06d}``; parsing
+        that back (against the project's video list) restores provenance after
+        a reload, so "Show in Source Video" keeps working across sessions.
+        """
+        import re
+        stem_map = {Path(vp).stem: vp for vp in self.video_paths}
+        pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
+        frames = []
+        for f in sorted(os.listdir(folder)):
+            if Path(f).suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            full = os.path.join(folder, f)
+            m = pat.match(Path(f).stem)
+            if m and m.group("stem") in stem_map:
+                frames.append(
+                    (stem_map[m.group("stem")], int(m.group("idx")), full)
+                )
+            else:
+                frames.append(("", 0, full))
+        self._extracted_frames = frames
         self._refresh_frame_list()
 
     def _load_existing_frames(self):
@@ -5637,6 +6143,60 @@ class MaskTrackerWindow(QMainWindow):
         _, _, img_path = self._extracted_frames[row]
         self._load_annotation_frame(img_path)
         self._update_nav_state()
+
+    def _frame_source_available(self, vpath: str) -> bool:
+        """Can this queue frame be traced back to a playable source video?
+
+        Requires project membership as well as an existing file, so the italic
+        "no source" marker and the Show in Source Video menu item can never
+        disagree about the same row.
+        """
+        return bool(vpath) and vpath in self.video_paths and os.path.exists(vpath)
+
+    def _on_frame_list_context_menu(self, pos):
+        item = self.frame_list.itemAt(pos)
+        if item is None:
+            return
+        row = item.data(0, Qt.UserRole)
+        if row is None or not (0 <= row < len(self._extracted_frames)):
+            return
+        vpath, fidx, _path = self._extracted_frames[row]
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #2b2b2b; color: #cccccc; border: 1px solid #555; }"
+            "QMenu::item:selected { background-color: #2979ff; }"
+            "QMenu::item:disabled { color: #666666; }"
+        )
+        act_show = menu.addAction("Show in Source Video")
+        if not self._frame_source_available(vpath):
+            act_show.setEnabled(False)
+            act_show.setText("Show in Source Video (no source linked)")
+        act_delete = menu.addAction("Delete Frame")
+        action = menu.exec_(self.frame_list.viewport().mapToGlobal(pos))
+        if action == act_show:
+            self._jump_to_source_frame(vpath, fidx)
+        elif action == act_delete:
+            self._select_frame_row(row)
+            self._delete_current_frame()
+
+    def _jump_to_source_frame(self, vpath: str, fidx: int):
+        """Open the source video at the frame an extracted png came from."""
+        try:
+            vrow = self.video_paths.index(vpath)
+        except ValueError:
+            return
+        if self.current_video_idx == vrow and self._video_cap is not None:
+            self._annot_in_video_mode = True
+            self.frame_list.blockSignals(True)
+            self.frame_list.clearSelection()
+            self._select_frame_row(-1)
+            self.frame_list.blockSignals(False)
+        else:
+            self.video_list.setCurrentRow(vrow)
+        self._show_video_frame(fidx)
+        self.status_bar.showMessage(
+            f"{os.path.basename(vpath)} @ frame {fidx}", 4000
+        )
 
     def _select_frame_row(self, row: int):
         """Select the QTreeWidget item whose stored frame index == row."""
@@ -5879,12 +6439,22 @@ class MaskTrackerWindow(QMainWindow):
 
         img_id = self._coco._image_id_map[filename]
         anns = self._coco.get_annotations_for_image(img_id)
+        dims = self._coco.image_dims(img_id) or (0, 0)
+
+        from .mask_tracker_annotator import segmentation_to_polygons
 
         for ann in anns:
             cat_name = self._coco.get_category_name(ann["category_id"])
             points = []
-            if ann["segmentation"]:
-                seg = ann["segmentation"][0]
+            # Ground truth is a pixel mask; the editable outline is traced from
+            # it for display. Edits are only written back when the user actually
+            # moves a vertex (see _on_annotation_edited), so simply opening a
+            # frame never rasterises the outline over the stored mask.
+            polys = segmentation_to_polygons(
+                ann["segmentation"], dims[0], dims[1]
+            )
+            if polys:
+                seg = polys[0]
                 for i in range(0, len(seg), 2):
                     points.append((float(seg[i]), float(seg[i + 1])))
             is_inferred = ann.get("inferred", False)
@@ -6113,8 +6683,134 @@ class MaskTrackerWindow(QMainWindow):
         self.status_bar.showMessage(f"Prediction error: {msg}")
 
     # ==================================================================
-    # Class management
+    # Class management, active class, undo/redo
     # ==================================================================
+    def _refresh_active_class_combo(self):
+        """Sync the info-row class selector (and preview menu) with _categories."""
+        current = self.combo_active_class.currentText()
+        self.combo_active_class.blockSignals(True)
+        self.combo_active_class.clear()
+        self.combo_active_class.addItems(self._categories)
+        if current in self._categories:
+            self.combo_active_class.setCurrentText(current)
+        elif self._last_used_category in self._categories:
+            self.combo_active_class.setCurrentText(self._last_used_category)
+        self.combo_active_class.blockSignals(False)
+        self.preview.available_categories = list(self._categories)
+
+    def _active_category(self) -> Optional[str]:
+        cat = self.combo_active_class.currentText().strip()
+        return cat if cat else None
+
+    def _on_category_hotkey(self, idx: int):
+        if 0 <= idx < self.combo_active_class.count():
+            self.combo_active_class.setCurrentIndex(idx)
+            self.status_bar.showMessage(
+                f"Active class: {self.combo_active_class.currentText()}", 2000
+            )
+
+    def _on_reassign_annotation(self, obj_idx: int, cat_name: str):
+        if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
+            return
+        ann = self.preview.annotations[obj_idx]
+        if ann.category == cat_name or ann.ann_id < 0:
+            return
+        if cat_name not in self._coco._category_name_map:
+            return
+        ann_dict = self._coco.get_annotation(ann.ann_id)
+        if ann_dict is None:
+            return
+        before = ann_dict["category_id"]
+        after = self._coco._category_name_map[cat_name]
+        self._coco.update_annotation_category(ann.ann_id, after)
+        ann.category = cat_name
+        self.preview.update()
+        self._push_undo({
+            "type": "reclass", "path": self._current_frame_path(),
+            "ann_id": ann.ann_id, "before": before, "after": after,
+            "label": f"class change to {cat_name}",
+        })
+        self._update_ann_stats()
+        self.status_bar.showMessage(f"Annotation {ann.ann_id} → {cat_name}")
+
+    def _current_frame_path(self) -> str:
+        if 0 <= self.current_frame_idx < len(self._extracted_frames):
+            return self._extracted_frames[self.current_frame_idx][2]
+        return ""
+
+    def _push_undo(self, op: Dict):
+        self._undo_stack.append(op)
+        if len(self._undo_stack) > 200:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _apply_op(self, op: Dict, reverse: bool):
+        t = op["type"]
+        if t == "add":
+            if reverse:
+                self._coco.remove_annotation(op["ann"]["id"])
+            else:
+                self._coco.restore_annotation(copy.deepcopy(op["ann"]))
+        elif t == "delete":
+            if reverse:
+                self._coco.restore_annotation(copy.deepcopy(op["ann"]))
+            else:
+                self._coco.remove_annotation(op["ann"]["id"])
+        elif t == "edit":
+            fields = op["before"] if reverse else op["after"]
+            self._coco.apply_annotation_fields(op["ann_id"], copy.deepcopy(fields))
+        elif t == "approve":
+            if reverse:
+                self._coco.set_inferred(op["ann_id"], True, op.get("score"))
+            else:
+                self._coco.set_inferred(op["ann_id"], False)
+        elif t == "reclass":
+            cat_id = op["before"] if reverse else op["after"]
+            self._coco.update_annotation_category(op["ann_id"], cat_id)
+
+    def _after_undo_redo(self, op: Dict):
+        """Show the affected frame and refresh every dependent view."""
+        path = op.get("path", "")
+        row = next(
+            (i for i, (_, _, p) in enumerate(self._extracted_frames) if p == path),
+            None,
+        )
+        if row is not None and row != self.current_frame_idx:
+            self._select_frame_row(row)
+        elif row is not None:
+            self._load_frame_annotations(path)
+            self.preview.update()
+        self._rebuild_frame_confidence()
+        if row is not None:
+            self._update_frame_list_item(row)
+        self._update_ann_stats()
+
+    def _undo(self):
+        if self.tab_widget.currentIndex() != 0:
+            self.status_bar.showMessage("Undo applies to the Mask tab.", 2000)
+            return
+        if not self._undo_stack:
+            self.status_bar.showMessage("Nothing to undo.", 2000)
+            return
+        op = self._undo_stack.pop()
+        self._apply_op(op, reverse=True)
+        self._redo_stack.append(op)
+        self._after_undo_redo(op)
+        self.status_bar.showMessage(f"Undid {op.get('label', op['type'])}", 3000)
+
+    def _redo(self):
+        if self.tab_widget.currentIndex() != 0:
+            self.status_bar.showMessage("Redo applies to the Mask tab.", 2000)
+            return
+        if not self._redo_stack:
+            self.status_bar.showMessage("Nothing to redo.", 2000)
+            return
+        op = self._redo_stack.pop()
+        self._apply_op(op, reverse=False)
+        self._undo_stack.append(op)
+        self._after_undo_redo(op)
+        self.status_bar.showMessage(f"Redid {op.get('label', op['type'])}", 3000)
+
     def _edit_classes(self):
         dialog = EditClassesDialog(list(self._categories), parent=self)
         if dialog.exec_() == QDialog.Accepted:
@@ -6130,37 +6826,46 @@ class MaskTrackerWindow(QMainWindow):
             if self.current_frame_idx >= 0:
                 _, _, path = self._extracted_frames[self.current_frame_idx]
                 self._load_frame_annotations(path)
+            self._refresh_active_class_combo()
+            self._autosave_project_config()
             self._update_ann_stats()
 
     # ==================================================================
     # Annotation logic
     # ==================================================================
     def _on_annotation_accepted(self):
-        if self._categories:
-            dialog = CategorySelectDialog(
-                self._categories, self._last_used_category, parent=self
-            )
-            if dialog.exec_() != QDialog.Accepted:
-                self.preview._clear_drawing()
-                return
-            cat = dialog.selected_category()
-            if not cat:
-                self.preview._clear_drawing()
-                return
-        else:
-            cat, ok = QInputDialog.getText(
-                self, "Assign Category", "Type category name (e.g. 'vole'):"
-            )
-            if not ok or not cat.strip():
-                self.preview._clear_drawing()
-                return
-            cat = cat.strip()
+        # The active class assigns silently — one dialog per mask killed the
+        # labeling rhythm. The dialogs only remain as the first-run fallback.
+        cat = self._active_category()
+        if cat is None:
+            if self._categories:
+                dialog = CategorySelectDialog(
+                    self._categories, self._last_used_category, parent=self
+                )
+                if dialog.exec_() != QDialog.Accepted:
+                    self.preview._clear_drawing()
+                    return
+                cat = dialog.selected_category()
+                if not cat:
+                    self.preview._clear_drawing()
+                    return
+            else:
+                cat, ok = QInputDialog.getText(
+                    self, "Assign Category", "Type category name (e.g. 'vole'):"
+                )
+                if not ok or not cat.strip():
+                    self.preview._clear_drawing()
+                    return
+                cat = cat.strip()
 
         if cat not in self._categories:
             self._categories.append(cat)
             self._coco.add_category(cat)
+            self._autosave_project_config()
 
         self._last_used_category = cat
+        self._refresh_active_class_combo()
+        self.combo_active_class.setCurrentText(cat)
 
         if self.current_frame_idx < 0:
             return
@@ -6192,23 +6897,100 @@ class MaskTrackerWindow(QMainWindow):
             return
 
         self.preview.accept_annotation(cat, ann_id=ann_id)
+        snapshot = self._coco.get_annotation(ann_id)
+        if snapshot is not None:
+            self._push_undo({
+                "type": "add", "path": path,
+                "ann": copy.deepcopy(snapshot),
+                "label": f"add {cat} mask",
+            })
         self._update_ann_stats()
         self.status_bar.showMessage(f"Annotation saved: {cat} (id={ann_id})")
+
+    def _on_edit_mode_blocked(self):
+        self.status_bar.showMessage(
+            "Editing a mask — press Enter to finish or Esc to cancel "
+            "before drawing a new one.", 3000
+        )
 
     def _on_annotation_edited(self, obj_idx: int):
         if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
             return
         ann = self.preview.annotations[obj_idx]
         if ann.ann_id >= 0:
+            before_dict = self._coco.get_annotation(ann.ann_id)
+            if before_dict is None:
+                return
+
+            # Committing an unchanged outline would rasterise the traced
+            # polygon over a pixel-exact stored mask, quietly coarsening it.
+            # Only write when a vertex actually moved.
+            if not self._annotation_shape_changed(before_dict, ann.points):
+                self.status_bar.showMessage(
+                    f"Annotation {ann.ann_id} unchanged", 2000
+                )
+                return
+
+            before = {k: copy.deepcopy(before_dict[k])
+                      for k in ("segmentation", "bbox", "area")
+                      if k in before_dict}
             self._coco.update_annotation_polygon(ann.ann_id, ann.points)
+            after_dict = self._coco.get_annotation(ann.ann_id)
+            if after_dict is not None:
+                after = {k: copy.deepcopy(after_dict[k])
+                         for k in ("segmentation", "bbox", "area")
+                         if k in after_dict}
+                self._push_undo({
+                    "type": "edit", "path": self._current_frame_path(),
+                    "ann_id": ann.ann_id, "before": before, "after": after,
+                    "label": "mask edit",
+                })
             self.status_bar.showMessage(f"Annotation {ann.ann_id} updated")
+
+    def _annotation_shape_changed(self, ann_dict: Dict, points: list) -> bool:
+        """Did the user actually move a vertex of this annotation's outline?"""
+        from .mask_tracker_annotator import segmentation_to_polygons
+        dims = self._coco.image_dims(ann_dict["image_id"])
+        if dims is None:
+            return True
+        polys = segmentation_to_polygons(ann_dict["segmentation"], dims[0], dims[1])
+        if not polys:
+            return True
+        original = [
+            (float(polys[0][i]), float(polys[0][i + 1]))
+            for i in range(0, len(polys[0]), 2)
+        ]
+        if len(original) != len(points):
+            return True
+        return any(
+            abs(ox - px) > 1e-6 or abs(oy - py) > 1e-6
+            for (ox, oy), (px, py) in zip(original, points)
+        )
+
+    def _on_edit_cancelled(self):
+        """Escape during editing: drop uncommitted vertex drags.
+
+        The preview points may have been dragged, but COCO was never updated —
+        reload from COCO so the display matches what's stored.
+        """
+        path = self._current_frame_path()
+        if path:
+            self._load_frame_annotations(path)
+            self.preview.update()
 
     def _on_approve_annotation_by_index(self, obj_idx: int):
         if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
             return
         ann = self.preview.annotations[obj_idx]
         if ann.ann_id >= 0 and ann.inferred:
+            ann_dict = self._coco.get_annotation(ann.ann_id)
+            score = ann_dict.get("score") if ann_dict else None
             self._coco.approve_annotation(ann.ann_id)
+            self._push_undo({
+                "type": "approve", "path": self._current_frame_path(),
+                "ann_id": ann.ann_id, "score": score,
+                "label": "mask approval",
+            })
             ann.inferred = False
             self.preview.update()
             self._recalc_current_frame_confidence()
@@ -6221,11 +7003,20 @@ class MaskTrackerWindow(QMainWindow):
         ann = self.preview.annotations[obj_idx]
         ann_id = ann.ann_id
         if ann_id >= 0:
+            snapshot = self._coco.get_annotation(ann_id)
+            if snapshot is not None:
+                self._push_undo({
+                    "type": "delete", "path": self._current_frame_path(),
+                    "ann": copy.deepcopy(snapshot),
+                    "label": f"delete of {ann.category} mask",
+                })
             self._coco.remove_annotation(ann_id)
         self.preview.annotations.pop(obj_idx)
         self.preview.update()
         self._update_ann_stats()
-        self.status_bar.showMessage(f"Annotation {ann_id} deleted")
+        self.status_bar.showMessage(
+            f"Annotation {ann_id} deleted — Ctrl+Z to undo"
+        )
 
     # ==================================================================
     # Export / Import (kept in File menu)
@@ -6254,6 +7045,9 @@ class MaskTrackerWindow(QMainWindow):
             return
         self._coco.load(path)
         self._categories = [c["name"] for c in self._coco.categories]
+        self._refresh_active_class_combo()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         if self.current_frame_idx >= 0:
             _, _, img_path = self._extracted_frames[self.current_frame_idx]
             self._load_frame_annotations(img_path)
@@ -6902,7 +7696,7 @@ class MaskTrackerWindow(QMainWindow):
             if score > max_score:
                 max_score = score
 
-            self._coco.add_annotation_from_polygon(
+            self._coco.add_annotation_from_segmentation(
                 image_id=img_id,
                 category_id=cat_id,
                 segmentation=det["segmentation"],
@@ -9373,60 +10167,136 @@ class MaskTrackerWindow(QMainWindow):
     # ==================================================================
     # Tracking
     # ==================================================================
+    # -- Model discovery: project models + external (browsed) models --------
+    #
+    # Models are standalone artifacts: everything inference needs lives in the
+    # run folder (weights + training_config.json with categories). The combos
+    # therefore also list models browsed from *other* projects, persisted
+    # globally in QSettings, so a trained model can be pointed at novel data.
+
+    _EXT_TRACK_KEY = "external_track_models"
+    _EXT_BEHAVIOR_KEY = "external_behavior_models"
+    _BROWSE_LABEL = "Browse for model folder…"
+
+    @staticmethod
+    def _is_track_model_dir(d: str) -> bool:
+        return os.path.isdir(d) and (
+            os.path.exists(os.path.join(d, "weights_best.pt"))
+            or os.path.exists(os.path.join(d, "weights.pt"))
+        )
+
+    @staticmethod
+    def _is_behavior_model_dir(d: str) -> bool:
+        return (
+            os.path.isfile(os.path.join(d, "classifier_config.json"))
+            and os.path.isfile(os.path.join(d, "best_classifier.pth"))
+        )
+
+    def _external_models(self, key: str, validator) -> List[str]:
+        stored = self._settings().value(key, [], type=list) or []
+        return [p for p in stored if isinstance(p, str) and validator(p)]
+
+    def _remember_external_model(self, key: str, path: str):
+        s = self._settings()
+        stored = s.value(key, [], type=list) or []
+        stored = [p for p in stored if p != path]
+        stored.insert(0, path)
+        s.setValue(key, stored[:20])
+
+    @staticmethod
+    def _track_model_label(run_dir: str, external: bool = False) -> str:
+        entry = os.path.basename(run_dir)
+        label = entry
+        config_path = os.path.join(run_dir, "training_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                arch = cfg.get("architecture", "maskrcnn")
+                cats = cfg.get("categories", {})
+                cat_names = list(cats.values()) if isinstance(cats, dict) else cats
+                cat_str = ", ".join(str(c) for c in cat_names) if cat_names else "?"
+                if arch == "yolov11-seg":
+                    variant = cfg.get("model_variant", "yolo11n-seg")
+                    label = f"{entry}  [YOLO {variant}: {cat_str}]"
+                else:
+                    backbone = cfg.get("backbone", "?")
+                    label = f"{entry}  [{backbone}: {cat_str}]"
+            except Exception:
+                pass
+        if external:
+            label += "  (external)"
+        return label
+
     def _refresh_model_list(self):
+        self.combo_track_model.blockSignals(True)
         self.combo_track_model.clear()
         self._track_model_dirs = []
-        if not self._project_dir:
-            self.lbl_track_model_info.setText("No project open")
-            self._update_tracking_button_state()
-            return
 
-        models_root = os.path.join(self._project_dir, "models")
-        if not os.path.isdir(models_root):
-            self.lbl_track_model_info.setText("No models/ directory found — train a model first")
-            self._update_tracking_button_state()
-            return
+        n_project = 0
+        if self._project_dir:
+            models_root = os.path.join(self._project_dir, "models")
+            if os.path.isdir(models_root):
+                for entry in sorted(os.listdir(models_root)):
+                    run_dir = os.path.join(models_root, entry)
+                    if not self._is_track_model_dir(run_dir):
+                        continue
+                    self.combo_track_model.addItem(self._track_model_label(run_dir))
+                    self._track_model_dirs.append(run_dir)
+                    n_project += 1
 
-        for entry in sorted(os.listdir(models_root)):
-            run_dir = os.path.join(models_root, entry)
-            if not os.path.isdir(run_dir):
+        for run_dir in self._external_models(
+            self._EXT_TRACK_KEY, self._is_track_model_dir
+        ):
+            if run_dir in self._track_model_dirs:
                 continue
-            has_weights = (
-                os.path.exists(os.path.join(run_dir, "weights_best.pt"))
-                or os.path.exists(os.path.join(run_dir, "weights.pt"))
+            self.combo_track_model.addItem(
+                self._track_model_label(run_dir, external=True)
             )
-            if not has_weights:
-                continue
-
-            label = entry
-            config_path = os.path.join(run_dir, "training_config.json")
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path) as f:
-                        cfg = json.load(f)
-                    arch = cfg.get("architecture", "maskrcnn")
-                    cats = cfg.get("categories", {})
-                    cat_names = list(cats.values()) if isinstance(cats, dict) else cats
-                    cat_str = ", ".join(str(c) for c in cat_names) if cat_names else "?"
-                    if arch == "yolov11-seg":
-                        variant = cfg.get("model_variant", "yolo11n-seg")
-                        label = f"{entry}  [YOLO {variant}: {cat_str}]"
-                    else:
-                        backbone = cfg.get("backbone", "?")
-                        label = f"{entry}  [{backbone}: {cat_str}]"
-                except Exception:
-                    pass
-
-            self.combo_track_model.addItem(label)
             self._track_model_dirs.append(run_dir)
 
-        if not self._track_model_dirs:
-            self.lbl_track_model_info.setText("No trained models found — train a model first")
+        # Browse entry is always last; None marks it in the parallel dir list.
+        self.combo_track_model.addItem(self._BROWSE_LABEL)
+        self._track_model_dirs.append(None)
+
+        real = [d for d in self._track_model_dirs if d is not None]
+        if not real:
+            self.combo_track_model.setCurrentIndex(-1)
+            self.lbl_track_model_info.setText(
+                "No trained models — train one, or Browse for a model "
+                "folder from another project."
+            )
         else:
-            last_idx = len(self._track_model_dirs) - 1
-            self.combo_track_model.setCurrentIndex(last_idx)
-            self._on_track_model_changed(last_idx)
+            # Default to the newest project model, else the first external.
+            sel = n_project - 1 if n_project else 0
+            self.combo_track_model.setCurrentIndex(sel)
+        self.combo_track_model.blockSignals(False)
+        if real:
+            self._on_track_model_changed(self.combo_track_model.currentIndex())
         self._fit_combo_popup(self.combo_track_model)
+        self._update_tracking_button_state()
+
+    def _browse_external_track_model(self):
+        prev = getattr(self, "_prev_track_model_idx", -1)
+        d = QFileDialog.getExistingDirectory(self, "Select Model Folder")
+        if d and self._is_track_model_dir(d):
+            self._remember_external_model(self._EXT_TRACK_KEY, d)
+            self._refresh_model_list()
+            if d in self._track_model_dirs:
+                self.combo_track_model.setCurrentIndex(
+                    self._track_model_dirs.index(d)
+                )
+            return
+        if d:
+            QMessageBox.warning(
+                self, "Not a Model Folder",
+                "That folder has no weights_best.pt / weights.pt.\n"
+                "Select a training run folder (e.g. <project>/models/<run>)."
+            )
+        # Cancelled or invalid: restore the previous selection.
+        self.combo_track_model.blockSignals(True)
+        self.combo_track_model.setCurrentIndex(prev)
+        self.combo_track_model.blockSignals(False)
         self._update_tracking_button_state()
 
     @staticmethod
@@ -9444,6 +10314,10 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_track_model_info.setText("No model selected")
             return
         run_dir = self._track_model_dirs[index]
+        if run_dir is None:  # "Browse…" sentinel
+            self._browse_external_track_model()
+            return
+        self._prev_track_model_idx = index
         config_path = os.path.join(run_dir, "training_config.json")
         if os.path.exists(config_path):
             try:
@@ -9510,67 +10384,120 @@ class MaskTrackerWindow(QMainWindow):
     def _on_behavior_cls_toggled(self, enabled: bool):
         self._behavior_cls_container.setVisible(enabled)
 
+    @staticmethod
+    def _behavior_model_label(run_dir: str, external: bool = False) -> str:
+        entry = os.path.basename(run_dir)
+        label = entry
+        try:
+            with open(os.path.join(run_dir, "classifier_config.json")) as f:
+                cfg = json.load(f)
+            classes = cfg.get("class_names", [])
+            backbone = cfg.get("backbone", "?")
+            n_cls = cfg.get("n_classes", len(classes))
+            cls_str = ", ".join(classes) if classes else "?"
+            label = f"{entry}  [{backbone}: {n_cls} classes — {cls_str}]"
+        except Exception:
+            pass
+        if external:
+            label += "  (external)"
+        return label
+
     def _refresh_classifier_model_list(self):
+        # NOTE: uses _behavior_model_dirs, NOT _cls_model_dirs — the Behavior
+        # tab's segmentation-model combo owns that list; sharing it meant the
+        # two tabs could silently swap each other's model paths.
+        self.combo_behavior_model.blockSignals(True)
         self.combo_behavior_model.clear()
-        self._cls_model_dirs = []
-        if not self._project_dir:
-            self.lbl_behavior_model_info.setText("No project open")
-            return
+        self._behavior_model_dirs = []
 
-        cls_root = os.path.join(self._project_dir, "action_classifier", "model")
-        if not os.path.isdir(cls_root):
-            self.lbl_behavior_model_info.setText(
-                "No classifier models found — train one in the Classifier tab"
+        n_project = 0
+        if self._project_dir:
+            cls_root = os.path.join(self._project_dir, "action_classifier", "model")
+            if os.path.isdir(cls_root):
+                for entry in sorted(os.listdir(cls_root)):
+                    run_dir = os.path.join(cls_root, entry)
+                    if not self._is_behavior_model_dir(run_dir):
+                        continue
+                    self.combo_behavior_model.addItem(
+                        self._behavior_model_label(run_dir)
+                    )
+                    self._behavior_model_dirs.append(run_dir)
+                    n_project += 1
+
+        for run_dir in self._external_models(
+            self._EXT_BEHAVIOR_KEY, self._is_behavior_model_dir
+        ):
+            if run_dir in self._behavior_model_dirs:
+                continue
+            self.combo_behavior_model.addItem(
+                self._behavior_model_label(run_dir, external=True)
             )
-            return
+            self._behavior_model_dirs.append(run_dir)
 
-        for entry in sorted(os.listdir(cls_root)):
-            run_dir = os.path.join(cls_root, entry)
-            cfg_path = os.path.join(run_dir, "classifier_config.json")
-            if not os.path.isfile(cfg_path):
-                continue
-            best_path = os.path.join(run_dir, "best_classifier.pth")
-            if not os.path.isfile(best_path):
-                continue
+        self.combo_behavior_model.addItem(self._BROWSE_LABEL)
+        self._behavior_model_dirs.append(None)
 
-            label = entry
-            try:
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                classes = cfg.get("class_names", [])
-                backbone = cfg.get("backbone", "?")
-                n_cls = cfg.get("n_classes", len(classes))
-                cls_str = ", ".join(classes) if classes else "?"
-                label = f"{entry}  [{backbone}: {n_cls} classes — {cls_str}]"
-            except Exception:
-                pass
-
-            self.combo_behavior_model.addItem(label)
-            self._cls_model_dirs.append(run_dir)
-
-        if not self._cls_model_dirs:
+        real = [d for d in self._behavior_model_dirs if d is not None]
+        if not real:
+            self.combo_behavior_model.setCurrentIndex(-1)
             self.lbl_behavior_model_info.setText(
-                "No classifier models found — train one in the Classifier tab"
+                "No classifier models — train one in the Behavior tab, "
+                "or Browse for one from another project."
             )
             self.chk_behavior_cls.setChecked(False)
             self.chk_behavior_cls.setEnabled(False)
         else:
             self.chk_behavior_cls.setEnabled(True)
-            last_idx = len(self._cls_model_dirs) - 1
-            self.combo_behavior_model.setCurrentIndex(last_idx)
-            run_dir = self._cls_model_dirs[last_idx]
-            try:
-                with open(os.path.join(run_dir, "classifier_config.json")) as f:
-                    cfg = json.load(f)
-                classes = cfg.get("class_names", [])
-                self.lbl_behavior_model_info.setText(
-                    f"Classes: {', '.join(classes)}  |  "
-                    f"Backbone: {cfg.get('backbone', '?')}"
-                )
-            except Exception:
-                self.lbl_behavior_model_info.setText(f"Path: {run_dir}")
+            sel = n_project - 1 if n_project else 0
+            self.combo_behavior_model.setCurrentIndex(sel)
+        self.combo_behavior_model.blockSignals(False)
+        if real:
+            self._on_behavior_model_changed(
+                self.combo_behavior_model.currentIndex()
+            )
             self._on_behavior_cls_toggled(self.chk_behavior_cls.isChecked())
         self._fit_combo_popup(self.combo_behavior_model)
+
+    def _on_behavior_model_changed(self, index: int):
+        dirs = getattr(self, "_behavior_model_dirs", [])
+        if index < 0 or index >= len(dirs):
+            return
+        run_dir = dirs[index]
+        if run_dir is None:  # "Browse…" sentinel
+            self._browse_external_behavior_model()
+            return
+        self._prev_behavior_model_idx = index
+        try:
+            with open(os.path.join(run_dir, "classifier_config.json")) as f:
+                cfg = json.load(f)
+            classes = cfg.get("class_names", [])
+            self.lbl_behavior_model_info.setText(
+                f"Classes: {', '.join(classes)}  |  "
+                f"Backbone: {cfg.get('backbone', '?')}"
+            )
+        except Exception:
+            self.lbl_behavior_model_info.setText(f"Path: {run_dir}")
+
+    def _browse_external_behavior_model(self):
+        prev = getattr(self, "_prev_behavior_model_idx", -1)
+        d = QFileDialog.getExistingDirectory(self, "Select Classifier Model Folder")
+        if d and self._is_behavior_model_dir(d):
+            self._remember_external_model(self._EXT_BEHAVIOR_KEY, d)
+            self._refresh_classifier_model_list()
+            if d in self._behavior_model_dirs:
+                self.combo_behavior_model.setCurrentIndex(
+                    self._behavior_model_dirs.index(d)
+                )
+            return
+        if d:
+            QMessageBox.warning(
+                self, "Not a Classifier Folder",
+                "That folder has no classifier_config.json / best_classifier.pth.\n"
+                "Select a run folder (e.g. <project>/action_classifier/model/<run>)."
+            )
+        self.combo_behavior_model.blockSignals(True)
+        self.combo_behavior_model.setCurrentIndex(prev)
+        self.combo_behavior_model.blockSignals(False)
 
     def _add_tracking_videos(self):
         had_none = self.list_track_videos.count() == 0
@@ -9608,13 +10535,16 @@ class MaskTrackerWindow(QMainWindow):
         self._update_tracking_button_state()
 
     def _update_tracking_button_state(self):
-        has_model = bool(getattr(self, "_track_model_dirs", []))
+        idx = self.combo_track_model.currentIndex()
+        dirs = getattr(self, "_track_model_dirs", [])
+        has_model = 0 <= idx < len(dirs) and dirs[idx] is not None
         has_videos = self.list_track_videos.count() > 0
         self.btn_start_tracking.setEnabled(has_model and has_videos)
 
     def _start_tracking(self):
         model_idx = self.combo_track_model.currentIndex()
-        if model_idx < 0 or model_idx >= len(self._track_model_dirs):
+        if (model_idx < 0 or model_idx >= len(self._track_model_dirs)
+                or self._track_model_dirs[model_idx] is None):
             QMessageBox.warning(self, "No Model", "Select a trained model first.")
             return
         if self.list_track_videos.count() == 0:
@@ -9743,13 +10673,14 @@ class MaskTrackerWindow(QMainWindow):
         classifier_dir = None
         if self.chk_behavior_cls.isChecked():
             cls_idx = self.combo_behavior_model.currentIndex()
-            if cls_idx >= 0 and cls_idx < len(self._cls_model_dirs):
-                classifier_dir = self._cls_model_dirs[cls_idx]
+            dirs = getattr(self, "_behavior_model_dirs", [])
+            if 0 <= cls_idx < len(dirs) and dirs[cls_idx] is not None:
+                classifier_dir = dirs[cls_idx]
             else:
                 QMessageBox.warning(
                     self, "No Classifier Model",
                     "Behavior classification is enabled but no classifier model\n"
-                    "is selected. Train a model in the Classifier tab first,\n"
+                    "is selected. Train a model in the Behavior tab first,\n"
                     "or uncheck 'Enable behavior classification'."
                 )
                 return
@@ -10120,5 +11051,12 @@ class MaskTrackerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._close_video()
-        # Annotations are auto-saved on every action, so no prompt needed.
+        # Annotations and the project config are auto-saved on every action.
+        self._autosave_project_config()
+        self._tab_anim_timer.stop()
+        # Join the background hardware probe so Qt doesn't tear the QThread
+        # down mid-run ("QThread: Destroyed while thread is still running").
+        worker = getattr(self, "_sysprofile_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.wait(2000)
         event.accept()

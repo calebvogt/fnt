@@ -6,6 +6,7 @@ engine, streaming live agent positions back to the canvas during the first trial
 """
 from __future__ import annotations
 
+import copy
 import os
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from ..core.presets import (
 from ..core.project import Project, list_projects, default_root
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
+from .protocol_timeline import ProtocolTimeline, describe as describe_event
 
 try:  # 3D live view needs pyqtgraph.opengl (PyOpenGL); fall back if absent
     from .pg_canvas import Arena3DView
@@ -199,7 +201,6 @@ class ABMAWindow(QMainWindow):
         if cfg.total_agents() == 0:
             self._stop_preview()
             return
-        import copy
         from ..core.simulation import Simulation
         pcfg = copy.deepcopy(cfg)
         pcfg.n_trials = 1
@@ -1150,7 +1151,6 @@ class ABMAWindow(QMainWindow):
             self._render_agent_cards()
 
     def _dup_agent_type(self, i):
-        import copy
         self._agent_types.insert(i + 1, copy.deepcopy(self._agent_types[i]))
         self._render_agent_cards()
 
@@ -1188,6 +1188,27 @@ class ABMAWindow(QMainWindow):
         ess.addRow("Replicates", self.in_trials)
         ess.addRow("Resolution", self.in_fidelity)
         lay.addLayout(ess)
+
+        # ---- protocol timeline (timed add/remove of animals & resources) ----
+        proto_box = QGroupBox("Experiment protocol")
+        pl = QVBoxLayout(proto_box)
+        proto_hint = QLabel(
+            "Mid-experiment manipulations: introduce or trap out animals, "
+            "place or remove food/water. Click the timeline to schedule one.")
+        proto_hint.setWordWrap(True)
+        proto_hint.setStyleSheet("color:#8a9099; font-size:11px;")
+        pl.addWidget(proto_hint)
+        self.timeline = ProtocolTimeline(self._protocol_context)
+        pl.addWidget(self.timeline)
+        prow = QHBoxLayout()
+        b_ev = QPushButton("＋ Schedule manipulation…")
+        b_ev.clicked.connect(
+            lambda: self.timeline._add_event(self.in_days.value() / 2))
+        prow.addWidget(b_ev)
+        prow.addStretch()
+        pl.addLayout(prow)
+        lay.addWidget(proto_box)
+        self.in_days.valueChanged.connect(self.timeline.set_days)
 
         # ---- advanced knobs (collapsed by default) ----
         self.in_dt = _dspin(0.1, 60, 2.0, 0.5, " s")
@@ -1486,6 +1507,26 @@ class ABMAWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # Config <-> UI
     # ------------------------------------------------------------------ #
+    def _protocol_context(self) -> dict:
+        """Live context handed to the timeline's event editor."""
+        labels = []
+        try:
+            labels = [o.label for o in self._arena_from_table().objects
+                      if o.label]
+        except Exception:
+            pass
+        # resources scheduled for addition are also removable later
+        for ev in self.timeline.protocol() if hasattr(self, "timeline") else []:
+            if ev.kind == "add_resource" and ev.object is not None \
+                    and ev.object.label and ev.object.label not in labels:
+                labels.append(ev.object.label)
+        return {
+            "groups": self._agent_types,
+            "resource_labels": labels,
+            "arena_wh": (self.in_width.value(), self.in_height.value()),
+            "days": self.in_days.value(),
+        }
+
     def _collect_config(self) -> ExperimentConfig:
         arena = self._arena_from_table()
         groups = [g for g in self._agent_types]
@@ -1495,6 +1536,7 @@ class ABMAWindow(QMainWindow):
         return ExperimentConfig(
             name=self.in_name.text().strip() or "experiment",
             arena=arena, groups=groups,
+            protocol=copy.deepcopy(self.timeline.protocol()),
             interventions=self._interventions_from_table(),
             dynamics=self._dynamics_from_table(),
             days=self.in_days.value(), dt=self.in_dt.value(),
@@ -1511,10 +1553,14 @@ class ABMAWindow(QMainWindow):
             parallel=self.in_parallel.isChecked(),
             n_workers=self.in_workers.value(),
             trial_prefix="S",
+            policy=copy.deepcopy(self._policy),
         )
 
     def _load_config(self, cfg: ExperimentConfig):
         self._loading = True          # suppress dirty-tracking during populate
+        # policy params have no editor widgets (yet) — carry them through so a
+        # tuned config's movement weights survive the GUI round-trip
+        self._policy = copy.deepcopy(cfg.policy)
         # arena attributes without a table cell ride along on the window
         self._zones = list(cfg.arena.zones)
         self._poles = list(cfg.arena.poles)
@@ -1539,9 +1585,11 @@ class ABMAWindow(QMainWindow):
         for o in cfg.arena.objects:
             self._add_obj_row(o)
         self.obj_table.blockSignals(False)
-        import copy
         self._agent_types = [copy.deepcopy(g) for g in cfg.groups]
         self._render_agent_cards()
+        if hasattr(self, "timeline"):
+            self.timeline.set_protocol(
+                copy.deepcopy(getattr(cfg, "protocol", []) or []), cfg.days)
         if hasattr(self, "iv_table"):
             self.iv_table.setRowCount(0)
             for iv in cfg.interventions:
@@ -1679,6 +1727,13 @@ class ABMAWindow(QMainWindow):
                         f"({cfg.dt}s); positions logged every step.")
         if cfg.enable_mortality and not cfg.arena.objects_of("food"):
             warn.append("Mortality ON with no food: agents will starve.")
+        for ev in getattr(cfg, "protocol", []):
+            if ev.at_day > cfg.days:
+                warn.append(f"Protocol event after the experiment ends "
+                            f"({describe_event(ev)}, duration {cfg.days:g} d).")
+            if ev.kind == "add_agents" and ev.group is None:
+                warn.append(f"Protocol event has no agent type "
+                            f"({describe_event(ev)}).")
         n = cfg.total_agents()
         samples = int(cfg.days * 86400 / cfg.record_interval)
         est_rows = samples * n * cfg.n_trials

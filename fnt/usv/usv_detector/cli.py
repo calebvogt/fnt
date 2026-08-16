@@ -182,6 +182,17 @@ def _cmd_train(args: argparse.Namespace) -> int:
             return
         if status == 'device':
             print(f"  device: {info.get('device', '?')}")
+        elif status == 'split':
+            level = info.get('split_level', '?')
+            print(f"  split: {level}-level — "
+                  f"{info.get('n_val_groups', 0)}/{info.get('n_groups', 0)} "
+                  f"group(s) held out, "
+                  f"{info.get('n_train_tiles', 0)} train / "
+                  f"{info.get('n_val_tiles', 0)} val tiles")
+            if not info.get('val_held_out', True):
+                print("  WARNING: validation is not held out at the recording "
+                      "level — val scores will flatter the model.",
+                      file=sys.stderr)
         elif status == 'training':
             tl, vl = info.get('train_loss'), info.get('val_loss')
             msg = f"  epoch {epoch}/{n_epochs}"
@@ -201,7 +212,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
     except RuntimeError as e:
         print(f"Training failed: {e}", file=sys.stderr)
         return 1
+    dice = summary.get('best_val_dice')
+    dice_str = f"{dice:.3f}" if isinstance(dice, (int, float)) else "?"
     print(f"Done — model saved to {summary.get('model_path', '?')}")
+    print(f"  val_dice={dice_str} "
+          f"({summary.get('split_level', '?')}-level split"
+          f"{'' if summary.get('val_held_out') else ', NOT held out'})")
     return 0
 
 

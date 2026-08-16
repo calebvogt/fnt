@@ -270,8 +270,109 @@ def _hemisync_probe_a():
     )
 
 
-PROTOCOLS = {p.key: p for p in [_hemisync_probe_a(), _binaural_10min(),
-                                _heterodyne()]}
+def _hemisync_probe_s():
+    """Speakers-only sibling of Probe A — no headphones required.
+
+    A binaural beat cannot survive open air: both tones reach both ears and
+    physically sum, so the interaural difference that defines "binaural" is
+    gone. But what that summation *produces* is an amplitude-modulated
+    waveform whose envelope beats at the difference frequency — a monaural
+    beat. The cochlea receives a real 10 Hz envelope, which drives the
+    auditory steady-state response far more robustly than a binaural beat
+    (whose beat exists only after binaural convergence in the brainstem).
+
+    For hemisphere synchronization specifically that may be the *better*
+    stimulus: both ears — and via bilateral auditory projections, both
+    hemispheres — receive the identical physical rhythm. Two oscillators
+    driven by one external clock are phase-locked to each other.
+
+    Practical speaker constraints baked in: 440 Hz carrier (laptop speakers
+    roll off steeply below ~300 Hz, so Probe A's 200 Hz would be thin), 100%
+    modulation depth, and the set-up phase plays the tone while you adjust
+    the volume, since speaker level varies with room and distance.
+
+    Same control structure as Probe A, so the two probes are directly
+    comparable: headphones/binaural vs speakers/physical-AM.
+    """
+    return Protocol(
+        key="probe_s",
+        name="Hemi-Sync Probe S  (speakers, 9 min)",
+        description=("Speakers-only controlled probe: eyes-open → eyes-closed "
+                     "→ steady tone → 10 Hz AM tone → rest. No headphones."),
+        phases=[
+            Phase(
+                "Set up",
+                "No headphones needed — this probe uses the laptop speakers.\n\n"
+                "A steady tone is playing: set your volume to comfortable-but-"
+                "clear, sit at arm's length from the laptop, then Continue.",
+                None,
+                actions=["audio_control"],
+                params={"base": 440},
+                speech="This session uses the laptop speakers. No headphones. "
+                       "A steady tone is playing now. Set your volume so it is "
+                       "comfortable but clearly audible, sit at about arm's "
+                       "length from the laptop, and press continue when ready.",
+            ),
+            Phase(
+                "Eyes open",
+                "Eyes OPEN. Rest your gaze on one spot and stay still.\n\n"
+                "Silence for this control block.",
+                60,
+                actions=["audio_off", "start_recording"],
+                speech="Block one. Keep your eyes open and rest your gaze on "
+                       "one spot. Stay still and breathe normally for one minute.",
+            ),
+            Phase(
+                "Eyes closed rest",
+                "Now CLOSE your eyes and rest. No sound this block.",
+                90,
+                actions=["calibrate"],
+                speech="Block two. Now close your eyes and simply rest. No "
+                       "sound for the next ninety seconds.",
+            ),
+            Phase(
+                "Control tone",
+                "Eyes closed. A steady unmodulated tone — no pulse.",
+                120,
+                actions=["audio_control"],
+                params={"base": 440},
+                speech="Block three. Keep your eyes closed. A steady tone is "
+                       "starting now. Just rest with it for two minutes.",
+            ),
+            Phase(
+                "AM tone 10 Hz",
+                "Eyes closed. The same tone, now pulsing at 10 Hz.\n\n"
+                "Let the pulsing settle; don't try to force anything.",
+                180,
+                actions=["audio_on"],
+                params={"base": 440, "beat": 10, "closed_loop": False,
+                        "mode": "monaural_am"},
+                speech="Block four. The tone now pulses ten times per second. "
+                       "Keep your eyes closed and let the pulsing settle. "
+                       "Three minutes.",
+            ),
+            Phase(
+                "Rest again",
+                "Eyes closed, sound fading. Rest exactly as in block two.",
+                90,
+                actions=["audio_fade_out"],
+                speech="Block five. The sound is fading out. Keep your eyes "
+                       "closed and rest for a final ninety seconds.",
+            ),
+            Phase(
+                "Done",
+                "Probe complete. Open your eyes — a short questionnaire follows.",
+                None,
+                actions=["stop_recording"],
+                speech="Probe complete. You can open your eyes. There is a "
+                       "short questionnaire on screen.",
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_hemisync_probe_a(), _hemisync_probe_s(),
+                                _binaural_10min(), _heterodyne()]}
 
 
 class ProtocolRunner(QObject):

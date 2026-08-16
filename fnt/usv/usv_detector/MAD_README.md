@@ -327,6 +327,37 @@ artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
 
 ## Knowing when a model is ready
 
+### The train/val split holds out whole recordings
+
+Validation is only a measurement if the model has never seen the data. A
+segmentation pipeline makes that easy to get wrong: one long call is sliced into
+several tiles, and neighbouring tiles overlap, so shuffling *tiles* into train
+and val puts near-duplicate — sometimes literally the same — pixels on both
+sides. On a representative label set (3 recordings, 120 calls, long calls
+spanning 3 tiles), a tile-level shuffle left **100%** of validation tiles coming
+from a recording the model trained on and **55%** from a call it had already
+seen other tiles of. Validation Dice then measures memorization.
+
+MAD splits by **group**, strongest level the labels support:
+
+| Level | What's held out | When it's used |
+|---|---|---|
+| `file` | whole recordings | labels on ≥2 recordings — **the only one that answers "will this work on a new recording?"** |
+| `call` | whole calls, recordings shared | all labels on one recording |
+| `tile` | nothing — train and val overlap | a single labeled call |
+
+The level is reported next to the score everywhere it appears (training log, run
+summary, CLI, and the checkpoint itself), and anything below `file` prints a
+warning, because a Dice quoted without that caveat is how an over-fitted model
+gets written up as a working one. `split_seed` (default 42) is recorded in the
+run summary, so a reported number can be reproduced exactly.
+
+The practical consequence: **label at least two recordings** before trusting a
+validation number, and more if your recordings differ in mic, animal, or noise
+floor — that variation is exactly what the held-out file is there to test.
+
+### Call-level evaluation
+
 Training reports validation **Dice** — a *pixel* score on *tiles*. It does not
 answer the question that decides whether to spend hours of compute: how many real
 calls will this find, and how much junk will I have to reject?
@@ -426,7 +457,7 @@ of sync.
 |---|---|
 | `mad_pyqt.py` | PyQt5 GUI (labeling, review, training/inference dialogs). |
 | `mad_inference.py` | Run a checkpoint over a wav → CSV rows + per-call crops. |
-| `mad_training.py` | Train the U-Net from confirmed examples. |
+| `mad_training.py` | Train the U-Net from confirmed examples; grouped (leak-free) train/val split. |
 | `mad_examples.py` | Confirmed training-example store (`training_data.h5`). |
 | `mad_dataset.py` | Spectrogram/tile helpers shared by training & inference. |
 | `mad_project.py` | Project config / on-disk layout; folds pre-merge two-list projects into one `audio_files` registry. |

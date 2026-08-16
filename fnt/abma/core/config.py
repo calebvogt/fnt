@@ -309,6 +309,36 @@ class AgentGroup:
 # Experiment
 # --------------------------------------------------------------------------- #
 @dataclass
+class ProtocolEvent:
+    """A timed manipulation of the world or the population — the moves an
+    enclosure experimenter actually makes mid-experiment.
+
+    kind:
+      'add_agents'      release ``group`` (an AgentGroup: type + count) into
+                        the arena at ``at_day``.
+      'remove_agents'   trap out up to ``count`` living agents matching
+                        ``target`` (group label, sexid, or 'all'; count 0 =
+                        all matching). Removed agents keep their identity and
+                        history but stop moving, interacting and recording.
+      'add_resource'    place ``object`` (a ResourceObject: nest/food/water)
+                        — this is how scheduled food provisioning is modelled.
+      'remove_resource' remove resource(s) whose label equals ``target``, or
+                        every object of that kind if ``target`` is
+                        'food' | 'water' | 'nest'.
+
+    ``target``/``count``/``group``/``object`` are read per ``kind`` as above;
+    unused fields are ignored. ``label`` is a display note for the timeline.
+    """
+    at_day: float = 5.0
+    kind: str = "add_agents"
+    target: str = ""
+    count: int = 0
+    group: AgentGroup | None = None
+    object: ResourceObject | None = None
+    label: str = ""
+
+
+@dataclass
 class Intervention:
     """A scheduled change to a target's attribute at a given day.
 
@@ -384,11 +414,27 @@ def default_dynamics() -> list["Coupling"]:
     ]
 
 
+def _group_from_dict(g: dict) -> AgentGroup:
+    """Parse an AgentGroup payload (used by groups and protocol add_agents)."""
+    return AgentGroup(
+        label=g.get("label", "group"),
+        species=g.get("species", "prairie"),
+        sex=g.get("sex", "F"),
+        count=g.get("count", 4),
+        genotype=Genotype(**g.get("genotype", {"genes": {}})),
+        treatment=Treatment(**g.get("treatment", {})),
+        traits=TraitProfile(**g.get("traits", {})),
+        appearance=Appearance(**g.get("appearance", {})),
+        dists=dict(g.get("dists", {})),
+    )
+
+
 @dataclass
 class ExperimentConfig:
     name: str = "experiment"
     arena: ArenaConfig = field(default_factory=ArenaConfig)
     groups: list[AgentGroup] = field(default_factory=list)
+    protocol: list[ProtocolEvent] = field(default_factory=list)
     interventions: list[Intervention] = field(default_factory=list)
     dynamics: list[Coupling] = field(default_factory=default_dynamics)
 
@@ -458,21 +504,20 @@ class ExperimentConfig:
             grass=GrassSpec(**arena_d.get("grass", {})),
             oriented=arena_d.get("oriented", False),
         )
-        groups = []
-        for g in d.get("groups", []):
-            groups.append(
-                AgentGroup(
-                    label=g.get("label", "group"),
-                    species=g.get("species", "prairie"),
-                    sex=g.get("sex", "F"),
-                    count=g.get("count", 4),
-                    genotype=Genotype(**g.get("genotype", {"genes": {}})),
-                    treatment=Treatment(**g.get("treatment", {})),
-                    traits=TraitProfile(**g.get("traits", {})),
-                    appearance=Appearance(**g.get("appearance", {})),
-                    dists=dict(g.get("dists", {})),
-                )
-            )
+        groups = [_group_from_dict(g) for g in d.get("groups", [])]
+        protocol = []
+        for p in d.get("protocol", []):
+            protocol.append(ProtocolEvent(
+                at_day=p.get("at_day", 5.0),
+                kind=p.get("kind", "add_agents"),
+                target=p.get("target", ""),
+                count=p.get("count", 0),
+                group=(_group_from_dict(p["group"])
+                       if p.get("group") else None),
+                object=(ResourceObject(**p["object"])
+                        if p.get("object") else None),
+                label=p.get("label", ""),
+            ))
         known = {
             "name", "days", "dt", "record_interval", "n_trials", "seed",
             "day_start_hour", "day_activity", "night_activity", "trial_prefix",
@@ -484,7 +529,7 @@ class ExperimentConfig:
         interventions = [Intervention(**iv) for iv in d.get("interventions", [])]
         dynamics = ([Coupling(**c) for c in d["dynamics"]]
                     if "dynamics" in d else default_dynamics())
-        return ExperimentConfig(arena=arena, groups=groups,
+        return ExperimentConfig(arena=arena, groups=groups, protocol=protocol,
                                 interventions=interventions, dynamics=dynamics,
                                 policy=PolicyParams(**d.get("policy", {})),
                                 **scalars)

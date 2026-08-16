@@ -236,7 +236,7 @@ def run_study(study: Study, study_dir: str, progress_cb: Callable | None = None,
     if analyze and out_dirs:
         _log("Collecting metrics...")
         try:
-            res.update(collect_results(study, study_dir))
+            res.update(collect_results(study, study_dir, log_cb=log_cb))
         except Exception as e:                    # analysis is best-effort
             _log(f"  metric collection skipped: {e}")
     return res
@@ -248,7 +248,8 @@ def run_study(study: Study, study_dir: str, progress_cb: Callable | None = None,
 _ID_COLS = ("Trial", "n_agents")
 
 
-def collect_results(study: Study, study_dir: str) -> dict:
+def collect_results(study: Study, study_dir: str,
+                    log_cb: Callable | None = None) -> dict:
     """Analyse every trial and write metrics_long.csv + comparison.csv."""
     import glob
     import pandas as pd
@@ -259,12 +260,19 @@ def collect_results(study: Study, study_dir: str) -> dict:
     for i, cond in enumerate(study.conditions):
         cd = os.path.join(cdir, f"{i + 1:02d}_{_slug(cond.name)}", "data")
         if not os.path.isdir(cd):
+            if log_cb:
+                log_cb(f"  ! condition '{cond.name}': no data directory — "
+                       f"excluded from results")
             continue
         zones = study.base.arena.zones or None
         for traj in sorted(glob.glob(os.path.join(cd, "uwb_*_processed.csv"))):
             try:
                 summ = analyze_trial(traj, cd, zones=zones)
-            except Exception:
+            except Exception as e:
+                # a dropped trial silently skews the comparison — say so
+                if log_cb:
+                    log_cb(f"  ! analysis failed for '{cond.name}' / "
+                           f"{os.path.basename(traj)}: {e} — trial excluded")
                 continue
             trial = str(summ.get("Trial", ""))
             m = re.search(r"(\d+)$", trial)

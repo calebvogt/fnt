@@ -273,6 +273,36 @@ def band_connectivity(x, y, fs, band, nperseg=None):
     return plv, imag
 
 
+def entrainment_snr(x, fs, f0=10.0, half_bw=0.5, flank_bw=2.0):
+    """Narrowband peak at the driving frequency, in dB above its neighbours.
+
+    Entrainment to a rhythmic stimulus (the auditory steady-state response)
+    shows up as a *narrow* spectral peak at exactly the stimulus rate. Generic
+    relaxation-alpha is broadband (8–12 Hz), so it raises the flanks as much as
+    the centre and leaves this ratio near 0 dB. That makes this metric the
+    cleanest separator between "the stimulus is driving the cortex at 10 Hz"
+    and "the subject just relaxed".
+
+    Signal = mean power in ``f0 ± half_bw``; noise = mean power in the flanking
+    bands ``[f0-half_bw-flank_bw, f0-half_bw)`` and ``(f0+half_bw, f0+half_bw+flank_bw]``.
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < int(fs * 4):        # need ≥4 s for ~0.25 Hz resolution
+        return float("nan")
+    f, p = welch(x - np.mean(x), fs=fs, nperseg=int(fs * 4),
+                 noverlap=int(fs * 2))
+    centre = (f >= f0 - half_bw) & (f <= f0 + half_bw)
+    flanks = (((f >= f0 - half_bw - flank_bw) & (f < f0 - half_bw)) |
+              ((f > f0 + half_bw) & (f <= f0 + half_bw + flank_bw)))
+    if not centre.any() or not flanks.any():
+        return float("nan")
+    sig = float(np.mean(p[centre]))
+    noise = float(np.mean(p[flanks]))
+    if noise <= 0:
+        return float("nan")
+    return float(10.0 * np.log10(sig / noise))
+
+
 def alpha_asymmetry(alpha_left, alpha_right):
     """Frontal alpha asymmetry: ``ln(right) - ln(left)``.
 

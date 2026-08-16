@@ -18,7 +18,7 @@ import numpy as np
 
 
 class Policy:
-    def decide(self, sim, elapsed_s: float):
+    def decide(self, sim, elapsed_s: float, dt: float):
         raise NotImplementedError
 
 
@@ -33,7 +33,12 @@ class RuleBasedPolicy(Policy):
     perception_r = 0.6    # neighbour perception radius (m)
     heading_jitter = 0.5  # radians of heading drift per step
 
-    def decide(self, sim, elapsed_s: float):
+    # Trait tuning (turn_rate defaults etc.) was calibrated at this timestep;
+    # jitter scales with sqrt(dt/REF) so path tortuosity is dt-invariant while
+    # existing configs behave identically at the reference dt.
+    REF_DT = 2.0
+
+    def decide(self, sim, elapsed_s: float, dt: float):
         P = sim.P
         n = sim.n
         # config-driven weights (fall back to the class defaults)
@@ -112,7 +117,10 @@ class RuleBasedPolicy(Policy):
         desired += np.einsum("ij,ijk->ik", terr_w, terr_dir)
 
         # --- correlated random walk (per-agent turn rate + wander gain) ---
-        sim.H += sim.rng.normal(0.0, 1.0, n) * np.clip(sim.turn_rate, 1e-3, None)
+        # heading drift is diffusive: sd grows with sqrt(dt), so tortuosity per
+        # simulated second doesn't change when the integration step does
+        jit = np.clip(sim.turn_rate, 1e-3, None) * np.sqrt(dt / self.REF_DT)
+        sim.H += sim.rng.normal(0.0, 1.0, n) * jit
         rand_dir = np.stack([np.cos(sim.H), np.sin(sim.H)], axis=1)
         desired += sim.wander[:, None] * rand_dir
 

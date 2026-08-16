@@ -128,7 +128,8 @@ class ConditionRecorder:
         rows = []
         for i, a in enumerate(self.agents):
             if not a.alive:
-                status = "dead"
+                # trapped out by a protocol event vs died in the arena
+                status = "removed" if getattr(a, "removed", False) else "dead"
             elif anosmic[i]:
                 status = "anosmic"
             else:

@@ -182,6 +182,21 @@ def connect_ro(path):
     return conn
 
 
+def is_corruption_error(err):
+    """True if ``err`` is SQLite reporting a damaged database file.
+
+    Corruption usually surfaces mid-scan rather than at open: the header and
+    schema pages read fine, so the file opens and lists its tables, and only a
+    query that reaches the damaged page fails. Recognising it explicitly lets
+    the UI say so once, loudly, instead of leaving an empty tag list behind a
+    one-line log message.
+    """
+    msg = str(err).lower()
+    return ("malformed" in msg          # "database disk image is malformed"
+            or "not a database" in msg  # wrong/truncated header
+            or "corrupt" in msg)
+
+
 def processing_select_clause(conn, table_name):
     """SELECT list covering PROCESSING_COLUMNS present in ``table_name``.
 
@@ -2212,15 +2227,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Anything upstream of the rendered frames invalidates cached chunks,
         # otherwise the pane would keep showing data processed under the old
-        # settings — which would quietly defeat the whole point of comparing
-        # smoothing methods here.
-        for w in (self.combo_smoothing, self.combo_timezone):
-            w.currentTextChanged.connect(self.invalidate_preview_cache)
-        for w in (self.spin_rolling_window, self.spin_velocity_threshold,
-                  self.spin_jump_threshold, self.spin_time_gap):
-            w.valueChanged.connect(self.invalidate_preview_cache)
-        for w in (self.chk_velocity_filter, self.chk_jump_filter):
-            w.stateChanged.connect(self.invalidate_preview_cache)
+        # settings. The preview has its OWN thresholds/smoothing/window controls
+        # (wired where they are built), so the Export Options equivalents are
+        # deliberately NOT connected here — they no longer feed _process_chunk,
+        # and invalidating on them would refetch every chunk for nothing.
+        # Timezone and the time-gap grouping are still shared by both paths.
+        self.combo_timezone.currentTextChanged.connect(self.invalidate_preview_cache)
+        self.spin_time_gap.valueChanged.connect(self.invalidate_preview_cache)
         
     def create_settings_panel(self):
         """Create the settings panel as a single scrollable column"""
@@ -3101,8 +3114,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         The preview is a streamlined scrubber: drag the timeline to move through
         the recording as a clean 2D top-down view, with optional zone/background/
-        anchor overlays and identity labels. No playback, no camera, no arena
-        registration — those richer views moved to the UWB Studio.
+        anchor overlays and identity labels.
         """
         group = QGroupBox("Preview")
         v = QVBoxLayout()
@@ -3731,7 +3743,10 @@ class UWBQuickVisualizationWindow(QWidget):
             if row and row[0] is not None:
                 return int(row[0]), int(row[1])
         except Exception as e:
-            self.log_message(f"Could not read time bounds: {e}")
+            if is_corruption_error(e):
+                self.report_corrupt_database(e)
+            else:
+                self.log_message(f"Could not read time bounds: {e}")
         return None
 
     def selected_preview_tags(self):
@@ -3926,6 +3941,12 @@ class UWBQuickVisualizationWindow(QWidget):
     # -- request / receive ------------------------------------------------- #
     def _request_chunk(self, idx, make_current=False):
         """Fetch a chunk in the background unless it is cached or in flight."""
+        # Never start a read once the preview is torn down (window closed) or
+        # disabled: a late-arriving result can otherwise re-enter here — e.g.
+        # _handle_empty_chunk skipping a recording gap — and spawn a thread
+        # after teardown already drained them.
+        if not getattr(self, '_preview_active', False):
+            return
         if self.preview_t0 is None or idx < 0:
             return
         if idx in self.preview_cache:
@@ -3934,9 +3955,20 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._show_chunk(idx)
             return
         if idx in self.preview_inflight:
-            if make_current:
-                self.preview_pending_current = idx
-            return
+            # Only a still-RUNNING loader means "already being fetched".
+            # Retirement is deferred by one event-loop turn (see _retire_loader,
+            # which avoids freeing a QThread inside its own finished signal), so
+            # a chunk that just completed lingers here briefly. Treating that as
+            # in-flight would silently drop a re-request issued in that window —
+            # e.g. changing a preview setting right after a chunk lands — and
+            # the pane would stay blank forever waiting on a load that already
+            # happened. A finished loader is safe to release now.
+            loader = self.preview_inflight[idx]
+            if loader.isRunning():
+                if make_current:
+                    self.preview_pending_current = idx
+                return
+            self.preview_inflight.pop(idx, None)
 
         tags = self.selected_preview_tags()
         if not tags:
@@ -3981,6 +4013,14 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_inflight.pop(idx, None)
 
     def _on_chunk_failed(self, idx, err):
+        if is_corruption_error(err):
+            # Stop streaming: every further chunk would fail the same way.
+            self._preview_active = False
+            self.stop_preview_playback()
+            self.preview_pending_current = None
+            self.lbl_preview_status.setText("Database file is damaged — see the message log.")
+            self.report_corrupt_database(err)
+            return
         self.log_message(f"Preview chunk {idx} failed: {err}")
         if self.preview_pending_current == idx:
             self.preview_pending_current = None
@@ -4073,11 +4113,13 @@ class UWBQuickVisualizationWindow(QWidget):
             # Keep pre-smoothing fixes so the pane can overlay raw vs smoothed
             g['raw_x'] = g['location_x']
             g['raw_y'] = g['location_y']
-            # Threshold + smooth in the correct order (jump raw → smooth →
-            # velocity smoothed). collect_stats=False: preview scrubbing must not
-            # overwrite the figures an export writes into runSummary.csv. Preview
-            # uses its own Smoothing Window / units so the effect can be tuned
-            # live, independent of the Export Options values.
+            # Threshold BOTH velocity and jump on the raw coordinates, then
+            # smooth (see _filter_and_smooth: thresholding velocity on the
+            # smoothed track was tried and produced a jumpy result).
+            # collect_stats=False: preview scrubbing must not overwrite the
+            # figures an export writes into runSummary.csv. Preview uses its own
+            # Smoothing Window / units so the effect can be tuned live,
+            # independent of the Export Options values.
             g = self._filter_and_smooth(
                 g, smoothing_method, collect_stats=False,
                 velocity=use_vel, jump=use_jump,
@@ -4427,13 +4469,13 @@ class UWBQuickVisualizationWindow(QWidget):
     def _export_sitemap(self, output_dir, db_name):
         """Write the background/site-map image into the export folder.
 
-        Makes the analysis folder a self-contained data product for the planned
-        UWB Studio: it carries the positions (CSV), zones/anchors/identities/scale
+        Makes the analysis folder a self-contained data product for downstream
+        analysis: it carries the positions (CSV), zones/anchors/identities/scale
         (config) and now the floorplan image too. Prefers a user-loaded PNG
         (copied verbatim), else the XML-embedded site map (decoded to PNG).
         Records filename + meter-extent in self._exported_sitemap for the config;
-        leaves it None when there is no background (that is fine — the Studio then
-        draws zones only, or bare tracks).
+        leaves it None when there is no background (downstream consumers then
+        draw zones only, or bare tracks).
         """
         self._exported_sitemap = None
         bg_image, bg_extent = self._context_bg_source()
@@ -4984,13 +5026,64 @@ class UWBQuickVisualizationWindow(QWidget):
         self._db_workers.append(w)
         w.done.connect(on_done)
         w.failed.connect(on_failed)
-        w.finished.connect(lambda: self._db_workers.remove(w)
-                           if w in self._db_workers else None)
+        # The list holds the only strong reference to the thread. Dropping it
+        # inside the finished handler can free the QThread during signal
+        # emission ("Destroyed while thread is still running"), so defer the
+        # release to the next event-loop turn — same pattern as the preview
+        # chunk loaders (_retire_loader).
+        w.finished.connect(lambda: QTimer.singleShot(0, lambda: self._retire_db_worker(w)))
         w.start()
+
+    def _retire_db_worker(self, w):
+        """Release a finished metadata worker, outside its finished signal."""
+        if w not in getattr(self, "_db_workers", []):
+            return
+        if not w.isFinished():
+            QTimer.singleShot(50, lambda: self._retire_db_worker(w))
+            return
+        self._db_workers.remove(w)
 
     def _on_meta_load_failed(self, err):
         self._hide_busy()
+        if is_corruption_error(err):
+            self.report_corrupt_database(err)
+            return
         self.log_message(f"Could not read database metadata: {err}")
+
+    def report_corrupt_database(self, err, path=None, quiet=False):
+        """Surface a damaged database once, loudly, with the recovery command.
+
+        Corruption typically appears only when a query reaches the bad page, so
+        without this the tool looks merely broken: the file opens, tables list,
+        and then the tag list silently stays empty. Shown at most once per
+        database so a burst of failing queries cannot stack dialogs.
+        """
+        path = path or self.db_path
+        name = os.path.basename(path) if path else "the database"
+        self.log_message(f"✗ {name} appears to be CORRUPTED: {err}")
+
+        if quiet or getattr(self, "_corrupt_reported", None) == path:
+            return
+        self._corrupt_reported = path
+
+        recover_hint = ""
+        if path:
+            root, ext = os.path.splitext(path)
+            recover_hint = (
+                f"\n\nTo attempt recovery into a NEW file (the original is not "
+                f"modified):\n\n"
+                f'sqlite3 "{path}" ".recover" | sqlite3 "{root}_recovered{ext or ".sqlite"}"')
+
+        QMessageBox.critical(
+            self, "Database File Is Damaged",
+            f"{name} is readable at the start but SQLite reports it as damaged "
+            f"partway through:\n\n    {err}\n\n"
+            f"This is a problem with the file itself, not with FNT — usually an "
+            f"interrupted copy or a write that was cut off while the recorder "
+            f"was running. Preprocessing cannot use it as-is.\n\n"
+            f"If the original is still on the recording machine, re-copying it "
+            f"is more reliable than recovery."
+            f"{recover_hint}")
 
     def _on_index_ready(self, src_path, path):
         self.preview_index_builder = None
@@ -5065,6 +5158,8 @@ class UWBQuickVisualizationWindow(QWidget):
         # Clear data state
         self.data = None
         self.available_tags = []
+        # A new database gets its own corruption warning if it needs one.
+        self._corrupt_reported = None
 
         # Clear background image and XML state
         self.xml_config_path = None
@@ -5263,7 +5358,9 @@ class UWBQuickVisualizationWindow(QWidget):
             return True
 
         except Exception as e:
-            if not batch:
+            if is_corruption_error(e):
+                self.report_corrupt_database(e, path=file_path, quiet=batch)
+            elif not batch:
                 QMessageBox.critical(self, "Error", f"Failed to open database: {str(e)}")
             else:
                 self.log_message(f"✗ Failed to open database {os.path.basename(file_path)}: {e}")
@@ -6581,10 +6678,6 @@ class UWBQuickVisualizationWindow(QWidget):
         text = self.combo_smoothing.currentText()
         return text.replace(" (default)", "")
 
-    def apply_smoothing(self):
-        """Apply smoothing to self.data"""
-        self.data = self.apply_smoothing_to_data(self.data, self.get_smoothing_method())
-    
     def apply_smoothing_to_data(self, data, method, window=None, units=None):
         """Apply smoothing to a dataframe (works on any dataframe, not just self.data).
 
@@ -6625,55 +6718,6 @@ class UWBQuickVisualizationWindow(QWidget):
             data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
                 lambda x: forward_backward_ewma(x, span))
 
-        return data
-    
-    def apply_filters(self, data):
-        """Apply velocity and jump filtering with time window grouping"""
-        initial_count = len(data)
-        
-        # Calculate time differences and group by time gaps (prevents filtering across battery restarts)
-        time_gap_threshold = self.spin_time_gap.value()
-        data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
-        data['time_diff_s'] = np.ceil(data['time_diff']).astype(int)
-        data['tw_group'] = data.groupby('shortid')['time_diff_s'].apply(
-            lambda x: (x > time_gap_threshold).cumsum()
-        ).reset_index(level=0, drop=True)
-        
-        # Calculate distance and velocity within time window groups
-        data['distance'] = np.sqrt(
-            (data['location_x'] - data.groupby(['shortid', 'tw_group'])['location_x'].shift())**2 +
-            (data['location_y'] - data.groupby(['shortid', 'tw_group'])['location_y'].shift())**2
-        )
-        data['velocity'] = data['distance'] / data['time_diff']
-        
-        # Apply velocity filtering if enabled
-        if self.chk_velocity_filter.isChecked():
-            velocity_threshold = self.spin_velocity_threshold.value()
-            before_velocity = len(data)
-            data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())]
-            removed_velocity = before_velocity - len(data)
-            if removed_velocity > 0:
-                self.log_message(f"  Removed {removed_velocity} points with velocity > {velocity_threshold} m/s")
-        
-        # Apply jump filtering if enabled
-        if self.chk_jump_filter.isChecked():
-            jump_threshold = self.spin_jump_threshold.value()
-            before_jump = len(data)
-            data['is_jump'] = (data['distance'] > jump_threshold)
-            data = data[~data['is_jump']]
-            removed_jump = before_jump - len(data)
-            if removed_jump > 0:
-                self.log_message(f"  Removed {removed_jump} points with distance jump > {jump_threshold} m")
-        
-        # Clean up temporary columns
-        data = data.drop(columns=['time_diff', 'time_diff_s', 'tw_group', 'distance', 'velocity'], errors='ignore')
-        if 'is_jump' in data.columns:
-            data = data.drop(columns=['is_jump'])
-        
-        final_count = len(data)
-        if initial_count != final_count:
-            self.log_message(f"  Total filtered: {initial_count - final_count} points ({100*(initial_count-final_count)/initial_count:.1f}%)")
-        
         return data
     
     def reset_filter_stats(self):
@@ -6906,9 +6950,80 @@ class UWBQuickVisualizationWindow(QWidget):
             'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None,
             # Anchor/antenna positions, zones, scale and map extent from the
             # site XML (all in meters); None when no XML was detected.
-            'xml_config': self.xml_config_summary()
+            'xml_config': self.xml_config_summary(),
+            # Live-preview display/analysis settings. Nested under one key so
+            # they are clearly NOT part of the export's reproducibility record —
+            # nothing here affects exported data — while still surviving a
+            # reload so the pane comes back the way it was left.
+            'preview': self.get_preview_config(),
         }
         return config
+
+    # Preview settings persisted in fnt_config.json: attribute -> (widget, kind).
+    # Kind drives how the value is read/written ('text' for combos, 'value' for
+    # spinboxes, 'checked' for checkboxes).
+    _PREVIEW_CONFIG_WIDGETS = {
+        'smoothing': ('combo_preview_smoothing', 'text'),
+        'window': ('spin_preview_window', 'value'),
+        'window_units': ('combo_preview_window_units', 'text'),
+        'velocity_filter': ('chk_preview_velocity', 'checked'),
+        'velocity_threshold': ('spin_preview_velocity', 'value'),
+        'jump_filter': ('chk_preview_jump', 'checked'),
+        'jump_threshold': ('spin_preview_jump', 'value'),
+        'color_by': ('combo_preview_color', 'text'),
+        'dark_mode': ('chk_preview_dark', 'checked'),
+        'trail_seconds': ('spin_preview_trail', 'value'),
+        'chunk_minutes': ('spin_preview_minutes', 'value'),
+        'rate': ('combo_preview_hz', 'text'),
+        'view_mode': ('combo_view_mode', 'text'),
+        'arena_source': ('combo_arena', 'text'),
+        'show_background': ('chk_show_background', 'checked'),
+        'show_anchors': ('chk_show_anchors', 'checked'),
+        # NOTE: the preview tag marker size persists separately as the
+        # top-level 'preview_tag_size' key (kept for config compatibility).
+    }
+
+    def get_preview_config(self):
+        """Current live-preview settings as a plain dict (missing widgets skipped)."""
+        out = {}
+        for key, (attr, kind) in self._PREVIEW_CONFIG_WIDGETS.items():
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            if kind == 'text':
+                out[key] = w.currentText()
+            elif kind == 'value':
+                out[key] = w.value()
+            else:
+                out[key] = w.isChecked()
+        return out
+
+    def apply_preview_config(self, cfg):
+        """Restore preview settings saved by get_preview_config.
+
+        Every set is guarded: a combo entry that no longer exists (renamed
+        smoothing method, removed arena) is skipped rather than clearing the
+        control, and a value outside a spinbox's range is clamped by Qt.
+        """
+        if not isinstance(cfg, dict):
+            return
+        for key, (attr, kind) in self._PREVIEW_CONFIG_WIDGETS.items():
+            if key not in cfg:
+                continue
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            val = cfg[key]
+            try:
+                if kind == 'text':
+                    if w.findText(str(val)) >= 0:
+                        w.setCurrentText(str(val))
+                elif kind == 'value':
+                    w.setValue(type(w.value())(val))
+                else:
+                    w.setChecked(bool(val))
+            except Exception:
+                continue
     
     def save_config(self, output_dir):
         """Save current configuration to JSON file"""
@@ -7047,6 +7162,12 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'preview_tag_size' in config:
                 self.spin_tag_size.setValue(config['preview_tag_size'])
+
+            # Live-preview display/analysis settings (nested; see
+            # get_preview_config). Absent in configs written before this key
+            # existed, in which case the preview simply keeps its defaults.
+            if 'preview' in config:
+                self.apply_preview_config(config['preview'])
 
             if 'show_battery' in config:
                 self.chk_show_battery.setChecked(config['show_battery'])
@@ -7746,28 +7867,8 @@ class UWBQuickVisualizationWindow(QWidget):
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
-    
-    def stop_export(self):
-        """Cancel ongoing export operations"""
-        self.export_cancelled = True
-        self.log_message("⚠ Export cancellation requested...")
-        
-        # Stop worker thread if running
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait()
-            self.log_message("✗ Plot export cancelled")
 
-        # Drop any temp render CSVs left behind by the cancelled run.
-        self._cleanup_plot_working_files()
-
-        # Reset UI
-        self.exporting = False
-        self.btn_export.setEnabled(True)
-        self.btn_stop_export.setVisible(False)
-        self.progress_widget.setVisible(False)
-        self.progress_bar.setValue(0)
-        self.lbl_export_progress.setText("")
+    # NOTE: stop_export lives with the other export-control methods further up.
 
     # ---- Batch queue: preprocess many trials one at a time --------------- #
     # Runs each queued database through the exact interactive load + export
@@ -8684,7 +8785,14 @@ class UWBQuickVisualizationWindow(QWidget):
 
         except Exception as e:
             self._last_export_failed = True
-            self._notify_done('error', "Error", f"Export failed: {str(e)}")
+            if is_corruption_error(e):
+                # Name the real cause: the file is damaged, not the export.
+                self.report_corrupt_database(e, quiet=getattr(self, '_batch_active', False))
+                self._notify_done('error', "Database File Is Damaged",
+                                  "Export stopped: the database file is damaged. "
+                                  "See the message log for recovery steps.")
+            else:
+                self._notify_done('error', "Error", f"Export failed: {str(e)}")
             self.log_message(f"✗ Export failed: {str(e)}")
             # If we failed before the async plot worker started, the export is
             # over now — clear the flag the batch waits on. (If a worker IS
@@ -8753,21 +8861,75 @@ class UWBQuickVisualizationWindow(QWidget):
         QTimer.singleShot(3000, lambda: self.progress_widget.setVisible(False))
     
     def closeEvent(self, event):
-        """Handle window close event - stop any ongoing exports"""
+        """Handle window close event — stop exports and release global hooks."""
         if self.exporting:
-            reply = QMessageBox.question(self, 'Export in Progress', 
+            reply = QMessageBox.question(self, 'Export in Progress',
                                         'An export is in progress. Do you want to cancel it and close?',
                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            
+
             if reply == QMessageBox.Yes:
                 self.stop_export()
-                event.accept()
             else:
                 event.ignore()
-        else:
-            event.accept()
-        
-        self.log_message("Ready for next operation")
+                return
+
+        self._teardown_preview()
+        event.accept()
+
+    def _teardown_preview(self):
+        """Release everything the preview owns beyond this window's lifetime.
+
+        The launcher keeps a reference to this window after it is closed, so an
+        app-level event filter and running timers/threads would otherwise live
+        on: arrow keys anywhere in FNT would still be swallowed to scrub a
+        hidden timeline, and a QThread freed while running aborts the process.
+        Safe to call more than once.
+        """
+        self._preview_active = False
+
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+        except Exception:
+            pass
+
+        for name in ("preview_timer", "preview_scrub_timer",
+                     "preview_tag_timer", "preview_trail_timer"):
+            t = getattr(self, name, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+
+        # Wait on in-flight readers rather than dropping their last reference.
+        for loader in list(getattr(self, "preview_inflight", {}).values()):
+            try:
+                if loader.isRunning():
+                    loader.wait(5000)
+            except Exception:
+                pass
+        try:
+            self.preview_inflight.clear()
+        except Exception:
+            pass
+
+        for name in ("preview_index_builder",):
+            th = getattr(self, name, None)
+            if th is not None:
+                try:
+                    if th.isRunning():
+                        th.wait(10000)
+                except Exception:
+                    pass
+
+        for w in list(getattr(self, "_db_workers", [])):
+            try:
+                if w.isRunning():
+                    w.wait(5000)
+            except Exception:
+                pass
 
 
 # Kept alive for the whole process so faulthandler's file target isn't GC'd.

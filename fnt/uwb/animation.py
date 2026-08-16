@@ -1,7 +1,7 @@
 """GUI-free rendering core for UWB tracking animations.
 
-Extracted from the preprocessing tool so the same code drives both the current
-export and the planned UWB Studio. Nothing here touches Qt: all UI concerns
+Extracted from the preprocessing tool so the rendering is reusable and testable
+independently of the GUI. Nothing here touches Qt: all UI concerns
 (dialogs, progress bars, event pumping, cancellation) are handled by the caller
 through the ``log``, ``progress`` and ``is_cancelled`` callbacks.
 

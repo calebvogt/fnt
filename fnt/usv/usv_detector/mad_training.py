@@ -39,6 +39,9 @@ class UNetTrainingConfig:
     batch_size: int = 8
     learning_rate: float = 1e-3
     val_fraction: float = 0.20
+    # Seed for the train/val split. Recorded in the run summary so a reported
+    # number can be reproduced exactly.
+    split_seed: int = 42
     device: str = "auto"             # 'auto' | 'cuda' | 'mps' | 'cpu'
 
     # SLEAP-style early stopping: halt when val_loss fails to improve by
@@ -92,6 +95,110 @@ class UNetTrainingConfig:
             arch = (self.model_arch or "unet").lower()
             name = f"{ts}_{arch}_n={n_examples}"
         return str(Path(self.project_dir) / "models" / name)
+
+
+# ----------------------------------------------------------------------
+# Train/val split
+# ----------------------------------------------------------------------
+def grouped_split(
+    group_keys: List[str], val_fraction: float, seed: int = 42,
+) -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
+    """Hold out whole groups. Returns ``(train_idx, val_idx, val_groups)``, or
+    None when there are fewer than two groups to split.
+
+    Splitting over tiles is what a segmentation pipeline must not do. Tiles are
+    cut from the same patch (a long call spans several) and neighbouring tiles
+    overlap, so a tile-level shuffle puts near-duplicate — sometimes literally
+    the same — pixels in both train and val. The model then scores itself on
+    data it fit, and validation Dice reads high for a model that has learned one
+    recording's noise floor rather than what a call looks like.
+
+    Groups are consumed in a seeded shuffle until the validation set reaches
+    ``val_fraction`` of tiles, and at least one group is always left for
+    training. Because groups differ in size, the realized fraction is
+    approximate — correctness of the split beats hitting the ratio exactly.
+    """
+    order: List[str] = []
+    members: Dict[str, List[int]] = {}
+    for i, key in enumerate(group_keys):
+        if key not in members:
+            members[key] = []
+            order.append(key)
+        members[key].append(i)
+    if len(order) < 2:
+        return None
+
+    rng = np.random.default_rng(seed)
+    shuffled = [order[i] for i in rng.permutation(len(order))]
+
+    n_total = len(group_keys)
+    target = max(1, int(round(n_total * float(val_fraction))))
+    val_groups: List[str] = []
+    n_val = 0
+    # Leave the final group for training no matter what, so neither side is
+    # ever empty.
+    for key in shuffled[:-1]:
+        if n_val >= target:
+            break
+        val_groups.append(key)
+        n_val += len(members[key])
+    if not val_groups:                      # val_fraction ~0 → still hold one out
+        val_groups = [shuffled[0]]
+
+    val_set = set(val_groups)
+    val_idx = np.array(
+        [i for i, k in enumerate(group_keys) if k in val_set], dtype=np.int64)
+    train_idx = np.array(
+        [i for i, k in enumerate(group_keys) if k not in val_set], dtype=np.int64)
+    return train_idx, val_idx, val_groups
+
+
+def _split_tiles(
+    groups: List[Tuple[str, str]], n_total: int, val_fraction: float,
+    seed: int = 42,
+) -> Dict:
+    """Pick the strongest split the label set supports, and say which one.
+
+    Preference order, because each level is a weaker guarantee than the last:
+
+    * ``file`` — whole recordings held out. The only split that measures what
+      the user cares about: does this model work on a recording it has never
+      seen? Needs labels on ≥2 recordings.
+    * ``call`` — whole calls held out, but train and val share recordings. Stops
+      a call's own overlapping tiles straddling the split; does NOT stop the
+      model exploiting one recording's noise floor, mic, or animal. Reported so
+      the number is read with that caveat.
+    * ``tile`` — last resort for a single labeled call. Train and val overlap;
+      validation is not a held-out measurement at all.
+    """
+    if groups and len(groups) == n_total:
+        for level, keys in (('file', [g[0] for g in groups]),
+                            ('call', [g[1] for g in groups])):
+            split = grouped_split(keys, val_fraction, seed=seed)
+            if split is not None:
+                train_idx, val_idx, val_groups = split
+                n_groups = len(set(keys))
+                return {
+                    'train_idx': train_idx, 'val_idx': val_idx,
+                    'split_level': level, 'val_groups': sorted(val_groups),
+                    'n_groups': n_groups,
+                    'n_val_groups': len(val_groups),
+                    # Deliberately narrow: True means "validated on a RECORDING
+                    # the model never saw", the only claim worth reporting
+                    # unqualified. A call-level split still shares recordings
+                    # with training, so it reads False and every consumer warns.
+                    'val_held_out': level == 'file',
+                }
+    # One call (or no provenance): nothing can be held out.
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_total)
+    n_val = max(1, int(n_total * val_fraction))
+    return {
+        'train_idx': indices[n_val:] if n_total > n_val else indices,
+        'val_idx': indices[:n_val],
+        'split_level': 'tile', 'val_groups': [], 'n_groups': 1,
+        'n_val_groups': 0, 'val_held_out': False,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -389,7 +496,7 @@ def train_unet(
     # ---- collect tiles from the self-contained example store ----
     if progress:
         progress(0, cfg.n_epochs, {'status': 'collecting_tiles'})
-    specs, targets, weights = collect_training_examples(
+    specs, targets, weights, groups = collect_training_examples(
         cfg.training_data_dir,
         tile_time_frames=cfg.tile_time_frames,
         tile_freq_bins=cfg.tile_freq_bins,
@@ -399,6 +506,7 @@ def train_unet(
                 'file_n': n, 'file_name': name,
             }) if progress else None
         ),
+        return_groups=True,
     )
 
     n_total = specs.shape[0]
@@ -408,12 +516,20 @@ def train_unet(
             "one call (Enter) before training."
         )
 
-    # ---- train/val split ----
-    rng = np.random.default_rng(42)
-    indices = rng.permutation(n_total)
-    n_val = max(1, int(n_total * cfg.val_fraction))
-    val_idx = indices[:n_val]
-    train_idx = indices[n_val:] if n_total > n_val else indices
+    # ---- train/val split (grouped — see _split_tiles) ----
+    split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed)
+    train_idx, val_idx = split['train_idx'], split['val_idx']
+    n_val = int(len(val_idx))
+    if progress:
+        progress(0, cfg.n_epochs, {
+            'status': 'split',
+            'split_level': split['split_level'],
+            'val_held_out': split['val_held_out'],
+            'n_groups': split['n_groups'],
+            'n_val_groups': split['n_val_groups'],
+            'val_groups': split['val_groups'],
+            'n_train_tiles': int(len(train_idx)), 'n_val_tiles': n_val,
+        })
 
     def to_tensor(arr):
         return torch.from_numpy(arr).float().unsqueeze(1)  # (N, 1, H, W)
@@ -641,6 +757,15 @@ def train_unet(
                     'nfft': cfg.nfft,
                     'db_min': cfg.db_min,
                     'db_max': cfg.db_max,
+                    # Provenance: travels with the weights, so a checkpoint
+                    # handed to someone else still says what its val score
+                    # actually measured.
+                    'split_level': split['split_level'],
+                    'val_held_out': split['val_held_out'],
+                    'val_groups': split['val_groups'],
+                    'n_train_tiles': int(len(train_idx)),
+                    'n_val_tiles': n_val,
+                    'trained': datetime.now().isoformat(timespec='seconds'),
                 },
                 best_path,
             )
@@ -675,8 +800,16 @@ def train_unet(
         'val_pos_frac': best_metrics.get('val_pos_frac'),
         'n_epochs_run': len(history),
         'early_stopped': early_stopped,
-        'n_train_tiles': n_total - n_val,
+        'n_train_tiles': int(len(train_idx)),
         'n_val_tiles': n_val,
+        # How the split was made. Every val_* number above must be read through
+        # this: only 'file' means "measured on a recording the model never saw".
+        'split_level': split['split_level'],
+        'val_held_out': split['val_held_out'],
+        'n_groups': split['n_groups'],
+        'n_val_groups': split['n_val_groups'],
+        'val_groups': split['val_groups'],
+        'split_seed': cfg.split_seed,
         'history': history,
         'config': asdict(cfg),
     }

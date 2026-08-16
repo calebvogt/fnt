@@ -22,13 +22,15 @@ import sys
 import numpy as np
 
 from fnt.musestudio.dsp import (
-    BANDS, band_connectivity, band_powers, contact_quality,
+    BANDS, band_connectivity, band_powers, contact_quality, entrainment_snr,
     relative_band_powers, scalp_channels,
 )
 from fnt.musestudio.review import load_session, phase_intervals
 
 WINDOW_SEC = 4.0
-STEP_SEC = 2.0
+# Non-overlapping windows. Overlapped windows share data, so treating them as
+# independent samples quietly inflates the effective N behind every Cohen's d.
+STEP_SEC = 4.0
 PAIRS = [("frontal", "AF7", "AF8"), ("temporal", "TP9", "TP10")]
 
 
@@ -91,7 +93,7 @@ def analyse(root, band="alpha"):
             continue
         seg = {c: signals[c][idx] for c in channels}
         rows = {"alpha_rel": [], "theta_rel": [], "alpha_abs": [],
-                "plv": [], "imag": [], "good": []}
+                "plv": [], "imag": [], "snr10": [], "good": []}
         for a, b in _windows(len(idx), fs):
             chunk = {c: seg[c][a:b] for c in channels}
             good = all(contact_quality(v, fs) for v in chunk.values())
@@ -115,6 +117,8 @@ def analyse(root, band="alpha"):
                     imags.append(i)
             rows["plv"].append(_mean(plvs))
             rows["imag"].append(_mean(imags))
+            rows["snr10"].append(_mean(
+                [entrainment_snr(v, fs, 10.0) for v in chunk.values()]))
         per_block[label] = {k: np.array(v, dtype=float) for k, v in rows.items()}
         per_block[label]["duration"] = t1 - t0
 
@@ -184,8 +188,8 @@ def report(root, band="alpha"):
     add("")
 
     # --- 3. primary contrast -------------------------------------------
-    add("3. PRIMARY CONTRAST  (binaural beat vs matched control tone)")
-    binaural = _pick(blocks, "binaural")
+    add("3. PRIMARY CONTRAST  (rhythmic stimulus vs matched control tone)")
+    binaural = _pick(blocks, "binaural") or _pick(blocks, "10 hz")
     control = _pick(blocks, "control")
     if binaural and control:
         for key, title in (("plv", "PLV        "),
@@ -209,6 +213,24 @@ def report(root, band="alpha"):
             add("   >> No clear beat-specific effect at this dose.")
     else:
         add("   (protocol lacks a binaural/control pair)")
+    add("")
+
+    # --- 3b. entrainment peak -------------------------------------------
+    add("3b. ENTRAINMENT AT 10 Hz  (narrow peak = stimulus-driven, not just relaxation)")
+    stim = _pick(blocks, "10 hz") or _pick(blocks, "binaural") or _pick(blocks, "am tone")
+    if stim and control:
+        for name in (control, stim):
+            add(f"   {name:<20} SNR@10Hz = {_mean(blocks[name]['snr10']):+5.2f} dB")
+        d = _cohens_d(blocks[stim]["snr10"], blocks[control]["snr10"])
+        add(f"   Cohen's d = {d:+.2f}   {_d_label(d)}")
+        if np.isfinite(d) and d > 0.5:
+            add("   >> A narrowband 10 Hz peak emerged under the stimulus —")
+            add("      direct evidence the rhythm is driving the cortex (ASSR).")
+        else:
+            add("   >> No stimulus-locked spectral peak. Any alpha change above is")
+            add("      broadband (state change), not frequency-following.")
+    else:
+        add("   (needs a 10 Hz stimulation block and a control-tone block)")
     add("")
 
     # --- 4. time-drift control ------------------------------------------

@@ -1487,6 +1487,41 @@ class MADSpectrogramWidget(SpectrogramWidget):
 # ======================================================================
 # Helpers
 # ======================================================================
+def _split_report(info: dict) -> List[str]:
+    """Human-readable lines describing a train/val split.
+
+    Validation numbers only mean "will this work on a new recording" when whole
+    recordings were held out. When the label set can't support that, the run has
+    to say so in the same breath as the score — a Dice printed without that
+    caveat is how an over-fitted model gets reported as a working one.
+    """
+    level = info.get('split_level', 'tile')
+    n_tr = info.get('n_train_tiles', 0)
+    n_va = info.get('n_val_tiles', 0)
+    n_vg = info.get('n_val_groups', 0)
+    n_g = info.get('n_groups', 0)
+    names = info.get('val_groups') or []
+    shown = ", ".join(os.path.basename(str(g)) for g in names[:4])
+    if len(names) > 4:
+        shown += f", +{len(names) - 4} more"
+    if level == 'file':
+        return [f"Split: {n_vg}/{n_g} recording(s) held out for validation "
+                f"({n_tr} train / {n_va} val tiles) — {shown}"]
+    if level == 'call':
+        return [
+            f"Split: {n_vg}/{n_g} call(s) held out ({n_tr} train / {n_va} val "
+            f"tiles). All labels are on ONE recording.",
+            "  ⚠ Validation shares a recording with training, so val scores "
+            "flatter the model. Label a second recording for an honest number.",
+        ]
+    return [
+        f"Split: tile-level ({n_tr} train / {n_va} val tiles) — only one "
+        f"labeled call available.",
+        "  ⚠ Train and validation overlap. These val scores are NOT a held-out "
+        "measurement. Label more calls, on more recordings.",
+    ]
+
+
 def _list_wavs_in_folder(folder: str, recursive: bool = False) -> List[str]:
     """``.wav`` files in ``folder`` — directly inside it, or in the whole tree.
 
@@ -9828,6 +9863,10 @@ class MADMainWindow(QMainWindow):
                 progress.set_main(metrics.get('file_i', 0),
                                   max(1, metrics.get('file_n', 1)))
                 progress.set_sub(0, 1)
+            elif status == 'split':
+                for line in _split_report(metrics):
+                    progress.append(line)
+                    self._log(line)
             elif status == 'batch':
                 bi = metrics.get('batch_i', 0)
                 bn = max(1, metrics.get('batches_per_epoch', 1))
@@ -9882,10 +9921,17 @@ class MADMainWindow(QMainWindow):
                     "\nEarly stopped — val_loss plateaued for "
                     f"{cfg.early_stop_patience} epoch(s)."
                 )
+            dice = summary.get('best_val_dice')
+            dice_str = f"{dice:.3f}" if isinstance(dice, (int, float)) else "?"
             progress.append(
-                f"\nFinished. best_val_loss={summary.get('best_val_loss', 0):.4f}\n"
+                f"\nFinished. best_val_loss={summary.get('best_val_loss', 0):.4f}"
+                f"  val_dice={dice_str}\n"
                 f"Model: {summary.get('model_path')}"
             )
+            # Repeat the split caveat next to the final score, not just at the
+            # top of a long log the user has already scrolled past.
+            for line in _split_report(summary):
+                progress.append(line)
             progress.mark_done(ok=True)
             self.status_bar.showMessage(
                 f"Training complete — {summary.get('model_path')}"
@@ -9893,7 +9939,8 @@ class MADMainWindow(QMainWindow):
             self._log(
                 f"Train DONE — best_val_loss="
                 f"{summary.get('best_val_loss', 0):.4f}, "
-                f"epochs={summary.get('n_epochs_run', '?')}, "
+                f"val_dice={dice_str} ({summary.get('split_level', '?')}-level "
+                f"split), epochs={summary.get('n_epochs_run', '?')}, "
                 f"model={Path(str(summary.get('model_path', ''))).parent.name}"
             )
             if self._project is not None:
@@ -9911,8 +9958,14 @@ class MADMainWindow(QMainWindow):
                             'path': mpath,
                             'date': _dt.now().isoformat(timespec='seconds'),
                             'best_val_loss': summary.get('best_val_loss'),
+                            'best_val_dice': summary.get('best_val_dice'),
                             'n_train_tiles': summary.get('n_train_tiles'),
                             'n_val_tiles': summary.get('n_val_tiles'),
+                            # Recorded per model so the picker can say what a
+                            # stored val score actually measured.
+                            'split_level': summary.get('split_level'),
+                            'val_held_out': summary.get('val_held_out'),
+                            'n_val_groups': summary.get('n_val_groups'),
                         })
                         self._project.models = models
                         try:

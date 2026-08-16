@@ -50,13 +50,36 @@ def _transform_anns(
     point_fn: Callable,
     new_w: int,
     new_h: int,
+    mask_fn: Optional[Callable] = None,
+    src_hw: Optional[Tuple[int, int]] = None,
 ) -> List[Dict]:
-    """Deep-copy and transform all annotations with the given point function."""
+    """Deep-copy and transform all annotations.
+
+    RLE annotations are warped as pixel masks using ``mask_fn`` — the same
+    operation applied to the image — which keeps augmented ground truth exactly
+    as detailed as the original. Polygon annotations (pre-RLE projects) fall
+    back to transforming their vertices with ``point_fn``.
+    """
+    from .mask_tracker_annotator import (
+        is_rle, rle_to_mask, mask_to_rle, mask_bbox,
+    )
+
     out = []
     for ann in anns:
         a = copy.deepcopy(ann)
-        a["segmentation"] = [_transform_polygon(p, point_fn) for p in a["segmentation"]]
-        a["bbox"] = _bbox_from_polygon(a["segmentation"])
+        seg = a["segmentation"]
+        if is_rle(seg) and mask_fn is not None:
+            mask = rle_to_mask(seg)
+            warped = mask_fn(mask.astype(np.uint8)).astype(bool)
+            a["segmentation"] = mask_to_rle(warped)
+            a["bbox"] = list(mask_bbox(warped))
+            a["area"] = int(warped.sum())
+        elif is_rle(seg):
+            # No mask transform supplied (photometric-only): shape is unchanged.
+            pass
+        else:
+            a["segmentation"] = [_transform_polygon(p, point_fn) for p in seg]
+            a["bbox"] = _bbox_from_polygon(a["segmentation"])
         out.append(a)
     return out
 
@@ -133,7 +156,7 @@ def _apply_affine_augmentation(
     W: int,
     H: int,
 ) -> Tuple[np.ndarray, List[Dict]]:
-    """Apply a 2x3 affine matrix to image and polygon annotations."""
+    """Apply a 2x3 affine matrix to the image and its annotations."""
     aug_img = cv2.warpAffine(img, M, (W, H), borderMode=cv2.BORDER_REFLECT_101)
 
     def point_fn(x, y):
@@ -141,7 +164,17 @@ def _apply_affine_augmentation(
         ny = M[1, 0] * x + M[1, 1] * y + M[1, 2]
         return (max(0.0, min(float(W), nx)), max(0.0, min(float(H), ny)))
 
-    transformed = _transform_anns(anns, point_fn, W, H)
+    def mask_fn(mask):
+        # Nearest-neighbour keeps the mask binary; a constant-0 border rather
+        # than the image's REFLECT_101 so mirrored pixels can't fabricate a
+        # second animal along the frame edge.
+        return cv2.warpAffine(
+            mask, M, (W, H), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+
+    src_hw = img.shape[:2]
+    transformed = _transform_anns(anns, point_fn, W, H, mask_fn, src_hw)
     return aug_img, transformed
 
 
@@ -339,7 +372,11 @@ def augment_coco_dataset(
             }
             new_images.append(aug_img_info)
 
-            transformed = _transform_anns(orig_anns, point_fn, new_W, new_H)
+            # img_fn (flip / rotate) applies unchanged to a 2D mask.
+            transformed = _transform_anns(
+                orig_anns, point_fn, new_W, new_H,
+                mask_fn=img_fn, src_hw=(H, W),
+            )
             for a in transformed:
                 a["id"] = next_ann_id
                 a["image_id"] = next_img_id

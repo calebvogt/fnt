@@ -132,7 +132,10 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
             "condition": base["condition"], "agents": base["agents"],
             "trial_id": sim.trial_id}})
 
-    if meta_cb is not None:  # combined static meta, keyed by GLOBAL index
+    def _emit_meta():
+        """Combined static meta, keyed by GLOBAL index (frame array order)."""
+        if meta_cb is None:
+            return
         combined, gi = [], 0
         for si, sim in enumerate(sims):
             for a in sim.agent_static():
@@ -143,6 +146,8 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
                 combined.append(a)
                 gi += 1
         meta_cb(combined)
+
+    _emit_meta()
 
     total_s = config.days * 86400.0
     dt = config.dt
@@ -162,6 +167,12 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
             for si, sim in enumerate(sims):
                 sim.step(elapsed, dt, events=recs[si]["evt"])
             elapsed += dt
+            if any(s._pop_dirty for s in sims):   # protocol changed a roster
+                for sim, r in zip(sims, recs):
+                    if sim._pop_dirty:
+                        write_agents_table(r["paths"]["agents"], sim.agents)
+                        sim._pop_dirty = False
+                _emit_meta()
             if k % rec_every == 0:
                 for sim, r in zip(sims, recs):
                     r["traj"].record(elapsed, sim.P[:, 0], sim.P[:, 1])

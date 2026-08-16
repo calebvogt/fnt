@@ -66,7 +66,7 @@ def _install_context_aware_shaders():
     slots: a class-level ``_shaderProgram`` on GLScatterPlotItem / GLLinePlotItem
     and ``ShaderProgram.prog`` (module registry) for GLMeshItem. A program id is
     only valid in the GL context that compiled it. FNT runs several independent
-    GLViewWidgets (ABMA's 3D arena, UWB Studio), each with its own context. The
+    GLViewWidgets (ABMA's 3D arena, the UWB preview), each with its own context. The
     first view to paint compiles and caches an id; the next view reuses that
     stale id in a *different* context, so every draw fails with
     GLError 1281 'invalid value' (glUseProgram / glGetAttribLocation) and nothing

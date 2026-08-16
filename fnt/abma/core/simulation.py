@@ -90,6 +90,7 @@ class AgentMeta:
     appearance: object = None
     home: np.ndarray = field(default_factory=lambda: np.zeros(2))
     alive: bool = True
+    removed: bool = False    # trapped out by a protocol event (vs died)
 
 
 class Simulation:
@@ -100,7 +101,10 @@ class Simulation:
     # plus a step of slack, so contact is not knife-edge at coarse dt.
     _REACH = 0.18
     estrus_period_days = 4.0
-    mate_rate = 0.02      # per-tick mating probability when in contact & receptive
+    # Mating hazard while in contact & receptive, per SECOND — converted to a
+    # per-step probability via p = 1 - exp(-rate*dt) so results don't depend on
+    # the integration timestep. 0.01/s matches the old 0.02-per-tick at dt=2.
+    mate_rate_hz = 0.01
     aggr_rate = 0.6       # per-encounter contest probability scaler (× aggr_i × aggr_j)
     fight_cooldown_s = 3600.0   # min interval between contests for a dyad
     mate_cooldown_s = 3600.0    # min interval between matings for a dyad
@@ -121,106 +125,36 @@ class Simulation:
     # ------------------------------------------------------------------ #
     def _build_population(self) -> None:
         cfg = self.cfg
-        nests = cfg.arena.objects_of("nest")
         self.agents: list[AgentMeta] = []
-        idx = 0
-        base_id = 9000 + self.trial_index * 100
-        # Animals are released together near the arena centre (as in a real
-        # enclosure release) and then self-organise; home ranges are emergent.
-        release = np.array([cfg.arena.width / 2, cfg.arena.height / 2])
+        self._next_index = 0
+        self._next_shortid = 9000 + self.trial_index * 100 + 1
         self._schedule: list[tuple[float, int, str, float]] = []  # onset,idx,attr,val
         self._last_fight: dict[tuple[int, int], float] = {}  # dyad -> last fight time
         self._last_mate: dict[tuple[int, int], float] = {}   # dyad -> last mating
-        sd = cfg.individual_variation
+        self._pop_dirty = False   # set when protocol events change the roster
+        # Animals are released together near the arena centre (as in a real
+        # enclosure release) and then self-organise; home ranges are emergent.
         for g in cfg.groups:
-            delayed = (g.treatment.drug not in ("none", None)
-                       and g.treatment.day_offset > 0.0)
-            specs = {k: parse_spec(v) for k, v in (g.dists or {}).items()}
-            for _ in range(g.count):
-                # seed each founder's innate attributes from the group's specs
-                base = deepcopy(g.traits)
-                for tname, spec in specs.items():
-                    if hasattr(base, tname):
-                        setattr(base, tname, spec.sample(self.rng))
-                # pre-onset profile: drug excluded if delivered after release
-                traits = resolve_traits(base, g.genotype, g.treatment,
-                                        drug_active=(False if delayed else None))
-                if sd > 0:  # global jitter only for traits without an explicit spec
-                    self._jitter_traits(traits, sd, skip=set(specs))
-                shortid = base_id + idx + 1
-                sexid = f"{g.sex}{shortid}"
-                start = release + self.rng.normal(0, 0.15, 2)
-                self.agents.append(AgentMeta(
-                    index=idx, sexid=sexid, shortid=shortid,
-                    species=g.species, sex=g.sex, group=g.label,
-                    genotype=g.genotype, treatment=g.treatment,
-                    traits=traits, appearance=getattr(g, "appearance", None),
-                    home=start.copy(),
-                ))
-                if delayed:  # schedule the drug to take effect mid-experiment
-                    post = deepcopy(traits)
-                    apply_drug(post, g.treatment)
-                    onset_s = g.treatment.day_offset * 86400.0
-                    for tname, arr in TRAIT_TO_ARRAY.items():
-                        if abs(getattr(post, tname) - getattr(traits, tname)) > 1e-9:
-                            self._schedule.append(
-                                (onset_s, idx, arr, getattr(post, tname)))
-                idx += 1
+            self.agents.extend(self._spawn_group(g))
 
         n = len(self.agents)
         self.n = n
         # ---- state arrays ----
-        self.home = np.array([a.home for a in self.agents], float)
-        self.P = np.clip(self.home.copy(), 0.02,
-                         [cfg.arena.width - 0.02, cfg.arena.height - 0.02])
         # home-range adaptation rate: home tracks a slow average of position so
         # territories emerge over ~half a day rather than being prescribed.
         self._settle_tau_s = 0.5 * 86400.0
-        self.H = self.rng.uniform(0, 2 * np.pi, n)
+        for k, v in self._init_state_for(self.agents).items():
+            setattr(self, k, v)
+        self.P = np.clip(self.home.copy(), 0.02,
+                         [cfg.arena.width - 0.02, cfg.arena.height - 0.02])
+        self.mass0 = self.mass.copy()      # release mass, for drift reporting
         self._build_obstacles()
-        # ---- condition (dynamic 0..1 bars; presented ×100) ----
-        self.hunger = self.rng.uniform(0, 0.3, n)
-        self.thirst = self.rng.uniform(0, 0.3, n)
-        self.energy = np.ones(n)
-        self.health = np.ones(n)
-        self.stress = np.full(n, 0.1)
-        self.alive = np.ones(n, bool)
-        self.estrus_phase = self.rng.uniform(0, 1, n)
-
-        # ---- behaviour counters / bookkeeping ----
-        self.fights_won = np.zeros(n, int)
-        self.fights_lost = np.zeros(n, int)
-        self.matings = np.zeros(n, int)
-        self.dist_today = np.zeros(n)
-        self.dist_total = np.zeros(n)
-        self.activity = np.zeros(n, int)   # 0 rest,1 forage,2 roam,3 flee,4 mate,5 dead
         self._cur_day = 1
 
-        # ---- trait vectors ----
-        self.sex_m = np.array([1.0 if a.sex == "M" else 0.0
-                               for a in self.agents])
-        self.aggr = np.array([a.traits.aggression for a in self.agents])
-        self.bold = np.array([a.traits.boldness for a in self.agents])
-        self.social = np.array([a.traits.sociability for a in self.agents])
-        self.explore = np.array([a.traits.exploration for a in self.agents])
-        self.smell = np.array([a.traits.smell_ability for a in self.agents])
-        self.identity = np.array([a.traits.identity_signal for a in self.agents])
-        self.speed = np.array([a.traits.base_speed for a in self.agents])
-        self.home_r = np.array([a.traits.home_range_r for a in self.agents])
-        self.mass = np.array([a.traits.mass for a in self.agents])
-        self.mass0 = self.mass.copy()      # release mass, for drift reporting
-        self.metabolism = np.array([a.traits.metabolism for a in self.agents])
-        self.turn_rate = np.array([a.traits.turn_rate for a in self.agents])
-        self.wander = np.array([a.traits.wander for a in self.agents])
-
-        # ---- appearance (per-agent colour / size / shape for the views) ----
-        self.agent_rgba = np.array(
-            [_appearance_rgba(a.appearance, a.sex) for a in self.agents])
-        self.agent_size = np.array(
-            [getattr(a.appearance, "size", 1.0) or 1.0 for a in self.agents])
-        self.agent_shape = np.array(
-            [_SHAPE_CODE.get(getattr(a.appearance, "shape", "rodent"), 0)
-             for a in self.agents])
+        # ---- protocol events (timed add/remove of animals and resources) ----
+        self._proto_schedule = sorted(
+            [(p.at_day * 86400.0, p) for p in getattr(cfg, "protocol", [])],
+            key=lambda t: t[0])
 
         # ---- condition-dynamics ruleset (editable interaction table) ----
         self.dynamics = list(getattr(cfg, "dynamics", []) or [])
@@ -240,23 +174,38 @@ class Simulation:
         # Built structures count as resources, not just decoration: a resource
         # zone holds the chow pile, a water tower holds water. Otherwise an
         # enclosure that visibly contains food would starve its animals.
-        # A walled resource zone is only reachable through its doorway, so the
-        # animal steers for the *entrance* while feeding happens anywhere
-        # inside. Seek target and feeding region are therefore separate: aiming
-        # at the centre would just press the animal against the outside wall.
-        food, food_seek = [], []
-        for o in cfg.arena.objects_of("food"):
-            food.append((o.x, o.y, o.radius))
-            food_seek.append((o.x, o.y))
-        for z in getattr(cfg.arena, "resource_zones", []):
-            # anywhere inside the box counts as being at the chow pile
-            food.append((z.x, z.y, float(np.hypot(z.w, z.d) / 2.0)))
+        # Sim-local copies so protocol events can add/remove resources mid-run
+        # without mutating the config (which is shared across lockstep trials).
+        self._res_objects = deepcopy(list(cfg.arena.objects))
+        self._res_zones = deepcopy(list(getattr(cfg.arena, "resource_zones", [])))
+        self._res_towers = deepcopy(list(getattr(cfg.arena, "water_towers", [])))
+        self._rebuild_resources()
+
+    def _rebuild_resources(self) -> None:
+        """(Re)build the food/water target arrays from the sim-local lists.
+
+        A walled resource zone is only reachable through its doorway, so the
+        animal steers for the *entrance* while feeding happens anywhere
+        inside. Seek target and feeding region are therefore separate: aiming
+        at the centre would just press the animal against the outside wall.
+        """
+        food, food_seek, frects = [], [], []
+        for o in self._res_objects:
+            if o.kind == "food":
+                food.append((o.x, o.y, o.radius))
+                food_seek.append((o.x, o.y))
+        for z in self._res_zones:
+            # anywhere inside the box counts as being at the chow pile — a
+            # rectangle containment test (the old circumscribing circle let
+            # animals "feed" through the corners from outside the walls)
+            frects.append((z.x, z.y, z.w / 2.0, z.d / 2.0))
             food_seek.append(_zone_door(z))
         water, water_seek = [], []
-        for o in cfg.arena.objects_of("water"):
-            water.append((o.x, o.y, o.radius))
-            water_seek.append((o.x, o.y))
-        for t in getattr(cfg.arena, "water_towers", []):
+        for o in self._res_objects:
+            if o.kind == "water":
+                water.append((o.x, o.y, o.radius))
+                water_seek.append((o.x, o.y))
+        for t in self._res_towers:
             # a tower is also a solid: collision holds the animal at
             # radius + body, so the drinkable band must clear that and add a
             # reach margin, or there is no reachable annulus at all.
@@ -266,8 +215,174 @@ class Simulation:
         self.water = np.array([[x, y] for x, y, _ in water], float).reshape(-1, 2)
         self.food_r = np.array([r for _, _, r in food], float)
         self.water_r = np.array([r for _, _, r in water], float)
+        self.food_rects = np.array(frects, float).reshape(-1, 4)  # cx,cy,hw,hd
         self.food_seek = np.array(food_seek, float).reshape(-1, 2)
         self.water_seek = np.array(water_seek, float).reshape(-1, 2)
+
+    # ------------------------------------------------------------------ #
+    # Founder construction (initial release AND protocol additions)
+    # ------------------------------------------------------------------ #
+    def _spawn_group(self, g: AgentGroup) -> list[AgentMeta]:
+        """Construct founders for group ``g``, released near the arena centre."""
+        cfg = self.cfg
+        sd = cfg.individual_variation
+        release = np.array([cfg.arena.width / 2, cfg.arena.height / 2])
+        delayed = (g.treatment.drug not in ("none", None)
+                   and g.treatment.day_offset > 0.0)
+        specs = {k: parse_spec(v) for k, v in (g.dists or {}).items()}
+        metas = []
+        for _ in range(g.count):
+            # seed each founder's innate attributes from the group's specs
+            base = deepcopy(g.traits)
+            for tname, spec in specs.items():
+                if hasattr(base, tname):
+                    setattr(base, tname, spec.sample(self.rng))
+            # pre-onset profile: drug excluded if delivered after release
+            traits = resolve_traits(base, g.genotype, g.treatment,
+                                    drug_active=(False if delayed else None))
+            if sd > 0:  # global jitter only for traits without an explicit spec
+                self._jitter_traits(traits, sd, skip=set(specs))
+            idx = self._next_index
+            shortid = self._next_shortid
+            self._next_index += 1
+            self._next_shortid += 1
+            start = release + self.rng.normal(0, 0.15, 2)
+            metas.append(AgentMeta(
+                index=idx, sexid=f"{g.sex}{shortid}", shortid=shortid,
+                species=g.species, sex=g.sex, group=g.label,
+                genotype=g.genotype, treatment=g.treatment,
+                traits=traits, appearance=getattr(g, "appearance", None),
+                home=start.copy(),
+            ))
+            if delayed:  # schedule the drug to take effect mid-experiment
+                post = deepcopy(traits)
+                apply_drug(post, g.treatment)
+                onset_s = g.treatment.day_offset * 86400.0
+                for tname, arr in TRAIT_TO_ARRAY.items():
+                    if abs(getattr(post, tname) - getattr(traits, tname)) > 1e-9:
+                        self._schedule.append(
+                            (onset_s, idx, arr, getattr(post, tname)))
+        return metas
+
+    def _init_state_for(self, metas: list[AgentMeta]) -> dict:
+        """Fresh per-agent state arrays for ``metas`` (attr name -> array)."""
+        m = len(metas)
+        rng = self.rng
+        return {
+            "home": np.array([a.home for a in metas], float).reshape(-1, 2),
+            "H": rng.uniform(0, 2 * np.pi, m),
+            # ---- condition (dynamic 0..1 bars; presented ×100) ----
+            "hunger": rng.uniform(0, 0.3, m),
+            "thirst": rng.uniform(0, 0.3, m),
+            "energy": np.ones(m),
+            "health": np.ones(m),
+            "stress": np.full(m, 0.1),
+            "alive": np.ones(m, bool),
+            "estrus_phase": rng.uniform(0, 1, m),
+            # ---- behaviour counters / bookkeeping ----
+            "fights_won": np.zeros(m, int),
+            "fights_lost": np.zeros(m, int),
+            "matings": np.zeros(m, int),
+            "dist_today": np.zeros(m),
+            "dist_total": np.zeros(m),
+            # 0 rest, 1 forage, 2 roam, 3 flee, 4 mate, 5 dead
+            "activity": np.zeros(m, int),
+            # ---- trait vectors ----
+            "sex_m": np.array([1.0 if a.sex == "M" else 0.0 for a in metas]),
+            "aggr": np.array([a.traits.aggression for a in metas]),
+            "bold": np.array([a.traits.boldness for a in metas]),
+            "social": np.array([a.traits.sociability for a in metas]),
+            "explore": np.array([a.traits.exploration for a in metas]),
+            "smell": np.array([a.traits.smell_ability for a in metas]),
+            "identity": np.array([a.traits.identity_signal for a in metas]),
+            "speed": np.array([a.traits.base_speed for a in metas]),
+            "home_r": np.array([a.traits.home_range_r for a in metas]),
+            "mass": np.array([a.traits.mass for a in metas]),
+            "metabolism": np.array([a.traits.metabolism for a in metas]),
+            "turn_rate": np.array([a.traits.turn_rate for a in metas]),
+            "wander": np.array([a.traits.wander for a in metas]),
+            # ---- appearance (per-agent colour / size / shape for the views) --
+            "agent_rgba": np.array(
+                [_appearance_rgba(a.appearance, a.sex)
+                 for a in metas]).reshape(-1, 4),
+            "agent_size": np.array(
+                [getattr(a.appearance, "size", 1.0) or 1.0 for a in metas]),
+            "agent_shape": np.array(
+                [_SHAPE_CODE.get(getattr(a.appearance, "shape", "rodent"), 0)
+                 for a in metas], int),
+        }
+
+    def _append_state(self, metas: list[AgentMeta]) -> None:
+        """Grow every per-agent array for newly introduced founders."""
+        if not metas:
+            return
+        st = self._init_state_for(metas)
+        for k, v in st.items():
+            cur = getattr(self, k)
+            setattr(self, k, np.concatenate([cur, v]) if v.ndim == 1
+                    else np.vstack([cur, v]))
+        cfg = self.cfg
+        newP = np.clip(st["home"].copy(), 0.02,
+                       [cfg.arena.width - 0.02, cfg.arena.height - 0.02])
+        self.P = np.vstack([self.P, newP])
+        self.mass0 = np.concatenate([self.mass0, st["mass"].copy()])
+        self.agents.extend(metas)
+        self.n = len(self.agents)
+
+    # ------------------------------------------------------------------ #
+    # Protocol events — timed add/remove of animals and resources
+    # ------------------------------------------------------------------ #
+    def _apply_protocol(self, elapsed_s: float, events) -> None:
+        due = [p for t, p in self._proto_schedule if elapsed_s >= t]
+        self._proto_schedule = [(t, p) for t, p in self._proto_schedule
+                                if elapsed_s < t]
+        for p in due:
+            if p.kind == "add_agents" and p.group is not None:
+                self._add_agents(p.group, elapsed_s, events)
+            elif p.kind == "remove_agents":
+                self._remove_agents(p.target or "all", p.count,
+                                    elapsed_s, events)
+            elif p.kind == "add_resource" and p.object is not None:
+                self._res_objects.append(deepcopy(p.object))
+                self._rebuild_resources()
+            elif p.kind == "remove_resource":
+                t = (p.target or "").strip()
+                keep = [o for o in self._res_objects
+                        if not (o.label == t or o.kind == t)]
+                if len(keep) != len(self._res_objects):
+                    self._res_objects = keep
+                    self._rebuild_resources()
+
+    def _add_agents(self, group: AgentGroup, elapsed_s: float, events) -> None:
+        metas = self._spawn_group(group)
+        self._append_state(metas)
+        self._pop_dirty = True
+        if events is not None:
+            for a in metas:
+                events.record(elapsed_s, "release", a, None,
+                              a.home[0], a.home[1])
+
+    def _remove_agents(self, target: str, count: int, elapsed_s: float,
+                       events) -> None:
+        """Trap out living agents matching ``target`` (count 0 = all matching).
+
+        Removed animals keep their identity and history, but stop moving,
+        interacting and appearing in the trajectory — like a real removal.
+        """
+        idxs = [a.index for a in self.agents
+                if self.alive[a.index] and self._match_target(a, target)]
+        if count > 0:
+            idxs = idxs[:count]
+        for i in idxs:
+            self.alive[i] = False
+            self.agents[i].alive = False
+            self.agents[i].removed = True
+            self.activity[i] = 5
+            if events is not None:
+                events.record(elapsed_s, "removal", self.agents[i], None,
+                              self.P[i, 0], self.P[i, 1])
+        if idxs:
+            self._pop_dirty = True
 
     # ------------------------------------------------------------------ #
     # Circadian activity
@@ -316,6 +431,12 @@ class Simulation:
                     still.append((onset_s, i, attr, val))
             self._schedule = still
 
+        # --- apply any protocol events whose time has arrived ---
+        if self._proto_schedule and elapsed_s >= self._proto_schedule[0][0]:
+            self._apply_protocol(elapsed_s, events)
+            n = self.n                      # roster may have grown
+            P = self.P
+
         # --- apply any scheduled interventions whose time has arrived ---
         if self._iv_schedule:
             still = []
@@ -330,17 +451,17 @@ class Simulation:
                         elif op == "add":
                             a[i] += val
                         setattr(self.agents[i].traits, _ARRAY_TO_TRAIT[arr], a[i])
-                    if events is not None and idxs:
-                        events.record(elapsed_s, "intervention",
-                                      self.agents[idxs[0]], None,
-                                      self.P[idxs[0], 0], self.P[idxs[0], 1],
-                                      val)
+                    if events is not None:
+                        for i in idxs:   # one event row per affected agent
+                            events.record(elapsed_s, "intervention",
+                                          self.agents[i], None,
+                                          self.P[i, 0], self.P[i, 1], val)
                 else:
                     still.append((at_s, idxs, arr, op, val))
             self._iv_schedule = still
 
         # --- decision: the policy turns state into a desired heading ---
-        desired, perc = self.policy.decide(self, elapsed_s)
+        desired, perc = self.policy.decide(self, elapsed_s, dt)
         dist = perc["dist"]
         dist_home = perc["dist_home"]
         within = perc["within"]
@@ -379,8 +500,7 @@ class Simulation:
                                   * (dt / self._settle_tau_s))
 
         # --- condition dynamics (data-driven interaction rules) ---
-        on_food = (self._on_resource(self.P, self.food, self.food_r)
-                   if self.food.shape[0] else np.zeros(n, bool))
+        on_food = self._on_food()
         on_water = (self._on_resource(self.P, self.water, self.water_r)
                     if self.water.shape[0] else np.zeros(n, bool))
         self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
@@ -407,7 +527,7 @@ class Simulation:
 
         # --- social events (mating, combat) ---
         if events is not None:
-            self._resolve_events(elapsed_s, dist, rec_j, events)
+            self._resolve_events(elapsed_s, dt, dist, rec_j, events)
 
     # ------------------------------------------------------------------ #
     def _seek(self, P, targets, need):
@@ -420,6 +540,17 @@ class Simulation:
     def _on_resource(self, P, targets, radii):
         d = np.linalg.norm(P[:, None, :] - targets[None, :, :], axis=2)
         return np.any(d < radii[None, :], axis=1)
+
+    def _on_food(self):
+        """At a chow pile: inside a food object's radius or a resource zone's box."""
+        hit = (self._on_resource(self.P, self.food, self.food_r)
+               if self.food.shape[0] else np.zeros(self.n, bool))
+        if len(self.food_rects):
+            cx, cy, hw, hd = self.food_rects.T
+            inx = np.abs(self.P[:, 0][:, None] - cx[None, :]) <= hw[None, :]
+            iny = np.abs(self.P[:, 1][:, None] - cy[None, :]) <= hd[None, :]
+            hit |= np.any(inx & iny, axis=1)
+        return hit
 
     def _apply_dynamics(self, dt, step_dist, activity, n_near, on_food, on_water):
         """Apply the editable interaction rules to the condition variables.
@@ -635,7 +766,9 @@ class Simulation:
         return float(self.aggr[i] * np.sqrt(self.mass[i]) * (0.3 + self.health[i])
                      * (1.0 + self.bold[i]) * (1.0 - 0.3 * self.stress[i]))
 
-    def _resolve_events(self, elapsed_s, dist, rec_j, events):
+    def _resolve_events(self, elapsed_s, dt, dist, rec_j, events):
+        # per-step mating probability from the per-second hazard (dt-invariant)
+        p_mate = 1.0 - np.exp(-self.mate_rate_hz * dt)
         contact = np.argwhere((dist < self.contact_r) & np.isfinite(dist))
         for i, j in contact:
             if i >= j or not (self.alive[i] and self.alive[j]):
@@ -644,7 +777,7 @@ class Simulation:
             if ai.sex != aj.sex:
                 # --- mating: opposite sex, female receptive ---
                 fem = i if ai.sex == "F" else j
-                if (rec_j[fem] > 0.3 and self.rng.random() < self.mate_rate
+                if (rec_j[fem] > 0.3 and self.rng.random() < p_mate
                         and elapsed_s - self._last_mate.get((i, j), -1e9)
                         >= self.mate_cooldown_s):
                     self._last_mate[(i, j)] = elapsed_s
@@ -754,6 +887,11 @@ class Simulation:
             for k in range(n_steps):
                 self.step(elapsed, dt, events=evt)
                 elapsed += dt
+                if self._pop_dirty:      # protocol changed the roster
+                    write_agents_table(agents_path, self.agents)
+                    if meta_cb is not None:
+                        meta_cb(self.agent_static())
+                    self._pop_dirty = False
                 if k % rec_every == 0:
                     rec.record(elapsed, self.P[:, 0], self.P[:, 1])
                 if k % cond_every == 0:
