@@ -1,4 +1,4 @@
-"""MAD training-file registry — recordings referenced by path, not copied.
+"""MAD audio-file registry — recordings referenced by path, not copied.
 
 A MAD project used to copy every training recording into ``<project>/recordings/``.
 That made projects self-contained but duplicated hundreds of MB per file (a

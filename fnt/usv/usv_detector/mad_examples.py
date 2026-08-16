@@ -301,12 +301,19 @@ def _examples_to_annotations(examples, wav_name, grid_shape):
         if f1 <= f0 or t1 <= t0:
             continue
         local = m[lf0:lf0 + (f1 - f0), lt0:lt0 + (t1 - t0)]
-        yield {
+        ann = {
             "id": meta.get("id", ex.get("meta", {}).get("id")),
             "category": meta.get("class", ""),
             "f0": f0, "f1": f1, "t0": t0, "t1": t1,
             "mask": np.ascontiguousarray(local),
         }
+        # Examples created by accepting a model prediction remember the blob_id
+        # of the row they came from, so the reviewer can tell "this CSV row is
+        # already on screen as a confirmed label" from "this is an accepted row
+        # with no example behind it" and not draw the call twice.
+        if meta.get("blob_id") is not None:
+            ann["blob_id"] = meta["blob_id"]
+        yield ann
 
 
 def iter_file_annotations(

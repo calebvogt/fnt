@@ -10,16 +10,32 @@ GUI entry point: `python fnt/usv/mad_pyqt.py`
 
 ---
 
-## The two tabs
+## One list, one canvas
 
-1. **Label & Train** — build the project. Paint/segment calls on a handful of
-   files, confirm them (they become training examples), and train a U-Net.
-2. **Inference (Deploy)** — point a trained model at your recordings. It writes
-   per-call detections you review (accept / reject / adjust).
+MAD follows SLEAP's project model: a project **points at** recordings where they
+already live, the way a SLEAP project points at videos. There is a single
+**Audio** list — every recording the project knows about — and a single
+spectrogram canvas. Click a row to preview it, label it, and review its
+detections.
 
-The loop you're meant to run: label a few calls → train → run inference →
-correct the predictions → (optionally) feed corrections back in and retrain
-until the model is accurate enough, then just deploy and review.
+Anything you confirm in that list trains the model. There is no separate
+"training set" to curate: if a recording is in the list, its labels train; if you
+don't want it to, take it out of the list.
+
+The loop you're meant to run: add audio → label a few calls → train → run
+inference → correct the predictions → (optionally) feed corrections back in and
+retrain until the model is accurate enough, then just deploy and review.
+
+**Running large batches** is the one thing that deliberately stays outside the
+list. *Run Inference ▸ Folder* scans a folder tree once and streams the paths
+straight to the worker: thousands of recordings don't become thousands of list
+rows, and production audio you're not curating never joins the training set.
+
+**A project is optional** — right up until you train. Add wavs, label them, load
+a model from any trained project, run inference and review, all with no project
+open (labels and detections save next to the audio either way). Training is what
+needs a project, because the model, its checkpoints and the consolidated example
+store have to live somewhere; the Run Training button offers to make one.
 
 ---
 
@@ -173,8 +189,8 @@ Project-wide:
 
 ### Recordings are referenced, not copied
 
-A project does **not** store your audio. `mad_project_info.json` holds a
-`training_files` table of *references*: absolute path, basename, size, and a
+A project does **not** store your audio. `mad_project_info.json` holds an
+`audio_files` table of *references*: absolute path, basename, size, and a
 cheap content fingerprint (size + first and last 1 MiB).
 
 This is safe because of where training data actually lives. Every confirmed call
@@ -187,7 +203,7 @@ indices and coordinates, so a missing video means it cannot train at all; MAD's
 model, labels and detections are all unaffected. So a missing recording is a
 **soft** state, not an error:
 
-- The Training Data row shows `⚠` and preview/playback are unavailable.
+- The Audio row shows `⚠` and preview/playback are unavailable.
 - Training, the example store, and every saved detection keep working.
 - Batch inference silently skips missing files rather than aborting the run.
 
@@ -209,12 +225,20 @@ changed — a wrong guess is a no-op.
 **Portability.** **File ▸ Pack Project (embed audio)…** copies every referenced
 recording into `recordings/`, making the project fully self-contained for
 archiving or handing to a collaborator. Packed files are marked `embedded=True`
-and become project-owned: removing one from the Training Data set deletes it,
-whereas removing a *referenced* file only unregisters it and never touches disk.
+and become project-owned: removing one from the Audio list deletes it (and says
+so first), whereas removing a *referenced* file only unregisters it and never
+touches disk.
 
 **Legacy projects.** Projects with `recordings/` copies still work. Those wavs are
 adopted into the registry on open as `embedded=True`, so nothing changes for them
 unless you delete the copies yourself.
+
+Projects written before the lists were merged kept two entries —
+`training_files` (the curated training set) and `audio_files` (the working
+session list, plain path strings). They are folded into one `audio_files`
+registry on open, registered entries first, and nothing is dropped. Recordings
+that only ever sat in the session list now train the model, since that is what
+being in the list means.
 
 ### Why we do NOT store the full probability grid
 
@@ -267,10 +291,11 @@ batch path is built around three properties.
 
 **Recursive folder targets.** 24/7 multi-mic sets are nested
 (experiment / mic / day), so folder scans walk the tree. The **Folder** target in
-Run Inference is deliberately *not* routed through the session list: loading
-3,000 recordings there would mean 3,000 list widgets plus a sibling-CSV stat per
-row before anything runs. The folder is scanned once and paths stream to the
-worker.
+Run Inference is deliberately *not* routed through the Audio list: adding 3,000
+recordings there would mean 3,000 list widgets plus a sibling-CSV stat per row
+before anything runs — and would enrol production audio into the project's
+training set, since everything in the list trains. The folder is scanned once and
+paths stream to the worker.
 
 **Resumable runs.** Two independent mechanisms, answering different questions:
 
@@ -404,6 +429,7 @@ of sync.
 | `mad_training.py` | Train the U-Net from confirmed examples. |
 | `mad_examples.py` | Confirmed training-example store (`training_data.h5`). |
 | `mad_dataset.py` | Spectrogram/tile helpers shared by training & inference. |
-| `mad_project.py` | Project config / on-disk layout. |
+| `mad_project.py` | Project config / on-disk layout; folds pre-merge two-list projects into one `audio_files` registry. |
+| `mad_registry.py` | Referenced-recording registry: fingerprints, re-resolving moved files. |
 | `mad_labels.py` | Sibling-path helpers (CSV naming, etc.). |
 | `fnt_mask_store.py` | Shared HDF5 mask storage (CAD + MAD); `/calls`, `/pred_calls`, training store, repack. |

@@ -2707,10 +2707,10 @@ class MADEvalDialog(QDialog):
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Evaluate on:"))
         self.combo_scope = QComboBox()
-        self.combo_scope.addItem("Training data files", 'training')
-        self.combo_scope.addItem("Session audio files", 'session')
+        self.combo_scope.addItem("All audio files", 'all')
+        self.combo_scope.addItem("Current file only", 'current')
         self.combo_scope.setToolTip(
-            "Which loaded recordings to score. Only files that carry "
+            "Which recordings in the Audio list to score. Only files that carry "
             "hand-labels are used; the rest are reported as skipped.")
         opts.addWidget(self.combo_scope, 1)
         opts.addWidget(QLabel("Match IoU ≥"))
@@ -2765,9 +2765,10 @@ class MADEvalDialog(QDialog):
 
     def _targets(self):
         m = self._main
-        if self.combo_scope.currentData() == 'session':
-            return [p for p in m.audio_files if os.path.isfile(p)]
-        return [p for p in m.deploy_files if not m._is_missing(p)]
+        if self.combo_scope.currentData() == 'current':
+            cur = m._active_wav_path()
+            return [cur] if cur and os.path.isfile(cur) else []
+        return [p for p in m.audio_files if os.path.isfile(p)]
 
     def _run(self):
         m = self._main
@@ -2974,7 +2975,7 @@ class MADRunSummaryDialog(QDialog):
         else:
             self.lbl_stats.setText(
                 "No batch runs recorded yet. Run inference over a folder or the "
-                "training set and the run is logged automatically.")
+                "Audio list and the run is logged automatically.")
 
     def _reload(self):
         from fnt.usv.usv_detector.mad_batch import RunManifest, summarize
@@ -3375,23 +3376,14 @@ class MADMainWindow(QMainWindow):
         # can reverse the last few. Reset on file change.
         self._undo_stack: List[dict] = []
 
-        # Training Data list (project recordings the model trains on). Backed
-        # by deploy_files/deploy_list (repurposed from the old inference queue).
-        self.deploy_files: List[str] = []
-        # Normcased absolute paths of registered training recordings whose audio
-        # can't be found right now. A soft state — see _rescan_project_wavs.
-        self._missing_training: set = set()
+        # Normcased absolute paths of registered recordings whose audio can't be
+        # found right now. A soft state — see _rescan_project_wavs.
+        self._missing_audio: set = set()
         # Batch-scale inference target: a folder tree scanned once, kept as a
         # plain path list so thousands of recordings never become list widgets.
         self._infer_folder: Optional[str] = None
         self._infer_folder_wavs: List[str] = []
-        self._deploy_file_idx: Optional[int] = None
         self._infer_model_project_dir: Optional[str] = None
-        # Which list owns the single preview: 'session' or 'training'. Drives
-        # _review_mode (training → accept saves a training example; session →
-        # accept/reject only writes status to the sibling CSV).
-        self._active_source: str = 'session'
-        self._review_mode: str = 'deploy'
 
         # Rubber-band multi-selection: stable ids of box-selected detections.
         self._box_sel_ids: List = []
@@ -3467,8 +3459,8 @@ class MADMainWindow(QMainWindow):
 
         # Single scrolled left column (no tabs): everything acts on the one
         # shared spectrogram canvas. Order top→bottom mirrors the workflow:
-        # open project → load session audio → curate Training Data → label →
-        # review detections → train/infer → logs.
+        # open project → add audio → label → review detections → train/infer →
+        # logs.
         self.left_column = QScrollArea()
         self.left_column.setWidgetResizable(True)
         self.left_column.setMinimumWidth(_min_w)
@@ -3479,8 +3471,7 @@ class MADMainWindow(QMainWindow):
         _page_layout.setContentsMargins(5, 5, 5, 5)
         _page_layout.setSpacing(8)
         for build in (
-            self._create_session_audio_section,
-            self._create_training_data_list_section, # Training Data
+            self._create_audio_section,              # Audio
             self._create_paint_tools_section,        # Labeling Tools
             self._create_annotation_list_section,    # Detections
             self._create_model_section,
@@ -3725,38 +3716,53 @@ class MADMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Left-panel section builders
     # ------------------------------------------------------------------
-    def _create_session_audio_section(self, layout):
-        group = QGroupBox("Load Session Audio")
-        self._grp_session_audio = group
+    def _create_audio_section(self, layout):
+        group = QGroupBox("Audio")
+        self._grp_audio = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
+
+        hint = QLabel(
+            "Every recording this project knows about — referenced where it "
+            "lives, never copied in. Label any of them; the model trains on all "
+            "of them. A ⚠ row means the audio moved: labels, training and saved "
+            "detections are fine, use File ▸ Locate Missing Recordings… to "
+            "restore preview.")
+        hint.setStyleSheet("color: #999999; font-size: 9px;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
 
         add_row = QHBoxLayout()
         add_row.setSpacing(4)
         self.btn_add_folder = QPushButton("Add Folder…")
         self.btn_add_folder.setToolTip(
-            "Load every .wav directly inside a folder (non-recursive) into the "
-            "working session. Loading does NOT copy files into the project — "
-            "labels/predictions save next to the original audio. Use 'Copy to "
-            "Training Data' to add a file to the project's training set."
+            "Add every .wav directly inside a folder (non-recursive). Files are "
+            "REFERENCED IN PLACE, not copied: labels and detections save next "
+            "to the original audio, and the project stays small.\n\n"
+            "With a project open the files are recorded in it and reappear next "
+            "time you open it; with no project they are loaded for this session "
+            "only."
         )
         self.btn_add_folder.clicked.connect(self._menu_add_folder)
         add_row.addWidget(self.btn_add_folder)
 
         self.btn_add_files = QPushButton("Add Files…")
         self.btn_add_files.setToolTip(
-            "Load individual .wav files into the working session. Does not copy "
-            "them into the project — labels save next to the source audio."
+            "Add individual .wav files. Referenced in place, not copied — "
+            "labels save next to the source audio."
         )
         self.btn_add_files.clicked.connect(self._add_audio_files)
         add_row.addWidget(self.btn_add_files)
         vbox.addLayout(add_row)
 
         self.file_list = QListWidget()
-        self.file_list.setMaximumHeight(180)
+        self.file_list.setMaximumHeight(220)
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.file_list.setItemDelegate(
             FileCountDelegate(self.file_list, palette_fn=self._overlay_palette))
+        self.file_list.setToolTip(
+            "Click a row to preview and label it. The count is "
+            "(accepted, pending, rejected) calls for that recording.")
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
         vbox.addWidget(self.file_list)
@@ -3765,27 +3771,13 @@ class MADMainWindow(QMainWindow):
         btn_row.setSpacing(4)
         self.btn_remove_files = QPushButton("Remove File(s)")
         self.btn_remove_files.setToolTip(
-            "Unload the selected files from the session list. Does NOT delete "
-            "anything from disk — the .wav and any sibling csv/h5 stay put. "
-            "Use Shift/Cmd+click to select multiple."
+            "Drop the selected recordings from the project. Referenced audio is "
+            "only unregistered — the .wav and any sibling csv/h5 stay exactly "
+            "where they are on disk. Use Shift/Cmd+click to select multiple."
         )
         self.btn_remove_files.clicked.connect(self._remove_selected_files)
         self.btn_remove_files.setEnabled(False)
         btn_row.addWidget(self.btn_remove_files)
-
-        self.btn_copy_to_training = QPushButton("Add File(s) → Training Data")
-        self.btn_copy_to_training.setToolTip(
-            "Add the selected file(s) to the project's Training Data set — the "
-            "model trains on that set.\n\n"
-            "The wav is REFERENCED IN PLACE, not copied: labels and detections "
-            "stay beside the original recording, and the project stays small. "
-            "Confirmed calls are baked into the project's own training store, "
-            "so if a recording later moves, only its preview is affected — "
-            "never the model or your labels. Needs an open project."
-        )
-        self.btn_copy_to_training.clicked.connect(self._copy_to_training_data)
-        self.btn_copy_to_training.setEnabled(False)
-        btn_row.addWidget(self.btn_copy_to_training)
         vbox.addLayout(btn_row)
 
         nav_row = QHBoxLayout()
@@ -3992,53 +3984,6 @@ class MADMainWindow(QMainWindow):
             self.btn_view_cycle.setText(labels.get(mode, 'Spec + Mask (V)'))
         self.spectrogram.set_view_mode(mode)
 
-    def _create_training_data_list_section(self, layout):
-        group = QGroupBox("Training Data")
-        self._grp_training_list = group
-        vbox = QVBoxLayout()
-        vbox.setSpacing(4)
-
-        hint = QLabel(
-            "Recordings the model trains on — referenced in place, not copied. "
-            "Add them with 'Add File(s) → Training Data' above; click a row to "
-            "preview/review. A ⚠ row means the audio moved: training and saved "
-            "detections are fine, use File ▸ Locate Missing Recordings… to "
-            "restore preview.")
-        hint.setStyleSheet("color: #999999; font-size: 9px;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
-
-        # Repurposed from the old inference queue: this is now the project's
-        # Training Data set. deploy_files/deploy_list back it.
-        self.deploy_list = QListWidget()
-        self.deploy_list.setMaximumHeight(150)
-        self.deploy_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.deploy_list.setItemDelegate(
-            FileCountDelegate(self.deploy_list,
-                              palette_fn=self._overlay_palette))
-        self.deploy_list.setToolTip(
-            "Training Data recordings (stored in the project). Click to preview "
-            "and review; edits modify this training copy's csv/h5.")
-        self.deploy_list.currentRowChanged.connect(self._on_deploy_file_selected)
-        self.deploy_list.itemSelectionChanged.connect(self._sync_list_buttons)
-        vbox.addWidget(self.deploy_list)
-
-        self.btn_remove_training = QPushButton("Remove from Training Data")
-        self.btn_remove_training.setToolTip(
-            "Delete the selected recording(s) from the project's Training Data "
-            "(removes the copied wav + csv/h5 from the project). Does not touch "
-            "the original session source files. Shift/Cmd+click for multiple.")
-        self.btn_remove_training.clicked.connect(self._remove_from_training_data)
-        self.btn_remove_training.setEnabled(False)
-        vbox.addWidget(self.btn_remove_training)
-
-        self.lbl_deploy_queue = QLabel("0 files in training set")
-        self.lbl_deploy_queue.setStyleSheet("color: #999999; font-size: 9px;")
-        vbox.addWidget(self.lbl_deploy_queue)
-
-        group.setLayout(vbox)
-        layout.addWidget(group)
-
     def _create_model_section(self, layout):
         group = QGroupBox("Model Training && Inference")
         self._grp_train_model = group
@@ -4077,7 +4022,7 @@ class MADMainWindow(QMainWindow):
         self.btn_deploy_load_project.setToolTip(
             "Pick a trained MAD project folder to load its models into the "
             "dropdown above — works with no project open, so you can point a "
-            "trained model at freshly loaded session audio and run inference.")
+            "trained model at freshly added audio and run inference.")
         self.btn_deploy_load_project.clicked.connect(self._browse_infer_project)
         src_row.addWidget(self.btn_deploy_load_project)
         self.btn_quick_infer = QPushButton("Quick Inference (Q)")
@@ -4113,9 +4058,9 @@ class MADMainWindow(QMainWindow):
         # ---- Train a new model (config collapses under a toggle) ----
         self.chk_train_new = QCheckBox("Train a new model")
         self.chk_train_new.setToolTip(
-            "Show the training configuration to train a fresh model on the "
-            "Training Data set. The trained model is added to the dropdown "
-            "above and selected automatically.")
+            "Show the training configuration to train a fresh model on every "
+            "label in the Audio list. The trained model is added to the "
+            "dropdown above and selected automatically.")
         self.chk_train_new.toggled.connect(self._on_train_new_toggled)
         vbox.addWidget(self.chk_train_new)
 
@@ -4293,50 +4238,35 @@ class MADMainWindow(QMainWindow):
         scope_hint.setStyleSheet("font-size: 9px; color: #bbbbbb;")
         vbox.addWidget(scope_hint)
 
-        sess_row = QHBoxLayout()
-        sess_row.setSpacing(4)
-        self.chk_scope_session = QCheckBox("Session data")
-        self.chk_scope_session.setToolTip(
-            "Run inference on files loaded in Load Session Audio. Predictions "
-            "save as csv/h5 next to each source recording.")
-        self.chk_scope_session.toggled.connect(self._update_run_button)
-        sess_row.addWidget(self.chk_scope_session)
-        self.combo_scope_session = QComboBox()
-        self.combo_scope_session.addItems(["All", "Current file"])
-        self.combo_scope_session.setToolTip(
-            "All session files, or just the currently previewed session file.")
-        self.combo_scope_session.currentIndexChanged.connect(
+        audio_row = QHBoxLayout()
+        audio_row.setSpacing(4)
+        self.chk_scope_audio = QCheckBox("Audio list")
+        self.chk_scope_audio.setToolTip(
+            "Run inference on the recordings in the Audio list. Predictions "
+            "save as csv/h5 next to each recording.")
+        self.chk_scope_audio.toggled.connect(self._update_run_button)
+        audio_row.addWidget(self.chk_scope_audio)
+        self.combo_scope_audio = QComboBox()
+        self.combo_scope_audio.addItems(["All", "Current file"])
+        self.combo_scope_audio.setToolTip(
+            "Every recording in the Audio list, or just the one being previewed.")
+        self.combo_scope_audio.currentIndexChanged.connect(
             self._update_run_button)
-        sess_row.addWidget(self.combo_scope_session, 1)
-        vbox.addLayout(sess_row)
-
-        train_row = QHBoxLayout()
-        train_row.setSpacing(4)
-        self.chk_scope_training = QCheckBox("Training data")
-        self.chk_scope_training.setToolTip(
-            "Run inference on the project's Training Data recordings. "
-            "Predictions save into the training copy's csv/h5.")
-        self.chk_scope_training.toggled.connect(self._update_run_button)
-        train_row.addWidget(self.chk_scope_training)
-        self.combo_scope_training = QComboBox()
-        self.combo_scope_training.addItems(["All", "Current file"])
-        self.combo_scope_training.setToolTip(
-            "All training-data files, or just the currently previewed one.")
-        self.combo_scope_training.currentIndexChanged.connect(
-            self._update_run_button)
-        train_row.addWidget(self.combo_scope_training, 1)
-        vbox.addLayout(train_row)
+        audio_row.addWidget(self.combo_scope_audio, 1)
+        vbox.addLayout(audio_row)
 
         # Folder target — the batch-scale path. Deliberately NOT routed through
-        # the session list: loading 3,000 recordings there means 3,000 list rows
-        # plus a sibling-CSV stat per row before anything runs. Here the folder
-        # is scanned once and the paths are streamed straight to the worker.
+        # the Audio list: adding 3,000 recordings there means 3,000 list rows
+        # plus a sibling-CSV stat per row before anything runs, and it would
+        # enrol production recordings you aren't curating into the project's
+        # training set. Here the folder is scanned once and the paths are
+        # streamed straight to the worker.
         folder_row = QHBoxLayout()
         folder_row.setSpacing(4)
         self.chk_scope_folder = QCheckBox("Folder")
         self.chk_scope_folder.setToolTip(
             "Run the model over every .wav in a folder tree, without loading "
-            "them into the session list. This is the path for large batches — "
+            "them into the Audio list. This is the path for large batches — "
             "thousands of recordings scan in seconds because nothing is "
             "rendered until you review results.\n\n"
             "Detections save as a standalone CSV next to each recording.")
@@ -4463,15 +4393,28 @@ class MADMainWindow(QMainWindow):
         else:
             self._on_deploy_infer()
 
+    def _training_source_paths(self) -> List[str]:
+        """The recordings whose labels train the model.
+
+        With a project open that is its *registry*, not the visible list: a file
+        opened straight from the run summary is shown for review without being
+        enrolled in the project (see :meth:`_open_wav_for_review`), and it must
+        not slip into training just because it's on screen. With no project open
+        the visible list is all there is.
+        """
+        if self._project is None:
+            return list(self.audio_files)
+        return [e.path for e in self._project.audio_entries()]
+
     def _training_label_count(self) -> int:
-        """Total confirmed training-example labels across the Training Data set
-        (what the next training run will use)."""
+        """Total confirmed labels across the training sources — what the next
+        training run will use."""
         n = 0
         try:
             from fnt.usv.usv_detector.fnt_mask_store import (
                 masks_sibling_path, td_count,
             )
-            for fp in self.deploy_files:
+            for fp in self._training_source_paths():
                 n += td_count(masks_sibling_path(fp))
         except Exception:
             n = 0
@@ -4488,8 +4431,8 @@ class MADMainWindow(QMainWindow):
             btn.setEnabled(True)
             return
         train = self.chk_train_new.isChecked()
-        infer = (self.chk_scope_session.isChecked()
-                 or self.chk_scope_training.isChecked())
+        infer = (self.chk_scope_audio.isChecked()
+                 or self.chk_scope_folder.isChecked())
         if train and infer:
             label = "Run Training + Inference"
         elif train:
@@ -4497,9 +4440,12 @@ class MADMainWindow(QMainWindow):
         else:
             label = "Run Inference"
         if train:
+            # Deliberately not gated on a project: with labels but no project,
+            # the button offers to create one (see _on_inline_train) instead of
+            # sitting grayed out with no explanation.
             n = self._training_label_count()
             label += f" ({n} label{'s' if n != 1 else ''})"
-            enabled = bool(self._project) and n > 0
+            enabled = n > 0
         else:
             model = self._selected_deploy_model_path()
             enabled = (bool(model and os.path.isfile(model))
@@ -5096,7 +5042,6 @@ class MADMainWindow(QMainWindow):
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
-        self._update_active_training_count()
         self._update_overview_marks()
 
     def _min_score(self) -> float:
@@ -5114,24 +5059,6 @@ class MADMainWindow(QMainWindow):
         # can't disagree.
         self.spectrogram.set_min_score(value / 100.0)
         self._refresh_annotation_list()
-
-    def _update_active_training_count(self):
-        """Live-update the active Training Data list row's mask count from the
-        in-memory annotations, so clear / delete / add / confirm reflect
-        immediately (mirrors the session list's live reconcile)."""
-        if getattr(self, '_active_source', 'session') != 'training':
-            return
-        if not hasattr(self, 'deploy_list'):
-            return
-        idx = self._deploy_file_idx
-        if idx is None or not (0 <= idx < len(self.deploy_files)):
-            return
-        item = self.deploy_list.item(idx)
-        if item is None:
-            return
-        fp = self.deploy_files[idx]
-        self._apply_file_row(item, os.path.basename(fp),
-                             self._file_status_counts(fp))
 
     def _update_overview_marks(self):
         """Place one status-colored tick per detection on the waveform overview
@@ -5175,9 +5102,8 @@ class MADMainWindow(QMainWindow):
         if not data:
             return
         wav, t0, eid, status = data
-        # The detection belongs to the currently-previewed file in the common
-        # case (session OR training). Only switch files if it names a DIFFERENT
-        # session file; a Training Data file is already the active preview.
+        # The detection almost always belongs to the previewed file; only
+        # switch files if the row names a DIFFERENT one.
         active = self._active_wav_path()
         if not (active and os.path.basename(active) == wav):
             for i, p in enumerate(self.audio_files):
@@ -5213,44 +5139,20 @@ class MADMainWindow(QMainWindow):
         return None
 
     def _active_wav_path(self) -> Optional[str]:
-        """Path of the file currently shown in the preview — from whichever
-        list (session or training) owns the selection, or None."""
-        if getattr(self, '_active_source', 'session') == 'training':
-            if (self.deploy_files and self._deploy_file_idx is not None and
-                    0 <= self._deploy_file_idx < len(self.deploy_files)):
-                return self.deploy_files[self._deploy_file_idx]
-        else:
-            if (self.audio_files and
-                    0 <= self.current_file_idx < len(self.audio_files)):
-                return self.audio_files[self.current_file_idx]
+        """Path of the file currently shown in the preview, or None."""
+        if (self.audio_files and
+                0 <= self.current_file_idx < len(self.audio_files)):
+            return self.audio_files[self.current_file_idx]
         return None
 
-    def _clear_session_selection(self):
-        lw = getattr(self, 'file_list', None)
-        if lw is not None:
-            lw.blockSignals(True)
-            lw.clearSelection()
-            lw.setCurrentRow(-1)
-            lw.blockSignals(False)
-
-    def _clear_training_selection(self):
-        lw = getattr(self, 'deploy_list', None)
-        if lw is not None:
-            lw.blockSignals(True)
-            lw.clearSelection()
-            lw.setCurrentRow(-1)
-            lw.blockSignals(False)
-
     def _update_scope_labels(self):
-        """Refresh the 'All (N)' counts on the inference-scope combos."""
-        if not hasattr(self, 'combo_scope_session'):
+        """Refresh the 'All (N)' count on the inference-scope combo."""
+        if not hasattr(self, 'combo_scope_audio'):
             return
-        self.combo_scope_session.setItemText(0, f"All ({len(self.audio_files)})")
-        self.combo_scope_training.setItemText(
-            0, f"All ({len(self.deploy_files)})")
+        self.combo_scope_audio.setItemText(0, f"All ({len(self.audio_files)})")
 
     def _update_review_buttons_for_source(self):
-        """Refresh widgets that depend on which list owns the preview."""
+        """Refresh widgets that depend on which file owns the preview."""
         self._update_scope_labels()
         self._update_pred_review_widgets()
         self._update_run_button()  # "current file" target may have changed
@@ -5260,18 +5162,10 @@ class MADMainWindow(QMainWindow):
         self._update_run_button()
 
     def _sync_list_buttons(self):
-        """Enable the Session/Training action buttons based on list selection."""
+        """Enable the Audio-list action buttons based on the list selection."""
         if hasattr(self, 'btn_remove_files'):
             self.btn_remove_files.setEnabled(
                 bool(self.file_list.selectedItems()))
-        if hasattr(self, 'btn_copy_to_training'):
-            # Enabled whenever a session file is selected; if no project is open
-            # yet, clicking offers to create/open one (Training Data lives in it).
-            self.btn_copy_to_training.setEnabled(
-                bool(self.file_list.selectedItems()))
-        if hasattr(self, 'btn_remove_training'):
-            self.btn_remove_training.setEnabled(
-                bool(self.deploy_list.selectedItems()))
 
     def _pred_indices(self) -> List[int]:
         """Annotation indices with status='prediction', ordered by the
@@ -5500,16 +5394,11 @@ class MADMainWindow(QMainWindow):
             self._after_review_decision(ann.get('id'), was_pending=False)
             return  # already accepted — just move on
         self._snapshot_for_undo("Accept", crops=False)
-        self._log(f"Accept {self._pred_describe(sel)} [{self._review_mode}]")
+        self._log(f"Accept {self._pred_describe(sel)}")
         was_pending = st == 'prediction'
-        if self._review_mode == 'deploy':
-            # Keep the detection visible (blue) and recorded 'accepted' in the
-            # CSV — same as the Label tab, minus saving a training example.
-            self._write_pred_csv_status(ann, 'accepted')
-            ann['status'] = 'accepted'
-            self.spectrogram._rebuild_confirmed_mask()
-        else:
-            self._accept_prediction(sel)
+        # One list, one meaning: accepting a call in the Audio list confirms it
+        # as a label, so it trains the model on the next run.
+        self._accept_prediction(sel)
         self._after_review_decision(self.spectrogram.annotations[sel].get('id')
                                     if sel < len(self.spectrogram.annotations)
                                     else ann.get('id'), was_pending)
@@ -5526,7 +5415,7 @@ class MADMainWindow(QMainWindow):
             self._after_review_decision(ann.get('id'), was_pending=False)
             return  # already rejected — just move on
         self._snapshot_for_undo("Reject", crops=False)
-        self._log(f"Reject {self._pred_describe(sel)} [{self._review_mode}]")
+        self._log(f"Reject {self._pred_describe(sel)}")
         was_pending = st == 'prediction'
         # Converting a confirmed/accepted call to rejected: drop its saved
         # training example (train mode) so it no longer trains the model.
@@ -5544,9 +5433,11 @@ class MADMainWindow(QMainWindow):
         """Delete the saved training example(s) backing a confirmed annotation
         from both the project store and the per-wav sibling, so a rejected call
         stops training the model. Keyed by id AND blob_id (they can differ once a
-        prediction is accepted), best-effort."""
-        if self._project is None:
-            return
+        prediction is accepted), best-effort.
+
+        The sibling h5 is cleaned whether or not a project is open — labels live
+        next to the audio, so rejecting one must not leave a stale example behind
+        for whichever project later picks that recording up."""
         ids = {ann.get('id'), ann.get('blob_id')}
         ids = {str(i) for i in ids if i is not None}
         if not ids:
@@ -5557,11 +5448,12 @@ class MADMainWindow(QMainWindow):
             from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
             h5 = masks_sibling_path(wav)
         for aid in ids:
-            try:
-                from fnt.usv.usv_detector.mad_examples import delete_example
-                delete_example(self._project.training_data_dir, aid)
-            except Exception:
-                pass
+            if self._project is not None:
+                try:
+                    from fnt.usv.usv_detector.mad_examples import delete_example
+                    delete_example(self._project.training_data_dir, aid)
+                except Exception:
+                    pass
             if h5:
                 try:
                     from fnt.usv.usv_detector.fnt_mask_store import td_delete
@@ -5605,11 +5497,7 @@ class MADMainWindow(QMainWindow):
         n = self._reviewed_count
         if n <= 0:
             return  # nothing was actually reviewed this file — no prompt
-        if self._review_mode == 'deploy':
-            idx = self._deploy_file_idx
-            has_next = idx is not None and idx + 1 < len(self.deploy_files)
-        else:
-            has_next = self.current_file_idx + 1 < len(self.audio_files)
+        has_next = self.current_file_idx + 1 < len(self.audio_files)
         base = f"All {n} pending mask(s) reviewed."
         if not has_next:
             self.status_bar.showMessage(base + " (last file)")
@@ -5623,15 +5511,10 @@ class MADMainWindow(QMainWindow):
             self._advance_to_next_review_file()
 
     def _advance_to_next_review_file(self):
-        """Select the next file in the active tab's list (loads it for review)."""
-        if self._review_mode == 'deploy':
-            nxt = (self._deploy_file_idx or 0) + 1
-            if 0 <= nxt < len(self.deploy_files):
-                self.deploy_list.setCurrentRow(nxt)
-        else:
-            nxt = self.current_file_idx + 1
-            if 0 <= nxt < len(self.audio_files):
-                self.file_list.setCurrentRow(nxt)
+        """Select the next file in the Audio list (loads it for review)."""
+        nxt = self.current_file_idx + 1
+        if 0 <= nxt < len(self.audio_files):
+            self.file_list.setCurrentRow(nxt)
 
     @staticmethod
     def _ann_csv_id(ann: dict):
@@ -5826,7 +5709,8 @@ class MADMainWindow(QMainWindow):
             cls_name = ann.get('category') or self._session_last_class or 'USV'
         comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
         try:
-            ex_id = self._save_component_example(cls_name, comp)
+            ex_id = self._save_component_example(cls_name, comp,
+                                                 blob_id=ann.get('blob_id'))
         except Exception as e:
             self.status_bar.showMessage(f"Failed to save: {e}")
             return
@@ -5843,22 +5727,7 @@ class MADMainWindow(QMainWindow):
         if not preds:
             return
         self._snapshot_for_undo("Accept All", crops=False)
-        self._log(f"Accept All — {len(preds)} prediction(s) [{self._review_mode}]")
-        if self._review_mode == 'deploy':
-            # Keep accepted detections visible (blue), recorded in the CSV.
-            anns = [self.spectrogram.annotations[i] for i in preds]
-            self._batch_write_pred_csv_status(anns, 'accepted')
-            for ann in anns:
-                ann['status'] = 'accepted'
-            self.spectrogram._rebuild_confirmed_mask()
-            self.spectrogram.update()
-            self._pred_review_idx = None
-            self._refresh_annotation_list()
-            self._update_pred_review_widgets()
-            self.status_bar.showMessage(f"Accepted {len(preds)} prediction(s)")
-            self._reviewed_count += len(preds)
-            self._maybe_prompt_next_file()
-            return
+        self._log(f"Accept All — {len(preds)} prediction(s)")
         if self.audio_data is None or self._active_wav_path() is None:
             return
         if self._project is not None:
@@ -5873,7 +5742,8 @@ class MADMainWindow(QMainWindow):
             ann = self.spectrogram.annotations[ann_idx]
             comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
             try:
-                ex_id = self._save_component_example(cls_name, comp)
+                ex_id = self._save_component_example(
+                    cls_name, comp, blob_id=ann.get('blob_id'))
                 ann['status'] = 'accepted'
                 ann['id'] = ex_id
                 done.append(ann)
@@ -5895,7 +5765,7 @@ class MADMainWindow(QMainWindow):
         if not preds:
             return
         self._snapshot_for_undo("Reject All", crops=False)
-        self._log(f"Reject All — {len(preds)} prediction(s) [{self._review_mode}]")
+        self._log(f"Reject All — {len(preds)} prediction(s)")
         # Recorded decisions: mark each rejected and keep it visible (red).
         anns = [self.spectrogram.annotations[i] for i in preds]
         self._batch_write_pred_csv_status(anns, 'rejected')
@@ -5913,7 +5783,7 @@ class MADMainWindow(QMainWindow):
         """Commit a batch of gallery accept/reject decisions.
 
         Routed through the same persistence the one-at-a-time reviewer uses —
-        training examples in train mode, batched CSV status writes, one undo
+        a training example per accept, batched CSV status writes, one undo
         snapshot for the whole batch — so a gallery decision is indistinguishable
         from a keyboard one afterward.
         """
@@ -5928,8 +5798,7 @@ class MADMainWindow(QMainWindow):
         if not to_accept and not to_reject:
             return 0
         self._snapshot_for_undo("Gallery review", crops=False)
-        self._log(f"Gallery: {len(to_accept)} accept, {len(to_reject)} reject "
-                  f"[{self._review_mode}]")
+        self._log(f"Gallery: {len(to_accept)} accept, {len(to_reject)} reject")
 
         if to_reject:
             self._batch_write_pred_csv_status(to_reject, 'rejected')
@@ -5938,9 +5807,10 @@ class MADMainWindow(QMainWindow):
 
         n_acc = 0
         if to_accept:
-            if self._review_mode == 'deploy' or self.audio_data is None:
-                # Review-only mode: record the decision, don't mint training
-                # examples (that's what train mode is for).
+            if self.audio_data is None:
+                # No audio loaded, so there is no spectrogram to carve a patch
+                # out of — record the decision now; the label is minted the next
+                # time the file is opened and accepted from the reviewer.
                 self._batch_write_pred_csv_status(to_accept, 'accepted')
                 for ann in to_accept:
                     ann['status'] = 'accepted'
@@ -5953,7 +5823,8 @@ class MADMainWindow(QMainWindow):
                     comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'],
                             ann['mask'])
                     try:
-                        ex_id = self._save_component_example(cls_name, comp)
+                        ex_id = self._save_component_example(
+                            cls_name, comp, blob_id=ann.get('blob_id'))
                     except Exception:
                         continue
                     ann['status'] = 'accepted'
@@ -6137,14 +6008,12 @@ class MADMainWindow(QMainWindow):
 
         sg = self.spectrogram
         # Re-load review detections from the CSV — drop existing ones first so we
-        # don't duplicate. In deploy mode accepted detections live in the CSV
-        # too (restored blue here); in train mode they come from the example
-        # store, so we leave those (status-less) confirmed annotations alone.
-        in_deploy = self._review_mode == 'deploy'
-        strip = (('prediction', 'rejected', 'accepted') if in_deploy
-                 else ('prediction', 'rejected'))
+        # don't duplicate. Confirmed labels (status-less) come from the example
+        # store and are left alone; 'accepted' here means a CSV row with no
+        # example behind it (see below).
         sg.annotations = [a for a in sg.annotations
-                          if a.get('status') not in strip]
+                          if a.get('status') not in
+                          ('prediction', 'rejected', 'accepted')]
         # Reconcile rejected calls against confirmed h5 masks. A 'rejected' CSV
         # row overrules any confirmed (green) annotation it overlaps — drop the
         # green so it doesn't linger, and if the row has no prediction crop,
@@ -6164,9 +6033,12 @@ class MADMainWindow(QMainWindow):
                 pass
         # Hand-labels live in BOTH the h5 (loaded above as confirmed) and the
         # unified CSV (as 'accepted' rows). Skip any CSV row already represented
-        # by a confirmed annotation so it isn't shown twice.
+        # by a confirmed annotation so it isn't shown twice — matching on the
+        # example id AND on the blob_id an accepted prediction carried over.
         confirmed_ids = {str(a.get('id')) for a in sg.annotations
                          if a.get('id') is not None}
+        confirmed_ids |= {str(a.get('blob_id')) for a in sg.annotations
+                          if a.get('blob_id') is not None}
         wav_name = os.path.basename(wav)
         n_added = 0
         n_pending = 0
@@ -6177,10 +6049,10 @@ class MADMainWindow(QMainWindow):
             if str(r.get('blob_id')) in confirmed_ids:
                 continue  # already loaded from the h5 as a confirmed label
             if st == 'accepted':
-                # Train mode loads confirmed from the example store; only deploy
-                # restores accepted detections (blue) from the CSV.
-                if not in_deploy:
-                    continue
+                # An accepted row with no example behind it: written by an older
+                # MAD version, where accepting in the session list only recorded
+                # status. Restore it (blue) rather than hiding the user's work —
+                # re-accepting it mints the training example.
                 ann_status = 'accepted'
             elif st == 'rejected':
                 ann_status = 'rejected'
@@ -6330,12 +6202,16 @@ class MADMainWindow(QMainWindow):
             self._log(f"Could not apply latest training config: {e}")
 
     def _on_inline_train(self):
-        if self._project is None:
-            return
         # Already training? The Train button doubles as "re-show the graph".
         if self._training_active:
             self._show_training_dialog()
             return
+        # Training is the one thing that needs a project — the model, its
+        # checkpoints and the consolidated example store all live in one. Offer
+        # to make one rather than dead-ending; the loaded audio comes along.
+        if self._project is None:
+            if not self._prompt_make_project_for_training():
+                return
         # Abort before any long run if the label set couldn't be fully rebuilt
         # (the method has already told the user why).
         if not self._consolidate_sibling_examples():
@@ -6378,12 +6254,12 @@ class MADMainWindow(QMainWindow):
 
     def _consolidate_sibling_examples(self) -> bool:
         """Rebuild the project's consolidated ``training_data.h5`` from the
-        Training Data list's per-wav sibling examples — the source of truth.
+        Audio list's per-wav sibling examples — the source of truth.
 
         Non-destructive to the siblings (the central store is just a training
         cache), and rebuilt fresh each time so removed/edited labels never
-        linger. A file therefore only trains the model once it's been copied
-        into Training Data.
+        linger. A recording therefore trains the model exactly when it is in the
+        project's Audio list — which is also the only list there is.
 
         The rebuild goes into a temp file and is swapped in with ``os.replace``
         only after a complete, error-free pass, so an interruption (full disk,
@@ -6413,7 +6289,7 @@ class MADMainWindow(QMainWindow):
         _drop_tmp()
         n, failed = 0, []
         try:
-            for fp in self.deploy_files:
+            for fp in self._training_source_paths():
                 h5 = masks_sibling_path(fp)
                 try:
                     if td_count(h5) == 0:
@@ -6437,7 +6313,7 @@ class MADMainWindow(QMainWindow):
             if n:
                 os.replace(tmp, store)      # atomic swap; old store until now
             else:
-                _drop_tmp()                 # Training Data really is empty
+                _drop_tmp()                 # there really are no labels
                 if os.path.isfile(store):
                     os.remove(store)
         except Exception as e:
@@ -6445,14 +6321,14 @@ class MADMainWindow(QMainWindow):
             self._log(f"Training store rebuild FAILED — {e}")
             QMessageBox.critical(
                 self, "Could not rebuild training store",
-                f"The training store could not be rebuilt from the Training "
-                f"Data labels:\n\n{e}\n\nThe previous store was left untouched "
-                f"and training was NOT started, so the model is never fitted "
-                f"on a partial label set.\n\nIf the Training Data lives on a "
+                f"The training store could not be rebuilt from the labels in "
+                f"the Audio list:\n\n{e}\n\nThe previous store was left "
+                f"untouched and training was NOT started, so the model is never "
+                f"fitted on a partial label set.\n\nIf the audio lives on a "
                 f"network drive, check it is still connected."
             )
             return False
-        self._log(f"Built training store from {n} Training Data label(s)")
+        self._log(f"Built training store from {n} label(s)")
         return True
 
     def _show_training_dialog(self):
@@ -6656,23 +6532,51 @@ class MADMainWindow(QMainWindow):
             return
         self._remove_files_by_path(to_remove)
 
-    def _remove_files_by_path(self, paths_to_remove: list):
-        """Unload files from the session list. Does NOT delete anything from
-        disk — sources and their sibling csv/h5 are left untouched."""
+    def _remove_files_by_path(self, paths_to_remove: list,
+                              delete_embedded: bool = False):
+        """Drop files from the Audio list and unregister them from the project.
+
+        Referenced audio is only unregistered — the wav and its sibling csv/h5
+        stay exactly where they are on disk, because MAD never owned them. Only
+        project-owned copies (a legacy ``recordings/`` file, or one made by Pack
+        Project) can be deleted, and only when ``delete_embedded`` says the user
+        was told that in as many words.
+        """
         self._auto_save_mask_if_dirty()
         current_path = (self.audio_files[self.current_file_idx]
                         if self.audio_files else None)
         remove_set = set(paths_to_remove)
+        remove_keys = {os.path.normcase(os.path.abspath(p))
+                       for p in paths_to_remove}
         self.audio_files = [p for p in self.audio_files if p not in remove_set]
         if self._project is not None:
-            self._project.audio_files = [
-                p for p in self._project.audio_files if p not in remove_set
-            ]
+            entries = self._project.audio_entries()
+            if delete_embedded:
+                from fnt.usv.usv_detector.fnt_mask_store import (
+                    masks_sibling_path)
+                for e in entries:
+                    if (not e.embedded
+                            or os.path.normcase(os.path.abspath(e.path))
+                            not in remove_keys):
+                        continue
+                    for path in (e.path, pred_csv_sibling_path(e.path),
+                                 masks_sibling_path(e.path)):
+                        try:
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        except Exception as ex:
+                            self._log(f"remove failed "
+                                      f"({os.path.basename(path)}): {ex}")
+            self._project.set_audio_entries([
+                e for e in entries
+                if os.path.normcase(os.path.abspath(e.path)) not in remove_keys
+            ])
             try:
                 self._project.save()
             except Exception:
                 pass
-        # Fix the session index.
+        self._missing_audio -= remove_keys
+        # Fix the current-file index.
         if not self.audio_files:
             self.current_file_idx = 0
         elif current_path in remove_set:
@@ -6684,25 +6588,24 @@ class MADMainWindow(QMainWindow):
             except ValueError:
                 self.current_file_idx = 0
         self._refresh_file_list()
-        # Only disturb the preview when the session list currently owns it.
-        if self._active_source == 'session':
-            self.file_list.blockSignals(True)
-            self.file_list.setCurrentRow(self.current_file_idx
-                                         if self.audio_files else -1)
-            self.file_list.blockSignals(False)
-            if not self.audio_files:
-                self.spectrogram.set_audio_data(None, None)
-                self.waveform_overview.set_audio_data(None, None)
-                self.spectrogram.annotations.clear()
-                self._refresh_annotation_list()
-            elif current_path in remove_set:
-                self._load_current_file()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(self.current_file_idx
+                                     if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if not self.audio_files:
+            self.spectrogram.set_audio_data(None, None)
+            self.waveform_overview.set_audio_data(None, None)
+            self.spectrogram.annotations.clear()
+            self._refresh_annotation_list()
+        elif current_path in remove_set:
+            self._load_current_file()
         self._update_project_state()
         self.btn_remove_files.setEnabled(bool(self.audio_files))
         self._update_scope_labels()
+        self._update_run_button()
         n = len(paths_to_remove)
-        self.status_bar.showMessage(f"Unloaded {n} file(s)")
-        self._log(f"Unloaded {n} file(s) from the session")
+        self.status_bar.showMessage(f"Removed {n} file(s) from the list")
+        self._log(f"Removed {n} file(s) from the Audio list")
 
     def _default_model_path(self) -> Optional[str]:
         if self._project and self._project.models:
@@ -6875,32 +6778,24 @@ class MADMainWindow(QMainWindow):
         self._update_run_button()
 
     def _gather_inference_targets(self) -> List[str]:
-        """Wav paths to run inference on, from the Session/Training/Folder scope
-        checkboxes (All vs Current file each). De-duplicated, order preserved."""
-        if not hasattr(self, 'chk_scope_session'):
+        """Wav paths to run inference on, from the Audio-list and Folder scope
+        checkboxes (All vs Current file). De-duplicated, order preserved."""
+        if not hasattr(self, 'chk_scope_audio'):
             return []
         targets: List[str] = []
         if (getattr(self, 'chk_scope_folder', None) is not None
                 and self.chk_scope_folder.isChecked()):
             targets.extend(getattr(self, '_infer_folder_wavs', []) or [])
-        if self.chk_scope_session.isChecked():
-            if self.combo_scope_session.currentText().startswith("Current"):
+        if self.chk_scope_audio.isChecked():
+            if self.combo_scope_audio.currentText().startswith("Current"):
                 if (self.audio_files and
                         0 <= self.current_file_idx < len(self.audio_files)):
                     targets.append(self.audio_files[self.current_file_idx])
             else:
                 targets.extend(self.audio_files)
-        if self.chk_scope_training.isChecked():
-            if self.combo_scope_training.currentText().startswith("Current"):
-                if (self.deploy_files and self._deploy_file_idx is not None and
-                        0 <= self._deploy_file_idx < len(self.deploy_files)):
-                    targets.append(self.deploy_files[self._deploy_file_idx])
-            else:
-                targets.extend(self.deploy_files)
-        # Drop referenced training recordings whose audio can't be found —
-        # inference needs the wav, unlike training. Silently skipping keeps a
-        # 3,000-file run from aborting on one unplugged drive; the Training Data
-        # list already flags them with ⚠.
+        # Drop referenced recordings whose audio can't be found — inference needs
+        # the wav, unlike training. Silently skipping keeps a 3,000-file run from
+        # aborting on one unplugged drive; the Audio list already flags them ⚠.
         seen, out = set(), []
         for p in targets:
             if p and p not in seen and not self._is_missing(p):
@@ -6908,7 +6803,6 @@ class MADMainWindow(QMainWindow):
                 out.append(p)
         return out
 
-    # --- Training Data list (project recordings the model trains on) -----
     # --- per-file status breakdown (accepted / pending / rejected) --------
     def _mem_status_counts(self):
         """(accepted, pending, rejected) from the in-memory annotations of the
@@ -6958,8 +6852,8 @@ class MADMainWindow(QMainWindow):
         """(accepted, pending, rejected) for a wav. Uses the live in-memory
         annotations when ``fp`` is the file actually loaded in the preview (so
         edits show instantly); otherwise reads the persisted CSV. The
-        loaded-file check is what stops the Training Data count from briefly
-        showing the *previous* file's number while a new file loads."""
+        loaded-file check is what stops a row's count from briefly showing the
+        *previous* file's number while a new file loads."""
         loaded = getattr(self, '_loaded_wav_path', None)
         if (loaded and self.audio_data is not None
                 and os.path.normpath(loaded) == os.path.normpath(fp)):
@@ -6979,65 +6873,27 @@ class MADMainWindow(QMainWindow):
         item.setData(_ROLE_FILE_COUNTS, counts)
         item.setData(Qt.ForegroundRole, None)  # delegate owns the colors
 
-    def _refresh_deploy_queue(self):
-        """Render the Training Data list, showing a green ✓ + the recorded call
-        count (labels + predictions) on each file that has any."""
-        if not hasattr(self, 'deploy_list'):
-            return
-        self.deploy_list.blockSignals(True)
-        self.deploy_list.clear()
-        n_missing = 0
-        for p in self.deploy_files:
-            base = os.path.basename(p)
-            item = QListWidgetItem()
-            if self._is_missing(p):
-                # Soft state: the recording moved or is on an unmounted drive.
-                # Training and saved detections are unaffected — only preview is.
-                n_missing += 1
-                item.setData(_ROLE_FILE_LABEL, None)
-                item.setData(_ROLE_FILE_COUNTS, None)
-                item.setText(f"⚠  {base}")
-                item.setForeground(QColor(180, 150, 90))
-                item.setToolTip(
-                    f"Recording not found at:\n{p}\n\nTraining examples and "
-                    "detections for this file are safe — only preview and "
-                    "playback need the audio. Use File ▸ Locate Missing "
-                    "Recordings… to repoint it.")
-            else:
-                counts = self._file_status_counts(p)
-                self._apply_file_row(item, base, counts)
-                if any(counts):
-                    item.setToolTip(
-                        "Calls recorded (accepted, pending, rejected) — "
-                        "click to review")
-                else:
-                    item.setToolTip(p)
-            self.deploy_list.addItem(item)
-        self.deploy_list.blockSignals(False)
-        n = len(self.deploy_files)
-        self.lbl_deploy_queue.setText(
-            f"{n} file(s) in training set"
-            + (f" — {n_missing} missing" if n_missing else ""))
-        self._update_infer_run_enabled()
-        self._update_train_button_count()
-
-    def _set_deploy_item_state(self, wav_path, state: str, count=None):
-        """Mark a queue row by inference state: 'pending' | 'done' | 'error'.
+    def _set_file_item_state(self, wav_path, state: str, count=None):
+        """Mark an Audio-list row by inference state: 'pending'|'done'|'error'.
         Finished files get a green ✓ and the detection count so the user can see
         how many calls were found and click in to QC them as the run progresses."""
-        if not hasattr(self, 'deploy_list'):
+        if not hasattr(self, 'file_list'):
             return
         try:
-            row = self.deploy_files.index(wav_path)
+            row = self.audio_files.index(wav_path)
         except ValueError:
             return
-        item = self.deploy_list.item(row)
+        item = self.file_list.item(row)
         if item is None:
             return
         base = os.path.basename(wav_path)
         if state == 'done':
-            # Freshly inferred — show the accepted/pending/rejected breakdown.
-            self._apply_file_row(item, base, self._file_status_counts(wav_path))
+            # Freshly inferred — show the accepted/pending/rejected breakdown,
+            # and keep the cache in step so the next full refresh agrees.
+            counts = self._file_status_counts(wav_path)
+            self._apply_file_row(item, base, counts)
+            if any(counts):
+                self._file_count_cache[base] = counts
             item.setToolTip(
                 f"Inference done — {count} detection(s); click to review"
                 if count is not None else
@@ -7055,47 +6911,37 @@ class MADMainWindow(QMainWindow):
             item.setData(Qt.ForegroundRole, None)
             item.setToolTip("")
 
-    def _on_deploy_file_selected(self, row: int):
-        if 0 <= row < len(self.deploy_files):
-            # Training Data owns the preview now; clear the session selection.
-            self._active_source = 'training'
-            self._review_mode = 'train'
-            self._clear_session_selection()
-            self._deploy_file_idx = row
-            self._load_deploy_file(self.deploy_files[row])
-            self._update_review_buttons_for_source()
-
-    def _clear_deploy_files(self):
-        """Empty the Training Data list (used on project close)."""
-        self.deploy_files = []
-        self._deploy_file_idx = None
-        self._missing_training = set()
-        self._refresh_deploy_queue()
-
     def _prompt_make_project_for_training(self) -> bool:
-        """Offer to create or open a project so there's somewhere to put the
-        Training Data set. Returns True if a project is open afterward."""
+        """Offer to create or open a project so there's somewhere to train into.
+        Returns True if a project is open afterward."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("Project needed")
-        box.setText("Training Data is stored inside a MAD project.")
+        box.setText("Training a model needs a MAD project to save into.")
         box.setInformativeText(
-            "Create a new project or open an existing one to hold the "
-            "training set?")
+            "Create a new project or open an existing one? Your currently "
+            "loaded audio is added to it.")
         b_new = box.addButton("New Project…", QMessageBox.AcceptRole)
         b_open = box.addButton("Open Project…", QMessageBox.AcceptRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
         box.exec_()
         clicked = box.clickedButton()
+        # New Project carries the loaded audio over itself; opening an existing
+        # one replaces the list with that project's, so fold the files in after.
+        carry = list(self.audio_files)
         if clicked is b_new:
             self._menu_new_project()
         elif clicked is b_open:
             self._menu_open_project()
+            if self._project is not None and carry:
+                if self._register_audio_files(carry):
+                    self._rescan_project_wavs()
         return self._project is not None
 
-    def _copy_to_training_data(self):
-        """Add the selected Session-audio file(s) to the project's Training Data
-        set **by reference** — the wav is not copied.
+    def _register_audio_files(self, paths, embedded: bool = False) -> int:
+        """Record wavs in the open project's audio registry **by reference** —
+        the wav is never copied. Returns how many were new (already-registered
+        paths are skipped, not duplicated); 0 with no project open.
 
         MAD bakes each confirmed call into training_data.h5 as a self-contained
         spec patch + mask, and training reads only that store, so the project has
@@ -7103,39 +6949,10 @@ class MADMainWindow(QMainWindow):
         lightweight (a 10-min 250 kHz recording is ~300 MB) and leaves one source
         of truth per recording. See mad_registry for how moved files are found
         again."""
-        # Capture the selection up front — creating/opening a project below may
-        # rebuild the session list, but the source files stay put on disk.
-        rows = sorted({i.row() for i in self.file_list.selectedIndexes()})
-        srcs = [self.audio_files[r] for r in rows
-                if 0 <= r < len(self.audio_files)]
-        if not srcs:
-            self.status_bar.showMessage("Select session file(s) to add first")
-            return
-        if not self._project:
-            if not self._prompt_make_project_for_training():
-                return
-            # Re-load the session files (closing the old project cleared the
-            # list) so they stay visible afterward.
-            self._append_audio_paths(srcs)
-        added = self._register_training_files(srcs)
-        if added:
-            self._refresh_deploy_queue()
-            self._log(f"Added {added} file(s) to Training Data (by reference)")
-            self.status_bar.showMessage(
-                f"Added {added} file(s) to Training Data — referenced in place, "
-                "not copied")
-            self._update_train_button_enabled()
-        else:
-            self.status_bar.showMessage(
-                "Already in Training Data — nothing added")
-
-    def _register_training_files(self, paths, embedded: bool = False) -> int:
-        """Register wavs in the project's Training Data set. Returns how many
-        were new (already-registered paths are skipped, not duplicated)."""
         from fnt.usv.usv_detector.mad_registry import RegisteredFile
         if self._project is None:
             return 0
-        entries = self._project.training_entries()
+        entries = self._project.audio_entries()
         known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
         added = 0
         for p in paths:
@@ -7144,81 +6961,17 @@ class MADMainWindow(QMainWindow):
                 continue
             entries.append(RegisteredFile.from_path(ap, embedded=embedded))
             known.add(os.path.normcase(ap))
-            if ap not in self.deploy_files:
-                self.deploy_files.append(ap)
             added += 1
         if added:
-            entries.sort(key=lambda e: e.basename.lower())
-            self._project.set_training_entries(entries)
+            self._project.set_audio_entries(entries)
             self._project.save()
-            self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
         return added
 
-    def _remove_from_training_data(self):
-        """Unregister the selected recording(s) from the Training Data set.
-
-        Referenced files are only *unregistered* — the wav and its csv/h5 stay
-        exactly where they are on disk. Only project-owned audio (a legacy
-        recordings/ copy, or one embedded by Pack Project) is deleted, and that
-        is spelled out in the prompt."""
-        rows = sorted({i.row() for i in self.deploy_list.selectedIndexes()},
-                      reverse=True)
-        victims = [self.deploy_files[r] for r in rows
-                   if 0 <= r < len(self.deploy_files)]
-        if not victims or self._project is None:
-            return
-        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-        entries = self._project.training_entries()
-        by_path = {os.path.normcase(os.path.abspath(e.path)): e
-                   for e in entries}
-        owned = [v for v in victims
-                 if getattr(by_path.get(os.path.normcase(os.path.abspath(v))),
-                            'embedded', False)]
-        names = "\n".join(f"   • {os.path.basename(v)}" for v in victims[:10])
-        detail = (
-            "The recordings are referenced, not copied, so nothing is deleted "
-            "from disk — they are just dropped from this project's training set."
-            if not owned else
-            f"{len(owned)} of these are stored inside the project and WILL be "
-            "deleted from disk (wav + csv/h5). The rest are only unregistered.")
-        reply = QMessageBox.question(
-            self, "Remove from Training Data",
-            f"Remove {len(victims)} recording(s) from the Training Data set?\n\n"
-            f"{names}\n\n{detail}\n\nConfirmed calls already saved as training "
-            "examples are kept — remove those from the Detections list instead.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        victim_keys = {os.path.normcase(os.path.abspath(v)) for v in victims}
-        for v in owned:
-            for path in (v, pred_csv_sibling_path(v), masks_sibling_path(v)):
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except Exception as e:
-                    self._log(f"remove failed ({os.path.basename(path)}): {e}")
-        for v in victims:
-            try:
-                self.deploy_files.remove(v)
-            except ValueError:
-                pass
-        self._project.set_training_entries(
-            [e for e in entries
-             if os.path.normcase(os.path.abspath(e.path)) not in victim_keys])
-        self._project.save()
-        self._deploy_file_idx = None
-        self._refresh_deploy_queue()
-        self._update_train_button_enabled()
-        self._log(f"Removed {len(victims)} file(s) from Training Data"
-                  + (f" ({len(owned)} deleted from disk)" if owned else ""))
-
     def _file_source_label(self, w) -> str:
-        """'Session' / 'Training Data' / '' — which list a wav belongs to."""
+        """'Audio' when the wav is in the list, '' otherwise."""
         wn = os.path.normpath(w)
-        if any(os.path.normpath(p) == wn for p in self.deploy_files):
-            return "Training Data"
         if any(os.path.normpath(p) == wn for p in self.audio_files):
-            return "Session"
+            return "Audio"
         return ""
 
     def _file_has_predictions(self, w) -> bool:
@@ -7360,82 +7113,6 @@ class MADMainWindow(QMainWindow):
         self.infer_panel.start_run()
         self._start_inference(cfg, wavs, reporter=self.infer_panel)
 
-    def _load_deploy_file(self, filepath: str):
-        """Preview a queued deployment file in the shared spectrogram.
-
-        Loads audio + grid only; deploy-mode prediction correction is added in
-        Phase 3. Does not touch the training example store."""
-        if not filepath:
-            return
-        if not os.path.isfile(filepath):
-            # Referenced recording moved. Say so plainly and point at the fix
-            # instead of failing silently — nothing else about the project is
-            # broken by this.
-            self.status_bar.showMessage(
-                f"{os.path.basename(filepath)} not found — File ▸ Locate "
-                "Missing Recordings… to repoint it")
-            return
-        self._stop_playback()
-        self._clear_predictions()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            audio, sr = load_audio(filepath)
-            if audio.ndim > 1:
-                audio = np.mean(audio, axis=1)
-            self.audio_data = audio.astype(np.float32, copy=False)
-            self.sample_rate = int(sr)
-            has_previous = self.spectrogram.total_duration > 0
-            self.spectrogram.set_audio_data(
-                self.audio_data, self.sample_rate, preserve_view=has_previous
-            )
-            self.waveform_overview.set_audio_data(self.audio_data, self.sample_rate)
-            self.waveform_overview.set_view_range(
-                self.spectrogram.view_start, self.spectrogram.view_end
-            )
-            # Predictions live in the sibling CSV/h5 — load them whether or not
-            # a project is open. Use the grid params recorded in the h5 (exactly
-            # what the predictions were computed with) so the masks align; fall
-            # back to the project's / default params when the h5 has none.
-            from fnt.usv.usv_detector.fnt_mask_store import (
-                masks_sibling_path, get_grid_attrs,
-            )
-            grid = get_grid_attrs(masks_sibling_path(filepath))
-            sp = self._spec_params()
-            self.spectrogram.init_mask(
-                audio_len=len(self.audio_data), sample_rate=self.sample_rate,
-                nperseg=int(grid.get('nperseg', sp['nperseg'])),
-                noverlap=int(grid.get('noverlap', sp['noverlap'])),
-                nfft=int(grid.get('nfft', sp['nfft'])),
-            )
-            # Show this Training-Data file's confirmed labels (green) plus any
-            # predictions (yellow) so it can be reviewed and edited like a
-            # session file.
-            gridhw = (self.spectrogram.n_freq_bins,
-                      self.spectrogram.n_time_frames)
-            self.spectrogram.set_annotations(
-                self._load_confirmed_annotations(filepath, gridhw))
-            n_pred = self._load_predictions_as_annotations(wav=filepath) or 0
-            # The in-memory annotations now belong to this file — record it so
-            # the list count reads them live (and doesn't show the prior file's
-            # number mid-load).
-            self._loaded_wav_path = filepath
-            self._update_active_training_count()
-            self._sync_scrollbar_from_view()
-            suffix = f"  |  {n_pred} prediction(s)" if n_pred else ""
-            self.status_bar.showMessage(
-                f"Training Data — {os.path.basename(filepath)}  |  "
-                f"{len(self.audio_data) / self.sample_rate:.2f}s @ "
-                f"{self.sample_rate} Hz{suffix}"
-            )
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Load error", f"{os.path.basename(filepath)}:\n{e}")
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._update_paint_buttons_enabled()
-        self._update_playback_buttons_enabled()
-
     # ------------------------------------------------------------------
     # Menu bar
     # ------------------------------------------------------------------
@@ -7471,12 +7148,12 @@ class MADMainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        # Training recordings are referenced by path, so a moved recording tree
-        # is repaired here rather than by re-importing files.
+        # Recordings are referenced by path, so a moved recording tree is
+        # repaired here rather than by re-importing files.
         self.act_locate_missing = QAction("&Locate Missing Recordings…", self)
         self.act_locate_missing.setToolTip(
-            "Repoint the project at training recordings that moved. Pick one "
-            "file and every sibling that moved with it is fixed too.")
+            "Repoint the project at recordings that moved. Pick one file and "
+            "every sibling that moved with it is fixed too.")
         self.act_locate_missing.triggered.connect(
             self._locate_missing_recordings)
         self.act_locate_missing.setEnabled(False)
@@ -8018,8 +7695,18 @@ class MADMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
             return
+        # Carry over whatever is already loaded: "open some wavs, look at them,
+        # then decide to make a project" is the common path, and losing the list
+        # at exactly that moment would be a needless re-import. Only from the
+        # no-project state, though — creating a project while one is open starts
+        # clean rather than silently cloning the old project's file list.
+        carry = list(self.audio_files) if self._project is None else []
         self._close_project(silent=True)
         self._activate_project(cfg)
+        if carry:
+            n = self._register_audio_files(carry)
+            self._rescan_project_wavs()
+            self._log(f"Added {n} already-loaded file(s) to the new project")
         self._remember_recent(project_dir)
         self.status_bar.showMessage(f"Created project: {project_dir}")
 
@@ -8122,29 +7809,31 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Loaded {added} wav(s) from {folder} — referenced in place")
 
-    def _append_audio_paths(self, paths, persist_files: bool = False) -> int:
-        """Load wav paths into the session list (in place — never copied into
-        the project). Labels/predictions save next to the source audio. Returns
-        the count added."""
+    def _append_audio_paths(self, paths, persist_files: bool = True) -> int:
+        """Add wav paths to the Audio list (in place — never copied into the
+        project). Labels/predictions save next to the source audio. With a
+        project open the files are also registered in it so they come back next
+        time it's opened; ``persist_files=False`` skips that, for paths opened
+        transiently (e.g. jumping to a batch-run result). Returns the count
+        added."""
         existing = set(self.audio_files)
         to_add = [p for p in paths
                   if p and p not in existing and os.path.isfile(p)]
         if not to_add:
             return 0
         self.audio_files.extend(to_add)
+        if persist_files and self._project is not None:
+            self._register_audio_files(to_add)
         if self.current_file_idx >= len(self.audio_files):
             self.current_file_idx = 0
         self._refresh_file_list()
-        self._active_source = 'session'
-        self._review_mode = 'deploy'
-        self._clear_training_selection()
-        self._deploy_file_idx = None
         self.file_list.blockSignals(True)
         self.file_list.setCurrentRow(self.current_file_idx)
         self.file_list.blockSignals(False)
         self._load_current_file()
         self._update_project_state()
         self._update_scope_labels()
+        self._update_run_button()
         self._sync_list_buttons()  # selection was set with signals blocked
         return len(to_add)
 
@@ -8168,7 +7857,7 @@ class MADMainWindow(QMainWindow):
         self._set_train_sections_enabled(True)
         self._offer_training_store_migration()
         self._refresh_deploy_models()
-        self._rescan_project_wavs()         # loads recordings/ → Training Data
+        self._rescan_project_wavs()         # registered audio → Audio list
         self._apply_latest_training_config()  # prefill train options from last run
         self._update_source_folders_label()
         self._update_model_info_label()
@@ -8239,15 +7928,14 @@ class MADMainWindow(QMainWindow):
         self.act_run_inference.setEnabled(False)
         self.act_load_pred.setEnabled(False)
         self.act_clear_pred.setEnabled(False)
-        self._active_source = 'session'
-        self._review_mode = 'deploy'
+        self._missing_audio = set()
+        self._n_missing_audio = 0
         self._update_run_button()
         self._set_train_sections_enabled(False)
         self.spectrogram.mask = None
         self.spectrogram.set_audio_data(None, None)
         self.waveform_overview.set_audio_data(None, None)
         self._clear_predictions()
-        self._clear_deploy_files()
         self._refresh_deploy_models()
         self._update_project_state()
         self._update_paint_buttons_enabled()
@@ -8272,20 +7960,23 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(msg)
 
     def _rescan_project_wavs(self) -> int:
-        """Load the project's Training Data set into the Training Data list.
+        """Load the project's registered audio into the Audio list.
 
         Files are referenced by path, so each registered entry is resolved
         against disk first (see mad_registry.resolve_entries — a moved file is
         found again by basename + fingerprint in a sibling's directory). Any wav
         sitting in a legacy ``recordings/`` copy is adopted into the registry as
         project-owned. Unresolved entries stay in the list as a soft "missing"
-        state: training still works, only preview is unavailable."""
+        state: training still works, only preview is unavailable.
+
+        Registration order is preserved rather than sorted, so the list reads the
+        same after a reopen as it did while the user was building it."""
         if self._project is None:
             return 0
         from fnt.usv.usv_detector.mad_registry import (
-            RegisteredFile, resolve_entries)
+            RegisteredFile, file_fingerprint, resolve_entries)
 
-        entries = self._project.training_entries()
+        entries = self._project.audio_entries()
         # Adopt legacy recordings/ copies the registry doesn't know about yet.
         rdir = self._project.recordings_dir
         known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
@@ -8307,35 +7998,55 @@ class MADMainWindow(QMainWindow):
                 e.basename = os.path.basename(found)
                 moved += 1
 
-        entries.sort(key=lambda e: e.basename.lower())
-        self._project.set_training_entries(entries)
-        if adopted or moved:
+        # Backfill the size/fingerprint on entries that predate them (including
+        # ones folded in from an older project's plain-path session list), so a
+        # later move can be resolved by content rather than by name alone.
+        backfilled = 0
+        for e in entries:
+            if e.size or not e.exists():
+                continue
+            try:
+                e.size = os.path.getsize(e.path)
+                e.fingerprint = file_fingerprint(e.path)
+                backfilled += 1
+            except OSError:
+                pass
+
+        self._project.set_audio_entries(entries)
+        if adopted or moved or backfilled:
             self._project.save()
 
-        self.deploy_files = [e.path for e in entries]
-        self._missing_training = {
+        self.audio_files = [e.path for e in entries]
+        self.current_file_idx = 0
+        self._missing_audio = {
             os.path.normcase(os.path.abspath(e.path))
             for e in entries if not e.exists()}
-        self._refresh_deploy_queue()
+        self._refresh_file_list()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(0 if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if self.audio_files:
+            self._load_current_file()
         self._update_train_button_enabled()
         self._update_scope_labels()
         self._update_project_state()
+        self._sync_list_buttons()
         if moved:
-            self._log(f"Relocated {moved} training recording(s) automatically")
-        if self._missing_training:
-            n = len(self._missing_training)
-            self._log(f"{n} training recording(s) missing — "
+            self._log(f"Relocated {moved} recording(s) automatically")
+        if self._missing_audio:
+            n = len(self._missing_audio)
+            self._log(f"{n} recording(s) missing — "
                       "File ▸ Locate Missing Recordings…")
             self.status_bar.showMessage(
-                f"{n} training recording(s) could not be found — training and "
-                "existing detections are unaffected; use File ▸ Locate Missing "
+                f"{n} recording(s) could not be found — training and existing "
+                "detections are unaffected; use File ▸ Locate Missing "
                 "Recordings… to restore preview")
         return len(entries)
 
     def _is_missing(self, path: str) -> bool:
-        """True when a Training Data entry's audio can't be found on disk."""
+        """True when a registered recording's audio can't be found on disk."""
         return (os.path.normcase(os.path.abspath(path))
-                in getattr(self, '_missing_training', set()))
+                in getattr(self, '_missing_audio', set()))
 
     def _locate_missing_recordings(self):
         """Point the project at one relocated recording, then repoint every
@@ -8348,12 +8059,12 @@ class MADMainWindow(QMainWindow):
             return
         from fnt.usv.usv_detector.mad_registry import (
             infer_prefix_change, remap_prefix, resolve_entries)
-        entries = self._project.training_entries()
+        entries = self._project.audio_entries()
         missing = [e for e in entries if not e.exists()]
         if not missing:
             QMessageBox.information(
                 self, "Locate Recordings",
-                "Every training recording in this project was found.")
+                "Every recording in this project was found.")
             return
         first = missing[0]
         QMessageBox.information(
@@ -8384,14 +8095,10 @@ class MADMainWindow(QMainWindow):
                 e.path = found
                 e.basename = os.path.basename(found)
                 fixed += 1
-        self._project.set_training_entries(entries)
+        self._project.set_audio_entries(entries)
         self._project.save()
-        self.deploy_files = [e.path for e in entries]
-        self._missing_training = {
-            os.path.normcase(os.path.abspath(e.path))
-            for e in entries if not e.exists()}
-        self._refresh_deploy_queue()
-        still = len(self._missing_training)
+        self._sync_list_from_entries(entries)
+        still = len(self._missing_audio)
         self._log(f"Located {fixed} recording(s); {still} still missing")
         QMessageBox.information(
             self, "Locate Recordings",
@@ -8410,7 +8117,7 @@ class MADMainWindow(QMainWindow):
             return
         import shutil
         from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-        entries = self._project.training_entries()
+        entries = self._project.audio_entries()
         outside = [e for e in entries if e.exists() and not e.embedded]
         if not outside:
             QMessageBox.information(
@@ -8454,35 +8161,70 @@ class MADMainWindow(QMainWindow):
                     self._log(f"pack failed ({e.basename}): {ex}")
         finally:
             QApplication.restoreOverrideCursor()
-        self._project.set_training_entries(entries)
+        self._project.set_audio_entries(entries)
         self._project.save()
-        self.deploy_files = [e.path for e in entries]
-        self._missing_training = {
-            os.path.normcase(os.path.abspath(e.path))
-            for e in entries if not e.exists()}
-        self._refresh_deploy_queue()
+        self._sync_list_from_entries(entries)
         self._log(f"Packed {packed} recording(s) into the project")
         QMessageBox.information(
             self, "Pack Project",
             f"Copied {packed} recording(s) into:\n{rdir}")
 
+    def _sync_list_from_entries(self, entries):
+        """Re-point the Audio list at ``entries`` after their paths changed
+        (Locate Missing Recordings, Pack Project), keeping the previewed file
+        selected where it survived the move."""
+        current = (self.audio_files[self.current_file_idx]
+                   if 0 <= self.current_file_idx < len(self.audio_files)
+                   else None)
+        self.audio_files = [e.path for e in entries]
+        self._missing_audio = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
+        if current in self.audio_files:
+            self.current_file_idx = self.audio_files.index(current)
+        else:
+            self.current_file_idx = min(self.current_file_idx,
+                                        max(0, len(self.audio_files) - 1))
+        self._refresh_file_list()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(
+            self.current_file_idx if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        self._update_project_state()
+        self._update_scope_labels()
+        self._update_run_button()
+
     def _refresh_file_list(self):
+        """Rebuild the Audio list. Rows whose audio can't be found are flagged
+        ⚠ rather than dropped: that state is soft — labels, training and saved
+        detections are all fine, only preview and playback need the wav."""
         self.file_list.blockSignals(True)
         self.file_list.clear()
+        n_missing = 0
         for fp in self.audio_files:
             item = QListWidgetItem(os.path.basename(fp))
             item.setData(Qt.UserRole, fp)
-            item.setToolTip(fp)
+            if self._is_missing(fp):
+                n_missing += 1
+                item.setText(f"⚠  {os.path.basename(fp)}")
+                item.setForeground(QColor(180, 150, 90))
+                item.setToolTip(
+                    f"Recording not found at:\n{fp}\n\nTraining examples and "
+                    "detections for this file are safe — only preview and "
+                    "playback need the audio. Use File ▸ Locate Missing "
+                    "Recordings… to repoint it.")
+            else:
+                item.setToolTip(fp)
             self.file_list.addItem(item)
         self.file_list.blockSignals(False)
+        self._n_missing_audio = n_missing
         self._scan_all_file_counts()
 
     def _scan_all_file_counts(self):
         """Populate ``_file_count_cache`` with the (accepted, pending, rejected)
-        breakdown per session file, via the shared :meth:`_csv_status_counts`
-        (same numbers the Training Data list shows). One cheap sibling read per
-        file; the multi-GB probability grid is never touched. Call on project
-        open / file-list rebuild, NOT on file switch.
+        breakdown per file, via the shared :meth:`_csv_status_counts`. One cheap
+        sibling read per file; the multi-GB probability grid is never touched.
+        Call on project open / file-list rebuild, NOT on file switch.
         """
         cache: Dict[str, tuple] = {}
         for fp in self.audio_files:
@@ -8506,12 +8248,10 @@ class MADMainWindow(QMainWindow):
             return
         if not hasattr(self, '_file_count_cache'):
             self._file_count_cache = {}
-        # Reconcile the current file only once its annotations are loaded, and
-        # only when the session list owns the preview (else the in-memory
-        # annotations belong to a Training Data file, not this list).
+        # Reconcile the current file only once its annotations are loaded.
         if (sync_current and hasattr(self, 'spectrogram')
-                and self._active_source == 'session'
-                and self.audio_files and self.audio_data is not None):
+                and self.audio_files and self.audio_data is not None
+                and 0 <= self.current_file_idx < len(self.audio_files)):
             cur_wav = os.path.basename(
                 self.audio_files[self.current_file_idx])
             counts = self._mem_status_counts()
@@ -8523,21 +8263,20 @@ class MADMainWindow(QMainWindow):
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
             fp = item.data(Qt.UserRole)
+            if self._is_missing(fp):
+                continue  # ⚠ row — leave the missing marker in place
             bn = os.path.basename(fp)
             self._apply_file_row(item, bn, self._file_count_cache.get(bn))
         self.file_list.blockSignals(False)
 
     def _set_train_sections_enabled(self, enabled: bool):
-        # Only the Training Data list is gated on a project (it lives in the
-        # project folder). The Model section stays enabled so a user can Load
-        # Project Models from any trained project and run inference on session
-        # audio with NO project open. Labeling Tools + Detections stay enabled
-        # too. The single action button's own logic disables training when
-        # there's no project/labels (see _update_run_button).
-        for attr in ('_grp_training_list',):
-            grp = getattr(self, attr, None)
-            if grp is not None:
-                grp.setEnabled(enabled)
+        # Nothing in the left column is gated on a project any more. MAD is
+        # usable standalone: add audio, label it, load a model from any trained
+        # project, run inference and review — all with no project open. Only
+        # *training* needs somewhere to save, and the action button's own logic
+        # handles that (see _update_run_button). Kept as a no-op so the
+        # open/close-project paths don't need special-casing.
+        return
 
     def _set_train_config_enabled(self, enabled: bool):
         """Enable/disable the training-config controls while a run is active, so
@@ -8563,28 +8302,27 @@ class MADMainWindow(QMainWindow):
         self.lbl_file_num.setText(
             f"File {self.current_file_idx + 1}/{n}" if n else "File 0/0"
         )
+        n_missing = getattr(self, '_n_missing_audio', 0)
         if n == 0:
-            self.lbl_data_summary.setText("No files loaded — add files or a folder")
+            self.lbl_data_summary.setText("No files — add files or a folder")
         else:
-            self.lbl_data_summary.setText(f"{n} file(s) loaded")
+            label = f"{n} file(s)"
+            if self._project is None:
+                label += " (session only — no project open)"
+            if n_missing:
+                label += f" — {n_missing} missing"
+            self.lbl_data_summary.setText(label)
 
     def _on_file_selected(self, row: int):
         if 0 <= row < len(self.audio_files):
-            # Session list now owns the single preview — drop any Training Data
-            # selection and switch review mode (session = CSV-only accept).
-            switching = (self._active_source != 'session' or
-                         row != self.current_file_idx)
-            self._active_source = 'session'
-            self._review_mode = 'deploy'
-            self._clear_training_selection()
-            self._deploy_file_idx = None
-            if switching:
-                self._dismiss_training_view()
-                self._auto_save_mask_if_dirty()
-                self.current_file_idx = row
-                self._load_current_file()
-                self._update_project_state()
-                self._update_review_buttons_for_source()
+            if row == self.current_file_idx and self.audio_data is not None:
+                return
+            self._dismiss_training_view()
+            self._auto_save_mask_if_dirty()
+            self.current_file_idx = row
+            self._load_current_file()
+            self._update_project_state()
+            self._update_review_buttons_for_source()
 
     def _prev_file(self):
         if self.current_file_idx > 0:
@@ -8595,23 +8333,62 @@ class MADMainWindow(QMainWindow):
             self.file_list.setCurrentRow(self.current_file_idx + 1)
 
     def _remove_selected_files(self):
-        """Unload the selected files from the session list. Nothing is deleted
-        from disk — the .wav and any sibling csv/h5 stay where they are."""
+        """Drop the selected recordings from the Audio list (and the project).
+
+        Referenced audio is only unregistered; nothing is deleted from disk. The
+        exception is project-owned audio — a legacy ``recordings/`` copy or one
+        made by Pack Project — which is deleted, and the prompt says so rather
+        than leaving orphaned copies inside the project."""
         sel = self.file_list.selectedItems()
         if not sel:
             return
         rows = sorted({self.file_list.row(item) for item in sel}, reverse=True)
-        removed_paths = [self.audio_files[r] for r in rows]
-        self._remove_files_by_path(removed_paths)
+        victims = [self.audio_files[r] for r in rows
+                   if 0 <= r < len(self.audio_files)]
+        if not victims:
+            return
+        owned = []
+        if self._project is not None:
+            by_path = {os.path.normcase(os.path.abspath(e.path)): e
+                       for e in self._project.audio_entries()}
+            owned = [v for v in victims
+                     if getattr(by_path.get(os.path.normcase(os.path.abspath(v))),
+                                'embedded', False)]
+        if not owned:
+            # Nothing leaves the disk — no need to interrupt the user for it.
+            self._remove_files_by_path(victims)
+            return
+        names = "\n".join(f"   • {os.path.basename(v)}" for v in victims[:10])
+        reply = QMessageBox.question(
+            self, "Remove from project",
+            f"Remove {len(victims)} recording(s) from this project?\n\n"
+            f"{names}\n\n"
+            f"{len(owned)} of these are stored inside the project and WILL be "
+            "deleted from disk (wav + csv/h5). The rest are only unregistered — "
+            "their files stay where they are.\n\nConfirmed calls already saved "
+            "as training examples are kept; remove those from the Detections "
+            "list instead.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._remove_files_by_path(victims, delete_embedded=True)
 
     def _load_current_file(self):
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
+            return
+        filepath = self.audio_files[self.current_file_idx]
+        if not os.path.isfile(filepath):
+            # Referenced recording moved. Say so plainly and point at the fix
+            # instead of failing silently — nothing else about the project is
+            # broken by this, and the ⚠ row already flags it.
+            self.status_bar.showMessage(
+                f"{os.path.basename(filepath)} not found — File ▸ Locate "
+                "Missing Recordings… to repoint it")
             return
         self._stop_playback()
         # Wipe any prediction overlay from the previous file — a new
         # file's predictions must be explicitly reloaded.
         self._clear_predictions()
-        filepath = self.audio_files[self.current_file_idx]
         self.status_bar.showMessage(f"Loading {os.path.basename(filepath)}…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
@@ -8648,11 +8425,11 @@ class MADMainWindow(QMainWindow):
                 except Exception:
                     pass
             self.status_bar.showMessage(
-                f"Session — {os.path.basename(filepath)}  |  "
+                f"{os.path.basename(filepath)}  |  "
                 f"{len(self.audio_data) / self.sample_rate:.2f}s @ "
                 f"{self.sample_rate} Hz"
             )
-            self._log(f"Open session file {self.current_file_idx + 1}/"
+            self._log(f"Open file {self.current_file_idx + 1}/"
                       f"{len(self.audio_files)}: {os.path.basename(filepath)}")
         except Exception as e:
             QMessageBox.warning(
@@ -8669,16 +8446,30 @@ class MADMainWindow(QMainWindow):
 
     def _init_or_load_mask_for_current_file(self):
         """Initialize the spec-pixel grid, then rebuild the confirmed mask for
-        this file from the saved example store and/or per-wav h5 sibling."""
+        this file from the saved example store and/or per-wav h5 sibling.
+
+        The grid comes from the params recorded in the sibling h5 when it has
+        them — those are exactly what any stored predictions/labels were computed
+        on, so reusing them is what makes the masks land on the right pixels.
+        Files with no h5 yet fall back to the project's (or default) params."""
         if self.audio_data is None or self.sample_rate is None:
             return
+        wav_path = self.audio_files[self.current_file_idx]
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, get_grid_attrs,
+        )
+        try:
+            grid = get_grid_attrs(masks_sibling_path(wav_path)) or {}
+        except Exception:
+            grid = {}
         sp = self._spec_params()
         self.spectrogram.init_mask(
             audio_len=len(self.audio_data),
             sample_rate=self.sample_rate,
-            nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
+            nperseg=int(grid.get('nperseg', sp['nperseg'])),
+            noverlap=int(grid.get('noverlap', sp['noverlap'])),
+            nfft=int(grid.get('nfft', sp['nfft'])),
         )
-        wav_path = self.audio_files[self.current_file_idx]
         wav_name = os.path.basename(wav_path)
         grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
         anns = self._load_confirmed_annotations(wav_path, grid)
@@ -8709,7 +8500,7 @@ class MADMainWindow(QMainWindow):
     def _load_confirmed_annotations(self, wav_path, grid):
         """Confirmed (human-labeled) annotations for ``wav_path`` — from the
         project store (by source wav) plus the per-wav h5 sibling — de-duped by
-        id. Shared by the session and Training-Data preview load paths."""
+        id."""
         from fnt.usv.usv_detector.mad_examples import iter_file_annotations
         wav_name = os.path.basename(wav_path)
         anns = []
@@ -9189,13 +8980,18 @@ class MADMainWindow(QMainWindow):
             "choose a project directory."
         )
 
-    def _save_component_example(self, class_name: str, comp) -> str:
+    def _save_component_example(self, class_name: str, comp,
+                                blob_id=None) -> str:
         """Save one connected-component mask as a self-contained example.
         ``comp`` is ``(f0, f1, t0, t1, local_bool)``. Returns the example id.
 
         With a project: saves to ``training_data.h5`` (consolidated store).
         Without: saves to the per-wav ``_FNT_masks.h5`` sibling so labels
         survive across sessions without a project.
+
+        ``blob_id`` is the detection row this example came from, when it came
+        from accepting a prediction. Storing it lets the reviewer recognize the
+        CSV row as already on screen instead of drawing the call a second time.
         """
         from datetime import datetime
         from scipy import signal as _signal
@@ -9205,10 +9001,16 @@ class MADMainWindow(QMainWindow):
         cfg = self._project
         sp = self._spec_params()
         f0, f1, t0, t1, local = comp
+        # Take the grid from the canvas, not the project config: the loaded file
+        # may be rendered on the params recorded in its own h5 (see
+        # _init_or_load_mask_for_current_file). Reading nperseg from the config
+        # while hop comes from the canvas would stamp the example with metadata
+        # that doesn't describe the patch it holds.
         hop = sg.hop
-        nperseg = sp['nperseg']
-        nfft = sp['nfft']
-        noverlap_val = sp['noverlap']
+        nperseg = sg.nperseg if sg.nperseg is not None else sp['nperseg']
+        nfft = sg.nfft if sg.nfft is not None else sp['nfft']
+        noverlap_val = (sg.noverlap if sg.noverlap is not None
+                        else sp['noverlap'])
         n_time, n_freq = sg.n_time_frames, sg.n_freq_bins
         sr = self.sample_rate
         margin = 64
@@ -9275,10 +9077,11 @@ class MADMainWindow(QMainWindow):
             'db_min': sp['db_min'], 'db_max': sp['db_max'],
             'created': datetime.now().isoformat(timespec='seconds'),
         }
-        # Labels always save to the sibling h5 next to the active file (session
-        # source or training copy). The project's consolidated training_data.h5
-        # is rebuilt from the Training Data list at train time, so a file only
-        # trains the model once it's been copied into Training Data.
+        if blob_id is not None:
+            meta['blob_id'] = blob_id
+        # Labels always save to the sibling h5 next to the recording — one
+        # source of truth per wav, project or not. The project's consolidated
+        # training_data.h5 is rebuilt from the Audio list at train time.
         import uuid
         from fnt.usv.usv_detector.fnt_mask_store import (
             masks_sibling_path, set_grid_attrs, td_save_example,
@@ -9470,19 +9273,19 @@ class MADMainWindow(QMainWindow):
                     n_done += 1
         else:
             # Collect the targets, then persist every decision in ONE CSV write.
-            # Writing per item (and, in train mode, rebuilding the detection tree
-            # per item via _accept_prediction) made box review quadratic in the
-            # file's call count.
+            # Writing per item (and rebuilding the detection tree per item via
+            # _accept_prediction) made box review quadratic in the file's call
+            # count.
             status = 'accepted' if action == 'accept' else 'rejected'
             targets = [sg.annotations[i] for i in sorted(idxs)
                        if 0 <= i < len(sg.annotations)
                        and sg.annotations[i].get('status') == 'prediction']
-            if (action == 'accept' and self._review_mode != 'deploy'
+            if (action == 'accept'
                     and (self.audio_data is None
                          or self._active_wav_path() is None)):
                 targets = []          # can't save examples without a loaded file
-            elif action == 'accept' and self._review_mode != 'deploy':
-                # Train mode: each accepted call also becomes a training example.
+            elif action == 'accept':
+                # Each accepted call also becomes a training example.
                 cls_default = ((self._project.last_class if self._project
                                 else self._session_last_class) or 'USV')
                 done = []
@@ -9491,7 +9294,8 @@ class MADMainWindow(QMainWindow):
                             ann['mask'])
                     try:
                         ex_id = self._save_component_example(
-                            ann.get('category') or cls_default, comp)
+                            ann.get('category') or cls_default, comp,
+                            blob_id=ann.get('blob_id'))
                         ann['status'] = 'accepted'
                         ann['id'] = ex_id
                         done.append(ann)
@@ -9571,7 +9375,7 @@ class MADMainWindow(QMainWindow):
 
     def _active_review_wav_path(self) -> Optional[str]:
         """The wav whose sibling stores hold the currently-reviewed detections —
-        the file owning the preview (session or Training Data)."""
+        the file owning the preview."""
         return self._active_wav_path()
 
     def _delete_pred_crop(self, ann: dict):
@@ -9701,10 +9505,9 @@ class MADMainWindow(QMainWindow):
         self._update_legend()
         self._refresh_annotation_list()
         self._update_overview_marks()
-        for lst in (getattr(self, 'file_list', None),
-                    getattr(self, 'deploy_list', None)):
-            if lst is not None:
-                lst.viewport().update()
+        lst = getattr(self, 'file_list', None)
+        if lst is not None:
+            lst.viewport().update()
 
     def _on_wheel_zoom(self, factor: float, center_time: float):
         if self.spectrogram.total_duration <= 0:
@@ -10146,12 +9949,10 @@ class MADMainWindow(QMainWindow):
         if self._project is None:
             QMessageBox.information(self, "No project", "Open a MAD project first.")
             return
-        files = list(self.audio_files) + [
-            f for f in self.deploy_files if f not in self.audio_files]
+        files = list(self.audio_files)
         if not files:
             QMessageBox.warning(
-                self, "No files",
-                "Load session audio or add Training Data files first.")
+                self, "No files", "Add audio to the project first.")
             return
         current = self._active_wav_path()
         default_model = None
@@ -10499,10 +10300,12 @@ class MADMainWindow(QMainWindow):
     def _open_wav_for_review(self, wav_path: str):
         """Load an arbitrary recording into the reviewer and show its detections.
 
-        Used by the run-summary table: a batch run's files usually aren't in
-        either list (that's the point of the folder target), so the file is
-        appended to the session list on demand rather than requiring the user to
-        go find and import it.
+        Used by the run-summary table: a batch run's files usually aren't in the
+        Audio list (that's the point of the folder target), so the file is
+        appended on demand rather than requiring the user to go find and import
+        it. It is NOT registered in the project — opening one result to look at
+        it shouldn't quietly enrol a production recording in the training set;
+        use Add Files… for that.
         """
         if not wav_path or not os.path.isfile(wav_path):
             return
@@ -10514,13 +10317,12 @@ class MADMainWindow(QMainWindow):
             self.audio_files.append(ap)
             self._refresh_file_list()
             idx = len(self.audio_files) - 1
-        self._active_source = 'session'
-        self._review_mode = 'deploy'
-        self._clear_training_selection()
-        self._deploy_file_idx = None
         self.current_file_idx = idx
         self.file_list.setCurrentRow(idx)
         n = self._load_predictions_as_annotations(wav=ap) or 0
+        if self._project is not None:
+            self._log(f"Opened {os.path.basename(ap)} for review — not added to "
+                      "the project (use Add Files… to train on it)")
         self.status_bar.showMessage(
             f"{os.path.basename(ap)} — {n} detection(s) loaded"
             if n else f"{os.path.basename(ap)} — no detections recorded")
@@ -10560,7 +10362,7 @@ class MADMainWindow(QMainWindow):
     def _batch_run_root(self) -> Optional[str]:
         """Where to keep batch-run manifests: the project if one is open, else
         the chosen inference folder. None when neither exists (a one-off run on
-        loose session files needs no run record)."""
+        loose files needs no run record)."""
         if self._project is not None:
             return self._project.project_dir
         folder = getattr(self, '_infer_folder', None)
@@ -10673,7 +10475,7 @@ class MADMainWindow(QMainWindow):
 
         # Reset queue markers so completion shows live as the run progresses.
         for w in wav_paths:
-            self._set_deploy_item_state(w, 'pending')
+            self._set_file_item_state(w, 'pending')
         self._infer_counted = set()
 
         # Human-readable stage labels so the X/Y is obviously *tiles* scanned by
@@ -10724,7 +10526,7 @@ class MADMainWindow(QMainWindow):
                         cnt = get_prob_blob_count(masks_sibling_path(wav_paths[j]))
                     except Exception:
                         pass
-                    self._set_deploy_item_state(wav_paths[j], 'done', cnt)
+                    self._set_file_item_state(wav_paths[j], 'done', cnt)
 
         def on_finished(results):
             self._infer_worker = None
@@ -10739,9 +10541,9 @@ class MADMainWindow(QMainWindow):
                 wp = r.get('wav_path')
                 if wp:
                     if 'error' in r:
-                        self._set_deploy_item_state(wp, 'error')
+                        self._set_file_item_state(wp, 'error')
                     else:
-                        self._set_deploy_item_state(wp, 'done', r.get('n_blobs'))
+                        self._set_file_item_state(wp, 'done', r.get('n_blobs'))
             # Aggregate timing across the batch (helps spot CPU vs GPU).
             tt = [r['timing'] for r in results if r.get('timing')]
             timing_line = ""
@@ -10772,10 +10574,11 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"Inference complete — {len(results)} file(s), {total} blob(s)"
             )
-            # Refresh the Training Data status ticks, then auto-open something
-            # for review: the currently-previewed file if it was inferred, else
-            # the first target file.
-            self._refresh_deploy_queue()
+            # Refresh the Audio-list status ticks, then auto-open something for
+            # review: the currently-previewed file if it was inferred, else the
+            # first target file.
+            self._scan_all_file_counts()
+            self._update_run_button()
             active = self._active_wav_path()
             if active and active in wav_paths:
                 n = self._load_predictions_as_annotations(wav=active)
@@ -10785,9 +10588,7 @@ class MADMainWindow(QMainWindow):
                         f"/ Skip (S)")
             elif wav_paths:
                 first = wav_paths[0]
-                if first in self.deploy_files:
-                    self.deploy_list.setCurrentRow(self.deploy_files.index(first))
-                elif first in self.audio_files:
+                if first in self.audio_files:
                     self.file_list.setCurrentRow(self.audio_files.index(first))
 
         def on_error(msg: str):

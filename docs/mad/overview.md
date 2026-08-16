@@ -16,7 +16,13 @@ Launch from the FNT main GUI **Audio** tab → **Mask Audio Detector (MAD)**.
 
 ## Project structure
 
-MAD organizes work into a project folder holding session audio references, the training-data store, and trained model checkpoints. Detections are saved as a sibling CSV next to each recording, cross-readable with the Classic Audio Detector (CAD) output.
+MAD follows SLEAP's project model: a project **points at** recordings where they already live, the way a SLEAP project points at videos. The project folder holds those path references, the training-data store, and trained model checkpoints — never copies of your audio, which for 250 kHz recordings would run to hundreds of MB per file. Detections are saved as a sibling CSV next to each recording, cross-readable with the Classic Audio Detector (CAD) output.
+
+There is a single **Audio** list: every recording the project knows about. Anything you confirm in it trains the model — there is no separate training set to curate. Large production runs stay outside the list via the **Folder** inference target, so recordings you are not curating never join the training set.
+
+A project is optional until you train. You can add wavs, label them, load a model from any trained project, run inference and review the results with no project open — labels and detections save beside the audio either way. Training needs a project, because the model and its example store have to live somewhere.
+
+Because recordings are referenced rather than copied, a recording that moves is a **soft** state: the row is flagged, but training, the example store and every saved detection keep working, and **File ▸ Locate Missing Recordings…** repoints a whole moved tree from one file. **File ▸ Pack Project** is the escape hatch — it copies the audio in, making the project self-contained for archiving or sharing.
 
 ## Detection output
 

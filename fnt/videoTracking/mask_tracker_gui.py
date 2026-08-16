@@ -279,6 +279,7 @@ class AnnotationPreviewWidget(QWidget):
     annotation_edited = pyqtSignal(int)
     delete_annotation_requested = pyqtSignal(int)
     approve_annotation_requested = pyqtSignal(int)
+    edit_mode_blocked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -516,13 +517,22 @@ class AnnotationPreviewWidget(QWidget):
                 self.setCursor(Qt.ClosedHandCursor)
                 return
 
+            # While a mask is being edited, the only left-button action is
+            # dragging that mask's own vertices; anything else pans. Drawing a
+            # new mask stays locked out until the edit is committed (Enter) or
+            # cancelled (Escape) — see also mouseDoubleClickEvent.
+            if self._editing_obj_idx is not None:
+                hit = self._find_point_at(event.x(), event.y())
+                if hit is not None and hit[0] == self._editing_obj_idx:
+                    self._drag_obj_idx, self._drag_pt_idx = hit
+                    self._dragging_point = True
+                    return
+                self._panning = True
+                self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
+                self.setCursor(Qt.ClosedHandCursor)
+                return
+
             if self.drawing_mode == "navigate":
-                if self._editing_obj_idx is not None:
-                    hit = self._find_point_at(event.x(), event.y())
-                    if hit is not None and hit[0] == self._editing_obj_idx:
-                        self._drag_obj_idx, self._drag_pt_idx = hit
-                        self._dragging_point = True
-                        return
                 self._panning = True
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
                 self.setCursor(Qt.ClosedHandCursor)
@@ -537,9 +547,6 @@ class AnnotationPreviewWidget(QWidget):
             if hit is not None:
                 self._drag_obj_idx, self._drag_pt_idx = hit
                 self._dragging_point = True
-                return
-
-            if self._editing_obj_idx is not None:
                 return
 
             if self.drawing_mode == "manual":
@@ -566,6 +573,11 @@ class AnnotationPreviewWidget(QWidget):
         if not self.annotation_keys_enabled:
             return
         if self.drawing_mode != "ai":
+            return
+        if self._editing_obj_idx is not None:
+            # An accidental double-click while reshaping a mask used to start a
+            # second, unrelated SAM mask on top of the one being edited.
+            self.edit_mode_blocked.emit()
             return
 
         coords = self._widget_to_img(event.x(), event.y())
@@ -2819,6 +2831,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
+        self.preview.edit_mode_blocked.connect(self._on_edit_mode_blocked)
         right_layout.addWidget(self.preview, 1)
 
         # Info row below preview
