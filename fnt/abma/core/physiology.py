@@ -101,12 +101,16 @@ class PhysiologyParams:
     # makes hunger bite on the timescale of an enclosure experiment: too large
     # a store and animals coast for days without ever needing to forage.
     energy_store_kj_per_g: float = 2.0    # usable somatic energy per gram
-    water_ml_per_g: float = 0.10          # readily-exchangeable water per gram
+    # Readily-exchangeable water, ~a quarter of body mass. Sized so a missed
+    # drinking opportunity is a setback rather than a death sentence — with a
+    # pool this small relative to daily loss, animals in a large enclosure die
+    # of thirst before they can walk to the next water tower.
+    water_ml_per_g: float = 0.25
     bladder_ml_per_g: float = 0.012       # bladder volume per gram
 
     # ---- intake --------------------------------------------------------- #
     feed_rate_g_min: float = 0.15         # grams eaten per minute at food
-    drink_rate_ml_min: float = 0.25       # mL drunk per minute at water
+    drink_rate_ml_min: float = 0.35       # mL drunk per minute at water
 
     # ---- energy expenditure --------------------------------------------- #
     # Balanced so a fed animal holds station on ~15-20 min of feeding a day,
@@ -127,7 +131,10 @@ class PhysiologyParams:
 
     # ---- consequences of an empty store ---------------------------------- #
     starvation_health_h: float = 6.0      # health lost per hour at zero energy
-    dehydration_health_h: float = 12.0    # health lost per hour at zero water
+    # Dehydration is faster than starvation but not instant: a fully parched
+    # animal has about a day before it is gone, so a long trip to water is
+    # survivable and thirst drives behaviour rather than just killing.
+    dehydration_health_h: float = 4.0
 
     # ---- capacities, resolved for an actual body mass -------------------- #
     def energy_capacity(self, mass_g):

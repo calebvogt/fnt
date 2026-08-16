@@ -228,8 +228,11 @@ class PolicyParams:
     k_territory: float = 2.0    # scent-marked territory avoidance gain
     k_random: float = 0.5       # exploratory noise gain
     perception_r: float = 0.6   # neighbour perception radius (m)
-    # hunger/thirst (0-100) at which the animal starts seeking food or water
-    forage_threshold: float = 50.0
+    # Hunger/thirst (0-100) at which the animal starts seeking food or water.
+    # Deliberately well below the crisis point: an animal that only sets out
+    # when it is desperate never crosses a large enclosure in time, so trips
+    # have to start while the need is still moderate.
+    forage_threshold: float = 30.0
     # --- scent-driven structure (used when ExperimentConfig.scent.enabled) --- #
     # With marks switched on these REPLACE the geometric home spring and the
     # home_range_r territory proxy: site fidelity is "stay where my own marks

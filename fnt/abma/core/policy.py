@@ -101,10 +101,36 @@ class RuleBasedPolicy(Policy):
         # steer for the access point (a walled zone's doorway), not the centre
         food_t = getattr(sim, "food_seek", sim.food)
         water_t = getattr(sim, "water_seek", sim.water)
+        # Go after the MORE urgent need rather than summing both pulls: when
+        # food and water sit in opposite directions the two vectors cancel and
+        # the animal starves standing between them.
+        go_food = need_food >= need_water
+        res_vec = np.zeros((n, 2))
         if food_t.shape[0]:
-            desired += self.k_resource * sim._seek(P, food_t, need_food)
+            res_vec += self.k_resource * sim._seek(
+                P, food_t, np.where(go_food, need_food, 0.0))
         if water_t.shape[0]:
-            desired += self.k_resource * sim._seek(P, water_t, need_water)
+            res_vec += self.k_resource * sim._seek(
+                P, water_t, np.where(go_food, 0.0, need_water))
+
+        # A walled resource zone has one small doorway. An animal inside it
+        # that wants something outside — water, almost always — would otherwise
+        # steer straight into a wall and stay there until it dehydrated, belly
+        # full. Inside a zone, head for the gap first.
+        rects = getattr(sim, "food_rects", np.zeros((0, 4)))
+        doors = getattr(sim, "zone_doors", np.zeros((0, 2)))
+        if len(rects) and len(doors):
+            cx, cy, hw, hd = rects.T
+            inz = ((np.abs(P[:, 0][:, None] - cx[None, :]) <= hw[None, :])
+                   & (np.abs(P[:, 1][:, None] - cy[None, :]) <= hd[None, :]))
+            leaving = inz.any(axis=1) & (~go_food) & (need_water > 0)
+            if leaving.any():
+                j = np.argmax(inz, axis=1)
+                to_door = doors[j] - P
+                dd = np.linalg.norm(to_door, axis=1)[:, None] + 1e-9
+                exit_vec = self.k_resource * (to_door / dd) * need_water[:, None]
+                res_vec = np.where(leaving[:, None], exit_vec, res_vec)
+        desired += res_vec
 
         # --- pairwise social / territorial forces (olfaction-gated) ---
         diff = P[None, :, :] - P[:, None, :]
@@ -141,7 +167,12 @@ class RuleBasedPolicy(Policy):
             # mark's stored identity) — so anosmia and MUP-knockout degrade
             # spacing by different routes, which is the point of the model.
             k_sa = getattr(pp, "k_scent_avoid", 2.2) if pp is not None else 2.2
-            desired += (k_sa * sim.smell)[:, None] * foreign_vec
+            # ...but a hungry animal trespasses. Without this, an animal that
+            # does not hold the patch containing the food starves rather than
+            # cross a boundary, and territoriality silently becomes lethal.
+            avoid = (k_sa * sim.smell) * (1.0 - rel * np.maximum(need_food,
+                                                                 need_water))
+            desired += avoid[:, None] * foreign_vec
         else:
             to_home = P[:, None, :] - sim.home[None, :, :]
             dth = np.linalg.norm(to_home, axis=2)
