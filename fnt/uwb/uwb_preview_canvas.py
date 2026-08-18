@@ -45,6 +45,7 @@ except Exception as _e:  # pragma: no cover - depends on optional PyOpenGL
     HAVE_GL = False
     GL_ERROR = f"{type(_e).__name__}: {_e}"
 
+from PyQt5.QtCore import Qt          # cursor shapes for drag-panning
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
@@ -497,9 +498,18 @@ class UWBPreview2D(FigureCanvas):
               and self._user_zoom is not None):
             # Pan only makes sense when zoomed in.
             self._pan = (event.x, event.y, self.ax.get_xlim(), self.ax.get_ylim())
+            # Closed-hand cursor while dragging, so the pan reads as grabbing
+            # the view rather than clicking on it.
+            self.setCursor(Qt.ClosedHandCursor)
 
     def _on_motion(self, event):
         """Drag-pan: translate the view by the pixel delta since button-press."""
+        if self._pan is None:
+            # Advertise that the view can be grabbed, but only where it can.
+            if event.inaxes is self.ax and self._user_zoom is not None:
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.unsetCursor()
         if self._pan is None or event.x is None or event.y is None:
             return
         px, py, (x0, x1), (y0, y1) = self._pan
@@ -514,6 +524,8 @@ class UWBPreview2D(FigureCanvas):
         self._rerender()
 
     def _on_release(self, event):
+        if self._pan is not None:
+            self.unsetCursor()
         self._pan = None
 
     def resizeEvent(self, event):
@@ -646,7 +658,7 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = False
 
     def update_frame(self, x, y, colors, tracks=None, raw_pts=None,
-                     labels=None, batteries=None):
+                     labels=None, batteries=None, behavior=None):
         """Draw one frame by blitting the moving tags over the cached scene.
 
         ``tracks``: list of (xy Nx2 array, rgb tuple) — one fading polyline per
@@ -657,7 +669,8 @@ class UWBPreview2D(FigureCanvas):
         Only these dynamic artists are drawn per frame; the arena/zones/anchors
         come from the cached static background.
         """
-        self._last_frame = (x, y, colors, tracks, raw_pts, labels, batteries)
+        self._last_frame = (x, y, colors, tracks, raw_pts, labels, batteries,
+                            behavior)
         if self._static_dirty or self._blit_bg is None:
             self._draw_static()
 
@@ -686,6 +699,32 @@ class UWBPreview2D(FigureCanvas):
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         ok = np.isfinite(x) & np.isfinite(y)
+
+        # --- behaviour overlays, drawn beneath the markers ------------------
+        # ``behavior`` = {"radius": social radius in metres or None,
+        #                 "links": [(i, j, colour)] pairs to join,
+        #                 "states": [(text, colour)] per tag}
+        if behavior:
+            radius = behavior.get("radius")
+            if radius:
+                edge_col = behavior.get("circle_color") or "#9fb3c8"
+                for i in range(len(x)):
+                    if not ok[i]:
+                        continue
+                    circ = Circle((x[i], y[i]), float(radius), fill=False,
+                                  linestyle=(0, (2, 2)), linewidth=1.2,
+                                  edgecolor=edge_col, alpha=0.9, zorder=4.5)
+                    self.ax.add_patch(circ)
+                    dynamic.append(circ)
+            # Dotted like the social circles they connect, but heavier so the
+            # link reads as a connection rather than another radius outline.
+            for i, j, col in behavior.get("links") or ():
+                if i < len(x) and j < len(x) and ok[i] and ok[j]:
+                    ln = self.ax.plot([x[i], x[j]], [y[i], y[j]], color=col,
+                                      linewidth=2.2, alpha=0.95,
+                                      linestyle=(0, (3, 2)), zorder=4.6)[0]
+                    dynamic.append(ln)
+
         if ok.any():
             edge = "white" if self._theme == "dark" else "#333333"
             # ``tag_size`` is a marker *diameter* in points (matching the
@@ -696,30 +735,88 @@ class UWBPreview2D(FigureCanvas):
                 x[ok], y[ok], s=float(tag_size) ** 2, c=np.asarray(colors)[ok],
                 edgecolors=edge, linewidths=0.6, zorder=5))
 
-        # Optional per-tag ID label (above the marker) and/or battery voltage
-        # beneath it — independent overlays. Both anchor at y+off: the label
-        # grows upward (va="bottom"), the voltage downward (va="top").
-        if (labels is not None or batteries is not None) and ok.any():
-            ylim = self.ax.get_ylim()
-            off = (ylim[1] - ylim[0]) * 0.035
+        # Per-tag text block, anchored in SCREEN space just outside the marker
+        # so it tracks the Tag Icon Size and never drifts as you zoom (a fixed
+        # fraction of the y-range left the label stranded far from its dot):
+        #
+        #     M9429        <- ID
+        #    (inactive)    <- behaviour state, smaller, under the ID
+        #       o          <- marker
+        #     3.91 V       <- battery, below so nothing collides
+        #
+        states = (behavior or {}).get("states") or []
+        state_parts = (behavior or {}).get("state_parts") or []
+        if (labels is not None or batteries is not None or states) and ok.any():
             colarr = np.asarray(colors)
+            # Clear whichever circle is larger. The icon size is already in
+            # points, but the social radius is in metres, so convert it through
+            # the data transform - which also means the label keeps its
+            # clearance as you zoom, since the circle grows on screen.
+            pad = float(tag_size) / 2.0 + 2.0
+            radius_m = (behavior or {}).get("radius")
+            if radius_m:
+                try:
+                    origin = self.ax.transData.transform((0.0, 0.0))
+                    edge_px = self.ax.transData.transform((float(radius_m), 0.0))
+                    radius_pts = (abs(edge_px[0] - origin[0]) * 72.0
+                                  / float(self.figure.dpi))
+                    pad = max(pad, radius_pts + 2.0)
+                except Exception:
+                    pass
             for i in range(len(x)):
                 if not ok[i]:
                     continue
                 lbl = labels[i] if (labels is not None and i < len(labels)) else None
+                state_text, state_col = (states[i] if i < len(states) else ("", None))
+
+                # State sits directly beneath the ID, so it takes the inner slot
+                # and pushes the ID up by one line only when both are shown.
+                parts = state_parts[i] if i < len(state_parts) else None
+                if parts:
+                    # Each half in its own colour with a white separator, so
+                    # locomotion and social state read as two separate facts.
+                    from matplotlib.offsetbox import (TextArea, HPacker,
+                                                      AnnotationBbox)
+                    props = dict(size=6.5, weight="bold")
+                    chunks = [TextArea("(", textprops=dict(color="white", **props))]
+                    for n_part, (ptxt, pcol) in enumerate(parts):
+                        if n_part:
+                            chunks.append(TextArea(
+                                " - ", textprops=dict(color="white", **props)))
+                        chunks.append(TextArea(
+                            ptxt, textprops=dict(color=pcol, **props)))
+                    chunks.append(TextArea(")", textprops=dict(color="white", **props)))
+                    packed = HPacker(children=chunks, align="baseline", pad=0, sep=0)
+                    abox = AnnotationBbox(
+                        packed, (x[i], y[i]), xybox=(0, pad),
+                        xycoords="data", boxcoords="offset points",
+                        box_alignment=(0.5, 0.0), frameon=False, pad=0.0,
+                        annotation_clip=False, zorder=6)
+                    self.ax.add_artist(abox)
+                    dynamic.append(abox)
+                elif state_text:
+                    dynamic.append(self.ax.annotate(
+                        f"({state_text})", (x[i], y[i]),
+                        textcoords="offset points", xytext=(0, pad),
+                        fontsize=6.5, ha="center", va="bottom",
+                        color=state_col or "#cccccc", zorder=6))
                 if lbl:
-                    # ID label matches the marker colour (so 'Color by: Sex'
-                    # tints labels blue=M / red=F, like the export animation).
-                    dynamic.append(self.ax.text(
-                        x[i], y[i] + off, str(lbl), fontsize=8, ha="center",
-                        va="bottom", color=tuple(colarr[i]), fontweight="bold",
-                        zorder=6))
+                    # ID matches the marker colour, so 'Color by: Sex' tints it
+                    # blue=M / red=F exactly like the export animation.
+                    dynamic.append(self.ax.annotate(
+                        str(lbl), (x[i], y[i]),
+                        textcoords="offset points",
+                        xytext=(0, pad + (8.0 if state_text else 0.0)),
+                        fontsize=8, ha="center", va="bottom",
+                        color=tuple(colarr[i]), fontweight="bold", zorder=6))
                 if batteries is not None and i < len(batteries):
                     bv = batteries[i]
                     if bv is not None and np.isfinite(bv):
-                        dynamic.append(self.ax.text(
-                            x[i], y[i] + off, f"{bv:.2f} V", fontsize=6,
-                            ha="center", va="top", color="#000000", zorder=6))
+                        dynamic.append(self.ax.annotate(
+                            f"{bv:.2f} V", (x[i], y[i]),
+                            textcoords="offset points", xytext=(0, -pad),
+                            fontsize=6, ha="center", va="top",
+                            color="#000000", zorder=6))
 
         for art in dynamic:
             self.ax.draw_artist(art)
