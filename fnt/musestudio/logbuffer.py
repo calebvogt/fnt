@@ -126,10 +126,18 @@ class LogBuffer:
             pass
 
     def _install_fd_tee(self, fd, label):
-        """Duplicate ``fd`` into a pipe, forwarding lines to the buffer *and* on
-        to the original destination so the terminal still works."""
+        """Redirect ``fd`` into a pipe whose lines land in this buffer.
+
+        By default the terminal is left **quiet**: everything native libraries
+        write to stdout/stderr (liblsl reconnect errors, OpenCV camera
+        complaints, netinterfaces spam) is captured for the Session Logs window
+        instead of scrolling the user's shell. Set the environment variable
+        ``FNT_LOG_ECHO=1`` to also echo captured lines back to the terminal —
+        useful when running from source and watching live.
+        """
+        echo = os.environ.get("FNT_LOG_ECHO", "") == "1"
         try:
-            saved = os.dup(fd)
+            saved = os.dup(fd)          # kept so the fd's destination survives
             read_fd, write_fd = os.pipe()
             os.dup2(write_fd, fd)
             os.close(write_fd)
@@ -146,10 +154,11 @@ class LogBuffer:
                         break
                     if not chunk:
                         break
-                    try:
-                        os.write(saved, chunk)      # keep the terminal working
-                    except Exception:
-                        pass
+                    if echo:
+                        try:
+                            os.write(saved, chunk)
+                        except Exception:
+                            pass
                     pending += chunk
                     *complete, pending = pending.split(b"\n")
                     for line in complete:

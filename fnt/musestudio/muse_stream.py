@@ -23,6 +23,13 @@ import time
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
+
+# NOTE: an earlier revision pointed LSLAPICFG at a generated lsl_api.cfg to
+# silence liblsl's start-up logging. That was removed: the log tee in
+# logbuffer.py already keeps the terminal quiet, so the config file bought
+# nothing while adding a way for stream resolution to break. Don't reintroduce
+# it — suppress liblsl output at the fd level instead.
+
 # Note: mne_lsl (liblsl) is imported lazily inside LSLReaderThread.run() so that
 # device discovery, the streamer subprocess, and the CSV recorder remain usable
 # (and testable) without the LSL stack installed.
@@ -152,8 +159,17 @@ class MuseRecorder:
     called from the GUI thread.
     """
 
-    def __init__(self, out_dir):
+    def __init__(self, out_dir, precision=6):
+        """``precision`` = decimal places per value.
+
+        The default 6 is lossless for anything the headband produces. Long
+        overnight runs pass 2: EEG resolution is then 0.01 µV — two orders of
+        magnitude below the device's own ~2 µV noise floor, so nothing real is
+        lost — and it removes roughly a third of a 1.5 GB night.
+        """
         self.session_dir = out_dir
+        self.precision = int(precision)
+        self._fmt = f"{{:.{int(precision)}f}}"
         os.makedirs(out_dir, exist_ok=True)
         self._lock = threading.Lock()
         self._files = {}   # stream_name -> (file_handle, csv.writer)
@@ -173,7 +189,10 @@ class MuseRecorder:
                 writer = self._open_stream_file(stream_name, channel_names)
             fh, w = writer
             for i in range(len(timestamps)):
-                w.writerow([f"{timestamps[i]:.6f}", *(f"{v:.6f}" for v in data[i])])
+                # Timestamps keep full precision regardless — they carry the
+                # alignment between streams and must not be rounded.
+                w.writerow([f"{timestamps[i]:.6f}",
+                            *(self._fmt.format(v) for v in data[i])])
             self._counts[stream_name] = self._counts.get(stream_name, 0) + len(timestamps)
             fh.flush()
 

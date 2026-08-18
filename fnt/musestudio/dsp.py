@@ -116,22 +116,42 @@ def curated_channels(stream_name, channel_names):
     return names
 
 
-def contact_quality(x, fs, p2p_limit=250.0, min_std=0.5):
-    """Is this electrode making usable contact?
+def contact_amplitude(x, fs):
+    """Robust signal amplitude (µV) used to judge electrode contact.
 
-    The check runs on a high-passed copy: raw Muse EEG carries a large DC
-    offset and slow drift, so a peak-to-peak test on the raw signal fails even
-    on a perfectly good electrode.
+    High-passed first — raw Muse EEG sits on a ~700 µV DC offset — then
+    summarised by the 95th percentile of |signal| rather than peak-to-peak.
+    Peak-to-peak is set by the single largest sample in the window, so one
+    blink makes an otherwise perfect electrode look broken; the percentile
+    ignores brief excursions and reports the amplitude the signal actually
+    spends its time at.
     """
     x = np.asarray(x, dtype=float)
     if len(x) < 16:
-        return False
+        return float("nan")
     sos = design_display_sos(fs, low=1.0, high=None, notch=None)
     y = sosfilt(sos, x - np.mean(x)) if sos is not None else x - np.mean(x)
     y = y[len(y) // 4:]           # drop the filter start-up transient
     if len(y) == 0:
+        return float("nan")
+    return float(np.percentile(np.abs(y), 95))
+
+
+# Calibrated against a real Muse S Athena recording, where the four electrodes
+# sat at median robust amplitudes of ~9 µV (AF8), 16 (AF7), 27 (TP9) and 37
+# (TP10). Physiological EEG rarely exceeds ~100 µV even with strong alpha, so
+# 150 µV cleanly separates "real signal, occasionally noisy" from an electrode
+# that is railing or floating.
+CONTACT_MAX_UV = 150.0
+CONTACT_MIN_UV = 0.5
+
+
+def contact_quality(x, fs, max_amplitude=CONTACT_MAX_UV, min_amplitude=CONTACT_MIN_UV):
+    """Is this electrode making usable contact?"""
+    amp = contact_amplitude(x, fs)
+    if not np.isfinite(amp):
         return False
-    return bool(np.ptp(y) < p2p_limit and np.std(y) > min_std)
+    return bool(min_amplitude < amp < max_amplitude)
 
 
 # --------------------------------------------------------------------------

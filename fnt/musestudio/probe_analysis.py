@@ -67,6 +67,10 @@ def _d_label(d):
     return f"{size} ({'+' if d > 0 else '-'})"
 
 
+def _short_ch(name):
+    return str(name).upper().replace("EEG_", "")
+
+
 def _mean(values):
     vals = [v for v in values if np.isfinite(v)]
     return float(np.mean(vals)) if vals else float("nan")
@@ -94,33 +98,51 @@ def analyse(root, band="alpha"):
         seg = {c: signals[c][idx] for c in channels}
         rows = {"alpha_rel": [], "theta_rel": [], "alpha_abs": [],
                 "plv": [], "imag": [], "snr10": [], "good": []}
+        # Each electrode pair is gated on its own two electrodes. Requiring all
+        # four to be clean throws away a perfectly good frontal recording just
+        # because an ear electrode lost contact — which is the common failure.
+        for _, left, right in PAIRS:
+            rows[f"plv_{left}"] = []
+            rows[f"imag_{left}"] = []
+        per_channel_good = {c: 0 for c in channels}
+        n_windows = 0
+
         for a, b in _windows(len(idx), fs):
             chunk = {c: seg[c][a:b] for c in channels}
-            good = all(contact_quality(v, fs) for v in chunk.values())
-            rows["good"].append(1.0 if good else 0.0)
-            if not good:
+            good = {c: contact_quality(v, fs) for c, v in chunk.items()}
+            n_windows += 1
+            for c, ok in good.items():
+                per_channel_good[c] += 1 if ok else 0
+            usable = [c for c in channels if good[c]]
+            rows["good"].append(len(usable) / max(1, len(channels)))
+            if not usable:
                 continue
-            rel, absol = [], []
-            for v in chunk.values():
-                ab = band_powers(v, fs)
-                rel.append(relative_band_powers(ab))
-                absol.append(ab)
+
+            rel = [relative_band_powers(band_powers(chunk[c], fs)) for c in usable]
+            absol = [band_powers(chunk[c], fs) for c in usable]
             rows["alpha_rel"].append(np.mean([r["alpha"] for r in rel]))
             rows["theta_rel"].append(np.mean([r["theta"] for r in rel]))
             rows["alpha_abs"].append(np.mean([x["alpha"] for x in absol]))
+            rows["snr10"].append(_mean(
+                [entrainment_snr(chunk[c], fs, 10.0) for c in usable]))
+
             plvs, imags = [], []
             for _, left, right in PAIRS:
                 lc, rc = _find(channels, left), _find(channels, right)
-                if lc and rc:
+                if lc and rc and good[lc] and good[rc]:
                     p, i = band_connectivity(chunk[lc], chunk[rc], fs, (lo, hi))
+                    rows[f"plv_{left}"].append(p)
+                    rows[f"imag_{left}"].append(i)
                     plvs.append(p)
                     imags.append(i)
-            rows["plv"].append(_mean(plvs))
-            rows["imag"].append(_mean(imags))
-            rows["snr10"].append(_mean(
-                [entrainment_snr(v, fs, 10.0) for v in chunk.values()]))
+            if plvs:
+                rows["plv"].append(_mean(plvs))
+                rows["imag"].append(_mean(imags))
+
         per_block[label] = {k: np.array(v, dtype=float) for k, v in rows.items()}
         per_block[label]["duration"] = t1 - t0
+        per_block[label]["channel_good"] = {
+            c: per_channel_good[c] / max(1, n_windows) for c in channels}
 
     return {"data": data, "blocks": per_block, "band": band,
             "channels": channels, "fs": fs}
@@ -145,6 +167,14 @@ def report(root, band="alpha"):
     add("=" * 72)
     add(f"HEMI-SYNC PROBE REPORT   ·   {os.path.basename(os.path.normpath(root))}")
     add("=" * 72)
+    subj = (data.config.get("subject") or {})
+    if subj.get("id"):
+        label = subj["id"]
+        if subj.get("handedness") and subj["handedness"] != "unspecified":
+            label += f" ({subj['handedness']}-handed)"
+        if subj.get("session_label"):
+            label += f" · {subj['session_label']}"
+        add(f"subject  : {label}")
     add(f"protocol : {data.config.get('protocol') or data.config.get('mode')}")
     add(f"duration : {data.duration / 60:.1f} min    "
         f"EEG {len(out['channels'])} ch @ {out['fs']:.0f} Hz    band: {band}")
@@ -155,17 +185,28 @@ def report(root, band="alpha"):
     if not blocks:
         add("   !! no phase blocks found — cannot analyse")
         return "\n".join(lines)
-    overall = []
+    first = next(iter(blocks.values()))
+    ch_names = list(first.get("channel_good", {}))
+    add("   " + "block".ljust(20) + "  dur" +
+        "".join(_short_ch(c).rjust(8) for c in ch_names))
     for name, b in blocks.items():
-        frac = float(np.mean(b["good"])) if len(b["good"]) else 0.0
-        overall.append(frac)
-        flag = "ok" if frac >= 0.7 else "POOR"
-        add(f"   {name:<20} {b['duration']:5.0f}s   clean windows {frac*100:5.1f}%  {flag}")
-    usable = float(np.mean(overall))
-    add(f"   overall clean: {usable*100:.1f}%")
-    if usable < 0.5:
-        add("   >> VERDICT: recording too noisy to interpret. Refit the headband.")
+        cg = b.get("channel_good", {})
+        cells = "".join(f"{cg.get(c, 0) * 100:7.0f}%" for c in ch_names)
+        add(f"   {name:<20} {b['duration']:4.0f}s{cells}")
+    # Per-electrode usability across the whole run decides what is analysable.
+    overall_ch = {c: float(np.mean([b.get("channel_good", {}).get(c, 0.0)
+                                    for b in blocks.values()])) for c in ch_names}
+    add("   " + "whole run".ljust(20) + "     " +
+        "".join(f"{overall_ch[c] * 100:7.0f}%" for c in ch_names))
+    good_ch = [c for c, v in overall_ch.items() if v >= 0.5]
+    add(f"   usable electrodes: {', '.join(_short_ch(c) for c in good_ch) or 'none'}")
+    if not good_ch:
+        add("   >> VERDICT: no electrode held contact. Nothing to interpret.")
         return "\n".join(lines)
+    dead = [c for c in ch_names if c not in good_ch]
+    if dead:
+        add(f"   >> {', '.join(_short_ch(c) for c in dead)} lost contact — pairs")
+        add("      needing them are reported as unavailable, the rest still stand.")
     add("")
 
     # --- 2. positive control -------------------------------------------
@@ -192,12 +233,19 @@ def report(root, band="alpha"):
     binaural = _pick(blocks, "binaural") or _pick(blocks, "10 hz")
     control = _pick(blocks, "control")
     if binaural and control:
-        for key, title in (("plv", "PLV        "),
-                           ("imag", "imag-coh   "),
-                           ("alpha_rel", "alpha (rel)")):
-            d = _cohens_d(blocks[binaural][key], blocks[control][key])
-            add(f"   {title}  control {_mean(blocks[control][key]):.3f}"
-                f"  ->  binaural {_mean(blocks[binaural][key]):.3f}"
+        series = [("alpha_rel", "alpha (rel)  ")]
+        for label, left, right in PAIRS:
+            series.append((f"plv_{left}", f"PLV {label:<9}"))
+            series.append((f"imag_{left}", f"imag-coh {label:<5}"))
+        for key, title in series:
+            a = blocks[binaural].get(key, np.array([]))
+            c = blocks[control].get(key, np.array([]))
+            if len(a) < 2 or len(c) < 2:
+                add(f"   {title}  unavailable (electrodes did not hold contact)")
+                continue
+            d = _cohens_d(a, c)
+            add(f"   {title}  control {_mean(c):.3f}"
+                f"  ->  stimulus {_mean(a):.3f}"
                 f"   d={d:+.2f}  {_d_label(d)}")
         d_plv = _cohens_d(blocks[binaural]["plv"], blocks[control]["plv"])
         d_img = _cohens_d(blocks[binaural]["imag"], blocks[control]["imag"])

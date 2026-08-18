@@ -92,6 +92,24 @@ REWARD_LEVEL = 0.6
 REWARD_HOLD_S = 3.0
 REWARD_BLOOM_S = 2.5
 
+# --- stimulus voicing ------------------------------------------------------
+# Session 1 (M01) rated the stimulus 9/10 for discomfort — "the constant beep
+# really irritated me" — and showed no 10 Hz entrainment. A subject bracing
+# against a buzzer is not going to entrain, so comfort is a prerequisite for
+# the effect, not a nicety. Three things were wrong: a bare sine at 440 Hz sits
+# in a bright, piercing region; 100% modulation depth chops the sound on and
+# off; and it started at full level instantly.
+TIMBRES = [
+    ("Soft tone", "soft"),      # harmonic-rich, organ-like — warm, not piercing
+    ("Warm noise", "noise"),    # filtered noise, like distant rain
+    ("Pure tone", "pure"),      # the original bare sine, kept for comparison
+]
+DEFAULT_TIMBRE = "soft"
+# 40% depth still drives the auditory steady-state response but is far easier
+# to sit with than the 100% on/off chopping used in session 1.
+DEFAULT_MOD_DEPTH = 0.40
+ONSET_SECONDS = 2.5             # gentle fade-in instead of a hard start
+
 
 class BinauralPlayer:
     """Phase-continuous stereo sine generator (left = base, right = base+beat)."""
@@ -102,6 +120,9 @@ class BinauralPlayer:
         self.right_freq = 210.0         # right ear tone (binaural)
         self.am_left = 10.0             # left-ear modulation rate (AM mode)
         self.am_right = 10.0            # right-ear modulation rate (AM mode)
+        self.timbre = DEFAULT_TIMBRE
+        self.mod_depth = DEFAULT_MOD_DEPTH
+        self._carrier_zi = np.zeros(1)  # noise-carrier filter state
         # Ramped gains (current -> target) for click-free changes.
         self._gain = self._t_gain = 0.0
         self._rough = self._t_rough = 0.0
@@ -119,6 +140,36 @@ class BinauralPlayer:
     def _ramp(self, current, target, n):
         return np.linspace(current, target, n, endpoint=False)
 
+    def _carrier(self, idx, n):
+        """The sound being modulated, per timbre.
+
+        ``soft`` adds a fifth and an octave above the fundamental at falling
+        amplitude. Laptop speakers roll off badly in the low end, so the
+        partials also let a warm, low-sounding tone survive a small driver:
+        the upper harmonics carry the timbre while the ear still hears the
+        fundamental. ``noise`` low-passes white noise into something like
+        distant rain, which is the least fatiguing option over minutes.
+        """
+        phase = self._phase_l
+        w = 2 * np.pi * self.left_freq / SAMPLE_RATE
+        if self.timbre == "noise":
+            white = np.random.randn(n)
+            out, self._carrier_zi = lfilter([0.08], [1, -0.92], white,
+                                            zi=self._carrier_zi)
+            return np.clip(out * 2.2, -1.0, 1.0)
+        if self.timbre == "soft":
+            # Strictly integer harmonics. A non-integer partial (a musical
+            # fifth at 1.5x) beats against the fundamental at 0.5x — 110 Hz of
+            # roughness for a 220 Hz carrier, which is the very harshness this
+            # timbre exists to avoid. 2x and 3x share the fundamental's period
+            # and simply thicken the tone.
+            base = phase + w * idx
+            return (np.sin(base)
+                    + 0.35 * np.sin(2.0 * base)     # octave
+                    + 0.15 * np.sin(3.0 * base)     # twelfth
+                    ) / 1.50
+        return np.sin(phase + w * idx)
+
     def _callback(self, outdata, frames, time_info, status):
         n = frames
         idx = np.arange(n)
@@ -130,40 +181,62 @@ class BinauralPlayer:
         if self.mode == "monaural_am":
             # Shared carrier (base), amplitude-modulated at each ear's own rate
             # -> more lateralized drive for interhemispheric heterodyning.
-            carrier = np.sin(self._phase_l + wl * idx)
+            carrier = self._carrier(idx, n)
             waml = 2 * np.pi * self.am_left / SAMPLE_RATE
             wamr = 2 * np.pi * self.am_right / SAMPLE_RATE
-            env_l = 0.5 + 0.5 * np.sin(self._phase_aml + waml * idx)
-            env_r = 0.5 + 0.5 * np.sin(self._phase_amr + wamr * idx)
+            # Envelope swings between (1 - depth) and 1 rather than 0 and 1, so
+            # the rhythm is clearly present without the sound cutting out.
+            d = float(np.clip(self.mod_depth, 0.0, 1.0))
+            env_l = (1.0 - d) + d * (0.5 + 0.5 * np.sin(self._phase_aml + waml * idx))
+            env_r = (1.0 - d) + d * (0.5 + 0.5 * np.sin(self._phase_amr + wamr * idx))
             core_l = carrier * env_l
             core_r = carrier * env_r
             self._phase_r = (self._phase_r + wr * n) % (2 * np.pi)  # keep advancing
             self._phase_aml = (self._phase_aml + waml * n) % (2 * np.pi)
             self._phase_amr = (self._phase_amr + wamr * n) % (2 * np.pi)
         else:
+            # Binaural: each ear needs its own frequency, so the harmonic/noise
+            # voicings (which share one carrier) don't apply here.
             core_l = np.sin(self._phase_l + wl * idx)
             core_r = np.sin(self._phase_r + wr * idx)
             self._phase_r = (self._phase_r + wr * n) % (2 * np.pi)
-        rough = np.sin(self._phase_rough + wrough * idx)
-        reward = np.sin(self._phase_reward + wreward * idx)
+        # Phases advance whether or not the layer is audible, so switching a
+        # layer on never produces a click.
         self._phase_l = (self._phase_l + wl * n) % (2 * np.pi)
         self._phase_rough = (self._phase_rough + wrough * n) % (2 * np.pi)
         self._phase_reward = (self._phase_reward + wreward * n) % (2 * np.pi)
 
-        # Brown-ish noise bed: one-pole lowpass of white noise (state carried).
-        # Scaled to sit under the tones without hard-clipping the summed output.
-        white = np.random.randn(n)
-        noise, self._noise_zi = lfilter([0.05], [1, -0.95], white, zi=self._noise_zi)
-        noise *= 2.0
-
-        g_rough = self._ramp(self._rough, self._t_rough, n)
-        g_noise = self._ramp(self._noise, self._t_noise, n)
-        g_reward = self._ramp(self._reward, self._t_reward, n)
         g_master = self._ramp(self._gain, self._t_gain, n)
-        self._rough, self._noise = self._t_rough, self._t_noise
-        self._reward, self._gain = self._t_reward, self._t_gain
+        self._gain = self._t_gain
 
-        shared = rough * g_rough + reward * g_reward + noise * g_noise
+        # Only synthesize a feedback layer when it is actually audible now or
+        # about to be. A plain tone (control block, open loop) previously still
+        # cost three extra oscillators plus a filtered noise generator on every
+        # callback; that work competes for the GIL with the GUI thread and is
+        # what made the tone catch and stutter.
+        shared = None
+
+        def _add(component, gain_now, gain_target):
+            nonlocal shared
+            if gain_now <= 0.0 and gain_target <= 0.0:
+                return
+            ramp = self._ramp(gain_now, gain_target, n)
+            shared = component * ramp if shared is None else shared + component * ramp
+
+        if self._rough > 0.0 or self._t_rough > 0.0:
+            _add(np.sin(self._phase_rough + wrough * idx), self._rough, self._t_rough)
+        if self._reward > 0.0 or self._t_reward > 0.0:
+            _add(np.sin(self._phase_reward + wreward * idx), self._reward, self._t_reward)
+        if self._noise > 0.0 or self._t_noise > 0.0:
+            white = np.random.randn(n)
+            noise, self._noise_zi = lfilter([0.05], [1, -0.95], white,
+                                            zi=self._noise_zi)
+            _add(noise * 2.0, self._noise, self._t_noise)
+
+        self._rough, self._noise = self._t_rough, self._t_noise
+        self._reward = self._t_reward
+        if shared is None:
+            shared = 0.0
         left = np.clip((core_l + shared) * g_master, -1.0, 1.0)
         right = np.clip((core_r + shared) * g_master, -1.0, 1.0)
         outdata[:, 0] = left.astype(np.float32)
@@ -175,6 +248,12 @@ class BinauralPlayer:
 
     def set_mode(self, mode):
         self.mode = "monaural_am" if mode == "monaural_am" else "binaural"
+
+    def set_timbre(self, timbre):
+        self.timbre = timbre if timbre in {t for _, t in TIMBRES} else DEFAULT_TIMBRE
+
+    def set_mod_depth(self, depth):
+        self.mod_depth = float(np.clip(depth, 0.0, 1.0))
 
     def set_am_freqs(self, left_hz, right_hz):
         self.am_left = float(left_hz)
@@ -200,9 +279,15 @@ class BinauralPlayer:
         if self._stream is None:
             import sounddevice as sd
 
+            # A large block buys scheduling slack, and latency simply does not
+            # matter for a continuous tone: nothing is triggered by it and
+            # nobody is playing along. At 1024 frames the callback had ~23 ms to
+            # run before an underrun clicked — easily lost when the GUI thread
+            # holds the GIL through a plot redraw or a spectral update. 4096
+            # frames raises that to ~93 ms.
             self._stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE, channels=2, dtype="float32",
-                blocksize=1024, callback=self._callback,
+                blocksize=4096, latency="high", callback=self._callback,
             )
             self._stream.start()
 
@@ -324,6 +409,48 @@ class BinauralPanel(QGroupBox):
         transport.addStretch()
         grid.addLayout(transport, 4, 0, 1, 3)
 
+        voice = QHBoxLayout()
+        voice.addWidget(QLabel("Timbre"))
+        self.timbre_combo = QComboBox()
+        for label, value in TIMBRES:
+            self.timbre_combo.addItem(label, value)
+        self.timbre_combo.setToolTip(
+            "How the stimulus sounds. Comfort matters for the result, not just "
+            "for politeness: a subject bracing against a harsh sound is not "
+            "going to entrain to it.\n\n"
+            "Soft tone — a fundamental with a fifth and octave above it; warm "
+            "and organ-like, and it carries better on small laptop speakers.\n"
+            "Warm noise — filtered noise, like distant rain. Least fatiguing "
+            "over several minutes.\n"
+            "Pure tone — a bare sine. Thin and piercing; kept for comparison "
+            "with earlier sessions."
+        )
+        self.timbre_combo.activated.connect(lambda _i: self._apply_params(log=True))
+        voice.addWidget(self.timbre_combo, stretch=1)
+
+        voice.addWidget(QLabel("Depth"))
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setRange(10, 100)
+        self.depth_spin.setSuffix(" %")
+        self.depth_spin.setValue(int(DEFAULT_MOD_DEPTH * 100))
+        self.depth_spin.setToolTip(
+            "How deeply the pulse modulates the sound.\n\n"
+            "100% switches it fully on and off — the strongest drive, but it "
+            "chops and quickly becomes irritating. Around 40% keeps the rhythm "
+            "clearly audible while staying comfortable for several minutes, "
+            "which is the trade this project needs."
+        )
+        self.depth_spin.valueChanged.connect(lambda _v: self._apply_params(log=False))
+        voice.addWidget(self.depth_spin)
+
+        self.preview_btn = QPushButton("Preview 8s")
+        self.preview_btn.setToolTip(
+            "Audition the current stimulus for eight seconds before committing "
+            "someone to a whole session with it.")
+        self.preview_btn.clicked.connect(self.on_preview)
+        voice.addWidget(self.preview_btn)
+        grid.addLayout(voice, 5, 0, 1, 3)
+
         fb = QHBoxLayout()
         fb.addWidget(QLabel("Feedback"))
         self.feedback_combo = QComboBox()
@@ -342,7 +469,7 @@ class BinauralPanel(QGroupBox):
         self.feedback_combo.activated.connect(
             lambda _i: self._emit_event("feedback_mode"))
         fb.addWidget(self.feedback_combo, stretch=1)
-        grid.addLayout(fb, 5, 0, 1, 3)
+        grid.addLayout(fb, 6, 0, 1, 3)
 
         presets = QHBoxLayout()
         presets.addWidget(QLabel("Preset"))
@@ -358,7 +485,7 @@ class BinauralPanel(QGroupBox):
         self.del_btn.clicked.connect(self._on_delete_preset)
         self.del_btn.setToolTip("Delete the selected preset.")
         presets.addWidget(self.del_btn)
-        grid.addLayout(presets, 6, 0, 1, 3)
+        grid.addLayout(presets, 7, 0, 1, 3)
 
         # Live updates (glide the audio) vs committed events (log to CSV).
         self.base_slider.valueChanged.connect(self.base_spin.setValue)
@@ -387,6 +514,8 @@ class BinauralPanel(QGroupBox):
 
     def _apply_params(self, log=True):
         p = self._params()
+        self.player.set_timbre(self.timbre_combo.currentData())
+        self.player.set_mod_depth(self.depth_spin.value() / 100.0)
         if self.stimulus_combo.currentData() == "monaural_am":
             self.player.set_mode("monaural_am")
             self.player.set_frequencies(p["base_hz"], p["base_hz"])  # shared carrier
@@ -455,19 +584,67 @@ class BinauralPanel(QGroupBox):
     def is_closed_loop(self):
         return self.loop_check.isChecked()
 
-    def protocol_audio_on(self, base, beat, closed_loop=False, mode="binaural"):
+    def set_voicing(self, timbre=None, depth=None):
+        """Point the timbre/depth controls at a protocol's chosen voicing.
+
+        The widgets are updated so the panel keeps showing what the subject is
+        actually hearing, but the values are also pushed to the player directly:
+        setting a combo index in code does not emit ``activated``, and setting a
+        spin box to the value it already holds emits nothing at all, so relying
+        on the signals would silently skip the change.
+        """
+        if timbre:
+            idx = self.timbre_combo.findData(timbre)
+            if idx >= 0:
+                self.timbre_combo.setCurrentIndex(idx)
+            self.player.set_timbre(timbre)
+        if depth:
+            self.depth_spin.setValue(int(round(float(depth) * 100)))
+            self.player.set_mod_depth(float(depth))
+
+    def protocol_audio_on(self, base, beat, closed_loop=False, mode="binaural",
+                          timbre=None, depth=None):
         """Set tone and start playback (used by the guided protocol runner)."""
         idx = self.stimulus_combo.findData(mode)
         if idx >= 0:
             self.stimulus_combo.setCurrentIndex(idx)
+        self.set_voicing(timbre, depth)
         self.base_spin.setValue(int(base))
         self.beat_spin.setValue(int(beat))
         self._apply_params(log=False)
         self.loop_check.setChecked(bool(closed_loop))
         if not self.player.is_playing():
             self.on_play_toggle()
+            self.fade_in()      # never start a subject at full level
 
-    def protocol_control_tone(self, base):
+    def on_preview(self):
+        """Play the current stimulus briefly so it can be judged before use."""
+        was_playing = self.player.is_playing()
+        if not was_playing:
+            self._apply_params(log=False)
+            self.player.set_volume(self._volume)
+            try:
+                self.player.play()
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(self, "Audio error", str(exc))
+                return
+            self.fade_in()
+            QTimer.singleShot(8000, self.fade_out)
+            self._emit_event("preview")
+
+    def fade_in(self, seconds=ONSET_SECONDS):
+        """Bring the tone up gently — a stimulus that starts at full level is
+        startling, and the first seconds set how the whole session feels."""
+        self._fade_timer.stop()
+        self._fading = False
+        self._fade_dir = 1
+        self._fade_steps = max(1, int(seconds / 0.05))
+        self._fade_i = 0
+        self._fade_g0 = self._volume * self._duck * MAX_AMPLITUDE
+        self.player.set_master_gain(0.0)
+        self._fade_timer.start(50)
+
+    def protocol_control_tone(self, base, timbre=None, depth=None):
         """Identical tone in both ears — a matched control with no beat.
 
         Same carrier, same loudness, same "there is a sound" experience, but no
@@ -477,6 +654,7 @@ class BinauralPanel(QGroupBox):
         idx = self.stimulus_combo.findData("binaural")
         if idx >= 0:
             self.stimulus_combo.setCurrentIndex(idx)
+        self.set_voicing(timbre, depth)
         self.loop_check.setChecked(False)
         self.base_spin.setValue(int(base))
         self.player.set_mode("binaural")
@@ -484,6 +662,7 @@ class BinauralPanel(QGroupBox):
         self.readout.setText(f"Control tone — {int(base)} Hz both ears (no beat)")
         if not self.player.is_playing():
             self.on_play_toggle()
+            self.fade_in()
         else:
             self._push_volume()
         self._emit_event("control_tone")
@@ -499,6 +678,7 @@ class BinauralPanel(QGroupBox):
         if not self.player.is_playing() or self._fading:
             return
         self._fading = True
+        self._fade_dir = -1
         self._fade_steps = max(1, int(seconds / 0.05))
         self._fade_i = 0
         self._fade_g0 = self.player._t_gain   # current master gain
@@ -506,7 +686,14 @@ class BinauralPanel(QGroupBox):
 
     def _fade_step(self):
         self._fade_i += 1
-        frac = 1.0 - self._fade_i / self._fade_steps
+        progress = min(1.0, self._fade_i / self._fade_steps)
+        if getattr(self, "_fade_dir", -1) > 0:          # fading in
+            self.player.set_master_gain(self._fade_g0 * progress)
+            if progress >= 1.0:
+                self._fade_timer.stop()
+                self._fading = False
+            return
+        frac = 1.0 - progress
         if frac <= 0:
             self._fade_timer.stop()
             self._fading = False

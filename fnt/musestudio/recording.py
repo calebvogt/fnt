@@ -22,6 +22,7 @@ recording starts the log already contains the lead-up (scan, connect, …).
 
 import json
 import os
+from collections import deque
 from datetime import datetime
 
 FOLDER_SUFFIX = "FNT_MuseStudio_recording"
@@ -30,9 +31,14 @@ FOLDER_SUFFIX = "FNT_MuseStudio_recording"
 class RecordingSession:
     """Creates and exposes the per-recording directory tree."""
 
-    def __init__(self, base_dir):
+    def __init__(self, base_dir, subject=""):
+        """``subject`` is folded into the folder name when given, so a
+        recording identifies its subject on the filesystem alone — no need to
+        open a config file to know whose night or session this was."""
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        self.name = f"{stamp}_{FOLDER_SUFFIX}"
+        self.subject = subject or ""
+        parts = [stamp] + ([self.subject] if self.subject else []) + [FOLDER_SUFFIX]
+        self.name = "_".join(parts)
         self.root = os.path.join(base_dir, self.name)
         self.data_dir = os.path.join(self.root, "Data")
         self.muse_dir = os.path.join(self.data_dir, "Muse")
@@ -55,8 +61,13 @@ class RecordingSession:
 class SessionLogger:
     """Timestamped GUI-action log with a pre-recording in-memory buffer."""
 
+    # Bounded so an all-night recording can't grow this without limit. Once the
+    # file is open every line goes straight to disk anyway; the buffer only
+    # exists to hold the pre-recording lead-up.
+    MAX_BUFFERED = 5000
+
     def __init__(self):
-        self._events = []       # buffered lines (ms-stamped)
+        self._events = deque(maxlen=self.MAX_BUFFERED)
         self._file = None
 
     def log(self, text):

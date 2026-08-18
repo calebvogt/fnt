@@ -39,6 +39,8 @@ from PyQt5.QtGui import (
     QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent, QPainterPath,
 )
 
+from .ethogram import BEHAVIOR_COLORS
+
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
 
@@ -4970,7 +4972,8 @@ class MaskTrackerWindow(QMainWindow):
         self.list_track_results.setToolTip(
             "Completed videos with track counts and CSV output paths.\n"
             "Double-click a [proofreadable] row to review and repair track\n"
-            "identities; right-click for the output folder."
+            "identities. Right-click for the ethogram (when behavior\n"
+            "classification ran) or the output folder."
         )
         self.list_track_results.itemDoubleClicked.connect(self._on_result_double_clicked)
         self.list_track_results.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -7989,8 +7992,7 @@ class MaskTrackerWindow(QMainWindow):
         add_row.addWidget(btn_add)
         layout.addLayout(add_row)
 
-        colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
-                  "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+        colors = list(BEHAVIOR_COLORS)
 
         def _add():
             name = txt_new.text().strip()
@@ -8095,8 +8097,7 @@ class MaskTrackerWindow(QMainWindow):
         if not ok or not name.strip():
             return
         name = name.strip()
-        colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
-                  "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+        colors = list(BEHAVIOR_COLORS)
         color = colors[self.list_cls_categories.count() % len(colors)]
         item = QListWidgetItem(f"● {name}")
         item.setForeground(QColor(color))
@@ -8779,8 +8780,7 @@ class MaskTrackerWindow(QMainWindow):
             new_names = set(behaviors)
             if not self._check_and_reset_clips_for_removed_behaviors(new_names):
                 return True
-            colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
-                      "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+            colors = list(BEHAVIOR_COLORS)
             self.list_cls_categories.clear()
             for i, name in enumerate(behaviors):
                 color = colors[i % len(colors)]
@@ -8800,8 +8800,7 @@ class MaskTrackerWindow(QMainWindow):
             if not ok or not name.strip():
                 return True
             name = name.strip()
-            colors = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
-                      "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+            colors = list(BEHAVIOR_COLORS)
             color = colors[self.list_cls_categories.count() % len(colors)]
             item = QListWidgetItem(f"● {name}")
             item.setForeground(QColor(color))
@@ -9100,8 +9099,7 @@ class MaskTrackerWindow(QMainWindow):
         self.list_clip_queue.setSortingEnabled(False)
         self.list_clip_queue.clear()
 
-        colors_default = ["#e53935", "#43a047", "#1e88e5", "#fb8c00",
-                          "#8e24aa", "#00acc1", "#ffb300", "#6d4c41"]
+        colors_default = list(BEHAVIOR_COLORS)
         seen_behaviors = {}
 
         for idx, (clip_dir, meta) in enumerate(saved_clips):
@@ -10892,12 +10890,48 @@ class MaskTrackerWindow(QMainWindow):
         if not h5:
             act_proof.setEnabled(False)
             act_proof.setText("Proofread Tracks (no saved masks)")
+
+        act_etho = menu.addAction("Open Ethogram…")
+        beh_csv = self._behavior_csv_for_result(item)
+        if not beh_csv:
+            act_etho.setEnabled(False)
+            act_etho.setText("Open Ethogram (no behavior predictions)")
+
+        menu.addSeparator()
         act_open = menu.addAction("Open Output Folder")
         action = menu.exec_(self.list_track_results.viewport().mapToGlobal(pos))
         if action == act_proof and h5:
             self._open_proofreader(h5)
+        elif action == act_etho and beh_csv:
+            self._open_ethogram(beh_csv, h5)
         elif action == act_open:
             self._open_tracking_result(item)
+
+    def _behavior_csv_for_result(self, item) -> Optional[str]:
+        output_dir = item.data(Qt.UserRole)
+        if output_dir and os.path.isdir(output_dir):
+            p = os.path.join(output_dir, "behavior_predictions.csv")
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _open_ethogram(self, behavior_csv: str, tracks_h5: Optional[str] = None):
+        try:
+            from .ethogram import EthogramDialog
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Ethogram Unavailable",
+                f"Could not load the ethogram view:\n\n{e}"
+            )
+            return
+        try:
+            dlg = EthogramDialog(behavior_csv, tracks_h5, parent=self)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Could Not Open Ethogram", f"{behavior_csv}\n\n{e}"
+            )
+            return
+        dlg.exec_()
 
     def _open_proofreader(self, tracks_h5: str):
         try:

@@ -37,6 +37,7 @@ class BandMetrics:
     alpha_asym: float = 0.0                            # ln(AF8 alpha) - ln(AF7 alpha)
     dominant: str = ""
     contact_ok: bool = False
+    contact_per_channel: dict = field(default_factory=dict)   # {channel: bool}
 
 
 @dataclass
@@ -135,8 +136,9 @@ class BandPowerAnalyzer(QObject):
 
         # Judged on high-passed data — raw Muse EEG has a large DC offset, so a
         # peak-to-peak test on the raw signal rejects even good electrodes.
-        contact_ok = all(contact_quality(a, self._fs, ARTIFACT_P2P_UV)
-                         for a in arrays.values())
+        per_channel = {n: contact_quality(a, self._fs, ARTIFACT_P2P_UV)
+                       for n, a in arrays.items()}
+        contact_ok = all(per_channel.values())
 
         absolute, relative = {}, {}
         for name, x in arrays.items():
@@ -173,6 +175,7 @@ class BandPowerAnalyzer(QObject):
         self.updated.emit(BandMetrics(
             relative=relative, absolute=absolute, mean_relative=mean_rel,
             alpha_asym=asym, dominant=dominant, contact_ok=contact_ok,
+            contact_per_channel=per_channel,
         ))
 
 

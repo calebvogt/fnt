@@ -39,6 +39,9 @@ class ReviewPanel(QWidget):
         self._band_times = None
         self._band_series = None
         self._spec_fmax = 50.0
+        self._spec = None            # (n_freqs, n_times) dB, for hover
+        self._spec_times = np.array([])
+        self._spec_freqs = np.array([])
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 8, 6, 6)
@@ -106,6 +109,32 @@ class ReviewPanel(QWidget):
         # One shared time axis: scrubbing one plot scrubs all three.
         self.band_plot.setXLink(self.spec_plot)
         self.sync_plot.setXLink(self.spec_plot)
+        # Shared crosshair + numeric readout. The three plots are x-linked, so
+        # one cursor position describes all of them at once: the point of the
+        # readout is to turn "the lines moved around here" into actual numbers.
+        self._cursor_lines = []
+        for plot in (self.spec_plot, self.band_plot, self.sync_plot):
+            line = pg.InfiniteLine(angle=90, movable=False,
+                                   pen=pg.mkPen(theme.TEXT_FAINT, width=1))
+            line.setZValue(100)
+            line.hide()
+            plot.addItem(line, ignoreBounds=True)
+            self._cursor_lines.append(line)
+        self.glw.scene().sigMouseMoved.connect(self._on_hover)
+
+        self.readout = QLabel("Hover a plot to read values at that moment")
+        self.readout.setStyleSheet(
+            f"color: {theme.TEXT}; background: {theme.SURFACE_HI}; "
+            f"border: 1px solid {theme.BORDER}; border-radius: 6px; padding: 6px;")
+        self.readout.setWordWrap(True)
+        self.readout.setToolTip(
+            "Values under the cursor.\n\n"
+            "Spectrogram: power in dB at that time and frequency — brighter is "
+            "stronger, and a steady horizontal band near 10 Hz is an alpha rhythm.\n"
+            "Bands: each band's share of total power (they sum to 1).\n"
+            "PLV: interhemispheric phase locking, 0 = independent, 1 = locked."
+        )
+
         split.addWidget(self.glw)
 
         self.table = QTableWidget(0, 7)
@@ -121,6 +150,7 @@ class ReviewPanel(QWidget):
             "Per-phase means. Δ columns compare each phase against the baseline "
             "phase — that is the number that says whether the protocol moved you."
         )
+        split.addWidget(self.readout)
         split.addWidget(self.table)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
@@ -128,6 +158,53 @@ class ReviewPanel(QWidget):
         root.addWidget(split, stretch=1)
 
         self._phase_items = []
+
+    def _on_hover(self, pos):
+        """Report every series' value at the hovered instant."""
+        if self.data is None:
+            return
+        plot = next((p for p in (self.spec_plot, self.band_plot, self.sync_plot)
+                     if p.sceneBoundingRect().contains(pos)), None)
+        if plot is None:
+            for line in self._cursor_lines:
+                line.hide()
+            return
+        point = plot.vb.mapSceneToView(pos)
+        t = float(point.x())
+        for line in self._cursor_lines:
+            line.setPos(t)
+            line.show()
+
+        bits = [f"<b>t = {t:.1f}s</b>"]
+        phase = next((n for n, a, b in phase_intervals(self.data) if a <= t < b), None)
+        if phase:
+            bits.append(f"phase <b>{phase}</b>")
+
+        # Spectrogram: report the frequency actually under the pointer.
+        if plot is self.spec_plot and self._spec is not None and len(self._spec_times):
+            hz = float(point.y())
+            ti = int(np.clip(np.searchsorted(self._spec_times, t), 0,
+                             self._spec.shape[1] - 1))
+            fi = int(np.clip(np.searchsorted(self._spec_freqs, hz), 0,
+                             self._spec.shape[0] - 1))
+            bits.append(f"{self._spec_freqs[fi]:.1f} Hz = "
+                        f"{self._spec[fi, ti]:.1f} dB")
+
+        if self._band_times is not None and len(self._band_times):
+            i = int(np.clip(np.searchsorted(self._band_times, t), 0,
+                            len(self._band_times) - 1))
+            bands = "  ".join(
+                f"<span style='color:{theme.band_color(b)}'>{b} "
+                f"{self._band_series[b][i]:.2f}</span>" for b in BAND_ORDER)
+            bits.append(bands)
+
+        d = self.data
+        if d.synchrony is not None and "plv_combined" in d.synchrony and len(d.synchrony):
+            st = d.synchrony["lsl_timestamp"].to_numpy(dtype=float) - d.t0
+            i = int(np.clip(np.searchsorted(st, t), 0, len(st) - 1))
+            bits.append(f"PLV {d.synchrony['plv_combined'].to_numpy(float)[i]:.3f}")
+
+        self.readout.setText("&nbsp;&nbsp;·&nbsp;&nbsp;".join(bits))
 
     def _apply_colormap(self):
         for name in ("viridis", "inferno", "magma", "CET-L9"):
@@ -167,6 +244,7 @@ class ReviewPanel(QWidget):
         idx = self.channel_combo.currentData() or 0
         times, freqs, spec, series = analyze_eeg(d, idx)
         self._band_times, self._band_series = times, series
+        self._spec, self._spec_times, self._spec_freqs = spec, times, freqs
         # Phase labels are placed relative to the spectrogram's top, so the
         # frequency range has to be known before the phases are drawn.
         self._spec_fmax = float(freqs[-1]) if len(freqs) else 50.0
@@ -269,6 +347,9 @@ class ReviewPanel(QWidget):
 
     def _set_summary(self, d, rows):
         bits = []
+        subj = (d.config.get("subject") or {})
+        if subj.get("id"):
+            bits.append(f"subject {subj['id']}")
         proto = d.config.get("protocol") or d.config.get("mode") or "free recording"
         bits.append(f"{proto}")
         if d.duration:

@@ -29,9 +29,27 @@ class Phase:
     # Spoken version. Written for listening, not reading — no "click", no line
     # breaks, and it says how long the phase lasts since you can't see the timer.
     speech: str = ""
+    # What the eyes are doing: "fixate" (open, show a fixation target),
+    # "closed" (dim the screen), or "" to infer it from the text.
+    gaze: str = ""
 
     def spoken(self):
         return self.speech or self.instruction.replace("\n", " ")
+
+    def gaze_mode(self):
+        """Whether this phase wants a fixation target or a dark screen.
+
+        Inferred from the wording when not set explicitly, so protocols written
+        before this existed behave correctly without edits.
+        """
+        if self.gaze:
+            return self.gaze
+        text = f"{self.instruction} {self.speech}".lower()
+        if "eyes open" in text or "keep your eyes open" in text:
+            return "fixate"
+        if "close your eyes" in text or "eyes closed" in text:
+            return "closed"
+        return ""
 
 
 @dataclass
@@ -371,8 +389,100 @@ def _hemisync_probe_s():
     )
 
 
-PROTOCOLS = {p.key: p for p in [_hemisync_probe_a(), _hemisync_probe_s(),
-                                _binaural_10min(), _heterodyne()]}
+def _hemisync_probe_quick():
+    """5-minute relaxation-oriented probe — the default for a new person.
+
+    Tuned after session 1, where the subject rated discomfort 9/10 and showed
+    no entrainment at all. The lesson was that comfort is a precondition for
+    the effect rather than a courtesy, so this version uses the soft harmonic
+    timbre at 40% modulation depth, a 220 Hz carrier (warm rather than the
+    piercing 440 Hz), and a gentle fade into every tone.
+
+    It still carries all three of Probe S's controls — eyes-open baseline,
+    matched unmodulated control tone, closing rest block — so results remain
+    directly comparable with the 9-minute runs. The trade is statistical: about
+    half the analysis windows per block, so only larger effects will clear the
+    noise. Get someone through this comfortably first; run the long version
+    when something looks worth pinning down.
+    """
+    return Protocol(
+        key="probe_quick",
+        name="Relax + Hemi-Sync  (speakers, 5 min)",
+        description=("Short, comfortable controlled probe: eyes-open → settle → "
+                     "control tone → 10 Hz AM → rest. Soft timbre, 40% depth."),
+        phases=[
+            Phase(
+                "Set up",
+                "No headphones needed — this uses the laptop speakers.\n\n"
+                "A soft tone is playing: set the volume comfortable-but-clear, "
+                "sit at arm's length, then Continue.",
+                None,
+                actions=["audio_control"],
+                params={"base": 220, "timbre": "soft", "depth": 0.40},
+                speech="This session uses the laptop speakers. A steady tone is "
+                       "playing now. Set the volume so it is comfortable but "
+                       "clearly audible, and press continue when you are ready.",
+            ),
+            Phase(
+                "Eyes open",
+                "Eyes OPEN. Rest your gaze on one spot and stay still.",
+                40,
+                actions=["audio_off", "start_recording"],
+                speech="Block one. Keep your eyes open, rest your gaze on one "
+                       "spot, and stay still for forty seconds.",
+            ),
+            Phase(
+                "Eyes closed rest",
+                "Now CLOSE your eyes and rest. No sound this block.",
+                60,
+                actions=["calibrate"],
+                speech="Block two. Close your eyes and let yourself settle. "
+                       "Breathe normally. One minute of quiet.",
+            ),
+            Phase(
+                "Control tone",
+                "Eyes closed. The same soft tone, steady — no pulse.",
+                70,
+                actions=["audio_control"],
+                params={"base": 220, "timbre": "soft", "depth": 0.40},
+                speech="Block three. Keep your eyes closed. A steady tone is "
+                       "starting now.",
+            ),
+            Phase(
+                "AM tone 10 Hz",
+                "Eyes closed. The same tone, now pulsing at 10 Hz.",
+                90,
+                actions=["audio_on"],
+                params={"base": 220, "beat": 10, "closed_loop": False,
+                        "mode": "monaural_am", "timbre": "soft",
+                        "depth": 0.40},
+                speech="Block four. A slow pulse is fading into the tone. "
+                       "Keep your eyes closed, let your breathing settle, and "
+                       "let the pulse carry you.",
+            ),
+            Phase(
+                "Rest again",
+                "Eyes closed, sound fading. Rest as in block two.",
+                40,
+                actions=["audio_fade_out"],
+                speech="Block five. The sound is fading. Keep your eyes closed "
+                       "and rest for a final forty seconds.",
+            ),
+            Phase(
+                "Done",
+                "Done. Open your eyes — a short questionnaire follows.",
+                None,
+                actions=["stop_recording"],
+                speech="All done. You can open your eyes. There is a short "
+                       "questionnaire on screen.",
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_hemisync_probe_quick(), _hemisync_probe_a(),
+                                _hemisync_probe_s(), _binaural_10min(),
+                                _heterodyne()]}
 
 
 class ProtocolRunner(QObject):
