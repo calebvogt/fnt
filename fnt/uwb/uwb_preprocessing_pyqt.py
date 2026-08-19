@@ -18,7 +18,11 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.patches import (Polygon as MplPolygon, Patch,
+                                Rectangle as MplRectangle)
+from matplotlib.lines import Line2D
+from matplotlib.colors import ListedColormap
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg, NavigationToolbar2QT)
 from scipy.signal import savgol_filter
@@ -601,6 +605,86 @@ class PreviewChunkLoader(QThread):
             self.failed.emit(self.chunk_index, str(e))
 
 
+class InheritSettingsDialog(QDialog):
+    """Offer to copy the analysis settings from a trial already in the queue.
+
+    Shown when a database is loaded while the batch queue is non-empty. Copies
+    only the settings that describe HOW a trial is analysed; everything that
+    describes WHICH trial it is - the tag selection, the identities and their
+    active windows, the background image, the arena geometry, the day list -
+    stays with the newly loaded database.
+    """
+
+    def __init__(self, items, new_db_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Apply Settings From a Queued Trial?")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout()
+
+        head = QLabel(
+            f"<b>{new_db_name}</b> was just loaded. Copy the tracking and "
+            f"export settings from a trial already in the queue?")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+
+        detail = QLabel(
+            "Copies: filtering and smoothing, behaviour-detection thresholds, "
+            "the tracking XY range, timezone, every export checkbox, the plot "
+            "selection and the animation settings.\n\n"
+            "Keeps this trial's own: tag selection, identities and their "
+            "start/stop windows, background image and alignment, arena "
+            "geometry, and the per-day animation list.")
+        detail.setWordWrap(True)
+        detail.setStyleSheet("color:#9fb3c8; font-size: 11px;")
+        layout.addWidget(detail)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Copy from:"))
+        self.combo = QComboBox()
+        for i, it in enumerate(items, 1):
+            cfg = it.get('config') or {}
+            bits = []
+            sm = (cfg.get('preview') or {}).get('smoothing') or cfg.get('smoothing_method')
+            if sm and sm != "None":
+                bits.append(sm.replace("Forward-Backward Exponentially Weighted "
+                                       "Moving Average", "EWMA"))
+            for key, tag in (('export_raw_csv', 'raw'),
+                             ('proximity_detection', 'prox'),
+                             ('export_gbi', 'GBI'),
+                             ('export_edgelist', 'EL'),
+                             ('export_behavior_events', 'behav'),
+                             ('save_plots', 'plots'),
+                             ('save_animation', 'anim')):
+                if cfg.get(key):
+                    bits.append(tag)
+            self.combo.addItem(
+                f"{i}. {os.path.basename(it['path'])}  ({', '.join(bits) or 'defaults'})",
+                i - 1)
+        # Most recent first is the usual intent when queueing a run of trials.
+        self.combo.setCurrentIndex(self.combo.count() - 1)
+        row.addWidget(self.combo, 1)
+        layout.addLayout(row)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        btn_skip = QPushButton("Keep This Trial's Settings")
+        btn_skip.clicked.connect(self.reject)
+        buttons.addWidget(btn_skip)
+        btn_apply = QPushButton("Apply Settings")
+        btn_apply.setDefault(True)
+        btn_apply.setStyleSheet(
+            "QPushButton { background-color: #2ea043; color: white; "
+            "padding: 6px 14px; font-weight: bold; }")
+        btn_apply.clicked.connect(self.accept)
+        buttons.addWidget(btn_apply)
+        layout.addLayout(buttons)
+
+        self.setLayout(layout)
+
+    def chosen_index(self):
+        return self.combo.currentData()
+
+
 class ExportConflictDialog(QDialog):
     """Dialog shown when export would overwrite existing files.
     Shows categorized lists of conflicting and new files."""
@@ -807,84 +891,154 @@ class PlotLayersDialog(QDialog):
 
 
 class IdentityAssignmentDialog(QDialog):
-    """Dialog for assigning sex, custom identities, and active time windows to tags"""
-    def __init__(self, available_tags, existing_identities=None, tag_time_ranges=None, parent=None):
+    """Assign sex, identity and an optional active time window to each tag.
+
+    The Start/Stop pickers TRIM the data: fixes outside a bound window are
+    dropped from the preview and from every export. Each bound therefore has an
+    explicit mode:
+
+      * FOLLOW DATA (default) - the bound is not applied. The picker shows the
+        tag's observed first/last fix for information only.
+      * LIMIT TO - the bound is applied, at exactly the value shown.
+
+    That distinction exists because the pickers are pre-filled from the data's
+    own extent. Without it, simply opening this dialog and pressing OK armed a
+    hard trim at whatever the recording happened to reach that day - so a
+    database that grew afterwards (a trial still running, re-copied later) had
+    its new days silently discarded.
+    """
+
+    def __init__(self, available_tags, existing_identities=None, tag_time_ranges=None,
+                 parent=None):
         super().__init__(parent)
         self.available_tags = available_tags
         self.identities = existing_identities if existing_identities else {}
         self.tag_time_ranges = tag_time_ranges if tag_time_ranges else {}
         self.initUI()
 
+    @staticmethod
+    def _mode_of(info, which, default='auto'):
+        """'manual' or 'auto' for a bound, tolerating pre-flag configs.
+
+        A config written before the modes existed carries only the times. Those
+        are treated as MANUAL so an existing trial keeps exporting exactly what
+        it exported before - deliberate removals stay honoured. The rows for
+        such a tag are flagged in the dialog when the bound is cutting data, so
+        a stale one is visible rather than silent.
+        """
+        if not info:
+            return default
+        mode = info.get(f'{which}_mode')
+        if mode in ('auto', 'manual'):
+            return mode
+        return 'manual' if info.get(f'{which}_time') else default
+
     def initUI(self):
         self.setWindowTitle("Assign Tag Identities")
-        self.setMinimumWidth(700)
+        self.setMinimumWidth(860)
 
         layout = QVBoxLayout()
 
-        # Instructions
         instructions = QLabel(
-            "Assign sex (M/F), IDs, and active time windows. "
-            "To merge tags (e.g., lost tag replaced), assign the same ID to both tags."
-        )
+            "Assign sex (M/F) and IDs. To merge tags (e.g. a lost tag replaced), "
+            "give both the same ID.\n"
+            "<b>Start / Stop trim the data.</b> Leave a bound on "
+            "<i>Follow data</i> unless you actually want fixes outside it "
+            "discarded \u2014 tick <i>Limit to</i> only for a real deployment or "
+            "removal time.")
         instructions.setWordWrap(True)
+        instructions.setTextFormat(Qt.RichText)
         layout.addWidget(instructions)
 
-        # Form for each tag — placed inside a scroll area so a long tag list
-        # never pushes the OK/Cancel row off-screen (the row stays fixed below).
         form_layout = QFormLayout()
         self.sex_combos = {}
         self.identity_edits = {}
         self.start_edits = {}
         self.stop_edits = {}
+        self.start_modes = {}
+        self.stop_modes = {}
+        stale = []
 
         for tag in sorted(self.available_tags):
-            # Sex selection
+            info = self.identities.get(tag) or {}
+            tr = self.tag_time_ranges.get(tag) or {}
+
             sex_combo = QComboBox()
             sex_combo.addItems(["M", "F"])
-
-            # Identity text input
             identity_edit = QLineEdit()
             identity_edit.setPlaceholderText(f"e.g., {tag}")
 
-            # Start/Stop time pickers
-            start_edit = QDateTimeEdit()
-            start_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-            start_edit.setCalendarPopup(True)
-            stop_edit = QDateTimeEdit()
-            stop_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-            stop_edit.setCalendarPopup(True)
+            def _picker():
+                e = QDateTimeEdit()
+                e.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+                e.setCalendarPopup(True)
+                return e
 
-            # Set defaults from tag time ranges
-            if tag in self.tag_time_ranges:
-                tr = self.tag_time_ranges[tag]
-                start_edit.setDateTime(QDateTime.fromString(tr['start'], "yyyy-MM-dd HH:mm:ss"))
-                stop_edit.setDateTime(QDateTime.fromString(tr['end'], "yyyy-MM-dd HH:mm:ss"))
-                # Set min/max to observed range
-                start_edit.setMinimumDateTime(QDateTime.fromString(tr['start'], "yyyy-MM-dd HH:mm:ss"))
-                stop_edit.setMaximumDateTime(QDateTime.fromString(tr['end'], "yyyy-MM-dd HH:mm:ss"))
+            start_edit, stop_edit = _picker(), _picker()
 
-            # Load existing identity values if available
-            if tag in self.identities:
-                sex_idx = 0 if self.identities[tag].get('sex', 'M') == 'M' else 1
-                sex_combo.setCurrentIndex(sex_idx)
-                identity_edit.setText(self.identities[tag].get('identity', ''))
-                # Restore saved start/stop times
-                if 'start_time' in self.identities[tag]:
-                    dt = QDateTime.fromString(self.identities[tag]['start_time'], "yyyy-MM-dd HH:mm:ss")
+            # Seed from the observed range; a saved time overrides it below.
+            obs_start = QDateTime.fromString(tr.get('start', ''), "yyyy-MM-dd HH:mm:ss")
+            obs_stop = QDateTime.fromString(tr.get('end', ''), "yyyy-MM-dd HH:mm:ss")
+            if obs_start.isValid():
+                start_edit.setDateTime(obs_start)
+            if obs_stop.isValid():
+                stop_edit.setDateTime(obs_stop)
+
+            start_mode = self._mode_of(info, 'start')
+            stop_mode = self._mode_of(info, 'stop')
+
+            if info:
+                sex_combo.setCurrentIndex(0 if info.get('sex', 'M') == 'M' else 1)
+                identity_edit.setText(info.get('identity', ''))
+                # A manual bound keeps its saved value; an automatic one is
+                # re-seeded from the CURRENT data extent, so it can never go
+                # stale.
+                if start_mode == 'manual':
+                    dt = QDateTime.fromString(info.get('start_time', ''),
+                                              "yyyy-MM-dd HH:mm:ss")
                     if dt.isValid():
                         start_edit.setDateTime(dt)
-                if 'stop_time' in self.identities[tag]:
-                    dt = QDateTime.fromString(self.identities[tag]['stop_time'], "yyyy-MM-dd HH:mm:ss")
+                if stop_mode == 'manual':
+                    dt = QDateTime.fromString(info.get('stop_time', ''),
+                                              "yyyy-MM-dd HH:mm:ss")
                     if dt.isValid():
                         stop_edit.setDateTime(dt)
             else:
-                sex_combo.setCurrentIndex(-1)  # No default selection
-                identity_edit.setText("")  # Blank until user configures
+                sex_combo.setCurrentIndex(-1)
+                identity_edit.setText("")
 
-            # Layout: Sex + ID on first row, Start/Stop on second row
+            def _mode_combo(mode, tip):
+                c = QComboBox()
+                c.addItem("Follow data", "auto")
+                c.addItem("Limit to", "manual")
+                c.setCurrentIndex(1 if mode == 'manual' else 0)
+                c.setFixedWidth(96)
+                c.setToolTip(tip)
+                return c
+
+            start_combo = _mode_combo(
+                start_mode,
+                "Follow data: use the tag's first fix; nothing is trimmed.\n"
+                "Limit to: discard everything BEFORE the time shown.")
+            stop_combo = _mode_combo(
+                stop_mode,
+                "Follow data: use the tag's last fix; nothing is trimmed. Choose "
+                "this if the recording may still grow.\n"
+                "Limit to: discard everything AFTER the time shown - for an "
+                "animal actually removed or dead at that moment.")
+
+            def _wire(combo, edit):
+                def _sync():
+                    edit.setEnabled(combo.currentData() == 'manual')
+                combo.currentIndexChanged.connect(_sync)
+                _sync()
+            _wire(start_combo, start_edit)
+            _wire(stop_combo, stop_edit)
+
             tag_widget = QWidget()
             tag_vlayout = QVBoxLayout()
             tag_vlayout.setContentsMargins(0, 0, 0, 0)
+            tag_vlayout.setSpacing(2)
 
             row1 = QHBoxLayout()
             row1.addWidget(QLabel("Sex:"))
@@ -894,20 +1048,37 @@ class IdentityAssignmentDialog(QDialog):
             tag_vlayout.addLayout(row1)
 
             row2 = QHBoxLayout()
-            start_label = QLabel("Start:")
-            start_label.setFixedWidth(35)
-            row2.addWidget(start_label)
+            lbl = QLabel("Start:"); lbl.setFixedWidth(35)
+            row2.addWidget(lbl)
+            row2.addWidget(start_combo)
             row2.addWidget(start_edit, 1)
             row2.addSpacing(10)
-            stop_label = QLabel("Stop:")
-            stop_label.setFixedWidth(35)
-            row2.addWidget(stop_label)
+            lbl2 = QLabel("Stop:"); lbl2.setFixedWidth(35)
+            row2.addWidget(lbl2)
+            row2.addWidget(stop_combo)
             row2.addWidget(stop_edit, 1)
             tag_vlayout.addLayout(row2)
 
-            tag_widget.setLayout(tag_vlayout)
+            # What the data actually covers, so a bound can be judged against it.
+            if tr.get('start') and tr.get('end'):
+                hint = QLabel(f"data: {tr['start']} \u2192 {tr['end']}")
+                hint.setStyleSheet("color:#9fb3c8; font-size: 9px;")
+                # Flag a stop that is throwing days away - the stale-default case.
+                if stop_mode == 'manual':
+                    try:
+                        cut = ((pd.Timestamp(tr['end'])
+                                - pd.Timestamp(stop_edit.dateTime().toString(
+                                    "yyyy-MM-dd HH:mm:ss"))).total_seconds() / 86400.0)
+                    except Exception:
+                        cut = 0.0
+                    if cut > 0.5:
+                        hint.setText(f"data: {tr['start']} \u2192 {tr['end']}   "
+                                     f"\u26a0 Stop discards the last {cut:.1f} day(s)")
+                        hint.setStyleSheet("color:#e5c07b; font-size: 9px; font-weight: bold;")
+                        stale.append(tag)
+                tag_vlayout.addWidget(hint)
 
-            # Convert DEC to HEX for display
+            tag_widget.setLayout(tag_vlayout)
             hex_id = hex(tag).upper().replace('0X', '')
             form_layout.addRow(f"HexID {hex_id}:", tag_widget)
 
@@ -915,15 +1086,36 @@ class IdentityAssignmentDialog(QDialog):
             self.identity_edits[tag] = identity_edit
             self.start_edits[tag] = start_edit
             self.stop_edits[tag] = stop_edit
+            self.start_modes[tag] = start_combo
+            self.stop_modes[tag] = stop_combo
+
+        if stale:
+            banner = QLabel(
+                f"\u26a0 {len(stale)} tag(s) have a Stop time earlier than their "
+                "last recorded fix, so those days are being discarded. If those "
+                "Stop times were only ever the pre-filled data extent (not a real "
+                "removal), set them back to <i>Follow data</i>.")
+            banner.setWordWrap(True)
+            banner.setTextFormat(Qt.RichText)
+            banner.setStyleSheet(
+                "color:#e5c07b; background:#3a3226; padding:6px; border-radius:3px;")
+            layout.addWidget(banner)
+
+            btn_release = QPushButton("Set every flagged Stop back to \u201cFollow data\u201d")
+            btn_release.setToolTip(
+                "Switch the Stop bound to Follow data for every tag flagged "
+                "above, so their full recordings are used. Start times are left "
+                "exactly as they are.")
+            btn_release.clicked.connect(lambda _=False, t=list(stale): self._release_stops(t))
+            layout.addWidget(btn_release)
 
         form_container = QWidget()
         form_container.setLayout(form_layout)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(form_container)
-        layout.addWidget(scroll, 1)   # takes the stretch; buttons stay fixed
+        layout.addWidget(scroll, 1)
 
-        # Dialog buttons (outside the scroll area — always visible)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
@@ -931,28 +1123,34 @@ class IdentityAssignmentDialog(QDialog):
 
         self.setLayout(layout)
 
-        # Open at a height that fits the current screen (tag list scrolls
-        # inside) and never let the window exceed it, keeping OK/Cancel reachable.
         try:
             avail = QApplication.primaryScreen().availableGeometry()
             self.setMaximumHeight(avail.height())
-            self.resize(760, min(880, int(avail.height() * 0.9)))
+            self.resize(900, min(880, int(avail.height() * 0.9)))
         except Exception:
-            self.resize(760, 800)
+            self.resize(900, 800)
+
+    def _release_stops(self, tags):
+        """Put the flagged tags' Stop bounds back on Follow data."""
+        for tag in tags:
+            combo = self.stop_modes.get(tag)
+            if combo is not None:
+                combo.setCurrentIndex(0)          # Follow data
 
     def get_identities(self):
-        """Return the configured identities with start/stop times"""
+        """Configured identities, with each bound's mode recorded alongside it."""
         result = {}
         for tag in self.available_tags:
-            sex = self.sex_combos[tag].currentText()
-            identity = self.identity_edits[tag].text().strip()
-            if not identity:
-                identity = str(tag)
+            identity = self.identity_edits[tag].text().strip() or str(tag)
             result[tag] = {
-                'sex': sex,
+                'sex': self.sex_combos[tag].currentText(),
                 'identity': identity,
-                'start_time': self.start_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss"),
-                'stop_time': self.stop_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss"),
+                'start_time': self.start_edits[tag].dateTime().toString(
+                    "yyyy-MM-dd HH:mm:ss"),
+                'stop_time': self.stop_edits[tag].dateTime().toString(
+                    "yyyy-MM-dd HH:mm:ss"),
+                'start_mode': self.start_modes[tag].currentData(),
+                'stop_mode': self.stop_modes[tag].currentData(),
             }
         return result
 
@@ -971,7 +1169,8 @@ class PlotSaverWorker(QThread):
                  output_dir=None, plots_dir=None, rolling_window_units='Seconds',
                  plot_layers=None, xml_zones=None, anchor_positions=None,
                  xml_map_image=None, xml_map_extent=None,
-                 bg_offset_x=0.0, bg_offset_y=0.0):
+                 bg_offset_x=0.0, bg_offset_y=0.0, behavior_params=None,
+                 axis_limits=None):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -1004,6 +1203,12 @@ class PlotSaverWorker(QThread):
         self.anchor_positions = anchor_positions or []
         self.xml_map_image = xml_map_image
         self.xml_map_extent = xml_map_extent
+        # Detection thresholds for the ethogram, taken from the preview so
+        # the plotted states are the ones the user tuned while watching.
+        self.behavior_params = behavior_params
+        # (x_min, x_max, y_min, y_max) pinned by the user, or None to fit
+        # each spatial plot to its data.
+        self.axis_limits = axis_limits
 
     def _bg_source(self):
         """(image, extent) for the background layer, or (None, None).
@@ -1019,9 +1224,40 @@ class PlotSaverWorker(QThread):
             return self.xml_map_image, list(self.xml_map_extent)
         return None, None
 
+    def _apply_axis_limits(self, ax, x_lo, x_hi, y_lo, y_hi, equal=False):
+        """Set axis limits, letting a user-pinned XY range override the fit.
+
+        Every spatial plot routes through here so a pinned range means the same
+        window in all of them — and in the animation and the live preview.
+        """
+        if self.axis_limits is not None:
+            x_lo, x_hi, y_lo, y_hi = self.axis_limits
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        if equal:
+            ax.set_aspect('equal', adjustable='box')
+
+    @staticmethod
+    def facet_grid(n_panels, max_cols=5, panel_w=3.4, panel_h=3.4,
+                   extra_h=0.0):
+        """(rows, cols, figsize) for n panels laid out as a wrapped grid.
+
+        Days used to be laid out in a single row with the figure width capped,
+        so a 19-day trial got 19 panels across 20 inches - about one inch each,
+        illegible at any DPI. Wrapping keeps every panel a fixed physical size
+        and lets the figure grow downwards instead, so a long trial simply
+        produces a taller image that stays readable when zoomed.
+        """
+        n = max(1, int(n_panels))
+        cols = min(max_cols, n)
+        rows = (n + cols - 1) // cols
+        return rows, cols, (panel_w * cols, panel_h * rows + extra_h)
+
     def save_figure(self, fig, output_path):
         """Save figure as PNG, and optionally also as SVG"""
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        # 200 dpi: a faceted plot of a long trial is meant to be zoomed
+        # into, and 150 left the per-day panels soft once wrapped.
+        fig.savefig(output_path, dpi=200, bbox_inches='tight')
         if self.save_svg:
             svg_path = os.path.splitext(output_path)[0] + '.svg'
             fig.savefig(svg_path, format='svg', bbox_inches='tight')
@@ -1102,73 +1338,56 @@ class PlotSaverWorker(QThread):
             generated_count = 0
             skipped_count = 0
             
-            if self.plot_types.get('daily_paths', False):
-                result = self.save_daily_paths_per_tag(data, plots_dir, db_name)
-                if result:
-                    generated_count += result
-
-            if self.plot_types.get('trajectory_overview', False):
-                result = self.save_trajectory_overview(data, plots_dir, db_name)
-                if result:
+            # Each plot runs in its own try/except: a failure in one (an
+            # unusual data shape, a matplotlib edge case) is reported and the
+            # remaining plots still run. One shared try/except meant a single
+            # bad plot silently cancelled every plot after it in this list.
+            plot_jobs = [
+                ('daily_paths', self.save_daily_paths_per_tag),
+                ('trajectory_overview', self.save_trajectory_overview),
+                ('battery_levels', self.save_battery_levels),
+                ('3d_occupancy', self.save_3d_occupancy),
+                ('activity_timeline', self.save_activity_timeline),
+                ('velocity_distribution', self.save_velocity_distribution),
+                ('cumulative_distance', self.save_cumulative_distance),
+                ('velocity_timeline', self.save_velocity_timeline),
+                ('actogram', self.save_actogram),
+                ('data_quality', self.save_data_quality),
+                ('home_range', self.save_home_range),
+                ('mcp_range', self.save_mcp_range),
+                ('zone_occupancy', self.save_zone_occupancy),
+                ('ethogram', self.save_ethogram),
+                ('behavior_counts', self.save_chase_timeline),
+                ('behavior_matrix', self.save_chase_matrix),
+            ]
+            # These write one file per tag and return a count; the rest write a
+            # single file and return True/False.
+            per_tag = {'daily_paths', '3d_occupancy', 'velocity_timeline',
+                       'actogram', 'home_range', 'mcp_range', 'ethogram'}
+            failed = []
+            for key, fn in plot_jobs:
+                if not self.plot_types.get(key, False):
+                    continue
+                try:
+                    result = fn(data, plots_dir, db_name)
+                except Exception as exc:
+                    failed.append(f"{key} ({type(exc).__name__}: {exc})")
+                    self.progress.emit(f"✗ {key} plot failed: {exc}")
+                    continue
+                if key in per_tag:
+                    generated_count += int(result or 0)
+                elif result:
                     generated_count += 1
                 else:
                     skipped_count += 1
 
-            if self.plot_types.get('battery_levels', False):
-                result = self.save_battery_levels(data, plots_dir, db_name)
-                if result:
-                    generated_count += 1
-                else:
-                    skipped_count += 1
-
-            if self.plot_types.get('3d_occupancy', False):
-                result = self.save_3d_occupancy(data, plots_dir, db_name)
-                if result:
-                    generated_count += result
-
-            if self.plot_types.get('activity_timeline', False):
-                result = self.save_activity_timeline(data, plots_dir, db_name)
-                if result:
-                    generated_count += 1
-                else:
-                    skipped_count += 1
-
-            if self.plot_types.get('velocity_distribution', False):
-                result = self.save_velocity_distribution(data, plots_dir, db_name)
-                if result:
-                    generated_count += 1
-                else:
-                    skipped_count += 1
-            
-            if self.plot_types.get('cumulative_distance', False):
-                result = self.save_cumulative_distance(data, plots_dir, db_name)
-                if result:
-                    generated_count += 1
-                else:
-                    skipped_count += 1
-
-            if self.plot_types.get('velocity_timeline', False):
-                result = self.save_velocity_timeline(data, plots_dir, db_name)
-                if result:
-                    generated_count += result
-
-            if self.plot_types.get('actogram', False):
-                result = self.save_actogram(data, plots_dir, db_name)
-                if result:
-                    generated_count += result
-
-            if self.plot_types.get('data_quality', False):
-                result = self.save_data_quality(data, plots_dir, db_name)
-                if result:
-                    generated_count += 1
-                else:
-                    skipped_count += 1
-            
             msg = f"Generated {generated_count} plot(s)"
             if skipped_count > 0:
-                msg += f", skipped {skipped_count} existing file(s)"
+                msg += f", skipped {skipped_count}"
+            if failed:
+                msg += f", FAILED {len(failed)} ({'; '.join(failed)})"
             msg += f" in {output_dir}"
-            self.finished.emit(True, msg)
+            self.finished.emit(not failed, msg)
             
         except Exception as e:
             self.finished.emit(False, f"Error generating plots: {str(e)}")
@@ -1265,13 +1484,15 @@ class PlotSaverWorker(QThread):
             
             tag_data = data[data['shortid'] == tag]
             num_days = len(unique_dates)
-            
-            fig = Figure(figsize=(min(4 * num_days, 20), 4))
-            
+
+            n_rows, n_cols, figsize = self.facet_grid(num_days, max_cols=5,
+                                                      extra_h=0.6)
+            fig = Figure(figsize=figsize)
+
             for day_idx, date in enumerate(unique_dates):
                 day_data = tag_data[tag_data['Date'] == date]
-                
-                ax = fig.add_subplot(1, num_days, day_idx + 1)
+
+                ax = fig.add_subplot(n_rows, n_cols, day_idx + 1)
 
                 # Spatial context (background/zones/anchors) per the export choice
                 draw_context_layers(
@@ -1287,9 +1508,8 @@ class PlotSaverWorker(QThread):
                     ax.scatter(day_data[x_col].iloc[-1], day_data[y_col].iloc[-1],
                               c='black', s=50, marker='s', zorder=5)
                 
-                # Apply global axis limits
-                ax.set_xlim(x_min, x_max)
-                ax.set_ylim(y_min, y_max)
+                # Global axis limits, or the user's pinned XY range
+                self._apply_axis_limits(ax, x_min, x_max, y_min, y_max)
                 
                 ax.set_xlabel('X (m)', fontsize=9)
                 ax.set_ylabel('Y (m)', fontsize=9)
@@ -1359,6 +1579,10 @@ class PlotSaverWorker(QThread):
         ax.legend(loc='best', fontsize=8)
         ax.grid(True, alpha=0.3)
         ax.set_aspect('equal')
+        # Only overrides when a range is pinned; otherwise matplotlib's
+        # autoscale (which this plot has always relied on) is left alone.
+        if self.axis_limits is not None:
+            self._apply_axis_limits(ax, *self.axis_limits)
         fig.tight_layout()
         
         self.save_figure(fig, output_path)
@@ -1389,6 +1613,19 @@ class PlotSaverWorker(QThread):
 
         if battery_col is None:
             self.progress.emit("No battery column found, skipping battery plot")
+            return False
+
+        # A battery column can exist but hold nothing usable (never populated,
+        # or all NaN for a tag that does not report voltage). Non-finite values
+        # propagate into the shared y-limits and set_ylim then raises, so
+        # drop them here and skip the plot outright if none survive.
+        data = data.copy()
+        data[battery_col] = pd.to_numeric(data[battery_col], errors='coerce')
+        data = data[np.isfinite(data[battery_col])]
+        if data.empty:
+            self.progress.emit(
+                f"Battery column '{battery_col}' has no usable values, "
+                "skipping battery plot")
             return False
 
         tags = sorted(data['shortid'].unique())
@@ -1654,11 +1891,13 @@ class PlotSaverWorker(QThread):
         
         # Calculate distance between consecutive points
         data = data.sort_values(['shortid', 'Timestamp'])
-        data['distance_step'] = data.groupby('shortid', group_keys=False).apply(
-            lambda group: np.sqrt(
-                group[x_col].diff()**2 + group[y_col].diff()**2
-            ).fillna(0)
-        ).reset_index(level=0, drop=True)
+        # Per-tag step distance. Done column-wise rather than with
+        # groupby().apply(): with a single tag the apply returned a DataFrame
+        # instead of a Series and the assignment raised, which took down
+        # every plot queued after this one.
+        dx = data.groupby('shortid')[x_col].diff()
+        dy = data.groupby('shortid')[y_col].diff()
+        data['distance_step'] = np.sqrt(dx ** 2 + dy ** 2).fillna(0)
         
         # Cumulative distance per day (reset each day)
         data['cumulative_distance'] = data.groupby(['shortid', 'Date'])['distance_step'].cumsum()
@@ -1666,10 +1905,9 @@ class PlotSaverWorker(QThread):
         
         unique_days = sorted(data['Date'].unique())
         num_days = len(unique_days)
-        num_cols = min(4, num_days)
-        num_rows = (num_days + num_cols - 1) // num_cols
-        
-        fig = Figure(figsize=(5 * num_cols, 4 * num_rows))
+        num_rows, num_cols, figsize = self.facet_grid(
+            num_days, max_cols=5, panel_w=5.0, panel_h=4.0, extra_h=0.5)
+        fig = Figure(figsize=figsize)
         
         for i, day in enumerate(unique_days):
             ax = fig.add_subplot(num_rows, num_cols, i + 1)
@@ -1920,6 +2158,748 @@ class PlotSaverWorker(QThread):
         self.progress.emit(f"Saved: {db_name}_DataQuality.png")
         return True
 
+    # ── Home range ───────────────────────────────────────────────────────────
+
+    def _tag_label(self, tag):
+        """Display label for a tag: sex-identity when configured, else hex ID."""
+        if self.use_identities and tag in self.tag_identities:
+            info = self.tag_identities[tag]
+            return f"{info.get('sex', 'M')}-{info.get('identity', str(tag))}"
+        return f"HexID {hex(tag).upper().replace('0X', '')}"
+
+    def _tag_file_suffix(self, tag):
+        if self.use_identities and tag in self.tag_identities:
+            info = self.tag_identities[tag]
+            return f"{info.get('sex', 'M')}-{info.get('identity', str(tag))}"
+        return f"HexID{hex(tag).upper().replace('0X', '')}"
+
+    # ── Home range: KDE and MCP as separate, comparable products ────────────
+    # Kept as one renderer with a `method` switch rather than two near-copies:
+    # the framing, faceting, shared axis limits and area annotation must stay
+    # identical or the two plots are not comparable, which is the entire point
+    # of splitting them.
+
+    _HR_STYLE = {
+        'kde': dict(
+            tag_prefix='HomeRange', title='Home Range (KDE)',
+            legend=(('KDE 50% (core)', '#ff4d4d', '-', 1.8),
+                    ('KDE 95% (home range)', '#4da3ff', '-', 1.4)),
+            subtitle=('filled = KDE 50% core · line = KDE 95%')),
+        'mcp': dict(
+            tag_prefix='MCP', title='Home Range (MCP)',
+            legend=(('MCP 95% (peeled)', '#2ea043', '-', 1.6),
+                    ('MCP 100% (all fixes)', '#f0c419', '--', 1.3)),
+            subtitle=('solid = 95% MCP · dashed = 100% MCP')),
+    }
+
+    def _hr_estimate(self, ax, sub_x, sub_y, method):
+        """Draw one panel's estimator(s); returns {label: area_m2}."""
+        from fnt.uwb import spatial_metrics as SM
+
+        areas = {}
+        if method == 'kde':
+            xg, yg, dens, cell = SM.kde_utilization(sub_x, sub_y)
+            for pct, colour, lw in ((95, '#4da3ff', 1.4), (50, '#ff4d4d', 1.8)):
+                level = SM.kde_isopleth(dens, cell, pct)
+                if level is None:
+                    areas[f'KDE {pct}%'] = float('nan')
+                    continue
+                ax.contour(xg, yg, dens, levels=[level], colors=[colour],
+                           linewidths=lw, zorder=4)
+                areas[f'KDE {pct}%'] = SM.kde_isopleth_area(dens, cell, level)
+        else:
+            for pct, colour, style, lw in ((100, '#f0c419', '--', 1.3),
+                                           (95, '#2ea043', '-', 1.6)):
+                verts, area = SM.mcp(sub_x, sub_y, percent=pct)
+                areas[f'MCP {pct}%'] = area
+                if verts is None:
+                    continue
+                ring = np.vstack([verts, verts[:1]])
+                ax.plot(ring[:, 0], ring[:, 1], style, color=colour,
+                        linewidth=lw, alpha=0.9, zorder=3)
+        return areas
+
+    def _save_home_range(self, data, output_dir, db_name, method):
+        """Per-tag panels faceted by day, plus a whole-trial overview."""
+        from fnt.uwb import spatial_metrics as SM
+
+        style = self._HR_STYLE[method]
+        self.progress.emit(f"Generating {style['title']} plots...")
+
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+
+        unique_dates = sorted(data['Date'].unique())
+        unique_tags = sorted(data['shortid'].unique())
+        bg_image, bg_extent = self._bg_source()
+        generated = 0
+
+        # Shared limits so every panel and every tag is on the same scale -
+        # comparing range SIZE across animals is the point of the plot.
+        gx_min, gx_max = data[x_col].min(), data[x_col].max()
+        gy_min, gy_max = data[y_col].min(), data[y_col].max()
+        if self.plot_layers.get('background') and bg_extent is not None:
+            gx_min = min(gx_min, bg_extent[0]); gx_max = max(gx_max, bg_extent[1])
+            gy_min = min(gy_min, bg_extent[2]); gy_max = max(gy_max, bg_extent[3])
+        pad = 0.05 * max(gx_max - gx_min, gy_max - gy_min, 1e-6)
+
+        def _draw(ax, sub_x, sub_y, title, show_legend):
+            draw_context_layers(
+                ax, self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
+                zones_xml=self.xml_zones, anchors=self.anchor_positions)
+            ax.plot(sub_x, sub_y, '.', ms=0.6, color='#999999', alpha=0.35, zorder=2)
+            areas = self._hr_estimate(ax, sub_x, sub_y, method)
+            self._apply_axis_limits(ax, gx_min - pad, gx_max + pad,
+                                    gy_min - pad, gy_max + pad, equal=True)
+            ax.set_title(title, fontsize=9)
+            ax.tick_params(labelsize=7)
+            txt = "\\n".join(
+                f"{k}: {v:.2f} m²" if np.isfinite(v) else f"{k}: n/a"
+                for k, v in areas.items())
+            ax.text(0.02, 0.98, txt, transform=ax.transAxes, va='top', ha='left',
+                    fontsize=6.5, family='monospace',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.75,
+                              ec='none'),
+                    zorder=6)
+            if show_legend:
+                handles = [Line2D([], [], color=c, lw=lw, ls=ls, label=lab)
+                           for lab, c, ls, lw in style['legend']]
+                ax.legend(handles=handles, loc='lower right', fontsize=6,
+                          framealpha=0.8)
+            return areas
+
+        # ---- one file per tag, faceted by day -------------------------------
+        for tag in unique_tags:
+            suffix = self._tag_file_suffix(tag)
+            output_path = os.path.join(
+                output_dir, f"{db_name}_{style['tag_prefix']}_{suffix}.png")
+            if self.skip_existing and os.path.exists(output_path):
+                self.progress.emit(f"Skipped (exists): {os.path.basename(output_path)}")
+                continue
+
+            tag_data = data[data['shortid'] == tag]
+            if tag_data.empty:
+                continue
+            n_days = len(unique_dates)
+            n_rows, n_cols, figsize = self.facet_grid(
+                n_days, max_cols=5, panel_w=4.2, panel_h=4.4, extra_h=0.5)
+            fig = Figure(figsize=figsize)
+            for i, day in enumerate(unique_dates):
+                ax = fig.add_subplot(n_rows, n_cols, i + 1)
+                d = tag_data[tag_data['Date'] == day]
+                if d.empty:
+                    ax.set_title(f'Day {i+1}: {day}\\n(no data)', fontsize=9)
+                    self._apply_axis_limits(ax, gx_min - pad, gx_max + pad,
+                                            gy_min - pad, gy_max + pad, equal=True)
+                    continue
+                _draw(ax, d[x_col].values, d[y_col].values,
+                      f'Day {i+1}: {day}  (n={len(d):,})', show_legend=(i == 0))
+            fig.suptitle(f"{style['title']} by Day — {self._tag_label(tag)}",
+                         fontsize=13, fontweight='bold')
+            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            self.save_figure(fig, output_path)
+            plt.close(fig)
+            generated += 1
+            self.progress.emit(f"Saved: {os.path.basename(output_path)}")
+
+        # ---- one overview: whole trial, every animal --------------------------
+        overview_path = os.path.join(
+            output_dir, f"{db_name}_{style['tag_prefix']}_Overview.png")
+        if self.skip_existing and os.path.exists(overview_path):
+            self.progress.emit(f"Skipped (exists): {os.path.basename(overview_path)}")
+            return generated
+
+        fig = Figure(figsize=(11, 9))
+        ax = fig.add_subplot(111)
+        draw_context_layers(ax, self.plot_layers, bg_image=bg_image,
+                            bg_extent=bg_extent, zones_xml=self.xml_zones,
+                            anchors=self.anchor_positions)
+        cmap = plt.get_cmap('tab10')
+        handles, rows = [], []
+        for i, tag in enumerate(unique_tags):
+            colour = cmap(i % 10)
+            d = data[data['shortid'] == tag]
+            xs, ys = d[x_col].values, d[y_col].values
+            label = self._tag_label(tag)
+            if method == 'kde':
+                xg, yg, dens, cell = SM.kde_utilization(xs, ys)
+                lvl95 = SM.kde_isopleth(dens, cell, 95)
+                lvl50 = SM.kde_isopleth(dens, cell, 50)
+                if lvl95 is not None:
+                    ax.contour(xg, yg, dens, levels=[lvl95], colors=[colour],
+                               linewidths=1.6, zorder=4)
+                if lvl50 is not None:
+                    ax.contourf(xg, yg, dens, levels=[lvl50, dens.max()],
+                                colors=[colour], alpha=0.22, zorder=3)
+                rows.append((label,
+                             SM.kde_isopleth_area(dens, cell, lvl50),
+                             SM.kde_isopleth_area(dens, cell, lvl95)))
+            else:
+                v100, a100 = SM.mcp(xs, ys, percent=100)
+                v95, a95 = SM.mcp(xs, ys, percent=95)
+                if v100 is not None:
+                    ring = np.vstack([v100, v100[:1]])
+                    ax.plot(ring[:, 0], ring[:, 1], '--', color=colour, lw=1.0,
+                            alpha=0.7, zorder=3)
+                if v95 is not None:
+                    ring = np.vstack([v95, v95[:1]])
+                    ax.plot(ring[:, 0], ring[:, 1], '-', color=colour, lw=1.8,
+                            alpha=0.9, zorder=4)
+                    ax.fill(ring[:, 0], ring[:, 1], color=colour, alpha=0.12,
+                            zorder=2)
+                rows.append((label, a95, a100))
+            handles.append(Line2D([], [], color=colour, lw=2, label=label))
+        self._apply_axis_limits(ax, gx_min - pad, gx_max + pad,
+                                gy_min - pad, gy_max + pad, equal=True)
+        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
+        ax.legend(handles=handles, loc='upper right', fontsize=8, framealpha=0.85)
+        if method == 'kde':
+            summary = "  ".join(f"{n}: core {a:.1f} / range {b:.1f} m²"
+                                for n, a, b in rows)
+        else:
+            summary = "  ".join(f"{n}: 95% {a:.1f} / 100% {b:.1f} m²"
+                                for n, a, b in rows)
+        ax.set_title(f"{style['title']} — whole trial\\n{style['subtitle']}",
+                     fontsize=12, fontweight='bold')
+        fig.text(0.01, 0.005, summary, fontsize=6.5, family='monospace', wrap=True)
+        fig.tight_layout(rect=[0, 0.03, 1, 1])
+        self.save_figure(fig, overview_path)
+        plt.close(fig)
+        generated += 1
+        self.progress.emit(f"Saved: {os.path.basename(overview_path)}")
+        return generated
+
+    def save_home_range(self, data, output_dir, db_name):
+        """Kernel-density home range: 50% core and 95% range."""
+        return self._save_home_range(data, output_dir, db_name, 'kde')
+
+    def save_mcp_range(self, data, output_dir, db_name):
+        """Minimum convex polygon home range: 95% peeled and 100%."""
+        return self._save_home_range(data, output_dir, db_name, 'mcp')
+
+    def save_zone_occupancy(self, data, output_dir, db_name):
+        """Time spent in each arena zone, per animal, over the recording.
+
+        Needs zone polygons from the site XML; returns False if none are loaded.
+        """
+        from fnt.uwb import spatial_metrics as SM
+
+        self.progress.emit("Generating zone occupancy...")
+
+        zones = list(self.xml_zones or [])
+        if not zones:
+            self.progress.emit(
+                "No arena zones loaded (site XML), skipping zone occupancy")
+            return False
+
+        output_path = os.path.join(output_dir, f'{db_name}_ZoneOccupancy.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_ZoneOccupancy.png")
+            return False
+
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+
+        data['zone_idx'] = SM.assign_zones(data[x_col].values, data[y_col].values, zones)
+        zone_names = [z.get('name', f'Zone {i+1}') for i, z in enumerate(zones)]
+        labels = zone_names + ['outside']
+        n = len(zones)
+
+        unique_tags = sorted(data['shortid'].unique())
+        unique_dates = sorted(data['Date'].unique())
+
+        # Zone colours come from the XML where authored, so the bars match the
+        # arena drawing the user already knows.
+        cmap = plt.get_cmap('tab20')
+        colours = []
+        for i, z in enumerate(zones):
+            c = z.get('color') or ''
+            colours.append(c if isinstance(c, str) and c.startswith('#') else cmap(i % 20))
+        colours.append('#bbbbbb')   # outside
+
+        fig = Figure(figsize=(15, 3.0 + 2.6 * len(unique_tags)))
+        gs = fig.add_gridspec(len(unique_tags) + 1, 2, width_ratios=[3, 1],
+                              hspace=0.55, wspace=0.25)
+
+        # --- per animal: hourly stacked occupancy over the whole recording ---
+        for r, tag in enumerate(unique_tags):
+            ax = fig.add_subplot(gs[r, 0])
+            d = data[data['shortid'] == tag].sort_values('Timestamp')
+            if d.empty:
+                ax.set_ylabel(self._tag_label(tag), fontsize=8)
+                continue
+            hours = d['Timestamp'].dt.floor('h')
+            frac = np.zeros((n + 1, 0))
+            centres = []
+            for h, g in d.groupby(hours, sort=True):
+                occ = SM.zone_occupancy(g['zone_idx'].values, g['Timestamp'].values, n)
+                tot = occ.sum()
+                frac = np.column_stack([frac, occ / tot if tot > 0 else occ])
+                centres.append(h)
+            if not centres:
+                continue
+            centres = pd.to_datetime(pd.Series(centres))
+            bottom = np.zeros(frac.shape[1])
+            for i in range(n + 1):
+                ax.bar(centres, frac[i], width=pd.Timedelta(hours=1),
+                       bottom=bottom, color=colours[i], edgecolor='none',
+                       label=labels[i] if r == 0 else None)
+                bottom = bottom + frac[i]
+            ax.set_ylim(0, 1)
+            ax.set_ylabel(self._tag_label(tag), fontsize=8, fontweight='bold')
+            ax.tick_params(labelsize=7)
+            ax.margins(x=0)
+            if r == 0:
+                ax.legend(fontsize=6.5, ncol=min(6, n + 1), loc='upper center',
+                          bbox_to_anchor=(0.5, 1.55), framealpha=0.9)
+            if r < len(unique_tags) - 1:
+                ax.tick_params(axis='x', labelbottom=False)
+
+        # --- right column: total time per zone per animal, as a matrix -------
+        ax = fig.add_subplot(gs[:, 1])
+        mat = np.zeros((len(unique_tags), n + 1))
+        for r, tag in enumerate(unique_tags):
+            d = data[data['shortid'] == tag].sort_values('Timestamp')
+            if d.empty:
+                continue
+            occ = SM.zone_occupancy(d['zone_idx'].values, d['Timestamp'].values, n)
+            tot = occ.sum()
+            mat[r] = occ / tot * 100.0 if tot > 0 else occ
+        im = ax.imshow(mat, aspect='auto', cmap='viridis', vmin=0,
+                       vmax=max(1.0, mat.max()))
+        ax.set_xticks(range(n + 1))
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=7)
+        ax.set_yticks(range(len(unique_tags)))
+        ax.set_yticklabels([self._tag_label(t) for t in unique_tags], fontsize=7)
+        for r in range(mat.shape[0]):
+            for c in range(mat.shape[1]):
+                if mat[r, c] >= 1.0:
+                    ax.text(c, r, f'{mat[r, c]:.0f}', ha='center', va='center',
+                            fontsize=6, color='white')
+        ax.set_title('% of tracked time', fontsize=9)
+        fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03).ax.tick_params(labelsize=6)
+
+        fig.suptitle(
+            f'Zone Occupancy — {len(zones)} zones, {len(unique_dates)} day(s)',
+            fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_ZoneOccupancy.png")
+        return True
+
+    # ── Behaviour ethogram ───────────────────────────────────────────────────
+
+    def _ethogram_states(self, data, tags, hz=1.0):
+        """Classify every tag on a regular grid, in overlapping chunks.
+
+        Returns ``(grid_times, loc, soc)`` with loc/soc as (frames, tags) code
+        arrays. The classifier builds (frames, tags, tags) pairwise arrays, so a
+        multi-day trial is processed in blocks with an overlap margin wide
+        enough to warm the lagged terms (heading lag, displacement window,
+        staleness limit); the margin is then trimmed off.
+        """
+        from fnt.uwb import behavior_detection as BD
+
+        params = self.behavior_params or BD.BehaviorParams()
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+
+        step_ns = int(1e9 / hz)
+        t = data['Timestamp'].dt.as_unit('ns').astype('int64')
+        t0, t1 = int(t.min()), int(t.max())
+        grid = np.arange(t0, t1 + step_ns, step_ns, dtype='int64')
+        n_frames, n_tags = len(grid), len(tags)
+        if n_frames == 0 or n_tags == 0:
+            return None, None, None
+
+        # Bin fixes onto the grid, one column per tag.
+        binned = data.copy()
+        binned['fi'] = ((t - t0) // step_ns).clip(0, n_frames - 1)
+        col = {tag: i for i, tag in enumerate(tags)}
+        X = np.full((n_frames, n_tags), np.nan)
+        Y = np.full((n_frames, n_tags), np.nan)
+        for tag, g in binned.groupby('shortid', sort=False):
+            if tag not in col:
+                continue
+            j = col[tag]
+            fi = g['fi'].to_numpy()
+            X[fi, j] = g[x_col].to_numpy()
+            Y[fi, j] = g[y_col].to_numpy()
+
+        # classify() derives dt by reading these as datetime64[ns] (that is
+        # what the live preview hands it). Passing float SECONDS made every
+        # value read as a nanosecond, so dt came out 1e-9 s: speeds were
+        # ~1e9x too large and the heading lag spanned ~3e9 frames, leaving
+        # every heading NaN. grid is already int64 nanoseconds since the
+        # epoch, so hand it over unchanged.
+        times_ns = grid.astype("datetime64[ns]")
+        margin = int(np.ceil(max(params.heading_lag_s, params.displace_window_s,
+                                 params.max_stale_s, 1.0) * hz)) + 2
+        # ~2 h of 1 Hz frames per block keeps the (frames, tags, tags) pairwise
+        # arrays comfortably small even for a full cohort.
+        block = max(margin * 4, int(7200 * hz))
+
+        loc = np.full((n_frames, n_tags), BD.LOC_NODATA, dtype=np.int8)
+        soc = np.full((n_frames, n_tags), BD.SOC_NONE, dtype=np.int8)
+        events = []
+        start = 0
+        while start < n_frames:
+            stop = min(start + block, n_frames)
+            lo = max(0, start - margin)
+            hi = min(n_frames, stop + margin)
+            res = BD.classify(times_ns[lo:hi], X[lo:hi], Y[lo:hi], params)
+            loc[start:stop] = res['locomotor'][start - lo:stop - lo]
+            soc[start:stop] = res['social'][start - lo:stop - lo]
+            # Directed bouts. Extracted over the block INCLUDING its warm-up
+            # margin, then kept only when the bout STARTS inside this
+            # block's own span: a bout straddling a boundary is therefore
+            # counted exactly once, by the block that saw its onset with the
+            # lagged terms already warm.
+            for ev in BD.extract_events(res, offset=lo):
+                if start <= ev['start_frame'] < stop:
+                    events.append(ev)
+            del res
+            start = stop
+            self.progress.emit(f"  behaviour classified {min(stop, n_frames):,}/{n_frames:,} frames")
+        return grid, loc, soc, events
+
+    def _behavior_classification(self, data, tags):
+        """Classify once and reuse: the ethogram and both chase plots need it.
+
+        Classification is the expensive part (pairwise geometry over every
+        frame), so running it per plot would triple the cost of ticking all
+        three. Cached on the worker for the lifetime of one plot run.
+        """
+        key = (tuple(tags), len(data))
+        cached = getattr(self, '_beh_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        result = self._ethogram_states(data, tags)
+        self._beh_cache = (key, result)
+        return result
+
+    def behavior_events_frame(self, data, tags, tz=None):
+        """Directed chase/displacement bouts as a tidy DataFrame.
+
+        One row per bout: who did it, to whom, when, and for how long. This is
+        the dyadic record the ethogram raster cannot show — the raster says an
+        animal was chasing, this says whom it was chasing.
+        """
+        cols = ['behavior', 'actor', 'target', 'actor_sex', 'target_sex',
+                'dyad_type', 'Day', 'Date', 'start', 'stop', 'duration_s']
+        grid, loc, soc, events = self._behavior_classification(data, tags)
+        if grid is None or not events:
+            return pd.DataFrame(columns=cols)
+
+        times = pd.to_datetime(grid, utc=True)
+        if tz is not None:
+            times = times.tz_convert(tz)
+        dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
+
+        def _label(i):
+            tag = tags[i]
+            if self.use_identities and tag in self.tag_identities:
+                info = self.tag_identities[tag]
+                return f"{info.get('sex', 'M')}{info.get('identity', str(tag))}"
+            return f"HexID{hex(tag).upper().replace('0X', '')}"
+
+        def _sex(i):
+            tag = tags[i]
+            if self.use_identities and tag in self.tag_identities:
+                return self.tag_identities[tag].get('sex', 'M')
+            return 'U'
+
+        rows = []
+        for ev in events:
+            i, j = ev['start_frame'], ev['stop_frame']
+            sa, sb = _sex(ev['actor']), _sex(ev['target'])
+            rows.append({
+                'behavior': ev['behavior'],
+                'actor': _label(ev['actor']),
+                'target': _label(ev['target']),
+                'actor_sex': sa, 'target_sex': sb,
+                'dyad_type': ''.join(sorted((sa, sb))) if 'U' not in (sa, sb) else 'NA',
+                'start': times[i], 'stop': times[j],
+                # +1 frame: start and stop are both inclusive frame indices, so
+                # a single-frame bout lasts one sampling interval, not zero.
+                'duration_s': float((j - i + 1) * dt_s),
+            })
+        out = pd.DataFrame(rows, columns=cols)
+        day0 = out['start'].dt.normalize()
+        out['Date'] = day0.dt.date
+        out['Day'] = (day0 - day0.min()).dt.days + 1
+        return out.sort_values('start').reset_index(drop=True)
+
+    def save_chase_timeline(self, data, output_dir, db_name):
+        """Chase and displacement counts per day, one line per animal.
+
+        Two panels per behaviour: how often each animal was the ACTOR, and how
+        often it was the TARGET. Separating them is the point — an animal that
+        chases a lot and an animal that gets chased a lot look identical in a
+        combined count.
+        """
+        self.progress.emit("Generating chase / displacement timeline...")
+
+        output_path = os.path.join(output_dir, f'{db_name}_BehaviorCounts.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_BehaviorCounts.png")
+            return False
+
+        tags = sorted(data['shortid'].unique())
+        ev = self.behavior_events_frame(data, tags,
+                                        tz=data['Timestamp'].dt.tz)
+        if ev.empty:
+            self.progress.emit(
+                "No chases or displacements detected — skipping behaviour "
+                "counts. Check the thresholds against the speed summary.")
+            return False
+
+        behaviours = [b for b in ('chase', 'displacement')
+                      if (ev['behavior'] == b).any()]
+        animals = sorted(set(ev['actor']) | set(ev['target']))
+        days = sorted(ev['Day'].unique())
+        cmap = plt.get_cmap('tab10')
+        colour = {a: cmap(i % 10) for i, a in enumerate(animals)}
+
+        fig = Figure(figsize=(6.5 * len(behaviours), 8.5))
+        for bi, beh in enumerate(behaviours):
+            sub = ev[ev['behavior'] == beh]
+            for ri, (role, label) in enumerate((('actor', 'as actor'),
+                                                ('target', 'as target'))):
+                ax = fig.add_subplot(2, len(behaviours), ri * len(behaviours) + bi + 1)
+                counts = (sub.groupby([role, 'Day']).size()
+                            .unstack('Day').reindex(columns=days).fillna(0))
+                for animal in animals:
+                    y = (counts.loc[animal].to_numpy()
+                         if animal in counts.index else np.zeros(len(days)))
+                    ax.plot(days, y, marker='o', ms=4, lw=1.6,
+                            color=colour[animal], label=animal, alpha=0.9)
+                ax.set_xlabel('Day', fontsize=9)
+                ax.set_ylabel(f'{beh}s {label}', fontsize=9)
+                ax.set_title(f'{beh.capitalize()} — {label}', fontsize=10)
+                ax.set_xticks(days)
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(labelsize=8)
+                ax.set_ylim(bottom=0)
+                if bi == 0 and ri == 0:
+                    ax.legend(fontsize=7, ncol=2, framealpha=0.85)
+
+        total = ", ".join(f"{len(ev[ev['behavior'] == b]):,} {b}s"
+                          for b in behaviours)
+        fig.suptitle(f'Behaviour Counts by Day — {total}',
+                     fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_BehaviorCounts.png")
+        return True
+
+    def save_chase_matrix(self, data, output_dir, db_name):
+        """Directed actor x target matrices for chase and displacement.
+
+        Rows are the actor, columns the target, so cell (i, j) counts the times
+        i chased (or displaced) j. Deliberately NOT symmetric: the asymmetry
+        between (i, j) and (j, i) is the dominance signal.
+        """
+        self.progress.emit("Generating chase / displacement matrices...")
+
+        output_path = os.path.join(output_dir, f'{db_name}_BehaviorMatrix.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_BehaviorMatrix.png")
+            return False
+
+        tags = sorted(data['shortid'].unique())
+        ev = self.behavior_events_frame(data, tags,
+                                        tz=data['Timestamp'].dt.tz)
+        if ev.empty:
+            self.progress.emit(
+                "No chases or displacements detected — skipping behaviour "
+                "matrix. Check the thresholds against the speed summary.")
+            return False
+
+        behaviours = [b for b in ('chase', 'displacement')
+                      if (ev['behavior'] == b).any()]
+        animals = sorted(set(ev['actor']) | set(ev['target']))
+        n = len(animals)
+        idx = {a: i for i, a in enumerate(animals)}
+
+        # Counts and total seconds side by side: a pair with many brief chases
+        # and a pair with one long one are different findings.
+        fig = Figure(figsize=(1.6 + 5.2 * len(behaviours), 5.6))
+        for bi, beh in enumerate(behaviours):
+            sub = ev[ev['behavior'] == beh]
+            mat = np.zeros((n, n))
+            dur = np.zeros((n, n))
+            for _, r in sub.iterrows():
+                mat[idx[r['actor']], idx[r['target']]] += 1
+                dur[idx[r['actor']], idx[r['target']]] += r['duration_s']
+
+            ax = fig.add_subplot(1, len(behaviours), bi + 1)
+            im = ax.imshow(mat, cmap='magma', vmin=0,
+                           vmax=max(1.0, mat.max()))
+            ax.set_xticks(range(n)); ax.set_yticks(range(n))
+            ax.set_xticklabels(animals, rotation=45, ha='right', fontsize=8)
+            ax.set_yticklabels(animals, fontsize=8)
+            ax.set_xlabel(f'target (was {beh}d)', fontsize=9)
+            ax.set_ylabel(f'actor (did the {beh[:5]})', fontsize=9)
+            ax.set_title(f'{beh.capitalize()}: {int(mat.sum()):,} events',
+                         fontsize=11, fontweight='bold')
+            # The diagonal is structurally empty (no self-directed bouts).
+            for i in range(n):
+                ax.add_patch(MplRectangle((i - 0.5, i - 0.5), 1, 1,
+                                          facecolor='#444444', edgecolor='none'))
+            for i in range(n):
+                for j in range(n):
+                    if i == j or mat[i, j] == 0:
+                        continue
+                    # Label with count and total duration; white on the dark end
+                    # of magma, black on the light end.
+                    frac = mat[i, j] / max(1.0, mat.max())
+                    ax.text(j, i, f"{int(mat[i, j])}\n{dur[i, j]:.0f}s",
+                            ha='center', va='center', fontsize=6.5,
+                            color='white' if frac < 0.6 else 'black')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                         label='events').ax.tick_params(labelsize=7)
+
+        fig.suptitle('Directed Behaviour Matrix — row acts on column '
+                     '(count above, total seconds below)',
+                     fontsize=12, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_BehaviorMatrix.png")
+        return True
+
+    def save_ethogram(self, data, output_dir, db_name):
+        """Behaviour-state raster per animal, plus a per-day time budget.
+
+        Returns the number of plots generated.
+        """
+        from fnt.uwb import behavior_detection as BD
+
+        self.progress.emit("Generating behaviour ethogram...")
+
+        output_path = os.path.join(output_dir, f'{db_name}_Ethogram.png')
+        budget_path = os.path.join(output_dir, f'{db_name}_EthogramTimeBudget.png')
+        if self.skip_existing and os.path.exists(output_path) and os.path.exists(budget_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_Ethogram.png")
+            return 0
+
+        data = data.copy()
+        tags = sorted(data['shortid'].unique())
+        grid, loc, soc, _events = self._behavior_classification(data, tags)
+        if grid is None:
+            self.progress.emit("No data to classify, skipping ethogram")
+            return 0
+
+        # Display code per frame: social state wins when present (it is the
+        # rarer, more informative event), else the locomotor state.
+        order = [('no data', BD.LOC_NODATA, None, BD.STATE_COLORS[BD.LOC_NODATA]),
+                 ('inactive', BD.LOC_INACTIVE, None, BD.STATE_COLORS[BD.LOC_INACTIVE]),
+                 ('moving', BD.LOC_MOVING, None, BD.STATE_COLORS[BD.LOC_MOVING]),
+                 ('contact', None, BD.SOC_CONTACT, BD.SOCIAL_COLORS[BD.SOC_CONTACT]),
+                 ('displacing', None, BD.SOC_DISPLACING, BD.SOCIAL_COLORS[BD.SOC_DISPLACING]),
+                 ('displaced', None, BD.SOC_DISPLACED, BD.SOCIAL_COLORS[BD.SOC_DISPLACED]),
+                 ('chasing', None, BD.SOC_CHASING, BD.SOCIAL_COLORS[BD.SOC_CHASING]),
+                 ('chased', None, BD.SOC_CHASED, BD.SOCIAL_COLORS[BD.SOC_CHASED])]
+        disp = np.zeros(loc.shape, dtype=np.int8)
+        for k, (_lab, lcode, scode, _c) in enumerate(order):
+            if scode is None:
+                disp[(soc == BD.SOC_NONE) & (loc == lcode)] = k
+            else:
+                disp[soc == scode] = k
+        cmap = ListedColormap([c for _l, _lc, _sc, c in order])
+
+        times = pd.to_datetime(grid, utc=True).tz_convert(
+            data['Timestamp'].dt.tz or 'UTC')
+        n_frames = len(grid)
+        # One column per output pixel: within a bin, any social state present
+        # wins over the locomotor background so brief events stay visible.
+        max_cols = 3000
+        stride = max(1, int(np.ceil(n_frames / max_cols)))
+        n_cols = int(np.ceil(n_frames / stride))
+        raster = np.zeros((len(tags), n_cols), dtype=np.int8)
+        for c in range(n_cols):
+            sl = disp[c * stride:(c + 1) * stride]
+            if sl.size == 0:
+                continue
+            raster[:, c] = sl.max(axis=0)
+
+        extent = [mdates.date2num(times[0]), mdates.date2num(times[-1]),
+                  len(tags) - 0.5, -0.5]
+        fig = Figure(figsize=(16, 1.6 + 0.55 * len(tags) + 1.8))
+        ax = fig.add_subplot(111)
+        ax.imshow(raster, aspect='auto', interpolation='nearest', cmap=cmap,
+                  vmin=0, vmax=len(order) - 1, extent=extent)
+        ax.set_yticks(range(len(tags)))
+        ax.set_yticklabels([self._tag_label(t) for t in tags], fontsize=8)
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+        for lbl in ax.get_xticklabels():
+            lbl.set_rotation(30); lbl.set_ha('right'); lbl.set_fontsize(7)
+        ax.set_xlabel('Time', fontsize=9)
+        handles = [Patch(facecolor=c, label=l) for l, _lc, _sc, c in order]
+        ax.legend(handles=handles, ncol=len(order), fontsize=7,
+                  loc='upper center', bbox_to_anchor=(0.5, -0.22),
+                  framealpha=0.9, borderaxespad=0.0)
+        secs = (grid[-1] - grid[0]) / 1e9
+        ax.set_title(
+            f'Behaviour Ethogram — 1 Hz classification, {secs/3600:.1f} h, '
+            f'{stride} s per pixel (social states take precedence)',
+            fontsize=12, fontweight='bold', pad=12)
+        fig.tight_layout()
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_Ethogram.png")
+        generated = 1
+
+        # ---- per-day time budget -------------------------------------------
+        days = times.normalize()
+        uniq_days = pd.unique(days)
+        panel_h = max(1.6, 0.42 * len(tags) * 1.6)
+        n_rows, n_cols, figsize = self.facet_grid(
+            len(uniq_days), max_cols=5, panel_w=2.8, panel_h=panel_h, extra_h=0.8)
+        fig = Figure(figsize=figsize)
+        for di, day in enumerate(uniq_days):
+            ax = fig.add_subplot(n_rows, n_cols, di + 1)
+            # DatetimeIndex comparison yields a bare ndarray, not a Series,
+            # so asarray rather than .to_numpy().
+            m = np.asarray(days == day)
+            left = np.zeros(len(tags))
+            for k, (lab, _lc, _sc, colour) in enumerate(order):
+                if lab == 'no data':
+                    continue
+                share = (disp[m] == k).sum(axis=0) / max(1, m.sum()) * 100.0
+                ax.barh(range(len(tags)), share, left=left, color=colour,
+                        edgecolor='none', label=lab if di == 0 else None)
+                left = left + share
+            ax.set_yticks(range(len(tags)))
+            ax.set_yticklabels(
+                [self._tag_label(t) for t in tags] if di % n_cols == 0 else [],
+                fontsize=7)
+            ax.invert_yaxis()
+            ax.set_xlim(0, 100)
+            ax.set_xlabel('% of day', fontsize=8)
+            ax.set_title(pd.Timestamp(day).strftime('%Y-%m-%d'), fontsize=9)
+            ax.tick_params(labelsize=7)
+        # One figure-level legend: an in-axes legend sat on top of the bars.
+        handles, labels = fig.axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, ncol=len(labels), fontsize=7,
+                   loc='lower center', framealpha=0.9)
+        fig.suptitle('Behaviour Time Budget by Day', fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0.06, 1, 0.94])
+        self.save_figure(fig, budget_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_EthogramTimeBudget.png")
+        return generated + 1
+
 
 class FigurePopup(QDialog):
     """A resizable, zoom/pan-able window wrapping a matplotlib Figure.
@@ -1962,6 +2942,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Batch queue: preprocess many trials sequentially (bounded memory).
         self._batch_items = []          # [{'path','table','config','conflict_choice','status'}]
+        self._batch_attempts = {}       # (job index, phase) -> attempts this run
         self._batch_active = False
         self._batch_index = 0
         self._batch_stop_requested = False
@@ -2189,9 +3170,24 @@ class UWBQuickVisualizationWindow(QWidget):
             summary_data['Parameter'].append('Animation Generated')
             summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
 
-            summary_data['Parameter'].append('Proximity Detection')
-            if self.chk_proximity_detection.isChecked():
-                summary_data['Value'].append(f'Yes (threshold: {self.spin_proximity_threshold.value()} m)')
+            # All three social products share one contact criterion, so the
+            # threshold is recorded once and each file is listed separately.
+            thr = self.spin_proximity_threshold.value()
+            summary_data['Parameter'].append('Contact Threshold (centre-to-centre)')
+            summary_data['Value'].append(f'{thr} m')
+
+            summary_data['Parameter'].append('Proximity Bout CSV')
+            summary_data['Value'].append(
+                'Yes' if self.chk_proximity_detection.isChecked() else 'No')
+
+            summary_data['Parameter'].append('Social GBI')
+            summary_data['Value'].append(
+                'Yes' if self.chk_export_gbi.isChecked() else 'No')
+
+            summary_data['Parameter'].append('Social Edge List CSV')
+            if self.chk_export_edgelist.isChecked():
+                summary_data['Value'].append(
+                    f'Yes ({self.spin_el_window.value():g} h windows)')
             else:
                 summary_data['Value'].append('No')
             
@@ -2334,6 +3330,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # canvases must exist before that group is constructed.
         self.preview_panel = self.create_preview_panel()
         settings_panel = self.create_settings_panel()
+        # Pristine values for every preview-owned setting, captured before
+        # any database is loaded. reset_to_defaults replays this, so a
+        # setting added to _PREVIEW_CONFIG_WIDGETS is reset automatically
+        # instead of having to be remembered in two places.
+        self._preview_defaults = self.get_preview_config()
         # Processing settings live in the preview now; the matching export
         # rows are hidden and mirrored from it.
         self._hide_inherited_export_rows()
@@ -2639,24 +3640,33 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_export_smoothed_csv.setVisible(False)
 
-        self.chk_proximity_detection = QCheckBox("Detect Proximity Bouts")
+        # -- Social / proximity CSV products ---------------------------------
+        # Three independent files, ordered raw -> most derived. All three share
+        # the same contact criterion: two animals touch when their centres are
+        # within 2x the social radius set in the preview. Ticking either social
+        # product runs the proximity computation whether or not the bouts CSV
+        # itself is written.
+        self.chk_proximity_detection = QCheckBox("Export Proximity Bout CSV")
         self.chk_proximity_detection.setChecked(True)
         self.chk_proximity_detection.setToolTip(
-            "Detect when pairs of tags are within the proximity threshold. "
-            "Outputs one CSV of aggregated proximity bouts: for each pair, the "
-            "contiguous periods spent within the threshold, with start/stop, "
-            "duration, mean distance and observation count.\n"
+            "FILE: {db}_proximity_bouts.csv\n"
             "\n"
-            "Computed from the filtered + smoothed data at full temporal "
-            "resolution, so no fixes are dropped before pairwise distances are "
-            "measured. This file is also what the social-network EDGE LIST is "
-            "aggregated from; the GBI is built separately, from the per-second "
-            "distances.\n"
+            "One row per dyad per contiguous contact bout: animal1, animal2, "
+            "bout_start, bout_stop, duration_s, mean_distance, n_obs, Day, "
+            "Date. A bout runs from the moment two animals come within contact "
+            "distance until they separate for longer than the merge gap.\n"
             "\n"
-            "Bouts are threshold-specific: to analyze a different distance, "
-            "re-run with a new threshold. The raw per-timestamp pairwise "
-            "distances are not exported."
-        )
+            "CONTACT = centres within 2x the social radius (the preview's "
+            "dotted circles overlapping). Measured from the filtered + smoothed "
+            "data at full temporal resolution, so no fixes are dropped before "
+            "pairwise distances are computed.\n"
+            "\n"
+            "Strictly DIRECT dyadic contact: a pair appears only if those two "
+            "animals were themselves within the radius. No chain rule.\n"
+            "\n"
+            "This is the file the edge list is aggregated from. Bouts are "
+            "threshold-specific - to analyze a different distance, re-run with "
+            "a new social radius. Raw per-timestamp distances are not exported.")
         self.chk_proximity_detection.stateChanged.connect(self.on_proximity_detection_toggled)
         export_layout.addWidget(self.chk_proximity_detection)
 
@@ -2672,47 +3682,71 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_proximity_threshold.setSuffix(" m")
         self.spin_proximity_threshold.setToolTip(
             "Two tags closer than this distance are considered in sociospatial proximity. "
-            "0.5 m is a typical threshold for rodent social contact."
-        )
+            "0.5 m is a typical threshold for rodent social contact.")
         self.spin_proximity_threshold.setFixedWidth(100)
         prox_layout.addWidget(self.spin_proximity_threshold)
         prox_layout.addStretch()
         self.proximity_threshold_widget.setLayout(prox_layout)
-        self.proximity_threshold_widget.setVisible(False)
+        self.proximity_threshold_widget.setVisible(False)   # inherited from the preview
         export_layout.addWidget(self.proximity_threshold_widget)
 
-        # ── Social network analysis (from the proximity threshold) ───────────
-        # Replicates the LID_2020 RFID workflow on UWB data: pairwise edge lists
-        # (event- and time-based), an asnipe-style GBI matrix of chain-rule
-        # proximity flocks, and an optional dynamic social-network animation.
-        self.chk_social_network = QCheckBox("Export social network CSVs (edge list + GBI)")
-        self.chk_social_network.setChecked(False)
-        self.chk_social_network.setToolTip(
-            "Two R-ready files, both keyed to the social radius set in the "
-            "preview. They are built from different things and answer "
-            "different questions, and neither is derived from the other:\n"
+        self.chk_export_gbi = QCheckBox("Export Social GBI CSV")
+        self.chk_export_gbi.setChecked(False)
+        self.chk_export_gbi.setToolTip(
+            "FILE: {db}_network_GBI.csv\n"
             "\n"
-            "• network_edgelist.csv  DERIVED FROM the proximity bouts "
-            "file. A per-window aggregate of those same bouts: n_events counts "
-            "bouts (event-based weight), total_duration_s sums their durations "
-            "(time-based), mean_distance averages them. Strictly DIRECT dyadic "
-            "contact: a pair appears only if those two animals were themselves "
-            "within the radius.\n"
+            "An asnipe-style group-by-individual matrix: one row per flocking "
+            "event, one 0/1 column per animal, plus m_sum / f_sum / mf_sum "
+            "counts and the event's start, stop and duration.\n"
             "\n"
-            "• network_GBI.csv  CALCULATED INDEPENDENTLY from the per-second "
-            "pairwise distances, not from the edge list. An asnipe-style "
-            "group-by-individual matrix: one row per chain-rule flocking event "
-            "(A-B and B-C in contact puts A, B and C in ONE group even if A and "
-            "C were never near each other), with m_sum/f_sum/mf_sum. Feeds "
-            "asnipe::get_network(data_format='GBI').\n"
+            "CHAIN RULE: membership is transitive. If A-B are in contact and "
+            "B-C are in contact, then A, B and C are all placed in ONE group - "
+            "even if A and C were never near each other. That is the standard "
+            "gambit-of-the-group convention, and it is what makes this file a "
+            "GBI rather than a list of pairs.\n"
             "\n"
-            "Because of that chain rule, an edge list rebuilt from the GBI is "
-            "NOT the same as this one: it would add pairs that never actually "
-            "met. Rebuild from the proximity bouts instead.\n"
+            "CALCULATED INDEPENDENTLY from the per-second pairwise distances. "
+            "It is NOT derived from the proximity bouts file or from the edge "
+            "list, and needs neither of them ticked.\n"
             "\n"
-            "Requires proximity detection (enabled automatically).")
-        self.chk_social_network.stateChanged.connect(self.on_social_network_toggled)
-        export_layout.addWidget(self.chk_social_network)
+            "Drops straight into R:\n"
+            "    m <- asnipe::get_network(gbi, data_format='GBI',\n"
+            "                             association_index='SRI')\n"
+            "    g <- igraph::graph.adjacency(m, mode='undirected',\n"
+            "                                 weighted=TRUE, diag=FALSE)\n"
+            "\n"
+            "Association indices (SRI/HWI) are computed there, from this "
+            "matrix - they are deliberately not written here.")
+        self.chk_export_gbi.stateChanged.connect(self.on_social_network_toggled)
+        export_layout.addWidget(self.chk_export_gbi)
+
+        self.chk_export_edgelist = QCheckBox("Export Social Edge List CSV")
+        self.chk_export_edgelist.setChecked(False)
+        self.chk_export_edgelist.setToolTip(
+            "FILE: {db}_network_edgelist_{window}h.csv  (e.g. "
+            "T005_network_edgelist_6h.csv - the aggregation window set "
+            "below is part of the name, so runs at different windows sit "
+            "side by side instead of overwriting each other)\n"
+            "\n"
+            "DERIVED FROM the proximity bouts file - it is simply those same "
+            "bouts aggregated per dyad over the time window set below. "
+            "Columns: window_start, window_end, animal1, animal2, sex1, sex2, "
+            "dyad_type, n_events, total_duration_s, mean_distance.\n"
+            "\n"
+            "Weights are contact-derived: n_events counts bouts (event-based) "
+            "and total_duration_s sums their durations (time-based). These are "
+            "NOT association indices - SRI/HWI are properties of the GBI and "
+            "belong to that file's workflow.\n"
+            "\n"
+            "Strictly DIRECT dyadic contact, with NO chain rule: a pair appears "
+            "only if those two animals were themselves within the radius. An "
+            "edge list rebuilt downstream from the GBI is therefore NOT this "
+            "file - transitive grouping would invent dyads that never met.\n"
+            "\n"
+            "Ticking this runs proximity detection even if the bouts CSV above "
+            "is left unticked.")
+        self.chk_export_edgelist.stateChanged.connect(self.on_social_network_toggled)
+        export_layout.addWidget(self.chk_export_edgelist)
 
         # Edge-list resolution. The old export hard-coded two files (whole-trial
         # and per-day); this is the same axis exposed as a single knob, so one
@@ -2728,8 +3762,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_el_window.setSuffix(" h")
         self.spin_el_window.setFixedWidth(90)
         self.spin_el_window.setToolTip(
-            "Time window each row of network_edgelist.csv covers. The edge "
-            "list is simply the proximity bouts aggregated over this window.\n"
+            "Time window each row of the edge list covers, and part of its "
+            "filename ({db}_network_edgelist_6h.csv at 6 h).\n"
             "\n"
             "24 h gives one row per dyad per day; 1 h gives hourly resolution. "
             "Windows are anchored to clock boundaries, so 24 h means real "
@@ -2745,12 +3779,41 @@ class UWBQuickVisualizationWindow(QWidget):
         el_win_row.addStretch()
         self.el_window_widget = QWidget()
         self.el_window_widget.setLayout(el_win_row)
-        self.el_window_widget.setVisible(self.chk_social_network.isChecked())
+        self.el_window_widget.setVisible(self.chk_export_edgelist.isChecked())
         export_layout.addWidget(self.el_window_widget)
 
+        self.chk_export_behavior = QCheckBox("Export Behavior Events CSV")
+        self.chk_export_behavior.setChecked(False)
+        self.chk_export_behavior.setToolTip(
+            "FILE: {db}_behavior_events.csv\n"
+            "\n"
+            "One row per DIRECTED behaviour bout - who did it, to whom, when, "
+            "and for how long. Columns: behavior (chase | displacement), actor, "
+            "target, actor_sex, target_sex, dyad_type, Day, Date, start, stop, "
+            "duration_s.\n"
+            "\n"
+            "This is the only place the direction is recorded. The ethogram "
+            "raster shows that an animal WAS chasing; this shows WHOM it was "
+            "chasing. Proximity bouts, the edge list and the GBI are all "
+            "undirected contact and cannot express it.\n"
+            "\n"
+            "HOW IT IS BUILT. The smoothed track is binned to a regular 1 Hz "
+            "grid and classified in blocks with an overlap margin, exactly as "
+            "the ethogram is. A bout is attributed to the block its onset falls "
+            "in, so one straddling a block boundary is counted exactly once. "
+            "actor is the chaser or the displacer; target is the chased or the "
+            "animal pushed off.\n"
+            "\n"
+            "Chase bouts already carry the minimum-duration filter from the "
+            "Behaviour Detection settings. Displacement bouts run from arrival "
+            "to resolution. Both inherit every threshold from those preview "
+            "controls, so tune them against the live overlay first.\n"
+            "\n"
+            "Contact is NOT included here - it is undirected and already "
+            "exported, in full, as the proximity bouts file.")
+        export_layout.addWidget(self.chk_export_behavior)
 
-
-        self.chk_save_plots = QCheckBox("Save Plots")
+        self.chk_save_plots = QCheckBox("Export Quick Plots")
         self.chk_save_plots.setChecked(False)  # off by default; opt in per run
         self.chk_save_plots.stateChanged.connect(self.on_save_plots_toggled)
         self.chk_save_plots.setToolTip(
@@ -2784,7 +3847,184 @@ class UWBQuickVisualizationWindow(QWidget):
             ("actogram", "Circadian Actogram",
              "Double-plotted 24-hour activity raster showing circadian patterns across days"),
             ("data_quality", "Data Quality Metrics",
-             "Summary table of data gaps, sample counts, and coverage statistics per tag")
+             "Summary table of data gaps, sample counts, and coverage statistics per tag"),
+            ("home_range", "Home Range \u2014 KDE (50% core / 95%)",
+            "Where each animal actually lived, drawn four ways so the "
+            "estimators can be compared directly. One file per animal "
+            "faceted by day, plus a whole-trial overview with every animal "
+            "overlaid.\n"
+            "\n"
+            "KDE 50% (red) and KDE 95% (blue) - KERNEL DENSITY ISOPLETHS.\n"
+            "A 2-D Gaussian kernel density estimate is fitted to that "
+            "animal's fixes and evaluated on a 180x180 grid padded 15% "
+            "beyond the data on each side so the kernel tails are not "
+            "clipped. Bandwidth is Scott's rule (n^(-1/6) scaled by the "
+            "data covariance) - the standard reference bandwidth, "
+            "equivalent to 'href' in most home-range software. Grid cells "
+            "are then sorted by density, high to low, and probability mass "
+            "(density x cell area) is accumulated until it reaches 50% or "
+            "95% of the total; the density at that point is the contour "
+            "level drawn. So the 50% isopleth encloses the smallest area "
+            "accounting for half of all space use (the CORE AREA), and the "
+            "95% isopleth the area accounting for 95% (the HOME RANGE, with "
+            "the outer 5% of the distribution treated as excursions). "
+            "Because these are density-based they may enclose several "
+            "disjoint patches - the honest answer for an animal shuttling "
+            "between a nest and a feeder.\n"
+            "\n"
+            "MCP 100% (yellow dashed) - MINIMUM CONVEX POLYGON.\n"
+            "The convex hull of every fix: the smallest convex shape "
+            "containing them all. Purely geometric, with no notion of how "
+            "intensively space is used. Reported because it is the oldest "
+            "and most comparable metric in the literature, but note it is "
+            "set by the outermost fixes alone, so a single excursion can "
+            "double it, and being convex it necessarily includes ground the "
+            "animal never crossed.\n"
+            "\n"
+            "MCP 95% (green) - PEELED MINIMUM CONVEX POLYGON.\n"
+            "The arithmetic centroid of all fixes is computed, the 5% of "
+            "fixes furthest from it are discarded, and the hull is taken "
+            "over the rest. The centroid is computed once, from the full "
+            "set, and not recomputed after peeling. This is the "
+            "conventional guard against one excursion dominating the "
+            "estimate, which is why MCP 95% is often far smaller than MCP "
+            "100%.\n"
+            "\n"
+            "Areas in m^2 are printed on every panel. KDE areas are "
+            "measured by counting grid cells at or above the contour level "
+            "rather than by measuring the drawn line, so disjoint patches "
+            "are summed correctly. MCP areas use the shoelace formula on "
+            "the hull vertices.\n"
+            "\n"
+            "All panels share one set of axis limits, so range SIZE is "
+            "directly comparable across days and across animals. Computed "
+            "from the filtered + smoothed coordinates. Needs at least 10 "
+            "fixes, and fails gracefully to 'n/a' for an animal that never "
+            "moved (a degenerate cloud has no estimable density).\n"),
+            ("mcp_range", "Home Range \u2014 MCP (95% / 100%)",
+             "Home range as a MINIMUM CONVEX POLYGON, kept separate from "
+             "the KDE plot so the two estimators can be compared side by "
+             "side on the same animals and the same axes.\n"
+             "\n"
+             "FILES: {db}_MCP_{animal}.png (per animal, faceted by day) "
+             "and {db}_MCP_Overview.png (whole trial, every animal).\n"
+             "\n"
+             "MCP 100% (yellow dashed) - the convex hull of every fix: the "
+             "smallest convex shape containing them all. Purely geometric, "
+             "with no notion of how intensively space is used. It is the "
+             "oldest and most comparable metric in the literature, but it "
+             "is set by the outermost fixes alone, so a single excursion "
+             "can double it, and being convex it necessarily includes "
+             "ground the animal never crossed.\n"
+             "\n"
+             "MCP 95% (green solid) - the peeled hull. The arithmetic "
+             "centroid of all fixes is computed, the 5% of fixes furthest "
+             "from it are discarded, and the hull is taken over the rest. "
+             "The centroid is computed once, from the full set, and not "
+             "recomputed after peeling. This is the conventional guard "
+             "against one excursion dominating the estimate, which is why "
+             "95% is often far smaller than 100%.\n"
+             "\n"
+             "Areas use the shoelace formula on the hull vertices and are "
+             "printed on every panel, in m^2.\n"
+             "\n"
+             "WHAT TO COMPARE. Against the KDE plot: a convex hull cannot "
+             "express multiple activity centres, so an animal shuttling "
+             "between a nest and a feeder gets one polygon spanning both "
+             "plus all the ground between, while the KDE splits into "
+             "disjoint patches. Where MCP is much larger than the KDE 95%, "
+             "that gap IS the ground the animal never used.\n"
+             "\n"
+             "Axis limits are shared with every other spatial plot, so "
+             "ranges are directly comparable across days and animals.\n"),
+            ("zone_occupancy", "Zone Occupancy",
+            "How each animal divided its time between the arena zones "
+            "defined in the site XML. Skipped with a message if no XML "
+            "zones are loaded.\n"
+            "\n"
+            "ZONE ASSIGNMENT. Every fix is tested against each zone polygon "
+            "with an even-odd point-in-polygon test, so concave zones "
+            "behave as authored. Zones are tested in XML order and the "
+            "FIRST match wins: where two zones overlap, a fix is credited "
+            "to the earlier one rather than counted twice. Fixes inside no "
+            "zone are collected as 'outside'.\n"
+            "\n"
+            "TIME, NOT FIX COUNTS. Each fix is credited with the real "
+            "interval to the NEXT fix, so a zone where the tag happened to "
+            "report more often does not appear to hold the animal longer. "
+            "The last fix of a series is credited with the median interval, "
+            "since its true dwell is unknown. Intervals are capped at 10x "
+            "the median before summing, so a dropout is not billed to "
+            "whichever zone the tag was last seen in.\n"
+            "\n"
+            "LEFT PANELS: one row per animal, stacked bars showing the "
+            "FRACTION of each clock hour spent in each zone. Bars fill to "
+            "1.0 wherever the animal was tracked at all, so the shape shows "
+            "composition, not coverage - check the Activity Timeline or "
+            "Data Quality plot for coverage.\n"
+            "\n"
+            "RIGHT PANEL: animal x zone matrix of the percentage of that "
+            "animal's total tracked time spent in each zone, over the whole "
+            "recording. Rows sum to 100%. Values below 1% are left "
+            "unlabelled.\n"
+            "\n"
+            "Bar colours are taken from each zone's authored XML colour "
+            "where present, so they match the arena drawing; zones without "
+            "one fall back to a categorical palette. Computed from the "
+            "filtered + smoothed coordinates.\n"),
+            ("behavior_counts", "Behaviour Counts by Day",
+             "How often each animal chased or displaced, and how often it was on the receiving end, per day.\n\nFILE: {db}_BehaviorCounts.png\n\nFour panels: chase and displacement, each split into AS ACTOR (this animal did it) and AS TARGET (it was done to this animal). One line per animal, x = day, y = number of bouts that day. The split is the point - an animal that chases constantly and one that is constantly chased have the same combined total and opposite meanings.\n\nA bout is counted on the day it STARTED. Chases already carry the minimum-duration filter from the detection settings; displacements run from arrival to resolution.\n\nThresholds are inherited from the preview's Behaviour Detection controls. If a behaviour is not being detected at all, the plot is skipped with a message - check the speed summary under those controls, since a chase speed above nearly all observed movement can never fire.\n\nSkipped entirely if no chases or displacements are detected."),
+            ("behavior_matrix", "Behaviour Matrix (who \u2192 whom)",
+             "Who does it to whom: a directed actor x target matrix.\n\nFILE: {db}_BehaviorMatrix.png\n\nOne panel per behaviour (chase, displacement). ROWS are the actor, COLUMNS the target, so cell (i, j) is the number of times i chased or displaced j. Each cell is labelled with the event count and the total seconds those bouts lasted, because many brief chases and one long chase are different findings.\n\nThe matrix is deliberately NOT symmetric, and that is what it is for: the difference between cell (i, j) and cell (j, i) is the dominance signal for that pair. A symmetric contact matrix - which is what the proximity bouts and the GBI give you - cannot show it. The diagonal is greyed out; there are no self-directed bouts.\n\nThresholds are inherited from the preview's Behaviour Detection controls. Skipped if no chases or displacements are detected."),
+            ("ethogram", "Behaviour Ethogram",
+            "The behaviour states from the preview, classified across the "
+            "ENTIRE recording and written out - the detections otherwise "
+            "exist only live in the preview window. Two files: a raster "
+            "over time, and a per-day time budget.\n"
+            "\n"
+            "THRESHOLDS ARE INHERITED FROM THE PREVIEW. Social radius, "
+            "inactive/moving speed split, chase "
+            "distance/speed/angle/duration, heading lag and every "
+            "displacement parameter are taken from the Behaviour Detection "
+            "controls exactly as set there. Tune them in the preview until "
+            "the overlay looks right, then export.\n"
+            "\n"
+            "HOW IT IS COMPUTED. Fixes are binned onto a regular 1 Hz grid, "
+            "one column per animal, and each animal's last known position "
+            "is held forward (up to the staleness limit) - the same held "
+            "track the preview draws, so the plotted states match the "
+            "overlay you tuned against. Speed and heading are measured "
+            "between real fixes using true elapsed time, never between grid "
+            "slots. Classification runs in ~2 h blocks with an overlap "
+            "margin wide enough to warm the lagged terms (heading lag, "
+            "displacement window, staleness limit); the margin is trimmed "
+            "off, so block boundaries do not appear in the output. Blocking "
+            "is what keeps the pairwise (frames x animals x animals) "
+            "geometry from exhausting memory on a multi-day trial.\n"
+            "\n"
+            "STATES. Locomotor: inactive (speed at or below the still "
+            "threshold), moving (above it), no data. Social: contact "
+            "(social circles overlapping, i.e. centres within 2x the social "
+            "radius), chasing/chased, displacing/displaced. An animal "
+            "carries at most one social state per frame; where several "
+            "qualify, the higher-precedence one wins (being displaced "
+            "outranks merely touching).\n"
+            "\n"
+            "RASTER. One row per animal, time along x. Each pixel covers "
+            "several seconds (printed in the title); within a pixel a "
+            "SOCIAL state takes precedence over the locomotor background, "
+            "so brief chases and displacements stay visible rather than "
+            "being averaged away. This means the raster over-represents "
+            "rare social events by design - read the time budget for true "
+            "proportions.\n"
+            "\n"
+            "TIME BUDGET. One panel per day, horizontal bars of the "
+            "percentage of that day's frames in each state, per animal. "
+            "Unlike the raster this is a straight frame count with no "
+            "precedence weighting, so the bars are quantitatively honest. "
+            "'No data' frames are excluded from the bars but still count "
+            "toward the day's denominator, so bars falling short of 100% "
+            "show tracking gaps.\n"),
         ]
         for key, plot_name, plot_desc in plot_types:
             cb = QCheckBox(plot_name)
@@ -2793,7 +4033,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self.plot_type_checkboxes[key] = cb
             plot_types_layout.addWidget(cb)
         self.plot_types_widget.setLayout(plot_types_layout)
-        self.plot_types_widget.setVisible(False)  # hidden until Save Plots is on
+        self.plot_types_widget.setVisible(False)  # hidden until Export Quick Plots is on
         export_layout.addWidget(self.plot_types_widget)
 
         self.svg_option_widget = QWidget()
@@ -2808,17 +4048,22 @@ class UWBQuickVisualizationWindow(QWidget):
         svg_option_layout.addWidget(self.chk_save_svg)
         svg_option_layout.addStretch()
         self.svg_option_widget.setLayout(svg_option_layout)
-        self.svg_option_widget.setVisible(False)  # hidden until Save Plots is on
+        self.svg_option_widget.setVisible(False)  # hidden until Export Quick Plots is on
         export_layout.addWidget(self.svg_option_widget)
 
-        self.chk_save_animation = QCheckBox("Save Tracking Animation")
+        self.chk_save_animation = QCheckBox("Export Tracking Animation")
         self.chk_save_animation.setChecked(False)
         self.chk_save_animation.stateChanged.connect(self.on_save_animation_toggled)
         self.chk_save_animation.setToolTip(
-            "Render an MP4 video of tag TRAJECTORIES over time (the arena view "
-            "with moving markers), from the filtered + smoothed data. This is "
-            "separate from the social-network animation above. "
-            "Can take a long time for multi-day recordings at high quality."
+            "Render an MP4 video of tag TRAJECTORIES over time - the arena "
+            "view with moving markers - from the filtered + smoothed data. "
+            "Trail length, colour-by and tag icon size are inherited from "
+            "the preview, so the video looks like what you tuned there.\n"
+            "\n"
+            "Much slower than the plots: a multi-day recording at high "
+            "quality can take hours. In a batch run every trial's data "
+            "products are finished before any animation starts, so a long "
+            "render never holds up the CSVs."
         )
         export_layout.addWidget(self.chk_save_animation)
 
@@ -2881,12 +4126,12 @@ class UWBQuickVisualizationWindow(QWidget):
         animation_options_layout.addLayout(anim_tagsize_layout)
         self._inherited_rows.append(anim_tagsize_layout)
 
+        # Battery display is inherited from the preview's "Display Tag
+        # Battery Levels". The widget stays alive (the config and run summary
+        # read it, and _sync_export_from_preview writes it) but is not shown.
         self.chk_show_battery_export = QCheckBox("Display Tag Battery Levels")
         self.chk_show_battery_export.setChecked(False)
-        self.chk_show_battery_export.setToolTip(
-            "Show each tag's battery voltage in small black text under its ID "
-            "label in the exported animation. Off by default.")
-        animation_options_layout.addWidget(self.chk_show_battery_export)
+        self.chk_show_battery_export.setVisible(False)
 
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
@@ -2932,33 +4177,63 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_animation_speed.currentTextChanged.connect(self.update_frame_estimate)
         self.combo_animation_fps.currentTextChanged.connect(self.update_frame_estimate)
 
+        # Full first, then the per-day breakdown beneath it: the whole-recording
+        # video is the default output, and the daily option (with its day list)
+        # reads as a subdivision of it.
+        self.chk_full_animation = QCheckBox("Generate full animation (all days)")
+        self.chk_full_animation.setChecked(True)   # on by default (the original behaviour)
+        self.chk_full_animation.setToolTip(
+            "Render one video spanning the whole recording. If daily animations "
+            "are also on AND every day is selected, this is built by simply "
+            "concatenating the daily videos (fast, no re-render); otherwise it "
+            "is rendered from scratch.\n"
+            "\n"
+            "Either route gives the same picture: every clip, daily or full, "
+            "is drawn in one shared arena frame taken from the whole "
+            "recording, so the view never shifts between days.")
+        animation_options_layout.addWidget(self.chk_full_animation)
+
         self.chk_daily_animations = QCheckBox("Generate daily animations (one per day)")
         self.chk_daily_animations.setChecked(False)
         self.chk_daily_animations.stateChanged.connect(self.on_daily_animations_toggled)
         self.chk_daily_animations.setToolTip(
-            "Create a separate MP4 for each calendar day (midnight to midnight) "
-            "instead of one long video for the entire recording."
-        )
+            "Also create a separate MP4 for each calendar day (midnight to "
+            "midnight), on top of - or instead of - the full video above. "
+            "Tick the days you want below.\n"
+            "\n"
+            "These render first; the full video then follows, reusing them "
+            "when every day is selected.")
         animation_options_layout.addWidget(self.chk_daily_animations)
 
         self.daily_animation_days_widget = QWidget()
         daily_days_layout = QVBoxLayout()
         daily_days_layout.setContentsMargins(20, 5, 0, 5)
         self.daily_animation_day_checkboxes = {}
+
+        # Master toggle. Tristate so it can SHOW a partial selection, but a
+        # click is always all-or-nothing - cycling a user through a
+        # third 'partial' state they cannot act on would be noise.
+        self.chk_all_days = QCheckBox("All days")
+        self.chk_all_days.setTristate(True)
+        self.chk_all_days.setChecked(True)
+        self.chk_all_days.setStyleSheet("font-weight: bold;")
+        self.chk_all_days.setToolTip(
+            "Select or clear every day at once.\n"
+            "\n"
+            "Shows a partial mark when only some days are ticked; clicking "
+            "then selects all of them. Clicking again clears all.\n"
+            "\n"
+            "Note that the full animation is only built by concatenating the "
+            "daily videos when EVERY day is selected; with a subset it is "
+            "rendered separately from scratch.")
+        self.chk_all_days.clicked.connect(self.on_all_days_clicked)
+        daily_days_layout.addWidget(self.chk_all_days)
+
         self.daily_days_layout_inner = QVBoxLayout()
         daily_days_layout.addLayout(self.daily_days_layout_inner)
         self.daily_animation_days_widget.setLayout(daily_days_layout)
         self.daily_animation_days_widget.setVisible(False)
         animation_options_layout.addWidget(self.daily_animation_days_widget)
-
-        self.chk_full_animation = QCheckBox("Generate full animation (all days)")
-        self.chk_full_animation.setChecked(True)   # on by default (the original behaviour)
-        self.chk_full_animation.setToolTip(
-            "Also render one video spanning the whole recording. Runs after the "
-            "daily animations. If daily animations are on AND every day is "
-            "selected, this is built by simply concatenating the daily videos "
-            "(fast, no re-render); otherwise it is rendered from scratch.")
-        animation_options_layout.addWidget(self.chk_full_animation)
 
         self.animation_options_widget.setLayout(animation_options_layout)
         self.animation_options_widget.setVisible(False)  # hidden until Save Animation is on
@@ -3055,6 +4330,38 @@ class UWBQuickVisualizationWindow(QWidget):
             "background-color: #d41100; color: white; }")
         batch_btns_row2.addWidget(self.btn_stop_batch)
         batch_layout.addLayout(batch_btns_row2)
+        retry_row = QHBoxLayout()
+        retry_row.setContentsMargins(0, 2, 0, 2)
+        lbl_retry = QLabel("Retry a crashed trial:")
+        lbl_retry.setStyleSheet("font-size: 10px;")
+        retry_row.addWidget(lbl_retry)
+        self.spin_batch_retries = QSpinBox()
+        self.spin_batch_retries.setRange(0, 5)
+        self.spin_batch_retries.setValue(2)
+        self.spin_batch_retries.setSuffix("x")
+        self.spin_batch_retries.setFixedWidth(60)
+        self.spin_batch_retries.setToolTip(
+            "How many times to re-run a trial whose worker process DIED - "
+            "exited on a native fault such as an access violation "
+            "(0xC0000005) or heap corruption (0xC0000374) rather than "
+            "finishing with an error.\n"
+            "\n"
+            "Those faults are non-deterministic: the same trial with the same "
+            "settings often succeeds on the next attempt. Retrying lets an "
+            "unattended queue finish instead of losing a trial to a fault that "
+            "had nothing to do with the data.\n"
+            "\n"
+            "A trial that fails CLEANLY - the worker ran and reported an error, "
+            "such as a missing file or an unreadable table - is NOT retried. "
+            "It would fail the same way every time, and retrying would just "
+            "delay the rest of the queue.\n"
+            "\n"
+            "Each attempt restarts the trial from the beginning in a fresh "
+            "process. Set to 0 to disable.")
+        retry_row.addWidget(self.spin_batch_retries)
+        retry_row.addStretch()
+        batch_layout.addLayout(retry_row)
+
         self.batch_list = QListWidget()
         self.batch_list.setToolTip("Queued databases and their status")
         self.batch_list.setMaximumHeight(120)
@@ -3314,6 +4621,83 @@ class UWBQuickVisualizationWindow(QWidget):
         self._bg_transform_box.setLayout(bg_tf)
         self._bg_transform_box.setEnabled(False)   # enabled once an image loads
         v.addWidget(self._bg_transform_box)
+
+        # ── Tracking XY range ────────────────────────────────────────────
+        # The auto fit frames whatever the loaded preview data covers, which is
+        # now post-trim. This box pins the frame instead, so every preview and
+        # every export share one coordinate window regardless of which animals
+        # were configured or which days were rendered.
+        self._xy_range_box = QGroupBox("Tracking XY range")
+        self._xy_range_box.setToolTip(
+            "Fix the coordinate window used to draw tracks, instead of fitting "
+            "it to whatever data is loaded.\n"
+            "\n"
+            "Off (default): the view is fitted to the data — after per-tag "
+            "active-window trimming, so removing a tag's early fixes narrows "
+            "the frame accordingly — plus the background image, XML zones and "
+            "anchors, with a 5% margin.\n"
+            "\n"
+            "On: the four values below are used verbatim, everywhere — the live "
+            "preview, exported plots and the exported animation. That makes "
+            "frames comparable ACROSS trials, which an auto fit never is: two "
+            "trials in the same arena otherwise get different windows purely "
+            "because their animals ranged differently.\n"
+            "\n"
+            "Values are metres in the Wiser world frame, the same units as the "
+            "background offsets above. Saved with the trial's config.")
+        xy = QGridLayout()
+        xy.setContentsMargins(6, 2, 6, 2)
+
+        self.chk_xy_range = QCheckBox("Set range manually")
+        self.chk_xy_range.setChecked(False)
+        self.chk_xy_range.setToolTip(
+            "Use the fixed range below instead of fitting to the data.")
+        self.chk_xy_range.stateChanged.connect(self.on_xy_range_toggled)
+        xy.addWidget(self.chk_xy_range, 0, 0, 1, 4)
+
+        def _xy_spin(tip):
+            sp = QDoubleSpinBox()
+            sp.setRange(-1000.0, 1000.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.25)
+            sp.setSuffix(" m")
+            sp.setFixedWidth(88)
+            sp.setToolTip(tip)
+            sp.valueChanged.connect(self.on_xy_range_changed)
+            return sp
+
+        xy.addWidget(QLabel("X:"), 1, 0)
+        self.spin_xy_xmin = _xy_spin("Left edge of the drawn area, in metres.")
+        xy.addWidget(self.spin_xy_xmin, 1, 1)
+        xy.addWidget(QLabel("to"), 1, 2)
+        self.spin_xy_xmax = _xy_spin("Right edge of the drawn area, in metres.")
+        xy.addWidget(self.spin_xy_xmax, 1, 3)
+
+        xy.addWidget(QLabel("Y:"), 2, 0)
+        self.spin_xy_ymin = _xy_spin("Bottom edge of the drawn area, in metres.")
+        xy.addWidget(self.spin_xy_ymin, 2, 1)
+        xy.addWidget(QLabel("to"), 2, 2)
+        self.spin_xy_ymax = _xy_spin("Top edge of the drawn area, in metres.")
+        xy.addWidget(self.spin_xy_ymax, 2, 3)
+
+        self.btn_xy_fit = QPushButton("Fit to loaded data")
+        self.btn_xy_fit.setToolTip(
+            "Fill the four values from the data currently loaded in the "
+            "preview (after filtering, smoothing and active-window trimming), "
+            "including the background image and zones, with the same 5% margin "
+            "the auto fit uses. A starting point you can then round off to "
+            "tidy numbers and reuse across trials.")
+        self.btn_xy_fit.clicked.connect(self.fit_xy_range_to_data)
+        xy.addWidget(self.btn_xy_fit, 3, 0, 1, 4)
+
+        self._xy_range_widgets = [self.spin_xy_xmin, self.spin_xy_xmax,
+                                  self.spin_xy_ymin, self.spin_xy_ymax,
+                                  self.btn_xy_fit]
+        self._xy_range_box.setLayout(xy)
+        v.addWidget(self._xy_range_box)
+        # Enabled state only: refreshing the arena here would run before the
+        # rest of the preview pane is built.
+        self._sync_xy_range_enabled()
 
         self.chk_preview_dark = QCheckBox("Dark mode")
         self.chk_preview_dark.setChecked(False)   # light by default
@@ -3579,17 +4963,41 @@ class UWBQuickVisualizationWindow(QWidget):
             row.addStretch()
             return row, sp
 
+        self._beh_groups = []
+
+        def _beh_group(checkbox):
+            """Container holding one detector's settings, shown only when it is on.
+
+            A detector that is switched off cannot affect anything drawn, so
+            its thresholds are noise — and with four detectors' worth of rows
+            always expanded they push the rest of the pane out of view.
+            """
+            holder = QWidget()
+            hl = QVBoxLayout()
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(2)
+            holder.setLayout(hl)
+            bl.addWidget(holder)
+            checkbox.toggled.connect(holder.setVisible)
+            # Initial visibility is applied once the pane is assembled:
+            # bl has no owning widget yet, so the holder is still an
+            # orphan and QWidget.setParent() would clear any shown state
+            # set here, leaving the group stuck hidden until toggled.
+            self._beh_groups.append((checkbox, holder))
+            return hl
+
         # Locomotor
         self.chk_beh_locomotor = QCheckBox("Locomotor state (inactive / moving)")
         self.chk_beh_locomotor.setChecked(True)
         self.chk_beh_locomotor.stateChanged.connect(self.render_preview_frame)
         bl.addWidget(self.chk_beh_locomotor)
+        gl = _beh_group(self.chk_beh_locomotor)
         row, self.spin_still_speed = _beh_spin(
             "Inactive below:", 0.0, 5.0, 0.005, 0.005, 4, " m/s",
             "At or below this speed a tag reads as inactive; above it, moving. "
             "Should sit above the position-noise floor - see the speed summary "
             "below.")
-        bl.addLayout(row)
+        gl.addLayout(row)
 
         # Social overlap
         self.chk_beh_social = QCheckBox("Social overlap")
@@ -3600,6 +5008,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "0.25 m reproduces the existing 0.50 m proximity exactly.")
         self.chk_beh_social.stateChanged.connect(self.render_preview_frame)
         bl.addWidget(self.chk_beh_social)
+        gl = _beh_group(self.chk_beh_social)
         row, self.spin_social_radius = _beh_spin(
             "Social radius:", 0.01, 5.0, 0.25, 0.05, 2, " m",
             "Radius of each animal's social circle. Overlap (contact) occurs "
@@ -3620,7 +5029,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "against your background image.")
         self.combo_circle_color.currentIndexChanged.connect(self.render_preview_frame)
         row.insertWidget(3, self.combo_circle_color)
-        bl.addLayout(row)
+        gl.addLayout(row)
 
         # Chase
         self.chk_beh_chase = QCheckBox("Chasing")
@@ -3630,32 +5039,71 @@ class UWBQuickVisualizationWindow(QWidget):
             "chaser is heading at the target and the target is heading away.")
         self.chk_beh_chase.stateChanged.connect(self.render_preview_frame)
         bl.addWidget(self.chk_beh_chase)
+        gl = _beh_group(self.chk_beh_chase)
         row, self.spin_chase_distance = _beh_spin(
             "Within:", 0.05, 5.0, 0.50, 0.05, 2, " m",
             "Maximum centre-to-centre separation for a chase.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_chase_speed = _beh_spin(
             "Both faster than:", 0.0, 10.0, 0.20, 0.05, 3, " m/s",
             "Both animals must exceed this speed.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_chase_angle = _beh_spin(
             "Heading within:", 5.0, 180.0, 45.0, 5.0, 0, " deg",
             "How closely the chaser must head at the target (and the target "
             "away from the chaser). Larger is more permissive.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_min_chase = _beh_spin(
             "Lasting at least:", 0.0, 60.0, 1.0, 0.5, 1, " s",
             "Minimum bout duration; shorter flickers are discarded.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_heading_lag = _beh_spin(
             "Heading over:", 0.5, 30.0, 3.0, 0.5, 1, " s",
-            "Heading is measured over this lag so it is not dominated by "
-            "per-frame position jitter.")
-        bl.addLayout(row)
+            "The window over which each animal's DIRECTION OF TRAVEL is "
+            "measured. Only chase detection uses it.\n"
+            "\n"
+            "WHAT IT COMPUTES\n"
+            "An animal's heading at any moment is the direction of the "
+            "straight line from where it was this many seconds ago to where "
+            "it is now - the net direction over the window, not the "
+            "frame-to-frame direction. 'Heading within' above is then "
+            "applied to that: the chaser's heading must point at the "
+            "target, and the target's heading must point away.\n"
+            "\n"
+            "Nothing else reads it. Speed is measured between consecutive "
+            "real fixes and ignores this setting; displacement detection "
+            "uses no heading at all (which is why it survives smoothing "
+            "that defeats chase detection); contact is pure distance.\n"
+            "\n"
+            "WHY IT IS ADJUSTABLE\n"
+            "Over a short window an animal barely moves, so the measured "
+            "direction is mostly UWB position noise, the angle test fails "
+            "at random, and real chases are missed. A longer window lets "
+            "genuine travel dominate the jitter.\n"
+            "\n"
+            "Rule of thumb: the animal should cover several times the "
+            "position noise within the window. Travel = the chase speed "
+            "threshold x this setting - at 0.20 m/s and 3 s that is 0.60 m. "
+            "If your tracks wobble by ~0.1 m between fixes, sub-second "
+            "windows are useless and 3-5 s work.\n"
+            "\n"
+            "Measured on a straight 300 s chase at 0.35 m/s: with clean "
+            "data every setting finds ~297 of 300 frames; with 0.10 m of "
+            "per-fix noise, 0.5 s finds 159 and 3 s finds 198; with 0.20 m "
+            "noise, 0.5 s finds 47 and 5 s finds 87.\n"
+            "\n"
+            "COST OF A LONG WINDOW\n"
+            "No heading exists until this much time has elapsed - at the "
+            "start of a recording and after every tracking gap - so no "
+            "chase can be detected there. A 20 s setting blinds the first "
+            "20 s of every segment. Long windows also average through "
+            "turns, so a chase that curves reads as its mean direction "
+            "rather than its current one.\n"
+            "\n"
+            "Set in real seconds and converted using the actual sampling "
+            "interval, so it means the same thing at any preview rate.\n")
+        gl.addLayout(row)
 
-        # One plain-language line instead of raw percentiles: it says whether
-        # the track being classified can actually support the thresholds set
-        # above, which is the question the numbers were there to answer.
         # Displacement
         self.chk_beh_displace = QCheckBox("Displacement (supplant)")
         self.chk_beh_displace.setChecked(True)
@@ -3665,27 +5113,31 @@ class UWBQuickVisualizationWindow(QWidget):
             "survives heavy smoothing where chase detection does not.")
         self.chk_beh_displace.stateChanged.connect(self.render_preview_frame)
         bl.addWidget(self.chk_beh_displace)
+        gl = _beh_group(self.chk_beh_displace)
         row, self.spin_displace_distance = _beh_spin(
             "Arrives within:", 0.05, 5.0, 0.30, 0.05, 2, " m",
             "How close the arriving animal must get for it to count as an arrival.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_displace_loser_speed = _beh_spin(
             "Settled below:", 0.0, 5.0, 0.10, 0.01, 3, " m/s",
             "The resident must be at or below this speed when the other arrives.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_displace_winner_speed = _beh_spin(
             "Arriving above:", 0.0, 5.0, 0.15, 0.01, 3, " m/s",
             "The arriving animal must be moving at least this fast.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_displace_leave = _beh_spin(
             "Resolved past:", 0.1, 10.0, 0.75, 0.05, 2, " m",
             "Separation that counts as the encounter being resolved.")
-        bl.addLayout(row)
+        gl.addLayout(row)
         row, self.spin_displace_window = _beh_spin(
             "Within:", 0.5, 60.0, 5.0, 0.5, 1, " s",
             "How long to wait after the arrival for that resolution.")
-        bl.addLayout(row)
+        gl.addLayout(row)
 
+        # One plain-language line instead of raw percentiles: it says whether
+        # the track being classified can actually support the thresholds set
+        # above, which is the question the numbers were there to answer.
         self.lbl_speed_pcts = QLabel("")
         self.lbl_speed_pcts.setStyleSheet("color: #9fb3c8; font-size: 9px;")
         self.lbl_speed_pcts.setWordWrap(True)
@@ -3696,6 +5148,9 @@ class UWBQuickVisualizationWindow(QWidget):
         bl.addWidget(self.lbl_speed_pcts)
 
         self.behavior_options_widget.setLayout(bl)
+        # Now that every holder has a parent, apply the initial states.
+        for _cb, _holder in self._beh_groups:
+            _holder.setVisible(_cb.isChecked())
         self.behavior_options_widget.setVisible(False)
         v.addWidget(self.behavior_options_widget)
 
@@ -3894,14 +5349,110 @@ class UWBQuickVisualizationWindow(QWidget):
             map_image=self.xml_map_image, map_extent=self.xml_map_extent,
             label="XML (site map)")
 
+    def xy_range(self):
+        """Fixed drawing window as (x_min, x_max, y_min, y_max), or None.
+
+        None means "fit to the data", the default. Returned in metres. An
+        inverted or zero-width range is treated as unset rather than being
+        silently corrected, so a half-typed value cannot collapse the view.
+        """
+        if not getattr(self, 'chk_xy_range', None) or not self.chk_xy_range.isChecked():
+            return None
+        x0, x1 = self.spin_xy_xmin.value(), self.spin_xy_xmax.value()
+        y0, y1 = self.spin_xy_ymin.value(), self.spin_xy_ymax.value()
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (x0, x1, y0, y1)
+
+    def _sync_xy_range_enabled(self):
+        """Grey the range inputs out unless the manual box is ticked."""
+        manual = self.chk_xy_range.isChecked()
+        for w in getattr(self, '_xy_range_widgets', []):
+            w.setEnabled(manual)
+        return manual
+
+    def on_xy_range_toggled(self):
+        manual = self._sync_xy_range_enabled()
+        # Seed the boxes from the current auto fit the first time it is turned
+        # on, so the view does not jump to an arbitrary default.
+        if manual and self.spin_xy_xmax.value() <= self.spin_xy_xmin.value():
+            self.fit_xy_range_to_data(announce=False)
+        self.refresh_preview_arena()
+
+    def on_xy_range_changed(self):
+        if getattr(self, 'chk_xy_range', None) and self.chk_xy_range.isChecked():
+            self.refresh_preview_arena()
+
+    def _auto_xy_extent(self):
+        """(x0, x1, y0, y1) the auto fit would use, or None if nothing to fit.
+
+        Same union the arena builds from: the loaded (trimmed, filtered) track
+        data plus the XML zones, map extent and background image.
+        """
+        xs, ys = [], []
+        if self.preview_x is not None and len(self.preview_x):
+            xs.append(np.asarray(self.preview_x, float).ravel())
+            ys.append(np.asarray(self.preview_y, float).ravel())
+        for z in (self.xml_zones or []):
+            pts = z.get('points')
+            if pts is not None and len(pts):
+                pts = np.asarray(pts, float)
+                xs.append(pts[:, 0]); ys.append(pts[:, 1])
+        if self.xml_map_extent:
+            mx0, mx1, my0, my1 = self.xml_map_extent
+            xs.append(np.array([mx0, mx1])); ys.append(np.array([my0, my1]))
+        bg = self._bg_placed_extent() if self.background_image is not None else None
+        if bg:
+            xs.append(np.array([bg[0], bg[1]])); ys.append(np.array([bg[2], bg[3]]))
+        if not xs:
+            return None
+        xa = np.concatenate(xs); ya = np.concatenate(ys)
+        xa = xa[np.isfinite(xa)]; ya = ya[np.isfinite(ya)]
+        if not len(xa) or not len(ya):
+            return None
+        x0, x1 = float(xa.min()), float(xa.max())
+        y0, y1 = float(ya.min()), float(ya.max())
+        margin = 0.05 * max(x1 - x0, y1 - y0, 1e-6)
+        return (x0 - margin, x1 + margin, y0 - margin, y1 + margin)
+
+    def fit_xy_range_to_data(self, announce=True):
+        """Fill the manual range from what the preview currently covers."""
+        ext = self._auto_xy_extent()
+        if ext is None:
+            if announce:
+                QMessageBox.information(
+                    self, "No Data",
+                    "Load a database and let the preview populate first — the "
+                    "fit is taken from the data currently on screen.")
+            return
+        x0, x1, y0, y1 = ext
+        for sp, val in ((self.spin_xy_xmin, x0), (self.spin_xy_xmax, x1),
+                        (self.spin_xy_ymin, y0), (self.spin_xy_ymax, y1)):
+            sp.blockSignals(True); sp.setValue(val); sp.blockSignals(False)
+        if announce:
+            self.log_message(
+                f"Tracking XY range fitted to loaded data: "
+                f"x {x0:.2f}-{x1:.2f} m, y {y0:.2f}-{y1:.2f} m")
+        self.refresh_preview_arena()
+
     def refresh_preview_arena(self):
         """Rebuild arena geometry for the selected view mode and offsets."""
-        if not hasattr(self, "combo_arena"):
+        if not hasattr(self, "combo_arena") or not hasattr(self, "chk_show_anchors"):
             return
         mode = self.combo_view_mode.currentText()
         dx = self.spin_arena_dx.value()
         dy = self.spin_arena_dy.value()
         arena = None
+
+        fixed = self.xy_range()
+        if fixed is not None:
+            # A pinned window wins over every fitted/builtin arena: the
+            # point is that the frame does not move.
+            fx0, fx1, fy0, fy1 = fixed
+            arena = PreviewArena(width=fx1 - fx0, height=fy1 - fy0,
+                                 origin_x=fx0, origin_y=fy0,
+                                 label="Fixed XY range")
+            arena.anchors = list(self.anchor_positions or [])
 
         if mode == self.VIEW_XML:
             arena = self.build_xml_arena()
@@ -3938,6 +5489,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 arena.origin_x += dx
                 arena.origin_y += dy
 
+        if arena is None:
+            return
         if not self.chk_show_anchors.isChecked():
             arena.anchors = []
 
@@ -4095,12 +5648,59 @@ class UWBQuickVisualizationWindow(QWidget):
             self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
                                 make_current=True)
 
+    def _windowed_bounds(self, bounds):
+        """Narrow (min_ts, max_ts) to the tags' configured active windows.
+
+        Fixes outside a tag's window are trimmed away, so a timeline that
+        still spanned the raw table would open on a stretch where the
+        trimmed tags simply are not there. A tag with no window configured
+        contributes the full data range, so mixing configured and
+        unconfigured tags never hides anything.
+
+        The result is always clamped back inside the data, and falls back
+        to the original bounds if the windows leave nothing.
+        """
+        lo, hi = bounds
+        tags = self.selected_preview_tags()
+        if not tags or not self.tag_identities:
+            return lo, hi
+        try:
+            tz = pytz.timezone(self.combo_timezone.currentText())
+        except Exception:
+            return lo, hi
+
+        starts, stops = [], []
+        for tag in tags:
+            w_start, w_stop = self._tag_window(tag, tz)
+            # No window on this tag -> it can span the whole recording.
+            starts.append(lo if w_start is None
+                          else int(w_start.timestamp() * 1000))
+            stops.append(hi if w_stop is None
+                         else int(w_stop.timestamp() * 1000))
+        if not starts:
+            return lo, hi
+        new_lo = max(lo, min(starts))
+        new_hi = min(hi, max(stops))
+        if new_hi <= new_lo:
+            self.log_message(
+                "Tag active windows leave no overlap with the recording; "
+                "showing the full timeline instead.")
+            return lo, hi
+        return new_lo, new_hi
+
     def _apply_timeline_bounds(self, bounds):
         """Size the timeline slider to (min_ts, max_ts) epoch-ms. Returns success."""
         if not bounds:
             self.lbl_preview_status.setText("No records for the selected tags")
             return False
-        self.preview_t0, self.preview_t1 = bounds
+        raw_lo, raw_hi = bounds
+        # Keep the raw span: widening a window later must be able to grow
+        # the timeline back out, which needs the untrimmed extent.
+        self._preview_raw_bounds = (raw_lo, raw_hi)
+        self.preview_t0, self.preview_t1 = self._windowed_bounds(bounds)
+        if (self.preview_t0, self.preview_t1) != (raw_lo, raw_hi):
+            self.log_message(
+                "Timeline narrowed to the tags' configured active windows.")
         total_s = max(1, (self.preview_t1 - self.preview_t0) // 1000)
         self._timeline_guard = True
         self.slider_timeline.setRange(0, int(total_s))
@@ -4362,6 +5962,66 @@ class UWBQuickVisualizationWindow(QWidget):
         return (self.combo_preview_smoothing.currentText()
                 if hasattr(self, 'combo_preview_smoothing') else 'None')
 
+    def _tag_window(self, tag, tz):
+        """(start, stop) timestamps for a tag's configured active window.
+
+        Returns (None, None) when the tag has no window set. Local wall-clock
+        strings are localized defensively: a DST spring-forward gap or
+        fall-back repeat would otherwise raise and take the whole preview
+        chunk or export with it.
+        """
+        info = (self.tag_identities or {}).get(tag)
+        if not info:
+            return None, None
+        # A bound on 'Follow data' is not applied at all; only an
+        # explicitly limited one trims.
+        start_manual = IdentityAssignmentDialog._mode_of(info, 'start') == 'manual'
+        stop_manual = IdentityAssignmentDialog._mode_of(info, 'stop') == 'manual'
+        if not start_manual and not stop_manual:
+            return None, None
+
+        def _loc(value):
+            try:
+                ts = pd.Timestamp(value)
+            except (ValueError, TypeError):
+                return None
+            if ts is pd.NaT:
+                return None
+            if ts.tzinfo is not None:
+                return ts.tz_convert(tz)
+            try:
+                return ts.tz_localize(tz)
+            except Exception:
+                # Nonexistent (spring forward) or ambiguous (fall back) local
+                # time: take the first valid reading rather than failing.
+                return ts.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
+
+        return (_loc(info['start_time']) if start_manual and 'start_time' in info else None,
+                _loc(info['stop_time']) if stop_manual and 'stop_time' in info else None)
+
+    def _trim_to_tag_window(self, data, tag, tz):
+        """Drop fixes outside the tag's active window set in Configure Identities.
+
+        Those Start/Stop pickers are a data-trimming control, not just
+        metadata: a tag deployed late, recovered early, or swapped mid-trial
+        must contribute nothing outside its window. Applied identically to the
+        preview, the occupancy heatmap and every export, so what the preview
+        shows is what the exported files contain.
+
+        ``data`` must already carry a tz-aware 'Timestamp' column. Returns
+        (trimmed_data, n_removed).
+        """
+        start, stop = self._tag_window(tag, tz)
+        if start is None and stop is None:
+            return data, 0
+        before = len(data)
+        keep = pd.Series(True, index=data.index)
+        if start is not None:
+            keep &= data['Timestamp'] >= start
+        if stop is not None:
+            keep &= data['Timestamp'] <= stop
+        return data[keep], before - int(keep.sum())
+
     def _process_chunk(self, df, idx=None):
         """Filter, smooth and bin one slice into frame arrays, or None if empty.
 
@@ -4388,6 +6048,12 @@ class UWBQuickVisualizationWindow(QWidget):
             # Keep pre-smoothing fixes so the pane can overlay raw vs smoothed
             g['raw_x'] = g['location_x']
             g['raw_y'] = g['location_y']
+            # Trim to the tag's active window BEFORE thresholding and
+            # smoothing, exactly as the export does — otherwise the preview
+            # shows fixes the exported CSV will not contain.
+            g, _dropped = self._trim_to_tag_window(g, tag, tz)
+            if not len(g):
+                continue
             # Threshold BOTH velocity and jump on the raw coordinates, then
             # smooth (see _filter_and_smooth: thresholding velocity on the
             # smoothed track was tried and produced a jumpy result).
@@ -4702,6 +6368,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # The rendered animation should look like the preview it came from.
             self.spin_animation_trail.setValue(self.spin_preview_trail.value())
             self.spin_anim_tag_size.setValue(self.spin_tag_size.value())
+            self.chk_show_battery_export.setChecked(
+                self.chk_show_battery.isChecked())
             # The two combos spell the same option differently ("Sex" vs "sex"),
             # so match case-insensitively rather than failing silently.
             want = self.combo_preview_color.currentText().strip().lower()
@@ -5228,14 +6896,9 @@ class UWBQuickVisualizationWindow(QWidget):
 
                 # Respect the tag's active window and the current filters, so
                 # the heatmap matches what an export would produce.
-                if tag in self.tag_identities:
-                    info = self.tag_identities[tag]
-                    if 'start_time' in info and 'stop_time' in info:
-                        td['Timestamp'] = pd.to_datetime(
-                            td['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
-                        start = pd.Timestamp(info['start_time']).tz_localize(tz)
-                        stop = pd.Timestamp(info['stop_time']).tz_localize(tz)
-                        td = td[(td['Timestamp'] >= start) & (td['Timestamp'] <= stop)]
+                td['Timestamp'] = pd.to_datetime(
+                    td['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
+                td, _dropped = self._trim_to_tag_window(td, tag, tz)
                 if do_filter and len(td) > 0:
                     td['Timestamp'] = pd.to_datetime(
                         td['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
@@ -5683,6 +7346,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_t0 = self.preview_t1 = None
         self.preview_playhead_ms = 0
         self.preview_db_path = None
+        self._tag_range_cache = None   # (key, ranges) for the identity dialog
         self.preview_x = self.preview_y = None
         self.preview_xf = self.preview_yf = None
         self.preview_raw_x = self.preview_raw_y = None
@@ -5715,12 +7379,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_smoothing.setCurrentIndex(0)  # None (default)
         self.spin_rolling_window.setValue(30)
         self.combo_window_units.setCurrentText("Seconds")
-        if hasattr(self, 'spin_preview_window'):
-            self.spin_preview_window.setValue(30)
-            self.combo_preview_window_units.setCurrentText("Seconds")
-        if hasattr(self, 'spin_preview_velocity'):
-            self.spin_preview_velocity.setValue(2.0)
-            self.spin_preview_jump.setValue(2.0)
+        # Every preview-owned setting back to its startup value. This used to
+        # reset only the smoothing window, units and the two thresholds, so
+        # switching databases half-carried the previous trial's analysis over
+        # - smoothing method, behaviour thresholds and the XY range persisted
+        # while their companions were reset. Carrying settings between trials
+        # is now a deliberate choice offered when a database is loaded (see
+        # _offer_inherit_settings), not an accident of which widget happened
+        # to be on this list.
+        self.apply_preview_config(getattr(self, '_preview_defaults', None) or {})
         self.chk_velocity_filter.setChecked(True)
         self.spin_velocity_threshold.setValue(2.0)
         self.chk_jump_filter.setChecked(True)
@@ -5733,7 +7400,9 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
-        self.chk_social_network.setChecked(False)
+        self.chk_export_gbi.setChecked(False)
+        self.chk_export_edgelist.setChecked(False)
+        self.chk_export_behavior.setChecked(False)
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
         self.chk_save_svg.setChecked(False)
@@ -5772,6 +7441,85 @@ class UWBQuickVisualizationWindow(QWidget):
         if not file_path:
             return
         self._load_database_path(file_path)
+
+    # Config keys that describe WHICH trial this is, not HOW it is analysed.
+    # Everything else is inherited, so a setting added later is carried across
+    # trials by default rather than being silently left behind.
+    _TRIAL_SPECIFIC_CONFIG_KEYS = frozenset({
+        'database_path', 'database_name', 'table_name',
+        'selected_tags', 'tag_identities',
+        'background_image_path', 'background_scale_inpx', 'background_offset_m',
+        'arena_zones', 'xml_config', 'sitemap',
+        'fnt_version', 'run_timestamp',
+    })
+    # Preview keys in the same category (nested under config['preview']).
+    _TRIAL_SPECIFIC_PREVIEW_KEYS = frozenset({'arena_source'})
+
+    def _offer_inherit_settings(self):
+        """Ask whether to copy analysis settings from a queued trial.
+
+        Called after a database has finished loading, only when there is a
+        queue to copy from. Silent during batch runs and whenever dialogs are
+        suppressed.
+        """
+        # _suppress_dialogs only swaps out QMessageBox; this is a QDialog,
+        # so it has to check the same flag itself or it would block an
+        # unattended run.
+        if (getattr(self, '_batch_active', False)
+                or getattr(self, '_saved_dialogs', None) is not None):
+            return
+        items = [it for it in getattr(self, '_batch_items', [])
+                 if (it.get('config') or {}) and it.get('path') != self.db_path]
+        if not items:
+            return
+
+        dlg = InheritSettingsDialog(items, os.path.basename(self.db_path), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        idx = dlg.chosen_index()
+        if idx is None or not (0 <= idx < len(items)):
+            return
+        source = items[idx]
+        self.apply_inherited_settings(source.get('config') or {})
+        self.log_message(
+            "Applied tracking/export settings from "
+            f"{os.path.basename(source['path'])}; this trial's tags, "
+            "identities and arena were kept.")
+        self.lbl_config_status.setText(
+            f"Settings copied from {os.path.basename(source['path'])}.")
+        self.lbl_config_status.setVisible(True)
+
+    def apply_inherited_settings(self, source_config):
+        """Overlay another trial's analysis settings onto the loaded database.
+
+        Built as a merge rather than a list of widget assignments: the source's
+        config is taken wholesale, the trial-specific keys are replaced with
+        this database's own values, and the result is replayed through the
+        ordinary config loader. That way there is exactly one place that knows
+        how to turn a config into widget state, so inheritance cannot drift out
+        of step with loading.
+        """
+        if not isinstance(source_config, dict) or not source_config:
+            return
+        current = self.get_config_dict()
+        merged = dict(source_config)
+        for key in self._TRIAL_SPECIFIC_CONFIG_KEYS:
+            if key in current:
+                merged[key] = current[key]
+            else:
+                merged.pop(key, None)
+        merged['preview'] = dict(source_config.get('preview') or {})
+        for key in self._TRIAL_SPECIFIC_PREVIEW_KEYS:
+            cur_preview = current.get('preview') or {}
+            if key in cur_preview:
+                merged['preview'][key] = cur_preview[key]
+            else:
+                merged['preview'].pop(key, None)
+        # The day list belongs to this recording's dates, not the source's.
+        merged.pop('daily_animation_days', None)
+
+        self._pending_config_override = merged
+        self.load_config_if_exists()
 
     def _load_database_path(self, file_path):
         """Load a database by path — shared by the file picker and the batch queue.
@@ -5834,6 +7582,13 @@ class UWBQuickVisualizationWindow(QWidget):
             self.auto_load_background()
             if self.background_image is None and not batch:
                 self.prompt_background_image()
+
+            # Offer to copy analysis settings from a trial already queued.
+            # Deferred to the next event-loop turn rather than called here:
+            # applying them replays the config loader, and re-entering it
+            # from inside this load rebuilds the tag checkboxes that this
+            # frame is still holding - which crashed the process.
+            QTimer.singleShot(0, self._offer_inherit_settings)
 
             return True
 
@@ -6592,12 +8347,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.proximity_threshold_widget.setVisible(False)  # inherited from the preview
 
     def on_social_network_toggled(self):
-        """Show the animation sub-options, and ensure the proximity threshold is
-        visible (social-network output is derived from it)."""
+        """Show the edge-list window only when the edge list is requested.
+
+        The GBI has no sub-options: it is calculated independently of the
+        window, so ticking it changes nothing here. The proximity threshold
+        row stays hidden either way - it is inherited from the preview's
+        social radius.
+        """
         if hasattr(self, 'el_window_widget'):
-            self.el_window_widget.setVisible(self.chk_social_network.isChecked())
-        if self.chk_social_network.isChecked():
-            # Proximity is the source; keep its threshold control visible.
+            self.el_window_widget.setVisible(self.chk_export_edgelist.isChecked())
+        if hasattr(self, 'proximity_threshold_widget'):
             self.proximity_threshold_widget.setVisible(False)
 
     def _recording_span_hours(self):
@@ -6665,16 +8424,53 @@ class UWBQuickVisualizationWindow(QWidget):
         for cb in self.daily_animation_day_checkboxes.values():
             cb.deleteLater()
         self.daily_animation_day_checkboxes.clear()
-        
+
         if not date_strings:
+            self._sync_all_days_checkbox()
             return
         
         # Create checkboxes for each day
         for i, date_str in enumerate(date_strings):
             cb = QCheckBox(f"Day {i+1}: {date_str}")
             cb.setChecked(True)  # Default to all days selected
+            cb.toggled.connect(self._sync_all_days_checkbox)
             self.daily_animation_day_checkboxes[date_str] = cb
             self.daily_days_layout_inner.addWidget(cb)
+        self._sync_all_days_checkbox()
+
+    def on_all_days_clicked(self):
+        """Master toggle: select every day, or clear every day."""
+        boxes = list(self.daily_animation_day_checkboxes.values())
+        if not boxes:
+            self._sync_all_days_checkbox()
+            return
+        # Anything short of "all ticked" means the click selects all; only a
+        # fully selected list is cleared by it.
+        turn_on = not all(cb.isChecked() for cb in boxes)
+        for cb in boxes:
+            cb.blockSignals(True)
+            cb.setChecked(turn_on)
+            cb.blockSignals(False)
+        self._sync_all_days_checkbox()
+
+    def _sync_all_days_checkbox(self, *_):
+        """Reflect the day checkboxes in the master, without re-triggering it."""
+        master = getattr(self, 'chk_all_days', None)
+        if master is None:
+            return
+        boxes = list(self.daily_animation_day_checkboxes.values())
+        n_on = sum(1 for cb in boxes if cb.isChecked())
+        master.blockSignals(True)
+        if not boxes or n_on == len(boxes):
+            master.setCheckState(Qt.Checked)
+        elif n_on == 0:
+            master.setCheckState(Qt.Unchecked)
+        else:
+            master.setCheckState(Qt.PartiallyChecked)
+        master.setText(f"All days ({n_on}/{len(boxes)} selected)"
+                       if boxes else "All days")
+        master.setEnabled(bool(boxes))
+        master.blockSignals(False)
 
     def populate_animation_days(self):
         """Populate day checkboxes based on loaded data (called after preview loads)"""
@@ -6684,6 +8480,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.daily_animation_day_checkboxes.clear()
 
         if self.data is None or 'Timestamp' not in self.data.columns:
+            self._sync_all_days_checkbox()
             return
 
         # Get unique dates
@@ -6696,64 +8493,165 @@ class UWBQuickVisualizationWindow(QWidget):
         
         self.log_message(f"Found {len(dates)} unique days in dataset")
     
+    def _tag_time_ranges(self, db_path, table_name, tags, tz_name):
+        """Observed first/last fix per tag, as formatted local-time strings.
+
+        Runs on a worker thread (no Qt access here). Strategy depends on
+        whether the database carries the preview index on (shortid, timestamp):
+
+        * INDEXED - one bare MIN() and one bare MAX() per tag. SQLite answers
+          each from the index endpoints without reading rows, so the whole
+          thing is a handful of seeks regardless of table size.
+        * NOT INDEXED - a single grouped query over all tags. One full scan is
+          the best available; asking per tag would mean one scan EACH, which
+          measured ~5x slower than the grouped form on a 6 M-row table.
+        """
+        tz = pytz.timezone(tz_name)
+        conn = connect_ro(db_path)
+        try:
+            indexed = bool(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND tbl_name=? "
+                "AND name=? LIMIT 1",
+                (table_name, PreviewIndexBuilder.INDEX_NAME)).fetchone())
+            raw = {}
+            if indexed:
+                for tag in tags:
+                    lo = conn.execute(
+                        f"SELECT MIN(timestamp) FROM {table_name} WHERE shortid=?",
+                        (tag,)).fetchone()[0]
+                    if lo is None:
+                        continue
+                    hi = conn.execute(
+                        f"SELECT MAX(timestamp) FROM {table_name} WHERE shortid=?",
+                        (tag,)).fetchone()[0]
+                    raw[tag] = (lo, hi)
+            else:
+                placeholders = ','.join(['?'] * len(tags))
+                for tag, lo, hi in conn.execute(
+                        f"SELECT shortid, MIN(timestamp), MAX(timestamp) "
+                        f"FROM {table_name} WHERE shortid IN ({placeholders}) "
+                        f"GROUP BY shortid", list(tags)):
+                    if lo is not None:
+                        raw[tag] = (lo, hi)
+        finally:
+            conn.close()
+
+        out = {}
+        for tag, (lo, hi) in raw.items():
+            out[tag] = {
+                'start': pd.Timestamp(lo, unit='ms', tz='UTC').tz_convert(tz)
+                           .strftime('%Y-%m-%d %H:%M:%S'),
+                'end': pd.Timestamp(hi, unit='ms', tz='UTC').tz_convert(tz)
+                         .strftime('%Y-%m-%d %H:%M:%S'),
+            }
+        return out
+
     def open_identity_dialog(self):
-        """Open dialog to assign identities to tags"""
+        """Open the dialog to assign identities to the selected tags.
+
+        The per-tag first/last-fix lookup that seeds the time pickers used to
+        run inline on the GUI thread against the ORIGINAL database, which meant
+        a full table scan (no index on shortid) with every page pulled over the
+        network — tens of seconds of frozen window on a large trial. It now runs
+        on a worker thread, against the indexed preview copy when one exists,
+        and the result is cached so reopening the dialog is instant.
+        """
         if not self.available_tags:
             QMessageBox.warning(self, "No Tags", "Please load a database and table first")
             return
 
-        # Get only selected tags
         selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
         if not selected_tags:
             QMessageBox.warning(self, "No Tags Selected", "Please select at least one tag")
             return
 
-        # Query per-tag time ranges from database
-        tag_time_ranges = {}
-        try:
-            tz = pytz.timezone(self.combo_timezone.currentText())
-            conn = connect_ro(self.db_path)
-            placeholders = ','.join(['?'] * len(selected_tags))
-            query = f"SELECT shortid, MIN(timestamp) as first_ts, MAX(timestamp) as last_ts FROM {self.table_name} WHERE shortid IN ({placeholders}) GROUP BY shortid"
-            cursor = conn.execute(query, selected_tags)
-            for row in cursor:
-                tag_id, first_ts, last_ts = row
-                # Convert ms timestamps to timezone-aware datetimes
-                first_dt = pd.Timestamp(first_ts, unit='ms', tz='UTC').tz_convert(tz)
-                last_dt = pd.Timestamp(last_ts, unit='ms', tz='UTC').tz_convert(tz)
-                tag_time_ranges[tag_id] = {
-                    'start': first_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    'end': last_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                }
-            conn.close()
-        except Exception as e:
-            self.log_message(f"Warning: Could not query tag time ranges: {str(e)}")
+        # Prefer the indexed copy the preview builds; it turns the scan into
+        # index seeks. Falls back to the original when no copy exists yet.
+        db = self.preview_db_path or self.db_path
+        tz_name = self.combo_timezone.currentText()
+        key = (db, self.table_name, tuple(sorted(selected_tags)), tz_name)
+        cached = getattr(self, '_tag_range_cache', None)
+        if cached is not None and cached[0] == key:
+            self._show_identity_dialog(selected_tags, cached[1])
+            return
 
-        dialog = IdentityAssignmentDialog(selected_tags, self.tag_identities, tag_time_ranges, self)
-        if dialog.exec_() == QDialog.Accepted:
-            self.tag_identities = dialog.get_identities()
-            self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
-            # Snapshot the export-details JSON to the analysis folder now, so it
-            # exists and reflects the just-applied identities before any export.
-            self.write_live_config()
-            # Update tag checkbox labels to reflect new identities
-            self.update_tag_labels()
-            # Recolour preview markers by the newly-assigned sex (blue=M, red=F)
-            if self._preview_active and self.preview_tags:
-                self.preview_colors = self._preview_tag_colors(self.preview_tags)
-                self.render_preview_frame()
-            self.lbl_status.setText(f"Identity assignments saved for {len(self.tag_identities)} tags")
-            
-            # Auto-save configuration to JSON
-            if self.db_path:
-                db_dir = os.path.dirname(self.db_path)
-                db_filename = os.path.basename(self.db_path)
-                db_name = os.path.splitext(db_filename)[0]
-                output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
-                os.makedirs(output_dir, exist_ok=True)
-                self.save_config(output_dir)
-                self.log_message("✓ Configuration auto-saved to JSON")
-    
+        if getattr(self, '_identity_query_running', False):
+            return                      # a lookup is already in flight
+        self._identity_query_running = True
+        self.btn_assign_identities.setEnabled(False)
+        self.btn_assign_identities.setText("Reading tag time ranges…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        table_name = self.table_name
+
+        def _query():
+            return self._tag_time_ranges(db, table_name, selected_tags, tz_name)
+
+        def _done(ranges):
+            self._identity_query_running = False
+            self._tag_range_cache = (key, ranges)
+            self._restore_identity_button()
+            self._show_identity_dialog(selected_tags, ranges)
+
+        def _failed(err):
+            self._identity_query_running = False
+            self._restore_identity_button()
+            self.log_message(f"Warning: Could not query tag time ranges: {err}")
+            # The ranges only seed the pickers' defaults, so a failure must not
+            # block identity assignment.
+            self._show_identity_dialog(selected_tags, {})
+
+        self._start_db_query(_query, _done, _failed)
+
+    def _retime_preview_for_identities(self):
+        """Resize the timeline and drop cached chunks after a window change."""
+        if getattr(self, '_preview_raw_bounds', None):
+            keep = self.preview_playhead_ms
+            if self._apply_timeline_bounds(self._preview_raw_bounds):
+                # Keep the playhead where it was when it is still in range.
+                self.preview_playhead_ms = min(max(keep, self.preview_t0),
+                                               self.preview_t1)
+                self._sync_timeline_to_playhead()
+        self.invalidate_preview_cache()
+
+    def _restore_identity_button(self):
+        QApplication.restoreOverrideCursor()
+        self.btn_assign_identities.setText("Configure Identities...")
+        self.btn_assign_identities.setEnabled(
+            any(cb.isChecked() for cb in self.tag_checkboxes.values()))
+
+    def _show_identity_dialog(self, selected_tags, tag_time_ranges):
+        """Run the dialog and apply the result. Ranges are already resolved."""
+        dialog = IdentityAssignmentDialog(selected_tags, self.tag_identities,
+                                          tag_time_ranges, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self.tag_identities = dialog.get_identities()
+        self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
+        # The active windows just changed: cached chunks were built under the
+        # old ones and the timeline may now cover a different span.
+        self._retime_preview_for_identities()
+        # Snapshot the export-details JSON to the analysis folder now, so it
+        # exists and reflects the just-applied identities before any export.
+        self.write_live_config()
+        # Update tag checkbox labels to reflect new identities
+        self.update_tag_labels()
+        # Recolour preview markers by the newly-assigned sex (blue=M, red=F)
+        if self._preview_active and self.preview_tags:
+            self.preview_colors = self._preview_tag_colors(self.preview_tags)
+            self.render_preview_frame()
+        self.lbl_status.setText(f"Identity assignments saved for {len(self.tag_identities)} tags")
+
+        # Auto-save configuration to JSON
+        if self.db_path:
+            db_dir = os.path.dirname(self.db_path)
+            db_filename = os.path.basename(self.db_path)
+            db_name = os.path.splitext(db_filename)[0]
+            output_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis")
+            os.makedirs(output_dir, exist_ok=True)
+            self.save_config(output_dir)
+            self.log_message("✓ Configuration auto-saved to JSON")
+
     def stop_export(self):
         """Cancel ongoing export operations"""
         self.export_cancelled = True
@@ -6790,14 +8688,31 @@ class UWBQuickVisualizationWindow(QWidget):
         db_path = self.db_path
         table = self.table_name
 
+        # A batch job already carries the tag list in its captured config, and
+        # only needs the day list when it is rendering per-day animations.
+        # Re-deriving either means a DISTINCT scan of the whole table; on a
+        # multi-GB Wiser database over SMB that is tens of seconds of network
+        # I/O per trial, and it is where a worker died with an access
+        # violation. Skip whatever the config can answer.
+        cfg = getattr(self, '_loaded_config', None) or {}
+        batch = getattr(self, '_batch_active', False)
+        known_tags = list(cfg.get('selected_tags') or []) if batch else []
+        needs_days = bool(cfg.get('daily_animations')) and bool(cfg.get('save_animation'))
+
         def _query():
-            conn = connect_ro(db_path)
+            if known_tags and not needs_days:
+                return {'db_path': db_path, 'table': table,
+                        'tags': known_tags, 'days': []}
+            # An indexed copy, when one exists, turns the tag DISTINCT into an
+            # index scan instead of a full table read.
+            conn = connect_ro(self.preview_db_path or db_path)
             try:
-                tags = [r[0] for r in conn.execute(
+                tags = known_tags or [r[0] for r in conn.execute(
                     f"SELECT DISTINCT shortid FROM {table} ORDER BY shortid")]
                 days = [r[0] for r in conn.execute(
                     "SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), "
-                    f"'localtime') FROM {table} ORDER BY 1")]
+                    f"'localtime') FROM {table} ORDER BY 1")] if (
+                        needs_days or not batch) else []
             finally:
                 conn.close()
             return {'db_path': db_path, 'table': table, 'tags': tags, 'days': days}
@@ -6805,7 +8720,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # In an unattended batch there is no UI to keep responsive, and the
         # background worker + preview timers race with the fast sequential trial
         # stepping — so load synchronously and skip the async path entirely.
-        if getattr(self, '_batch_active', False):
+        if batch:
+            if known_tags and not needs_days:
+                self.log_message(
+                    f"Using the {len(known_tags)} tag(s) captured with this job; "
+                    "skipping the full-table tag/day scan.")
             try:
                 self._on_tags_days_loaded(_query())
             except Exception as e:
@@ -7166,8 +9085,17 @@ class UWBQuickVisualizationWindow(QWidget):
         return summary
 
     def get_config_dict(self):
-        """Get current configuration as dictionary"""
+        """Get current configuration as dictionary.
+
+        Syncs the hidden export widgets from the preview first: the preview
+        is the single source of truth for filtering/smoothing, and the
+        top-level keys below are read from the export mirrors. Without this
+        a config written outside the export path (e.g. write_live_config
+        after assigning identities) could record stale mirror values that
+        disagree with the pane the user is looking at.
+        """
         from datetime import datetime
+        self._sync_export_from_preview()
         config = {
             'fnt_version': get_fnt_version(),
             'run_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -7200,7 +9128,9 @@ class UWBQuickVisualizationWindow(QWidget):
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
-            'export_social_network': self.chk_social_network.isChecked(),
+            'export_gbi': self.chk_export_gbi.isChecked(),
+            'export_edgelist': self.chk_export_edgelist.isChecked(),
+            'export_behavior_events': self.chk_export_behavior.isChecked(),
             'edgelist_window_h': self.spin_el_window.value(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
@@ -7257,6 +9187,39 @@ class UWBQuickVisualizationWindow(QWidget):
         'arena_source': ('combo_arena', 'text'),
         'show_background': ('chk_show_background', 'checked'),
         'show_anchors': ('chk_show_anchors', 'checked'),
+        'show_zones': ('chk_show_zones', 'checked'),
+        'show_tracking': ('chk_show_tracking', 'checked'),
+        'show_tag_id': ('chk_show_tag_id', 'checked'),
+        'tag_id_type': ('combo_tag_id_type', 'text'),
+        'show_battery': ('chk_show_battery', 'checked'),
+        'time_gap': ('spin_time_gap', 'value'),
+        # Pinned drawing window. Persisted here because it now governs the
+        # exports too, so a trial must reopen framed the way it was exported.
+        'xy_range_manual': ('chk_xy_range', 'checked'),
+        'xy_xmin': ('spin_xy_xmin', 'value'),
+        'xy_xmax': ('spin_xy_xmax', 'value'),
+        'xy_ymin': ('spin_xy_ymin', 'value'),
+        'xy_ymax': ('spin_xy_ymax', 'value'),
+        # Behaviour detection. These drive the preview overlay AND the
+        # exported ethogram, so a trial must reopen with the thresholds it
+        # was tuned and exported with.
+        'show_behavior': ('chk_show_behavior', 'checked'),
+        'beh_locomotor': ('chk_beh_locomotor', 'checked'),
+        'beh_social': ('chk_beh_social', 'checked'),
+        'beh_chase': ('chk_beh_chase', 'checked'),
+        'beh_displace': ('chk_beh_displace', 'checked'),
+        'social_radius': ('spin_social_radius', 'value'),
+        'still_speed': ('spin_still_speed', 'value'),
+        'chase_distance': ('spin_chase_distance', 'value'),
+        'chase_speed': ('spin_chase_speed', 'value'),
+        'chase_angle_deg': ('spin_chase_angle', 'value'),
+        'min_chase_s': ('spin_min_chase', 'value'),
+        'heading_lag_s': ('spin_heading_lag', 'value'),
+        'displace_distance': ('spin_displace_distance', 'value'),
+        'displace_loser_speed': ('spin_displace_loser_speed', 'value'),
+        'displace_winner_speed': ('spin_displace_winner_speed', 'value'),
+        'displace_leave_distance': ('spin_displace_leave', 'value'),
+        'displace_window_s': ('spin_displace_window', 'value'),
         # NOTE: the preview tag marker size persists separately as the
         # top-level 'preview_tag_size' key (kept for config compatibility).
     }
@@ -7275,6 +9238,65 @@ class UWBQuickVisualizationWindow(QWidget):
             else:
                 out[key] = w.isChecked()
         return out
+
+    # Pre-consolidation config keys -> the preview widget that now owns them.
+    # Only consulted when config['preview'] does not already carry the setting.
+    _LEGACY_PREVIEW_KEYS = {
+        'smoothing_method': ('smoothing', 'combo_preview_smoothing', 'text'),
+        'rolling_window': ('window', 'spin_preview_window', 'value'),
+        'rolling_window_units': ('window_units', 'combo_preview_window_units', 'text'),
+        'velocity_filter': ('velocity_filter', 'chk_preview_velocity', 'checked'),
+        'velocity_threshold': ('velocity_threshold', 'spin_preview_velocity', 'value'),
+        'jump_filter': ('jump_filter', 'chk_preview_jump', 'checked'),
+        'jump_threshold': ('jump_threshold', 'spin_preview_jump', 'value'),
+        'color_by': ('color_by', 'combo_preview_color', 'text'),
+        'animation_trail': ('trail_seconds', 'spin_preview_trail', 'value'),
+    }
+
+    def _backfill_preview_from_legacy(self, config):
+        """Seed the preview pane from a config written before consolidation.
+
+        Each entry is applied only when the nested 'preview' block does not
+        already define it, so a current config always wins. Combo values are
+        matched case-insensitively and normalised the same way the export
+        loader does, so old smoothing labels still resolve.
+        """
+        preview = config.get('preview') or {}
+        for legacy_key, (preview_key, attr, kind) in self._LEGACY_PREVIEW_KEYS.items():
+            if preview_key in preview or legacy_key not in config:
+                continue
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            value = config[legacy_key]
+            try:
+                if kind == 'text':
+                    want = str(value).replace(" (default)", "")
+                    if want == "Forward-Backward EWMA":
+                        want = ("Forward-Backward Exponentially Weighted "
+                                "Moving Average")
+                    idx = next(
+                        (i for i in range(w.count())
+                         if w.itemText(i).replace(" (default)", "").strip().lower()
+                         == want.strip().lower()), -1)
+                    if idx >= 0:
+                        w.setCurrentIndex(idx)
+                elif kind == 'value':
+                    w.setValue(type(w.value())(value))
+                else:
+                    w.setChecked(bool(value))
+            except Exception:
+                continue
+
+        # The social radius is stored as the export's centre-to-centre
+        # proximity threshold; the preview owns half of it.
+        if ('social_radius' not in preview and 'proximity_threshold' in config
+                and getattr(self, 'spin_social_radius', None) is not None):
+            try:
+                self.spin_social_radius.setValue(
+                    float(config['proximity_threshold']) / 2.0)
+            except (TypeError, ValueError):
+                pass
 
     def apply_preview_config(self, cfg):
         """Restore preview settings saved by get_preview_config.
@@ -7446,6 +9468,13 @@ class UWBQuickVisualizationWindow(QWidget):
             # existed, in which case the preview simply keeps its defaults.
             if 'preview' in config:
                 self.apply_preview_config(config['preview'])
+            # Configs written before these settings moved into the preview
+            # pane carry them only as top-level export keys. Without this the
+            # visible controls would show defaults while the export mirrors
+            # held the real values - and the next _sync_export_from_preview
+            # would then overwrite those real values with the defaults,
+            # silently discarding the trial's smoothing settings.
+            self._backfill_preview_from_legacy(config)
 
             if 'show_battery' in config:
                 self.chk_show_battery.setChecked(config['show_battery'])
@@ -7476,8 +9505,17 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'proximity_threshold' in config:
                 self.spin_proximity_threshold.setValue(config['proximity_threshold'])
 
+            # 'export_social_network' is the pre-split key: one checkbox used
+            # to drive both files, so an old config restores both.
             if 'export_social_network' in config:
-                self.chk_social_network.setChecked(config['export_social_network'])
+                self.chk_export_gbi.setChecked(config['export_social_network'])
+                self.chk_export_edgelist.setChecked(config['export_social_network'])
+            if 'export_gbi' in config:
+                self.chk_export_gbi.setChecked(config['export_gbi'])
+            if 'export_edgelist' in config:
+                self.chk_export_edgelist.setChecked(config['export_edgelist'])
+            if 'export_behavior_events' in config:
+                self.chk_export_behavior.setChecked(config['export_behavior_events'])
             if 'edgelist_window_h' in config:
                 self.spin_el_window.setValue(float(config['edgelist_window_h']))
             self.on_social_network_toggled()
@@ -7665,6 +9703,18 @@ class UWBQuickVisualizationWindow(QWidget):
                                 self.log_message(f"Warning: Could not move {anim_file}: {move_err}")
                     self.log_message(f"Migrated {moved} file(s) into subfolders")
 
+            # The preview pane is now authoritative for filtering and
+            # smoothing, so push the just-restored values onto the hidden
+            # export mirrors. Without this the mirrors keep whatever the
+            # top-level keys set, and the two disagree until the next
+            # preview edit.
+            self._sync_export_from_preview()
+            self.invalidate_preview_cache()
+            # Kept so later steps can reuse what the config already knows
+            # instead of re-deriving it from the database (see
+            # load_tags_from_table).
+            self._loaded_config = config
+
             return True
 
         except Exception as e:
@@ -7765,26 +9815,64 @@ class UWBQuickVisualizationWindow(QWidget):
             'use_identities': bool(self.tag_identities),
         }
 
-    def _export_social_network(self, events, bouts, output_dir, db_name, *,
-                               write_csvs, skip_existing):
-        """Write the social-network CSVs.
+    def _edgelist_filename(self, db_name):
+        """Edge-list filename, stamped with the aggregation window.
 
-        ``events`` = per-second pairwise distances (for the chain-rule GBI);
-        ``bouts`` = pairwise proximity bouts (for the edge lists). Both come
-        from proximity detection, so every network product inherits the same
-        social-radius threshold the preview draws.
+        The window changes what the rows MEAN (one per dyad per day at 24 h,
+        per hour at 1 h), so two runs at different settings are different
+        products rather than versions of one file. Putting the window in the
+        name lets them coexist in the analysis folder, and stops a re-run at
+        a new window from silently overwriting the old one.
+        """
+        # ':g' keeps whole hours clean (6h, not 6.0h) while still allowing
+        # a fractional window (1.5h).
+        return f'{db_name}_network_edgelist_{self.spin_el_window.value():g}h.csv'
+
+    def _export_behavior_events(self, csv_path, selected_tags):
+        """Directed chase/displacement bouts from the exported smoothed CSV.
+
+        Borrows PlotSaverWorker's classifier rather than duplicating it, so the
+        CSV and the behaviour plots can never disagree about what fired.
+        """
+        df = pd.read_csv(csv_path, low_memory=False)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], format='mixed')
+        tags = sorted(t for t in df['shortid'].unique()
+                      if not selected_tags or t in selected_tags)
+        worker = PlotSaverWorker(
+            self.db_path, self.table_name, tags, False, "None",
+            plot_types={}, tag_identities=self.tag_identities,
+            use_identities=bool(self.tag_identities),
+            behavior_params=self._behavior_params())
+        worker.progress.connect(self.log_message)
+        return worker.behavior_events_frame(df, tags, tz=df['Timestamp'].dt.tz)
+
+    def _export_social_network(self, events, bouts, output_dir, db_name, *,
+                               write_gbi, write_edgelist, skip_existing):
+        """Write the requested social-network CSVs.
+
+        ``events`` = per-second pairwise distances, which the chain-rule GBI
+        is built from; ``bouts`` = pairwise proximity bouts, which the edge
+        list aggregates. Both come from proximity detection, so every network
+        product inherits the same social-radius threshold the preview draws -
+        but the two files are computed from different inputs and either can
+        be requested without the other.
         """
         from fnt.uwb import social_network as SN
 
-        if not write_csvs:
-            return
-        window_h = self.spin_el_window.value()
-        self.log_message(
-            f"Building social network CSVs (edge list @ {window_h:g} h windows + GBI)...")
-        gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
-        edgelist = SN.build_edgelist(bouts, self.tag_identities, window_hours=window_h)
-        for fname, df in ((f'{db_name}_network_edgelist.csv', edgelist),
-                          (f'{db_name}_network_GBI.csv', gbi)):
+        outputs = []
+        if write_gbi:
+            self.log_message("Building chain-rule GBI from per-second distances...")
+            outputs.append((f'{db_name}_network_GBI.csv',
+                            SN.build_gbi(events, self.tag_identities,
+                                         gap_s=5, min_group=2)))
+        if write_edgelist:
+            window_h = self.spin_el_window.value()
+            self.log_message(
+                f"Aggregating proximity bouts into a {window_h:g} h edge list...")
+            outputs.append((self._edgelist_filename(db_name),
+                            SN.build_edgelist(bouts, self.tag_identities,
+                                              window_hours=window_h)))
+        for fname, df in outputs:
             path = os.path.join(output_dir, fname)
             if skip_existing and os.path.exists(path):
                 self.log_message(f"Skipped (exists): {fname}")
@@ -7991,6 +10079,21 @@ class UWBQuickVisualizationWindow(QWidget):
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
             daily_paths = []   # final daily video paths in day order (for concat)
 
+            # ONE set of axis limits, spanning the whole recording, used by
+            # every render below. Letting each daily video compute its own
+            # min/max made the arena shift slightly from day to day, so the
+            # concatenated result jumped at each day boundary and did not
+            # match a from-scratch full render. Computed after the tag subset
+            # is applied so excluded animals do not stretch the frame.
+            _, bg_extent_for_limits = self._context_bg_source()
+            axis_limits = self.xy_range() or uwb_animation.compute_axis_limits(
+                anim_data, self.plot_layers, bg_extent_for_limits)
+            self.log_message(
+                ("Animation frame (fixed XY range): " if self.xy_range()
+                 else "Animation frame (shared by every clip): ") +
+                f"x {axis_limits[0]:.2f}–{axis_limits[1]:.2f} m, "
+                f"y {axis_limits[2]:.2f}–{axis_limits[3]:.2f} m")
+
             # ---- Daily animations (one per selected day) ----
             if generate_daily:
                 selected_days = s['selected_days']
@@ -8016,7 +10119,8 @@ class UWBQuickVisualizationWindow(QWidget):
                             day_data, temp_frames_dir, frame_interval, trailing_window,
                             fps, color_by, s['use_identities'],
                             total_export_steps, current_export_step,
-                            day_suffix=f"_Day{day_idx + 1}_{date_str}", speed_text=speed_text)
+                            day_suffix=f"_Day{day_idx + 1}_{date_str}", speed_text=speed_text,
+                            axis_limits=axis_limits)
                         if video_path and not self.export_cancelled:
                             final_video_path = os.path.join(
                                 animations_dir,
@@ -8049,7 +10153,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     video_path = self.create_animation_frames(
                         anim_data, temp_frames_dir, frame_interval, trailing_window,
                         fps, color_by, s['use_identities'],
-                        total_export_steps, current_export_step, speed_text=speed_text)
+                        total_export_steps, current_export_step, speed_text=speed_text,
+                        axis_limits=axis_limits)
                     if video_path and not self.export_cancelled and os.path.exists(video_path):
                         shutil.move(video_path, full_path)
                         self.log_message(f"✓ Full animation saved: {os.path.basename(full_path)}")
@@ -8091,7 +10196,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def create_animation_frames(self, data, output_dir, frame_interval, trailing_window,
                                fps, color_by, use_custom_identities=False,
-                               total_export_steps=1, current_export_step=1, day_suffix="", speed_text=""):
+                               total_export_steps=1, current_export_step=1, day_suffix="",
+                               speed_text="", axis_limits=None):
         """Render one animation video via the shared ``uwb_animation`` core.
 
         This is a thin adapter: it gathers the GUI-held settings (quality/DPI,
@@ -8124,7 +10230,7 @@ class UWBQuickVisualizationWindow(QWidget):
             arena_zones=self.arena_zones, anchors=self.anchor_positions,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
             color_by=color_by, marker_size=s['tag_size'],
-            show_battery=s['show_battery'],
+            show_battery=s['show_battery'], axis_limits=axis_limits,
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
@@ -8215,7 +10321,9 @@ class UWBQuickVisualizationWindow(QWidget):
             if cfg.get('save_plots'): outs.append('plots')
             if cfg.get('save_animation'): outs.append('anim')
             if cfg.get('proximity_detection'): outs.append('prox')
-            if cfg.get('export_social_network'): outs.append('SNA')
+            if cfg.get('export_gbi'): outs.append('GBI')
+            if cfg.get('export_edgelist'): outs.append('EL')
+            if cfg.get('export_behavior_events'): outs.append('behav')
             ntags = len(cfg.get('selected_tags', []))
             summary = f"{ntags} tags · {', '.join(outs) or 'no outputs'}"
             self.batch_list.addItem(
@@ -8283,6 +10391,8 @@ class UWBQuickVisualizationWindow(QWidget):
             self._batch_temp_frames_dir = chosen
 
         self._sync_export_from_preview()      # export inherits the preview
+        # (job index, phase) -> attempts made this run.
+        self._batch_attempts = {}
         for it in self._batch_items:          # fresh run: reset all statuses
             it['status'] = 'Queued'
             # Clear last run's outcome too. This flag suppresses a trial's
@@ -8318,8 +10428,63 @@ class UWBQuickVisualizationWindow(QWidget):
         self.log_message(
             f"BATCH START: {len(self._batch_items)} database(s) — "
             f"data products first, then {len(anim_idx)} animation render(s)")
+        self._log_batch_settings()
         self._refresh_batch_list()
         QTimer.singleShot(0, self._batch_step)
+
+    # Config keys too bulky to be worth pasting into a bug report, replaced by
+    # a one-line summary. Everything else is written out in full.
+    _LOG_SUMMARISE_KEYS = ('arena_zones', 'xml_config', 'tag_identities')
+
+    def _loggable_config(self, cfg):
+        """A copy of a job's config with the bulky keys reduced to a summary.
+
+        Zone polygons and the XML anchor dump run to hundreds of coordinate
+        pairs; identities can be dozens of records. Pasting those verbatim
+        buries the settings someone is actually trying to read.
+        """
+        out = {}
+        for key, value in (cfg or {}).items():
+            if key not in self._LOG_SUMMARISE_KEYS or value in (None, [], {}):
+                out[key] = value
+                continue
+            if key == 'tag_identities':
+                # Keep the part that changes behaviour (which tags, and their
+                # active windows); drop nothing else of consequence.
+                out[key] = {
+                    str(t): (f"{v.get('sex', '?')}{v.get('identity', '?')} "
+                             f"{v.get('start_time', '-')} → {v.get('stop_time', '-')}")
+                    for t, v in (value or {}).items()}
+            elif key == 'arena_zones':
+                names = sorted({r.get('zone') for r in value if isinstance(r, dict)})
+                out[key] = f"<{len(names)} zone(s): {', '.join(n for n in names if n)}>"
+            else:
+                out[key] = f"<{type(value).__name__} omitted from the log>"
+        return out
+
+    def _log_batch_settings(self):
+        """Write each queued job's settings into the session log.
+
+        Dumped at batch start so the log a user copies is self-contained: the
+        run and the exact settings that produced it are in one paste, without
+        having to go and find the fnt_config.json of every trial. These are the
+        settings CAPTURED when each job was added to the queue, which is what
+        actually runs - not necessarily what the settings pane shows now.
+        """
+        self.log_message("─" * 20 + " batch settings " + "─" * 20)
+        for i, it in enumerate(self._batch_items, 1):
+            name = os.path.basename(it.get('path') or '?')
+            self.log_message(f"[{i}/{len(self._batch_items)}] {name} "
+                             f"(table {it.get('table') or '?'}) — settings as queued:")
+            try:
+                text = json.dumps(self._loggable_config(it.get('config')),
+                                   indent=2, sort_keys=True, default=str)
+            except Exception as e:
+                self.log_message(f"  (could not serialise settings: {e})")
+                continue
+            for line in text.splitlines():
+                self.log_message("  " + line)
+        self.log_message("─" * 56)
 
     def stop_batch(self):
         """Stop the batch, terminating the trial currently running."""
@@ -8365,7 +10530,10 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(
                 f"Skipping animation for {os.path.basename(it['path'])} "
                 f"— its data pass failed in this run.")
-            it['status'] = 'Animation skipped (data failed)'
+            # Must still read as a failure: overwriting it with a neutral
+            # 'skipped' string lost the fact that the trial failed at all,
+            # and the end-of-run summary then counted it as nothing.
+            it['status'] = 'Failed (data) \u2014 animation skipped'
             self._refresh_batch_list()
             self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
@@ -8394,7 +10562,9 @@ class UWBQuickVisualizationWindow(QWidget):
             cfg['export_raw_csv'] = False
             cfg['save_plots'] = False
             cfg['proximity_detection'] = False      # bouts CSV already written
-            cfg['export_social_network'] = False    # network CSVs already written
+            cfg['export_gbi'] = False               # GBI already written
+            cfg['export_edgelist'] = False          # edge list already written
+            cfg['export_behavior_events'] = False   # behaviour events already written
 
         # Frozen builds can't run `python -m`; fall back to the in-process path
         # so the queue still works (without crash isolation).
@@ -8574,6 +10744,9 @@ class UWBQuickVisualizationWindow(QWidget):
                 QTimer.singleShot(300, self._batch_poll_export)
                 return
             failed = bool(getattr(self, '_last_export_failed', False))
+            # In-process fallback: an exception was caught and reported, so
+            # this is a clean failure, never a dead process.
+            rc_for_retry = 1
         else:
             self._drain_worker_log()
             if proc.poll() is None:            # still running
@@ -8582,6 +10755,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self._drain_worker_log()           # final flush
             rc = proc.returncode
             failed = (rc != 0)
+            rc_for_retry = rc
             try:
                 self._batch_log_fh.close()
             except Exception:
@@ -8596,8 +10770,29 @@ class UWBQuickVisualizationWindow(QWidget):
         phase = getattr(self, '_batch_phase', 'data')
         has_anim = bool((it.get('config') or {}).get('save_animation')
                         or (it.get('config') or {}).get('social_animation'))
+
+        # A worker that DIED (native fault) is worth another go: those
+        # faults are non-deterministic. A worker that ran and reported an
+        # error is not - it would fail identically and only delay the queue.
+        if failed and self._batch_should_retry(it, phase, rc_for_retry):
+            key = (self._batch_index, phase)
+            attempts = self._batch_attempts.get(key, 1) + 1
+            self._batch_attempts[key] = attempts
+            limit = attempts + self._batch_retries_left(it, phase)
+            it['status'] = f'Retrying ({phase}, attempt {attempts})'
+            self.log_message(
+                f"\u21ba Worker died on a native fault — retrying "
+                f"{os.path.basename(it['path'])} [{phase}], "
+                f"attempt {attempts} of {limit}.")
+            self._refresh_batch_list()
+            # Re-run the SAME plan step: do not advance _batch_plan_pos.
+            QTimer.singleShot(0, self._batch_step)
+            return
+
         if failed:
-            it['status'] = f'Failed ({phase})'
+            tries = self._batch_attempts.get((self._batch_index, phase), 1)
+            it['status'] = (f'Failed ({phase})' if tries == 1
+                            else f'Failed ({phase}) after {tries} attempts')
             if phase == 'data':
                 it['data_failed'] = True
         elif phase == 'data':
@@ -8610,6 +10805,31 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_plan_pos += 1
         QTimer.singleShot(0, self._batch_step)
 
+    @staticmethod
+    def _is_native_fault(rc):
+        """True when the worker DIED rather than exiting with an error.
+
+        The worker reports its own problems by logging and returning 1. Anything
+        else - a Windows NTSTATUS such as 0xC0000005 (access violation) or
+        0xC0000374 (heap corruption), or a POSIX signal (negative rc) - means
+        the process was killed out from under us mid-run.
+        """
+        if rc is None:
+            return False
+        if rc < 0:                       # POSIX: killed by signal
+            return True
+        return (rc & 0xFFFFFFFF) >= 0xC0000000
+
+    def _batch_retries_left(self, it, phase):
+        cap = self.spin_batch_retries.value() if hasattr(self, 'spin_batch_retries') else 0
+        used = self._batch_attempts.get((self._batch_index, phase), 1) - 1
+        return max(0, cap - used)
+
+    def _batch_should_retry(self, it, phase, rc):
+        if not self._is_native_fault(rc):
+            return False
+        return self._batch_retries_left(it, phase) > 0
+
     def _finish_batch(self):
         self._batch_active = False
         if hasattr(self, 'batch_progress_widget'):
@@ -8617,21 +10837,50 @@ class UWBQuickVisualizationWindow(QWidget):
             self.batch_progress_widget.setVisible(False)
         self._restore_dialogs()   # before the summary box, and re-enable normal UI dialogs
         for it in self._batch_items:
-            if it['status'] in ('Queued', 'Loading', 'Running', 'Processing data',
-                                'Rendering animation', 'Data ✓ — animation queued'):
+            status = str(it['status'])
+            if (status in ('Queued', 'Loading', 'Running', 'Processing data',
+                           'Rendering animation', 'Data ✓ — animation queued')
+                    or status.startswith('Retrying')):
                 it['status'] = 'Cancelled' if it['status'] != 'Data ✓ — animation queued' \
                     else 'Data ✓ (animation cancelled)'
         self._refresh_batch_list()
-        done = sum(1 for it in self._batch_items if it['status'] == 'Done')
-        failed = sum(1 for it in self._batch_items if str(it['status']).startswith('Failed'))
-        cancelled = sum(1 for it in self._batch_items if 'ancelled' in str(it['status']))
-        self.log_message(
-            f"BATCH FINISHED: {done} done, {failed} failed, {cancelled} cancelled")
+        # Every item lands in exactly one bucket, and anything unrecognised
+        # is reported rather than dropped - a status that matched none of
+        # these is what made a failed run summarise as '0 done, 0 failed,
+        # 0 cancelled'.
+        done = failed = cancelled = 0
+        unknown = []
+        for it in self._batch_items:
+            status = str(it.get('status', ''))
+            if status.startswith('Failed'):
+                failed += 1
+            elif 'ancelled' in status:
+                cancelled += 1
+            elif status.startswith('Done') or status.startswith('Data \u2713'):
+                done += 1
+            else:
+                unknown.append(f"{os.path.basename(it['path'])}: {status}")
+        total = len(self._batch_items)
+        summary = (f"{done} done, {failed} failed, {cancelled} cancelled"
+                   + (f", {len(unknown)} unaccounted" if unknown else ""))
+        self.log_message(f"BATCH FINISHED: {total} trial(s) \u2014 {summary}")
+        for u in unknown:
+            self.log_message(f"  unaccounted status \u2014 {u}")
+        if failed:
+            for it in self._batch_items:
+                if str(it.get('status', '')).startswith('Failed'):
+                    self.log_message(
+                        f"  FAILED: {os.path.basename(it['path'])} "
+                        f"({it['status']})")
         self._batch_stop_requested = False
         QMessageBox.information(
             self, "Batch complete",
-            f"Batch finished.\n\n{done} succeeded, {failed} failed, "
-            f"{cancelled} cancelled.")
+            f"Batch finished: {total} trial(s).\n\n"
+            f"{done} succeeded, {failed} failed, {cancelled} cancelled."
+            + (f"\n{len(unknown)} finished in an unexpected state \u2014 "
+               "see the message log." if unknown else "")
+            + ("\n\nFailed trials are listed in the message log; the queue "
+               "is kept so you can re-run them." if failed else ""))
 
     def _cleanup_plot_working_files(self):
         """Delete any temporary render CSVs tracked for this run.
@@ -8674,7 +10923,8 @@ class UWBQuickVisualizationWindow(QWidget):
         # DELETED the freshly written CSV before the render could reuse it.
         export_smoothed_csv = not getattr(self, '_batch_reuse_smoothed', False)
         detect_proximity = self.chk_proximity_detection.isChecked()
-        export_social_network = self.chk_social_network.isChecked()
+        export_gbi = self.chk_export_gbi.isChecked()
+        export_edgelist = self.chk_export_edgelist.isChecked()
         social_animation = False   # social-network animation was removed
         save_animation = self.chk_save_animation.isChecked()
         save_plots = self.chk_save_plots.isChecked()
@@ -8699,9 +10949,12 @@ class UWBQuickVisualizationWindow(QWidget):
             predicted_files.append(f'{db_name}_smoothed.csv')
         if detect_proximity:
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
-        if export_social_network:
-            predicted_files += [f'{db_name}_network_edgelist.csv',
-                                f'{db_name}_network_GBI.csv']
+        if export_edgelist:
+            predicted_files.append(self._edgelist_filename(db_name))
+        if export_gbi:
+            predicted_files.append(f'{db_name}_network_GBI.csv')
+        if self.chk_export_behavior.isChecked():
+            predicted_files.append(f'{db_name}_behavior_events.csv')
 
         predicted_sna_files = []   # social-network animation was removed
 
@@ -8742,6 +10995,23 @@ class UWBQuickVisualizationWindow(QWidget):
             if plot_types.get('actogram', False):
                 for tag in selected_tags:
                     _add_with_svg(predicted_plot_files, f'{db_name}_Actogram_{_tag_suffix(tag)}')
+            if plot_types.get('home_range', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_HomeRange_{_tag_suffix(tag)}')
+                _add_with_svg(predicted_plot_files, f'{db_name}_HomeRange_Overview')
+            if plot_types.get('mcp_range', False):
+                for tag in selected_tags:
+                    _add_with_svg(predicted_plot_files, f'{db_name}_MCP_{_tag_suffix(tag)}')
+                _add_with_svg(predicted_plot_files, f'{db_name}_MCP_Overview')
+            if plot_types.get('zone_occupancy', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_ZoneOccupancy')
+            if plot_types.get('ethogram', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_Ethogram')
+                _add_with_svg(predicted_plot_files, f'{db_name}_EthogramTimeBudget')
+            if plot_types.get('behavior_counts', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_BehaviorCounts')
+            if plot_types.get('behavior_matrix', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_BehaviorMatrix')
             if plot_types.get('data_quality', False):
                 _add_with_svg(predicted_plot_files, f'{db_name}_DataQuality')
 
@@ -8795,12 +11065,16 @@ class UWBQuickVisualizationWindow(QWidget):
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
-        export_social_network = self.chk_social_network.isChecked()
+        export_gbi = self.chk_export_gbi.isChecked()
+        export_edgelist = self.chk_export_edgelist.isChecked()
+        export_behavior = self.chk_export_behavior.isChecked()
+        export_social_network = export_gbi or export_edgelist
         social_animation = False   # social-network animation was removed
         # Frozen at export start so mid-export clicks can't change them.
 
         if not (export_raw_csv or export_smoothed_csv or save_plots
                 or save_animation or detect_proximity or export_social_network
+                or export_behavior
                 or social_animation):
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
@@ -9067,17 +11341,29 @@ class UWBQuickVisualizationWindow(QWidget):
                     tag_data['location_y'] *= 0.0254
                     tag_data = tag_data.sort_values(by='Timestamp')
 
-                    # Per-tag time trimming
-                    if tag in self.tag_identities:
-                        info = self.tag_identities[tag]
-                        if 'start_time' in info and 'stop_time' in info:
-                            start = pd.Timestamp(info['start_time']).tz_localize(tz)
-                            stop = pd.Timestamp(info['stop_time']).tz_localize(tz)
-                            before = len(tag_data)
-                            tag_data = tag_data[(tag_data['Timestamp'] >= start) & (tag_data['Timestamp'] <= stop)]
-                            trimmed = before - len(tag_data)
-                            if trimmed > 0:
-                                self.log_message(f"    Trimmed {trimmed} points outside time window")
+                    # Per-tag time trimming (same helper the preview uses)
+                    data_last = (tag_data['Timestamp'].max()
+                                 if len(tag_data) else None)
+                    tag_data, trimmed = self._trim_to_tag_window(tag_data, tag, tz)
+                    if trimmed > 0:
+                        self.log_message(
+                            f"    Trimmed {trimmed} points outside the tag's active window")
+                        # A window whose stop lands well before the tag's last
+                        # fix is usually a STALE default rather than a
+                        # decision: the identity dialog pre-fills the stop
+                        # with whatever the data extent was when it was last
+                        # opened, so a database that has grown since then gets
+                        # its new days silently discarded.
+                        _, w_stop = self._tag_window(tag, tz)
+                        if (w_stop is not None and data_last is not None
+                                and w_stop < data_last - pd.Timedelta(hours=12)):
+                            lost = (data_last - w_stop).total_seconds() / 86400.0
+                            self.log_message(
+                                f"    \u26a0 Active window for this tag stops at "
+                                f"{w_stop:%Y-%m-%d %H:%M} but it has data to "
+                                f"{data_last:%Y-%m-%d %H:%M} — {lost:.1f} days are being "
+                                f"discarded. If that is not deliberate, reopen "
+                                f"Configure Identities and extend the Stop time.")
 
                     # Threshold + smooth: jump threshold (raw) → smooth →
                     # velocity threshold (on the smoothed track).
@@ -9209,10 +11495,11 @@ class UWBQuickVisualizationWindow(QWidget):
                             self.log_message("✓ Proximity detection complete!")
 
                         # ── Social network outputs (edge lists + GBI + anim) ──
-                        if export_social_network or social_animation:
+                        if export_gbi or export_edgelist:
                             self._export_social_network(
                                 prox_events, proximity_bouts, output_dir, db_name,
-                                write_csvs=export_social_network,
+                                write_gbi=export_gbi,
+                                write_edgelist=export_edgelist,
                                 skip_existing=skip_existing)
 
                 except Exception as e:
@@ -9222,6 +11509,46 @@ class UWBQuickVisualizationWindow(QWidget):
 
                 self.log_message("=" * 50)
             
+            # Directed behaviour bouts (chase / displacement). Classified
+            # from the smoothed CSV with the preview's thresholds; the only
+            # export that records WHO acted on WHOM.
+            if export_behavior and not self.export_cancelled:
+                self.log_message("=" * 50)
+                self.log_message("Extracting behaviour events...")
+                self.lbl_export_progress.setText(
+                    "Classifying chases and displacements...")
+                QApplication.processEvents()
+                try:
+                    ev_path = os.path.join(output_dir, f'{db_name}_behavior_events.csv')
+                    if skip_existing and os.path.exists(ev_path):
+                        self.log_message(
+                            f"Skipped (exists): {os.path.basename(ev_path)}")
+                    elif csv_path and os.path.exists(csv_path):
+                        # Read the selection here rather than relying on the
+                        # outer binding, which only exists when the smoothed
+                        # data was actually (re)generated this run.
+                        chosen = [t for t, cb in self.tag_checkboxes.items()
+                                  if cb.isChecked()]
+                        ev = self._export_behavior_events(csv_path, chosen)
+                        ev.to_csv(ev_path, index=False)
+                        by = ev['behavior'].value_counts().to_dict() if len(ev) else {}
+                        self.log_message(
+                            f"\u2713 Exported behaviour events ({len(ev)} bouts"
+                            + (f": {by}" if by else "")
+                            + f"): {os.path.basename(ev_path)}")
+                        if not len(ev):
+                            self.log_message(
+                                "  No chases or displacements fired \u2014 check the "
+                                "thresholds against the speed summary in the preview.")
+                    else:
+                        self.log_message(
+                            "Error: No smoothed data available for behaviour events")
+                except Exception as e:
+                    self.log_message(f"Error during behaviour-event export: {e}")
+                    import traceback
+                    traceback.print_exc()
+                self.log_message("=" * 50)
+
             # Export plots if requested (BEFORE animation, which takes longer)
             if save_plots:
                 if self.export_cancelled:
@@ -9235,19 +11562,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 
                 selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
 
-                # Get selected plot types - include ALL plot types
-                plot_types = {
-                    'daily_paths': self.plot_type_checkboxes['daily_paths'].isChecked(),
-                    'trajectory_overview': self.plot_type_checkboxes['trajectory_overview'].isChecked(),
-                    'battery_levels': self.plot_type_checkboxes['battery_levels'].isChecked(),
-                    '3d_occupancy': self.plot_type_checkboxes['3d_occupancy'].isChecked(),
-                    'activity_timeline': self.plot_type_checkboxes['activity_timeline'].isChecked(),
-                    'velocity_distribution': self.plot_type_checkboxes['velocity_distribution'].isChecked(),
-                    'cumulative_distance': self.plot_type_checkboxes['cumulative_distance'].isChecked(),
-                    'velocity_timeline': self.plot_type_checkboxes['velocity_timeline'].isChecked(),
-                    'actogram': self.plot_type_checkboxes['actogram'].isChecked(),
-                    'data_quality': self.plot_type_checkboxes['data_quality'].isChecked()
-                }
+                # Read every checkbox rather than naming them one by one:
+                # the hand-written dict this replaces silently dropped any
+                # plot type added later, so a newly ticked plot produced no
+                # file and no error. Matches how _predict_export_conflicts
+                # enumerates them, so prediction and output cannot diverge.
+                plot_types = {k: cb.isChecked()
+                              for k, cb in self.plot_type_checkboxes.items()}
 
                 # Get rolling window value
                 rolling_window = self.spin_rolling_window.value()
@@ -9284,6 +11605,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     xml_map_extent=self.xml_map_extent,
                     bg_offset_x=self.bg_offset_x,
                     bg_offset_y=self.bg_offset_y,
+                    behavior_params=self._behavior_params(),
+                    axis_limits=self.xy_range(),
                 )
                 self.worker.progress.connect(self.update_status)
                 self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, anim_csv_path, animations_dir))

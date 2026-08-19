@@ -430,3 +430,52 @@ def state_color(loc_code, soc_code):
     if soc_code and soc_code != SOC_NONE:
         return SOCIAL_COLORS.get(soc_code, "#cccccc")
     return STATE_COLORS.get(loc_code, "#cccccc")
+
+
+def _runs(mask):
+    """Contiguous True runs in a 1-D boolean, as (start, stop_inclusive)."""
+    if not mask.any():
+        return []
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[0::2].tolist(), (edges[1::2] - 1).tolist()))
+
+
+def extract_events(result, offset=0):
+    """Directed behaviour bouts from a ``classify`` result.
+
+    ``classify`` computes who chased whom and who displaced whom, then collapses
+    it to one state per animal for display — which throws the direction and the
+    partner away. This recovers the dyadic form: one record per bout, with the
+    actor and the target kept distinct.
+
+    Returns a list of dicts with frame indices (``offset`` is added, so a caller
+    classifying in blocks can report indices in the full recording's frame):
+
+        {'behavior': 'chase' | 'displacement',
+         'actor': <tag index>, 'target': <tag index>,
+         'start_frame': int, 'stop_frame': int}   # stop is inclusive
+
+    ``actor`` is the chaser / the displacer; ``target`` is the chased / the one
+    pushed off. Chase bouts already carry the minimum-duration filter applied in
+    ``classify``; displacement bouts run from arrival to resolution.
+    """
+    out = []
+    chase = result.get("chase")
+    if chase is not None and chase.size:
+        n_tags = chase.shape[1]
+        # n_tags is small (one cohort), so the pair loop is cheap next to the
+        # per-frame geometry that produced these arrays.
+        for a in range(n_tags):
+            for b in range(n_tags):
+                if a == b:
+                    continue
+                for i, j in _runs(chase[:, a, b]):
+                    out.append({'behavior': 'chase', 'actor': a, 'target': b,
+                                'start_frame': i + offset,
+                                'stop_frame': j + offset})
+    for i, j, a, b in result.get("displacements", []):
+        out.append({'behavior': 'displacement', 'actor': a, 'target': b,
+                    'start_frame': i + offset, 'stop_frame': j + offset})
+    out.sort(key=lambda e: (e['start_frame'], e['behavior'], e['actor']))
+    return out

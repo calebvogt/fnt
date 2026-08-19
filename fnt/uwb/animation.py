@@ -177,6 +177,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      arena_zones=None, anchors=None,
                      tag_identities=None, use_custom_identities=False,
                      color_by="None", marker_size=10, show_battery=False,
+                     axis_limits=None,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -195,7 +196,12 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
 
     layers = layers or {}
 
-    x_min, x_max, y_min, y_max = compute_axis_limits(data, layers, bg_extent)
+    # Callers rendering several clips of the same recording (the per-day
+    # videos) pass one shared set of limits so every clip is drawn in the
+    # same arena frame and can be concatenated without the view shifting.
+    x_min, x_max, y_min, y_max = (
+        axis_limits if axis_limits is not None
+        else compute_axis_limits(data, layers, bg_extent))
     y_range = y_max - y_min  # for label offset
 
     start = data['Timestamp'].min()

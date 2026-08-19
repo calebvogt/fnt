@@ -136,6 +136,48 @@ def _enable_hidpi():
         pass
 
 
+def _suppress_child_consoles():
+    """Stop console programs launched by a tool from popping up cmd windows.
+
+    Tool hosts run under pythonw.exe, which has no console of its own. On
+    Windows a console program (ffmpeg, ffprobe, sleap-track...) started from a
+    process with no console gets a brand-new console window allocated for it --
+    so a batch of 1300 videos would flash up 1300 empty black windows.
+
+    The per-call fix is creationflags=CREATE_NO_WINDOW, but the tools make
+    subprocess calls from dozens of places across many modules and any missed
+    call site reintroduces the flicker. Since a hosted GUI tool should never
+    want a console window, default the flag here instead: subprocess.run,
+    call and check_output all construct a Popen, so patching Popen covers
+    every entry point, including ones added later.
+
+    An explicit creationflags= or startupinfo= from the caller is left alone.
+    """
+    if os.name != "nt":
+        return
+
+    import subprocess
+
+    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    original_init = subprocess.Popen.__init__
+
+    # Popen's positional signature: (args, bufsize, executable, stdin, stdout,
+    # stderr, preexec_fn, close_fds, shell, cwd, env, universal_newlines,
+    # startupinfo, creationflags, ...) -- startupinfo/creationflags are #12/#13
+    # after self, so only override when the caller passed neither.
+    def patched_init(self, *args, **kwargs):
+        caller_set_it = (
+            len(args) >= 13                     # startupinfo/creationflags positional
+            or kwargs.get("startupinfo")
+            or kwargs.get("creationflags")
+        )
+        if not caller_set_it:
+            kwargs["creationflags"] = CREATE_NO_WINDOW
+        return original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = patched_init
+
+
 def load_window(module_name, attr_name):
     """Import ``module_name`` and instantiate ``attr_name`` from it."""
     import importlib
@@ -166,6 +208,8 @@ def main(argv=None):
     # Both must happen before QApplication is constructed.
     _prepare_windows_taskbar()
     _enable_hidpi()
+    # Must be in place before the tool imports/runs anything that shells out.
+    _suppress_child_consoles()
 
     app = QApplication(sys.argv)
     # Closing the tool's last window should end the process.
