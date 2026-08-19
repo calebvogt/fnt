@@ -312,43 +312,6 @@ class VideoProcessorWorker(QThread):
             pass
         return None
 
-    def _is_already_processed(self, video_file, out_dir):
-        """Check if a video already has a correctly processed file in out_dir.
-        Verifies the output exists, has size > 0, AND matches the target resolution.
-        If the output exists but has the wrong resolution, it is deleted so the
-        file gets reprocessed."""
-        output_filename = self._get_output_filename(video_file)
-        output_path = os.path.join(out_dir, output_filename)
-
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            return False
-
-        # Verify resolution matches the current target
-        if self.resolution == "1080p":
-            target_w, target_h = 1920, 1080
-        else:
-            target_w, target_h = 1280, 720
-
-        res = self._get_video_resolution(output_path)
-        if res is None:
-            # Can't verify — assume it needs reprocessing
-            return False
-
-        actual_w, actual_h = res
-        if actual_w == target_w and actual_h == target_h:
-            return True
-
-        # Wrong resolution — delete the stale output so it gets reprocessed
-        self.progress_update.emit(
-            f"  🔄 Existing output has wrong resolution ({actual_w}x{actual_h}, "
-            f"target {target_w}x{target_h}): {output_filename} — will reprocess"
-        )
-        try:
-            os.remove(output_path)
-        except Exception:
-            pass
-        return False
-
     def _copy_to_failed(self, video_file, parent_dir):
         """Copy a failed video file to proc_failed_copies/ directory."""
         failed_dir = os.path.join(parent_dir, "proc_failed_copies")
@@ -369,12 +332,95 @@ class VideoProcessorWorker(QThread):
                 f"⚠️ Could not copy {os.path.basename(video_file)} to proc_failed_copies/: {str(e)}"
             )
 
+    def _target_resolution(self):
+        """(width, height) the current settings will produce."""
+        return (1920, 1080) if self.resolution == "1080p" else (1280, 720)
+
+    def _plan_work(self, file_list):
+        """Split *file_list* into the files that need processing and those to skip.
+
+        Done once, up front, instead of re-deciding inside the processing loop.
+        Two phases, cheapest first:
+
+        1. A stat-only pass (exists + size). Anything with no output, or a
+           zero-byte one, needs processing and is never probed.
+        2. Only the files that DO have a real output get their resolution
+           verified, and those ffprobe calls run concurrently. Probing is
+           process-spawn and network-latency bound rather than CPU bound, so
+           running a poolful at once collapses what used to be a serial
+           ffprobe-per-file walk over the whole library.
+
+        Returns ``(work_list, skipped_count)``.
+        """
+        if not self.skip_already_processed:
+            return file_list, 0
+
+        target_w, target_h = self._target_resolution()
+
+        # --- Phase 1: stat only, no subprocesses ---
+        work = []
+        candidates = []          # (video_file, out_dir, output_path)
+        for video_file, out_dir in file_list:
+            if self.should_stop:
+                return work, 0
+            output_path = os.path.join(out_dir, self._get_output_filename(video_file))
+            try:
+                if os.path.getsize(output_path) > 0:
+                    candidates.append((video_file, out_dir, output_path))
+                    continue
+            except OSError:
+                pass                      # missing or unreadable -> needs processing
+            work.append((video_file, out_dir))
+
+        if not candidates:
+            return work, 0
+
+        self.progress_update.emit(
+            f"Checking {len(candidates)} existing output(s) in proc/ "
+            f"before starting…"
+        )
+
+        # --- Phase 2: verify resolutions in parallel ---
+        from concurrent.futures import ThreadPoolExecutor
+
+        skipped = 0
+        done = 0
+        # Bounded so a huge library can't spawn thousands of ffprobes at once.
+        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            resolutions = pool.map(
+                self._get_video_resolution, [c[2] for c in candidates])
+
+            for (video_file, out_dir, output_path), res in zip(candidates, resolutions):
+                done += 1
+                if done % 200 == 0:
+                    self.progress_update.emit(
+                        f"  …checked {done}/{len(candidates)}")
+
+                if res == (target_w, target_h):
+                    skipped += 1
+                    continue
+
+                if res is not None:
+                    # Stale output from a run at a different target resolution.
+                    self.progress_update.emit(
+                        f"  🔄 Existing output has wrong resolution "
+                        f"({res[0]}x{res[1]}, target {target_w}x{target_h}): "
+                        f"{os.path.basename(output_path)} — will reprocess")
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
+                work.append((video_file, out_dir))
+
+        return work, skipped
+
     def run(self):
         """Main processing function"""
         import time
         try:
             processed_count = 0
-            skipped_count = 0
+            skipped_count = 0   # set by _plan_work() below
             failed_count = 0
             missing_files = []
 
@@ -396,12 +442,38 @@ class VideoProcessorWorker(QThread):
                 file_list.append((video_file, out_dir))
 
             total_files = len(file_list)
+            discovered_total = total_files   # before skip-filtering, for the summary
 
             if total_files == 0:
                 self.finished.emit(False, "No video files found in selected directories or video list.")
                 return
 
-            self.progress_update.emit(f"Found {total_files} video files to process...")
+            self.progress_update.emit(f"Found {total_files} video files...")
+
+            # --- Decide what actually needs doing, once, before starting ---
+            file_list, skipped_count = self._plan_work(file_list)
+
+            if self.should_stop:
+                self.finished.emit(False, "Processing stopped by user.")
+                return
+
+            if skipped_count:
+                self.progress_update.emit(
+                    f"Skipping {skipped_count} already-processed video(s); "
+                    f"{len(file_list)} to process.")
+                self.results_update.emit(0, 0, skipped_count)
+
+            total_files = len(file_list)
+            if total_files == 0:
+                self.finished.emit(
+                    True,
+                    f"Nothing to do — all {skipped_count} video(s) were already "
+                    f"processed at the selected resolution.")
+                return
+
+            # Create the output folders once, not once per file.
+            for out_dir in dict.fromkeys(d for _, d in file_list):
+                os.makedirs(out_dir, exist_ok=True)
 
             # --- Process the pre-collected file list ---
             for file_index, (video_file, out_dir) in enumerate(file_list, start=1):
@@ -416,17 +488,6 @@ class VideoProcessorWorker(QThread):
                         f"File not found (moved or deleted?): {video_file}"
                     )
                     missing_files.append(video_file)
-                    continue
-
-                os.makedirs(out_dir, exist_ok=True)
-
-                # Skip check
-                if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
-                    self.progress_update.emit(
-                        f"Skipping (already processed): {os.path.basename(video_file)}"
-                    )
-                    skipped_count += 1
-                    self.results_update.emit(processed_count, failed_count, skipped_count)
                     continue
 
                 self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
@@ -486,7 +547,7 @@ class VideoProcessorWorker(QThread):
             if skipped_count > 0:
                 parts.append(f"{skipped_count} skipped (already processed)")
 
-            summary = f"Processed {processed_count} of {total_files} videos."
+            summary = f"Processed {processed_count} of {discovered_total} videos found."
             if parts:
                 summary += " " + ". ".join(parts) + "."
 
