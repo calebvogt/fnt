@@ -96,6 +96,9 @@ def _run(job_path):
 
     win._batch_conflict_choice = job.get("conflict_choice", ExportConflictDialog.OVERWRITE)
     win._batch_temp_frames_dir = job.get("temp_frames_dir")
+    # Animation pass of a two-phase batch: render from the smoothed CSV the data
+    # pass already wrote instead of re-smoothing every tag from the database.
+    win._batch_reuse_smoothed = bool(job.get("reuse_smoothed", False))
 
     win.export_data()
 

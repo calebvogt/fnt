@@ -5,6 +5,7 @@ import os
 import re
 from collections import OrderedDict
 import sys
+import time
 import sqlite3
 import struct
 import numpy as np
@@ -13,7 +14,6 @@ import pytz
 import json
 import shutil
 import xml.etree.ElementTree as ET
-from multiprocessing import Pool, cpu_count
 import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
@@ -146,6 +146,127 @@ def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
         ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
+
+def is_network_path(path):
+    """True if ``path`` lives on a network filesystem (SMB/NFS/AFP share).
+
+    Used to warn before the tracking animation writes its temporary frames
+    somewhere slow: the renderer churns through frame data continuously, and
+    doing that over a share is far slower than local disk.
+
+    Cross-platform: UNC paths anywhere, mapped drive letters on Windows, and
+    real mount types on macOS/Linux (an SMB share on macOS lands in /Volumes
+    exactly like a USB disk, so the path alone cannot tell them apart).
+    """
+    try:
+        p = os.path.abspath(path)
+        if p.startswith('\\\\') or p.startswith('//'):
+            return True
+        if os.name == 'nt':
+            drive = os.path.splitdrive(p)[0]
+            if drive:
+                import ctypes
+                DRIVE_REMOTE = 4
+                return ctypes.windll.kernel32.GetDriveTypeW(
+                    drive + '\\') == DRIVE_REMOTE
+            return False
+        # POSIX: ask the OS which mount points are network filesystems.
+        import subprocess
+        out = subprocess.run(['mount'], capture_output=True, text=True,
+                             timeout=5).stdout
+        net_types = ('smbfs', 'afpfs', 'nfs', 'cifs', 'webdav', 'ftpfs')
+        for line in out.splitlines():
+            if ' on ' not in line:
+                continue
+            rest = line.split(' on ', 1)[1]
+            mount_point = rest.split(' (')[0].strip()
+            opts = rest[rest.find('('):] if '(' in rest else ''
+            if not any(t in opts for t in net_types):
+                continue
+            if p == mount_point or p.startswith(mount_point.rstrip('/') + '/'):
+                return True
+        return False
+    except Exception:
+        pass
+    return False
+
+def _onedrive_sync_roots():
+    """Folders OneDrive is ACTUALLY syncing, per its own registry state.
+
+    A folder merely named 'OneDrive' proves nothing: Windows' Known Folder Move
+    can redirect the Desktop into C:/Users/<you>/OneDrive and leave it there
+    after that account is signed out, so the path looks synced while nothing
+    syncs. Only the roots OneDrive registers are real.
+    """
+    roots = []
+    if os.name != 'nt':
+        return roots
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            "Software" + os.sep + "Microsoft" + os.sep
+                            + "OneDrive" + os.sep + "Accounts") as key:
+            i = 0
+            while True:
+                try:
+                    account = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(
+                            key, account + os.sep
+                            + "ScopeIdToMountPointPathCache") as scope:
+                        j = 0
+                        while True:
+                            try:
+                                _n, val, _t = winreg.EnumValue(scope, j)
+                            except OSError:
+                                break
+                            j += 1
+                            if val:
+                                roots.append(os.path.abspath(str(val)))
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return roots
+
+
+def cloud_sync_provider(path):
+    """Name of the cloud-sync service backing ``path``, or None.
+
+    Writing a multi-GB render into a synced folder makes the sync client
+    upload it continuously while the animation is still being written, which
+    competes for disk and network and can lock the file mid-render. Worth a
+    warning even though the folder is technically local.
+
+    Note Windows' OneDrive Backup redirects Desktop/Documents into OneDrive,
+    so a folder the user picked as 'the Desktop' can be synced without any
+    obvious sign in the path they chose.
+    """
+    try:
+        p = os.path.abspath(path)
+        # Prefer OneDrive's own record of what it syncs. If it lists any roots,
+        # trust it completely: a path outside them is NOT synced, however it is
+        # named.
+        roots = _onedrive_sync_roots()
+        if roots:
+            for root in roots:
+                if p == root or p.startswith(root + os.sep):
+                    return 'OneDrive'
+            return None
+        known = (('onedrive', 'OneDrive'), ('dropbox', 'Dropbox'),
+                 ('google drive', 'Google Drive'), ('googledrive', 'Google Drive'),
+                 ('icloud drive', 'iCloud Drive'), ('box sync', 'Box'))
+        for seg in p.replace('/', os.sep).split(os.sep):
+            low = seg.strip().lower()
+            for key, name in known:
+                if low == key or low.startswith(key + ' -'):
+                    return name
+    except Exception:
+        pass
+    return None
 
 def connect_ro(path):
     """Open a SQLite database read-only for querying, safely over a network drive.
@@ -596,15 +717,16 @@ class ExportConflictDialog(QDialog):
         # Buttons
         btn_layout = QHBoxLayout()
 
-        skip_btn = QPushButton("Skip Existing")
-        skip_btn.setToolTip("Only write the new files; leave existing files untouched")
-        skip_btn.clicked.connect(lambda: self.done(self.SKIP))
-        btn_layout.addWidget(skip_btn)
-
+        # Overwrite sits first: it is the usual choice when re-running a trial.
         overwrite_btn = QPushButton("Overwrite")
         overwrite_btn.setToolTip("Replace all conflicting files and write new files")
         overwrite_btn.clicked.connect(lambda: self.done(self.OVERWRITE))
         btn_layout.addWidget(overwrite_btn)
+
+        skip_btn = QPushButton("Skip Existing")
+        skip_btn.setToolTip("Only write the new files; leave existing files untouched")
+        skip_btn.clicked.connect(lambda: self.done(self.SKIP))
+        btn_layout.addWidget(skip_btn)
 
         new_folder_btn = QPushButton("New Folder")
         new_folder_btn.setToolTip("Create a new timestamped analysis folder instead")
@@ -1846,6 +1968,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_proc = None         # isolated worker process for the running trial
         self._batch_log_path = None
         self._batch_log_pos = 0
+        self._batch_plan = []           # [(job_index, 'data'|'animation')] — data pass first
+        self._batch_plan_pos = 0
+        self._batch_phase = 'data'
+        self._batch_reuse_smoothed = False
 
         # Tag identity and sex mapping
         self.tag_identities = {}  # {tag_id: {'sex': 'M', 'identity': 'Animal1'}}
@@ -2088,6 +2214,20 @@ class UWBQuickVisualizationWindow(QWidget):
                 color: #cccccc;
                 font-family: Arial;
             }
+            /* Tooltips need their own rule: otherwise they inherit whatever
+               colours the hovered widget carries (a button styled
+               'color: white' rendered white text on a pale tooltip, and the
+               inherited padding/min-width squashed the box). Matches the
+               tooltip styling used by FNT's other tools. */
+            QToolTip {
+                background-color: #1e1e1e;
+                color: #dddddd;
+                border: 1px solid #0078d4;
+                border-radius: 3px;
+                padding: 4px 6px;
+                font-weight: normal;
+                font-size: 11px;
+            }
             QLabel {
                 color: #cccccc;
                 background-color: transparent;
@@ -2194,6 +2334,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # canvases must exist before that group is constructed.
         self.preview_panel = self.create_preview_panel()
         settings_panel = self.create_settings_panel()
+        # Processing settings live in the preview now; the matching export
+        # rows are hidden and mirrored from it.
+        self._hide_inherited_export_rows()
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(self.preview_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -2344,6 +2487,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # lived in their own "Smoothing & Filtering Options" group.)
         export_group = QGroupBox("Export Options")
         export_layout = QVBoxLayout()
+        # Rows duplicated from the preview. The preview is the single place
+        # these are set; these widgets stay alive (a lot of code reads them,
+        # and the saved config records what was actually used) but are hidden
+        # and mirrored from the preview by _sync_export_from_preview().
+        self._inherited_rows = []
 
         velocity_filter_layout = QHBoxLayout()
         self.chk_velocity_filter = QCheckBox("Velocity threshold (remove >")
@@ -2370,6 +2518,7 @@ class UWBQuickVisualizationWindow(QWidget):
         velocity_filter_layout.addWidget(self.spin_velocity_threshold)
         velocity_filter_layout.addStretch()
         export_layout.addLayout(velocity_filter_layout)
+        self._inherited_rows.append(velocity_filter_layout)
 
         jump_filter_layout = QHBoxLayout()
         self.chk_jump_filter = QCheckBox("Jump threshold (remove >")
@@ -2396,21 +2545,8 @@ class UWBQuickVisualizationWindow(QWidget):
         jump_filter_layout.addWidget(self.spin_jump_threshold)
         jump_filter_layout.addStretch()
         export_layout.addLayout(jump_filter_layout)
+        self._inherited_rows.append(jump_filter_layout)
 
-        time_gap_layout = QHBoxLayout()
-        time_gap_layout.addWidget(QLabel("Time gap grouping:"))
-        self.spin_time_gap = QSpinBox()
-        self.spin_time_gap.setRange(5, 300)
-        self.spin_time_gap.setValue(30)
-        self.spin_time_gap.setSuffix(" sec")
-        self.spin_time_gap.setToolTip(
-            "Splits data into segments when gaps exceed this duration. "
-            "Prevents the velocity/jump thresholds from comparing points across "
-            "battery restarts or signal dropouts."
-        )
-        time_gap_layout.addWidget(self.spin_time_gap)
-        time_gap_layout.addStretch()
-        export_layout.addLayout(time_gap_layout)
 
         smoothing_label_layout = QHBoxLayout()
         smoothing_label_layout.addWidget(QLabel("Smoothing method:"))
@@ -2424,6 +2560,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.combo_smoothing.currentTextChanged.connect(self.on_smoothing_changed)
         smoothing_label_layout.addWidget(self.combo_smoothing)
         export_layout.addLayout(smoothing_label_layout)
+        self._inherited_rows.append(smoothing_label_layout)
 
         self.rolling_window_layout = QHBoxLayout()
         self.lbl_rolling_window = QLabel("Smoothing Window:")
@@ -2477,6 +2614,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.rolling_window_layout.addWidget(self.combo_window_units)
         self.rolling_window_layout.addStretch()
         export_layout.addLayout(self.rolling_window_layout)
+        self._inherited_rows.append(self.rolling_window_layout)
         # Sync the window control's visibility to the default method now.
         # setCurrentIndex above ran before the signal was connected, so
         # on_smoothing_changed never fired — sync the Smoothing Window's
@@ -2511,7 +2649,9 @@ class UWBQuickVisualizationWindow(QWidget):
             "\n"
             "Computed from the filtered + smoothed data at full temporal "
             "resolution, so no fixes are dropped before pairwise distances are "
-            "measured.\n"
+            "measured. This file is also what the social-network EDGE LIST is "
+            "aggregated from; the GBI is built separately, from the per-second "
+            "distances.\n"
             "\n"
             "Bouts are threshold-specific: to analyze a different distance, "
             "re-run with a new threshold. The raw per-timestamp pairwise "
@@ -2538,169 +2678,77 @@ class UWBQuickVisualizationWindow(QWidget):
         prox_layout.addWidget(self.spin_proximity_threshold)
         prox_layout.addStretch()
         self.proximity_threshold_widget.setLayout(prox_layout)
-        self.proximity_threshold_widget.setVisible(True)
+        self.proximity_threshold_widget.setVisible(False)
         export_layout.addWidget(self.proximity_threshold_widget)
 
         # ── Social network analysis (from the proximity threshold) ───────────
         # Replicates the LID_2020 RFID workflow on UWB data: pairwise edge lists
         # (event- and time-based), an asnipe-style GBI matrix of chain-rule
         # proximity flocks, and an optional dynamic social-network animation.
-        self.chk_social_network = QCheckBox("Export social network CSVs (edge lists + GBI)")
+        self.chk_social_network = QCheckBox("Export social network CSVs (edge list + GBI)")
         self.chk_social_network.setChecked(False)
         self.chk_social_network.setToolTip(
-            "Uses the proximity threshold to write R-ready social-network raw "
-            "materials:\n"
-            "  • edgelist_full / edgelist_daily — per-pair co-occurrence: "
-            "n_events (event-based) and total_duration_s (time-based)\n"
-            "  • GBI — asnipe-style group-by-individual matrix of proximity "
-            "flocks (chain rule), with m_sum/f_sum/mf_sum.\n"
+            "Two R-ready files, both keyed to the social radius set in the "
+            "preview. They are built from different things and answer "
+            "different questions, and neither is derived from the other:\n"
+            "\n"
+            "• network_edgelist.csv  DERIVED FROM the proximity bouts "
+            "file. A per-window aggregate of those same bouts: n_events counts "
+            "bouts (event-based weight), total_duration_s sums their durations "
+            "(time-based), mean_distance averages them. Strictly DIRECT dyadic "
+            "contact: a pair appears only if those two animals were themselves "
+            "within the radius.\n"
+            "\n"
+            "• network_GBI.csv  CALCULATED INDEPENDENTLY from the per-second "
+            "pairwise distances, not from the edge list. An asnipe-style "
+            "group-by-individual matrix: one row per chain-rule flocking event "
+            "(A-B and B-C in contact puts A, B and C in ONE group even if A and "
+            "C were never near each other), with m_sum/f_sum/mf_sum. Feeds "
+            "asnipe::get_network(data_format='GBI').\n"
+            "\n"
+            "Because of that chain rule, an edge list rebuilt from the GBI is "
+            "NOT the same as this one: it would add pairs that never actually "
+            "met. Rebuild from the proximity bouts instead.\n"
+            "\n"
             "Requires proximity detection (enabled automatically).")
         self.chk_social_network.stateChanged.connect(self.on_social_network_toggled)
         export_layout.addWidget(self.chk_social_network)
 
-        self.chk_social_animation = QCheckBox("Render social network animation")
-        self.chk_social_animation.setChecked(False)
-        self.chk_social_animation.setToolTip(
-            "Render a sliding-window dynamic social-network video (node colour = "
-            "sex, size = weighted degree, edge width = pair weight).")
-        self.chk_social_animation.stateChanged.connect(self.on_social_network_toggled)
-        export_layout.addWidget(self.chk_social_animation)
-
-        self.social_animation_widget = QWidget()
-        sna_layout = QGridLayout()
-        sna_layout.setContentsMargins(30, 0, 0, 0)
-        r = 0
-        sna_layout.addWidget(QLabel("Network construction:"), r, 0)
-        self.combo_sna_weighting = QComboBox()
-        self.combo_sna_weighting.addItems(["Total time (s)", "Bout count",
-                                           "Simple Ratio Index (SRI)",
-                                           "Half-weight Index (HWI)"])
-        self.combo_sna_weighting.setToolTip(
-            "How the EDGE WEIGHT between two animals is quantified in each window:\n"
+        # Edge-list resolution. The old export hard-coded two files (whole-trial
+        # and per-day); this is the same axis exposed as a single knob, so one
+        # file covers both and anything between.
+        el_win_row = QHBoxLayout()
+        el_win_row.setContentsMargins(30, 0, 0, 0)
+        el_win_row.addWidget(QLabel("Edge list window:"))
+        self.spin_el_window = QDoubleSpinBox()
+        self.spin_el_window.setRange(1.0, 24.0)
+        self.spin_el_window.setValue(24.0)
+        self.spin_el_window.setSingleStep(1.0)
+        self.spin_el_window.setDecimals(1)
+        self.spin_el_window.setSuffix(" h")
+        self.spin_el_window.setFixedWidth(90)
+        self.spin_el_window.setToolTip(
+            "Time window each row of network_edgelist.csv covers. The edge "
+            "list is simply the proximity bouts aggregated over this window.\n"
             "\n"
-            "• Total time (s): total seconds the pair spent within the proximity "
-            "threshold. Raw, absolute — dominated by the most social animals.\n"
-            "• Bout count: number of separate uninterrupted proximity events. "
-            "Counts frequency of contact rather than its duration.\n"
-            "• Simple Ratio Index (SRI): x / (x + yA + yB), where each flocking "
-            "event (a proximity cluster, chain rule) is one observation, x = "
-            "events with BOTH animals, yA/yB = events with only one. Normalised "
-            "0–1; controls for how gregarious each animal is. The asnipe standard.\n"
-            "• Half-weight Index (HWI): 2x / (cA + cB) — like SRI but down-weights "
-            "observations where only one of the pair was in a group. Use when "
-            "detectability is uneven. HWI ≥ SRI.")
-        sna_layout.addWidget(self.combo_sna_weighting, r, 1); r += 1
-        sna_layout.addWidget(QLabel("Window (hours):"), r, 0)
-        self.spin_sna_window = QDoubleSpinBox()
-        self.spin_sna_window.setRange(0.5, 240.0)
-        self.spin_sna_window.setValue(24.0)
-        self.spin_sna_window.setSingleStep(1.0)
-        self.spin_sna_window.setToolTip(
-            "Trailing time window each frame summarises. Each frame shows the "
-            "network built from all associations in the preceding N hours "
-            "(e.g. 24 h = a rolling day). Larger = smoother, more integrated ties.")
-        sna_layout.addWidget(self.spin_sna_window, r, 1); r += 1
-        sna_layout.addWidget(QLabel("Step (hours):"), r, 0)
-        self.spin_sna_step = QDoubleSpinBox()
-        self.spin_sna_step.setRange(0.005, 48.0)
-        self.spin_sna_step.setValue(1.0)
-        self.spin_sna_step.setDecimals(3)
-        self.spin_sna_step.setSingleStep(0.05)
-        self.spin_sna_step.setToolTip(
-            "How far the window advances between frames, in HOURS (e.g. 1.0 = one "
-            "frame per hour; 0.027 ≈ 1.6 min → ~900 frames/day). Smaller step = "
-            "more frames = smoother node motion, but longer render. Watch the "
-            "'Estimated clip' line to hit a target length (e.g. ~30 s/day).")
-        sna_layout.addWidget(self.spin_sna_step, r, 1); r += 1
-        sna_layout.addWidget(QLabel("Frame rate (fps):"), r, 0)
-        self.combo_sna_fps = QComboBox()
-        self.combo_sna_fps.addItems(["2", "5", "10", "15", "30"])
-        self.combo_sna_fps.setCurrentText("10")
-        self.combo_sna_fps.setToolTip(
-            "Playback frames per second of the network video. Note there is no "
-            "'speed' control — pacing is set by Window / Step (e.g. a 24 h window "
-            "stepped 1 h shows one frame per hour regardless of fps); fps only "
-            "sets how fast those frames play back.")
-        sna_layout.addWidget(self.combo_sna_fps, r, 1); r += 1
-        self.lbl_sna_clip = QLabel("Estimated clip: — (load data)")
-        self.lbl_sna_clip.setStyleSheet("color:#3a7; font-style:italic;")
-        self.lbl_sna_clip.setToolTip(
-            "Approximate video length = frames / fps, where frames ≈ span / step. "
-            "Window size sets what each frame shows, not the length. For smooth "
-            "node movement use a small Step (more frames) and a higher fps.")
-        sna_layout.addWidget(self.lbl_sna_clip, r, 0, 1, 2); r += 1
-        for _w in (self.combo_sna_fps, self.spin_sna_step, self.spin_sna_window):
-            _w.currentTextChanged.connect(self._update_sna_clip_estimate) if isinstance(_w, QComboBox) \
-                else _w.valueChanged.connect(self._update_sna_clip_estimate)
-        sna_layout.addWidget(QLabel("Node size by:"), r, 0)
-        self.combo_sna_node = QComboBox()
-        self.combo_sna_node.addItems(["None (uniform)", "Degree", "Strength",
-                                      "Betweenness", "Closeness", "Eigenvector",
-                                      "PageRank"])
-        self.combo_sna_node.setCurrentText("None (uniform)")
-        self.combo_sna_node.setToolTip(
-            "Node centrality metric (igraph) driving each node's size, computed "
-            "per window and rescaled per frame:\n"
-            "• None: all nodes the same size.\n"
-            "• Degree: number of distinct partners (unweighted).\n"
-            "• Strength: weighted degree = sum of the node's edge weights.\n"
-            "• Betweenness: how often the node lies on shortest paths between "
-            "others (a 'broker' / bridge between groups).\n"
-            "• Closeness: inverse mean distance to all others (how quickly it can "
-            "reach the whole network).\n"
-            "• Eigenvector: connection to other WELL-connected nodes (influence).\n"
-            "• PageRank: eigenvector variant with a random-restart (robust to "
-            "disconnected components).")
-        sna_layout.addWidget(self.combo_sna_node, r, 1); r += 1
-        sna_layout.addWidget(QLabel("Layout:"), r, 0)
-        self.combo_sna_layout = QComboBox()
-        self.combo_sna_layout.addItems(["Fruchterman-Reingold", "Kamada-Kawai",
-                                        "Circular"])
-        self.combo_sna_layout.setCurrentText("Fruchterman-Reingold")
-        self.combo_sna_layout.setToolTip(
-            "How node positions are computed (via igraph):\n"
-            "• Fruchterman-Reingold: force-directed spring layout, re-solved each "
-            "frame from the previous positions — so nodes DRIFT and move closer / "
-            "farther as ties change (the LID_2020 R animation style). Default.\n"
-            "• Kamada-Kawai: clean static spread; node positions are FIXED for "
-            "the whole video (only edges/sizes change).\n"
-            "• Circular: nodes evenly on a circle; fixed, guaranteed no overlap, "
-            "but position carries no meaning.")
-        sna_layout.addWidget(self.combo_sna_layout, r, 1); r += 1
-        sna_layout.addWidget(QLabel("Edge width:"), r, 0)
-        self.combo_sna_edge = QComboBox()
-        self.combo_sna_edge.addItems(["Scaled by weight", "Uniform"])
-        self.combo_sna_edge.setToolTip(
-            "Edge line width scaled by the (windowed) edge weight, or drawn at a "
-            "constant width. Edge weight itself is set by 'Network construction'.")
-        sna_layout.addWidget(self.combo_sna_edge, r, 1); r += 1
-        self.btn_sna_preview = QPushButton("Preview Layout…")
-        self.btn_sna_preview.setToolTip(
-            "Render a single network frame with the current settings so you can "
-            "check the look before committing to a full render. The popup has a "
-            "'Random frame' button to sample different times across the recording.")
-        self.btn_sna_preview.clicked.connect(self.open_sna_layout_preview)
-        sna_layout.addWidget(self.btn_sna_preview, r, 0, 1, 2); r += 1
-        self.chk_sna_daily = QCheckBox("Daily social network animations (one per day)")
-        self.chk_sna_daily.setChecked(False)
-        self.chk_sna_daily.setToolTip(
-            "Render one video per calendar day instead of a single video for the "
-            "whole recording. Tick to choose which days.")
-        self.chk_sna_daily.stateChanged.connect(self.on_sna_daily_toggled)
-        sna_layout.addWidget(self.chk_sna_daily, r, 0, 1, 2); r += 1
-        # Per-day checkboxes (populated from the loaded data, default all on).
-        self.sna_daily_days_widget = QWidget()
-        _sna_days_outer = QVBoxLayout()
-        _sna_days_outer.setContentsMargins(20, 0, 0, 4)
-        self.sna_daily_days_inner = QVBoxLayout()
-        self.sna_daily_day_checkboxes = {}
-        _sna_days_outer.addLayout(self.sna_daily_days_inner)
-        self.sna_daily_days_widget.setLayout(_sna_days_outer)
-        self.sna_daily_days_widget.setVisible(False)
-        sna_layout.addWidget(self.sna_daily_days_widget, r, 0, 1, 2); r += 1
-        self.social_animation_widget.setLayout(sna_layout)
-        self.social_animation_widget.setVisible(False)
-        export_layout.addWidget(self.social_animation_widget)
+            "24 h gives one row per dyad per day; 1 h gives hourly resolution. "
+            "Windows are anchored to clock boundaries, so 24 h means real "
+            "calendar days rather than time since the recording started.\n"
+            "\n"
+            "The aggregation is lossless at any setting (every bout is counted "
+            "exactly once), so a fine window can be summed up to a coarser one "
+            "downstream and give identical totals. A bout is counted in the "
+            "window its START falls in; it is not split across a boundary.\n"
+            "\n"
+            "Does not affect the GBI, which is calculated independently.")
+        el_win_row.addWidget(self.spin_el_window)
+        el_win_row.addStretch()
+        self.el_window_widget = QWidget()
+        self.el_window_widget.setLayout(el_win_row)
+        self.el_window_widget.setVisible(self.chk_social_network.isChecked())
+        export_layout.addWidget(self.el_window_widget)
+
+
 
         self.chk_save_plots = QCheckBox("Save Plots")
         self.chk_save_plots.setChecked(False)  # off by default; opt in per run
@@ -2789,6 +2837,7 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         trail_layout.addWidget(self.spin_animation_trail)
         animation_options_layout.addLayout(trail_layout)
+        self._inherited_rows.append(trail_layout)
 
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel("Color by:"))
@@ -2800,6 +2849,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "colour per tag. sex: blue = male, red = female (needs identities).")
         color_layout.addWidget(self.combo_color_by, 1)
         animation_options_layout.addLayout(color_layout)
+        self._inherited_rows.append(color_layout)
 
         # Which animals to render (default: all configured tags).
         inctag_layout = QHBoxLayout()
@@ -2815,20 +2865,21 @@ class UWBQuickVisualizationWindow(QWidget):
         animation_options_layout.addLayout(inctag_layout)
 
         # Marker diameter (points) for the rendered video. Mirrors the preview's
-        # 'Tag Display Size' so a size dialled in during preview matches the export.
+        # 'Tag Icon Size' so a size dialled in during preview matches the export.
         anim_tagsize_layout = QHBoxLayout()
-        anim_tagsize_layout.addWidget(QLabel("Tag Display Size:"))
+        anim_tagsize_layout.addWidget(QLabel("Tag Icon Size:"))
         self.spin_anim_tag_size = QSpinBox()
         self.spin_anim_tag_size.setRange(2, 40)
         self.spin_anim_tag_size.setValue(10)
         self.spin_anim_tag_size.setSuffix(" pts")
         self.spin_anim_tag_size.setToolTip(
             "Diameter (in points) of each tag's marker in the exported animation. "
-            "Match this to the preview's 'Tag Display Size' so the video looks "
+            "Match this to the preview's 'Tag Icon Size' so the video looks "
             "like what you tuned in the preview window.")
         anim_tagsize_layout.addWidget(self.spin_anim_tag_size)
         anim_tagsize_layout.addStretch(1)
         animation_options_layout.addLayout(anim_tagsize_layout)
+        self._inherited_rows.append(anim_tagsize_layout)
 
         self.chk_show_battery_export = QCheckBox("Display Tag Battery Levels")
         self.chk_show_battery_export.setChecked(False)
@@ -2992,16 +3043,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_run_batch.clicked.connect(self.run_batch)
         self.btn_run_batch.setEnabled(False)
         self.btn_run_batch.setStyleSheet(
-            "padding: 8px; font-size: 11px; font-weight: bold; "
-            "background-color: #2ea043; color: white;")
+            "QPushButton { padding: 8px; font-size: 11px; font-weight: bold; "
+            "background-color: #2ea043; color: white; }")
         batch_btns_row2.addWidget(self.btn_run_batch)
         self.btn_stop_batch = QPushButton("Stop Batch")
         self.btn_stop_batch.setToolTip("Stop after tearing down the current trial")
         self.btn_stop_batch.clicked.connect(self.stop_batch)
         self.btn_stop_batch.setVisible(False)
         self.btn_stop_batch.setStyleSheet(
-            "padding: 8px; font-size: 11px; font-weight: bold; "
-            "background-color: #d41100; color: white;")
+            "QPushButton { padding: 8px; font-size: 11px; font-weight: bold; "
+            "background-color: #d41100; color: white; }")
         batch_btns_row2.addWidget(self.btn_stop_batch)
         batch_layout.addLayout(batch_btns_row2)
         self.batch_list = QListWidget()
@@ -3010,6 +3061,33 @@ class UWBQuickVisualizationWindow(QWidget):
         batch_layout.addWidget(self.batch_list)
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
+
+        # --- Batch progress ------------------------------------------------
+        # The queue list says WHICH trial is running; this says how far along
+        # the run is as a whole, and (during a render) how far through the
+        # frames — the part that takes hours. Hidden until a batch starts.
+        self.batch_progress_widget = QWidget()
+        _bp = QVBoxLayout()
+        _bp.setContentsMargins(0, 4, 0, 0)
+        self.lbl_batch_progress = QLabel("")
+        self.lbl_batch_progress.setStyleSheet(
+            "color: #2ea043; font-weight: bold; font-size: 10px;")
+        self.lbl_batch_progress.setWordWrap(True)
+        _bp.addWidget(self.lbl_batch_progress)
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setRange(0, 100)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setTextVisible(True)
+        self.batch_progress_bar.setFormat("%p% of queue")
+        self.batch_progress_bar.setFixedHeight(16)
+        _bp.addWidget(self.batch_progress_bar)
+        self.lbl_batch_eta = QLabel("")
+        self.lbl_batch_eta.setStyleSheet("color: #888888; font-size: 9px;")
+        self.lbl_batch_eta.setWordWrap(True)
+        _bp.addWidget(self.lbl_batch_eta)
+        self.batch_progress_widget.setLayout(_bp)
+        self.batch_progress_widget.setVisible(False)
+        layout.addWidget(self.batch_progress_widget)
 
         # Session Logs window
         messages_label = QLabel("Session Logs:")
@@ -3033,7 +3111,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.btn_copy_logs = QPushButton("Copy Session Logs to Clipboard")
         self.btn_copy_logs.setToolTip("Copy the full session log above to the clipboard for pasting into a bug report or notes")
-        self.btn_copy_logs.setStyleSheet("padding: 6px; font-size: 10px;")
+        self.btn_copy_logs.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
         self.btn_copy_logs.clicked.connect(self.copy_session_logs)
         layout.addWidget(self.btn_copy_logs)
 
@@ -3161,13 +3239,13 @@ class UWBQuickVisualizationWindow(QWidget):
             "Load a floorplan or arena image to overlay under trajectory plots. "
             "Requires an XML config in the database folder for spatial scaling."
         )
-        self.btn_load_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        self.btn_load_background.setStyleSheet("QPushButton { padding: 8px; font-size: 11px; }")
         bg_buttons_layout.addWidget(self.btn_load_background)
         self.btn_remove_background = QPushButton("Remove Background")
         self.btn_remove_background.clicked.connect(self.remove_background)
         self.btn_remove_background.setEnabled(False)
         self.btn_remove_background.setToolTip("Clear the loaded background image from all visualizations")
-        self.btn_remove_background.setStyleSheet("padding: 8px; font-size: 11px;")
+        self.btn_remove_background.setStyleSheet("QPushButton { padding: 8px; font-size: 11px; }")
         bg_buttons_layout.addWidget(self.btn_remove_background)
         v.addLayout(bg_buttons_layout)
 
@@ -3237,6 +3315,15 @@ class UWBQuickVisualizationWindow(QWidget):
         self._bg_transform_box.setEnabled(False)   # enabled once an image loads
         v.addWidget(self._bg_transform_box)
 
+        self.chk_preview_dark = QCheckBox("Dark mode")
+        self.chk_preview_dark.setChecked(False)   # light by default
+        self.chk_preview_dark.setToolTip(
+            "Dark background for the preview. Off by default — the light theme "
+            "(white background, tan arena floor) is better for figures and "
+            "screenshots.")
+        self.chk_preview_dark.stateChanged.connect(self.on_preview_theme_changed)
+        v.addWidget(self.chk_preview_dark)
+
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
         self.chk_show_anchors.setEnabled(False)
@@ -3256,15 +3343,6 @@ class UWBQuickVisualizationWindow(QWidget):
             "authored colours. Preview only. Zones are parsed from the site XML.")
         self.chk_show_zones.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_zones)
-
-        self.chk_show_tracking = QCheckBox("Show Tag Tracking Data")
-        self.chk_show_tracking.setChecked(True)
-        self.chk_show_tracking.setToolTip(
-            "Draw the tag position markers and trailing tracks in the LIVE "
-            "PREVIEW. Turn off to inspect just the arena / background / anchors "
-            "without any tracking data on top.")
-        self.chk_show_tracking.stateChanged.connect(self.on_show_background_toggled)
-        v.addWidget(self.chk_show_tracking)
 
         # Show the tag's ID label above each marker, with a choice of ID format.
         tagid_row = QHBoxLayout()
@@ -3288,24 +3366,6 @@ class UWBQuickVisualizationWindow(QWidget):
         tagid_row.addWidget(self.combo_tag_id_type, 1)
         v.addLayout(tagid_row)
 
-        # Marker diameter in points. Matches the animation export's Tag Display
-        # Size so a size dialled in here reads the same in the rendered video —
-        # the preview marker was previously smaller than the export.
-        tagsize_row = QHBoxLayout()
-        tagsize_row.addWidget(QLabel("Tag Display Size:"))
-        self.spin_tag_size = QSpinBox()
-        self.spin_tag_size.setRange(2, 40)
-        self.spin_tag_size.setValue(10)
-        self.spin_tag_size.setSuffix(" pts")
-        self.spin_tag_size.setToolTip(
-            "Diameter (in points) of each tag's position marker in the preview. "
-            "Set the same value in the animation export's 'Tag Display Size' to "
-            "make the video markers match what you see here.")
-        self.spin_tag_size.valueChanged.connect(self.on_show_background_toggled)
-        tagsize_row.addWidget(self.spin_tag_size)
-        tagsize_row.addStretch(1)
-        v.addLayout(tagsize_row)
-
         self.chk_show_battery = QCheckBox("Display Tag Battery Levels")
         self.chk_show_battery.setChecked(False)
         self.chk_show_battery.setToolTip(
@@ -3313,6 +3373,33 @@ class UWBQuickVisualizationWindow(QWidget):
             "its marker. Independent of 'Show Tag ID'. Off by default.")
         self.chk_show_battery.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_battery)
+
+        self.chk_show_tracking = QCheckBox("Show Tag Tracking Data")
+        self.chk_show_tracking.setChecked(True)
+        self.chk_show_tracking.setToolTip(
+            "Draw the tag position markers and trailing tracks in the LIVE "
+            "PREVIEW. Turn off to inspect just the arena / background / anchors "
+            "without any tracking data on top.")
+        self.chk_show_tracking.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_tracking)
+
+        # Marker diameter in points. Matches the animation export's Tag Icon
+        # Size so a size dialled in here reads the same in the rendered video;
+        # the preview marker was previously smaller than the export.
+        tagsize_row = QHBoxLayout()
+        tagsize_row.addWidget(QLabel("Tag Icon Size:"))
+        self.spin_tag_size = QSpinBox()
+        self.spin_tag_size.setRange(2, 40)
+        self.spin_tag_size.setValue(10)
+        self.spin_tag_size.setSuffix(" pts")
+        self.spin_tag_size.setToolTip(
+            "Diameter (in points) of each tag's position marker in the preview. "
+            "Set the same value in the animation export's 'Tag Icon Size' to "
+            "make the video markers match what you see here.")
+        self.spin_tag_size.valueChanged.connect(self.on_show_background_toggled)
+        tagsize_row.addWidget(self.spin_tag_size)
+        tagsize_row.addStretch(1)
+        v.addLayout(tagsize_row)
 
         color_row = QHBoxLayout()
         color_row.addWidget(QLabel("Color by:"))
@@ -3327,18 +3414,41 @@ class UWBQuickVisualizationWindow(QWidget):
         color_row.addWidget(self.combo_preview_color, 1)
         v.addLayout(color_row)
 
-        self.chk_preview_dark = QCheckBox("Dark mode")
-        self.chk_preview_dark.setChecked(False)   # light by default
-        self.chk_preview_dark.setToolTip(
-            "Dark background for the preview. Off by default — the light theme "
-            "(white background, tan arena floor) is better for figures and "
-            "screenshots.")
-        self.chk_preview_dark.stateChanged.connect(self.on_preview_theme_changed)
-        v.addWidget(self.chk_preview_dark)
+        disp_row = QHBoxLayout()
+        disp_row.addWidget(QLabel("Trail length (seconds):"))
+        self.spin_preview_trail = QSpinBox()
+        self.spin_preview_trail.setRange(0, 3600)     # up to one hour of path
+        self.spin_preview_trail.setValue(60)
+        self.spin_preview_trail.setSuffix(" s")
+        self.spin_preview_trail.setSingleStep(30)
+        self.spin_preview_trail.setToolTip(
+            "Seconds of trailing track drawn behind each tag's current "
+            "position. The export animation has its own 'Trail length' "
+            "setting; set them alike for the video to match the preview.")
+        self.spin_preview_trail.valueChanged.connect(self.on_preview_trail_changed)
+        disp_row.addWidget(self.spin_preview_trail)
+        disp_row.addStretch()
+        v.addLayout(disp_row)
+
 
         # Preview thresholding — independent of the Export thresholds, so you can
         # see the track with/without each applied AND tune the cutoff live. Each
         # toggle carries its own value spinbox (defaults match Export: 2.0).
+        time_gap_layout = QHBoxLayout()
+        time_gap_layout.addWidget(QLabel("Time gap grouping:"))
+        self.spin_time_gap = QSpinBox()
+        self.spin_time_gap.setRange(5, 300)
+        self.spin_time_gap.setValue(30)
+        self.spin_time_gap.setSuffix(" sec")
+        self.spin_time_gap.setToolTip(
+            "Splits data into segments when gaps exceed this duration. "
+            "Prevents the velocity/jump thresholds from comparing points across "
+            "battery restarts or signal dropouts."
+        )
+        time_gap_layout.addWidget(self.spin_time_gap)
+        time_gap_layout.addStretch()
+        v.addLayout(time_gap_layout)
+
         pvel_row = QHBoxLayout()
         self.chk_preview_velocity = QCheckBox("Velocity threshold (remove >")
         self.chk_preview_velocity.setChecked(True)
@@ -3431,19 +3541,163 @@ class UWBQuickVisualizationWindow(QWidget):
         # Set initial visibility for the default method (None → hidden).
         self.on_preview_smoothing_changed()
 
-        disp_row = QHBoxLayout()
-        disp_row.addWidget(QLabel("Trail:"))
-        self.spin_preview_trail = QSpinBox()
-        self.spin_preview_trail.setRange(0, 3600)     # up to one hour of path
-        self.spin_preview_trail.setValue(60)
-        self.spin_preview_trail.setSuffix(" s")
-        self.spin_preview_trail.setSingleStep(30)
-        self.spin_preview_trail.setToolTip(
-            "Seconds of trailing track drawn behind each tag's current position.")
-        self.spin_preview_trail.valueChanged.connect(self.on_preview_trail_changed)
-        disp_row.addWidget(self.spin_preview_trail)
-        disp_row.addStretch()
-        v.addLayout(disp_row)
+
+        # --- Behaviour detection --------------------------------------------
+        # Detection runs on exactly the track shown in the preview, so changing
+        # the smoothing above immediately changes what is detected. That makes
+        # the smoothing/detectability trade-off visible rather than assumed.
+        self.chk_show_behavior = QCheckBox("Show Behavior Detection")
+        self.chk_show_behavior.setChecked(False)
+        self.chk_show_behavior.setToolTip(
+            "Classify each tag in the current frame and draw the result. "
+            "Detection uses the preview track as smoothed above — change the "
+            "smoothing and the detections change with it.")
+        self.chk_show_behavior.stateChanged.connect(self.on_show_behavior_toggled)
+        v.addWidget(self.chk_show_behavior)
+
+        self.behavior_options_widget = QWidget()
+        bl = QVBoxLayout()
+        bl.setContentsMargins(18, 0, 0, 0)
+        bl.setSpacing(2)
+
+        def _beh_spin(label, lo, hi, val, step, decimals, suffix, tip):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            lab = QLabel(label)
+            lab.setStyleSheet("font-size: 9px;")
+            row.addWidget(lab)
+            sp = QDoubleSpinBox()
+            sp.setRange(lo, hi)
+            sp.setValue(val)
+            sp.setSingleStep(step)
+            sp.setDecimals(decimals)
+            sp.setSuffix(suffix)
+            sp.setToolTip(tip)
+            sp.setFixedWidth(90)
+            sp.valueChanged.connect(self.render_preview_frame)
+            row.addWidget(sp)
+            row.addStretch()
+            return row, sp
+
+        # Locomotor
+        self.chk_beh_locomotor = QCheckBox("Locomotor state (inactive / moving)")
+        self.chk_beh_locomotor.setChecked(True)
+        self.chk_beh_locomotor.stateChanged.connect(self.render_preview_frame)
+        bl.addWidget(self.chk_beh_locomotor)
+        row, self.spin_still_speed = _beh_spin(
+            "Inactive below:", 0.0, 5.0, 0.005, 0.005, 4, " m/s",
+            "At or below this speed a tag reads as inactive; above it, moving. "
+            "Should sit above the position-noise floor - see the speed summary "
+            "below.")
+        bl.addLayout(row)
+
+        # Social overlap
+        self.chk_beh_social = QCheckBox("Social overlap")
+        self.chk_beh_social.setChecked(True)
+        self.chk_beh_social.setToolTip(
+            "Each tag carries a circle of the radius below; an overlap is when "
+            "two circles intersect, i.e. centres within twice the radius. "
+            "0.25 m reproduces the existing 0.50 m proximity exactly.")
+        self.chk_beh_social.stateChanged.connect(self.render_preview_frame)
+        bl.addWidget(self.chk_beh_social)
+        row, self.spin_social_radius = _beh_spin(
+            "Social radius:", 0.01, 5.0, 0.25, 0.05, 2, " m",
+            "Radius of each animal's social circle. Overlap (contact) occurs "
+            "when two circles intersect, i.e. centre-to-centre <= 2x this.")
+        lab_col = QLabel("colour:")
+        lab_col.setStyleSheet("font-size: 9px;")
+        row.insertWidget(2, lab_col)
+        self.combo_circle_color = QComboBox()
+        for name, hexv in (("White", "#ffffff"), ("Yellow", "#ffe066"),
+                           ("Cyan", "#4dd2ff"), ("Magenta", "#ff6ec7"),
+                           ("Black", "#000000"), ("Grey", "#9fb3c8"),
+                           ("Green", "#2ea043")):
+            self.combo_circle_color.addItem(name, hexv)
+        self.combo_circle_color.setCurrentIndex(0)
+        self.combo_circle_color.setFixedWidth(90)
+        self.combo_circle_color.setToolTip(
+            "Colour of the dotted social-radius circle — pick one that reads "
+            "against your background image.")
+        self.combo_circle_color.currentIndexChanged.connect(self.render_preview_frame)
+        row.insertWidget(3, self.combo_circle_color)
+        bl.addLayout(row)
+
+        # Chase
+        self.chk_beh_chase = QCheckBox("Chasing")
+        self.chk_beh_chase.setChecked(True)
+        self.chk_beh_chase.setToolTip(
+            "Directional pursuit: the pair is close, both are moving, the "
+            "chaser is heading at the target and the target is heading away.")
+        self.chk_beh_chase.stateChanged.connect(self.render_preview_frame)
+        bl.addWidget(self.chk_beh_chase)
+        row, self.spin_chase_distance = _beh_spin(
+            "Within:", 0.05, 5.0, 0.50, 0.05, 2, " m",
+            "Maximum centre-to-centre separation for a chase.")
+        bl.addLayout(row)
+        row, self.spin_chase_speed = _beh_spin(
+            "Both faster than:", 0.0, 10.0, 0.20, 0.05, 3, " m/s",
+            "Both animals must exceed this speed.")
+        bl.addLayout(row)
+        row, self.spin_chase_angle = _beh_spin(
+            "Heading within:", 5.0, 180.0, 45.0, 5.0, 0, " deg",
+            "How closely the chaser must head at the target (and the target "
+            "away from the chaser). Larger is more permissive.")
+        bl.addLayout(row)
+        row, self.spin_min_chase = _beh_spin(
+            "Lasting at least:", 0.0, 60.0, 1.0, 0.5, 1, " s",
+            "Minimum bout duration; shorter flickers are discarded.")
+        bl.addLayout(row)
+        row, self.spin_heading_lag = _beh_spin(
+            "Heading over:", 0.5, 30.0, 3.0, 0.5, 1, " s",
+            "Heading is measured over this lag so it is not dominated by "
+            "per-frame position jitter.")
+        bl.addLayout(row)
+
+        # One plain-language line instead of raw percentiles: it says whether
+        # the track being classified can actually support the thresholds set
+        # above, which is the question the numbers were there to answer.
+        # Displacement
+        self.chk_beh_displace = QCheckBox("Displacement (supplant)")
+        self.chk_beh_displace.setChecked(True)
+        self.chk_beh_displace.setToolTip(
+            "One animal moves in on a settled neighbour and the neighbour is "
+            "the one that leaves. Needs no sprint from either animal, so it "
+            "survives heavy smoothing where chase detection does not.")
+        self.chk_beh_displace.stateChanged.connect(self.render_preview_frame)
+        bl.addWidget(self.chk_beh_displace)
+        row, self.spin_displace_distance = _beh_spin(
+            "Arrives within:", 0.05, 5.0, 0.30, 0.05, 2, " m",
+            "How close the arriving animal must get for it to count as an arrival.")
+        bl.addLayout(row)
+        row, self.spin_displace_loser_speed = _beh_spin(
+            "Settled below:", 0.0, 5.0, 0.10, 0.01, 3, " m/s",
+            "The resident must be at or below this speed when the other arrives.")
+        bl.addLayout(row)
+        row, self.spin_displace_winner_speed = _beh_spin(
+            "Arriving above:", 0.0, 5.0, 0.15, 0.01, 3, " m/s",
+            "The arriving animal must be moving at least this fast.")
+        bl.addLayout(row)
+        row, self.spin_displace_leave = _beh_spin(
+            "Resolved past:", 0.1, 10.0, 0.75, 0.05, 2, " m",
+            "Separation that counts as the encounter being resolved.")
+        bl.addLayout(row)
+        row, self.spin_displace_window = _beh_spin(
+            "Within:", 0.5, 60.0, 5.0, 0.5, 1, " s",
+            "How long to wait after the arrival for that resolution.")
+        bl.addLayout(row)
+
+        self.lbl_speed_pcts = QLabel("")
+        self.lbl_speed_pcts.setStyleSheet("color: #9fb3c8; font-size: 9px;")
+        self.lbl_speed_pcts.setWordWrap(True)
+        self.lbl_speed_pcts.setToolTip(
+            "How fast the tags actually move on the track being classified, "
+            "and whether your speed thresholds sit inside that range. A "
+            "threshold above nearly all observed movement can never fire.")
+        bl.addWidget(self.lbl_speed_pcts)
+
+        self.behavior_options_widget.setLayout(bl)
+        self.behavior_options_widget.setVisible(False)
+        v.addWidget(self.behavior_options_widget)
 
         # Chunk length + binning rate are streaming internals: kept at sensible
         # defaults but hidden so the streamlined preview stays simple.
@@ -3526,7 +3780,23 @@ class UWBQuickVisualizationWindow(QWidget):
         smoothing option) does NOT block scrubbing.
         """
         from PyQt5.QtCore import QEvent
-        from PyQt5.QtWidgets import QAbstractSpinBox, QComboBox, QLineEdit
+        from PyQt5.QtWidgets import QAbstractSpinBox, QComboBox, QLineEdit, QWidget
+
+        # A click anywhere in the preview pane hands focus back to the timeline
+        # so the arrow keys resume scrubbing. Without this, focus left in a
+        # spinbox in the settings column keeps swallowing the arrows, and the
+        # only way to get scrubbing back is to click the slider itself.
+        if event.type() == QEvent.MouseButtonPress:
+            panel = getattr(self, 'preview_panel', None)
+            if panel is not None and isinstance(obj, QWidget):
+                node = obj
+                while node is not None:
+                    if node is panel:
+                        self.slider_timeline.setFocus(Qt.MouseFocusReason)
+                        break
+                    node = node.parentWidget()
+            # never consume the click - panning and slider drags still need it
+
         if (event.type() == QEvent.KeyPress
                 and event.key() in (Qt.Key_Left, Qt.Key_Right)
                 and getattr(self, '_preview_active', False)
@@ -3812,6 +4082,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.invalidate_preview_cache()
 
     def invalidate_preview_cache(self):
+        # Keep the (hidden) export settings identical to the preview's.
+        self._sync_export_from_preview()
         """Drop cached chunks. Called whenever anything upstream of the frames
         changes — filtering, smoothing, timezone, tag selection, chunk size —
         so the pane can never show data processed with stale settings."""
@@ -4383,6 +4655,214 @@ class UWBQuickVisualizationWindow(QWidget):
         return int(np.clip(i, 0, len(self.preview_times) - 1))
 
     # -- rendering --------------------------------------------------------- #
+    def on_show_behavior_toggled(self, *_):
+        """Reveal the per-behaviour controls and redraw."""
+        if hasattr(self, "behavior_options_widget"):
+            self.behavior_options_widget.setVisible(self.chk_show_behavior.isChecked())
+        self.render_preview_frame()
+
+    def _hide_inherited_export_rows(self):
+        """Hide the export rows that now come from the preview.
+
+        The widgets stay alive rather than being deleted: the export pipeline,
+        the saved config and the run summary all read them, and keeping them in
+        sync means the config still records exactly what a run used.
+        """
+        for layout in getattr(self, "_inherited_rows", []):
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                wdg = item.widget() if item is not None else None
+                if wdg is not None:
+                    wdg.setVisible(False)
+        if hasattr(self, "proximity_threshold_widget"):
+            self.proximity_threshold_widget.setVisible(False)
+        self._sync_export_from_preview()
+
+    def _sync_export_from_preview(self):
+        """Mirror the preview's processing settings onto the export widgets.
+
+        The preview is the single source of truth for how a track is filtered
+        and smoothed, so what you tuned while looking at the data is exactly
+        what gets exported.
+        """
+        try:
+            self.chk_velocity_filter.setChecked(self.chk_preview_velocity.isChecked())
+            self.spin_velocity_threshold.setValue(self.spin_preview_velocity.value())
+            self.chk_jump_filter.setChecked(self.chk_preview_jump.isChecked())
+            self.spin_jump_threshold.setValue(self.spin_preview_jump.value())
+            self.combo_smoothing.setCurrentText(self.combo_preview_smoothing.currentText())
+            self.spin_rolling_window.setValue(self.spin_preview_window.value())
+            self.combo_window_units.setCurrentText(
+                self.combo_preview_window_units.currentText())
+            # Proximity is parameterised in the preview as a per-animal social
+            # radius; the exporter still works in centre-to-centre distance.
+            if hasattr(self, "spin_social_radius"):
+                self.spin_proximity_threshold.setValue(
+                    2.0 * self.spin_social_radius.value())
+            # The rendered animation should look like the preview it came from.
+            self.spin_animation_trail.setValue(self.spin_preview_trail.value())
+            self.spin_anim_tag_size.setValue(self.spin_tag_size.value())
+            # The two combos spell the same option differently ("Sex" vs "sex"),
+            # so match case-insensitively rather than failing silently.
+            want = self.combo_preview_color.currentText().strip().lower()
+            for i in range(self.combo_color_by.count()):
+                if self.combo_color_by.itemText(i).strip().lower() == want:
+                    self.combo_color_by.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+
+    def _behavior_params(self):
+        """Current detection thresholds straight from the preview controls."""
+        from fnt.uwb.behavior_detection import BehaviorParams
+        return BehaviorParams(
+            social_radius=self.spin_social_radius.value(),
+            still_speed=self.spin_still_speed.value(),
+            chase_distance=self.spin_chase_distance.value(),
+            chase_speed=self.spin_chase_speed.value(),
+            chase_angle_deg=self.spin_chase_angle.value(),
+            min_chase_s=self.spin_min_chase.value(),
+            heading_lag_s=self.spin_heading_lag.value(),
+            displace_distance=self.spin_displace_distance.value(),
+            displace_loser_speed=self.spin_displace_loser_speed.value(),
+            displace_winner_speed=self.spin_displace_winner_speed.value(),
+            displace_leave_distance=self.spin_displace_leave.value(),
+            displace_window_s=self.spin_displace_window.value(),
+        )
+
+    def _behavior_results(self):
+        """Classification for the loaded preview chunk, recomputed when needed.
+
+        The chunk's geometry is the expensive part, so the result is cached and
+        only rebuilt when the data or a threshold actually changes — which keeps
+        dragging a threshold spinbox interactive.
+        """
+        if self.preview_x is None or not len(self.preview_x):
+            return None
+        from fnt.uwb import behavior_detection as bd
+        params = self._behavior_params()
+        key = (id(self.preview_x), self.preview_x.shape, tuple(sorted(params.to_dict().items())))
+        cached = getattr(self, "_behavior_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            res = bd.classify(self.preview_times, self.preview_x, self.preview_y, params)
+        except Exception as e:
+            self.log_message(f"Behavior detection failed: {e}")
+            return None
+        self._behavior_cache = (key, res)
+        return res
+
+    def _behavior_overlay(self, idx):
+        """Circles / partner links / per-tag state text for one preview frame."""
+        if not (getattr(self, "chk_show_behavior", None)
+                and self.chk_show_behavior.isChecked()):
+            if hasattr(self, "lbl_speed_pcts"):
+                self.lbl_speed_pcts.setText("")
+            return None
+        res = self._behavior_results()
+        if res is None or idx >= len(res["locomotor"]):
+            return None
+        from fnt.uwb import behavior_detection as bd
+
+        show_social = self.chk_beh_social.isChecked()
+        show_loco = self.chk_beh_locomotor.isChecked()
+        show_chase = self.chk_beh_chase.isChecked()
+        show_displace = self.chk_beh_displace.isChecked()
+
+        loc = res["locomotor"][idx]
+        # Derive the displayed social state from the raw masks rather than
+        # masking the collapsed array: chase outranks contact in the collapsed
+        # state, so blanking chase there would also hide a contact that is
+        # genuinely happening underneath it.
+        n_tags = len(loc)
+        chase_f = res["chase"][idx]
+        contact_f = res["contact"][idx]
+        soc = np.full(n_tags, bd.SOC_NONE, dtype=np.int8)
+        partner_f = np.full(n_tags, -1, dtype=int)
+        dist_f = res["pairs"]["dist"][idx]
+
+        def _nearest(mask_row):
+            cand = np.where(mask_row, np.nan_to_num(dist_f_row, nan=np.inf), np.inf)
+            j = int(np.argmin(cand))
+            return j if np.isfinite(cand[j]) else -1
+
+        disp_f = res["displacing"][idx]
+        for t in range(n_tags):
+            dist_f_row = dist_f[t]
+            if show_chase and chase_f[t].any():
+                soc[t] = bd.SOC_CHASING
+                partner_f[t] = _nearest(chase_f[t])
+            elif show_chase and chase_f[:, t].any():
+                soc[t] = bd.SOC_CHASED
+                partner_f[t] = _nearest(chase_f[:, t])
+            elif show_displace and disp_f[t].any():
+                soc[t] = bd.SOC_DISPLACING
+                partner_f[t] = _nearest(disp_f[t])
+            elif show_displace and disp_f[:, t].any():
+                soc[t] = bd.SOC_DISPLACED
+                partner_f[t] = _nearest(disp_f[:, t])
+            elif show_social and contact_f[t].any():
+                soc[t] = bd.SOC_CONTACT
+                partner_f[t] = _nearest(contact_f[t])
+
+        # Undirected links, so a pair is drawn once.
+        links = []
+        seen = set()
+        if show_chase:
+            ca, cb = np.nonzero(res["chase"][idx])
+            for i, j in zip(ca.tolist(), cb.tolist()):
+                if (min(i, j), max(i, j)) not in seen:
+                    seen.add((min(i, j), max(i, j)))
+                    links.append((i, j, bd.SOCIAL_COLORS[bd.SOC_CHASING]))
+        if show_displace:
+            da, db = np.nonzero(res["displacing"][idx])
+            for i, j in zip(da.tolist(), db.tolist()):
+                if (min(i, j), max(i, j)) not in seen:
+                    seen.add((min(i, j), max(i, j)))
+                    links.append((i, j, bd.SOCIAL_COLORS[bd.SOC_DISPLACING]))
+        if show_social:
+            # Contact links use the same colour as the social circles, so the
+            # radius and the connection it produced read as one thing.
+            circle_col = self.combo_circle_color.currentData() or "#9fb3c8"
+            sa, sb = np.nonzero(res["contact"][idx])
+            for i, j in zip(sa.tolist(), sb.tolist()):
+                if (min(i, j), max(i, j)) not in seen:
+                    seen.add((min(i, j), max(i, j)))
+                    links.append((i, j, circle_col))
+
+        # Combined "locomotion - social" label, e.g. "moving - chasing".
+        # Either half is dropped when its behaviour is switched off or absent,
+        # so a lone animal simply reads "moving".
+        states = []
+        state_parts = []
+        for t in range(n_tags):
+            loco_txt = ""
+            if show_loco and loc[t] != bd.LOC_NODATA:
+                loco_txt = bd.LOCOMOTOR_LABELS[loc[t]]
+            soc_txt = bd.SOCIAL_LABELS.get(soc[t], "") if soc[t] != bd.SOC_NONE else ""
+            text = " - ".join(part for part in (loco_txt, soc_txt) if part)
+            loco_col = bd.STATE_COLORS.get(loc[t], "#cccccc")
+            soc_col = bd.SOCIAL_COLORS.get(soc[t], "#cccccc")
+            # Each half keeps its own colour; the canvas paints the separator
+            # white so the two read as distinct facts rather than one phrase.
+            parts = []
+            if loco_txt:
+                parts.append((loco_txt, loco_col))
+            if soc_txt:
+                parts.append((soc_txt, soc_col))
+            state_parts.append(parts)
+            colour = soc_col if soc[t] != bd.SOC_NONE else loco_col
+            states.append((text, colour))
+
+        pct, msg = bd.speed_summary(res["velocity"], res["have_fix"],
+                                    self._behavior_params())
+        self.lbl_speed_pcts.setText(msg)
+
+        return {"radius": self.spin_social_radius.value() if show_social else None,
+                "circle_color": self.combo_circle_color.currentData(),
+                "links": links, "states": states, "state_parts": state_parts}
+
     def render_preview_frame(self):
         """Draw the frame the playhead currently points at."""
         if getattr(self, "preview_x", None) is None or not len(self.preview_x):
@@ -4391,8 +4871,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Marker uses the forward-filled position so a tag stays put between its
         # sparse fixes instead of blinking; the trail below uses the real fixes.
-        xf = getattr(self, "preview_xf", self.preview_x)
-        yf = getattr(self, "preview_yf", self.preview_y)
+        # getattr's default does not apply when the attribute exists but is
+        # None (which it is between cache invalidation and the next chunk), so
+        # fall back explicitly.
+        xf = getattr(self, "preview_xf", None)
+        yf = getattr(self, "preview_yf", None)
+        if xf is None or yf is None:
+            xf, yf = self.preview_x, self.preview_y
         x = xf[idx]
         y = yf[idx]
         colors = self.preview_colors
@@ -4442,8 +4927,10 @@ class UWBQuickVisualizationWindow(QWidget):
             if batt is not None and idx < len(batt):
                 batteries = batt[idx]
 
+        behavior = self._behavior_overlay(idx)
         backend.update_frame(x, y, colors, tracks=tracks, raw_pts=None,
-                             labels=labels, batteries=batteries)
+                             labels=labels, batteries=batteries,
+                             behavior=behavior)
         self._update_time_label()
 
     # -- transport --------------------------------------------------------- #
@@ -5247,17 +5734,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
         self.chk_social_network.setChecked(False)
-        self.chk_social_animation.setChecked(False)
-        self.combo_sna_weighting.setCurrentIndex(0)
-        self.spin_sna_window.setValue(24.0)
-        self.spin_sna_step.setValue(1.0)
-        self.chk_sna_daily.setChecked(False)
-        self.combo_sna_node.setCurrentText("None (uniform)")
-        self.combo_sna_edge.setCurrentIndex(0)
-        self.combo_sna_layout.setCurrentIndex(0)
-        self.combo_sna_fps.setCurrentText("10")
         self.on_social_network_toggled()
-        self.on_sna_daily_toggled()
         self.chk_save_plots.setChecked(False)
         self.chk_save_svg.setChecked(False)
         for cb in self.plot_type_checkboxes.values():
@@ -6096,11 +6573,12 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.lbl_rolling_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
         self.spin_rolling_window.setEnabled(needs_param)
-        self.spin_rolling_window.setVisible(needs_param)
-        self.lbl_rolling_window.setVisible(needs_param)
-        # The seconds/samples toggle only applies to the rolling windows; the
-        # EWMA span is always in samples and Savitzky-Golay has no exposed size.
-        self.combo_window_units.setVisible(is_rolling)
+        # These export widgets are inherited from the preview and stay hidden;
+        # only their values matter. Re-showing them here is what made the span
+        # row reappear whenever EWMA was selected.
+        self.spin_rolling_window.setVisible(False)
+        self.lbl_rolling_window.setVisible(False)
+        self.combo_window_units.setVisible(False)
 
     def on_save_plots_toggled(self):
         """Handle save plots checkbox toggle"""
@@ -6111,20 +6589,16 @@ class UWBQuickVisualizationWindow(QWidget):
     def on_proximity_detection_toggled(self):
         """Handle proximity detection checkbox toggle"""
         enabled = self.chk_proximity_detection.isChecked()
-        self.proximity_threshold_widget.setVisible(enabled)
+        self.proximity_threshold_widget.setVisible(False)  # inherited from the preview
 
     def on_social_network_toggled(self):
         """Show the animation sub-options, and ensure the proximity threshold is
         visible (social-network output is derived from it)."""
-        self.social_animation_widget.setVisible(self.chk_social_animation.isChecked())
-        if self.chk_social_network.isChecked() or self.chk_social_animation.isChecked():
+        if hasattr(self, 'el_window_widget'):
+            self.el_window_widget.setVisible(self.chk_social_network.isChecked())
+        if self.chk_social_network.isChecked():
             # Proximity is the source; keep its threshold control visible.
-            self.proximity_threshold_widget.setVisible(True)
-
-    def on_sna_daily_toggled(self):
-        """Show/hide the per-day checkboxes for daily social-network animations."""
-        self.sna_daily_days_widget.setVisible(self.chk_sna_daily.isChecked())
-        self._update_sna_clip_estimate()
+            self.proximity_threshold_widget.setVisible(False)
 
     def _recording_span_hours(self):
         """Total recording duration in hours (from the preview timeline, else the
@@ -6133,197 +6607,8 @@ class UWBQuickVisualizationWindow(QWidget):
         t1 = getattr(self, 'preview_t1', None)
         if t0 is not None and t1 is not None and t1 > t0:
             return (t1 - t0) / 3_600_000.0
-        n = len(getattr(self, 'sna_daily_day_checkboxes', {}) or {})
+        n = len(getattr(self, 'daily_animation_day_checkboxes', {}) or {})
         return n * 24.0 if n else 0.0
-
-    def _update_sna_clip_estimate(self, *_):
-        """Refresh the estimated social-network clip length from step / fps.
-
-        length ≈ frames / fps, frames ≈ span / step. Window size only sets what
-        each frame shows, so it does not change the length.
-        """
-        if not hasattr(self, 'lbl_sna_clip'):
-            return
-        try:
-            fps = max(int(self.combo_sna_fps.currentText()), 1)
-            step_h = max(self.spin_sna_step.value(), 1e-6)
-        except Exception:
-            return
-
-        def _fmt(secs):
-            if secs < 90:
-                return f"{secs:.0f} s"
-            return f"{secs/60:.1f} min"
-
-        if self.chk_sna_daily.isChecked():
-            frames = max(round(24.0 / step_h), 1)
-            n_sel = sum(1 for cb in getattr(self, 'sna_daily_day_checkboxes', {}).values()
-                        if cb.isChecked())
-            per = _fmt(frames / fps)
-            extra = f"  ·  {n_sel} day(s) selected" if n_sel else ""
-            self.lbl_sna_clip.setText(
-                f"Estimated clip: ≈ {frames} frames · {per} per full day{extra}")
-        else:
-            span_h = self._recording_span_hours()
-            if span_h <= 0:
-                self.lbl_sna_clip.setText("Estimated clip: — (load data)")
-                return
-            frames = max(round(span_h / step_h), 1)
-            self.lbl_sna_clip.setText(
-                f"Estimated clip: ≈ {frames} frames · {_fmt(frames / fps)} "
-                f"(whole recording, {span_h/24:.1f} days)")
-
-    def _populate_sna_days(self, date_strings):
-        """Mirror the tracking-animation day checkboxes for the SNA animation."""
-        if not hasattr(self, 'sna_daily_day_checkboxes'):
-            return
-        for cb in self.sna_daily_day_checkboxes.values():
-            cb.deleteLater()
-        self.sna_daily_day_checkboxes.clear()
-        for i, date_str in enumerate(date_strings or []):
-            cb = QCheckBox(f"Day {i+1}: {date_str}")
-            cb.setChecked(True)
-            cb.stateChanged.connect(self._update_sna_clip_estimate)
-            self.sna_daily_day_checkboxes[date_str] = cb
-            self.sna_daily_days_inner.addWidget(cb)
-        self._update_sna_clip_estimate()
-
-    def _sna_db_network(self, window_hours):
-        """Build a network from a RANDOM ``window_hours`` slice of the database.
-
-        Reads one random window of positions straight from the DB (the indexed
-        copy when present), runs proximity + GBI on it, and returns
-        (bouts, gbi, animals, sexes, window_end) — or None. Used by the layout
-        preview so each 'Random frame' samples a genuinely different time.
-        """
-        import random
-        from fnt.uwb.proximity_detection import detect_proximity_bouts
-        from fnt.uwb import social_network as SN
-        dbp = self.preview_db_path or self.db_path
-        if not dbp or not self.table_name:
-            return None
-        try:
-            conn = connect_ro(dbp)
-            tmin, tmax = conn.execute(
-                f"SELECT MIN(timestamp), MAX(timestamp) FROM {self.table_name}").fetchone()
-            if tmin is None:
-                conn.close()
-                return None
-            win_ms = max(int(window_hours * 3600 * 1000), 1000)
-            tmin, tmax = int(tmin), int(tmax)
-            hi = max(tmin, tmax - win_ms)
-            start = random.randint(tmin, hi) if hi > tmin else tmin
-            end = start + win_ms
-            cols = processing_select_clause(conn, self.table_name)
-            tags = self.selected_preview_tags()
-            if tags:
-                ph = ",".join("?" * len(tags))
-                q = (f"SELECT {cols} FROM {self.table_name} WHERE shortid IN ({ph}) "
-                     f"AND timestamp BETWEEN ? AND ? ORDER BY shortid, timestamp")
-                params = list(tags) + [start, end]
-            else:
-                q = (f"SELECT {cols} FROM {self.table_name} "
-                     f"WHERE timestamp BETWEEN ? AND ? ORDER BY shortid, timestamp")
-                params = [start, end]
-            df = pd.read_sql_query(q, conn, params=params)
-            conn.close()
-        except Exception as e:
-            self.log_message(f"Layout preview query failed: {e}")
-            return None
-        if df.empty:
-            return None
-        df['Timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-        df['smoothed_x'] = df['location_x'] * 0.0254
-        df['smoothed_y'] = df['location_y'] * 0.0254
-        events, bouts = detect_proximity_bouts(
-            df[['Timestamp', 'shortid', 'smoothed_x', 'smoothed_y']],
-            threshold=self.spin_proximity_threshold.value(), gap_s=5,
-            tag_identities=self.tag_identities, log_callback=None)
-        if bouts is None or bouts.empty:
-            return None
-        gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
-        sexmap = SN._label_sex_map(self.tag_identities)
-        animals = sorted(set(bouts['animal1']) | set(bouts['animal2']))
-        sexes = {a: SN._sex_of(a, sexmap) for a in animals}
-        return bouts, gbi, animals, sexes, pd.Timestamp(end, unit='ms')
-
-    def open_sna_layout_preview(self):
-        """Popup that renders a network frame from a RANDOM database window;
-        'Random frame' resamples a new random window each click."""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
-        from PyQt5.QtGui import QImage, QPixmap
-        from PyQt5.QtCore import Qt
-        from fnt.uwb import social_network as SN
-
-        if not self.db_path or not self.table_name:
-            QMessageBox.information(self, "No database",
-                                    "Select a database first — the layout preview "
-                                    "samples a random window from it.")
-            return
-
-        wmap = {'Total time (s)': 'time', 'Bout count': 'events',
-                'Simple Ratio Index (SRI)': 'sri', 'Half-weight Index (HWI)': 'hwi'}
-        nmap = {'None (uniform)': 'none', 'Degree': 'degree', 'Strength': 'strength',
-                'Betweenness': 'betweenness', 'Closeness': 'closeness',
-                'Eigenvector': 'eigenvector', 'PageRank': 'pagerank'}
-        lmap = {'Kamada-Kawai': 'kamada_kawai',
-                'Fruchterman-Reingold': 'fruchterman_reingold', 'Circular': 'circular'}
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Social network — layout preview")
-        v = QVBoxLayout(dlg)
-        img_label = QLabel("Rendering…")
-        img_label.setAlignment(Qt.AlignCenter)
-        img_label.setMinimumSize(640, 560)
-        v.addWidget(img_label)
-
-        def render():
-            img_label.setText("Sampling a random window from the database…")
-            QApplication.processEvents()
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                src = self._sna_db_network(self.spin_sna_window.value())
-            finally:
-                QApplication.restoreOverrideCursor()
-            if src is None:
-                img_label.setText("No proximity network in the sampled window — "
-                                  "try again (Random frame) or lower the window.")
-                return
-            bouts, gbi, animals, sexes, wend = src
-            if len(animals) < 2:
-                img_label.setText("Fewer than two animals in proximity this window "
-                                  "— click Random frame to resample.")
-                return
-            arr, te = SN.render_network_frame(
-                bouts, animals=animals, sexes=sexes,
-                weighting=wmap.get(self.combo_sna_weighting.currentText(), 'time'),
-                window_hours=self.spin_sna_window.value(),
-                node_metric=nmap.get(self.combo_sna_node.currentText(), 'none'),
-                edge_scale=('uniform' if self.combo_sna_edge.currentText() == 'Uniform' else 'weight'),
-                layout=lmap.get(self.combo_sna_layout.currentText(), 'kamada_kawai'),
-                gbi=gbi, window_end=wend, title_prefix='PREVIEW · ')
-            if arr is None:
-                img_label.setText("No network to show for this window.")
-                return
-            h, w, _ = arr.shape
-            qimg = QImage(arr.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
-            img_label.setPixmap(QPixmap.fromImage(qimg).scaled(
-                img_label.width(), img_label.height(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
-
-        btns = QHBoxLayout()
-        b_rand = QPushButton("Random frame")
-        b_rand.setToolTip("Sample a different random window from the database.")
-        b_rand.clicked.connect(render)
-        b_close = QPushButton("Close")
-        b_close.clicked.connect(dlg.accept)
-        btns.addWidget(b_rand)
-        btns.addStretch(1)
-        btns.addWidget(b_close)
-        v.addLayout(btns)
-        render()
-        dlg.resize(720, 680)
-        dlg.exec_()
 
     def on_save_animation_toggled(self):
         """Handle save animation checkbox toggle"""
@@ -6390,8 +6675,6 @@ class UWBQuickVisualizationWindow(QWidget):
             cb.setChecked(True)  # Default to all days selected
             self.daily_animation_day_checkboxes[date_str] = cb
             self.daily_days_layout_inner.addWidget(cb)
-        # Mirror the same days into the social-network animation day picker.
-        self._populate_sna_days(date_strings)
 
     def populate_animation_days(self):
         """Populate day checkboxes based on loaded data (called after preview loads)"""
@@ -6613,11 +6896,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.tag_buttons_layout = QHBoxLayout()
         btn_select_all = QPushButton("Select All")
         btn_select_all.setToolTip("Check all tags for export")
-        btn_select_all.setStyleSheet("padding: 6px; font-size: 10px;")
+        btn_select_all.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
         btn_select_all.clicked.connect(self.select_all_tags)
         btn_select_none = QPushButton("Select None")
         btn_select_none.setToolTip("Uncheck all tags")
-        btn_select_none.setStyleSheet("padding: 6px; font-size: 10px;")
+        btn_select_none.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
         btn_select_none.clicked.connect(self.select_none_tags)
         self.tag_buttons_layout.addWidget(btn_select_all)
         self.tag_buttons_layout.addWidget(btn_select_none)
@@ -6631,7 +6914,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "Assign sex (M/F), custom IDs, and active time windows to each tag. "
             "Time pickers default to the tag's first/last timestamp in your selected timezone."
         )
-        self.btn_assign_identities.setStyleSheet("padding: 6px; font-size: 10px;")
+        self.btn_assign_identities.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
         self.tag_layout.addWidget(self.btn_assign_identities)
         
         # Apply pending tag selection from loaded config
@@ -6918,15 +7201,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
             'export_social_network': self.chk_social_network.isChecked(),
-            'social_animation': self.chk_social_animation.isChecked(),
-            'sna_weighting': self.combo_sna_weighting.currentText(),
-            'sna_window_h': self.spin_sna_window.value(),
-            'sna_step_h': self.spin_sna_step.value(),
-            'sna_daily': self.chk_sna_daily.isChecked(),
-            'sna_node_metric': self.combo_sna_node.currentText(),
-            'sna_edge_scale': self.combo_sna_edge.currentText(),
-            'sna_layout': self.combo_sna_layout.currentText(),
-            'sna_fps': self.combo_sna_fps.currentText(),
+            'edgelist_window_h': self.spin_el_window.value(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
@@ -7203,37 +7478,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'export_social_network' in config:
                 self.chk_social_network.setChecked(config['export_social_network'])
-            if 'social_animation' in config:
-                self.chk_social_animation.setChecked(config['social_animation'])
-            if 'sna_weighting' in config:
-                i = self.combo_sna_weighting.findText(config['sna_weighting'])
-                if i >= 0:
-                    self.combo_sna_weighting.setCurrentIndex(i)
-            if 'sna_window_h' in config:
-                self.spin_sna_window.setValue(config['sna_window_h'])
-            if 'sna_step_h' in config:
-                self.spin_sna_step.setValue(config['sna_step_h'])
-            if 'sna_daily' in config:
-                self.chk_sna_daily.setChecked(config['sna_daily'])
-            if 'sna_node_metric' in config:
-                i = self.combo_sna_node.findText(config['sna_node_metric'])
-                if i >= 0:
-                    self.combo_sna_node.setCurrentIndex(i)
-            if 'sna_edge_scale' in config:
-                i = self.combo_sna_edge.findText(config['sna_edge_scale'])
-                if i >= 0:
-                    self.combo_sna_edge.setCurrentIndex(i)
-            if 'sna_layout' in config:
-                i = self.combo_sna_layout.findText(config['sna_layout'])
-                if i >= 0:
-                    self.combo_sna_layout.setCurrentIndex(i)
-            if 'sna_fps' in config:
-                i = self.combo_sna_fps.findText(str(config['sna_fps']))
-                if i >= 0:
-                    self.combo_sna_fps.setCurrentIndex(i)
+            if 'edgelist_window_h' in config:
+                self.spin_el_window.setValue(float(config['edgelist_window_h']))
             self.on_social_network_toggled()
-            self.on_sna_daily_toggled()
-
+    
             if 'save_plots' in config:
                 self.chk_save_plots.setChecked(config['save_plots'])
 
@@ -7353,10 +7601,25 @@ class UWBQuickVisualizationWindow(QWidget):
             loose_plots = []
             loose_animations = []
 
+            # The site-map image is a root-level PNG but it is NOT a plot: the
+            # config references it by filename at the analysis-folder root, so
+            # sweeping it into plots/ would break that reference. Exclude it
+            # (and anything the config names as the site map) from the sweep.
+            sitemap_names = {f"{db_name}_sitemap.png".lower()}
+            cfg_map = (config or {}).get('sitemap') or {}
+            if cfg_map.get('filename'):
+                sitemap_names.add(str(cfg_map['filename']).lower())
+
+            def _is_plot(name):
+                low = name.lower()
+                if low in sitemap_names or low.endswith('_sitemap.png'):
+                    return False
+                return low.endswith(('.png', '.svg'))
+
             if not os.path.exists(plots_subdir):
                 loose_plots = [f for f in list_visible_files(analysis_dir)
                                if os.path.isfile(os.path.join(analysis_dir, f))
-                               and f.lower().endswith(('.png', '.svg'))]
+                               and _is_plot(f)]
 
             if not os.path.exists(animations_subdir):
                 loose_animations = [f for f in list_visible_files(analysis_dir)
@@ -7503,104 +7766,32 @@ class UWBQuickVisualizationWindow(QWidget):
         }
 
     def _export_social_network(self, events, bouts, output_dir, db_name, *,
-                               write_csvs, animate, skip_existing,
-                               weighting, window_h, step_h, daily, days=None,
-                               node_choice='None (uniform)', edge_choice='Scaled by weight',
-                               layout_choice='Kamada-Kawai', fps=10):
-        """Write the social-network CSVs and/or render the network animation(s).
+                               write_csvs, skip_existing):
+        """Write the social-network CSVs.
 
         ``events`` = per-second pairwise distances (for the chain-rule GBI);
-        ``bouts`` = pairwise proximity bouts (for the edge lists + animation).
+        ``bouts`` = pairwise proximity bouts (for the edge lists). Both come
+        from proximity detection, so every network product inherits the same
+        social-radius threshold the preview draws.
         """
         from fnt.uwb import social_network as SN
 
-        # The GBI is needed for the CSV export AND for SRI/HWI edge weights, so
-        # build it once here.
+        if not write_csvs:
+            return
+        window_h = self.spin_el_window.value()
+        self.log_message(
+            f"Building social network CSVs (edge list @ {window_h:g} h windows + GBI)...")
         gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
+        edgelist = SN.build_edgelist(bouts, self.tag_identities, window_hours=window_h)
+        for fname, df in ((f'{db_name}_network_edgelist.csv', edgelist),
+                          (f'{db_name}_network_GBI.csv', gbi)):
+            path = os.path.join(output_dir, fname)
+            if skip_existing and os.path.exists(path):
+                self.log_message(f"Skipped (exists): {fname}")
+            else:
+                df.to_csv(path, index=False)
+                self.log_message(f"✓ Exported {fname} ({len(df)} rows)")
 
-        if write_csvs:
-            self.log_message("Building social network CSVs (edge lists + GBI)...")
-            full, daily_el = SN.build_edgelists(bouts, self.tag_identities)
-            for fname, df in ((f'{db_name}_network_edgelist_full.csv', full),
-                              (f'{db_name}_network_edgelist_daily.csv', daily_el),
-                              (f'{db_name}_network_GBI.csv', gbi)):
-                p = os.path.join(output_dir, fname)
-                if skip_existing and os.path.exists(p):
-                    self.log_message(f"Skipped (exists): {fname}")
-                else:
-                    df.to_csv(p, index=False)
-                    self.log_message(f"✓ Exported {fname} ({len(df)} rows)")
-
-        if not animate:
-            return
-        if bouts is None or bouts.empty:
-            self.log_message("No proximity bouts — skipping social network animation")
-            return
-
-        sexmap = SN._label_sex_map(self.tag_identities)
-        animals = sorted(set(bouts['animal1']) | set(bouts['animal2']))
-        sexes = {a: SN._sex_of(a, sexmap) for a in animals}
-        sna_dir = os.path.join(output_dir, 'animation_SocialNetworks')
-        os.makedirs(sna_dir, exist_ok=True)
-
-        b = bouts.copy()
-        b['bout_start'] = pd.to_datetime(b['bout_start'], utc=True, errors='coerce').dt.tz_localize(None)
-        b['bout_stop'] = pd.to_datetime(b['bout_stop'], utc=True, errors='coerce').dt.tz_localize(None)
-        g = gbi.copy()
-        if len(g):
-            g['group_start'] = pd.to_datetime(g['group_start'], utc=True, errors='coerce').dt.tz_localize(None)
-
-        node_map = {'None (uniform)': 'none', 'Degree': 'degree',
-                    'Strength': 'strength', 'Betweenness': 'betweenness',
-                    'Closeness': 'closeness', 'Eigenvector': 'eigenvector',
-                    'PageRank': 'pagerank'}
-        weight_map = {'Total time (s)': 'time', 'Bout count': 'events',
-                      'Simple Ratio Index (SRI)': 'sri', 'Half-weight Index (HWI)': 'hwi'}
-        layout_map = {'Kamada-Kawai': 'kamada_kawai',
-                      'Fruchterman-Reingold': 'fruchterman_reingold', 'Circular': 'circular'}
-        node_metric = node_map.get(node_choice, 'none')
-        edge_scale = 'uniform' if edge_choice == 'Uniform' else 'weight'
-        weighting = weight_map.get(weighting, 'time')
-        layout = layout_map.get(layout_choice, 'kamada_kawai')
-
-        # Per-day videos (only the chosen days), or one for the whole recording.
-        jobs = []   # (suffix, span, bouts_subset, gbi_subset)
-        if daily and 'Day' in b.columns:
-            day_dates = None
-            if 'Date' in b.columns:
-                day_dates = {int(d): str(b.loc[b['Day'] == d, 'Date'].iloc[0])
-                             for d in b['Day'].dropna().unique()}
-            for d in sorted(b['Day'].dropna().unique()):
-                d = int(d)
-                if days is not None and day_dates is not None and day_dates.get(d) not in days:
-                    continue
-                sub = b[b['Day'] == d]
-                if sub.empty:
-                    continue
-                gsub = g[g['day'] == d] if len(g) and 'day' in g.columns else g
-                jobs.append((f'_Day{d}',
-                             (sub['bout_start'].min(), sub['bout_stop'].max()), sub, gsub))
-        else:
-            jobs.append(('', (b['bout_start'].min(), b['bout_stop'].max()), b, g))
-
-        for suffix, span, sub, gsub in jobs:
-            if self.export_cancelled:
-                return
-            out = os.path.join(sna_dir, f'{db_name}_SocialNet_{weighting}{suffix}.mp4')
-            if skip_existing and os.path.exists(out):
-                self.log_message(f"Skipped (exists): {os.path.basename(out)}")
-                continue
-            self.lbl_export_progress.setText(f"Rendering social network ({weighting}{suffix})...")
-            QApplication.processEvents()
-            SN.render_network_animation(
-                sub, out, animals=animals, sexes=sexes, weighting=weighting,
-                window_hours=window_h, step_hours=step_h,
-                node_metric=node_metric, edge_scale=edge_scale,
-                layout=layout, gbi=gsub,
-                fps=fps, dpi=100, span=span, title_prefix=f'{db_name} · ',
-                is_cancelled=lambda: self.export_cancelled,
-                progress=lambda i, n: QApplication.processEvents(),
-                log=self.log_message)
 
     def _prompt_animation_temp_dir(self, animations_dir):
         """Ask up-front where to write the tracking animation's temp frames.
@@ -7608,31 +7799,98 @@ class UWBQuickVisualizationWindow(QWidget):
         Returns the chosen directory, or None if the user cancels (which aborts
         the export). Called at export start so the prompt isn't sprung on the
         user minutes into a long run.
+
+        Built as a plain QDialog rather than a QMessageBox so the buttons appear
+        in the order given: QMessageBox re-orders by button role, which varies by
+        platform. Mirrors ExportConflictDialog's layout in this module.
         """
         default_temp_dir = os.path.join(animations_dir, 'temp_frames')
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Temporary Frames Location")
-        msg.setText(
-            f"The tracking animation writes temporary frame files while it "
-            f"renders.\n\nDefault location:\n{default_temp_dir}\n\n"
-            f"These are deleted when the animation finishes. Use the default "
-            f"location, or choose a different folder?"
-        )
-        msg.addButton("Use Default", QMessageBox.AcceptRole)
-        choose_btn = msg.addButton("Choose Folder...", QMessageBox.ActionRole)
-        cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
-        msg.exec_()
-        clicked = msg.clickedButton()
-        if clicked == cancel_btn:
-            return None
-        if clicked == choose_btn:
+        on_network = is_network_path(default_temp_dir)
+        cloud = cloud_sync_provider(default_temp_dir)
+
+        CHOOSE, USE_DEFAULT, CANCEL = 1, 2, 0
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Temporary Frames Location")
+        dlg.setMinimumWidth(520)
+        lay = QVBoxLayout()
+
+        intro = QLabel("The tracking animation writes temporary frame files "
+                       "while it renders.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        head = QLabel("Default location:")
+        head.setStyleSheet("font-weight: bold;")
+        lay.addWidget(head)
+
+        loc = QLabel(default_temp_dir)
+        loc.setWordWrap(True)
+        loc.setStyleSheet("color: #9ecbff;")
+        lay.addWidget(loc)
+
+        note = QLabel("These are deleted when the animation finishes.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        if on_network or cloud:
+            if on_network:
+                drive = (os.path.splitdrive(os.path.abspath(default_temp_dir))[0]
+                         or "this location")
+                body = (drive + " is a network / mapped drive. Rendering "
+                        "writes and rewrites frame data continuously, which is "
+                        "far slower over the network than on local storage, and "
+                        "a long render is exposed to any dropout on the share.")
+            else:
+                body = (cloud + " syncs this folder to the cloud. The render "
+                        "writes several GB of video here, and " + cloud + " will "
+                        "keep uploading it while it is still being written "
+                        "— competing for disk and network, and risking a lock on "
+                        "the file mid-render. (Windows' OneDrive Backup "
+                        "redirects your Desktop into OneDrive, so a folder that "
+                        "looks local can still be synced.)")
+            warn = QLabel(
+                "⚠  " + body + "  A plain local folder outside any synced "
+                "or network location is recommended. The frames are deleted when "
+                "the render finishes, so the space is only needed while it runs.")
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                "color: #ffcc66; background-color: #3a2f10; "
+                "border: 1px solid #7a5c00; border-radius: 4px; padding: 8px;")
+            lay.addWidget(warn)
+
+        row = QHBoxLayout()
+        btn_choose = QPushButton("Choose Folder...")
+        btn_choose.setToolTip("Pick a different folder for the temporary frames")
+        btn_choose.clicked.connect(lambda: dlg.done(CHOOSE))
+        row.addWidget(btn_choose)
+
+        btn_default = QPushButton("Use Default")
+        btn_default.setToolTip("Write the temporary frames to the default location")
+        btn_default.clicked.connect(lambda: dlg.done(USE_DEFAULT))
+        row.addWidget(btn_default)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setToolTip("Abort the export")
+        btn_cancel.clicked.connect(lambda: dlg.done(CANCEL))
+        row.addWidget(btn_cancel)
+
+        lay.addLayout(row)
+        dlg.setLayout(lay)
+        # On a network default, make picking a local folder the Enter action.
+        (btn_choose if (on_network or cloud) else btn_default).setDefault(True)
+
+        result = dlg.exec_()
+        if result == CHOOSE:
             custom_dir = QFileDialog.getExistingDirectory(
                 self, "Select Folder for Temporary Animation Frames",
                 os.path.expanduser("~"))
             if not custom_dir:
                 return None
             return os.path.join(custom_dir, 'temp_animation_frames')
-        return default_temp_dir
+        if result == USE_DEFAULT:
+            return default_temp_dir
+        return None
 
     def _concat_videos_cv2(self, paths, out_path):
         """Concatenate same-resolution/fps MP4s into one, frame by frame (cv2).
@@ -7907,6 +8165,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.log_message("Add to queue cancelled at layer selection.")
                 return
 
+        self._sync_export_from_preview()
+
         # Freeze the animation snapshot so conflict prediction matches what will
         # actually be rendered for this job.
         self._anim_settings = self._snapshot_anim_settings()
@@ -8022,14 +8282,42 @@ class UWBQuickVisualizationWindow(QWidget):
                 return
             self._batch_temp_frames_dir = chosen
 
+        self._sync_export_from_preview()      # export inherits the preview
         for it in self._batch_items:          # fresh run: reset all statuses
             it['status'] = 'Queued'
+            # Clear last run's outcome too. This flag suppresses a trial's
+            # animation when its data pass failed; left sticky it would keep
+            # skipping that render on every later run (silently, since the
+            # queue row never changed) while the batch moved on to the next
+            # trial's animation.
+            it.pop('data_failed', None)
+
+        # Two-phase plan: every trial's DATA products (CSVs, proximity, social
+        # network, plots) run first, for the whole queue; only then do the video
+        # renders. A tracking animation takes hours while the CSVs take minutes,
+        # so this gets every trial's data out in the first hour instead of
+        # trickling one trial per day.
+        self._batch_plan = [(i, 'data') for i in range(len(self._batch_items))]
+        anim_idx = [i for i, it in enumerate(self._batch_items)
+                    if (it.get('config') or {}).get('save_animation')
+                    or (it.get('config') or {}).get('social_animation')]
+        self._batch_plan += [(i, 'animation') for i in anim_idx]
+        self._batch_plan_pos = 0
+
         self._batch_active = True
         self._batch_stop_requested = False
-        self._batch_index = 0
+        self._batch_frame_cur = 0
+        self._batch_frame_total = 0
+        self._batch_stage = ''
+        self.batch_progress_bar.setValue(0)
+        self.lbl_batch_progress.setText("Starting batch...")
+        self.lbl_batch_eta.setText("")
+        self.batch_progress_widget.setVisible(True)
         self._suppress_dialogs()
         self.log_message("=" * 50)
-        self.log_message(f"BATCH START: {len(self._batch_items)} database(s) queued")
+        self.log_message(
+            f"BATCH START: {len(self._batch_items)} database(s) — "
+            f"data products first, then {len(anim_idx)} animation render(s)")
         self._refresh_batch_list()
         QTimer.singleShot(0, self._batch_step)
 
@@ -8063,21 +8351,55 @@ class UWBQuickVisualizationWindow(QWidget):
         Isolating trials bounds the damage to a single job and gives each one a
         fresh heap, so nothing accumulates across an overnight run.
         """
-        if self._batch_stop_requested or self._batch_index >= len(self._batch_items):
+        if self._batch_stop_requested or self._batch_plan_pos >= len(self._batch_plan):
             self._finish_batch()
             return
 
-        it = self._batch_items[self._batch_index]
-        it['status'] = 'Running'
+        job_idx, phase = self._batch_plan[self._batch_plan_pos]
+        self._batch_index = job_idx
+        self._batch_phase = phase
+        it = self._batch_items[job_idx]
+
+        # A trial whose data pass failed has no smoothed CSV to render from.
+        if phase == 'animation' and it.get('data_failed'):
+            self.log_message(
+                f"Skipping animation for {os.path.basename(it['path'])} "
+                f"— its data pass failed in this run.")
+            it['status'] = 'Animation skipped (data failed)'
+            self._refresh_batch_list()
+            self._batch_plan_pos += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
+
+        it['status'] = 'Processing data' if phase == 'data' else 'Rendering animation'
+        self._batch_frame_cur = 0
+        self._batch_frame_total = 0
+        self._batch_stage = ''
+        self._batch_step_started = time.time()
         self._refresh_batch_list()
+        self._update_batch_progress()
         self.log_message(
-            f"BATCH [{self._batch_index + 1}/{len(self._batch_items)}]: "
+            f"BATCH [{self._batch_plan_pos + 1}/{len(self._batch_plan)}] "
+            f"({'data' if phase == 'data' else 'animation'}): "
             f"{os.path.basename(it['path'])} — starting worker process")
+
+        # Split the captured settings into the two phases.
+        cfg = dict(it.get('config') or {})
+        if phase == 'data':
+            # Everything except the video renders.
+            cfg['save_animation'] = False
+            cfg['social_animation'] = False
+        else:
+            # Renders only — the data products already exist from the data pass.
+            cfg['export_raw_csv'] = False
+            cfg['save_plots'] = False
+            cfg['proximity_detection'] = False      # bouts CSV already written
+            cfg['export_social_network'] = False    # network CSVs already written
 
         # Frozen builds can't run `python -m`; fall back to the in-process path
         # so the queue still works (without crash isolation).
         if getattr(sys, 'frozen', False):
-            self._batch_run_in_process(it)
+            self._batch_run_in_process(it, cfg, phase)
             return
 
         import json as _json
@@ -8087,9 +8409,11 @@ class UWBQuickVisualizationWindow(QWidget):
         job = {
             'path': it['path'],
             'table': it.get('table'),
-            'config': it.get('config'),
+            'config': cfg,
             'conflict_choice': it.get('conflict_choice', ExportConflictDialog.OVERWRITE),
             'temp_frames_dir': getattr(self, '_batch_temp_frames_dir', None),
+            # The animation pass renders from the CSV the data pass wrote.
+            'reuse_smoothed': (phase == 'animation'),
         }
         job_dir = tempfile.mkdtemp(prefix='fnt_batch_')
         job_path = os.path.join(job_dir, 'job.json')
@@ -8099,8 +8423,10 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"✗ Could not write batch job file: {e}")
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -8121,8 +8447,10 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"✗ Could not start worker process: {e}")
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -8130,13 +8458,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_log_pos = 0
         QTimer.singleShot(500, self._batch_poll_export)
 
-    def _batch_run_in_process(self, it):
+    def _batch_run_in_process(self, it, cfg=None, phase='data'):
         """Fallback for frozen builds: export in this process (no isolation)."""
-        self._pending_config_override = it.get('config')
+        self._pending_config_override = cfg if cfg is not None else it.get('config')
+        self._batch_reuse_smoothed = (phase == 'animation')
         if not self._load_database_path(it['path']):
             it['status'] = 'Failed'
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                it['data_failed'] = True
             self._refresh_batch_list()
-            self._batch_index += 1
+            self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
         if not any(cb.isChecked() for cb in self.tag_checkboxes.values()):
@@ -8161,12 +8492,77 @@ class UWBQuickVisualizationWindow(QWidget):
             return
         for line in chunk.splitlines():
             line = line.strip()
-            # Frame-by-frame render spam would flood the log; keep every 500th.
+            if not line:
+                continue
+            # Track render progress for the batch progress bar. Parsed from
+            # every line (the display thinning below only affects the log).
+            if line.startswith('Creating ') and 'animation frames' in line:
+                try:
+                    self._batch_frame_total = int(line.split()[1])
+                    self._batch_frame_cur = 0
+                    self._update_batch_progress()
+                except Exception:
+                    pass
+            elif line.startswith('Rendering frame'):
+                try:
+                    part = line.split('Rendering frame', 1)[1].strip()
+                    num, rest = part.split('/', 1)
+                    self._batch_frame_cur = int(num)
+                    self._batch_frame_total = int(rest.split('.')[0].strip())
+                    self._update_batch_progress()
+                except Exception:
+                    pass
+            elif line and not line.startswith('['):
+                self._batch_stage = line[:70]
+                self._update_batch_progress()
+            # The renderer emits a progress line every 50 frames — thousands over
+            # a long animation. Thin them to every 20th (≈ every 1000 frames) so
+            # the log stays readable but never goes silent: a multi-hour render
+            # with no output at all reads as a hang.
             if line.startswith('Rendering frame'):
-                if '00/' not in line:
+                self._worker_frame_lines = getattr(self, '_worker_frame_lines', 0) + 1
+                if self._worker_frame_lines % 20 != 1:
                     continue
-            if line:
-                self.log_message(f"  [worker] {line}")
+            self.log_message(f"  [worker] {line}")
+
+    def _update_batch_progress(self):
+        """Refresh the progress bar under the queue.
+
+        Overall position = completed plan steps + how far the current step has
+        got (known only while frames are rendering, which is where the hours
+        go). Everything is derived from the plan, so it stays correct whether a
+        step is a data pass or a render.
+        """
+        if not hasattr(self, 'batch_progress_bar') or not self._batch_active:
+            return
+        total_steps = max(1, len(self._batch_plan))
+        done = min(self._batch_plan_pos, total_steps)
+        cur = getattr(self, '_batch_frame_cur', 0)
+        tot = getattr(self, '_batch_frame_total', 0)
+        frac = min(1.0, cur / tot) if tot else 0.0
+        pct = int(round((done + frac) / total_steps * 100))
+        self.batch_progress_bar.setValue(max(0, min(100, pct)))
+
+        it = (self._batch_items[self._batch_index]
+              if self._batch_index < len(self._batch_items) else None)
+        name = os.path.basename(it['path']) if it else ''
+        phase = getattr(self, '_batch_phase', 'data')
+        self.lbl_batch_progress.setText(
+            f"Step {done + 1} of {total_steps}  ·  {name}  ·  "
+            f"{'data products' if phase == 'data' else 'animation render'}")
+
+        detail = getattr(self, '_batch_stage', '') or ''
+        if tot:
+            detail = f"frame {cur:,} of {tot:,} ({frac * 100:.1f}%)"
+            started = getattr(self, '_batch_step_started', None)
+            if started and cur > 50:
+                elapsed = time.time() - started
+                remaining = elapsed / max(frac, 1e-9) - elapsed
+                if remaining > 0:
+                    h, m = int(remaining // 3600), int((remaining % 3600) // 60)
+                    detail += (f"  ·  ~{h}h {m:02d}m left in this render"
+                               if h else f"  ·  ~{m}m left in this render")
+        self.lbl_batch_eta.setText(detail)
 
     def _batch_poll_export(self):
         """Wait for the current job to finish, then advance to the next."""
@@ -8197,22 +8593,38 @@ class UWBQuickVisualizationWindow(QWidget):
                     f"continuing with the rest of the queue.")
 
         it = self._batch_items[self._batch_index]
-        it['status'] = 'Failed' if failed else 'Done'
-        self.log_message(f"BATCH item {self._batch_index + 1}: {it['status']}")
+        phase = getattr(self, '_batch_phase', 'data')
+        has_anim = bool((it.get('config') or {}).get('save_animation')
+                        or (it.get('config') or {}).get('social_animation'))
+        if failed:
+            it['status'] = f'Failed ({phase})'
+            if phase == 'data':
+                it['data_failed'] = True
+        elif phase == 'data':
+            # Data products are on disk now; the render (if any) comes later.
+            it['status'] = 'Data ✓ — animation queued' if has_anim else 'Done'
+        else:
+            it['status'] = 'Done'
+        self.log_message(f"BATCH {os.path.basename(it['path'])} [{phase}]: {it['status']}")
         self._refresh_batch_list()
-        self._batch_index += 1
+        self._batch_plan_pos += 1
         QTimer.singleShot(0, self._batch_step)
 
     def _finish_batch(self):
         self._batch_active = False
+        if hasattr(self, 'batch_progress_widget'):
+            self.batch_progress_bar.setValue(100)
+            self.batch_progress_widget.setVisible(False)
         self._restore_dialogs()   # before the summary box, and re-enable normal UI dialogs
         for it in self._batch_items:
-            if it['status'] in ('Queued', 'Loading', 'Running'):
-                it['status'] = 'Cancelled'
+            if it['status'] in ('Queued', 'Loading', 'Running', 'Processing data',
+                                'Rendering animation', 'Data ✓ — animation queued'):
+                it['status'] = 'Cancelled' if it['status'] != 'Data ✓ — animation queued' \
+                    else 'Data ✓ (animation cancelled)'
         self._refresh_batch_list()
         done = sum(1 for it in self._batch_items if it['status'] == 'Done')
-        failed = sum(1 for it in self._batch_items if it['status'] == 'Failed')
-        cancelled = sum(1 for it in self._batch_items if it['status'] == 'Cancelled')
+        failed = sum(1 for it in self._batch_items if str(it['status']).startswith('Failed'))
+        cancelled = sum(1 for it in self._batch_items if 'ancelled' in str(it['status']))
         self.log_message(
             f"BATCH FINISHED: {done} done, {failed} failed, {cancelled} cancelled")
         self._batch_stop_requested = False
@@ -8256,17 +8668,17 @@ class UWBQuickVisualizationWindow(QWidget):
         sna_subdir = os.path.join(base_output_dir, 'animation_SocialNetworks')
 
         export_raw_csv = self.chk_export_raw_csv.isChecked()
-        export_smoothed_csv = True
+        # On the animation pass of a two-phase batch the smoothed CSV is an
+        # INPUT written by the data pass, not an output of this pass. Predicting
+        # it as an output made it "conflicting", and the Overwrite choice then
+        # DELETED the freshly written CSV before the render could reuse it.
+        export_smoothed_csv = not getattr(self, '_batch_reuse_smoothed', False)
         detect_proximity = self.chk_proximity_detection.isChecked()
         export_social_network = self.chk_social_network.isChecked()
-        social_animation = self.chk_social_animation.isChecked()
+        social_animation = False   # social-network animation was removed
         save_animation = self.chk_save_animation.isChecked()
         save_plots = self.chk_save_plots.isChecked()
         save_svg = self.chk_save_svg.isChecked()
-        sna_weighting = self.combo_sna_weighting.currentText()
-        sna_daily = self.chk_sna_daily.isChecked()
-        sna_days = ([d for d, cb in self.sna_daily_day_checkboxes.items() if cb.isChecked()]
-                    if sna_daily else None)
         anim = getattr(self, '_anim_settings', None) or self._snapshot_anim_settings()
 
         def _tag_suffix(tag):
@@ -8288,21 +8700,10 @@ class UWBQuickVisualizationWindow(QWidget):
         if detect_proximity:
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
         if export_social_network:
-            predicted_files += [f'{db_name}_network_edgelist_full.csv',
-                                f'{db_name}_network_edgelist_daily.csv',
+            predicted_files += [f'{db_name}_network_edgelist.csv',
                                 f'{db_name}_network_GBI.csv']
 
-        predicted_sna_files = []
-        if social_animation:
-            _wkey = {'Total time (s)': 'time', 'Bout count': 'events',
-                     'Simple Ratio Index (SRI)': 'sri',
-                     'Half-weight Index (HWI)': 'hwi'}.get(sna_weighting, 'time')
-            if sna_daily:
-                for i, ds in enumerate(self.sna_daily_day_checkboxes.keys()):
-                    if sna_days is None or ds in sna_days:
-                        predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}_Day{i + 1}.mp4')
-            else:
-                predicted_sna_files.append(f'{db_name}_SocialNet_{_wkey}.mp4')
+        predicted_sna_files = []   # social-network animation was removed
 
         predicted_animation_files = []
         if save_animation:
@@ -8386,25 +8787,17 @@ class UWBQuickVisualizationWindow(QWidget):
         db_name = os.path.splitext(db_filename)[0]  # Remove extension
 
         export_raw_csv = self.chk_export_raw_csv.isChecked()
-        export_smoothed_csv = True   # smoothed CSV is always exported
+        # Always exported, except on the animation pass of a two-phase batch,
+        # where the data pass already wrote it (see _batch_reuse_smoothed).
+        export_smoothed_csv = not getattr(self, '_batch_reuse_smoothed', False)
         save_plots = self.chk_save_plots.isChecked()
         save_animation = self.chk_save_animation.isChecked()
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
         export_social_network = self.chk_social_network.isChecked()
-        social_animation = self.chk_social_animation.isChecked()
+        social_animation = False   # social-network animation was removed
         # Frozen at export start so mid-export clicks can't change them.
-        sna_weighting = self.combo_sna_weighting.currentText()
-        sna_window_h = self.spin_sna_window.value()
-        sna_step_h = self.spin_sna_step.value()
-        sna_daily = self.chk_sna_daily.isChecked()
-        sna_node = self.combo_sna_node.currentText()
-        sna_edge = self.combo_sna_edge.currentText()
-        sna_layout = self.combo_sna_layout.currentText()
-        sna_fps = int(self.combo_sna_fps.currentText())
-        sna_days = ([d for d, cb in self.sna_daily_day_checkboxes.items() if cb.isChecked()]
-                    if sna_daily else None)
 
         if not (export_raw_csv or export_smoothed_csv or save_plots
                 or save_animation or detect_proximity or export_social_network
@@ -8473,8 +8866,14 @@ class UWBQuickVisualizationWindow(QWidget):
             elif result == ExportConflictDialog.OVERWRITE:
                 skip_existing = False
                 output_dir = base_output_dir
-                # Delete conflicting files so they get cleanly rewritten
+                # Delete conflicting files so they get cleanly rewritten —
+                # except the smoothed CSV, which is published atomically
+                # (.partial + os.replace). Pre-deleting it would destroy the
+                # previous good copy if the rewrite then crashed.
+                _atomic = f'{db_name}_smoothed.csv'
                 for fname, subfolder in all_conflicting:
+                    if not subfolder and fname == _atomic:
+                        continue
                     if subfolder:
                         fpath = os.path.join(base_output_dir, subfolder, fname)
                     else:
@@ -8558,6 +8957,25 @@ class UWBQuickVisualizationWindow(QWidget):
             # Prepare processed data (needed for smoothed CSV, plots, animation, behaviors)
             needs_processed_data = export_smoothed_csv or save_plots or save_animation or detect_proximity
             csv_path = None  # Path to the CSV that plots/animation will use
+            plot_csv_path = None
+            anim_csv_path = None
+
+            # Animation pass of a two-phase batch: the smoothed CSV was already
+            # written by the data pass, so render straight from it instead of
+            # re-reading and re-smoothing every tag (minutes of pure waste).
+            if getattr(self, '_batch_reuse_smoothed', False):
+                _existing = os.path.join(output_dir, f'{db_name}_smoothed.csv')
+                if os.path.exists(_existing):
+                    csv_path = _existing
+                    plot_csv_path = _existing if save_plots else None
+                    anim_csv_path = _existing if save_animation else None
+                    needs_processed_data = False
+                    self.log_message(
+                        f"Animation pass: reusing existing {os.path.basename(_existing)} "
+                        f"(no re-processing).")
+                else:
+                    self.log_message(
+                        "Animation pass: smoothed CSV missing — reprocessing from the database.")
 
             if needs_processed_data:
                 if self.export_cancelled:
@@ -8795,11 +9213,7 @@ class UWBQuickVisualizationWindow(QWidget):
                             self._export_social_network(
                                 prox_events, proximity_bouts, output_dir, db_name,
                                 write_csvs=export_social_network,
-                                animate=social_animation, skip_existing=skip_existing,
-                                weighting=sna_weighting, window_h=sna_window_h,
-                                step_h=sna_step_h, daily=sna_daily, days=sna_days,
-                                node_choice=sna_node, edge_choice=sna_edge,
-                                layout_choice=sna_layout, fps=sna_fps)
+                                skip_existing=skip_existing)
 
                 except Exception as e:
                     self.log_message(f"Error during proximity/social-network export: {e}")

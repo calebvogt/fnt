@@ -54,49 +54,58 @@ def _dyad_type(s1, s2):
 
 
 # ── edge lists ───────────────────────────────────────────────────────────────
-def build_edgelists(proximity_bouts, tag_identities=None):
-    """Aggregate pairwise proximity bouts into (edgelist_full, edgelist_daily).
+def build_edgelist(proximity_bouts, tag_identities=None, window_hours=24.0):
+    """Aggregate pairwise proximity bouts into ONE windowed edge list.
 
-    edgelist_full columns:
-        animal1, animal2, sex1, sex2, dyad_type, n_events, total_duration_s,
-        mean_distance, n_days
-    edgelist_daily columns: same, plus Day (no n_days).
-    ``n_events`` is the event-based weight; ``total_duration_s`` the time-based.
+    Rows are (window, dyad). ``window_hours`` sets the resolution: 24 gives one
+    row per dyad per day, 1 gives hourly, and a value spanning the whole trial
+    gives a single row per dyad. Replaces the old full/daily pair of files,
+    which were just two hard-coded points on this same axis.
+
+    Windows are anchored to natural clock boundaries (pandas Grouper), so 24 h
+    windows line up with calendar days rather than with whenever the recording
+    happened to start.
+
+    Weights are bout-derived: ``n_events`` counts bouts (event-based) and
+    ``total_duration_s`` sums their durations (time-based). Association indices
+    (SRI/HWI) are deliberately not included - they are a property of the GBI,
+    which is exported alongside for exactly that purpose.
+
+    Caveat: a bout is assigned whole to the window its *start* falls in, so a
+    bout straddling a boundary is not split.
     """
-    cols_full = ['animal1', 'animal2', 'sex1', 'sex2', 'dyad_type',
-                 'n_events', 'total_duration_s', 'mean_distance', 'n_days']
-    cols_daily = ['animal1', 'animal2', 'Day', 'sex1', 'sex2', 'dyad_type',
-                  'n_events', 'total_duration_s', 'mean_distance']
+    cols = ['window_start', 'window_end', 'animal1', 'animal2', 'sex1', 'sex2',
+            'dyad_type', 'n_events', 'total_duration_s', 'mean_distance']
     if proximity_bouts is None or proximity_bouts.empty:
-        return pd.DataFrame(columns=cols_full), pd.DataFrame(columns=cols_daily)
+        return pd.DataFrame(columns=cols)
 
+    hours = float(window_hours) if window_hours and window_hours > 0 else 24.0
     sexmap = _label_sex_map(tag_identities)
     b = proximity_bouts.copy()
+    b['bout_start'] = pd.to_datetime(b['bout_start'], errors='coerce', utc=True)
+    b = b.dropna(subset=['bout_start'])
+    if b.empty:
+        return pd.DataFrame(columns=cols)
 
-    def _add_sex(df):
-        df['sex1'] = df['animal1'].map(lambda a: _sex_of(a, sexmap))
-        df['sex2'] = df['animal2'].map(lambda a: _sex_of(a, sexmap))
-        df['dyad_type'] = [_dyad_type(a, c) for a, c in zip(df['sex1'], df['sex2'])]
-        return df
+    # 'h' rather than the deprecated 'H'; minutes keep fractional windows exact.
+    freq = pd.Timedelta(hours=hours)
+    grouper = pd.Grouper(key='bout_start', freq=freq)
+    out = (b.groupby([grouper, 'animal1', 'animal2'], sort=True)
+             .agg(n_events=('duration_s', 'size'),
+                  total_duration_s=('duration_s', 'sum'),
+                  mean_distance=('mean_distance', 'mean'))
+             .reset_index()
+             .rename(columns={'bout_start': 'window_start'}))
+    out = out[out['n_events'] > 0]
+    out['window_end'] = out['window_start'] + freq
+    out['sex1'] = out['animal1'].map(lambda a: _sex_of(a, sexmap))
+    out['sex2'] = out['animal2'].map(lambda a: _sex_of(a, sexmap))
+    out['dyad_type'] = [_dyad_type(a, c) for a, c in zip(out['sex1'], out['sex2'])]
+    return (out[cols]
+            .sort_values(['window_start', 'total_duration_s'],
+                         ascending=[True, False])
+            .reset_index(drop=True))
 
-    full = (b.groupby(['animal1', 'animal2'], sort=True)
-              .agg(n_events=('duration_s', 'size'),
-                   total_duration_s=('duration_s', 'sum'),
-                   mean_distance=('mean_distance', 'mean'),
-                   n_days=('Day', 'nunique'))
-              .reset_index())
-    full = _add_sex(full)[cols_full].sort_values(
-        ['total_duration_s'], ascending=False).reset_index(drop=True)
-
-    daily = (b.groupby(['animal1', 'animal2', 'Day'], sort=True)
-               .agg(n_events=('duration_s', 'size'),
-                    total_duration_s=('duration_s', 'sum'),
-                    mean_distance=('mean_distance', 'mean'))
-               .reset_index())
-    daily = _add_sex(daily)[cols_daily].sort_values(
-        ['Day', 'total_duration_s'], ascending=[True, False]).reset_index(drop=True)
-
-    return full, daily
 
 
 # ── chain-rule grouping (GBI) ────────────────────────────────────────────────
