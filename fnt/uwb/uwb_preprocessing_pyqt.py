@@ -2649,7 +2649,9 @@ class UWBQuickVisualizationWindow(QWidget):
             "\n"
             "Computed from the filtered + smoothed data at full temporal "
             "resolution, so no fixes are dropped before pairwise distances are "
-            "measured.\n"
+            "measured. This file is also what the social-network EDGE LIST is "
+            "aggregated from; the GBI is built separately, from the per-second "
+            "distances.\n"
             "\n"
             "Bouts are threshold-specific: to analyze a different distance, "
             "re-run with a new threshold. The raw per-timestamp pairwise "
@@ -2683,18 +2685,68 @@ class UWBQuickVisualizationWindow(QWidget):
         # Replicates the LID_2020 RFID workflow on UWB data: pairwise edge lists
         # (event- and time-based), an asnipe-style GBI matrix of chain-rule
         # proximity flocks, and an optional dynamic social-network animation.
-        self.chk_social_network = QCheckBox("Export social network CSVs (edge lists + GBI)")
+        self.chk_social_network = QCheckBox("Export social network CSVs (edge list + GBI)")
         self.chk_social_network.setChecked(False)
         self.chk_social_network.setToolTip(
-            "Uses the proximity threshold to write R-ready social-network raw "
-            "materials:\n"
-            "  • edgelist_full / edgelist_daily — per-pair co-occurrence: "
-            "n_events (event-based) and total_duration_s (time-based)\n"
-            "  • GBI — asnipe-style group-by-individual matrix of proximity "
-            "flocks (chain rule), with m_sum/f_sum/mf_sum.\n"
+            "Two R-ready files, both keyed to the social radius set in the "
+            "preview. They are built from different things and answer "
+            "different questions, and neither is derived from the other:\n"
+            "\n"
+            "• network_edgelist.csv  DERIVED FROM the proximity bouts "
+            "file. A per-window aggregate of those same bouts: n_events counts "
+            "bouts (event-based weight), total_duration_s sums their durations "
+            "(time-based), mean_distance averages them. Strictly DIRECT dyadic "
+            "contact: a pair appears only if those two animals were themselves "
+            "within the radius.\n"
+            "\n"
+            "• network_GBI.csv  CALCULATED INDEPENDENTLY from the per-second "
+            "pairwise distances, not from the edge list. An asnipe-style "
+            "group-by-individual matrix: one row per chain-rule flocking event "
+            "(A-B and B-C in contact puts A, B and C in ONE group even if A and "
+            "C were never near each other), with m_sum/f_sum/mf_sum. Feeds "
+            "asnipe::get_network(data_format='GBI').\n"
+            "\n"
+            "Because of that chain rule, an edge list rebuilt from the GBI is "
+            "NOT the same as this one: it would add pairs that never actually "
+            "met. Rebuild from the proximity bouts instead.\n"
+            "\n"
             "Requires proximity detection (enabled automatically).")
         self.chk_social_network.stateChanged.connect(self.on_social_network_toggled)
         export_layout.addWidget(self.chk_social_network)
+
+        # Edge-list resolution. The old export hard-coded two files (whole-trial
+        # and per-day); this is the same axis exposed as a single knob, so one
+        # file covers both and anything between.
+        el_win_row = QHBoxLayout()
+        el_win_row.setContentsMargins(30, 0, 0, 0)
+        el_win_row.addWidget(QLabel("Edge list window:"))
+        self.spin_el_window = QDoubleSpinBox()
+        self.spin_el_window.setRange(1.0, 24.0)
+        self.spin_el_window.setValue(24.0)
+        self.spin_el_window.setSingleStep(1.0)
+        self.spin_el_window.setDecimals(1)
+        self.spin_el_window.setSuffix(" h")
+        self.spin_el_window.setFixedWidth(90)
+        self.spin_el_window.setToolTip(
+            "Time window each row of network_edgelist.csv covers. The edge "
+            "list is simply the proximity bouts aggregated over this window.\n"
+            "\n"
+            "24 h gives one row per dyad per day; 1 h gives hourly resolution. "
+            "Windows are anchored to clock boundaries, so 24 h means real "
+            "calendar days rather than time since the recording started.\n"
+            "\n"
+            "The aggregation is lossless at any setting (every bout is counted "
+            "exactly once), so a fine window can be summed up to a coarser one "
+            "downstream and give identical totals. A bout is counted in the "
+            "window its START falls in; it is not split across a boundary.\n"
+            "\n"
+            "Does not affect the GBI, which is calculated independently.")
+        el_win_row.addWidget(self.spin_el_window)
+        el_win_row.addStretch()
+        self.el_window_widget = QWidget()
+        self.el_window_widget.setLayout(el_win_row)
+        self.el_window_widget.setVisible(self.chk_social_network.isChecked())
+        export_layout.addWidget(self.el_window_widget)
 
 
 
@@ -6542,6 +6594,8 @@ class UWBQuickVisualizationWindow(QWidget):
     def on_social_network_toggled(self):
         """Show the animation sub-options, and ensure the proximity threshold is
         visible (social-network output is derived from it)."""
+        if hasattr(self, 'el_window_widget'):
+            self.el_window_widget.setVisible(self.chk_social_network.isChecked())
         if self.chk_social_network.isChecked():
             # Proximity is the source; keep its threshold control visible.
             self.proximity_threshold_widget.setVisible(False)
@@ -7147,6 +7201,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
             'export_social_network': self.chk_social_network.isChecked(),
+            'edgelist_window_h': self.spin_el_window.value(),
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
@@ -7423,6 +7478,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'export_social_network' in config:
                 self.chk_social_network.setChecked(config['export_social_network'])
+            if 'edgelist_window_h' in config:
+                self.spin_el_window.setValue(float(config['edgelist_window_h']))
             self.on_social_network_toggled()
     
             if 'save_plots' in config:
@@ -7721,11 +7778,12 @@ class UWBQuickVisualizationWindow(QWidget):
 
         if not write_csvs:
             return
-        self.log_message("Building social network CSVs (edge lists + GBI)...")
+        window_h = self.spin_el_window.value()
+        self.log_message(
+            f"Building social network CSVs (edge list @ {window_h:g} h windows + GBI)...")
         gbi = SN.build_gbi(events, self.tag_identities, gap_s=5, min_group=2)
-        full, daily_el = SN.build_edgelists(bouts, self.tag_identities)
-        for fname, df in ((f'{db_name}_network_edgelist_full.csv', full),
-                          (f'{db_name}_network_edgelist_daily.csv', daily_el),
+        edgelist = SN.build_edgelist(bouts, self.tag_identities, window_hours=window_h)
+        for fname, df in ((f'{db_name}_network_edgelist.csv', edgelist),
                           (f'{db_name}_network_GBI.csv', gbi)):
             path = os.path.join(output_dir, fname)
             if skip_existing and os.path.exists(path):
@@ -8642,8 +8700,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if detect_proximity:
             predicted_files.append(f'{db_name}_proximity_bouts.csv')
         if export_social_network:
-            predicted_files += [f'{db_name}_network_edgelist_full.csv',
-                                f'{db_name}_network_edgelist_daily.csv',
+            predicted_files += [f'{db_name}_network_edgelist.csv',
                                 f'{db_name}_network_GBI.csv']
 
         predicted_sna_files = []   # social-network animation was removed
