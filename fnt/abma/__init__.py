@@ -1,7 +1,7 @@
 """Animal Behavior Modeling Arena (ABMA).
 
 A GUI-driven agent-based platform for running *in silico* animal-behaviour
-experiments inside the Field Neuroethology Toolbox. Design an arena, populate it
+experiments inside the FieldNeuroToolbox. Design an arena, populate it
 with genetically and pharmacologically manipulated agents, run replicate trials,
 and export tracking data in FNT's canonical schema for post-hoc analysis in R.
 

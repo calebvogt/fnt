@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video PreProcessing Tool for FieldNeuroethologyToolbox
+Video PreProcessing Tool for FieldNeuroToolbox
 
 Comprehensive video preprocessing combining downsampling, re-encoding, and format conversion.
 Allows users to batch process videos with customizable quality, resolution, and encoding options.
@@ -1099,7 +1099,7 @@ class VideoProcessingGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroethologyToolbox")
+        self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroToolbox")
         self.setGeometry(200 + (self.instance_id - 1) * 50, 200 + (self.instance_id - 1) * 50, 900, 700)
         self.setMinimumSize(700, 600)
         

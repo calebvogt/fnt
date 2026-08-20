@@ -108,7 +108,7 @@ class CompressWavsWindow(QMainWindow):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle("Compress WAV Files - FieldNeuroethologyToolbox")
+        self.setWindowTitle("Compress WAV Files - FieldNeuroToolbox")
         self.setGeometry(200, 200, 900, 700)
         self.setMinimumSize(700, 600)
         

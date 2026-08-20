@@ -105,7 +105,7 @@ def _prepare_windows_taskbar():
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "fnt.fieldneuroethologytoolbox.gui.01")
+            "fnt.fieldneurotoolbox.gui.01")
     except Exception:
         pass
 
@@ -216,7 +216,7 @@ def main(argv=None):
     app.setQuitOnLastWindowClosed(True)
 
     # Show the FNT icon rather than the bare interpreter's.
-    app.setApplicationName("FieldNeuroethologyToolbox")
+    app.setApplicationName("FieldNeuroToolbox")
     icon = fnt_icon_path()
     if icon:
         app.setWindowIcon(QIcon(icon))

@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.patches import Circle, Polygon as MplPolygon
+from matplotlib.collections import LineCollection
 
 import cv2
 
@@ -177,13 +178,32 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      arena_zones=None, anchors=None,
                      tag_identities=None, use_custom_identities=False,
                      color_by="None", marker_size=10, show_battery=False,
-                     axis_limits=None,
+                     axis_limits=None, behavior=None, show_trail=True,
+                     show_labels=True,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
     Each frame shows the current position at its timestamp plus the trailing
     ``trailing_window`` seconds behind it. Returns ``output_path`` on success,
     or None on failure/cancel.
+
+    ``behavior`` puts the preview's behaviour overlays into the video, so an
+    export looks like the preview it was tuned in. It is a dict of:
+
+        radius       social radius in metres, or None for no circles
+        circle_color edge colour for those circles
+        grid         int64 ns timestamps of the classification frames
+        tags         tag ids, in the column order of `loc`/`soc`
+        loc          (frames, tags) locomotor codes, or None
+        soc          (frames, tags) social codes, or None
+        links        (n, 4) int32 rows of (frame, i, j, kind), sorted by frame
+        link_colors  {kind: colour}
+        state_labels {"loc": {code: text}, "soc": {code: text}}
+        state_colors {"loc": {code: colour}, "soc": {code: colour}}
+
+    The classification grid is independent of the video frame rate: each video
+    frame takes the classification row nearest its own timestamp, so the
+    overlay stays correct whatever speed the video is rendered at.
 
     Callbacks (all optional):
         is_cancelled() -> bool : checked before each frame; True aborts.
@@ -271,6 +291,35 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                              color='#000000', animated=True)
         dyn[tag] = (trail_line, marker, label, batt_label)
 
+    # Behaviour overlays get the same treatment as everything else here: one
+    # persistent artist per tag, repositioned each frame rather than recreated,
+    # so a multi-hour render allocates nothing per frame.
+    beh = behavior or None
+    beh_radius = float(beh['radius']) if beh and beh.get('radius') else None
+    beh_grid = np.asarray(beh['grid'], dtype='int64') if beh else np.empty(0, 'int64')
+    beh_links = np.asarray(beh['links'], dtype='int64').reshape(-1, 4) if beh else None
+    beh_col_of = {t: i for i, t in enumerate(beh['tags'])} if beh else {}
+    beh_circles, beh_states = {}, {}
+    link_lc = None
+    if beh:
+        for tag in tag_data_dict:
+            if beh_radius:
+                circ = Circle((0, 0), beh_radius, fill=False,
+                              linestyle=(0, (2, 2)), linewidth=1.2,
+                              edgecolor=beh.get('circle_color') or '#9fb3c8',
+                              alpha=0.9, zorder=4.5, animated=True)
+                circ.set_visible(False)
+                ax.add_patch(circ)
+                beh_circles[tag] = circ
+            beh_states[tag] = ax.text(0, 0, '', fontsize=7, ha='center',
+                                      va='bottom', animated=True)
+        # Dashed like the circles they join, but heavier, so a link reads as a
+        # connection rather than as another radius outline.
+        link_lc = LineCollection([], linewidths=2.2, alpha=0.95,
+                                 linestyle=(0, (3, 2)), zorder=4.6,
+                                 animated=True)
+        ax.add_collection(link_lc)
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     if not video_writer.isOpened():
@@ -291,6 +340,15 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         # marker sits at `current`.
         window_start = frame_start - pd.Timedelta(seconds=trailing_window)
 
+        # Nearest classification row to this frame's display time. The grid is
+        # regular, so this stays right no matter how the video speed compares
+        # to the classification rate.
+        beh_i = -1
+        if beh is not None and len(beh_grid):
+            beh_i = int(np.searchsorted(beh_grid, frame_start.value))
+            beh_i = min(max(beh_i, 0), len(beh_grid) - 1)
+        positions = {}
+
         canvas.restore_region(static_bg)  # wipe back to the cached scene
 
         title_text = title
@@ -305,38 +363,105 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
             tag_df = tag_info['data']
             trailing = tag_df[(tag_df['Timestamp'] >= window_start) &
                               (tag_df['Timestamp'] <= frame_start)]
+            state_txt = beh_states.get(tag)
+            circ = beh_circles.get(tag)
             if trailing.empty:
                 # Tag not reporting in this window (e.g. battery dead): hide it.
                 trail_line.set_data([], [])
                 marker.set_data([], [])
                 label.set_text('')
                 batt_label.set_text('')
+                if state_txt is not None:
+                    state_txt.set_text('')
+                if circ is not None:
+                    circ.set_visible(False)
             else:
                 xs = trailing['smoothed_x'].to_numpy()
                 ys = trailing['smoothed_y'].to_numpy()
-                trail_line.set_data(xs, ys)
+                trail_line.set_data(xs, ys if show_trail else [])
+                if not show_trail:
+                    trail_line.set_data([], [])
                 cx, cy = xs[-1], ys[-1]
                 marker.set_data([cx], [cy])
+                positions[tag] = (cx, cy)
+                if circ is not None:
+                    circ.set_center((cx, cy))
+                    circ.set_visible(True)
+                # 'moving - chasing': the locomotor half and the social half,
+                # either of which is dropped when its layer is off or the
+                # animal is not doing it. Colour follows the social state when
+                # there is one, since that is the rarer, more informative half.
+                state_text, state_col = '', '#cccccc'
+                if state_txt is not None and beh_i >= 0:
+                    j = beh_col_of.get(tag)
+                    if j is not None:
+                        parts = []
+                        lc_ = beh.get('loc')
+                        sc_ = beh.get('soc')
+                        if lc_ is not None:
+                            code = int(lc_[beh_i, j])
+                            txt = beh['state_labels']['loc'].get(code, '')
+                            if txt:
+                                parts.append(txt)
+                                state_col = beh['state_colors']['loc'].get(
+                                    code, state_col)
+                        if sc_ is not None:
+                            code = int(sc_[beh_i, j])
+                            txt = beh['state_labels']['soc'].get(code, '')
+                            if txt:
+                                parts.append(txt)
+                                state_col = beh['state_colors']['soc'].get(
+                                    code, state_col)
+                        state_text = ' - '.join(parts)
+                if state_txt is not None:
+                    state_txt.set_text(state_text)
+                    state_txt.set_color(state_col)
+                    state_txt.set_position((cx, cy + y_range * 0.02))
+                # The state line sits where the ID normally does, so lift the
+                # ID clear of it when both are shown.
+                lift = y_range * 0.028 if state_text else 0.0
                 if show_battery:
                     # Lift the label and hang the voltage beneath it (shared
                     # anchor at cy+off: label grows up, voltage grows down).
-                    off = y_range * 0.035
+                    off = y_range * 0.035 + lift
                     label.set_position((cx, cy + off))
                     label.set_verticalalignment('bottom')
-                    label.set_text(tag_info['label'])
+                    label.set_text(tag_info['label'] if show_labels else '')
                     bv = (trailing['battery_voltage'].iloc[-1]
                           if 'battery_voltage' in trailing.columns else None)
                     batt_label.set_position((cx, cy + off))
                     batt_label.set_text(f"{bv:.2f} V" if bv is not None and pd.notna(bv) else '')
                 else:
-                    label.set_position((cx, cy + (y_range * 0.02)))
+                    label.set_position((cx, cy + y_range * 0.02 + lift))
                     label.set_verticalalignment('baseline')
-                    label.set_text(tag_info['label'])
+                    label.set_text(tag_info['label'] if show_labels else '')
                     batt_label.set_text('')
             ax.draw_artist(trail_line)
             ax.draw_artist(marker)
             ax.draw_artist(label)
             ax.draw_artist(batt_label)
+            if tag in beh_circles and beh_circles[tag].get_visible():
+                ax.draw_artist(beh_circles[tag])
+            if tag in beh_states:
+                ax.draw_artist(beh_states[tag])
+
+        # Links last: they join two markers, so every position has to be known
+        # before any of them can be drawn.
+        if link_lc is not None:
+            segs, cols = [], []
+            if beh_i >= 0 and beh_links is not None and len(beh_links):
+                lo = int(np.searchsorted(beh_links[:, 0], beh_i, 'left'))
+                hi = int(np.searchsorted(beh_links[:, 0], beh_i, 'right'))
+                for _f, a, b, kind in beh_links[lo:hi]:
+                    pa = positions.get(beh['tags'][a])
+                    pb = positions.get(beh['tags'][b])
+                    if pa is not None and pb is not None:
+                        segs.append([pa, pb])
+                        cols.append(beh['link_colors'].get(int(kind), '#9fb3c8'))
+            link_lc.set_segments(segs)
+            if cols:
+                link_lc.set_color(cols)
+            ax.draw_artist(link_lc)
 
         canvas.blit(fig.bbox)
         buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)

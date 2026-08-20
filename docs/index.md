@@ -1,4 +1,4 @@
-# Field Neuroethology Toolbox (fnt)
+# FieldNeuroToolbox (fnt)
 
 Preprocessing and analysis toolbox for field and laboratory neurobehavioral data. This software is fully open source and made available freely to the research and hobbyist community. It is released "as-is" and continues to evolve alongside our own research needs.
 
@@ -47,7 +47,7 @@ If you use FNT in your research, please cite the repository:
 
 ```bibtex
 @software{fnt,
-  title  = {Field Neuroethology Toolbox (fnt)},
+  title  = {FieldNeuroToolbox (fnt)},
   author = {Vogt, Caleb C. and Contributors},
   url    = {https://github.com/calebvogt/fnt}
 }

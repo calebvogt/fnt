@@ -111,7 +111,13 @@ def _run(job_path):
     app.processEvents(QEventLoop.AllEvents, 50)
 
     failed = bool(getattr(win, "_last_export_failed", False))
-    print(f"WORKER: export {'FAILED' if failed else 'OK'}", flush=True)
+    corrupt = bool(getattr(win, "_export_output_corrupt", False))
+    print(f"WORKER: export {'FAILED' if failed else 'OK'}"
+          + (" (output failed verification)" if corrupt else ""), flush=True)
+    if corrupt:
+        # Distinct from 1: the queue retries this one, because the same
+        # job run again usually writes a clean file.
+        return UWBQuickVisualizationWindow.EXIT_OUTPUT_CORRUPT
     return 1 if failed else 0
 
 

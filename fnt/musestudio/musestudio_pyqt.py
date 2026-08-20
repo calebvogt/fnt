@@ -247,7 +247,7 @@ class MuseStudioWindow(QMainWindow):
         self._settings = QSettings("FNT", "MuseStudio")
         self.output_dir = self._settings.value("recording_dir", _default_recording_dir())
 
-        self.setWindowTitle("MuseStudio - FieldNeuroethologyToolbox")
+        self.setWindowTitle("MuseStudio - FieldNeuroToolbox")
         self.resize(1480, 900)
         self.setMinimumSize(1100, 700)
         self.setStyleSheet(theme.STYLESHEET)
@@ -1558,7 +1558,7 @@ class MuseStudioWindow(QMainWindow):
         p = self.binaural._params()
         streams = self.reader.channel_names() if self.reader else {}
         return {
-            "app": "FieldNeuroethologyToolbox / MuseStudio",
+            "app": "FieldNeuroToolbox / MuseStudio",
             "subject": self._subject_block(),
             "version": app_version,
             "created": datetime.now().isoformat(timespec="milliseconds"),

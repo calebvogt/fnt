@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FieldNeuroethologyToolbox (FNT) - PyQt Main GUI Application
+FieldNeuroToolbox (FNT) - PyQt Main GUI Application
 
 A professional GUI interface for neurobehavioral data preprocessing and analysis.
 
@@ -133,7 +133,7 @@ class UpdateCheckerThread(QThread):
 
 
 class FNTMainWindow(QMainWindow):
-    """Main PyQt GUI window for FieldNeuroethologyToolbox"""
+    """Main PyQt GUI window for FieldNeuroToolbox"""
     
     def __init__(self):
         super().__init__()
@@ -174,7 +174,7 @@ class FNTMainWindow(QMainWindow):
             except Exception:
                 pass
             
-        self.setWindowTitle(f"FieldNeuroethologyToolbox (FNT) v{self.version}")
+        self.setWindowTitle(f"FieldNeuroToolbox (FNT) v{self.version}")
         self.setGeometry(100, 100, 1100, 780)
         self.setMinimumSize(850, 650)
         
@@ -328,7 +328,7 @@ class FNTMainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.status_bar.setSizeGripEnabled(False)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready - FieldNeuroethologyToolbox initialized")
+        self.status_bar.showMessage("Ready - FieldNeuroToolbox initialized")
         
         self.update_label = QLabel()
         self.update_label.setOpenExternalLinks(True)
@@ -378,7 +378,7 @@ class FNTMainWindow(QMainWindow):
         # Title and subtitle in the center
         text_layout = QVBoxLayout()
         
-        title = QLabel("Field Neuroethology Toolbox (FNT)")
+        title = QLabel("FieldNeuroToolbox (FNT)")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 20, QFont.Bold))
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
@@ -911,7 +911,7 @@ class FNTMainWindow(QMainWindow):
         info_layout = QGridLayout()
 
         info_buttons = [
-            ("About FNT", "About FieldNeuroethologyToolbox", self.show_about),
+            ("About FNT", "About FieldNeuroToolbox", self.show_about),
             ("Check Dependencies", "Verify required software is installed", self.check_dependencies),
             ("Open Documentation", "Open FNT documentation", self.open_documentation),
             ("Report Issue", "Report a bug or request a feature", self.report_issue),
@@ -1428,7 +1428,7 @@ class FNTMainWindow(QMainWindow):
     # Utility Methods
     def show_about(self):
         """Show about dialog"""
-        about_text = f"""<h2>FieldNeuroethologyToolbox (FNT) v{self.version}</h2>
+        about_text = f"""<h2>FieldNeuroToolbox (FNT) v{self.version}</h2>
 
         <p>A comprehensive preprocessing and analysis toolbox for neurobehavioral data.</p>
         
@@ -1449,7 +1449,7 @@ class FNTMainWindow(QMainWindow):
         """
         
         msg = QMessageBox()
-        msg.setWindowTitle("About FieldNeuroethologyToolbox")
+        msg.setWindowTitle("About FieldNeuroToolbox")
         msg.setTextFormat(Qt.RichText)
         msg.setText(about_text)
         msg.exec_()
@@ -1601,7 +1601,7 @@ def main():
     # Windows taskbar icon fix - must be set before creating QApplication
     try:
         import ctypes
-        myappid = 'fnt.fieldneuroethologytoolbox.gui.01'  # arbitrary string
+        myappid = 'fnt.fieldneurotoolbox.gui.01'  # arbitrary string
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except:
         pass
@@ -1627,7 +1627,7 @@ def main():
     app = QApplication(sys.argv)
     
     # Set application properties
-    app.setApplicationName("FieldNeuroethologyToolbox")
+    app.setApplicationName("FieldNeuroToolbox")
     try:
         from importlib.metadata import version
         app_version = version("fnt")
