@@ -1625,6 +1625,7 @@ class PlotSaverWorker(QThread):
                 ('mcp_range', self.save_mcp_range),
                 ('zone_occupancy', self.save_zone_occupancy),
                 ('ethogram', self.save_ethogram),
+                ('social_budget', self.save_social_budget),
                 ('behavior_counts', self.save_chase_timeline),
                 ('behavior_matrix', self.save_chase_matrix),
             ]
@@ -3106,13 +3107,82 @@ class PlotSaverWorker(QThread):
         self.progress.emit(f"Saved: {db_name}_BehaviorMatrix.png")
         return True
 
-    def save_ethogram(self, data, output_dir, db_name):
-        """Behaviour-state raster per animal, plus a per-day time budget.
+    # Present, but in no social state at all. The classifier has no code for
+    # this: SOC_NONE means "nothing social happened", which in the old combined
+    # raster was just the locomotor colour showing through, so "alone" was not
+    # readable anywhere. Splitting the raster makes it a state in its own right
+    # and it needs its own colour. Dark reads as absent, light as present but
+    # alone, saturated as an event.
+    ALONE_COLOR = '#cfd8e3'
 
-        Returns the number of plots generated.
+    def _behaviour_rasters(self, loc, soc):
+        """(locomotor, social) display codes and their colour keys.
+
+        Two independent codings of the same frames rather than one with a
+        precedence rule. The combined raster had to let a social state
+        overwrite the locomotor one - the old title said as much - so an animal
+        in contact showed no locomotor state at all, and time spent alone was
+        invisible. Split, each panel answers exactly one question.
+
+        Codes ascend by how much they are worth seeing, because a pixel covers
+        many frames and the rasteriser keeps the maximum in each bin.
         """
         from fnt.uwb import behavior_detection as BD
 
+        loc_key = [('no data', BD.STATE_COLORS[BD.LOC_NODATA]),
+                   ('inactive', BD.STATE_COLORS[BD.LOC_INACTIVE]),
+                   ('moving', BD.STATE_COLORS[BD.LOC_MOVING])]
+        loc_disp = np.zeros(loc.shape, dtype=np.int8)
+        loc_disp[loc == BD.LOC_INACTIVE] = 1
+        loc_disp[loc == BD.LOC_MOVING] = 2
+
+        soc_spec = [('no data', None, BD.STATE_COLORS[BD.LOC_NODATA]),
+                    ('alone', 'alone', self.ALONE_COLOR),
+                    ('contact', BD.SOC_CONTACT, BD.SOCIAL_COLORS[BD.SOC_CONTACT])]
+        if DISPLACEMENT_ENABLED:
+            soc_spec += [
+                ('displaced', BD.SOC_DISPLACED, BD.SOCIAL_COLORS[BD.SOC_DISPLACED]),
+                ('displacing', BD.SOC_DISPLACING, BD.SOCIAL_COLORS[BD.SOC_DISPLACING])]
+        soc_spec += [
+            ('chased', BD.SOC_CHASED, BD.SOCIAL_COLORS[BD.SOC_CHASED]),
+            ('chasing', BD.SOC_CHASING, BD.SOCIAL_COLORS[BD.SOC_CHASING])]
+
+        soc_disp = np.zeros(soc.shape, dtype=np.int8)
+        for k, (_lab, code, _c) in enumerate(soc_spec):
+            if code == 'alone':
+                # Has a fix, but nothing social - the state the combined
+                # raster could not show.
+                soc_disp[(loc != BD.LOC_NODATA) & (soc == BD.SOC_NONE)] = k
+            elif code is not None:
+                soc_disp[soc == code] = k
+
+        soc_key = [(lab, colour) for lab, _code, colour in soc_spec]
+        return (loc_disp, loc_key), (soc_disp, soc_key)
+
+    @staticmethod
+    def _rasterise(disp, n_tags, max_cols=3000):
+        """Collapse frames to one column per output pixel, keeping the max.
+
+        A pixel covers many frames; taking the maximum means a brief chase
+        survives a bin full of contact rather than being averaged away. That
+        over-represents rare states by design - the time budget is where
+        proportions should be read.
+        """
+        n_frames = disp.shape[0]
+        stride = max(1, int(np.ceil(n_frames / max_cols)))
+        n_cols = int(np.ceil(n_frames / stride))
+        raster = np.zeros((n_tags, n_cols), dtype=np.int8)
+        for c in range(n_cols):
+            sl = disp[c * stride:(c + 1) * stride]
+            if sl.size:
+                raster[:, c] = sl.max(axis=0)
+        return raster, stride
+
+    def save_ethogram(self, data, output_dir, db_name):
+        """Locomotion and social state as two stacked rasters per animal.
+
+        Returns the number of plots generated.
+        """
         self.progress.emit("Generating behaviour ethogram...")
 
         output_path = os.path.join(output_dir, f'{db_name}_Ethogram.png')
@@ -3127,73 +3197,126 @@ class PlotSaverWorker(QThread):
             self.progress.emit("No data to classify, skipping ethogram")
             return 0
 
-        # Display code per frame: social state wins when present (it is the
-        # rarer, more informative event), else the locomotor state.
-        order = [('no data', BD.LOC_NODATA, None, BD.STATE_COLORS[BD.LOC_NODATA]),
-                 ('inactive', BD.LOC_INACTIVE, None, BD.STATE_COLORS[BD.LOC_INACTIVE]),
-                 ('moving', BD.LOC_MOVING, None, BD.STATE_COLORS[BD.LOC_MOVING]),
-                 ('contact', None, BD.SOC_CONTACT, BD.SOCIAL_COLORS[BD.SOC_CONTACT]),
-                 ('displacing', None, BD.SOC_DISPLACING, BD.SOCIAL_COLORS[BD.SOC_DISPLACING]),
-                 ('displaced', None, BD.SOC_DISPLACED, BD.SOCIAL_COLORS[BD.SOC_DISPLACED]),
-                 ('chasing', None, BD.SOC_CHASING, BD.SOCIAL_COLORS[BD.SOC_CHASING]),
-                 ('chased', None, BD.SOC_CHASED, BD.SOCIAL_COLORS[BD.SOC_CHASED])]
-        if not DISPLACEMENT_ENABLED:
-            # A key entry for a state that can no longer occur is a claim the
-            # figure cannot back up.
-            order = [row for row in order
-                     if row[2] not in (BD.SOC_DISPLACING, BD.SOC_DISPLACED)]
-        disp = np.zeros(loc.shape, dtype=np.int8)
-        for k, (_lab, lcode, scode, _c) in enumerate(order):
-            if scode is None:
-                disp[(soc == BD.SOC_NONE) & (loc == lcode)] = k
-            else:
-                disp[soc == scode] = k
-        cmap = ListedColormap([c for _l, _lc, _sc, c in order])
+        (loc_disp, loc_key), (soc_disp, soc_key) = self._behaviour_rasters(loc, soc)
+        loc_raster, stride = self._rasterise(loc_disp, len(tags))
+        soc_raster, _ = self._rasterise(soc_disp, len(tags))
 
         times = pd.to_datetime(grid, utc=True).tz_convert(
             data['Timestamp'].dt.tz or 'UTC')
-        n_frames = len(grid)
-        # One column per output pixel: within a bin, any social state present
-        # wins over the locomotor background so brief events stay visible.
-        max_cols = 3000
-        stride = max(1, int(np.ceil(n_frames / max_cols)))
-        n_cols = int(np.ceil(n_frames / stride))
-        raster = np.zeros((len(tags), n_cols), dtype=np.int8)
-        for c in range(n_cols):
-            sl = disp[c * stride:(c + 1) * stride]
-            if sl.size == 0:
-                continue
-            raster[:, c] = sl.max(axis=0)
-
-        extent = [mdates.date2num(times[0]), mdates.date2num(times[-1]),
+        extent = [date_axis(pd.Series([times[0]]))[0],
+                  date_axis(pd.Series([times[-1]]))[0],
                   len(tags) - 0.5, -0.5]
-        fig = Figure(figsize=(16, 1.6 + 0.55 * len(tags) + 1.8))
-        ax = fig.add_subplot(111)
-        ax.imshow(raster, aspect='auto', interpolation='nearest', cmap=cmap,
-                  vmin=0, vmax=len(order) - 1, extent=extent)
-        ax.set_yticks(range(len(tags)))
-        ax.set_yticklabels([self._tag_label(t) for t in tags], fontsize=8)
-        ax.xaxis_date()
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-        for lbl in ax.get_xticklabels():
-            lbl.set_rotation(30); lbl.set_ha('right'); lbl.set_fontsize(7)
-        ax.set_xlabel('Time', fontsize=9)
-        handles = [Patch(facecolor=c, label=l) for l, _lc, _sc, c in order]
-        ax.legend(handles=handles, ncol=len(order), fontsize=7,
-                  loc='upper center', bbox_to_anchor=(0.5, -0.22),
-                  framealpha=0.9, borderaxespad=0.0)
+        labels = [self._tag_label(t) for t in tags]
+
+        row_h = 0.55 * len(tags)
+        fig = Figure(figsize=(16, 2.0 + 2 * (row_h + 1.4)))
+        panels = ((loc_raster, loc_key, 'Locomotion'),
+                  (soc_raster, soc_key, 'Social state'))
+        for i, (raster, key, name) in enumerate(panels):
+            ax = fig.add_subplot(2, 1, i + 1)
+            ax.imshow(raster, aspect='auto', interpolation='nearest',
+                      cmap=ListedColormap([c for _l, c in key]),
+                      vmin=0, vmax=len(key) - 1, extent=extent)
+            ax.set_yticks(range(len(tags)))
+            ax.set_yticklabels(labels, fontsize=8)
+            ax.xaxis_date()
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+            for lbl in ax.get_xticklabels():
+                lbl.set_rotation(30); lbl.set_ha('right'); lbl.set_fontsize(7)
+            ax.set_title(name, fontsize=11, fontweight='bold')
+            ax.legend(handles=[Patch(facecolor=c, label=l) for l, c in key],
+                      ncol=len(key), fontsize=7, loc='upper center',
+                      bbox_to_anchor=(0.5, -0.18), framealpha=0.9,
+                      borderaxespad=0.0)
+            if i == 1:
+                ax.set_xlabel('Time', fontsize=9)
+
         secs = (grid[-1] - grid[0]) / 1e9
-        ax.set_title(
-            f'Behaviour Ethogram — 1 Hz classification, {secs/3600:.1f} h, '
-            f'{stride} s per pixel (social states take precedence)',
-            fontsize=12, fontweight='bold', pad=12)
-        fig.tight_layout()
+        fig.suptitle(
+            f'Behaviour Ethogram — 1 Hz classification, {secs / 3600:.1f} h, '
+            f'{stride} s per pixel (each pixel shows the most notable state '
+            f'it covers)',
+            fontsize=12, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
         self.save_figure(fig, output_path)
         plt.close(fig)
         self.progress.emit(f"Saved: {db_name}_Ethogram.png")
-        generated = 1
+        return 1
 
-        return generated
+    def save_social_budget(self, data, output_dir, db_name):
+        """One pie per animal: how its whole tracked recording was spent.
+
+        Faceted by animal rather than by day, and over the whole recording
+        rather than per day, so the panels answer "who is social and who is
+        not" at a glance - a question a per-day breakdown makes you assemble
+        yourself across twenty panels.
+
+        The counterpart to the ethogram raster, not a repeat of it: the raster
+        deliberately over-represents brief events so they stay visible at a
+        pixel per several minutes, so proportions have to come from the frame
+        counts instead.
+
+        Returns True if generated, False if skipped.
+        """
+        self.progress.emit("Generating social time budget...")
+
+        output_path = os.path.join(output_dir, f'{db_name}_SocialBudget.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_SocialBudget.png")
+            return False
+
+        data = data.copy()
+        tags = sorted(data['shortid'].unique())
+        grid, loc, soc, _events, _links = self._behavior_classification(data, tags)
+        if grid is None:
+            self.progress.emit("No data to classify, skipping social budget")
+            return False
+
+        (_loc_disp, _lk), (soc_disp, soc_key) = self._behaviour_rasters(loc, soc)
+        # Code 0 is 'no data'; a budget of TRACKED time excludes it.
+        slices = list(soc_key[1:])
+        dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
+
+        budgets = []
+        for col, tag in enumerate(tags):
+            counts = [int((soc_disp[:, col] == k + 1).sum())
+                      for k in range(len(slices))]
+            if sum(counts) > 0:
+                budgets.append((tag, counts))
+        if not budgets:
+            self.progress.emit(
+                "No tracked time to summarise, skipping social budget")
+            return False
+
+        n_rows, n_cols, figsize = self.facet_grid(
+            len(budgets), max_cols=5, panel_w=3.0, panel_h=3.4, extra_h=0.9)
+        fig = Figure(figsize=figsize)
+        for i, (tag, counts) in enumerate(budgets):
+            ax = fig.add_subplot(n_rows, n_cols, i + 1)
+            total = sum(counts)
+            keep = [(colour, c) for (_lab, colour), c in zip(slices, counts)
+                    if c > 0]
+            ax.pie([c for _c, c in keep], colors=[c for c, _n in keep],
+                   startangle=90, counterclock=False,
+                   wedgeprops=dict(edgecolor='white', linewidth=0.6),
+                   autopct=lambda p: f'{p:.0f}%' if p >= 4 else '',
+                   textprops=dict(fontsize=7))
+            social = total - counts[0]
+            ax.set_title(
+                f'{self._tag_label(tag)}\n'
+                f'{total * dt_s / 3600:.1f} h tracked, '
+                f'{100 * social / total:.0f}% with others',
+                fontsize=9)
+        fig.legend(handles=[Patch(facecolor=c, label=l) for l, c in slices],
+                   ncol=len(slices), fontsize=9, loc='lower center',
+                   framealpha=0.9)
+        fig.suptitle('Social Time Budget \u2014 whole recording, per animal',
+                     fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_SocialBudget.png")
+        return True
 
 
 class FigurePopup(QDialog):
@@ -4346,11 +4469,47 @@ class UWBQuickVisualizationWindow(QWidget):
              "How often each animal chased, and how often it was on the receiving end, per day.\n\nFILE: {db}_BehaviorCounts.png\n\nTwo panels: AS ACTOR (this animal did the chasing) and AS TARGET (it was the one chased). One line per animal, x = day, y = number of bouts that day. The split is the point - an animal that chases constantly and one that is constantly chased have the same combined total and opposite meanings.\n\nA bout is counted on the day it STARTED, and carries the minimum-duration filter from the detection settings.\n\nThresholds are inherited from the preview's Behaviour Detection controls. If nothing is detected at all, the plot is skipped with a message - check the speed summary under those controls, since a chase speed above nearly all observed movement can never fire.\n\nSkipped entirely if no chases are detected."),
             ("behavior_matrix", "Behaviour Matrix (who \u2192 whom)",
              "Who does it to whom: a directed actor x target matrix.\n\nFILE: {db}_BehaviorMatrix.png\n\nROWS are the actor, COLUMNS the target, so cell (i, j) is the number of times i chased j. Each cell is labelled with the event count and the total seconds those bouts lasted, because many brief chases and one long chase are different findings.\n\nThe matrix is deliberately NOT symmetric, and that is what it is for: the difference between cell (i, j) and cell (j, i) is the dominance signal for that pair. A symmetric contact matrix - which is what the proximity bouts and the GBI give you - cannot show it. The diagonal is greyed out; there are no self-directed bouts.\n\nThresholds are inherited from the preview's Behaviour Detection controls. Skipped if no chases are detected."),
+            ("social_budget", "Social Time Budget (per animal)",
+             "How much of its tracked time each animal spent alone versus "
+             "with others, over the whole recording.\n\n"
+             "FILE: {db}_SocialBudget.png - one pie per animal, faceted so "
+             "the cohort can be compared side by side.\n\n"
+             "Slices are alone, contact, chased and chasing - the same social "
+             "states as the ethogram's lower panel, from the same 1 Hz "
+             "classification, so one second of tracked time is one unit of "
+             "pie. Untracked time is excluded rather than drawn as a slice: "
+             "the question is how an animal spent the time it WAS tracked "
+             "for, so an animal that reported for three days and one that "
+             "reported for twenty stay comparable. Each panel is captioned "
+             "with the hours behind it and the share spent with others.\n\n"
+             "This is the counterpart to the ethogram raster, not a repeat "
+             "of it. The raster deliberately over-represents brief events - "
+             "a pixel spans minutes and shows the most notable state in it - "
+             "so proportions cannot be read off it. They come from the frame "
+             "counts here.\n\n"
+             "Slices under 4% are left unlabelled to keep the panels "
+             "legible; they are still drawn. An animal with no tracked fixes "
+             "is left out rather than drawn as an empty circle.\n\n"
+             "Thresholds are inherited from the preview's Behaviour "
+             "Detection controls."),
             ("ethogram", "Behaviour Ethogram",
             "The behaviour states from the preview, classified across the "
             "ENTIRE recording and written out - the detections otherwise "
-            "exist only live in the preview window. Two files: a raster "
-            "over time, and a per-day time budget.\n"
+            "exist only live in the preview window.\n"
+            "\n"
+            "FILE: {db}_Ethogram.png - TWO stacked rasters over a shared "
+            "time axis, one row per animal in each.\n"
+            "\n"
+            "LOCOMOTION: no data / inactive / moving.\n"
+            "SOCIAL: no data / alone / contact / chased / chasing.\n"
+            "\n"
+            "They are separate panels rather than one raster because a "
+            "single one has to choose: the previous version let a social "
+            "state overwrite the locomotor state, so an animal in contact "
+            "showed no locomotor state at all, and time spent ALONE was not "
+            "visible anywhere - it was just the locomotor colour showing "
+            "through. Split, each panel answers one question and the two "
+            "line up in time.\n"
             "\n"
             "THRESHOLDS ARE INHERITED FROM THE PREVIEW. Social radius, "
             "inactive/moving speed split, chase "
@@ -12101,6 +12260,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 _add_with_svg(predicted_plot_files, f'{db_name}_ZoneOccupancy')
             if plot_types.get('ethogram', False):
                 _add_with_svg(predicted_plot_files, f'{db_name}_Ethogram')
+            if plot_types.get('social_budget', False):
+                _add_with_svg(predicted_plot_files, f'{db_name}_SocialBudget')
             if plot_types.get('behavior_counts', False):
                 _add_with_svg(predicted_plot_files, f'{db_name}_BehaviorCounts')
             if plot_types.get('behavior_matrix', False):

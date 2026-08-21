@@ -8723,17 +8723,60 @@ class MADMainWindow(QMainWindow):
             return
         self._remove_files_by_path(victims, delete_embedded=True)
 
+    def _clear_review_canvas(self):
+        """Blank the preview and every piece of per-file review state.
+
+        Used when the selected recording cannot be opened. Leaving the previous
+        file's audio, annotations and undo history on screen while
+        current_file_idx already points elsewhere is what allowed a review
+        decision to be written against the wrong recording: _active_wav_path()
+        follows the index, so Accept wrote the old file's call into the new
+        file's CSV and stamped a training example with the wrong source_wav.
+
+        Showing nothing is the honest state. The Audio list still marks the row
+        with a warning, and File > Locate Missing Recordings can repoint it.
+        """
+        sg = self.spectrogram
+        self._stop_playback()
+        self.audio_data = None
+        self.sample_rate = None
+        self._loaded_wav_path = None
+        sg.set_predicted_mask(None)
+        sg.mask = None
+        sg.set_annotations([])
+        sg._selected_ann_idx = None
+        sg._selected_set = set()
+        sg.set_audio_data(None, None)
+        self.waveform_overview.set_audio_data(None, None)
+        # Per-file state that would otherwise still describe the file we left.
+        # The undo stack matters most: its snapshots restore annotations AND
+        # rewrite the sibling CSV, and _active_review_wav_path() would resolve
+        # to the recording we could not open.
+        self._undo_stack = []
+        self._reviewed_count = 0
+        self._pred_review_idx = None
+        self._bump_review_token()
+        self._refresh_annotation_list()
+        self._update_pred_review_widgets()
+        self._update_paint_buttons_enabled()
+        self._update_playback_buttons_enabled()
+
     def _load_current_file(self):
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
             return
         filepath = self.audio_files[self.current_file_idx]
         if not os.path.isfile(filepath):
-            # Referenced recording moved. Say so plainly and point at the fix
-            # instead of failing silently — nothing else about the project is
+            # Referenced recording moved. Clear the canvas rather than leaving
+            # the previous file's detections on screen under this file's name —
+            # see _clear_review_canvas. Nothing else about the project is
             # broken by this, and the ⚠ row already flags it.
+            name = os.path.basename(filepath)
+            self._clear_review_canvas()
+            self.lbl_mask_status.setText(f"{name} not found")
             self.status_bar.showMessage(
-                f"{os.path.basename(filepath)} not found — File ▸ Locate "
-                "Missing Recordings… to repoint it")
+                f"{name} not found — File ▸ Locate Missing Recordings… to "
+                "repoint it")
+            self._log(f"Cannot open {name} — recording not found")
             return
         self._stop_playback()
         # Wipe any prediction overlay from the previous file — a new
