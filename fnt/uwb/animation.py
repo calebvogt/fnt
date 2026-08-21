@@ -179,7 +179,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      tag_identities=None, use_custom_identities=False,
                      color_by="None", marker_size=10, show_battery=False,
                      axis_limits=None, behavior=None, show_trail=True,
-                     show_labels=True,
+                     show_labels=True, time_range=None,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -224,8 +224,13 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         else compute_axis_limits(data, layers, bg_extent))
     y_range = y_max - y_min  # for label offset
 
-    start = data['Timestamp'].min()
-    end = data['Timestamp'].max()
+    # `time_range` lets a caller pass extra LEADING rows - to warm the
+    # smoothing and fill the first frame's trail - without those rows
+    # lengthening the video. Frames are generated over the requested span only;
+    # every row in `data` is still available to draw them, so frame one opens
+    # with a full trail instead of building one up.
+    start, end = (time_range if time_range
+                  else (data['Timestamp'].min(), data['Timestamp'].max()))
     total_seconds = (end - start).total_seconds()
     num_frames = int(total_seconds / frame_interval) + 1
     time_starts = [start + pd.Timedelta(seconds=i * frame_interval) for i in range(num_frames)]

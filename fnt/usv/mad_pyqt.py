@@ -2730,7 +2730,8 @@ class MADEvalDialog(QDialog):
         v = QVBoxLayout(self)
 
         blurb = QLabel(
-            "Scores the selected model against your <b>hand-labeled</b> calls, "
+            "Scores the selected model against the calls you have "
+            "<b>confirmed</b> — hand-drawn labels and accepted predictions, "
             "one call at a time — not pixel Dice. Every threshold is evaluated "
             "from a single inference pass, so the whole curve costs one run.<br>"
             "<i>Use recordings you have labeled but that the model has not been "
@@ -2746,7 +2747,7 @@ class MADEvalDialog(QDialog):
         self.combo_scope.addItem("Current file only", 'current')
         self.combo_scope.setToolTip(
             "Which recordings in the Audio list to score. Only files that carry "
-            "hand-labels are used; the rest are reported as skipped.")
+            "confirmed calls are used; the rest are reported as skipped.")
         opts.addWidget(self.combo_scope, 1)
         opts.addWidget(QLabel("Match IoU ≥"))
         self.spin_iou = QDoubleSpinBox()
@@ -2755,7 +2756,7 @@ class MADEvalDialog(QDialog):
         self.spin_iou.setValue(0.30)
         self.spin_iou.setToolTip(
             "How much a prediction's time/frequency box must overlap a "
-            "hand-labeled call to count as the same call. 0.3 is forgiving "
+            "confirmed call to count as the same call. 0.3 is forgiving "
             "about exact mask edges while still requiring the right call.")
         opts.addWidget(self.spin_iou)
         v.addLayout(opts)
@@ -2856,15 +2857,15 @@ class MADEvalDialog(QDialog):
         self.progress.setVisible(False)
         skipped = [f for f in res.files if f.get('skipped')]
         self.lbl_status.setText(
-            f"Scored {res.n_files} file(s) / {res.n_labels} hand-labeled call(s)"
-            + (f" · {len(skipped)} file(s) skipped (no hand-labels)"
+            f"Scored {res.n_files} file(s) / {res.n_labels} confirmed call(s)"
+            + (f" · {len(skipped)} file(s) skipped (no confirmed calls)"
                if skipped else ""))
         self.table.clear()
         if not res.per_threshold or res.n_labels == 0:
             self.lbl_best.setText(
-                "<span style='color:#c8a05a;'>No hand-labeled calls found in "
-                "the chosen scope — label some calls first, or switch scope."
-                "</span>")
+                "<span style='color:#c8a05a;'>No confirmed calls found in "
+                "the chosen scope — label or accept some calls first, or "
+                "switch scope.</span>")
             self.btn_apply.setEnabled(False)
             return
         best = res.best('f1') or {}
@@ -2891,13 +2892,26 @@ class MADEvalDialog(QDialog):
             if d is best:
                 self.table.setCurrentItem(item)
         self.btn_apply.setEnabled(True)
+        # An unreviewed prediction is not ground truth, so the model
+        # re-detecting one scores as a false positive even though nobody has
+        # judged it. That understates precision, and saying so is the
+        # difference between a number the user can act on and one that quietly
+        # misleads them.
+        warn = ""
+        if res.n_unreviewed:
+            warn = (
+                f"<br><span style='color:#c8a05a;'>Precision is understated: "
+                f"{res.n_unreviewed} prediction(s) on these files are still "
+                "unreviewed, so re-detecting them counts against the model. "
+                "Finish reviewing, or evaluate on fully-reviewed files, for a "
+                "number you can trust.</span>")
         self.lbl_best.setText(
             f"Best F1 <b>{best.get('f1', 0):.3f}</b> at threshold "
             f"<b>{best.get('threshold', 0):.2f}</b> "
             f"(precision {best.get('precision', 0):.3f}, recall "
             f"{best.get('recall', 0):.3f}).<br>"
             "<i>Raise the threshold when false positives cost you review time; "
-            "lower it when missed calls matter more.</i>")
+            "lower it when missed calls matter more.</i>" + warn)
 
     def _apply_threshold(self):
         item = self.table.currentItem()
@@ -4076,7 +4090,7 @@ class MADMainWindow(QMainWindow):
 
         self.btn_eval_model = QPushButton("Evaluate Model…")
         self.btn_eval_model.setToolTip(
-            "Score this model against your hand-labeled calls at call level — "
+            "Score this model against your confirmed calls at call level — "
             "precision / recall / F1 swept across probability thresholds.\n\n"
             "Training reports pixel Dice on tiles, which does not tell you how "
             "many real calls you'll catch. Run this before committing hours to "

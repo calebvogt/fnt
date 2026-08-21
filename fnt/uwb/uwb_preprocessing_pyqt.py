@@ -5,6 +5,7 @@ import os
 import re
 from collections import OrderedDict
 import sys
+import tempfile
 import time
 import sqlite3
 import struct
@@ -14,6 +15,8 @@ import pytz
 import json
 import shutil
 import xml.etree.ElementTree as ET
+
+import cv2
 import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
@@ -36,7 +39,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QSlider, QProgressDialog, QGridLayout,
                              QListWidget)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
-from PyQt5.QtGui import QFont, QTextCursor
+from PyQt5.QtGui import QFont, QTextCursor, QImage, QPixmap
 
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
@@ -110,6 +113,27 @@ def list_visible_files(directory):
 # in the config. Kept separate from the Preview Options 'Show ...' toggles,
 # which only affect the live preview.
 DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True}
+
+# ── Displacement (supplant) detection: PARKED, not removed ────────────────
+# FUTURE FEATURE. The detector runs and its thresholds are still configurable
+# in code, but nothing about it is offered in the GUI and it contributes no
+# rows to any exported file. Parked because the detections have not been
+# validated against scored video: an unvalidated behaviour that quietly lands
+# in behavior_events.csv is worse than one that is absent, because it looks
+# like a finding.
+#
+# Everything needed to bring it back is intact and covered by the tests:
+# behavior_detection.classify still computes `displacing`, extract_events still
+# recovers the directed bouts, the five threshold spinboxes are still built
+# (hidden) and still round-trip through fnt_config.json, and the plots already
+# add a displacement panel whenever displacement bouts exist. Flip this to True
+# to restore the whole feature - preview overlay, animation layer, its own
+# settings group, and the CSV rows. Grep DISPLACEMENT_ENABLED for every site.
+#
+# When it does come back, the thing to settle first is whether "arrival +
+# resident leaves" is separable from two animals happening to swap places,
+# which is what the current thresholds cannot distinguish.
+DISPLACEMENT_ENABLED = False
 
 
 def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
@@ -603,6 +627,140 @@ class PreviewChunkLoader(QThread):
             self.loaded.emit(self.chunk_index, df)
         except Exception as e:
             self.failed.emit(self.chunk_index, str(e))
+
+
+class AnimationClipDialog(QDialog):
+    """Play a short rendered clip so export settings can be judged before
+    committing to a multi-hour render.
+
+    Frames are decoded up front with OpenCV and shown in a QLabel on a timer,
+    rather than handed to QtMultimedia. The clip is a handful of megabytes, so
+    holding it in memory is cheap, and it sidesteps the two things that make
+    embedded playback unreliable on Windows: QtMultimedia is an optional
+    install, and the mp4v stream the renderer writes is not always one its
+    backend will open. Decoding it ourselves means the dialog can play exactly
+    what was written, or say plainly that it could not.
+    """
+
+    def __init__(self, video_path, fps, caption="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Animation preview")
+        self.video_path = video_path
+        self.frames = []
+        self._playing = True
+
+        cap = cv2.VideoCapture(video_path)
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, _ = rgb.shape
+                # copy(): QImage does not own the numpy buffer, and the frame
+                # it points at is rebound on the next read.
+                self.frames.append(QImage(rgb.data, w, h, 3 * w,
+                                          QImage.Format_RGB888).copy())
+        finally:
+            cap.release()
+
+        layout = QVBoxLayout()
+        if caption:
+            lbl = QLabel(caption)
+            lbl.setStyleSheet("color:#9fb3c8;")
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+
+        self.view = QLabel()
+        self.view.setAlignment(Qt.AlignCenter)
+        self.view.setMinimumSize(480, 384)
+        self.view.setStyleSheet("background:#1e1e1e;")
+        layout.addWidget(self.view, 1)
+
+        if not self.frames:
+            self.view.setText("The clip rendered but could not be decoded "
+                              "for playback.\nOpen the file directly:\n"
+                              + video_path)
+            self.view.setWordWrap(True)
+        else:
+            self.slider = QSlider(Qt.Horizontal)
+            self.slider.setRange(0, len(self.frames) - 1)
+            self.slider.valueChanged.connect(self._show_frame)
+            layout.addWidget(self.slider)
+
+            row = QHBoxLayout()
+            self.btn_play = QPushButton("Pause")
+            self.btn_play.setFixedWidth(80)
+            self.btn_play.clicked.connect(self._toggle)
+            row.addWidget(self.btn_play)
+            self.chk_loop = QCheckBox("Loop")
+            self.chk_loop.setChecked(True)
+            row.addWidget(self.chk_loop)
+            self.lbl_pos = QLabel("")
+            self.lbl_pos.setStyleSheet("color:#9fb3c8;")
+            row.addWidget(self.lbl_pos)
+            row.addStretch(1)
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(self.accept)
+            row.addWidget(btn_close)
+            layout.addLayout(row)
+
+            self.timer = QTimer(self)
+            self.timer.setInterval(max(1, int(1000.0 / max(1.0, float(fps)))))
+            self.timer.timeout.connect(self._advance)
+            self._show_frame(0)
+            self.timer.start()
+
+        self.setLayout(layout)
+        first = self.frames[0] if self.frames else None
+        if first is not None:
+            # Fit the dialog to the clip, capped to the screen.
+            w, h = first.width(), first.height()
+            try:
+                avail = QApplication.primaryScreen().availableGeometry()
+                scale = min(1.0, (avail.width() - 80) / w,
+                            (avail.height() - 200) / h)
+            except Exception:
+                scale = 1.0
+            self.resize(int(w * scale) + 20, int(h * scale) + 120)
+
+    def _show_frame(self, i):
+        if not self.frames:
+            return
+        i = max(0, min(int(i), len(self.frames) - 1))
+        pix = QPixmap.fromImage(self.frames[i])
+        self.view.setPixmap(pix.scaled(self.view.size(), Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation))
+        self.lbl_pos.setText(f"frame {i + 1} / {len(self.frames)}")
+
+    def _advance(self):
+        i = self.slider.value() + 1
+        if i >= len(self.frames):
+            if not self.chk_loop.isChecked():
+                self._toggle()
+                return
+            i = 0
+        self.slider.setValue(i)
+
+    def _toggle(self):
+        self._playing = not self._playing
+        self.btn_play.setText("Pause" if self._playing else "Play")
+        if self._playing:
+            self.timer.start()
+        else:
+            self.timer.stop()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.frames:
+            self._show_frame(self.slider.value())
+
+    def done(self, result):
+        timer = getattr(self, 'timer', None)
+        if timer is not None:
+            timer.stop()
+        self.frames = []          # a few hundred MB of decoded RGB
+        super().done(result)
 
 
 class InheritSettingsDialog(QDialog):
@@ -1431,11 +1589,24 @@ class PlotSaverWorker(QThread):
             # a single file and return True/False.
             per_tag = {'daily_paths', 'home_range', 'mcp_range', 'ethogram'}
             failed = []
+            # One frame per animal for most plots, the raw per-tag frame for
+            # the two that are about the hardware. Built once, not per plot.
+            merged_data, remap = self.merge_tag_data(data)
+            if remap:
+                self.progress.emit(
+                    "  merged " + ", ".join(
+                        f"HexID {hex(a).upper().replace('0X', '')}"
+                        f"\u2192{hex(b).upper().replace('0X', '')}"
+                        for a, b in sorted(remap.items()))
+                    + " for the per-animal plots (battery and data quality "
+                      "stay per tag)")
+
             for key, fn in plot_jobs:
                 if not self.plot_types.get(key, False):
                     continue
                 try:
-                    result = fn(data, plots_dir, db_name)
+                    result = fn(data if key in self._PER_TAG_PLOTS
+                                else merged_data, plots_dir, db_name)
                 except Exception as exc:
                     failed.append(f"{key} ({type(exc).__name__}: {exc})")
                     self.progress.emit(f"✗ {key} plot failed: {exc}")
@@ -2120,6 +2291,42 @@ class PlotSaverWorker(QThread):
         name = f"{info.get('sex', '')}{info.get('identity', '')}" or None
         return f"HexIDs {hexes}" + (f" — {name}" if name else "")
 
+    # Plots that describe an ANIMAL take the merged frame; plots that
+    # describe a TAG do not. A replaced tag is still the same animal, so its
+    # ethogram row, its speed and its tracks belong on one line - but its
+    # battery is the battery of one piece of hardware, and the coverage plot
+    # is about how well each tag reported, so those two keep the tags apart.
+    _PER_TAG_PLOTS = frozenset({'battery_levels', 'data_quality',
+                                'activity_timeline'})
+
+    def merge_tag_data(self, data):
+        """Rewrite the shortid of a replaced tag to the animal's first tag.
+
+        When one animal wore two tags, everything downstream keys off
+        `shortid` and therefore treated it as two animals: two ethogram rows,
+        two velocity panels, two entries in the trajectory legend. Collapsing
+        the ids here fixes all of them at once and keeps the label lookups
+        working, because the surviving id is a real tag of that animal.
+
+        Rows are re-sorted by (shortid, Timestamp) afterwards: the per-tag
+        diffs that several plots take - speed, cumulative distance - run down
+        the frame in order, and two tags concatenated out of order would put a
+        spurious backwards step at the join.
+        """
+        if 'shortid' not in data.columns:
+            return data, {}
+        groups = self.animal_groups(sorted(data['shortid'].unique()))
+        remap = {}
+        for _suffix, members in groups:
+            for extra in members[1:]:
+                remap[extra] = members[0]
+        if not remap:
+            return data, {}
+        merged = data.copy()
+        merged['shortid'] = merged['shortid'].map(lambda t: remap.get(t, t))
+        merged = merged.sort_values(['shortid', 'Timestamp'], kind='stable')
+        return merged.reset_index(drop=True), remap
+
     def animal_groups(self, tags):
         """[(file suffix, [shortid, ...]), ...] - one entry per ANIMAL.
 
@@ -2547,6 +2754,19 @@ class PlotSaverWorker(QThread):
             res = BD.classify(times_ns[lo:hi], X[lo:hi], Y[lo:hi], params)
             loc[start:stop] = res['locomotor'][start - lo:stop - lo]
             soc[start:stop] = res['social'][start - lo:stop - lo]
+            if not DISPLACEMENT_ENABLED:
+                # classify() still resolves displacement and it outranks
+                # contact in the social precedence, so leaving it here would
+                # paint a parked detector's output straight into the exported
+                # ethogram. Fall back to what the animal was otherwise doing:
+                # contact if it was touching someone, else no social state, so
+                # the locomotor colour shows through.
+                blk = soc[start:stop]
+                hit = (blk == BD.SOC_DISPLACING) | (blk == BD.SOC_DISPLACED)
+                if hit.any():
+                    touching = res['contact'][start - lo:stop - lo].any(axis=2)
+                    blk[hit] = np.where(touching[hit],
+                                        BD.SOC_CONTACT, BD.SOC_NONE)
             # Directed bouts. Extracted over the block INCLUDING its warm-up
             # margin, then kept only when the bout STARTS inside this
             # block's own span: a bout straddling a boundary is therefore
@@ -2655,6 +2875,12 @@ class PlotSaverWorker(QThread):
 
         rows = []
         for ev in events:
+            # Displacement is parked (see DISPLACEMENT_ENABLED). classify()
+            # still computes it and extract_events still recovers the bouts,
+            # but an unvalidated behaviour must not appear in an exported data
+            # product where it reads as a finding.
+            if not DISPLACEMENT_ENABLED and ev['behavior'] == 'displacement':
+                continue
             i, j = ev['start_frame'], ev['stop_frame']
             sa, sb = _sex(ev['actor']), _sex(ev['target'])
             rows.append({
@@ -2668,6 +2894,11 @@ class PlotSaverWorker(QThread):
                 # a single-frame bout lasts one sampling interval, not zero.
                 'duration_s': float((j - i + 1) * dt_s),
             })
+        if not rows:
+            # Every bout was filtered out - all of them displacement,
+            # which is parked. The empty frame's 'start' column is not
+            # datetimelike, so the .dt work below cannot run on it.
+            return pd.DataFrame(columns=cols)
         out = pd.DataFrame(rows, columns=cols)
         day0 = out['start'].dt.normalize()
         out['Date'] = day0.dt.date
@@ -2682,7 +2913,7 @@ class PlotSaverWorker(QThread):
         chases a lot and an animal that gets chased a lot look identical in a
         combined count.
         """
-        self.progress.emit("Generating chase / displacement timeline...")
+        self.progress.emit("Generating chase timeline...")
 
         output_path = os.path.join(output_dir, f'{db_name}_BehaviorCounts.png')
         if self.skip_existing and os.path.exists(output_path):
@@ -2694,8 +2925,8 @@ class PlotSaverWorker(QThread):
                                         tz=data['Timestamp'].dt.tz)
         if ev.empty:
             self.progress.emit(
-                "No chases or displacements detected — skipping behaviour "
-                "counts. Check the thresholds against the speed summary.")
+                "No chases detected — skipping behaviour counts. "
+                "Check the thresholds against the speed summary.")
             return False
 
         behaviours = [b for b in ('chase', 'displacement')
@@ -2745,7 +2976,7 @@ class PlotSaverWorker(QThread):
         i chased (or displaced) j. Deliberately NOT symmetric: the asymmetry
         between (i, j) and (j, i) is the dominance signal.
         """
-        self.progress.emit("Generating chase / displacement matrices...")
+        self.progress.emit("Generating chase matrices...")
 
         output_path = os.path.join(output_dir, f'{db_name}_BehaviorMatrix.png')
         if self.skip_existing and os.path.exists(output_path):
@@ -2757,8 +2988,8 @@ class PlotSaverWorker(QThread):
                                         tz=data['Timestamp'].dt.tz)
         if ev.empty:
             self.progress.emit(
-                "No chases or displacements detected — skipping behaviour "
-                "matrix. Check the thresholds against the speed summary.")
+                "No chases detected — skipping behaviour matrix. "
+                "Check the thresholds against the speed summary.")
             return False
 
         behaviours = [b for b in ('chase', 'displacement')
@@ -2845,6 +3076,11 @@ class PlotSaverWorker(QThread):
                  ('displaced', None, BD.SOC_DISPLACED, BD.SOCIAL_COLORS[BD.SOC_DISPLACED]),
                  ('chasing', None, BD.SOC_CHASING, BD.SOCIAL_COLORS[BD.SOC_CHASING]),
                  ('chased', None, BD.SOC_CHASED, BD.SOCIAL_COLORS[BD.SOC_CHASED])]
+        if not DISPLACEMENT_ENABLED:
+            # A key entry for a state that can no longer occur is a claim the
+            # figure cannot back up.
+            order = [row for row in order
+                     if row[2] not in (BD.SOC_DISPLACING, BD.SOC_DISPLACED)]
         disp = np.zeros(loc.shape, dtype=np.int8)
         for k, (_lab, lcode, scode, _c) in enumerate(order):
             if scode is None:
@@ -2987,6 +3223,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_log_pos = 0
         self._batch_plan = []           # [(job_index, 'data'|'animation')] — data pass first
         self._batch_plan_pos = 0
+        # One launch per plan position: see _batch_step.
+        self._batch_step_running = False
         self._batch_phase = 'data'
         self._batch_reuse_smoothed = False
 
@@ -3297,14 +3535,18 @@ class UWBQuickVisualizationWindow(QWidget):
                 color: #cccccc;
                 background-color: transparent;
             }
+            /* Trimmed from 8px/16px padding and a 100px floor, which made
+               every button a 33px slab - heavy against the spinboxes and
+               checkboxes it sits between, and the floor kept even one-word
+               buttons full width. */
             QPushButton {
                 background-color: #0078d4;
                 color: white;
                 border: none;
-                padding: 8px 16px;
+                padding: 5px 12px;
                 border-radius: 4px;
                 font-weight: bold;
-                min-width: 100px;
+                min-width: 84px;
             }
             QPushButton:hover {
                 background-color: #106ebe;
@@ -3861,8 +4103,8 @@ class UWBQuickVisualizationWindow(QWidget):
             "FILE: {db}_behavior_events.csv\n"
             "\n"
             "One row per DIRECTED behaviour bout - who did it, to whom, when, "
-            "and for how long. Columns: behavior (chase | displacement), actor, "
-            "target, actor_sex, target_sex, dyad_type, Day, Date, start, stop, "
+            "and for how long. Columns: behavior (chase), actor, target, "
+            "actor_sex, target_sex, dyad_type, Day, Date, start, stop, "
             "duration_s.\n"
             "\n"
             "This is the only place the direction is recorded. The ethogram "
@@ -3874,13 +4116,11 @@ class UWBQuickVisualizationWindow(QWidget):
             "grid and classified in blocks with an overlap margin, exactly as "
             "the ethogram is. A bout is attributed to the block its onset falls "
             "in, so one straddling a block boundary is counted exactly once. "
-            "actor is the chaser or the displacer; target is the chased or the "
-            "animal pushed off.\n"
+            "actor is the chaser; target is the animal chased.\n"
             "\n"
-            "Chase bouts already carry the minimum-duration filter from the "
-            "Behaviour Detection settings. Displacement bouts run from arrival "
-            "to resolution. Both inherit every threshold from those preview "
-            "controls, so tune them against the live overlay first.\n"
+            "Chase bouts carry the minimum-duration filter from the Behaviour "
+            "Detection settings, and inherit every threshold from those "
+            "preview controls, so tune them against the live overlay first.\n"
             "\n"
             "Contact is NOT included here - it is undirected and already "
             "exported, in full, as the proximity bouts file.")
@@ -4042,9 +4282,9 @@ class UWBQuickVisualizationWindow(QWidget):
             "one fall back to a categorical palette. Computed from the "
             "filtered + smoothed coordinates.\n"),
             ("behavior_counts", "Behaviour Counts by Day",
-             "How often each animal chased or displaced, and how often it was on the receiving end, per day.\n\nFILE: {db}_BehaviorCounts.png\n\nFour panels: chase and displacement, each split into AS ACTOR (this animal did it) and AS TARGET (it was done to this animal). One line per animal, x = day, y = number of bouts that day. The split is the point - an animal that chases constantly and one that is constantly chased have the same combined total and opposite meanings.\n\nA bout is counted on the day it STARTED. Chases already carry the minimum-duration filter from the detection settings; displacements run from arrival to resolution.\n\nThresholds are inherited from the preview's Behaviour Detection controls. If a behaviour is not being detected at all, the plot is skipped with a message - check the speed summary under those controls, since a chase speed above nearly all observed movement can never fire.\n\nSkipped entirely if no chases or displacements are detected."),
+             "How often each animal chased, and how often it was on the receiving end, per day.\n\nFILE: {db}_BehaviorCounts.png\n\nTwo panels: AS ACTOR (this animal did the chasing) and AS TARGET (it was the one chased). One line per animal, x = day, y = number of bouts that day. The split is the point - an animal that chases constantly and one that is constantly chased have the same combined total and opposite meanings.\n\nA bout is counted on the day it STARTED, and carries the minimum-duration filter from the detection settings.\n\nThresholds are inherited from the preview's Behaviour Detection controls. If nothing is detected at all, the plot is skipped with a message - check the speed summary under those controls, since a chase speed above nearly all observed movement can never fire.\n\nSkipped entirely if no chases are detected."),
             ("behavior_matrix", "Behaviour Matrix (who \u2192 whom)",
-             "Who does it to whom: a directed actor x target matrix.\n\nFILE: {db}_BehaviorMatrix.png\n\nOne panel per behaviour (chase, displacement). ROWS are the actor, COLUMNS the target, so cell (i, j) is the number of times i chased or displaced j. Each cell is labelled with the event count and the total seconds those bouts lasted, because many brief chases and one long chase are different findings.\n\nThe matrix is deliberately NOT symmetric, and that is what it is for: the difference between cell (i, j) and cell (j, i) is the dominance signal for that pair. A symmetric contact matrix - which is what the proximity bouts and the GBI give you - cannot show it. The diagonal is greyed out; there are no self-directed bouts.\n\nThresholds are inherited from the preview's Behaviour Detection controls. Skipped if no chases or displacements are detected."),
+             "Who does it to whom: a directed actor x target matrix.\n\nFILE: {db}_BehaviorMatrix.png\n\nROWS are the actor, COLUMNS the target, so cell (i, j) is the number of times i chased j. Each cell is labelled with the event count and the total seconds those bouts lasted, because many brief chases and one long chase are different findings.\n\nThe matrix is deliberately NOT symmetric, and that is what it is for: the difference between cell (i, j) and cell (j, i) is the dominance signal for that pair. A symmetric contact matrix - which is what the proximity bouts and the GBI give you - cannot show it. The diagonal is greyed out; there are no self-directed bouts.\n\nThresholds are inherited from the preview's Behaviour Detection controls. Skipped if no chases are detected."),
             ("ethogram", "Behaviour Ethogram",
             "The behaviour states from the preview, classified across the "
             "ENTIRE recording and written out - the detections otherwise "
@@ -4053,10 +4293,10 @@ class UWBQuickVisualizationWindow(QWidget):
             "\n"
             "THRESHOLDS ARE INHERITED FROM THE PREVIEW. Social radius, "
             "inactive/moving speed split, chase "
-            "distance/speed/angle/duration, heading lag and every "
-            "displacement parameter are taken from the Behaviour Detection "
-            "controls exactly as set there. Tune them in the preview until "
-            "the overlay looks right, then export.\n"
+            "distance/speed/angle/duration and heading lag are taken from "
+            "the Behaviour Detection controls exactly as set there. Tune "
+            "them in the preview until the overlay looks right, then "
+            "export.\n"
             "\n"
             "HOW IT IS COMPUTED. Fixes are binned onto a regular 1 Hz grid, "
             "one column per animal, and each animal's last known position "
@@ -4066,7 +4306,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "between real fixes using true elapsed time, never between grid "
             "slots. Classification runs in ~2 h blocks with an overlap "
             "margin wide enough to warm the lagged terms (heading lag, "
-            "displacement window, staleness limit); the margin is trimmed "
+            "staleness limit); the margin is trimmed "
             "off, so block boundaries do not appear in the output. Blocking "
             "is what keeps the pairwise (frames x animals x animals) "
             "geometry from exhausting memory on a multi-day trial.\n"
@@ -4074,15 +4314,14 @@ class UWBQuickVisualizationWindow(QWidget):
             "STATES. Locomotor: inactive (speed at or below the still "
             "threshold), moving (above it), no data. Social: contact "
             "(social circles overlapping, i.e. centres within 2x the social "
-            "radius), chasing/chased, displacing/displaced. An animal "
-            "carries at most one social state per frame; where several "
-            "qualify, the higher-precedence one wins (being displaced "
-            "outranks merely touching).\n"
+            "radius), chasing/chased. An animal carries at most one social "
+            "state per frame; where several qualify, the higher-precedence "
+            "one wins (being chased outranks merely touching).\n"
             "\n"
             "RASTER. One row per animal, time along x. Each pixel covers "
             "several seconds (printed in the title); within a pixel a "
             "SOCIAL state takes precedence over the locomotor background, "
-            "so brief chases and displacements stay visible rather than "
+            "so brief chases stay visible rather than "
             "being averaged away. This means the raster over-represents "
             "rare social events by design - read the time budget for true "
             "proportions.\n"
@@ -4172,7 +4411,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_anim_tags.setStyleSheet("color:#aaaaaa; font-style:italic;")
         inctag_layout.addWidget(self.lbl_anim_tags, 1)
         self.btn_anim_tags = QPushButton("Select…")
-        self.btn_anim_tags.setFixedWidth(80)
+        # This label needs more room than the pane's shared floor allows, and
+        # has been rendering as "Selec\u2026". A stylesheet min-width outranks
+        # both setMinimumWidth and the size policy, so the only thing that
+        # moves it is another stylesheet rule.
+        self.btn_anim_tags.setStyleSheet("QPushButton { min-width: 120px; }")
         self.btn_anim_tags.setToolTip("Choose a subset of tags to include in the animation")
         self.btn_anim_tags.clicked.connect(self.select_animation_tags)
         inctag_layout.addWidget(self.btn_anim_tags)
@@ -4257,10 +4500,14 @@ class UWBQuickVisualizationWindow(QWidget):
             'chk_anim_beh_chase', "Chasing",
             "Join chaser to chased while a chase is firing, and name it in "
             "both animals' state text.", indent=18)
+        # Parked with the rest of the displacement feature; built so the
+        # layer dict and the saved config keep their shape.
         _anim_show_box(
             'chk_anim_beh_displace', "Displacement (supplant)",
             "Join winner to loser while a displacement is firing, and name it "
             "in both animals' state text.", indent=18)
+        self.chk_anim_beh_displace.setChecked(DISPLACEMENT_ENABLED)
+        self.chk_anim_beh_displace.setVisible(DISPLACEMENT_ENABLED)
 
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
@@ -4305,6 +4552,46 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.combo_animation_speed.currentTextChanged.connect(self.update_frame_estimate)
         self.combo_animation_fps.currentTextChanged.connect(self.update_frame_estimate)
+
+        # A few seconds of the real thing, before committing to hours of it.
+        # Sits directly under speed / FPS / quality and the frame estimate,
+        # because those are what it is standing in for - the clip is rendered
+        # with whatever they are set to.
+        clip_row = QHBoxLayout()
+        self.btn_preview_clip = QPushButton("Preview")
+        # The pane-wide QPushButton rule carries padding: 8px 16px and
+        # min-width: 100px, which is why every button here is the same 132 px
+        # slab. Override both so this one sizes to its own text - it is a small
+        # aside next to the settings it previews, not another primary action.
+        self.btn_preview_clip.setStyleSheet(
+            "QPushButton { padding: 3px 10px; min-width: 0px; "
+            "font-weight: normal; }")
+        # The font goes on the widget, not in the stylesheet: sizeHint is
+        # computed from the widget's QFont, so a stylesheet-only font-size
+        # shrinks the drawn text while the button keeps its old width.
+        _clip_font = self.btn_preview_clip.font()
+        _clip_font.setPointSize(8)
+        _clip_font.setBold(False)
+        self.btn_preview_clip.setFont(_clip_font)
+        self.btn_preview_clip.setToolTip(
+            "Render a short clip at the speed, frame rate and quality set "
+            "above, and play it in a window.\n\n"
+            "The clip starts at the preview playhead, so scrub to a moment "
+            "worth looking at first. It is rendered through the same code as "
+            "the full export, from the same rows the preview is drawing, so "
+            "trail length, marker size, colouring, context layers and "
+            "behaviour overlays all appear exactly as they will in the "
+            "finished video.\n\n"
+            "Length is fixed in SECONDS OF VIDEO, so it costs the same "
+            "whatever the speed multiplier - at a higher speed it simply "
+            "covers more of the recording.")
+        self.btn_preview_clip.clicked.connect(self.preview_animation_clip)
+        clip_row.addWidget(self.btn_preview_clip)
+        lbl_clip = QLabel(f"{self.ANIM_CLIP_SECONDS}s from the playhead")
+        lbl_clip.setStyleSheet("color: #888; font-size: 9pt; font-style: italic;")
+        clip_row.addWidget(lbl_clip)
+        clip_row.addStretch(1)
+        animation_options_layout.addLayout(clip_row)
 
         # Full first, then the per-day breakdown beneath it: the whole-recording
         # video is the default output, and the daily option (with its day list)
@@ -4447,7 +4734,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_run_batch.clicked.connect(self.run_batch)
         self.btn_run_batch.setEnabled(False)
         self.btn_run_batch.setStyleSheet(
-            "QPushButton { padding: 8px; font-size: 11px; font-weight: bold; "
+            "QPushButton { padding: 5px 10px; font-size: 11px; font-weight: bold; "
             "background-color: #2ea043; color: white; }")
         batch_btns_row2.addWidget(self.btn_run_batch)
         self.btn_stop_batch = QPushButton("Stop Batch")
@@ -4455,7 +4742,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_stop_batch.clicked.connect(self.stop_batch)
         self.btn_stop_batch.setVisible(False)
         self.btn_stop_batch.setStyleSheet(
-            "QPushButton { padding: 8px; font-size: 11px; font-weight: bold; "
+            "QPushButton { padding: 5px 10px; font-size: 11px; font-weight: bold; "
             "background-color: #d41100; color: white; }")
         batch_btns_row2.addWidget(self.btn_stop_batch)
         batch_layout.addLayout(batch_btns_row2)
@@ -4547,7 +4834,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.btn_copy_logs = QPushButton("Copy Session Logs to Clipboard")
         self.btn_copy_logs.setToolTip("Copy the full session log above to the clipboard for pasting into a bug report or notes")
-        self.btn_copy_logs.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
+        self.btn_copy_logs.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         self.btn_copy_logs.clicked.connect(self.copy_session_logs)
         layout.addWidget(self.btn_copy_logs)
 
@@ -4675,13 +4962,13 @@ class UWBQuickVisualizationWindow(QWidget):
             "Load a floorplan or arena image to overlay under trajectory plots. "
             "Requires an XML config in the database folder for spatial scaling."
         )
-        self.btn_load_background.setStyleSheet("QPushButton { padding: 8px; font-size: 11px; }")
+        self.btn_load_background.setStyleSheet("QPushButton { padding: 5px 10px; font-size: 11px; }")
         bg_buttons_layout.addWidget(self.btn_load_background)
         self.btn_remove_background = QPushButton("Remove Background")
         self.btn_remove_background.clicked.connect(self.remove_background)
         self.btn_remove_background.setEnabled(False)
         self.btn_remove_background.setToolTip("Clear the loaded background image from all visualizations")
-        self.btn_remove_background.setStyleSheet("QPushButton { padding: 8px; font-size: 11px; }")
+        self.btn_remove_background.setStyleSheet("QPushButton { padding: 5px 10px; font-size: 11px; }")
         bg_buttons_layout.addWidget(self.btn_remove_background)
         v.addLayout(bg_buttons_layout)
 
@@ -5206,9 +5493,8 @@ class UWBQuickVisualizationWindow(QWidget):
             "target, and the target's heading must point away.\n"
             "\n"
             "Nothing else reads it. Speed is measured between consecutive "
-            "real fixes and ignores this setting; displacement detection "
-            "uses no heading at all (which is why it survives smoothing "
-            "that defeats chase detection); contact is pure distance.\n"
+            "real fixes and ignores this setting; contact is pure "
+            "distance.\n"
             "\n"
             "WHY IT IS ADJUSTABLE\n"
             "Over a short window an animal barely moves, so the measured "
@@ -5239,15 +5525,21 @@ class UWBQuickVisualizationWindow(QWidget):
             "interval, so it means the same thing at any preview rate.\n")
         gl.addLayout(row)
 
-        # Displacement
+        # Displacement — PARKED as a future feature; see DISPLACEMENT_ENABLED
+        # at the top of this module for why and for how to switch it back on.
+        # The widgets are still built so the thresholds keep round-tripping
+        # through fnt_config.json and nothing downstream has to special-case a
+        # missing attribute; they are simply never shown, and start unchecked
+        # so the detector contributes nothing anyone can see.
         self.chk_beh_displace = QCheckBox("Displacement (supplant)")
-        self.chk_beh_displace.setChecked(True)
+        self.chk_beh_displace.setChecked(DISPLACEMENT_ENABLED)
         self.chk_beh_displace.setToolTip(
             "One animal moves in on a settled neighbour and the neighbour is "
             "the one that leaves. Needs no sprint from either animal, so it "
             "survives heavy smoothing where chase detection does not.")
         self.chk_beh_displace.stateChanged.connect(self.render_preview_frame)
         self.chk_beh_displace.stateChanged.connect(self._sync_anim_show_options)
+        self.chk_beh_displace.setVisible(DISPLACEMENT_ENABLED)
         bl.addWidget(self.chk_beh_displace)
         gl = _beh_group(self.chk_beh_displace)
         row, self.spin_displace_distance = _beh_spin(
@@ -5287,6 +5579,17 @@ class UWBQuickVisualizationWindow(QWidget):
         # Now that every holder has a parent, apply the initial states.
         for _cb, _holder in self._beh_groups:
             _holder.setVisible(_cb.isChecked())
+        if not DISPLACEMENT_ENABLED:
+            # A parked detector's thresholds are not a setting anyone can act
+            # on. Unbind the toggle first, or re-checking the (hidden) box
+            # from a saved config would put the group back on screen.
+            try:
+                self.chk_beh_displace.toggled.disconnect()
+            except TypeError:
+                pass
+            for _cb, _holder in self._beh_groups:
+                if _cb is self.chk_beh_displace:
+                    _holder.setVisible(False)
         self.behavior_options_widget.setVisible(False)
         v.addWidget(self.behavior_options_widget)
 
@@ -6165,6 +6468,20 @@ class UWBQuickVisualizationWindow(QWidget):
         from it (not from the data), so the lead-in overlap the loader prepends
         stays outside the scrubbable/containment range.
         """
+        merged = self._processed_slice(df)
+        if merged is None:
+            return None
+        return self._build_preview_frames(merged, self.selected_preview_tags(), idx)
+
+    def _processed_slice(self, df):
+        """One raw time slice, trimmed/thresholded/smoothed, in long form.
+
+        The tail end of the preview pipeline, split out because the animation
+        clip preview needs the same rows the preview is drawing - same tag
+        windows, same thresholds, same smoothing - and reimplementing that
+        would let the clip drift away from what the user is looking at.
+        Returns None when nothing survives.
+        """
         tz = pytz.timezone(self.combo_timezone.currentText())
         smoothing_method = self.get_preview_smoothing_method()
         # Preview thresholding toggles are independent of the export ones, so the
@@ -6172,7 +6489,6 @@ class UWBQuickVisualizationWindow(QWidget):
         use_vel = self.chk_preview_velocity.isChecked()
         use_jump = self.chk_preview_jump.isChecked()
         do_filter = use_vel or use_jump
-        tags = self.selected_preview_tags()
 
         chunks = []
         for tag, g in df.groupby('shortid', sort=False):
@@ -6208,9 +6524,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 chunks.append(g)
         if not chunks:
             return None
-
-        merged = pd.concat(chunks, ignore_index=True)
-        return self._build_preview_frames(merged, tags, idx)
+        return pd.concat(chunks, ignore_index=True)
 
     def _build_preview_frames(self, df, selected_tags, idx=None):
         """Bin a slice onto a fixed time grid: one column per selected tag.
@@ -7624,6 +7938,21 @@ class UWBQuickVisualizationWindow(QWidget):
         if (getattr(self, '_batch_active', False)
                 or getattr(self, '_saved_dialogs', None) is not None):
             return
+        # Wait until the tag list on screen is THIS trial's. The scan runs
+        # off-thread and is usually still going when this is first posted - on
+        # a multi-GB database over a share, for a long while. Answering the
+        # prompt before it lands means answering it against the previous
+        # trial's widgets, which is how an inherited trial ended up with only
+        # the tags the two cohorts had in common. Re-post rather than block, so
+        # the window stays live while the scan runs.
+        if getattr(self, '_tags_loaded_for', None) != (self.db_path,
+                                                       self.table_name):
+            waited = getattr(self, '_inherit_offer_waits', 0) + 1
+            self._inherit_offer_waits = waited
+            if waited * 0.15 < 120:        # give a slow share two minutes
+                QTimer.singleShot(150, self._offer_inherit_settings)
+            return
+        self._inherit_offer_waits = 0
         items = [it for it in getattr(self, '_batch_items', [])
                  if (it.get('config') or {}) and it.get('path') != self.db_path]
         if not items:
@@ -7657,20 +7986,20 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         if not isinstance(source_config, dict) or not source_config:
             return
-        current = self.get_config_dict()
-        merged = dict(source_config)
-        for key in self._TRIAL_SPECIFIC_CONFIG_KEYS:
-            if key in current:
-                merged[key] = current[key]
-            else:
-                merged.pop(key, None)
-        merged['preview'] = dict(source_config.get('preview') or {})
-        for key in self._TRIAL_SPECIFIC_PREVIEW_KEYS:
-            cur_preview = current.get('preview') or {}
-            if key in cur_preview:
-                merged['preview'][key] = cur_preview[key]
-            else:
-                merged['preview'].pop(key, None)
+        # The trial-specific keys are DROPPED, not overwritten with this
+        # window's current values. Substituting a snapshot looked equivalent
+        # and was not: the config loader skips any key that is absent, so
+        # dropping leaves the loaded trial's own tags, identities and arena
+        # exactly as its own load left them - whereas a snapshot pins whatever
+        # the widgets happened to hold at the moment the prompt was answered,
+        # and then FORCES it. When the prompt was answered before this trial's
+        # tag scan landed, that snapshot was the PREVIOUS trial's tag list, and
+        # forcing it left only the tags the two cohorts had in common.
+        merged = {k: v for k, v in source_config.items()
+                  if k not in self._TRIAL_SPECIFIC_CONFIG_KEYS}
+        merged['preview'] = {
+            k: v for k, v in (source_config.get('preview') or {}).items()
+            if k not in self._TRIAL_SPECIFIC_PREVIEW_KEYS}
         # The day list belongs to this recording's dates, not the source's.
         merged.pop('daily_animation_days', None)
 
@@ -7688,6 +8017,9 @@ class UWBQuickVisualizationWindow(QWidget):
         batch = getattr(self, '_batch_active', False)
         # Holds ~70 MB of classification arrays for the trial being left.
         PlotSaverWorker._BEH_CACHE = None
+        # The tag list on screen still belongs to the outgoing trial until the
+        # scan for this one lands.
+        self._tags_loaded_for = None
         try:
             conn = connect_ro(file_path)
             cursor = conn.cursor()
@@ -9010,11 +9342,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.tag_buttons_layout = QHBoxLayout()
         btn_select_all = QPushButton("Select All")
         btn_select_all.setToolTip("Check all tags for export")
-        btn_select_all.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
+        btn_select_all.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         btn_select_all.clicked.connect(self.select_all_tags)
         btn_select_none = QPushButton("Select None")
         btn_select_none.setToolTip("Uncheck all tags")
-        btn_select_none.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
+        btn_select_none.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         btn_select_none.clicked.connect(self.select_none_tags)
         self.tag_buttons_layout.addWidget(btn_select_all)
         self.tag_buttons_layout.addWidget(btn_select_none)
@@ -9028,9 +9360,15 @@ class UWBQuickVisualizationWindow(QWidget):
             "Assign sex (M/F), custom IDs, and active time windows to each tag. "
             "Time pickers default to the tag's first/last timestamp in your selected timezone."
         )
-        self.btn_assign_identities.setStyleSheet("QPushButton { padding: 6px; font-size: 10px; }")
+        self.btn_assign_identities.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         self.tag_layout.addWidget(self.btn_assign_identities)
         
+        # Whose tags these are. Anything that must not act on the previous
+        # trial's widgets can compare this against (db_path, table_name);
+        # "no background worker running" is NOT the same test, because the
+        # scan for a newly loaded database has not necessarily been posted yet.
+        self._tags_loaded_for = (self.db_path, self.table_name)
+
         # Apply pending tag selection from loaded config
         self.apply_pending_tag_selection()
 
@@ -9533,7 +9871,14 @@ class UWBQuickVisualizationWindow(QWidget):
                     w.setChecked(bool(val))
             except Exception:
                 continue
-    
+        if not DISPLACEMENT_ENABLED:
+            # Trials configured before displacement was parked have
+            # beh_displace: true saved. Honouring it would put a hidden
+            # detector's output back into the overlay and the events CSV
+            # with no visible control to turn it off. The saved thresholds
+            # are still restored above, so nothing is lost by re-enabling.
+            self.chk_beh_displace.setChecked(False)
+
     def save_config(self, output_dir):
         """Save current configuration to JSON file"""
         config = self.get_config_dict()
@@ -10087,6 +10432,12 @@ class UWBQuickVisualizationWindow(QWidget):
             use_identities=bool(self.tag_identities),
             behavior_params=self._behavior_params())
         worker.progress.connect(self.log_message)
+        # One animal, one entity - the same merge the ethogram uses. Without
+        # it an animal that wore two tags is classified as two, and the CSV
+        # and the raster disagree about what fired.
+        df, _remap = worker.merge_tag_data(df)
+        tags = sorted(t for t in df['shortid'].unique()
+                      if not selected_tags or t in selected_tags)
         return worker.behavior_events_frame(df, tags, tz=df['Timestamp'].dt.tz)
 
     # Which animation "Show" option each preview toggle governs. The export
@@ -10179,6 +10530,11 @@ class UWBQuickVisualizationWindow(QWidget):
             use_identities=bool(self.tag_identities),
             behavior_params=self._behavior_params())
         worker.progress.connect(self.log_message)
+        # Same merge as the plots: a replaced tag is not a second animal to
+        # draw a circle around or to link to.
+        data, remap = worker.merge_tag_data(data)
+        if remap:
+            tags = [t for t in tags if t not in remap]
         grid, loc, soc, _events, links = worker._behavior_classification(
             data, tags, hz=hz, collect_links=True)
         if grid is None:
@@ -10266,6 +10622,167 @@ class UWBQuickVisualizationWindow(QWidget):
                 df.to_csv(path, index=False)
                 self.log_message(f"✓ Exported {fname} ({len(df)} rows)")
 
+
+    # Seconds of VIDEO in a preview clip. Deliberately a video duration and
+    # not a data duration: it is what the user is about to sit and watch, and
+    # it keeps the render cost fixed (fps x seconds frames) whatever the speed
+    # multiplier is set to.
+    ANIM_CLIP_SECONDS = 10
+
+    def _animation_speed_multiplier(self):
+        try:
+            return int(self.combo_animation_speed.currentText().replace("x", ""))
+        except (ValueError, AttributeError):
+            return 60
+
+    def animation_clip_span_ms(self):
+        """(start_ms, end_ms) of tracking time one preview clip needs.
+
+        Starts at the playhead, so the clip shows the moment being looked at
+        rather than the top of the trial - which for most trials is the release
+        and says nothing about the settings. Falls back to the start of the
+        timeline, and pulls the window back inside the end if the playhead is
+        parked near it.
+        """
+        if self.preview_t0 is None or self.preview_t1 is None:
+            return None
+        span_ms = int(self.ANIM_CLIP_SECONDS
+                      * self._animation_speed_multiplier() * 1000)
+        span_ms = max(1000, min(span_ms, int(self.preview_t1 - self.preview_t0)))
+        start = int(getattr(self, "preview_playhead_ms", 0) or self.preview_t0)
+        start = max(int(self.preview_t0), min(start, int(self.preview_t1) - span_ms))
+        return start, start + span_ms
+
+    def preview_animation_clip(self):
+        """Render a few seconds of the animation and play it in a window.
+
+        Goes through the SAME adapter the export uses, over the same rows the
+        preview is drawing, so what plays here is what the full video will look
+        like - trail length, marker size, colouring, context layers and
+        behaviour overlays included. The only thing that differs is how much of
+        the recording it covers.
+        """
+        if self.exporting:
+            QMessageBox.information(
+                self, "Export running",
+                "An export is already running. Wait for it to finish before "
+                "rendering a preview clip.")
+            return
+        if not self.db_path or not self.table_name:
+            QMessageBox.information(self, "No database", "Load a database first.")
+            return
+        tags = self.selected_preview_tags()
+        span = self.animation_clip_span_ms()
+        if not tags or span is None:
+            QMessageBox.information(
+                self, "Nothing to render",
+                "Select at least one tag and let the preview timeline load "
+                "first.")
+            return
+
+        start_ms, end_ms = span
+        fps = int(self.combo_animation_fps.currentText())
+        speed_text = self.combo_animation_speed.currentText()
+        frame_interval = uwb_animation.frame_interval_seconds(
+            self._animation_speed_multiplier(), fps)
+        tz = pytz.timezone(self.combo_timezone.currentText())
+        stamp = pd.to_datetime(start_ms, unit="ms", utc=True).tz_convert(tz)
+
+        self.log_message(
+            f"Rendering a {self.ANIM_CLIP_SECONDS}s preview clip from "
+            f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} at {speed_text}...")
+        prev_cursor = self.cursor()
+        self.setCursor(Qt.WaitCursor)
+        # The adapter reads the frozen snapshot; take one now so the clip uses
+        # exactly what is on screen, and put back whatever was there after.
+        prev_snapshot = getattr(self, "_anim_settings", None)
+        prev_cancelled = self.export_cancelled
+        self._anim_settings = self._snapshot_anim_settings()
+        self.export_cancelled = False
+        tmp_dir = tempfile.mkdtemp(prefix="fnt_clip_")
+        try:
+            # Read a lead-in before the clip, exactly as the preview loader
+            # does: without it the smoothing starts cold and the first frame
+            # opens with no trail, neither of which is what the full video
+            # will show at that moment. The lead-in rows are dropped from the
+            # rendered span by `time_range` below.
+            lead_ms = int(self._anim_settings['trailing_window'] * 1000)
+            load_from = max(int(self.preview_t0), start_ms - lead_ms)
+            conn = connect_ro(self.current_indexed_db() or self.db_path)
+            try:
+                cols = processing_select_clause(conn, self.table_name)
+                placeholders = ",".join(["?"] * len(tags))
+                raw = pd.read_sql_query(
+                    f"SELECT {cols} FROM {self.table_name} "
+                    f"WHERE shortid IN ({placeholders}) "
+                    f"AND timestamp BETWEEN ? AND ? ORDER BY shortid, timestamp",
+                    conn, params=list(tags) + [load_from, end_ms])
+            finally:
+                conn.close()
+
+            data = self._processed_slice(raw) if len(raw) else None
+            if data is None or data.empty:
+                QMessageBox.information(
+                    self, "No data in that window",
+                    "No fixes survived filtering in the clip's time window. "
+                    "Move the playhead somewhere with data, or loosen the "
+                    "thresholds.")
+                return
+            anim_tags = self._anim_settings.get("animation_tags")
+            if anim_tags:
+                data = data[data["shortid"].isin(anim_tags)]
+                if data.empty:
+                    QMessageBox.information(
+                        self, "No data in that window",
+                        "None of the tags chosen for the animation have data "
+                        "in this window.")
+                    return
+            data = uwb_animation.prepare_animation_data(data, self.tag_identities)
+
+            # Same framing rule as the export, so the clip is not drawn in a
+            # tighter box than the real video will be.
+            _, bg_extent = self._context_bg_source()
+            axis_limits = self.xy_range() or uwb_animation.compute_axis_limits(
+                data[data['Timestamp'] >= stamp], self.plot_layers, bg_extent)
+
+            path = self.create_animation_frames(
+                data, tmp_dir, frame_interval,
+                self._anim_settings["trailing_window"], fps,
+                self._anim_settings["color_by"],
+                use_custom_identities=bool(self.tag_identities),
+                day_suffix="_clip", speed_text=speed_text,
+                axis_limits=axis_limits,
+                time_range=(stamp, pd.to_datetime(end_ms, unit="ms", utc=True)
+                            .tz_convert(tz)))
+            if not path or not os.path.exists(path):
+                QMessageBox.warning(
+                    self, "Clip failed",
+                    "The preview clip could not be rendered. See the message "
+                    "log for details.")
+                return
+
+            mins = (end_ms - start_ms) / 60000.0
+            dlg = AnimationClipDialog(
+                path, fps,
+                caption=(f"{self.ANIM_CLIP_SECONDS}s at {speed_text} \u2014 "
+                         f"{mins:.1f} min of tracking from "
+                         f"{stamp.strftime('%Y-%m-%d %H:%M:%S')}, rendered "
+                         f"with the current export settings."),
+                parent=self)
+            self.log_message("Preview clip ready.")
+            dlg.exec_()
+        except Exception as e:
+            self.log_message(f"\u2717 Preview clip failed: {e}")
+            QMessageBox.warning(self, "Clip failed", str(e))
+        finally:
+            self.setCursor(prev_cursor)
+            self.export_cancelled = prev_cancelled
+            self._anim_settings = prev_snapshot
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if hasattr(self, "progress_bar"):
+                self.progress_bar.setValue(0)
+            if hasattr(self, "lbl_export_progress"):
+                self.lbl_export_progress.setText("")
 
     def _prompt_animation_temp_dir(self, animations_dir):
         """Ask up-front where to write the tracking animation's temp frames.
@@ -10372,7 +10889,6 @@ class UWBQuickVisualizationWindow(QWidget):
         Used to build the full tracking animation from already-rendered daily
         videos when every day was selected — no re-render needed.
         """
-        import cv2
         writer = None
         try:
             for p in paths:
@@ -10590,7 +11106,7 @@ class UWBQuickVisualizationWindow(QWidget):
     def create_animation_frames(self, data, output_dir, frame_interval, trailing_window,
                                fps, color_by, use_custom_identities=False,
                                total_export_steps=1, current_export_step=1, day_suffix="",
-                               speed_text="", axis_limits=None):
+                               speed_text="", axis_limits=None, time_range=None):
         """Render one animation video via the shared ``uwb_animation`` core.
 
         This is a thin adapter: it gathers the GUI-held settings (quality/DPI,
@@ -10653,6 +11169,7 @@ class UWBQuickVisualizationWindow(QWidget):
             behavior=behavior,
             show_trail=layers_on.get('trail', True),
             show_labels=layers_on.get('tag_id', True),
+            time_range=time_range,
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
@@ -10844,6 +11361,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     or (it.get('config') or {}).get('social_animation')]
         self._batch_plan += [(i, 'animation') for i in anim_idx]
         self._batch_plan_pos = 0
+        self._batch_step_running = False
 
         self._batch_active = True
         self._batch_stop_requested = False
@@ -10961,6 +11479,16 @@ class UWBQuickVisualizationWindow(QWidget):
             self._finish_batch()
             return
 
+        # The plan position only advances when a job FINISHES, so a second
+        # entry here before then would launch a second worker process for the
+        # same trial - two processes writing one trial's CSVs and video at the
+        # same time. This is posted from several places (run_batch, each skip
+        # branch, the poll loop), and a duplicate post is easy to introduce, so
+        # guard the launch rather than trusting every caller.
+        if getattr(self, '_batch_step_running', False):
+            return
+        self._batch_step_running = True
+
         job_idx, phase = self._batch_plan[self._batch_plan_pos]
         self._batch_index = job_idx
         self._batch_phase = phase
@@ -10977,6 +11505,7 @@ class UWBQuickVisualizationWindow(QWidget):
             it['status'] = 'Failed (data) \u2014 animation skipped'
             self._refresh_batch_list()
             self._batch_plan_pos += 1
+            self._batch_step_running = False
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -11037,6 +11566,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if getattr(self, '_batch_phase', 'data') == 'data':
                 it['data_failed'] = True
             self._refresh_batch_list()
+            self._batch_step_running = False
             self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
@@ -11061,6 +11591,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if getattr(self, '_batch_phase', 'data') == 'data':
                 it['data_failed'] = True
             self._refresh_batch_list()
+            self._batch_step_running = False
             self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
@@ -11078,6 +11609,7 @@ class UWBQuickVisualizationWindow(QWidget):
             if getattr(self, '_batch_phase', 'data') == 'data':
                 it['data_failed'] = True
             self._refresh_batch_list()
+            self._batch_step_running = False
             self._batch_plan_pos += 1
             QTimer.singleShot(0, self._batch_step)
             return
@@ -11237,6 +11769,10 @@ class UWBQuickVisualizationWindow(QWidget):
                 f"attempt {attempts} of {limit}.")
             self._refresh_batch_list()
             # Re-run the SAME plan step: do not advance _batch_plan_pos.
+            # The one-launch guard has to be released explicitly here,
+            # precisely because this is the one path that relaunches a
+            # position on purpose rather than moving past it.
+            self._batch_step_running = False
             QTimer.singleShot(0, self._batch_step)
             return
 
@@ -11253,6 +11789,7 @@ class UWBQuickVisualizationWindow(QWidget):
             it['status'] = 'Done'
         self.log_message(f"BATCH {os.path.basename(it['path'])} [{phase}]: {it['status']}")
         self._refresh_batch_list()
+        self._batch_step_running = False
         self._batch_plan_pos += 1
         QTimer.singleShot(0, self._batch_step)
 
@@ -11288,6 +11825,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def _finish_batch(self):
         self._batch_active = False
+        self._batch_step_running = False
         if hasattr(self, 'batch_progress_widget'):
             self.batch_progress_bar.setValue(100)
             self.batch_progress_widget.setVisible(False)

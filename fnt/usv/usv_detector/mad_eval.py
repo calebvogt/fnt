@@ -6,8 +6,9 @@ decides whether a model is ready for a 3,000-file run: *how many real calls will
 it find, and how much junk will I have to reject?*
 
 So this evaluates at the level the user actually works at — one call, accepted or
-rejected — by matching predicted blobs against hand-labeled calls and reporting
-precision / recall / F1. Because every prediction carries a probability score,
+rejected — by matching predicted blobs against the calls the user confirmed
+(hand-drawn labels *and* accepted predictions) and reporting precision / recall /
+F1. Because every prediction carries a probability score,
 one inference pass yields the whole threshold curve: run the model once at a
 permissive threshold, then re-score the same detections at each candidate cutoff.
 That turns "pick a threshold" from a guess into a table.
@@ -119,35 +120,82 @@ def match_boxes(preds: Sequence[Box], labels: Sequence[Box],
     return c, pairs
 
 
+def _to_box(r: Dict) -> Optional[Box]:
+    """One CSV row as a time/frequency box, or None if its numbers are unusable."""
+    try:
+        return Box(
+            t0=float(r.get('start_s', 0.0)),
+            t1=float(r.get('stop_s', 0.0)),
+            f0=float(r.get('min_freq_hz', 0.0)),
+            f1=float(r.get('max_freq_hz', 0.0)),
+            score=float(r.get('score', 1.0) or 1.0),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_prediction(r: Dict) -> bool:
+    """Model output, as opposed to a hand-drawn label. The unified CSV
+    distinguishes them by blob_id type: int for predictions, string id for
+    hand-labels."""
+    return isinstance(r.get('blob_id'), int)
+
+
+def _status(r: Dict) -> str:
+    return (r.get('status') or 'pending')
+
+
 def rows_to_boxes(rows: Sequence[Dict], source: Optional[str] = None
                   ) -> List[Box]:
-    """Convert CSV rows to boxes, optionally filtered to predictions or labels.
+    """Convert CSV rows to boxes, optionally filtered by role.
 
-    ``source='prediction'`` selects model output (int blob_id), ``'label'``
-    selects hand-labels (string blob_id). Rejected rows are dropped from labels —
-    a rejection is a recorded "not a call", so it is not ground truth.
+    ``source='prediction'`` selects model output. ``source='truth'`` selects
+    **every call a human affirmed is real** — that is hand-drawn labels *and*
+    predictions the user accepted.
+
+    Including accepted predictions is the whole point. In MAD's workflow most
+    confirmed calls arrive by accepting a prediction, not by painting one, and
+    accepting keeps the row's int blob_id while only flipping status. Ground
+    truth built from hand-labels alone therefore omits the majority of the
+    user's confirmed calls, and the model's correct re-detections of them get
+    scored as false positives — reporting near-zero precision for a model that
+    was right about every call.
+
+    Rejected rows are excluded: a rejection is a recorded "not a call", so
+    re-detecting one is genuinely a false positive. Pending predictions are
+    excluded too — they are unjudged, not confirmed; see :func:`count_unreviewed`
+    for why that has to be surfaced to the reader.
     """
     out: List[Box] = []
     for r in rows:
-        is_pred = isinstance(r.get('blob_id'), int)
+        is_pred = _is_prediction(r)
         if source == 'prediction' and not is_pred:
             continue
-        if source == 'label':
-            if is_pred:
+        if source == 'truth':
+            status = _status(r)
+            if status == 'rejected':
                 continue
-            if (r.get('status') or '') == 'rejected':
+            # A hand-label is affirmed by existing; a prediction has to have
+            # been accepted.
+            if is_pred and status != 'accepted':
                 continue
-        try:
-            out.append(Box(
-                t0=float(r.get('start_s', 0.0)),
-                t1=float(r.get('stop_s', 0.0)),
-                f0=float(r.get('min_freq_hz', 0.0)),
-                f1=float(r.get('max_freq_hz', 0.0)),
-                score=float(r.get('score', 1.0) or 1.0),
-            ))
-        except (TypeError, ValueError):
-            continue
+        box = _to_box(r)
+        if box is not None:
+            out.append(box)
     return out
+
+
+def count_unreviewed(rows: Sequence[Dict]) -> int:
+    """Predictions on this file that the user has neither accepted nor rejected.
+
+    These are the one remaining way to get a misleading precision number: an
+    unreviewed prediction is not ground truth, so if the model re-detects it the
+    match is scored as a false positive even though nobody has said whether it
+    is one. Evaluating a partially-reviewed file understates precision by
+    roughly this count, so every consumer reports it rather than hiding it.
+    """
+    return sum(1 for r in rows
+               if _is_prediction(r) and _status(r) == 'pending')
 
 
 DEFAULT_THRESHOLDS = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
@@ -162,6 +210,10 @@ class EvalResult:
     files: List[Dict] = field(default_factory=list)
     model_name: str = ""
     iou_min: float = 0.3
+    # Pending predictions across the scored files. Nonzero means precision is
+    # understated: those calls are unjudged, so re-detecting one scores as a
+    # false positive. Consumers must show this, not bury it.
+    n_unreviewed: int = 0
 
     def best(self, metric: str = 'f1') -> Optional[Dict]:
         if not self.per_threshold:
@@ -174,6 +226,7 @@ class EvalResult:
             'iou_min': self.iou_min,
             'n_files': self.n_files,
             'n_labels': self.n_labels,
+            'n_unreviewed': self.n_unreviewed,
             'per_threshold': self.per_threshold,
             'files': self.files,
         }
@@ -194,9 +247,12 @@ def evaluate_wavs(
     That is what makes a full curve affordable — the expensive part (the tiled
     forward pass) is not repeated per threshold.
 
-    Ground truth is each recording's hand-labels, read from its sibling CSV. Files
-    with no hand-labels are skipped and reported, since scoring against an empty
-    ground truth would make precision look catastrophic for no reason.
+    Ground truth is every call the user affirmed on that recording — hand-drawn
+    labels **and** accepted predictions (see :func:`rows_to_boxes`). Files with
+    no confirmed calls are skipped and reported, since scoring against an empty
+    ground truth would make precision look catastrophic for no reason. Files that
+    still hold unreviewed predictions are scored but counted in
+    ``n_unreviewed``, because those understate precision.
     """
     from .mad_inference import (
         blobs_to_rows, compute_full_spec_image, extract_blobs, load_model,
@@ -222,6 +278,7 @@ def evaluate_wavs(
     totals = {t: Counts() for t in thresholds}
     files_out: List[Dict] = []
     n_labels_total = 0
+    n_unreviewed_total = 0
     n_scored = 0
 
     for i, wav in enumerate(wav_paths):
@@ -236,10 +293,11 @@ def evaluate_wavs(
             rows = read_blob_csv(csv_path) if Path(csv_path).is_file() else []
         except Exception:
             rows = []
-        labels = rows_to_boxes(rows, source='label')
+        labels = rows_to_boxes(rows, source='truth')
         if not labels:
-            files_out.append({'name': name, 'skipped': 'no hand-labels'})
+            files_out.append({'name': name, 'skipped': 'no confirmed calls'})
             continue
+        n_pending = count_unreviewed(rows)
 
         audio, sr = load_audio(wav)
         if audio.ndim > 1:
@@ -261,8 +319,10 @@ def evaluate_wavs(
         preds_all = rows_to_boxes(pred_rows)
 
         n_labels_total += len(labels)
+        n_unreviewed_total += n_pending
         n_scored += 1
-        per_file = {'name': name, 'n_labels': len(labels)}
+        per_file = {'name': name, 'n_labels': len(labels),
+                    'n_unreviewed': n_pending}
         for t in thresholds:
             # Re-scoring by the stored per-call score is what makes the sweep
             # cheap; only calls whose mean probability clears the cutoff survive.
@@ -284,6 +344,7 @@ def evaluate_wavs(
         thresholds=list(thresholds),
         per_threshold=per_threshold,
         n_labels=n_labels_total,
+        n_unreviewed=n_unreviewed_total,
         n_files=n_scored,
         files=files_out,
         model_name=Path(cfg.model_path).stem if cfg.model_path else "",
