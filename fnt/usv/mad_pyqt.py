@@ -10,6 +10,7 @@ Run directly:
 """
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 import time
@@ -72,6 +73,27 @@ except Exception:
 
 
 _SORT_ROLE = Qt.UserRole + 1
+
+
+# Monotonic id source for in-memory prediction annotations.
+#
+# These ids used to be positional per load ('pred_0', 'pred_1', ...), which is
+# not an identity: every file produced the same names, and a second Quick
+# Inference on another part of the SAME file restarted the numbering. Anything
+# that looks a call up by id -- the detections list, the review cursor, the
+# gallery's mark dictionary -- could then land on a different call than the one
+# the user clicked, in the same file or a different one. A counter that never
+# resets for the life of the process makes the id actually identify the call.
+#
+# Only in-memory identity depends on this. Persistence joins on the CSV's
+# blob_id (or, for hand-labels, the stable example id), so ids may be renumbered
+# freely between sessions.
+_ANN_ID_SEQ = itertools.count(1)
+
+
+def _new_ann_id(prefix: str) -> str:
+    """A process-unique annotation id, e.g. ``pred_00000042``."""
+    return f"{prefix}_{next(_ANN_ID_SEQ):08d}"
 
 
 _ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
@@ -2492,6 +2514,7 @@ class MADGalleryDialog(QDialog):
         self._page = 0
         self._per_page = 48
         self._marks: Dict[str, str] = {}   # ann id -> 'accept' | 'reject'
+        self._token = None                 # detection set these tiles came from
 
         v = QVBoxLayout(self)
         head = QLabel(
@@ -2551,6 +2574,9 @@ class MADGalleryDialog(QDialog):
         sg = m.spectrogram
         self._marks.clear()
         self._page = 0
+        # Bind these tiles to the detection set they came from, so marks made
+        # here can never be applied to a different file's calls.
+        self._token = m._review_token()
         tiles = []
         for i, ann in enumerate(sg.annotations):
             if ann.get('status') != 'prediction':
@@ -2672,6 +2698,19 @@ class MADGalleryDialog(QDialog):
         training examples, CSV status and undo all behave exactly as they do
         when reviewing one call at a time."""
         if not self._marks:
+            return
+        # The previewed file (or its detection set) may have changed since these
+        # tiles were built. Applying anyway would decide calls the user never
+        # looked at, so refuse and show the current file instead.
+        if self._token != self._main._review_token():
+            QMessageBox.information(
+                self, "Detection Gallery",
+                "The previewed recording changed since these tiles were "
+                "loaded, so the marks were discarded rather than applied to "
+                "a different file's detections.\n\nThe gallery now shows the "
+                "current file.")
+            self._marks.clear()
+            self.reload()
             return
         n = self._main._apply_gallery_marks(dict(self._marks))
         self._marks.clear()
@@ -5243,6 +5282,7 @@ class MADMainWindow(QMainWindow):
         self._update_train_button_count()
         self._update_file_list_counts()
         self._update_overview_marks()
+        self._refresh_open_gallery()
 
     def _min_score(self) -> float:
         """Current minimum-score filter as a probability in [0, 1]. 0 = off."""
@@ -5337,6 +5377,39 @@ class MADMainWindow(QMainWindow):
         if hasattr(self, 'annotation_list'):
             return self.annotation_list
         return None
+
+    def _review_token(self):
+        """Identifies the detection set currently on screen.
+
+        The path alone is not enough: re-loading the same recording rebuilds
+        every annotation with fresh ids, so a dialog holding the old ones is
+        just as stale as if the file had changed. ``_ann_load_seq`` is bumped on
+        every load, which covers both.
+        """
+        return (os.path.normcase(os.path.abspath(self._active_wav_path() or '')),
+                getattr(self, '_ann_load_seq', 0))
+
+    def _bump_review_token(self):
+        """Mark the on-screen detection set as a new generation.
+
+        Deliberately does NOT refresh dependent views: this fires the moment the
+        old annotations are replaced, which during a file load is *before* the
+        new file's predictions have been appended. Refreshing here would show a
+        half-built set. :meth:`_refresh_open_gallery` does the showing, once.
+        """
+        self._ann_load_seq = getattr(self, '_ann_load_seq', 0) + 1
+
+    def _refresh_open_gallery(self):
+        """Re-show an open gallery when the detection set it was built from is
+        no longer the one on screen. Cheap to call often -- a token compare --
+        so it can hang off the ordinary list refresh and stay correct without
+        every caller having to remember it."""
+        dlg = getattr(self, '_gallery_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        if getattr(dlg, '_token', None) == self._review_token():
+            return
+        dlg.reload()
 
     def _active_wav_path(self) -> Optional[str]:
         """Path of the file currently shown in the preview, or None."""
@@ -6290,7 +6363,7 @@ class MADMainWindow(QMainWindow):
             if not blob_region.any():
                 continue
             sg.annotations.append({
-                'id': f'pred_{n_added}',
+                'id': _new_ann_id('pred'),
                 'category': (self._project.last_class if self._project else
                              self._session_last_class) or 'USV',
                 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
@@ -6312,6 +6385,7 @@ class MADMainWindow(QMainWindow):
             pass
         sg._rebuild_confirmed_mask()
         sg.update()
+        self._bump_review_token()
         self._pred_review_idx = 0 if n_pending > 0 else None
         self._refresh_annotation_list()
         self._update_pred_review_widgets()
@@ -8679,6 +8753,9 @@ class MADMainWindow(QMainWindow):
         grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
         anns = self._load_confirmed_annotations(wav_path, grid)
         self.spectrogram.set_annotations(anns)
+        # New annotation objects with new ids: anything holding the old ones
+        # (an open gallery) is now stale.
+        self._bump_review_token()
         # _load_predictions_as_annotations refreshes the list itself when it adds
         # predictions (returns an int); it returns None on its early-out paths
         # (no predictions) without refreshing — only then do we refresh here, so
@@ -10457,7 +10534,7 @@ class MADMainWindow(QMainWindow):
             f1 = f0 + blob_region.shape[0]
             t1 = t0 + blob_region.shape[1]
             sg.annotations.append({
-                'id': f'vpred_{n_added}',
+                'id': _new_ann_id('vpred'),
                 'category': (self._project.last_class if self._project else
                              self._session_last_class) or 'USV',
                 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
@@ -10502,6 +10579,7 @@ class MADMainWindow(QMainWindow):
             pass
         sg._rebuild_confirmed_mask()
         sg.update()
+        self._bump_review_token()
         self._pred_review_idx = None
         self._refresh_annotation_list()
         if n_added:
@@ -10544,8 +10622,14 @@ class MADMainWindow(QMainWindow):
             self.audio_files.append(ap)
             self._refresh_file_list()
             idx = len(self.audio_files) - 1
-        self.current_file_idx = idx
+        # setCurrentRow must be the thing that triggers the load. Assigning
+        # current_file_idx first makes _on_file_selected's "already on this
+        # row" guard fire, so the file is never loaded and the summary's
+        # detections get painted onto whatever recording was on screen before.
         self.file_list.setCurrentRow(idx)
+        if self.current_file_idx != idx or self.audio_data is None:
+            self.current_file_idx = idx
+            self._load_current_file()
         n = self._load_predictions_as_annotations(wav=ap) or 0
         if self._project is not None:
             self._log(f"Opened {os.path.basename(ap)} for review — not added to "

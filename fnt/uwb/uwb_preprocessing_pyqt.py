@@ -362,18 +362,31 @@ def processing_select_clause(conn, table_name):
 
 
 def date_axis(values):
-    """Datetimes as the float day-numbers matplotlib uses internally.
+    """Datetimes as the float day-numbers matplotlib plots internally.
 
-    Handing ``ax.plot`` a datetime series makes matplotlib run every point
-    through its unit-conversion machinery on each call. Converting once with
-    ``date2num`` and telling the axis to treat the result as dates gives the
-    identical figure: on a 17-subplot, 690k-point-per-subplot battery figure
-    that was 51 s versus 7 s.
+    Handing ``ax.plot`` a datetime series makes matplotlib convert every point
+    on every call. Converting up front is only worth doing if the conversion
+    is itself cheap, and ``mdates.date2num`` is not: it routes a 3 M-row
+    series through Python datetime objects and takes ~11 s. Matplotlib's date
+    numbers are simply days since its epoch, so the same answer comes out of
+    integer nanoseconds by division - 543x faster, and agreeing with
+    ``date2num`` to under a microsecond (float64 rounding; a pixel on these
+    figures spans minutes).
 
-    Pair every use with ``ax.xaxis_date(tz)``, or the axis has no way to know
-    the numbers are dates and will label them as plain floats.
+    The epoch is read from matplotlib rather than hard-coded, so this keeps
+    matching if a caller ever moves it.
+
+    Pair every use with ``ax.xaxis_date(tz)``: the axis has no other way to
+    know the numbers are dates, and would label them as plain floats.
     """
-    return mdates.date2num(values)
+    ser = pd.Series(values) if not isinstance(values, pd.Series) else values
+    if not pd.api.types.is_datetime64_any_dtype(ser):
+        return mdates.date2num(values)
+    if getattr(ser.dt, 'tz', None) is not None:
+        ser = ser.dt.tz_convert('UTC').dt.tz_localize(None)
+    epoch = np.datetime64(mdates.get_epoch()).astype('datetime64[ns]').astype('int64')
+    ns = ser.dt.as_unit('ns').astype('int64').to_numpy()
+    return (ns - epoch) / 86_400_000_000_000.0
 
 
 def smoothed_csv_timestamps(df, tz):
@@ -1953,10 +1966,19 @@ class PlotSaverWorker(QThread):
                 sex = self.tag_identities[tag].get('sex', 'M')
                 color = 'tab:blue' if sex == 'M' else 'tab:red'
 
+            # A marker per fix stops meaning anything once there are more
+            # fixes than pixels to put them on: the axis is ~2800 px wide, so
+            # a 691k-point series drew a solid band the line already covered,
+            # and it cost 6 of the 7 seconds spent encoding this figure. Keep
+            # them where they still separate - which is also where they earn
+            # their place, since a tag with a handful of readings would
+            # otherwise be a bare line, and a single reading nothing at all.
+            marker_kw = ({} if len(tag_data) > 2000
+                         else dict(marker='o', markersize=1))
             ax.xaxis_date(self.timezone)
             ax.plot(tag_data['_x'].to_numpy(),
                     tag_data[battery_col].to_numpy(),
-                    linewidth=1.0, marker='o', markersize=1, color=color, alpha=0.85)
+                    linewidth=1.0, color=color, alpha=0.85, **marker_kw)
 
             ax.set_ylim(y_lo, y_hi)
             ax.set_ylabel(label, fontsize=8, fontweight='bold', rotation=0, labelpad=60, ha='right')
