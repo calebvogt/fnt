@@ -4611,7 +4611,8 @@ class MADMainWindow(QMainWindow):
             "detection, so raising this hides marginal calls instantly without "
             "re-running the model. It only affects what you see — nothing is "
             "deleted, and accepted/rejected calls are never hidden.")
-        self.slider_min_score.valueChanged.connect(self._on_min_score_changed)
+        # Label tracks the drag live; the expensive part is debounced below.
+        self.slider_min_score.valueChanged.connect(self._on_min_score_slid)
         score_row.addWidget(self.slider_min_score, 1)
         self.lbl_min_score = QLabel("off")
         self.lbl_min_score.setFixedWidth(58)
@@ -5289,16 +5290,46 @@ class MADMainWindow(QMainWindow):
         s = getattr(self, 'slider_min_score', None)
         return (s.value() / 100.0) if s is not None else 0.0
 
-    def _on_min_score_changed(self, value: int):
-        """Apply the score filter to the review list and the canvas."""
+    def _on_min_score_slid(self, value: int):
+        """Slider moved: update the readout now, defer the expensive work.
+
+        Applying the filter rebuilds every row of the detections tree plus the
+        file counts, the overview marks and the spectrogram. Doing that on every
+        intermediate value of a drag means ~70 full rebuilds for one gesture,
+        which visibly locks up a file carrying thousands of detections after a
+        batch run. The readout still tracks the drag live so it feels immediate.
+        """
         self.lbl_min_score.setText("off" if value <= 0 else f"≥ {value / 100:.2f}")
         self.lbl_min_score.setStyleSheet(
             "font-size: 9px; color: #999999;" if value <= 0
             else "font-size: 9px; color: #7ec87e;")
+        timer = getattr(self, '_min_score_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_min_score)
+            self._min_score_timer = timer
+        timer.start(120)
+
+    def _apply_min_score(self):
+        """Apply the current filter value to the review list and the canvas."""
+        value = self.slider_min_score.value()
         # The canvas hides the same calls, so what you review and what you see
         # can't disagree.
         self.spectrogram.set_min_score(value / 100.0)
         self._refresh_annotation_list()
+
+    def _on_min_score_changed(self, value: int):
+        """Set the filter and apply it immediately (no debounce).
+
+        Used by code that changes the slider programmatically and needs the
+        effect to be visible before it returns.
+        """
+        self.slider_min_score.setValue(value)
+        timer = getattr(self, '_min_score_timer', None)
+        if timer is not None:
+            timer.stop()
+        self._apply_min_score()
 
     def _update_overview_marks(self):
         """Place one status-colored tick per detection on the waveform overview
@@ -5767,25 +5798,65 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage("All predictions reviewed")
             self._maybe_prompt_next_file()
 
+    def _hidden_pending_count(self) -> int:
+        """Pending predictions the Min score filter is currently hiding.
+
+        Computed from the annotations rather than read off the last list
+        refresh, so it is right whatever order the caller runs in.
+        """
+        sg = self.spectrogram
+        if self._min_score() <= 0.0:
+            return 0
+        return sum(1 for a in sg.annotations if sg._score_hidden(a))
+
     def _maybe_prompt_next_file(self):
-        """When the last pending detection in a file has just been reviewed,
-        offer to jump to the next file (Yes is the default, so Enter advances)."""
+        """When the last *visible* pending detection has been reviewed, offer to
+        jump to the next file.
+
+        "Visible" is the catch. _pred_indices() is scoped by the Min score
+        filter, so with a filter set this fires while lower-scoring predictions
+        are still pending. Saying "all reviewed" there is how someone sweeps
+        3,000 files taking the default and finishes believing the batch is
+        done — so when the filter is hiding calls the prompt says so, offers to
+        reveal them, and does not default to advancing.
+        """
         if self._pred_indices():
             return  # still pending — nothing to prompt
         n = self._reviewed_count
         if n <= 0:
             return  # nothing was actually reviewed this file — no prompt
+        hidden = self._hidden_pending_count()
         has_next = self.current_file_idx + 1 < len(self.audio_files)
-        base = f"All {n} pending mask(s) reviewed."
-        if not has_next:
+        if hidden:
+            base = (f"Reviewed {n} mask(s) — but {hidden} more are still "
+                    f"pending on this file, hidden by the Min score filter "
+                    f"(≥ {self._min_score():.2f}).")
+        else:
+            base = f"All {n} pending mask(s) reviewed."
+        if not has_next and not hidden:
             self.status_bar.showMessage(base + " (last file)")
             return
         box = QMessageBox(self)
-        box.setWindowTitle("Review complete")
-        box.setText(base + "\n\nMove to the next file?")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.Yes)
-        if box.exec_() == QMessageBox.Yes:
+        box.setWindowTitle("Review complete" if not hidden
+                           else "Some detections are hidden")
+        box.setText(base + ("\n\nMove to the next file?" if has_next
+                            else "\n\nThis is the last file."))
+        b_show = box.addButton(f"Show the {hidden} hidden",
+                               QMessageBox.AcceptRole) if hidden else None
+        b_next = (box.addButton("Next file", QMessageBox.AcceptRole)
+                  if has_next else None)
+        b_stay = box.addButton("Stay", QMessageBox.RejectRole)
+        # Only default to advancing when there is genuinely nothing left here.
+        box.setDefaultButton(b_show if hidden else (b_next or b_stay))
+        box.exec_()
+        clicked = box.clickedButton()
+        if b_show is not None and clicked is b_show:
+            self._on_min_score_changed(0)
+            self.status_bar.showMessage(
+                f"Min score filter cleared — {hidden} pending detection(s) "
+                "back in the list")
+            return
+        if b_next is not None and clicked is b_next:
             self._advance_to_next_review_file()
 
     def _advance_to_next_review_file(self):
@@ -10707,10 +10778,19 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        def _scan_progress(i, n):
+            self.status_bar.showMessage(
+                f"Checking which of {n:,} file(s) are already analyzed… "
+                f"({i:,})")
+            QApplication.processEvents()
+
         try:
-            todo, done = partition_done(wav_paths, settings, manifest_done)
+            todo, done = partition_done(wav_paths, settings, manifest_done,
+                                        progress=_scan_progress)
         finally:
             QApplication.restoreOverrideCursor()
+            self.status_bar.clearMessage()
         if not done:
             return wav_paths
         box = QMessageBox(self)

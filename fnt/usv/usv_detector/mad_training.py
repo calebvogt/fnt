@@ -135,15 +135,15 @@ def grouped_split(
     target = max(1, int(round(n_total * float(val_fraction))))
     val_groups: List[str] = []
     n_val = 0
-    # Leave the final group for training no matter what, so neither side is
-    # ever empty.
+    # Leave the final group for training no matter what, so neither side is ever
+    # empty. The first iteration always appends (n_val starts at 0 and target is
+    # at least 1), and there are at least two groups here, so val_groups cannot
+    # come out empty either — no fallback needed.
     for key in shuffled[:-1]:
         if n_val >= target:
             break
         val_groups.append(key)
         n_val += len(members[key])
-    if not val_groups:                      # val_fraction ~0 → still hold one out
-        val_groups = [shuffled[0]]
 
     val_set = set(val_groups)
     val_idx = np.array(

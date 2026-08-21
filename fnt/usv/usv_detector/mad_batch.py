@@ -182,15 +182,28 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
     csv_path = pred_csv_sibling_path(wav_path)
     if not os.path.isfile(csv_path):
         return False
+    # Streamed, and only the four provenance fields are touched. read_blob_csv
+    # would parse and float-convert ~40 columns of every detection on the file;
+    # at 3,000 previously-analyzed recordings that is minutes of work to answer
+    # a yes/no question. Bails at the first mismatching row.
+    import csv as _csv
+    n_pred = 0
     try:
-        from .mad_inference import read_blob_csv
-        rows = read_blob_csv(csv_path)
-    except Exception:
+        with open(csv_path, newline='') as f:
+            for row in _csv.DictReader(f):
+                raw = row.get('call_id', row.get('blob_id'))
+                if raw is None:
+                    continue
+                try:                       # int call_id == model prediction
+                    int(str(raw).strip())
+                except (TypeError, ValueError):
+                    continue               # string id == hand-label, not ours
+                n_pred += 1
+                if not settings.matches_row(row):
+                    return False
+    except (OSError, _csv.Error):
         return False
-    preds = [r for r in rows if isinstance(r.get('blob_id'), int)]
-    if not preds:
-        return False
-    return all(settings.matches_row(r) for r in preds)
+    return n_pred > 0
 
 
 def completed_by_settings(roots, settings: RunSettings) -> set:
