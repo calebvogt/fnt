@@ -90,14 +90,31 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         amp=not args.no_amp,
     )
 
-    # Resume: skip recordings this model already analyzed at these settings.
-    # Provenance lives in each file's own CSV, so this works across runs and
-    # survives losing the manifest.
-    from .mad_batch import RunManifest, RunSettings, new_run_dir, partition_done
-    manifest = None
-    if not args.no_resume:
-        settings = RunSettings.from_config(cfg)
-        todo, done = partition_done(wavs, settings)
+    from .mad_batch import (
+        RunManifest, RunSettings, completed_by_settings, new_run_dir,
+        partition_done)
+
+    settings = RunSettings.from_config(cfg)
+    # Runs log under --log-root (beside the model by default), and resume reads
+    # that same place back, so repeated invocations against one model
+    # accumulate a history they can actually use.
+    log_root = args.log_root or os.path.dirname(os.path.abspath(args.model))
+    read_roots = [log_root]
+    if args.run_dir:
+        read_roots.append(os.path.dirname(os.path.abspath(args.run_dir)))
+
+    # Resume: skip recordings already analyzed at these settings. Two sources,
+    # because neither alone is enough:
+    #   * each file's own CSV carries the model/threshold/min-blob provenance,
+    #     which survives losing the manifests entirely;
+    #   * the manifests cover files that produced ZERO detections. Those write
+    #     no prediction rows, so the CSV cannot prove they ran — and on a 24/7
+    #     set the silent files are the overwhelming majority, so without this
+    #     a resume re-does most of the work it was supposed to skip.
+    # "Re-detect from scratch" means redo everything, so it disables resume.
+    if not args.no_resume and not args.no_preserve_labels:
+        manifest_done = completed_by_settings(read_roots, settings)
+        todo, done = partition_done(wavs, settings, manifest_done)
         if done:
             print(f"  Resuming — {len(done)} file(s) already analyzed with "
                   f"these settings, {len(todo)} to go.")
@@ -106,16 +123,18 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             print("Nothing to do — every file is already analyzed.")
             return 0
 
-    run_dir = args.run_dir or new_run_dir(
-        args.log_root or os.path.dirname(os.path.abspath(args.model)))
+    run_dir = args.run_dir or new_run_dir(log_root)
     manifest = RunManifest(run_dir).open()
-    manifest.write_info({
-        'model_path': args.model, 'model_name': os.path.splitext(
-            os.path.basename(args.model))[0],
-        'threshold': cfg.threshold, 'min_blob_pixels': cfg.min_blob_pixels,
+    # The settings block comes from RunSettings so a later resume checks
+    # exactly what this run recorded.
+    info = dict(settings.to_info())
+    info.update({
+        'model_path': args.model,
         'n_files': len(wavs), 'device': cfg.device,
         'batch_size': cfg.batch_size, 'amp': cfg.amp,
+        'preserve_labels': cfg.preserve_labels,
     })
+    manifest.write_info(info)
     print(f"  Run log: {run_dir}")
 
     def _on_done(summary: dict):
@@ -289,7 +308,8 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument('--no-resume', action='store_true',
                     help="Re-analyze files that already carry detections from "
                          "this model at these settings (default is to skip "
-                         "them, so an interrupted run resumes).")
+                         "them, so an interrupted run resumes). Implied by "
+                         "--no-preserve-labels.")
     pa.add_argument('--run-dir', default='',
                     help="Directory for this run's manifest.jsonl (default: a "
                          "timestamped folder under --log-root).")

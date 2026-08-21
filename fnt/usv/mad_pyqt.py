@@ -10614,11 +10614,12 @@ class MADMainWindow(QMainWindow):
         root = self._batch_run_root()
         if root:
             try:
-                from fnt.usv.usv_detector.mad_batch import RunManifest, list_runs
-                for rd in list_runs(root):
-                    manifest_done |= {
-                        os.path.normcase(p)
-                        for p in RunManifest(rd).completed_paths()}
+                # Only manifests written at THESE settings count. Unioning
+                # every prior run would mean a retrained model re-run over the
+                # same folder found all of it "already done" and analyzed
+                # nothing while reporting success.
+                from fnt.usv.usv_detector.mad_batch import completed_by_settings
+                manifest_done = completed_by_settings(root, settings)
             except Exception:
                 pass
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -10676,18 +10677,20 @@ class MADMainWindow(QMainWindow):
                     RunManifest, new_run_dir)
                 run_dir = new_run_dir(root)
                 self._manifest = RunManifest(run_dir).open()
-                self._manifest.write_info({
+                # The settings block comes from RunSettings so what a later
+                # resume checks is exactly what this run recorded.
+                from fnt.usv.usv_detector.mad_batch import RunSettings as _RS
+                info = dict(_RS.from_config(cfg).to_info())
+                info.update({
                     'started': time.time(),
                     'model_path': cfg.model_path,
-                    'model_name': Path(cfg.model_path).stem,
-                    'threshold': cfg.threshold,
-                    'min_blob_pixels': cfg.min_blob_pixels,
                     'n_files': len(wav_paths),
                     'device': cfg.device,
                     'batch_size': cfg.batch_size,
                     'amp': cfg.amp,
                     'preserve_labels': cfg.preserve_labels,
                 })
+                self._manifest.write_info(info)
                 progress.append(f"Run log: {run_dir}")
                 self._log(f"Batch run log: {run_dir}")
             except Exception as e:

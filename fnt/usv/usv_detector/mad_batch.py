@@ -18,6 +18,12 @@ Two independent mechanisms, because they answer different questions:
   manifest entirely, and it works across runs — pointing a second run at an
   overlapping folder re-does nothing.
 
+Both are scoped by :class:`RunSettings`. A manifest is only trusted when its
+``run_info`` attests to the *same* settings — otherwise retraining a model and
+re-running the same folder would find every file marked done by the old model's
+run and quietly analyze nothing. Use :func:`completed_by_settings` to gather
+prior completions; both the GUI and the CLI go through it so they cannot drift.
+
 Both are deliberately cheap: skipping reads only the CSV header rows, never the
 h5 mask crops or the audio.
 """
@@ -70,10 +76,27 @@ class RunSettings:
     Only settings that change the *detections* belong here. batch_size, amp and
     device deliberately do not: they alter speed, not output, so a run should
     never redo work just because it is using a bigger batch this time.
+
+    Two sources can attest that a file is done, and they can verify different
+    amounts:
+
+    * a recording's own CSV carries ``model_name`` / ``threshold`` /
+      ``min_blob_pixels`` as columns, so :meth:`matches_row` can check only
+      those three;
+    * a run manifest's ``run_info`` records the whole settings block, so
+      :meth:`matches_info` also checks the merge options, which change how
+      blobs are combined into calls and therefore change the output.
+
+    The manifest check is the stricter one. That asymmetry is deliberate: the
+    failure it prevents (skipping a file that was never analyzed at these
+    settings) is far worse than the one it risks (redoing work).
     """
     model_name: str
     threshold: float
     min_blob_pixels: int
+    merge_consecutive: bool = False
+    merge_max_gap_s: float = 0.01
+    merge_require_freq_overlap: bool = True
 
     @classmethod
     def from_config(cls, cfg) -> 'RunSettings':
@@ -81,9 +104,28 @@ class RunSettings:
             model_name=Path(cfg.model_path).stem if cfg.model_path else "",
             threshold=round(float(cfg.threshold), 6),
             min_blob_pixels=int(cfg.min_blob_pixels),
+            merge_consecutive=bool(getattr(cfg, 'merge_consecutive', False)),
+            merge_max_gap_s=round(
+                float(getattr(cfg, 'merge_max_gap_s', 0.01)), 6),
+            merge_require_freq_overlap=bool(
+                getattr(cfg, 'merge_require_freq_overlap', True)),
         )
 
+    def to_info(self) -> Dict:
+        """The settings block to record in a run's ``run_info.json``, so a later
+        run can tell whether that run's results are reusable."""
+        return {
+            'model_name': self.model_name,
+            'threshold': self.threshold,
+            'min_blob_pixels': self.min_blob_pixels,
+            'merge_consecutive': self.merge_consecutive,
+            'merge_max_gap_s': self.merge_max_gap_s,
+            'merge_require_freq_overlap': self.merge_require_freq_overlap,
+        }
+
     def matches_row(self, row: Dict) -> bool:
+        """Whether a CSV detection row was produced by these settings (the three
+        provenance columns the CSV actually carries)."""
         try:
             return (str(row.get('model_name', '')) == self.model_name
                     and abs(float(row.get('threshold', -1))
@@ -92,6 +134,38 @@ class RunSettings:
                     == self.min_blob_pixels)
         except (TypeError, ValueError):
             return False
+
+    def matches_info(self, info: Optional[Dict]) -> bool:
+        """Whether a run's recorded ``run_info`` was produced by these settings.
+
+        A run whose info is missing, unreadable, or predates a field is treated
+        as NOT matching. Its files then get re-analyzed, which costs time; the
+        alternative — trusting an unverifiable claim — silently skips work that
+        may never have happened.
+        """
+        if not info:
+            return False
+        try:
+            if str(info.get('model_name', '')) != self.model_name:
+                return False
+            if abs(float(info.get('threshold', -1)) - self.threshold) > 1e-6:
+                return False
+            if int(float(info.get('min_blob_pixels', -1))) != self.min_blob_pixels:
+                return False
+            for key, mine in (
+                ('merge_consecutive', self.merge_consecutive),
+                ('merge_require_freq_overlap', self.merge_require_freq_overlap),
+            ):
+                if key not in info or bool(info.get(key)) != bool(mine):
+                    return False
+            if 'merge_max_gap_s' not in info:
+                return False
+            if abs(float(info.get('merge_max_gap_s', -1))
+                    - self.merge_max_gap_s) > 1e-6:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
 
 
 def file_already_done(wav_path: str, settings: RunSettings) -> bool:
@@ -117,6 +191,38 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
     if not preds:
         return False
     return all(settings.matches_row(r) for r in preds)
+
+
+def completed_by_settings(roots, settings: RunSettings) -> set:
+    """Normcased absolute paths that earlier runs finished **at these settings**.
+
+    This is what makes resume safe across a retrain. Unioning every prior
+    manifest regardless of settings would mean: analyze a folder with model A,
+    retrain to model B, re-run the same folder, and every file counts as already
+    done — model B silently runs on nothing while the run reports success.
+
+    Runs whose ``run_info`` does not attest to these exact settings are ignored
+    (see :meth:`RunSettings.matches_info`), so an unverifiable manifest can only
+    ever cost a redo, never a wrongly skipped file.
+    """
+    if isinstance(roots, (str, bytes)):
+        roots = [roots]
+    out: set = set()
+    seen_dirs: set = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for run_dir in list_runs(root):
+            key = os.path.normcase(os.path.abspath(run_dir))
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            m = RunManifest(run_dir)
+            if not settings.matches_info(m.read_info()):
+                continue
+            for path in m.completed_paths():
+                out.add(os.path.normcase(os.path.abspath(path)))
+    return out
 
 
 def partition_done(wav_paths: Iterable[str], settings: RunSettings,

@@ -361,6 +361,21 @@ def processing_select_clause(conn, table_name):
     return ", ".join(c for c in PROCESSING_COLUMNS if c in have)
 
 
+def date_axis(values):
+    """Datetimes as the float day-numbers matplotlib uses internally.
+
+    Handing ``ax.plot`` a datetime series makes matplotlib run every point
+    through its unit-conversion machinery on each call. Converting once with
+    ``date2num`` and telling the axis to treat the result as dates gives the
+    identical figure: on a 17-subplot, 690k-point-per-subplot battery figure
+    that was 51 s versus 7 s.
+
+    Pair every use with ``ax.xaxis_date(tz)``, or the axis has no way to know
+    the numbers are dates and will label them as plain floats.
+    """
+    return mdates.date2num(values)
+
+
 def smoothed_csv_timestamps(df, tz):
     """The exported CSV's timestamps as a tz-aware datetime series.
 
@@ -1900,6 +1915,10 @@ class PlotSaverWorker(QThread):
             self.progress.emit("No tags found, skipping battery plot")
             return False
 
+        # Convert the time axis once for the whole frame rather than letting
+        # each ax.plot re-convert its slice (see date_axis).
+        data = data.assign(_x=date_axis(data['Timestamp']))
+
         # Size: generous height per facet so many tags remain readable when zoomed
         subplot_height = 2.0
         fig_height = max(6, n_tags * subplot_height + 1.5)
@@ -1934,7 +1953,9 @@ class PlotSaverWorker(QThread):
                 sex = self.tag_identities[tag].get('sex', 'M')
                 color = 'tab:blue' if sex == 'M' else 'tab:red'
 
-            ax.plot(tag_data['Timestamp'], tag_data[battery_col],
+            ax.xaxis_date(self.timezone)
+            ax.plot(tag_data['_x'].to_numpy(),
+                    tag_data[battery_col].to_numpy(),
                     linewidth=1.0, marker='o', markersize=1, color=color, alpha=0.85)
 
             ax.set_ylim(y_lo, y_hi)
@@ -2177,12 +2198,15 @@ class PlotSaverWorker(QThread):
         n_rows, n_cols, figsize = self.facet_grid(
             len(tags), max_cols=3, panel_w=5.5, panel_h=2.4, extra_h=0.7)
         fig = Figure(figsize=figsize)
-        t0, t1 = data['Timestamp'].min(), data['Timestamp'].max()
+        # One conversion of the time axis for the whole frame (see date_axis).
+        data = data.assign(_x=date_axis(data['Timestamp']))
+        t0, t1 = data['_x'].min(), data['_x'].max()
         for i, tag in enumerate(tags):
             ax = fig.add_subplot(n_rows, n_cols, i + 1)
+            ax.xaxis_date(self.timezone)
             d = data[data['shortid'] == tag]
-            ax.plot(d['Timestamp'], d['velocity'], alpha=0.6, linewidth=0.4,
-                    color='#4da3ff')
+            ax.plot(d['_x'].to_numpy(), d['velocity'].to_numpy(),
+                    alpha=0.6, linewidth=0.4, color='#4da3ff')
             if still is not None:
                 ax.axhline(y=still, color='#ff4d4d', linestyle='--', linewidth=1.0)
             ax.set_title(self._tag_label(tag), fontsize=9)
