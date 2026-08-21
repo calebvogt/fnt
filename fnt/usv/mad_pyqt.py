@@ -4768,7 +4768,26 @@ class MADMainWindow(QMainWindow):
         """Capture the current file's review state (annotations + sibling CSV,
         and the per-blob crops only when ``crops`` is True) so the next
         Cmd/Ctrl+Z can restore it. Accept/Reject only touch the CSV, so they skip
-        the (slightly costly) crop read; Delete/Clear need it."""
+        the (slightly costly) crop read; Delete/Clear need it.
+
+        The training-example store is covered too, in two halves, because review
+        actions both create and destroy examples and undo has to reverse either:
+
+        * ``example_ids`` is a cheap *name* list. Anything present after the
+          operation but not here was MINTED by it (accepting a call saves a
+          training example), and undo deletes it -- otherwise a call you
+          accepted and then undid trains the model forever, invisibly, since
+          nothing in the Detections list reads the example store.
+        * ``removed_examples`` is filled in lazily by
+          :meth:`_remember_undo_example` as an operation DESTROYS examples
+          (rejecting an already-accepted call, Delete, Clear All), so undo can
+          put the content back.
+
+        The destroy half is captured lazily rather than up front on purpose:
+        Reject and Delete run per keystroke, and reading every example's arrays
+        for a heavily-labeled file on each one would make review crawl. Nothing
+        is read unless something is actually being deleted.
+        """
         sg = self.spectrogram
         wav = self._active_review_wav_path()
         snap = {'label': label,
@@ -4778,8 +4797,12 @@ class MADMainWindow(QMainWindow):
                            and sg._selected_ann_idx < len(sg.annotations)
                            else None),
                 'reviewed': self._reviewed_count,
-                'csv': None, 'crops': None}
+                'csv': None, 'crops': None,
+                'examples_h5': None, 'example_ids': set(),
+                'removed_examples': {}}
         if wav:
+            from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+            h5 = masks_sibling_path(wav)
             try:
                 from fnt.usv.usv_detector.mad_inference import read_blob_csv
                 cp = pred_csv_sibling_path(wav)
@@ -4787,17 +4810,118 @@ class MADMainWindow(QMainWindow):
                     snap['csv'] = (cp, read_blob_csv(cp))
             except Exception:
                 pass
+            try:
+                from fnt.usv.usv_detector.fnt_mask_store import td_list_ids
+                snap['examples_h5'] = h5
+                snap['example_ids'] = set(td_list_ids(h5))
+            except Exception:
+                pass
             if crops:
                 try:
                     from fnt.usv.usv_detector.fnt_mask_store import (
-                        masks_sibling_path, read_all_pred_masks)
-                    h5 = masks_sibling_path(wav)
+                        read_all_pred_masks)
                     snap['crops'] = (h5, read_all_pred_masks(h5))
                 except Exception:
                     pass
         self._undo_stack.append(snap)
         if len(self._undo_stack) > 15:  # bound the history
             self._undo_stack.pop(0)
+
+    def _remember_undo_example(self, example_id) -> None:
+        """Stash one training example's content into the active undo snapshot,
+        immediately before the caller deletes it.
+
+        Called from the deletion paths rather than from _snapshot_for_undo so
+        the (decompressing) read only happens for examples actually being
+        destroyed -- see that method for why up-front capture is too slow.
+        """
+        if getattr(self, '_in_undo', False) or not self._undo_stack:
+            return                      # never re-enter while undoing
+        snap = self._undo_stack[-1]
+        store = snap.get('removed_examples')
+        h5 = snap.get('examples_h5')
+        key = str(example_id) if example_id is not None else ''
+        if store is None or not h5 or not key or key in store:
+            return
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import td_read_example
+            ex = td_read_example(h5, key)
+        except Exception:
+            ex = None
+        if ex is not None:
+            store[key] = ex
+
+    def _restore_undo_examples(self, snap: dict, current_anns):
+        """Reverse an operation's effect on the training-example store.
+
+        ``current_anns`` is the annotation list as it stood *after* the
+        operation and *before* undo rolls it back -- the comparison against
+        ``snap['anns']`` is what identifies which examples the operation minted,
+        so it has to be captured by the caller first.
+
+        Returns ``(n_deleted, n_restored)``. Deletions go through the store
+        primitives directly rather than _purge_training_example, which would
+        try to record its own undo entry against whatever snapshot is now on
+        top of the stack.
+        """
+        h5 = snap.get('examples_h5')
+        if not h5:
+            return (0, 0)
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            td_delete, td_list_ids, td_save_example)
+        n_del = n_add = 0
+        try:
+            now_ids = set(td_list_ids(h5))
+        except Exception:
+            return (0, 0)
+        # Examples the undone operation created.
+        #
+        # Deliberately NOT a plain "everything added since the snapshot" diff.
+        # Confirming a painted mask (Enter) and finishing a shape edit both mint
+        # examples without taking a snapshot, so a store-wide diff would delete
+        # hand-drawn labels made after the snapshot -- turning undo into data
+        # loss. An accept is identified instead by what only an accept does: the
+        # same call (same time/frequency box, which accepting never moves) goes
+        # prediction -> accepted and its id becomes the new example id. The
+        # store diff is applied as a second, independent guard, so an id is
+        # removed only when both signals agree it is new.
+        before = {}
+        for a in snap.get('anns') or ():
+            before[(a.get('f0'), a.get('f1'), a.get('t0'), a.get('t1'))] = a
+        minted = set()
+        for a in current_anns or ():
+            if a.get('status') != 'accepted':
+                continue
+            prev = before.get((a.get('f0'), a.get('f1'),
+                               a.get('t0'), a.get('t1')))
+            if prev is None or prev.get('status') != 'prediction':
+                continue
+            aid = a.get('id')
+            if aid is not None and aid != prev.get('id'):
+                minted.add(str(aid))
+        added_since = now_ids - set(snap.get('example_ids') or ())
+        for ex_id in (minted & added_since):
+            try:
+                td_delete(h5, ex_id)
+                n_del += 1
+            except Exception:
+                continue
+            if self._project is not None:
+                try:
+                    from fnt.usv.usv_detector.mad_examples import delete_example
+                    delete_example(self._project.training_data_dir, ex_id)
+                except Exception:
+                    pass
+        # Examples it destroyed.
+        for ex_id, ex in (snap.get('removed_examples') or {}).items():
+            if ex_id in now_ids:
+                continue
+            try:
+                td_save_example(h5, ex['spec'], ex['mask'], ex['meta'], ex_id)
+                n_add += 1
+            except Exception:
+                continue
+        return (n_del, n_add)
 
     def _undo_review_action(self):
         """Reverse the last review action (accept/reject/delete) on this file."""
@@ -4806,6 +4930,13 @@ class MADMainWindow(QMainWindow):
             return
         snap = self._undo_stack.pop()
         sg = self.spectrogram
+        # Guard the deletion paths from recording undo entries against the
+        # snapshot below this one while we reverse this one.
+        self._in_undo = True
+        # Keep the post-operation annotations: _restore_undo_examples diffs
+        # them against the snapshot to work out which training examples the
+        # operation minted, and the next line destroys that evidence.
+        post_anns = [dict(a) for a in sg.annotations]
         # Restore the annotation list.
         sg.annotations = [dict(a) for a in snap['anns']]
         # Restore the sibling CSV.
@@ -4827,6 +4958,17 @@ class MADMainWindow(QMainWindow):
                 write_pred_masks(h5, items)
             except Exception:
                 pass
+        # Reverse the training-example store: drop what this operation minted,
+        # put back what it destroyed. Without this an accept-then-undo leaves a
+        # training example behind that nothing in the UI can show or remove,
+        # and an undone delete never gets its label back.
+        try:
+            n_del, n_add = self._restore_undo_examples(snap, post_anns)
+        except Exception as e:
+            n_del = n_add = 0
+            self._log(f"Undo: training-example rollback failed: {e}")
+        finally:
+            self._in_undo = False
         self._reviewed_count = snap.get('reviewed', 0)
         sg._rebuild_confirmed_mask()
         sg.update()
@@ -4834,7 +4976,15 @@ class MADMainWindow(QMainWindow):
         self._reselect_by_id(snap.get('sel_id'))
         self._update_pred_review_widgets()
         self.status_bar.showMessage(f"Undid: {snap['label']}")
-        self._log(f"Undo: {snap['label']}")
+        detail = ""
+        if n_del or n_add:
+            bits = []
+            if n_del:
+                bits.append(f"-{n_del} training example(s)")
+            if n_add:
+                bits.append(f"+{n_add} training example(s) restored")
+            detail = "  [" + ", ".join(bits) + "]"
+        self._log(f"Undo: {snap['label']}{detail}")
 
     def _purge_review_annotation(self, ann: dict):
         """Remove all persisted traces of one detection — its CSV row, stored
@@ -4845,6 +4995,7 @@ class MADMainWindow(QMainWindow):
         aid = ann.get('id')
         if not aid:
             return
+        self._remember_undo_example(aid)
         if self._project is not None:
             try:
                 from fnt.usv.usv_detector.mad_examples import delete_example
@@ -5491,6 +5642,11 @@ class MADMainWindow(QMainWindow):
         ids = {str(i) for i in ids if i is not None}
         if not ids:
             return
+        # Hand the content to the active undo snapshot first: once these are
+        # deleted the pixels are gone, and Ctrl+Z has to be able to put a
+        # wrongly-rejected label back.
+        for aid in ids:
+            self._remember_undo_example(aid)
         wav = self._active_review_wav_path()
         h5 = None
         if wav:
@@ -9446,6 +9602,10 @@ class MADMainWindow(QMainWindow):
         ann = sg.remove_annotation(ann_idx)
         if ann:
             aid = ann.get('id', '')
+            # Hand the training example to the active undo snapshot before it
+            # is destroyed. This path deletes from the store directly rather
+            # than via _purge_training_example, so it needs its own hook.
+            self._remember_undo_example(aid)
             if self._project is not None:
                 from fnt.usv.usv_detector.mad_examples import delete_example
                 try:

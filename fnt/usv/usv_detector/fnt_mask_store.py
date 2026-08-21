@@ -502,6 +502,32 @@ def td_iter_file_examples(h5_path: str, wav_name: str) -> Iterator[Dict]:
             yield {"meta": meta, "spec": spec, "mask": mask}
 
 
+def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
+    """Read ONE example by id: ``{meta, spec(float[0,1]), mask(float{0,1})}``.
+
+    Targeted rather than a scan, because the caller is the undo path: it grabs
+    an example's content immediately before that example is deleted, on a
+    per-keystroke review action. Iterating the whole store to find one would
+    decompress every other example's arrays for nothing.
+    """
+    _require_h5()
+    if not os.path.isfile(h5_path) or not example_id:
+        return None
+    try:
+        with h5py.File(h5_path, "r") as f:
+            ex = f.get("examples")
+            if ex is None or str(example_id) not in ex:
+                return None
+            g = ex[str(example_id)]
+            return {
+                "meta": json.loads(g.attrs.get("meta_json", "{}")),
+                "spec": g["spec"][()].astype(np.float32) / 255.0,
+                "mask": (g["mask"][()] > 0).astype(np.float32),
+            }
+    except Exception:
+        return None
+
+
 def td_count(h5_path: str) -> int:
     _require_h5()
     if not os.path.isfile(h5_path):

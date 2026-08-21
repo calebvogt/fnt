@@ -245,12 +245,25 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     keep_cols = ['Timestamp', 'smoothed_x', 'smoothed_y']
     if show_battery and 'battery_voltage' in data.columns:
         keep_cols.append('battery_voltage')
+    # Flat, sorted arrays rather than a DataFrame per tag. The frame loop
+    # below takes the trailing window by binary search on `t_ns`; masking the
+    # DataFrame instead cost ~15 ms a frame on one day of a 17-tag trial,
+    # because every frame re-scanned every tag's ENTIRE series. Timestamps are
+    # already sorted, so two searchsorted calls give the identical slice.
     tag_data_dict = {}
     for tag in tags:
         sub = data[data[id_col] == tag][keep_cols].sort_values('Timestamp')
-        tag_data_dict[tag] = {'data': sub,
-                              'label': styles[tag]['label'],
-                              'color': styles[tag]['color']}
+        bat = (sub['battery_voltage'].to_numpy(dtype='float64')
+               if 'battery_voltage' in sub.columns else None)
+        tag_data_dict[tag] = {
+            # int64 nanoseconds: directly comparable to a Timestamp's own
+            # .value, and free of any per-comparison timezone handling.
+            't_ns': sub['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy(),
+            'xs': sub['smoothed_x'].to_numpy(dtype='float64'),
+            'ys': sub['smoothed_y'].to_numpy(dtype='float64'),
+            'battery': bat,
+            'label': styles[tag]['label'],
+            'color': styles[tag]['color']}
 
     # GUI-free Agg figure/canvas (no pyplot global state).
     fig = Figure(figsize=(10, 8), dpi=dpi)
@@ -344,6 +357,10 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         # seconds behind it, so the window is [current - trail, current] and the
         # marker sits at `current`.
         window_start = frame_start - pd.Timedelta(seconds=trailing_window)
+        # Same bounds as the mask this replaced: >= window_start ('left') and
+        # <= frame_start ('right').
+        win_ns = window_start.as_unit('ns').value
+        now_ns = frame_start.as_unit('ns').value
 
         # Nearest classification row to this frame's display time. The grid is
         # regular, so this stays right no matter how the video speed compares
@@ -365,12 +382,12 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
 
         for tag, tag_info in tag_data_dict.items():
             trail_line, marker, label, batt_label = dyn[tag]
-            tag_df = tag_info['data']
-            trailing = tag_df[(tag_df['Timestamp'] >= window_start) &
-                              (tag_df['Timestamp'] <= frame_start)]
             state_txt = beh_states.get(tag)
             circ = beh_circles.get(tag)
-            if trailing.empty:
+            t_ns = tag_info['t_ns']
+            lo = int(np.searchsorted(t_ns, win_ns, 'left'))
+            hi = int(np.searchsorted(t_ns, now_ns, 'right'))
+            if hi <= lo:
                 # Tag not reporting in this window (e.g. battery dead): hide it.
                 trail_line.set_data([], [])
                 marker.set_data([], [])
@@ -381,8 +398,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 if circ is not None:
                     circ.set_visible(False)
             else:
-                xs = trailing['smoothed_x'].to_numpy()
-                ys = trailing['smoothed_y'].to_numpy()
+                xs = tag_info['xs'][lo:hi]
+                ys = tag_info['ys'][lo:hi]
                 trail_line.set_data(xs, ys if show_trail else [])
                 if not show_trail:
                     trail_line.set_data([], [])
@@ -432,8 +449,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                     label.set_position((cx, cy + off))
                     label.set_verticalalignment('bottom')
                     label.set_text(tag_info['label'] if show_labels else '')
-                    bv = (trailing['battery_voltage'].iloc[-1]
-                          if 'battery_voltage' in trailing.columns else None)
+                    bv = (tag_info['battery'][hi - 1]
+                          if tag_info['battery'] is not None else None)
                     batt_label.set_position((cx, cy + off))
                     batt_label.set_text(f"{bv:.2f} V" if bv is not None and pd.notna(bv) else '')
                 else:

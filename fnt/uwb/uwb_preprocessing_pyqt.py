@@ -361,6 +361,30 @@ def processing_select_clause(conn, table_name):
     return ", ".join(c for c in PROCESSING_COLUMNS if c in have)
 
 
+def smoothed_csv_timestamps(df, tz):
+    """The exported CSV's timestamps as a tz-aware datetime series.
+
+    Reads the INTEGER `timestamp` column (epoch ms) that the export writes
+    alongside the human-readable `Timestamp` string, and which the string was
+    derived from in the first place. Parsing the string instead cost ~40 s on a
+    15 M-row trial, three times over (proximity, plots, animation), and it had
+    to use format='mixed' because a recording crossing a DST boundary carries
+    two UTC offsets in that column - the same thing that made it fragile, since
+    without utc=True pandas hands back an object-dtype column and every later
+    .dt access raises. One integer per row has neither problem.
+
+    Falls back to the string column when the integer one is missing (a CSV
+    written by an older version) or unusable.
+    """
+    if 'timestamp' in df.columns:
+        epoch = pd.to_numeric(df['timestamp'], errors='coerce')
+        if len(epoch) and epoch.notna().all():
+            return pd.to_datetime(epoch.astype('int64'), unit='ms',
+                                  utc=True).dt.tz_convert(tz)
+    return pd.to_datetime(df['Timestamp'], format='mixed',
+                          utc=True).dt.tz_convert(tz)
+
+
 def forward_backward_ewma(series, span):
     """Zero-phase exponential weighted moving average (filtfilt-style cascade).
 
@@ -1490,16 +1514,7 @@ class PlotSaverWorker(QThread):
                 self.progress.emit("Loading data from CSV...")
                 data = pd.read_csv(self.csv_path, low_memory=False)
                 
-                # Parse Timestamp column (let pandas infer the format automatically)
-                # This handles timezone-aware timestamps like "2025-10-13 18:09:10-06:00"
-                # A recording that crosses a DST boundary has TWO utc offsets in this
-                # column. Without utc=True pandas returns an object-dtype column of
-                # Timestamps rather than a datetime64 one, and every later .dt access
-                # raises - which took out every plot for such a trial. Parse as UTC,
-                # then convert back to the trial's zone.
-                data['Timestamp'] = pd.to_datetime(
-                    data['Timestamp'], format='mixed', utc=True
-                ).dt.tz_convert(self.timezone)
+                data['Timestamp'] = smoothed_csv_timestamps(data, self.timezone)
                 
                 self.progress.emit(f"Loaded {len(data)} records from CSV")
                 coord = 'smoothed' if 'smoothed_x' in data.columns else 'raw (unsmoothed)'
@@ -10413,17 +10428,14 @@ class UWBQuickVisualizationWindow(QWidget):
         coord = ['smoothed_x', 'smoothed_y']
         if not all(c in head.columns for c in coord):
             coord = ['location_x', 'location_y']
-        want = ['shortid', 'Timestamp'] + coord
+        # 'timestamp' as well as 'Timestamp': the integer column is what
+        # smoothed_csv_timestamps reads, and it is far cheaper than parsing
+        # the string. The string stays in the list as the fallback.
+        want = ['shortid', 'timestamp', 'Timestamp'] + coord
         df = pd.read_csv(csv_path, low_memory=False,
                          usecols=[c for c in want if c in head.columns])
-        # A recording that crosses a DST boundary has TWO utc offsets in this
-        # column. Without utc=True pandas returns an object-dtype column of
-        # Timestamps rather than a datetime64 one, and every later .dt access
-        # raises - which took out every plot for such a trial. Parse as UTC,
-        # then convert back to the trial's zone.
-        df['Timestamp'] = pd.to_datetime(
-            df['Timestamp'], format='mixed', utc=True
-        ).dt.tz_convert(self.combo_timezone.currentText())
+        df['Timestamp'] = smoothed_csv_timestamps(
+            df, self.combo_timezone.currentText())
         tags = sorted(t for t in df['shortid'].unique()
                       if not selected_tags or t in selected_tags)
         worker = PlotSaverWorker(
@@ -10937,15 +10949,8 @@ class UWBQuickVisualizationWindow(QWidget):
             if csv_path and os.path.exists(csv_path):
                 self.log_message(f"Loading animation data from CSV...")
                 anim_data = pd.read_csv(csv_path, low_memory=False)
-                # Parse Timestamp column (with mixed format to handle timezone-aware timestamps)
-                # A recording that crosses a DST boundary has TWO utc offsets in this
-                # column. Without utc=True pandas returns an object-dtype column of
-                # Timestamps rather than a datetime64 one, and every later .dt access
-                # raises - which took out every plot for such a trial. Parse as UTC,
-                # then convert back to the trial's zone.
-                anim_data['Timestamp'] = pd.to_datetime(
-                    anim_data['Timestamp'], format='mixed', utc=True
-                ).dt.tz_convert(self.combo_timezone.currentText())
+                anim_data['Timestamp'] = smoothed_csv_timestamps(
+                    anim_data, self.combo_timezone.currentText())
                 self.log_message(f"Loaded {len(anim_data)} records from CSV")
             else:
                 # Fallback to using self.data
