@@ -11572,6 +11572,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_plan += [(i, 'animation') for i in anim_idx]
         self._batch_plan_pos = 0
         self._batch_step_running = False
+        # Anchors _smoothed_csv_is_fresh: only a CSV written after this
+        # moment can have come from this run.
+        self._batch_started_at = time.time()
+        for _it in self._batch_items:
+            _it.pop('reuse_smoothed', None)
 
         self._batch_active = True
         self._batch_stop_requested = False
@@ -11763,7 +11768,11 @@ class UWBQuickVisualizationWindow(QWidget):
             'conflict_choice': it.get('conflict_choice', ExportConflictDialog.OVERWRITE),
             'temp_frames_dir': getattr(self, '_batch_temp_frames_dir', None),
             # The animation pass renders from the CSV the data pass wrote.
-            'reuse_smoothed': (phase == 'animation'),
+            # The animation pass always reuses what the data pass wrote;
+            # a data retry reuses it only when this run already verified
+            # it (see _smoothed_csv_is_fresh).
+            'reuse_smoothed': (phase == 'animation'
+                               or bool(it.get('reuse_smoothed'))),
         }
         job_dir = tempfile.mkdtemp(prefix='fnt_batch_')
         job_path = os.path.join(job_dir, 'job.json')
@@ -11813,7 +11822,8 @@ class UWBQuickVisualizationWindow(QWidget):
     def _batch_run_in_process(self, it, cfg=None, phase='data'):
         """Fallback for frozen builds: export in this process (no isolation)."""
         self._pending_config_override = cfg if cfg is not None else it.get('config')
-        self._batch_reuse_smoothed = (phase == 'animation')
+        self._batch_reuse_smoothed = (phase == 'animation'
+                                      or bool(it.get('reuse_smoothed')))
         if not self._load_database_path(it['path']):
             it['status'] = 'Failed'
             if getattr(self, '_batch_phase', 'data') == 'data':
@@ -11952,7 +11962,7 @@ class UWBQuickVisualizationWindow(QWidget):
             except Exception:
                 pass
             self._batch_proc = None
-            if failed:
+            if failed and not self._batch_stop_requested:
                 self.log_message(
                     f"✗ Worker exited with code {rc} — this trial failed, "
                     f"continuing with the rest of the queue.")
@@ -11961,6 +11971,24 @@ class UWBQuickVisualizationWindow(QWidget):
         phase = getattr(self, '_batch_phase', 'data')
         has_anim = bool((it.get('config') or {}).get('save_animation')
                         or (it.get('config') or {}).get('social_animation'))
+
+        # A worker that stopped because Stop Batch killed it did not fail -
+        # nothing went wrong, the user changed their mind. Calling it a failure
+        # buried what HAD worked: a trial whose data products were already on
+        # disk was summarised as "Failed (animation)" because an hour into the
+        # render someone pressed stop.
+        if self._batch_stop_requested:
+            it['status'] = ('Data ✓ (animation cancelled)'
+                            if phase == 'animation' and it.get('data_ok')
+                            else f'Cancelled ({phase})')
+            self.log_message(
+                f"BATCH {os.path.basename(it['path'])} [{phase}]: "
+                f"{it['status']}")
+            self._refresh_batch_list()
+            self._batch_step_running = False
+            self._batch_plan_pos += 1
+            QTimer.singleShot(0, self._batch_step)
+            return
 
         # A worker that DIED (native fault) is worth another go: those
         # faults are non-deterministic. A worker that ran and reported an
@@ -11977,6 +12005,17 @@ class UWBQuickVisualizationWindow(QWidget):
                  "↺ Worker died on a native fault — retrying ") +
                 f"{os.path.basename(it['path'])} [{phase}], "
                 f"attempt {attempts} of {limit}.")
+            # The smoothed CSV is published atomically and VERIFIED before any
+            # of the stages that crash, so if this attempt got that far the
+            # file on disk is sound. Re-deriving it costs minutes for a
+            # byte-identical result - on a 7-tag trial, ~5 of the ~12 minutes
+            # each retry was spending.
+            if phase == 'data' and self._smoothed_csv_is_fresh(it):
+                it['reuse_smoothed'] = True
+                self.log_message(
+                    "  its smoothed CSV is already written and verified — "
+                    "the retry will reuse it instead of re-processing "
+                    "every tag.")
             self._refresh_batch_list()
             # Re-run the SAME plan step: do not advance _batch_plan_pos.
             # The one-launch guard has to be released explicitly here,
@@ -11994,6 +12033,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 it['data_failed'] = True
         elif phase == 'data':
             # Data products are on disk now; the render (if any) comes later.
+            it['data_ok'] = True
             it['status'] = 'Data ✓ — animation queued' if has_anim else 'Done'
         else:
             it['status'] = 'Done'
@@ -12002,6 +12042,32 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_step_running = False
         self._batch_plan_pos += 1
         QTimer.singleShot(0, self._batch_step)
+
+    def _smoothed_csv_is_fresh(self, it):
+        """True when THIS batch run already wrote and verified the CSV.
+
+        Two guards, because reusing the wrong file would silently analyse the
+        wrong data. The mtime must fall inside this batch run, so a file left
+        by an earlier run is never picked up; and the export only reaches the
+        stages that crash AFTER it has verified what it wrote, so a file that
+        exists and is recent is one that passed. Publication is atomic (a
+        .partial renamed with os.replace), so a half-written file cannot be
+        mistaken for a finished one.
+
+        A trial exported into a timestamped folder (the New Folder conflict
+        choice) simply will not be found here, and falls back to re-processing.
+        """
+        started = getattr(self, '_batch_started_at', None)
+        if started is None:
+            return False
+        try:
+            db_dir = os.path.dirname(it['path'])
+            db_name = os.path.splitext(os.path.basename(it['path']))[0]
+            csv = os.path.join(db_dir, f"{db_name}_FNT_analysis",
+                               f"{db_name}_smoothed.csv")
+            return os.path.exists(csv) and os.path.getmtime(csv) >= started
+        except Exception:
+            return False
 
     @classmethod
     def _is_native_fault(cls, rc):
@@ -12045,8 +12111,10 @@ class UWBQuickVisualizationWindow(QWidget):
             if (status in ('Queued', 'Loading', 'Running', 'Processing data',
                            'Rendering animation', 'Data ✓ — animation queued')
                     or status.startswith('Retrying')):
-                it['status'] = 'Cancelled' if it['status'] != 'Data ✓ — animation queued' \
-                    else 'Data ✓ (animation cancelled)'
+                # A trial whose data pass finished keeps that in its status:
+                # its animation was cancelled, its CSVs and plots were not.
+                it['status'] = ('Data ✓ (animation cancelled)'
+                                if it.get('data_ok') else 'Cancelled')
         self._refresh_batch_list()
         # Every item lands in exactly one bucket, and anything unrecognised
         # is reported rather than dropped - a status that matched none of
@@ -12067,6 +12135,14 @@ class UWBQuickVisualizationWindow(QWidget):
         total = len(self._batch_items)
         summary = (f"{done} done, {failed} failed, {cancelled} cancelled"
                    + (f", {len(unknown)} unaccounted" if unknown else ""))
+        # A stopped run reads as all-cancelled, which undersells it: the CSVs
+        # and plots of every trial that got that far are on disk and do not
+        # need redoing. Say so, rather than letting '0 done' imply the hours
+        # before the stop were wasted.
+        data_ok = sum(1 for it in self._batch_items if it.get('data_ok'))
+        if data_ok > done:
+            summary += (f" ({data_ok} of {total} have their data products "
+                        f"complete)")
         self.log_message(f"BATCH FINISHED: {total} trial(s) \u2014 {summary}")
         for u in unknown:
             self.log_message(f"  unaccounted status \u2014 {u}")
@@ -12139,6 +12215,26 @@ class UWBQuickVisualizationWindow(QWidget):
         if not check:
             return True, []
 
+        # Fast path first. Read those columns AS NUMBERS: a corrupted cell
+        # cannot parse, so pandas hands the whole column back as object dtype
+        # - the same signal the string scan below looks for, for a fifth of
+        # the cost (6 s against 35 s on a 14 M-row trial). Chunked, so a large
+        # file is still bounded in memory.
+        try:
+            suspect = False
+            for chunk in pd.read_csv(path, usecols=check, chunksize=chunksize):
+                if any(not pd.api.types.is_numeric_dtype(chunk[c])
+                       for c in check):
+                    suspect = True
+                    break
+            if not suspect:
+                return True, []
+        except Exception as e:
+            return False, [f"could not read the file: {e}"]
+
+        # Something did not parse. Re-read as text to name the file, the line
+        # and the value - this is the expensive pass, and now it only runs
+        # when there is actually something to report.
         line0 = 1                       # 1-based, after the header
         try:
             for chunk in pd.read_csv(path, usecols=check, dtype=str,
@@ -12499,7 +12595,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     anim_csv_path = _existing if save_animation else None
                     needs_processed_data = False
                     self.log_message(
-                        f"Animation pass: reusing existing {os.path.basename(_existing)} "
+                        f"Reusing the existing {os.path.basename(_existing)} "
                         f"(no re-processing).")
                 else:
                     self.log_message(
@@ -12760,8 +12856,21 @@ class UWBQuickVisualizationWindow(QWidget):
                     # for pairwise distances, so it is loaded as one frame here —
                     # only when proximity/SNA is actually requested.
                     if csv_path and os.path.exists(csv_path):
-                        prox_data = pd.read_csv(csv_path, low_memory=False)
-                        prox_data['Timestamp'] = pd.to_datetime(prox_data['Timestamp'], format='ISO8601')
+                        # Only the four columns detect_proximity uses, and the
+                        # time from the INTEGER column: parsing the ISO string
+                        # cost ~34 s on a 14 M-row trial for an answer the
+                        # integer gives in one, and the six unused columns
+                        # doubled the read on top of that.
+                        _head = pd.read_csv(csv_path, nrows=0)
+                        _coord = (['smoothed_x', 'smoothed_y']
+                                  if 'smoothed_x' in _head.columns
+                                  else ['location_x', 'location_y'])
+                        _want = ['shortid', 'timestamp', 'Timestamp'] + _coord
+                        prox_data = pd.read_csv(
+                            csv_path, low_memory=False,
+                            usecols=[c for c in _want if c in _head.columns])
+                        prox_data['Timestamp'] = smoothed_csv_timestamps(
+                            prox_data, self.combo_timezone.currentText())
                     else:
                         self.log_message("Error: No smoothed data available for proximity detection")
                         prox_data = None
