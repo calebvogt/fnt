@@ -19,10 +19,16 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
+
+
+# NOTE: an earlier revision pointed LSLAPICFG at a generated lsl_api.cfg to
+# silence liblsl's start-up logging. That was removed: the log tee in
+# logbuffer.py already keeps the terminal quiet, so the config file bought
+# nothing while adding a way for stream resolution to break. Don't reintroduce
+# it — suppress liblsl output at the fd level instead.
 
 # Note: mne_lsl (liblsl) is imported lazily inside LSLReaderThread.run() so that
 # device discovery, the streamer subprocess, and the CSV recorder remain usable
@@ -51,8 +57,8 @@ def find_devices(timeout=15):
         )
     except FileNotFoundError:
         raise RuntimeError(
-            "OpenMuse CLI not found. Install the muse extra:\n"
-            '    pip install -e ".[muse]"'
+            "OpenMuse CLI not found. Reinstall project dependencies:\n"
+            "    pip install -e ."
         )
     except subprocess.TimeoutExpired as exc:
         raw = (exc.stdout or "") + (exc.stderr or "")
@@ -147,16 +153,24 @@ class MuseStreamProcess:
 
 
 class MuseRecorder:
-    """Writes per-stream samples to CSV files in a timestamped session folder.
+    """Writes one CSV per stream into the given directory.
 
-    Thread-safe: ``write`` is called from the reader thread while ``start``/
-    ``stop`` are called from the GUI thread.
+    Thread-safe: ``write`` is called from the reader thread while ``stop`` is
+    called from the GUI thread.
     """
 
-    def __init__(self, base_dir):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(base_dir, f"MuseStudio_{ts}")
-        os.makedirs(self.session_dir, exist_ok=True)
+    def __init__(self, out_dir, precision=6):
+        """``precision`` = decimal places per value.
+
+        The default 6 is lossless for anything the headband produces. Long
+        overnight runs pass 2: EEG resolution is then 0.01 µV — two orders of
+        magnitude below the device's own ~2 µV noise floor, so nothing real is
+        lost — and it removes roughly a third of a 1.5 GB night.
+        """
+        self.session_dir = out_dir
+        self.precision = int(precision)
+        self._fmt = f"{{:.{int(precision)}f}}"
+        os.makedirs(out_dir, exist_ok=True)
         self._lock = threading.Lock()
         self._files = {}   # stream_name -> (file_handle, csv.writer)
         self._counts = {}  # stream_name -> int
@@ -175,7 +189,10 @@ class MuseRecorder:
                 writer = self._open_stream_file(stream_name, channel_names)
             fh, w = writer
             for i in range(len(timestamps)):
-                w.writerow([f"{timestamps[i]:.6f}", *(f"{v:.6f}" for v in data[i])])
+                # Timestamps keep full precision regardless — they carry the
+                # alignment between streams and must not be rounded.
+                w.writerow([f"{timestamps[i]:.6f}",
+                            *(self._fmt.format(v) for v in data[i])])
             self._counts[stream_name] = self._counts.get(stream_name, 0) + len(timestamps)
             fh.flush()
 
@@ -214,13 +231,15 @@ class LSLReaderThread(QThread):
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, resolve_timeout=10.0, parent=None):
+    def __init__(self, resolve_timeout=10.0, address=None, parent=None):
         super().__init__(parent)
         self._running = False
         self._resolve_timeout = resolve_timeout
+        self._address = address       # restrict to this device's streams if given
         self._recorder = None
         self._rec_lock = threading.Lock()
         self._channel_names = {}  # stream_name -> [names]
+        self._sfreq = {}          # stream_name -> sample rate (Hz)
 
     # --- recording control (called from GUI thread) ---
     def start_recording(self, recorder):
@@ -239,17 +258,28 @@ class LSLReaderThread(QThread):
         """Return a copy of {stream_name: [channel names]} (valid after connect)."""
         return dict(self._channel_names)
 
+    def sample_rate(self, stream_name):
+        """Sample rate (Hz) of a resolved stream, or None."""
+        return self._sfreq.get(stream_name)
+
     def stop(self):
         self._running = False
 
     def run(self):
         self._running = True
+        inlets = []
         try:
             from mne_lsl.lsl import StreamInlet, resolve_streams
 
             self.status.emit("Resolving LSL streams from OpenMuse...")
             infos = resolve_streams(timeout=self._resolve_timeout)
             muse_infos = [si for si in infos if si.name.startswith(MUSE_STREAM_PREFIX)]
+            # If we know the device address, prefer its streams (OpenMuse embeds
+            # the id in the stream name) so a second headband/app doesn't leak in.
+            if self._address:
+                matched = [si for si in muse_infos if self._address in si.name]
+                if matched:
+                    muse_infos = matched
             if not muse_infos:
                 self.error.emit(
                     "No Muse LSL streams found. Is the OpenMuse streamer "
@@ -257,14 +287,13 @@ class LSLReaderThread(QThread):
                 )
                 return
 
-            inlets = []
             names = []
             for si in muse_infos:
                 inlet = StreamInlet(si, max_buffered=4)
                 inlet.open_stream(timeout=5.0)
                 sinfo = inlet.get_sinfo()
-                ch_names = self._channel_names_for(sinfo)
-                self._channel_names[si.name] = ch_names
+                self._channel_names[si.name] = self._channel_names_for(sinfo)
+                self._sfreq[si.name] = getattr(sinfo, "sfreq", None)
                 inlets.append((si.name, inlet))
                 names.append(si.name)
 
@@ -287,15 +316,14 @@ class LSLReaderThread(QThread):
                         rec.write(name, timestamps, data, self._channel_names[name])
                 if not got_any:
                     time.sleep(0.005)  # avoid busy-spin when no data is pending
-
+        except Exception as exc:  # noqa: BLE001 - surface any backend failure to UI
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+        finally:
             for _, inlet in inlets:
                 try:
                     inlet.close_stream()
                 except Exception:
                     pass
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure to UI
-            self.error.emit(f"{type(exc).__name__}: {exc}")
-        finally:
             self.disconnected.emit()
 
     @staticmethod

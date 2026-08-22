@@ -598,11 +598,15 @@ class SpectrogramWidget(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(self._cursor_pos, int(rpx), int(rpx))
 
-        # Draw playback position line
+        # Draw playback position line. Use black on the light background of the
+        # inverted-grayscale colormap (where white is invisible), white otherwise.
         if self.playback_position is not None:
             x = self._time_to_x(self.playback_position, spec_rect)
             if spec_rect.left() <= x <= spec_rect.right():
-                painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
+                line_color = (QColor(0, 0, 0, 230)
+                              if self.colormap_name == 'grayscale_inv'
+                              else QColor(255, 255, 255, 220))
+                painter.setPen(QPen(line_color, 2))
                 painter.drawLine(int(x), int(spec_rect.top()),
                                  int(x), int(spec_rect.bottom()))
 
@@ -1392,8 +1396,8 @@ class WaveformOverviewWidget(QWidget):
         # Draw viewport highlight
         x1 = int(self.view_start / self.total_duration * w)
         x2 = int(self.view_end / self.total_duration * w)
-        painter.setBrush(QBrush(QColor(0, 120, 212, 50)))
-        painter.setPen(QPen(QColor(0, 120, 212, 200), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 50)))
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
         painter.drawRect(x1, 0, max(2, x2 - x1), h)
 
     def mousePressEvent(self, event):

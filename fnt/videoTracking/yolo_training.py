@@ -17,6 +17,8 @@ from typing import Callable, Dict, List, Optional
 import cv2
 import numpy as np
 
+from .mask_tracker_annotator import segmentation_to_polygons
+
 
 @dataclass
 class YOLOTrainingConfig:
@@ -108,7 +110,10 @@ def convert_coco_to_yolo(
             cls_idx = cat_id_to_idx.get(ann["category_id"])
             if cls_idx is None:
                 continue
-            for seg in ann["segmentation"]:
+            # YOLO wants normalised polygons, so RLE ground truth is traced
+            # back to outlines here. The stored mask stays lossless; only this
+            # throwaway training copy is polygonised.
+            for seg in segmentation_to_polygons(ann["segmentation"], h, w):
                 if len(seg) < 6:
                     continue
                 coords = []

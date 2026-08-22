@@ -82,13 +82,14 @@ def get_device_description(device: str) -> str:
     return "CPU"
 
 
-def _polygon_to_mask(segmentation: List[List[float]], height: int, width: int) -> np.ndarray:
-    """Convert COCO polygon segmentation to a binary mask."""
-    mask = np.zeros((height, width), dtype=np.uint8)
-    for poly in segmentation:
-        pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
-        cv2.fillPoly(mask, [pts], 1)
-    return mask
+def _polygon_to_mask(segmentation, height: int, width: int) -> np.ndarray:
+    """Convert any COCO segmentation (RLE or polygons) to a uint8 mask.
+
+    Ground truth is RLE now; polygons still appear in projects annotated
+    before that change, so both are accepted here.
+    """
+    from .mask_tracker_annotator import segmentation_to_mask
+    return segmentation_to_mask(segmentation, height, width).astype(np.uint8)
 
 
 class COCOInstanceDataset:

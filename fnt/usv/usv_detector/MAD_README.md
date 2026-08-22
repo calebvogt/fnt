@@ -10,16 +10,32 @@ GUI entry point: `python fnt/usv/mad_pyqt.py`
 
 ---
 
-## The two tabs
+## One list, one canvas
 
-1. **Label & Train** — build the project. Paint/segment calls on a handful of
-   files, confirm them (they become training examples), and train a U-Net.
-2. **Inference (Deploy)** — point a trained model at your recordings. It writes
-   per-call detections you review (accept / reject / adjust).
+MAD follows SLEAP's project model: a project **points at** recordings where they
+already live, the way a SLEAP project points at videos. There is a single
+**Audio** list — every recording the project knows about — and a single
+spectrogram canvas. Click a row to preview it, label it, and review its
+detections.
 
-The loop you're meant to run: label a few calls → train → run inference →
-correct the predictions → (optionally) feed corrections back in and retrain
-until the model is accurate enough, then just deploy and review.
+Anything you confirm in that list trains the model. There is no separate
+"training set" to curate: if a recording is in the list, its labels train; if you
+don't want it to, take it out of the list.
+
+The loop you're meant to run: add audio → label a few calls → train → run
+inference → correct the predictions → (optionally) feed corrections back in and
+retrain until the model is accurate enough, then just deploy and review.
+
+**Running large batches** is the one thing that deliberately stays outside the
+list. *Run Inference ▸ Folder* scans a folder tree once and streams the paths
+straight to the worker: thousands of recordings don't become thousands of list
+rows, and production audio you're not curating never joins the training set.
+
+**A project is optional** — right up until you train. Add wavs, label them, load
+a model from any trained project, run inference and review, all with no project
+open (labels and detections save next to the audio either way). Training is what
+needs a project, because the model, its checkpoints and the consolidated example
+store have to live somewhere; the Run Training button offers to make one.
 
 ---
 
@@ -65,11 +81,12 @@ Per recording `<wav>`:
   - `call_number` — 1…N display index, renumbered by onset time on every write.
   - `call_id` — stable join key to the h5 mask (int for predictions, string id
     for hand-labels).
-  - `status` — `pending` (yellow, unreviewed) · `accepted` (green; hand-labels
-    write accepted, and accepting a prediction in train mode also saves a
-    training example) · `rejected` (a **recorded** human "no", kept visible red
-    as an audit trail; *not* used as negative training data). **Delete** drops
-    the row + mask entirely (no `deleted` status).
+  - `status` — `pending` (unreviewed) · `accepted` (hand-labels write accepted,
+    and accepting a prediction in train mode also saves a training example) ·
+    `rejected` (a **recorded** human "no", kept visible as an audit trail;
+    *not* used as negative training data). **Delete** drops the row + mask
+    entirely (no `deleted` status). The on-screen color of each status depends
+    on the active spectrogram colormap — see *Review colors* below.
   - `source` — `prediction` or `label`.
   - `class` — call type (e.g. `USV`); `score` — mean model probability (`1.0`
     for hand-labels). Inference preserves existing label rows and replaces only
@@ -81,6 +98,22 @@ Per recording `<wav>`:
     first); the basis for bout/sequence analysis.
   - `call_rate_hz` — local emission rate: calls whose onset falls within ±0.5 s
     of this one, per second.
+
+  > **Time convention (changed).** Spectrogram frame `i` maps to
+  > `nperseg/(2·sr) + i·(nperseg−noverlap)/sr` seconds — `scipy.signal.spectrogram`
+  > centres its first frame half a window into the signal, and CAD reads its
+  > times straight off that axis. MAD previously used `i·hop/sr`, dropping the
+  > `nperseg/(2·sr)` origin term, so every exported onset sat early by ~1 ms at
+  > `nperseg=512, sr=250 kHz` (two whole hops, and it scales with window size)
+  > and did not line up with CAD's for the same call. Durations were unaffected
+  > (both endpoints shifted equally); absolute onsets were not.
+  >
+  > **CSVs written before this change are offset by `nperseg/(2·sr)`.** Re-run
+  > inference to regenerate them, or add that constant when comparing old files
+  > against new ones, CAD output, or video/UWB timestamps. Stored mask crops
+  > carry their own pixel offsets and are unaffected. `frames_to_seconds()` /
+  > `seconds_to_frames()` in `mad_inference.py` are the single source of truth
+  > for this conversion — use them rather than multiplying by `dt` by hand.
 
   **Frequency box & contour** (the contour is the peak-power frequency traced
   across each time column inside the mask)
@@ -154,27 +187,58 @@ Project-wide:
 - `.scratch/` — temporary masks/predictions for files you're **browsing in
   place** but haven't accepted a call on yet. Wiped on close (see below).
 
-### Browse-in-place ingestion (finding calls in big recording sets)
+### Recordings are referenced, not copied
 
-When recording 24/7 you may have hundreds of wavs and not know which contain
-USVs. Adding a folder to **Label & Train** does **not** copy those files into
-the project. Instead they're **browsed in place**:
+A project does **not** store your audio. `mad_project_info.json` holds an
+`audio_files` table of *references*: absolute path, basename, size, and a
+cheap content fingerprint (size + first and last 1 MiB).
 
-- Their masks/predictions are redirected to `<project>/.scratch/` (so the
-  original recording folders stay clean — no stray `.h5`/`.csv` siblings). This
-  redirect is implemented as a path override consulted by
-  `fnt_mask_store.masks_sibling_path` / `mad_labels.pred_csv_sibling_path`.
-- A file is **graduated** — copied into `recordings/`, with its scratch masks
-  moved alongside and the file recorded in the project — only when you **accept
-  a call** on it (hand-label + confirm, or change a prediction to accepted, via
-  `_ensure_wav_in_project`). Reject/pending/delete do **not** graduate a file.
-- On close, `.scratch/` is discarded, so files you never accepted leave no
-  trace. Browsing is **session-only**: reopening the project shows just the
-  graduated files; re-add the folder to keep searching.
+This is safe because of where training data actually lives. Every confirmed call
+is baked into `training_data.h5` as a self-contained spectrogram patch + mask,
+and `mad_training` reads only that store — **it never opens a wav**. The audio is
+needed for exactly one thing: re-opening a file to look at it.
 
-So you can point MAD at 500 raw recordings, run post-training inference, accept
-calls in the handful that have USVs, and only those few wavs (plus their masks)
-ever land in the project — no bulk copying of files you'll discard.
+That is a much weaker dependency than SLEAP has on its videos. SLEAP stores frame
+indices and coordinates, so a missing video means it cannot train at all; MAD's
+model, labels and detections are all unaffected. So a missing recording is a
+**soft** state, not an error:
+
+- The Audio row shows `⚠` and preview/playback are unavailable.
+- Training, the example store, and every saved detection keep working.
+- Batch inference silently skips missing files rather than aborting the run.
+
+**Finding files again.** `mad_registry.resolve_entries` tries, cheapest first:
+the stored path; then the same basename in a directory where another entry *did*
+resolve (files move in groups, so a resolved sibling is the best hint) or in one
+of the project's `source_folders`. A candidate is accepted only if the size — and
+the fingerprint, when known — matches, so a same-named different recording is
+never silently swapped in.
+
+When automatic resolution fails, **File ▸ Locate Missing Recordings…** asks for
+one file and infers the prefix change from it (`D:/exp/mic2/a.wav` →
+`E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`), then repoints every sibling
+that moved the same way. Fix one, fix two hundred. Prefix matching compares whole
+path components, so a neighbouring `exp_backup/` tree is never dragged along, and
+only files that are *currently missing* and whose rewritten path *exists* are
+changed — a wrong guess is a no-op.
+
+**Portability.** **File ▸ Pack Project (embed audio)…** copies every referenced
+recording into `recordings/`, making the project fully self-contained for
+archiving or handing to a collaborator. Packed files are marked `embedded=True`
+and become project-owned: removing one from the Audio list deletes it (and says
+so first), whereas removing a *referenced* file only unregisters it and never
+touches disk.
+
+**Legacy projects.** Projects with `recordings/` copies still work. Those wavs are
+adopted into the registry on open as `embedded=True`, so nothing changes for them
+unless you delete the copies yourself.
+
+Projects written before the lists were merged kept two entries —
+`training_files` (the curated training set) and `audio_files` (the working
+session list, plain path strings). They are folded into one `audio_files`
+registry on open, registered entries first, and nothing is dropped. Recordings
+that only ever sat in the session list now train the model, since that is what
+being in the list means.
 
 ### Why we do NOT store the full probability grid
 
@@ -220,6 +284,140 @@ re-run inference to regenerate predictions in the new format.
 
 ---
 
+## Batch runs at scale
+
+The target workflow is one model applied to thousands of recordings, so the
+batch path is built around three properties.
+
+**Recursive folder targets.** 24/7 multi-mic sets are nested
+(experiment / mic / day), so folder scans walk the tree. The **Folder** target in
+Run Inference is deliberately *not* routed through the Audio list: adding 3,000
+recordings there would mean 3,000 list widgets plus a sibling-CSV stat per row
+before anything runs — and would enrol production audio into the project's
+training set, since everything in the list trains. The folder is scanned once and
+paths stream to the worker.
+
+**Resumable runs.** Two independent mechanisms, answering different questions:
+
+- `batch_runs/<timestamp>/manifest.jsonl` — the run's own append-only log, one
+  JSON line per file, flushed immediately. A crash at file 2,800 of 3,000 leaves
+  a manifest valid up to 2,799; a torn final line is skipped on read.
+- **Provenance skipping** asks whether a recording already carries detections
+  from *this* model at *these* settings. That lives in the recording's own CSV
+  (`model_name`, `threshold`, `min_blob_pixels`), so it survives losing the
+  manifest and works across runs when two folders overlap.
+
+Only settings that change *detections* invalidate prior work — `batch_size`,
+`amp` and `device` deliberately do not, so raising the batch size never forces a
+redo. Zero-detection files write no prediction rows and so can't be proven done
+from the CSV alone; the manifest covers them, which matters because quiet files
+dominate 24/7 recordings.
+
+**Bounded memory.** `infer_probability_mask` never materializes the whole
+probability grid as float32. The output grid is uint8 (probability x 255), the
+Hann weight accumulator is 1-D (it never varied along frequency), and the float32
+accumulator is per-chunk with the un-finalized tail carried across chunk
+boundaries — so the result is identical to whole-grid accumulation with no seam
+artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
+
+`mad analyze` has the same behavior headless (`--no-resume`, `--run-dir`,
+`--log-root`, `--batch-size`, `--no-amp`) for HPC or overnight runs.
+
+---
+
+## Knowing when a model is ready
+
+### The train/val split holds out whole recordings
+
+Validation is only a measurement if the model has never seen the data. A
+segmentation pipeline makes that easy to get wrong: one long call is sliced into
+several tiles, and neighbouring tiles overlap, so shuffling *tiles* into train
+and val puts near-duplicate — sometimes literally the same — pixels on both
+sides. On a representative label set (3 recordings, 120 calls, long calls
+spanning 3 tiles), a tile-level shuffle left **100%** of validation tiles coming
+from a recording the model trained on and **55%** from a call it had already
+seen other tiles of. Validation Dice then measures memorization.
+
+MAD splits by **group**, strongest level the labels support:
+
+| Level | What's held out | When it's used |
+|---|---|---|
+| `file` | whole recordings | labels on ≥2 recordings — **the only one that answers "will this work on a new recording?"** |
+| `call` | whole calls, recordings shared | all labels on one recording |
+| `tile` | nothing — train and val overlap | a single labeled call |
+
+The level is reported next to the score everywhere it appears (training log, run
+summary, CLI, and the checkpoint itself), and anything below `file` prints a
+warning, because a Dice quoted without that caveat is how an over-fitted model
+gets written up as a working one. `split_seed` (default 42) is recorded in the
+run summary, so a reported number can be reproduced exactly.
+
+The practical consequence: **label at least two recordings** before trusting a
+validation number, and more if your recordings differ in mic, animal, or noise
+floor — that variation is exactly what the held-out file is there to test.
+
+### Call-level evaluation
+
+Training reports validation **Dice** — a *pixel* score on *tiles*. It does not
+answer the question that decides whether to spend hours of compute: how many real
+calls will this find, and how much junk will I have to reject?
+
+**Evaluate Model…** answers that at call level. It matches predicted blobs
+against hand-labeled calls (time and frequency IoU, greedy by score, one-to-one —
+the same accounting a human does) and reports precision / recall / F1 across a
+threshold sweep. Because every prediction stores its own score, the whole curve
+comes from **one** inference pass: run once at a permissive threshold, then
+re-score the same detections at each cutoff. Picking a threshold stops being a
+guess. Use held-out labeled files — scoring on training files flatters the model.
+
+---
+
+## Reviewing at scale
+
+After a large run the bottleneck is human attention, not compute.
+
+- **Run Summary** (Ctrl+B) — per-file results from the manifest: which
+  recordings have calls, how many, calls/min. Reads no audio, so it opens
+  instantly. Double-click to review a file.
+- **Detection Gallery** (G) — a contact sheet of mask crops; click tiles to
+  cycle accept -> reject, then Apply. This is what the per-call crop storage
+  buys: a page is a few hundred KB and touches no audio. Decisions commit
+  through the same paths as one-at-a-time review, so training examples, CSV
+  status and undo behave identically.
+- **Min score slider** — hides pending predictions below a confidence.
+  Call-level re-thresholding for free, with no re-run, using the stored score.
+  It never hides accepted or rejected calls (a decision is not a guess), and the
+  count label always reports how many are hidden.
+
+---
+
+## Review colors
+
+Overlay colors are **not fixed** — they're chosen per spectrogram colormap
+(`_OVERLAY_PALETTES` in `mad_pyqt.py`). A fixed palette always collides with
+some map: green confirmed masks disappear into viridis's green midtones and
+yellow predictions disappear into its bright end. Each palette therefore draws
+from hues the active map never produces, and every outline is stroked over a
+contrast **halo** pen, which is what actually keeps it legible across the map's
+full dark→bright range.
+
+| Colormap | confirmed | pending | rejected |
+|---|---|---|---|
+| Viridis | white | magenta | red |
+| Magma / Inferno | white | cyan | red |
+| Grayscale | cyan | magenta | red |
+| Grayscale Inverted | blue | purple | dark red |
+
+Two rules keep it readable while switching maps: `rejected` stays red wherever
+the map allows (it's an audit trail — stable semantics beat maximum pop), and
+`confirmed` always takes the map's most contrasting hue, since that's the state
+you scan for. The legend under **Labeling Tools** is generated from the active
+palette, and the detections list, waveform-overview marks and per-file
+`(A, P, R)` badges all read from the same source, so no surface can drift out
+of sync.
+
+---
+
 ## Inference options (what the dialog settings mean)
 
 - **Probability threshold** (default `0.5`) — the per-pixel cutoff described
@@ -259,9 +457,10 @@ re-run inference to regenerate predictions in the new format.
 |---|---|
 | `mad_pyqt.py` | PyQt5 GUI (labeling, review, training/inference dialogs). |
 | `mad_inference.py` | Run a checkpoint over a wav → CSV rows + per-call crops. |
-| `mad_training.py` | Train the U-Net from confirmed examples. |
+| `mad_training.py` | Train the U-Net from confirmed examples; grouped (leak-free) train/val split. |
 | `mad_examples.py` | Confirmed training-example store (`training_data.h5`). |
 | `mad_dataset.py` | Spectrogram/tile helpers shared by training & inference. |
-| `mad_project.py` | Project config / on-disk layout. |
+| `mad_project.py` | Project config / on-disk layout; folds pre-merge two-list projects into one `audio_files` registry. |
+| `mad_registry.py` | Referenced-recording registry: fingerprints, re-resolving moved files. |
 | `mad_labels.py` | Sibling-path helpers (CSV naming, etc.). |
 | `fnt_mask_store.py` | Shared HDF5 mask storage (CAD + MAD); `/calls`, `/pred_calls`, training store, repack. |

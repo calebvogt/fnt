@@ -26,7 +26,11 @@ classifiers = [
 dependencies = [
     # Core scientific stack
     "numpy>=1.24",
-    "pandas",
+    # Pin to the pandas 2.x line: pandas 3.0 makes Copy-on-Write mandatory and
+    # changes groupby.apply / default string dtype, which the preprocessing
+    # pipeline was not written against. Keeps a fresh `pip install -e .` from
+    # silently jumping to 3.x.
+    "pandas>=2.2,<3",
     "scipy",
     "matplotlib",
     "pytz",
@@ -60,6 +64,8 @@ dependencies = [
     "mne-lsl",        # LSL bindings (bundles liblsl on macOS); also pulled by OpenMuse
     "bleak",          # BLE backend (macOS CoreBluetooth, no dongle required)
     "pyqtgraph",      # fast live multichannel scrolling at 256 Hz
+    "PyOpenGL",       # ABMA 3D live arena view (pyqtgraph.opengl)
+    "python-igraph>=0.11",   # social-network construction/metrics/layout (SNA)
 ]
 
 [project.optional-dependencies]
@@ -82,6 +88,7 @@ all = [
 
 [project.scripts]
 fnt = "fnt.gui_pyqt:main"
+mad = "fnt.usv.usv_detector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"

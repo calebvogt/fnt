@@ -1,6 +1,6 @@
 [![build](https://github.com/calebvogt/fnt/actions/workflows/build.yml/badge.svg)](https://github.com/calebvogt/fnt/actions/workflows/build.yml)
 
-# Field Neuroethology Toolbox (fnt)
+# FieldNeuroToolbox (fnt)
 
 Preprocessing and analysis toolbox for field and laboratory neurobehavioral data. This software is fully open source and made available freely to the research/hobbyist community. The software is released "as-is", and will continue to be updated as our own research needs evolve. Please open an issue for bugs or for feature requests! Thanks for checking us out! 
 
@@ -13,7 +13,7 @@ Subscribe for updates!
 
 ### Standalone Executables (Recommended)
 
-The easiest way to use FieldNeuroethologyToolbox is by downloading the pre-built standalone executable for your operating system. **You do not need to install Python or Anaconda to use this version.**
+The easiest way to use FieldNeuroToolbox is by downloading the pre-built standalone executable for your operating system. **You do not need to install Python or Anaconda to use this version.**
 
 **Requirements for the Executable:**
 
@@ -102,7 +102,7 @@ pip install -e .
 
 ### Launch the GUI
 
-After installation, launch the FieldNeuroethologyToolbox GUI:
+After installation, launch the FieldNeuroToolbox GUI:
 
 ```bash
 conda activate fnt
@@ -126,3 +126,15 @@ That's it — the updated code is immediately available the next time you run `f
 conda activate fnt
 pip install -e .
 ```
+
+## License
+
+FieldNeuroToolbox is released under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See the [LICENSE](LICENSE) file for the full text.
+
+In short:
+
+- You are free to use, modify, and redistribute this software, including for commercial purposes.
+- If you distribute a modified version, you must release your source code under the same license.
+- If you run a modified version as a network service, you must offer its source code to users of that service.
+
+If you use FNT in published research, please cite this repository: [github.com/calebvogt/fnt](https://github.com/calebvogt/fnt)

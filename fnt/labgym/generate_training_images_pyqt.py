@@ -172,7 +172,7 @@ class GenerateTrainingImagesWindow(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("Generate Training Images - FieldNeuroethologyToolbox")
+        self.setWindowTitle("Generate Training Images - FieldNeuroToolbox")
         self.setGeometry(200, 200, 900, 750)
         self.setMinimumSize(700, 600)
 

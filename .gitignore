@@ -249,6 +249,7 @@ sam_models_local/
 
 # R history
 .Rhistory
+site/
 
 # macOS
 .DS_Store

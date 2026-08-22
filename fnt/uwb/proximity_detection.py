@@ -75,10 +75,20 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     # Round timestamp to nearest second (reduces computation like R version)
     work['ts_rounded'] = work['Timestamp'].dt.round('1s')
 
-    # Derive Day and Date from timestamp
-    work['Date'] = work['ts_rounded'].dt.date
-    min_date = work['Date'].min()
-    work['Day'] = (work['Date'] - min_date).apply(lambda d: d.days + 1)
+    # Derive Day and Date from timestamp.
+    #
+    # Kept as datetime64 normalised to midnight rather than Python
+    # ``datetime.date`` objects. The old form built an object column (one Python
+    # date per row) and then ran a per-row ``.apply()`` over the differences —
+    # on a multi-million-row trial that is tens of millions of short-lived
+    # object allocations before any distance is computed, which is slow and a
+    # large amount of native allocator churn. The vectorised form below is
+    # equivalent (both use the UTC calendar day) and allocates nothing per row.
+    # Converted back to plain dates at the very end, on the much smaller bouts
+    # table, so the exported CSV is byte-identical.
+    day0 = work['ts_rounded'].dt.normalize()
+    work['Date'] = day0
+    work['Day'] = (day0 - day0.min()).dt.days + 1
 
     # Apply animal labels
     if label_map:
@@ -205,6 +215,9 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         ['animal1', 'animal2', 'Day', 'Date', 'bout_start', 'bout_stop',
          'duration_s', 'mean_distance', 'n_observations']
     ].sort_values(['animal1', 'animal2', 'bout_start']).reset_index(drop=True)
+
+    # Present Date as a plain calendar date, matching the previous output.
+    proximity_bouts['Date'] = proximity_bouts['Date'].dt.date
 
     _log(f"  {len(proximity_bouts)} proximity bouts detected")
 

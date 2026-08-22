@@ -183,4 +183,4 @@ print(f"Duration: {df['time_s'].iloc[-1]:.1f} seconds")
 
 **Version:** 0.1.0  
 **Last Updated:** 2024  
-**Part of:** FieldNeuroethologyToolbox
+**Part of:** FieldNeuroToolbox

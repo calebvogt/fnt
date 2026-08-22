@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FieldNeuroethologyToolbox (FNT) - PyQt Main GUI Application
+FieldNeuroToolbox (FNT) - PyQt Main GUI Application
 
 A professional GUI interface for neurobehavioral data preprocessing and analysis.
 
@@ -49,6 +49,7 @@ except ImportError:
 import threading
 from datetime import datetime
 from fnt.fed3.fed_widgets import FEDTabWidget
+from fnt.tool_launcher import ToolProcessManager
 
 
 def resource_path(relative_path):
@@ -132,13 +133,16 @@ class UpdateCheckerThread(QThread):
 
 
 class FNTMainWindow(QMainWindow):
-    """Main PyQt GUI window for FieldNeuroethologyToolbox"""
+    """Main PyQt GUI window for FieldNeuroToolbox"""
     
     def __init__(self):
         super().__init__()
         self.current_worker = None
+        # Every tool window runs in its own OS process, so a native crash in
+        # one tool can't take down the others (see fnt.tool_host).
+        self.tools = ToolProcessManager(self)
         self.init_ui()
-        
+
         # Start update check
         self.update_thread = UpdateCheckerThread(self.version)
         self.update_thread.update_available.connect(self.show_update_link)
@@ -170,7 +174,7 @@ class FNTMainWindow(QMainWindow):
             except Exception:
                 pass
             
-        self.setWindowTitle(f"FieldNeuroethologyToolbox (FNT) v{self.version}")
+        self.setWindowTitle(f"FieldNeuroToolbox (FNT) v{self.version}")
         self.setGeometry(100, 100, 1100, 780)
         self.setMinimumSize(850, 650)
         
@@ -316,6 +320,7 @@ class FNTMainWindow(QMainWindow):
         self.create_fed_tab()
         self.create_imaging_tab()
         self.create_wifp_tab()
+        self.create_abma_tab()
         self.create_musestudio_tab()
         self.create_utilities_tab()
         
@@ -323,7 +328,7 @@ class FNTMainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.status_bar.setSizeGripEnabled(False)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready - FieldNeuroethologyToolbox initialized")
+        self.status_bar.showMessage("Ready - FieldNeuroToolbox initialized")
         
         self.update_label = QLabel()
         self.update_label.setOpenExternalLinks(True)
@@ -373,7 +378,7 @@ class FNTMainWindow(QMainWindow):
         # Title and subtitle in the center
         text_layout = QVBoxLayout()
         
-        title = QLabel("Field Neuroethology Toolbox (FNT)")
+        title = QLabel("FieldNeuroToolbox (FNT)")
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont("Arial", 20, QFont.Bold))
         title.setStyleSheet("color: #0078d4; background-color: transparent;")
@@ -465,6 +470,21 @@ class FNTMainWindow(QMainWindow):
         tracking_group.setLayout(tracking_layout)
         layout.addWidget(tracking_group)
 
+        # SLEAP Utilities group
+        sleap_group = QGroupBox("SLEAP Utilities")
+        sleap_layout = QGridLayout()
+
+        sleap_buttons = [
+            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
+            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
+            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
+            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
+        ]
+
+        self.create_button_grid(sleap_layout, sleap_buttons)
+        sleap_group.setLayout(sleap_layout)
+        layout.addWidget(sleap_group)
+
         # Behavioral scoring group
         scoring_group = QGroupBox("Behavior Scoring")
         scoring_group_layout = QGridLayout()
@@ -535,12 +555,60 @@ class FNTMainWindow(QMainWindow):
         quick_buttons = [
             ("UWB PreProcessing Tool", "Preprocess and export UWB tracking data", self.run_uwb_preprocessing),
         ]
-        
+
         self.create_button_grid(quick_layout, quick_buttons)
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
-        
+
         layout.addStretch()
+
+
+    def create_abma_tab(self):
+        """Create the ABMA (Animal Behavior Modeling Arena) tab"""
+        tab, layout = self._make_scrollable_tab("ABMA")
+
+        desc = QLabel("Animal Behavior Modeling Arena — in silico agent-based experiments")
+        desc.setFont(QFont("Arial", 10, QFont.Bold))
+        desc.setStyleSheet("color: #cccccc; margin: 10px;")
+        layout.addWidget(desc)
+
+        design_group = QGroupBox("Experiment Designer")
+        design_layout = QGridLayout()
+        design_buttons = [
+            ("Animal Behavior Modeling Arena (ABMA)",
+             "Design an arena, build populations, run replicate trials, export tracking data",
+             self.run_abma_designer),
+        ]
+        self.create_button_grid(design_layout, design_buttons)
+        design_group.setLayout(design_layout)
+        layout.addWidget(design_group)
+
+        info_group = QGroupBox("About ABMA")
+        info_layout = QVBoxLayout()
+        info_label = QLabel(
+            "<b>Run animal-behavior experiments in silico.</b><br>"
+            "1. <b>Arena</b> — set dimensions/boundary and place nests, food, water<br>"
+            "2. <b>Population</b> — define founder cohorts with sex, genotype "
+            "(e.g. OXTR:KO), and treatment (e.g. methimazole for anosmia)<br>"
+            "3. <b>Experiment</b> — set duration, replicates, circadian activity, seed<br>"
+            "4. <b>Run</b> — watch agents live, then export data<br><br>"
+            "<b>Key design:</b> output <code>uwb_&lt;trial&gt;_processed.csv</code> "
+            "matches FNT's UWB preprocessing schema exactly, so the UWB Proximity/"
+            "Network tools and your R pipeline run unchanged on simulated animals."
+        )
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+
+
+    def run_abma_designer(self):
+        """Launch the ABMA experiment designer window"""
+        self.tools.launch("abma_designer")
 
 
     def create_rfid_tab(self):
@@ -571,18 +639,7 @@ class FNTMainWindow(QMainWindow):
 
     def run_rfid_preprocessing(self):
         """Launch RFID Preprocessing Tool"""
-        try:
-            from fnt.rfid.rfid_preprocessing_pyqt import RFIDPreprocessingWindow
-
-            self.rfid_preprocessing_window = RFIDPreprocessingWindow()
-            self.rfid_preprocessing_window.show()
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Error",
-                f"Failed to launch RFID tool: {str(e)}\n\n"
-                "Make sure dependencies are installed:\n"
-                "pip install networkx openpyxl"
-            )
+        self.tools.launch("rfid_preprocessing")
     
     def create_fed_tab(self):
         """Create the FED processing tab using modular widget"""
@@ -630,16 +687,16 @@ class FNTMainWindow(QMainWindow):
             self.fed_window.setWindowTitle("FED Processing Tool")
             self.fed_window.resize(1000, 800)
             self.fed_window.setStyleSheet(self.styleSheet())
-            
+
             # Wrap FEDTabWidget in a container with margins to match other FNT windows
             container = QWidget()
             container_layout = QVBoxLayout(container)
             container_layout.setContentsMargins(10, 10, 10, 10)
-            
+
             fed_widget = FEDTabWidget(parent=self.fed_window, worker_class=WorkerThread)
             self.fed_window.fed_widget = fed_widget
             container_layout.addWidget(fed_widget)
-            
+
             self.fed_window.setCentralWidget(container)
             self.fed_window.show()
         except Exception as e:
@@ -751,7 +808,7 @@ class FNTMainWindow(QMainWindow):
 
     def create_musestudio_tab(self):
         """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
-        tab, layout = self._make_scrollable_tab("EEG+fNIRS")
+        tab, layout = self._make_scrollable_tab("Muse")
 
         desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
@@ -761,7 +818,7 @@ class FNTMainWindow(QMainWindow):
         group = QGroupBox("MuseStudio")
         group_layout = QGridLayout()
         buttons = [
-            ("Open MuseStudio",
+            ("MuseStudio",
              "Connect to a Muse S Athena over Bluetooth, live-plot EEG/fNIRS, and record to CSV",
              self.run_musestudio),
         ]
@@ -775,12 +832,17 @@ class FNTMainWindow(QMainWindow):
             "<b>MuseStudio</b> connects directly to a Muse S Athena headband over "
             "Bluetooth LE (no phone or dongle on a modern Mac) using "
             "<a href='https://github.com/DominiqueMakowski/OpenMuse'>OpenMuse</a>.<br><br>"
-            "• Live scrolling plots of EEG (256 Hz) and fNIRS (64 Hz)<br>"
+            "• Live scrolling plots of EEG (256 Hz) and optics/fNIRS (64 Hz)<br>"
+            "• Live numeric channel table and battery percentage readout<br>"
+            "• Optional webcam preview + recording, timestamp-synced to the Muse data<br>"
+            "• Binaural-beat generator (base 20–1500 Hz, beat 1–50 Hz) with savable presets<br>"
+            "• Closed-loop biofeedback: interhemispheric synchrony (PLV) drives tone purity, "
+            "with a head-map + synchrony meter<br>"
+            "• Guided sessions: free record, or a one-click timed protocol (10-min binaural trial) "
+            "with on-screen instructions<br>"
             "• Records each stream to CSV in a timestamped session folder<br><br>"
             "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
-            "and experimental, and is not affiliated with InteraXon.<br><br>"
-            "Requires the optional <code>muse</code> dependencies: "
-            "<code>pip install -e \".[muse]\"</code>"
+            "and experimental, and is not affiliated with InteraXon."
         )
         info_label.setWordWrap(True)
         info_label.setOpenExternalLinks(True)
@@ -793,23 +855,21 @@ class FNTMainWindow(QMainWindow):
 
     def run_musestudio(self):
         """Launch the MuseStudio window"""
-        try:
-            from fnt.musestudio.musestudio_pyqt import MuseStudioWindow
-        except ImportError as e:
+        # Check for the optional deps up front so we can give the install hint.
+        # find_spec only looks the modules up — it doesn't import them into the
+        # launcher process.
+        import importlib.util
+        missing = [m for m in ("mne_lsl", "bleak", "pyqtgraph")
+                   if importlib.util.find_spec(m) is None]
+        if missing:
             QMessageBox.critical(
                 self, "MuseStudio dependencies missing",
-                "MuseStudio requires the optional 'muse' dependencies "
-                "(OpenMuse, mne-lsl, bleak, pyqtgraph).\n\n"
-                "Install them with:\n    pip install -e \".[muse]\"\n\n"
-                f"Import error: {str(e)}",
+                "MuseStudio requires OpenMuse, mne-lsl, bleak and pyqtgraph.\n\n"
+                "Reinstall project dependencies with:\n    pip install -e .\n\n"
+                f"Missing: {', '.join(missing)}",
             )
             return
-        try:
-            self.musestudio_window = MuseStudioWindow()
-            self.musestudio_window.setStyleSheet(self.styleSheet())
-            self.musestudio_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"MuseStudio failed: {str(e)}")
+        self.tools.launch("musestudio")
 
     def create_utilities_tab(self):
         """Create the utilities tab"""
@@ -834,21 +894,6 @@ class FNTMainWindow(QMainWindow):
         general_group.setLayout(general_layout)
         layout.addWidget(general_group)
 
-        # SLEAP Utilities group
-        sleap_group = QGroupBox("SLEAP Utilities")
-        sleap_layout = QGridLayout()
-
-        sleap_buttons = [
-            ("Run Inference", "Run SLEAP inference with optional tracking", self.run_sleap_inference_only),
-            ("Convert SLP to CSV/H5", "Convert SLEAP files to analysis formats", self.run_sleap_convert),
-            ("Re-track SLP Files", "Re-run tracking on existing predictions", self.run_sleap_retrack),
-            ("Create Tracked Videos", "Render tracked videos from existing .slp files", self.run_sleap_render_videos),
-        ]
-
-        self.create_button_grid(sleap_layout, sleap_buttons)
-        sleap_group.setLayout(sleap_layout)
-        layout.addWidget(sleap_group)
-
         # LabGym Utilities group
         labgym_group = QGroupBox("LabGym Utilities")
         labgym_layout = QGridLayout()
@@ -866,7 +911,7 @@ class FNTMainWindow(QMainWindow):
         info_layout = QGridLayout()
 
         info_buttons = [
-            ("About FNT", "About FieldNeuroethologyToolbox", self.show_about),
+            ("About FNT", "About FieldNeuroToolbox", self.show_about),
             ("Check Dependencies", "Verify required software is installed", self.check_dependencies),
             ("Open Documentation", "Open FNT documentation", self.open_documentation),
             ("Report Issue", "Report a bug or request a feature", self.report_issue),
@@ -882,6 +927,11 @@ class FNTMainWindow(QMainWindow):
         """Create a grid of buttons with descriptions"""
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
+        # Keep both columns equal width so a lone button occupies half the row
+        # (matching the two-column layout used on the other tabs) instead of
+        # stretching to fill the whole width.
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
         row, col = 0, 0
 
         for title, description, callback in buttons:
@@ -939,68 +989,24 @@ class FNTMainWindow(QMainWindow):
     # Video Processing Methods
     def run_video_trim(self):
         """Launch video trimming tool"""
-        # PyQt dialogs must run in main thread, not worker thread
-        try:
-            from fnt.videoProcessing.video_trim_pyqt import video_trim
-            video_trim()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Video trimming failed: {str(e)}")
+        self.tools.launch("video_trim")
     
     def run_video_concatenate(self):
         """Launch video concatenation tool with PyQt interface"""
-        try:
-            from fnt.videoProcessing.video_concatenate_pyqt import VideoConcatenationGUI
-            
-            # Create a new instance each time to allow multiple windows
-            video_concatenation_window = VideoConcatenationGUI()
-            video_concatenation_window.show()
-            
-            # Store reference to prevent garbage collection (use list to allow multiple instances)
-            if not hasattr(self, 'video_concatenation_windows'):
-                self.video_concatenation_windows = []
-            self.video_concatenation_windows.append(video_concatenation_window)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch video concatenation tool: {str(e)}")
-    
+        self.tools.launch("video_concatenate")
+
     def run_video_processing(self):
         """Launch combined video processing tool with PyQt interface"""
-        try:
-            from fnt.videoProcessing.videoProcessing import VideoProcessingGUI
-            
-            # Create a new instance each time to allow multiple windows
-            video_processing_window = VideoProcessingGUI()
-            video_processing_window.show()
-            
-            # Store reference to prevent garbage collection (use list to allow multiple instances)
-            if not hasattr(self, 'video_processing_windows'):
-                self.video_processing_windows = []
-            self.video_processing_windows.append(video_processing_window)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch video processing tool: {str(e)}")
+        self.tools.launch("video_processing")
 
     def run_behavior_scoring_studio(self):
         """Launch Behavior Scoring Studio"""
-        try:
-            from fnt.videoProcessing.behavior_scoring_studio_pyqt import BehaviorScoringStudioWindow
-            self.behavior_scoring_window = BehaviorScoringStudioWindow()
-            self.behavior_scoring_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Behavior Scoring Studio failed: {str(e)}")
+        self.tools.launch("behavior_scoring")
 
     # SLEAP Processing Methods
     def run_sleap_inference_only(self):
         """Launch SLEAP inference tool with PyQt interface"""
-        try:
-            from fnt.sleapProcessing.sleap_inference_tool_pyqt import VideoInferenceWindow
-            
-            # Create and show the video inference window
-            self.video_inference_window = VideoInferenceWindow()
-            self.video_inference_window.show()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch SLEAP inference tool: {str(e)}")
+        self.tools.launch("sleap_inference")
     
     def run_sleap_convert(self):
         """Launch SLEAP file conversion"""
@@ -1018,68 +1024,29 @@ class FNTMainWindow(QMainWindow):
     
     def run_sleap_render_videos(self):
         """Launch SLEAP video rendering from existing .slp files"""
-        try:
-            from fnt.sleapProcessing.batch_render_videos_pyqt import RenderVideosWindow
-            
-            # Create and show the render videos window
-            self.render_videos_window = RenderVideosWindow()
-            self.render_videos_window.show()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch video rendering tool: {str(e)}")
-    
+        self.tools.launch("sleap_render_videos")
+
     def run_roi_tool(self):
         """Launch ROI Analysis Tool (supports SLEAP, Mask Tracker, and Simple Tracker data)"""
-        try:
-            from fnt.sleapProcessing.sleap_roi_tool_pyqt import ROIToolGUI
-
-            self.roi_tool_window = ROIToolGUI()
-            self.roi_tool_window.show()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch ROI tool: {str(e)}")
+        self.tools.launch("roi_tool")
 
     def run_sam2_annotator(self):
         """Launch Mask Tracker Tool"""
-        try:
-            from fnt.videoTracking.mask_tracker_gui import MaskTrackerWindow
-            self.mask_tracker_window = MaskTrackerWindow()
-            self.mask_tracker_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch Mask Tracker: {str(e)}")
-
+        self.tools.launch("mask_tracker")
 
     # LabGym Methods
     def run_generate_training_images(self):
         """Launch Generate Training Images tool"""
-        try:
-            from fnt.labgym.generate_training_images_pyqt import GenerateTrainingImagesWindow
-
-            self.generate_training_images_window = GenerateTrainingImagesWindow()
-            self.generate_training_images_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch Generate Training Images: {str(e)}")
+        self.tools.launch("generate_training_images")
 
     # USV Processing Methods
     def run_classic_audio_detector(self):
         """Launch Classic Audio Detector - DSP-based detection and labeling"""
-        try:
-            from fnt.usv.classic_audio_detector import ClassicAudioDetectorWindow
-
-            self.cad_window = ClassicAudioDetectorWindow()
-            self.cad_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Classic Audio Detector failed: {str(e)}")
+        self.tools.launch("classic_audio_detector")
 
     def run_mask_audio_detector(self):
         """Launch Mask Audio Detector - segmentation-based labeling, training, inference"""
-        try:
-            from fnt.usv.mad_pyqt import MADMainWindow
-
-            self.mad_window = MADMainWindow()
-            self.mad_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Mask Audio Detector failed: {str(e)}")
+        self.tools.launch("mask_audio_detector")
 
     def run_usv_heterodyne(self):
         """Launch USV heterodyne processing"""
@@ -1090,102 +1057,59 @@ class FNTMainWindow(QMainWindow):
     
     def run_audio_trim(self):
         """Launch audio trimming with spectrogram visualization"""
-        try:
-            from fnt.usv.audio_trim_pyqt import AudioTrimWindow
-            
-            # Create and show the audio trim window
-            self.audio_trim_window = AudioTrimWindow()
-            self.audio_trim_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Audio trimming failed: {str(e)}")
-    
+        self.tools.launch("audio_trim")
+
     def run_compress_wavs(self):
         """Launch WAV compression"""
-        try:
-            from fnt.usv.compress_wavs_pyqt import CompressWavsWindow
-            
-            # Create and show the compress wavs window
-            self.compress_wavs_window = CompressWavsWindow()
-            self.compress_wavs_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"WAV compression failed: {str(e)}")
+        self.tools.launch("compress_wavs")
     
     # UWB Processing Methods
     def run_uwb_preprocessing(self):
-        """Launch UWB PreProcessing Tool"""
-        try:
-            from fnt.uwb.uwb_preprocessing_pyqt import UWBQuickVisualizationWindow
+        """Launch UWB PreProcessing Tool (its own process, like every tool)."""
+        self.tools.launch("uwb_preprocessing")
 
-            # Create and show the UWB PreProcessing Tool window
-            self.uwb_quick_viz_window = UWBQuickVisualizationWindow()
-            self.uwb_quick_viz_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"UWB PreProcessing Tool failed: {str(e)}")
-    
     # Imaging Methods
     def run_czi_viewer(self):
         """Launch CZI Viewer for microscopy images"""
-        try:
-            from fnt.imaging.czi_viewer_pyqt import CZIViewerWindow
-
-            self.czi_viewer_window = CZIViewerWindow()
-            self.czi_viewer_window.show()
-        except ImportError as e:
-            if "aicspylibczi" in str(e) or "No module named" in str(e):
-                QMessageBox.warning(
-                    self, "Missing Dependencies",
-                    "CZI file support requires additional packages.\n\n"
-                    "Install with:\n"
-                    "pip install aicspylibczi fsspec Pillow"
-                )
-            else:
-                QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"CZI Viewer failed: {str(e)}")
+        if self._require_modules(
+                ("aicspylibczi", "fsspec", "PIL"), "CZI Viewer",
+                "pip install aicspylibczi fsspec Pillow"):
+            self.tools.launch("czi_viewer")
 
     def run_image_quantification(self):
         """Launch Image Quantification tool for CZI microscopy images"""
-        try:
-            from fnt.imaging.quantification_pyqt import QuantificationToolWindow
+        if self._require_modules(
+                ("aicspylibczi", "fsspec", "PIL", "skimage"), "Image Quantification",
+                "pip install aicspylibczi fsspec Pillow scikit-image"):
+            self.tools.launch("image_quantification")
 
-            self.image_quant_window = QuantificationToolWindow()
-            self.image_quant_window.show()
-        except ImportError as e:
-            if "aicspylibczi" in str(e) or "No module named" in str(e):
-                QMessageBox.warning(
-                    self, "Missing Dependencies",
-                    "Image Quantification requires additional packages.\n\n"
-                    "Install with:\n"
-                    "pip install aicspylibczi fsspec Pillow scikit-image"
-                )
-            else:
-                QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Image Quantification failed: {str(e)}")
+    def _require_modules(self, modules, tool_name, install_hint):
+        """True if every module is importable; otherwise warn and return False.
+
+        Uses find_spec so the check doesn't drag heavy optional dependencies
+        into the launcher process — the tool itself imports them in its own.
+        """
+        import importlib.util
+        missing = [m for m in modules if importlib.util.find_spec(m) is None]
+        if missing:
+            QMessageBox.warning(
+                self, "Missing Dependencies",
+                f"{tool_name} requires additional packages.\n\n"
+                f"Missing: {', '.join(missing)}\n\n"
+                f"Install with:\n{install_hint}")
+            return False
+        return True
 
     # Video Tracking Methods
     def run_mask_pose_tracker(self):
         """Launch Mask Pose Tracker with SAM"""
-        try:
-            from fnt.videoTracking.mask_pose_tracker_gui import MaskPoseTrackerGUI
-            
-            # Create and show the Mask Pose Tracker window
-            self.mask_pose_tracker_window = MaskPoseTrackerGUI()
-            self.mask_pose_tracker_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch Mask Pose Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python torch segment-anything pandas numpy")
-    
+        self.tools.launch("mask_pose_tracker")
+
     def run_simple_tracker(self):
         """Launch Simple Tracker (CPU-only, no SAM)"""
-        try:
-            from fnt.videoTracking.simple_tracker_gui_v2 import SimpleTrackerGUI
-            
-            # Create and show the Simple Tracker window
-            self.simple_tracker_window = SimpleTrackerGUI()
-            self.simple_tracker_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to launch Simple Tracker: {str(e)}\n\nMake sure dependencies are installed:\npip install opencv-python pandas numpy scipy")
-    
+        self.tools.launch("simple_tracker")
+
+
     # GitHub Processing Methods - Pure PyQt implementations
     def run_file_splitter(self):
         """Launch file splitter for GitHub preparation"""
@@ -1197,31 +1121,12 @@ class FNTMainWindow(QMainWindow):
     
     def run_github_csv_transfer(self):
         """Launch Data Transfer tool for copying data files to a destination folder"""
-        try:
-            from fnt.gitProcessing.github_csv_transfer_pyqt import GitHubCSVTransferWindow
+        self.tools.launch("github_csv_transfer")
 
-            # Store as instance variable to prevent garbage collection
-            self.github_csv_transfer_window = GitHubCSVTransferWindow()
-            self.github_csv_transfer_window.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Data Transfer failed: {str(e)}")
-    
     # Doric WiFP Processing Methods
     def run_doric_processor(self):
         """Launch Doric WiFP Fiber Photometry Processor"""
-        try:
-            from fnt.DoricFP.doric_processor_pyqt import DoricProcessorWindow
-            
-            # Create and show the processor window
-            self.doric_processor_window = DoricProcessorWindow()
-            self.doric_processor_window.show()
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Error", 
-                f"Failed to launch Doric Processor: {str(e)}\n\n"
-                "Make sure dependencies are installed:\n"
-                "pip install h5py scipy pandas numpy matplotlib opencv-python"
-            )
+        self.tools.launch("doric_processor")
     
     def run_doric_explorer(self):
         """Run the .doric file structure explorer"""
@@ -1523,7 +1428,7 @@ class FNTMainWindow(QMainWindow):
     # Utility Methods
     def show_about(self):
         """Show about dialog"""
-        about_text = f"""<h2>FieldNeuroethologyToolbox (FNT) v{self.version}</h2>
+        about_text = f"""<h2>FieldNeuroToolbox (FNT) v{self.version}</h2>
 
         <p>A comprehensive preprocessing and analysis toolbox for neurobehavioral data.</p>
         
@@ -1544,7 +1449,7 @@ class FNTMainWindow(QMainWindow):
         """
         
         msg = QMessageBox()
-        msg.setWindowTitle("About FieldNeuroethologyToolbox")
+        msg.setWindowTitle("About FieldNeuroToolbox")
         msg.setTextFormat(Qt.RichText)
         msg.setText(about_text)
         msg.exec_()
@@ -1628,12 +1533,36 @@ class FNTMainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close event"""
-        # Close the FED processing window if open (which will trigger its own closeEvent and cleanup)
+        # Close the FED processing window if open (which will trigger its own
+        # closeEvent and cleanup). FED still runs in-process.
         if hasattr(self, 'fed_window') and self.fed_window is not None:
             try:
                 self.fed_window.close()
             except Exception:
                 pass
+
+        # Tool windows run in their own processes and get hard-terminated on
+        # quit, with no chance to save in-progress work. We can't see inside
+        # another process to know whether it's mid-export, so list what's still
+        # open and let the user cancel the quit.
+        open_tools = self.tools.running_tools()
+        if open_tools:
+            n = len(open_tools)
+            listed = "\n".join(f"  • {t}" for t in sorted(set(open_tools)))
+            reply = QMessageBox.question(
+                self, 'Close Application',
+                f"{n} FNT tool window{'s are' if n > 1 else ' is'} still open:\n\n"
+                f"{listed}\n\n"
+                f"Quitting FNT will close {'them' if n > 1 else 'it'} and cancel "
+                f"any processing still in progress.\n\nQuit anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        self.tools.terminate_all()
 
         if self.current_worker and self.current_worker.isRunning():
             reply = QMessageBox.question(
@@ -1659,11 +1588,20 @@ def main():
     if not PYQT_AVAILABLE:
         print("Error: PyQt5 is not available. Please install it with: pip install PyQt5")
         return
-    
+
+    # Dump a native-crash traceback to ~/.fnt/faulthandler_crash.log. This is
+    # the ACTUAL entry point (the `fnt` console script), so the crash logger
+    # must be installed here — not only in the standalone UWB main().
+    try:
+        from fnt.uwb.uwb_preprocessing_pyqt import _install_faulthandler
+        _install_faulthandler()
+    except Exception as _e:
+        print(f"[FNT] faulthandler not installed: {_e}")
+
     # Windows taskbar icon fix - must be set before creating QApplication
     try:
         import ctypes
-        myappid = 'fnt.fieldneuroethologytoolbox.gui.01'  # arbitrary string
+        myappid = 'fnt.fieldneurotoolbox.gui.01'  # arbitrary string
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except:
         pass
@@ -1689,7 +1627,7 @@ def main():
     app = QApplication(sys.argv)
     
     # Set application properties
-    app.setApplicationName("FieldNeuroethologyToolbox")
+    app.setApplicationName("FieldNeuroToolbox")
     try:
         from importlib.metadata import version
         app_version = version("fnt")

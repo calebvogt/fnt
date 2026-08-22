@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video PreProcessing Tool for FieldNeuroethologyToolbox
+Video PreProcessing Tool for FieldNeuroToolbox
 
 Comprehensive video preprocessing combining downsampling, re-encoding, and format conversion.
 Allows users to batch process videos with customizable quality, resolution, and encoding options.
@@ -12,6 +12,7 @@ import subprocess
 import glob
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 try:
@@ -55,6 +56,66 @@ DEFAULT_SUBTITLE_STYLE = {
 
 
 _VIDEO_EXT_RE = r'\.(avi|mp4|mov|mkv|webm|flv|wmv|m4v)$'
+
+
+# ---------------------------------------------------------------------------
+# Network-drive detection
+# ---------------------------------------------------------------------------
+
+_NETWORK_FSTYPES = {
+    'nfs', 'nfs4', 'cifs', 'smb', 'smbfs', 'afpfs', 'ftpfs', 'webdav',
+    'fuse.sshfs', 'fuse.davfs', 'fuse.rclone', 'fuse.gvfsd-fuse', '9p',
+}
+
+
+def _posix_path_is_network(path):
+    """Best-effort network check on POSIX by matching the path to its mount."""
+    try:
+        real = os.path.realpath(path)
+        entries = []
+        if os.path.exists('/proc/mounts'):
+            with open('/proc/mounts', 'r', errors='ignore') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        entries.append((parts[1], parts[2]))
+        else:
+            out = subprocess.run(['mount'], capture_output=True, text=True, timeout=5)
+            for line in out.stdout.splitlines():
+                m = re.search(r' on (.+?) \(([^,) ]+)', line)
+                if m:
+                    entries.append((m.group(1), m.group(2)))
+        best = None
+        for mountpoint, fstype in entries:
+            mp = mountpoint.rstrip('/') or '/'
+            if real == mp or real.startswith(mp + '/'):
+                if best is None or len(mp) > len(best[0]):
+                    best = (mp, fstype)
+        if best:
+            return best[1].lower() in _NETWORK_FSTYPES
+    except Exception:
+        pass
+    return False
+
+
+def is_network_path(path):
+    """True if *path* lives on a network/remote drive."""
+    if not path:
+        return False
+    p = str(path)
+    if p.startswith('\\\\') or p.startswith('//'):
+        return True
+    if os.name == 'nt':
+        import ctypes
+        drive = os.path.splitdrive(os.path.abspath(p))[0]
+        if drive and drive.endswith(':'):
+            DRIVE_REMOTE = 4
+            try:
+                return ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == DRIVE_REMOTE
+            except Exception:
+                return False
+        return False
+    return _posix_path_is_network(p)
 
 # All video extensions the tool understands, as glob patterns.
 DEFAULT_VIDEO_GLOBS = ["*.avi", "*.mp4", "*.mov", "*.mkv",
@@ -251,43 +312,6 @@ class VideoProcessorWorker(QThread):
             pass
         return None
 
-    def _is_already_processed(self, video_file, out_dir):
-        """Check if a video already has a correctly processed file in out_dir.
-        Verifies the output exists, has size > 0, AND matches the target resolution.
-        If the output exists but has the wrong resolution, it is deleted so the
-        file gets reprocessed."""
-        output_filename = self._get_output_filename(video_file)
-        output_path = os.path.join(out_dir, output_filename)
-
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            return False
-
-        # Verify resolution matches the current target
-        if self.resolution == "1080p":
-            target_w, target_h = 1920, 1080
-        else:
-            target_w, target_h = 1280, 720
-
-        res = self._get_video_resolution(output_path)
-        if res is None:
-            # Can't verify — assume it needs reprocessing
-            return False
-
-        actual_w, actual_h = res
-        if actual_w == target_w and actual_h == target_h:
-            return True
-
-        # Wrong resolution — delete the stale output so it gets reprocessed
-        self.progress_update.emit(
-            f"  🔄 Existing output has wrong resolution ({actual_w}x{actual_h}, "
-            f"target {target_w}x{target_h}): {output_filename} — will reprocess"
-        )
-        try:
-            os.remove(output_path)
-        except Exception:
-            pass
-        return False
-
     def _copy_to_failed(self, video_file, parent_dir):
         """Copy a failed video file to proc_failed_copies/ directory."""
         failed_dir = os.path.join(parent_dir, "proc_failed_copies")
@@ -308,12 +332,95 @@ class VideoProcessorWorker(QThread):
                 f"⚠️ Could not copy {os.path.basename(video_file)} to proc_failed_copies/: {str(e)}"
             )
 
+    def _target_resolution(self):
+        """(width, height) the current settings will produce."""
+        return (1920, 1080) if self.resolution == "1080p" else (1280, 720)
+
+    def _plan_work(self, file_list):
+        """Split *file_list* into the files that need processing and those to skip.
+
+        Done once, up front, instead of re-deciding inside the processing loop.
+        Two phases, cheapest first:
+
+        1. A stat-only pass (exists + size). Anything with no output, or a
+           zero-byte one, needs processing and is never probed.
+        2. Only the files that DO have a real output get their resolution
+           verified, and those ffprobe calls run concurrently. Probing is
+           process-spawn and network-latency bound rather than CPU bound, so
+           running a poolful at once collapses what used to be a serial
+           ffprobe-per-file walk over the whole library.
+
+        Returns ``(work_list, skipped_count)``.
+        """
+        if not self.skip_already_processed:
+            return file_list, 0
+
+        target_w, target_h = self._target_resolution()
+
+        # --- Phase 1: stat only, no subprocesses ---
+        work = []
+        candidates = []          # (video_file, out_dir, output_path)
+        for video_file, out_dir in file_list:
+            if self.should_stop:
+                return work, 0
+            output_path = os.path.join(out_dir, self._get_output_filename(video_file))
+            try:
+                if os.path.getsize(output_path) > 0:
+                    candidates.append((video_file, out_dir, output_path))
+                    continue
+            except OSError:
+                pass                      # missing or unreadable -> needs processing
+            work.append((video_file, out_dir))
+
+        if not candidates:
+            return work, 0
+
+        self.progress_update.emit(
+            f"Checking {len(candidates)} existing output(s) in proc/ "
+            f"before starting…"
+        )
+
+        # --- Phase 2: verify resolutions in parallel ---
+        from concurrent.futures import ThreadPoolExecutor
+
+        skipped = 0
+        done = 0
+        # Bounded so a huge library can't spawn thousands of ffprobes at once.
+        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            resolutions = pool.map(
+                self._get_video_resolution, [c[2] for c in candidates])
+
+            for (video_file, out_dir, output_path), res in zip(candidates, resolutions):
+                done += 1
+                if done % 200 == 0:
+                    self.progress_update.emit(
+                        f"  …checked {done}/{len(candidates)}")
+
+                if res == (target_w, target_h):
+                    skipped += 1
+                    continue
+
+                if res is not None:
+                    # Stale output from a run at a different target resolution.
+                    self.progress_update.emit(
+                        f"  🔄 Existing output has wrong resolution "
+                        f"({res[0]}x{res[1]}, target {target_w}x{target_h}): "
+                        f"{os.path.basename(output_path)} — will reprocess")
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
+                work.append((video_file, out_dir))
+
+        return work, skipped
+
     def run(self):
         """Main processing function"""
         import time
         try:
             processed_count = 0
-            skipped_count = 0
+            skipped_count = 0   # set by _plan_work() below
             failed_count = 0
             missing_files = []
 
@@ -335,12 +442,38 @@ class VideoProcessorWorker(QThread):
                 file_list.append((video_file, out_dir))
 
             total_files = len(file_list)
+            discovered_total = total_files   # before skip-filtering, for the summary
 
             if total_files == 0:
                 self.finished.emit(False, "No video files found in selected directories or video list.")
                 return
 
-            self.progress_update.emit(f"Found {total_files} video files to process...")
+            self.progress_update.emit(f"Found {total_files} video files...")
+
+            # --- Decide what actually needs doing, once, before starting ---
+            file_list, skipped_count = self._plan_work(file_list)
+
+            if self.should_stop:
+                self.finished.emit(False, "Processing stopped by user.")
+                return
+
+            if skipped_count:
+                self.progress_update.emit(
+                    f"Skipping {skipped_count} already-processed video(s); "
+                    f"{len(file_list)} to process.")
+                self.results_update.emit(0, 0, skipped_count)
+
+            total_files = len(file_list)
+            if total_files == 0:
+                self.finished.emit(
+                    True,
+                    f"Nothing to do — all {skipped_count} video(s) were already "
+                    f"processed at the selected resolution.")
+                return
+
+            # Create the output folders once, not once per file.
+            for out_dir in dict.fromkeys(d for _, d in file_list):
+                os.makedirs(out_dir, exist_ok=True)
 
             # --- Process the pre-collected file list ---
             for file_index, (video_file, out_dir) in enumerate(file_list, start=1):
@@ -355,17 +488,6 @@ class VideoProcessorWorker(QThread):
                         f"File not found (moved or deleted?): {video_file}"
                     )
                     missing_files.append(video_file)
-                    continue
-
-                os.makedirs(out_dir, exist_ok=True)
-
-                # Skip check
-                if self.skip_already_processed and self._is_already_processed(video_file, out_dir):
-                    self.progress_update.emit(
-                        f"Skipping (already processed): {os.path.basename(video_file)}"
-                    )
-                    skipped_count += 1
-                    self.results_update.emit(processed_count, failed_count, skipped_count)
                     continue
 
                 self.progress_update.emit(f"Processing: {os.path.basename(video_file)}")
@@ -425,7 +547,7 @@ class VideoProcessorWorker(QThread):
             if skipped_count > 0:
                 parts.append(f"{skipped_count} skipped (already processed)")
 
-            summary = f"Processed {processed_count} of {total_files} videos."
+            summary = f"Processed {processed_count} of {discovered_total} videos found."
             if parts:
                 summary += " " + ". ".join(parts) + "."
 
@@ -443,6 +565,9 @@ class VideoProcessorWorker(QThread):
     
     def process_single_file(self, video_file, out_dir, file_index, attempt=1):
         """Process a single video file"""
+        local_copy = None
+        local_sub_copy = None
+        tmp_dir = None
         try:
             # Get filename and build output path
             video_filename = os.path.basename(video_file)
@@ -450,14 +575,39 @@ class VideoProcessorWorker(QThread):
 
             self.progress_update.emit(f"Processing: {video_filename}")
 
+            # Stage network files locally to avoid transient I/O crashes
+            ffmpeg_input = video_file
+            if is_network_path(video_file):
+                tmp_dir = tempfile.mkdtemp(prefix="fnt_preproc_")
+                local_copy = os.path.join(tmp_dir, video_filename)
+                if attempt == 1:
+                    self.progress_update.emit(
+                        f"  📥 Staging from network drive → local temp…")
+                try:
+                    shutil.copy2(video_file, local_copy)
+                except Exception as e:
+                    self.progress_update.emit(
+                        f"❌ Failed to copy {video_filename} locally: {e}")
+                    return False
+                ffmpeg_input = local_copy
+                if self.burn_subtitles:
+                    sub_file = find_subtitle_file(video_file)
+                    if sub_file:
+                        local_sub_copy = os.path.join(
+                            tmp_dir, os.path.basename(sub_file))
+                        shutil.copy2(sub_file, local_sub_copy)
+
             # Build FFmpeg command based on settings
-            cmd = self.build_ffmpeg_command(video_file, output_file)
+            cmd = self.build_ffmpeg_command(ffmpeg_input, output_file)
 
             # When burning subtitles we run ffmpeg from the video's own folder so
             # the .smi can be referenced by basename in the filtergraph (avoids
             # Windows drive-letter/colon escaping). Input/output use absolute
             # paths, so this cwd is otherwise harmless.
-            run_cwd = os.path.dirname(video_file) if self.burn_subtitles else None
+            if self.burn_subtitles:
+                run_cwd = os.path.dirname(ffmpeg_input)
+            else:
+                run_cwd = None
 
             # Run FFmpeg and capture output for GUI display.
             # stdin=subprocess.DEVNULL prevents FFmpeg from hanging on
@@ -592,6 +742,13 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.progress_update.emit(f"❌ Error processing {video_filename}: {str(e)}")
             return False
+
+        finally:
+            if tmp_dir:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
     
     def build_ffmpeg_command(self, input_file, output_file):
         """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""
@@ -614,9 +771,14 @@ class VideoProcessorWorker(QThread):
             "-pix_fmt", "yuv420p",
         ]
         
-        # Always apply fps filter to match user's requested frame rate
-        # This maintains video duration by duplicating/dropping frames as needed
-        video_filters = [f"fps={self.frame_rate}"]
+        # Override color metadata: some DVRs (e.g. ViewTron) write bogus
+        # values (colorspace=gbr, primaries/trc=reserved) that crash
+        # swscaler during format conversion (especially to grayscale).
+        # setparams only relabels metadata — no pixel reprocessing.
+        video_filters = [
+            "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            f"fps={self.frame_rate}",
+        ]
         
         # Add audio option
         if self.remove_audio:
@@ -937,7 +1099,7 @@ class VideoProcessingGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroethologyToolbox")
+        self.setWindowTitle(f"Video PreProcessing Tool #{self.instance_id} - FieldNeuroToolbox")
         self.setGeometry(200 + (self.instance_id - 1) * 50, 200 + (self.instance_id - 1) * 50, 900, 700)
         self.setMinimumSize(700, 600)
         

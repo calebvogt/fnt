@@ -10,8 +10,10 @@ Run directly:
 """
 from __future__ import annotations
 
+import itertools
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -22,10 +24,12 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
 from PyQt5.QtCore import (
-    Qt, QEvent, QObject, QSettings, QThread, QTimer, QRectF, QPointF, pyqtSignal,
+    Qt, QEvent, QObject, QSettings, QSize, QThread, QTimer, QRectF, QPointF,
+    pyqtSignal,
 )
 from PyQt5.QtGui import (
-    QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
+    QIcon, QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
+    QPalette,
 )
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -33,7 +37,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QTreeWidget,
+    QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTabWidget, QTextEdit, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 # scipy.signal is imported lazily where used (spectrogram compute / resample)
@@ -67,6 +72,122 @@ except Exception:
     HAS_CV2 = False
 
 
+_SORT_ROLE = Qt.UserRole + 1
+
+
+# Monotonic id source for in-memory prediction annotations.
+#
+# These ids used to be positional per load ('pred_0', 'pred_1', ...), which is
+# not an identity: every file produced the same names, and a second Quick
+# Inference on another part of the SAME file restarted the numbering. Anything
+# that looks a call up by id -- the detections list, the review cursor, the
+# gallery's mark dictionary -- could then land on a different call than the one
+# the user clicked, in the same file or a different one. A counter that never
+# resets for the life of the process makes the id actually identify the call.
+#
+# Only in-memory identity depends on this. Persistence joins on the CSV's
+# blob_id (or, for hand-labels, the stable example id), so ids may be renumbered
+# freely between sessions.
+_ANN_ID_SEQ = itertools.count(1)
+
+
+def _new_ann_id(prefix: str) -> str:
+    """A process-unique annotation id, e.g. ``pred_00000042``."""
+    return f"{prefix}_{next(_ANN_ID_SEQ):08d}"
+
+
+_ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
+_ROLE_FILE_COUNTS = Qt.UserRole + 21  # (accepted, pending, rejected) or None
+
+
+class FileCountDelegate(QStyledItemDelegate):
+    """Render a file-list row as ``name  (A, P, R)`` with A green (accepted),
+    P yellow (pending) and R red (rejected). The base name lives in
+    ``_ROLE_FILE_LABEL`` and the ``(a, p, r)`` tuple in ``_ROLE_FILE_COUNTS``
+    (None → just the name). The row's DisplayRole text is kept as a plain
+    ``name (a, p, r)`` string so column sizing / fallback rendering still work;
+    this delegate only recolors the segments.
+
+    ``palette_fn`` returns the active overlay palette so these counts use the
+    same colors as the spectrogram masks — otherwise the list would still say
+    "green = accepted" after the canvas switched accepted to white."""
+
+    def __init__(self, parent=None, palette_fn=None):
+        super().__init__(parent)
+        self._palette_fn = palette_fn
+
+    def _colors(self):
+        pal = self._palette_fn() if self._palette_fn else _DEFAULT_PALETTE
+        return (QColor(*pal['confirmed']), QColor(*pal['pending']),
+                QColor(*pal['rejected']))
+
+    def paint(self, painter, option, index):
+        label = index.data(_ROLE_FILE_LABEL)
+        if label is None:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        # Let the style paint the row background/selection, but not the text —
+        # we draw that ourselves so each count can carry its own color.
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        counts = index.data(_ROLE_FILE_COUNTS)
+        painter.save()
+        painter.setClipRect(opt.rect)
+        fm = opt.fontMetrics
+        y = opt.rect.top() + (opt.rect.height() + fm.ascent() - fm.descent()) // 2
+        x = opt.rect.left() + 5
+        selected = bool(opt.state & QStyle.State_Selected)
+        base_col = (opt.palette.color(QPalette.HighlightedText) if selected
+                    else QColor(220, 220, 220))
+        has_counts = counts is not None and any(counts)
+
+        def draw(text, col):
+            nonlocal x
+            painter.setPen(col)
+            painter.drawText(x, y, text)
+            x += fm.horizontalAdvance(text)
+
+        draw(("✓  " if has_counts else "") + str(label), base_col)
+        if has_counts:
+            a, p, r = counts
+            c_acc, c_pend, c_rej = self._colors()
+            draw("  (", base_col)
+            draw(str(a), c_acc)
+            draw(", ", base_col)
+            draw(str(p), c_pend)
+            draw(", ", base_col)
+            draw(str(r), c_rej)
+            draw(")", base_col)
+        painter.restore()
+
+
+class SortableTreeWidgetItem(QTreeWidgetItem):
+    """QTreeWidgetItem that sorts numerically when a per-column numeric key is
+    stored under ``_SORT_ROLE``, falling back to case-insensitive text.
+
+    The default QTreeWidgetItem compares the *display* strings, so a Time
+    column showing ``"452.60s"`` and ``"52.74s"`` sorts lexicographically —
+    ``"4"`` before ``"5"`` — placing 452s ahead of 52s. Storing the raw float
+    as the sort key fixes that for Time/Dur/Px/Score/kHz.
+    """
+
+    def __lt__(self, other: 'QTreeWidgetItem') -> bool:
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        a = self.data(col, _SORT_ROLE)
+        b = other.data(col, _SORT_ROLE)
+        if a is not None and b is not None:
+            try:
+                return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return self.text(col).lower() < other.text(col).lower()
+
+
 RECENT_PROJECTS_KEY = "mad/recent_projects"
 MAX_RECENT_PROJECTS = 8
 
@@ -76,6 +197,87 @@ MASK_POSITIVE = 1   # user-painted target
 MASK_NEGATIVE = 2   # auto-assigned inside committed time bands
 
 LABEL_SUFFIX = "_FNT_MAD_labels.png"
+
+
+# ======================================================================
+# Review-overlay palettes (per spectrogram colormap)
+# ======================================================================
+# Each colormap occupies a narrow slice of color space, so a fixed overlay
+# palette is guaranteed to collide with *some* map: green confirmed masks
+# vanish into viridis's green midtones, yellow predictions vanish into its
+# bright end. These palettes instead draw each state from hues the active map
+# never produces, and every outline is stroked over a ``halo`` under-pen so it
+# stays legible across the map's full dark→bright range.
+#
+# Two rules keep the scheme readable as you switch maps:
+#   • ``rejected`` stays red wherever the map allows it — it's an audit trail,
+#     so stable semantics matter more than maximum pop.
+#   • ``confirmed`` always gets the map's single most contrasting hue; it's
+#     the state you scan for.
+_OVERLAY_PALETTES = {
+    # violet → blue → teal → green → yellow. Free: white, magenta, red.
+    'viridis': {
+        'confirmed': (255, 255, 255),
+        'pending':   (255, 95, 235),
+        'drawing':   (255, 150, 240),
+        'rejected':  (255, 60, 60),
+        'selected':  (255, 175, 45),
+        'edit':      (90, 170, 255),
+        'prob':      (255, 95, 235),
+        'halo':      (0, 0, 0),
+    },
+    # black → purple → magenta → orange → cream. Free: cyan, green, white.
+    'magma': {
+        'confirmed': (255, 255, 255),
+        'pending':   (60, 240, 255),
+        'drawing':   (150, 245, 255),
+        'rejected':  (255, 55, 55),
+        'selected':  (90, 255, 140),
+        'edit':      (90, 170, 255),
+        'prob':      (60, 240, 255),
+        'halo':      (0, 0, 0),
+    },
+    # black → purple → red → orange → yellow → near-white. Free: cyan, green.
+    'inferno': {
+        'confirmed': (255, 255, 255),
+        'pending':   (60, 240, 255),
+        'drawing':   (150, 245, 255),
+        'rejected':  (255, 55, 55),
+        'selected':  (90, 255, 140),
+        'edit':      (90, 170, 255),
+        'prob':      (60, 240, 255),
+        'halo':      (0, 0, 0),
+    },
+    # black → white: every neutral is taken, so all three states are saturated.
+    'grayscale': {
+        'confirmed': (60, 240, 255),
+        'pending':   (255, 95, 235),
+        'drawing':   (255, 150, 240),
+        'rejected':  (255, 60, 60),
+        'selected':  (110, 255, 120),
+        'edit':      (90, 170, 255),
+        'prob':      (255, 95, 235),
+        'halo':      (0, 0, 0),
+    },
+    # white → black: the background is *light*, so colors go dark/saturated and
+    # the halo flips to white.
+    'grayscale_inv': {
+        'confirmed': (0, 80, 235),
+        'pending':   (190, 0, 200),
+        'drawing':   (215, 60, 220),
+        'rejected':  (200, 0, 0),
+        'selected':  (215, 110, 0),
+        'edit':      (0, 110, 190),
+        'prob':      (190, 0, 200),
+        'halo':      (255, 255, 255),
+    },
+}
+_DEFAULT_PALETTE = _OVERLAY_PALETTES['viridis']
+
+
+def overlay_palette(colormap_name: Optional[str]) -> dict:
+    """Review-overlay colors for a spectrogram colormap (viridis if unknown)."""
+    return _OVERLAY_PALETTES.get(colormap_name or 'viridis', _DEFAULT_PALETTE)
 
 
 class _WheelEater(QObject):
@@ -174,6 +376,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self.mask_alpha = 0.45
         # Render mode: 'spec' | 'overlay' | 'mask_only'
         self.view_mode: str = 'overlay'
+        # Display-only confidence floor for pending predictions (0 = off).
+        self.min_score: float = 0.0
 
         # Inference loading overlay
         self._infer_loading = False
@@ -874,6 +1078,55 @@ class MADSpectrogramWidget(SpectrogramWidget):
             self.zoom_requested.emit(1.25, center_time)
         event.accept()
 
+    # --- score filtering -------------------------------------------------
+    def set_min_score(self, v: float) -> None:
+        """Hide pending predictions scoring below ``v`` (0 = show everything).
+
+        Display-only: the annotations stay in the list and on disk. Reviewed
+        calls are never hidden — a decision is not a guess.
+        """
+        v = max(0.0, min(1.0, float(v)))
+        if v != self.min_score:
+            self.min_score = v
+            self.update()
+
+    def _score_hidden(self, ann: dict) -> bool:
+        return (self.min_score > 0.0
+                and ann.get('status') == 'prediction'
+                and float(ann.get('score') or 0.0) < self.min_score)
+
+    # --- overlay colors -------------------------------------------------
+    def palette_colors(self) -> dict:
+        """Review-overlay colors matched to the loaded spectrogram colormap."""
+        return overlay_palette(getattr(self, 'colormap_name', None))
+
+    @staticmethod
+    def _stroke_polys(painter, polys, color, width: int, halo,
+                      style=Qt.SolidLine):
+        """Stroke ``polys`` twice — a wider ``halo`` pen underneath, then the
+        colored pen on top. The halo is what actually guarantees the outline
+        reads over both the darkest and brightest parts of any colormap."""
+        if not polys:
+            return
+        painter.setBrush(Qt.NoBrush)
+        for col, w in ((halo, width + 2), (color, width)):
+            pen = QPen(QColor(*col))
+            pen.setWidth(w)
+            pen.setStyle(style)
+            painter.setPen(pen)
+            for poly in polys:
+                painter.drawPolygon(poly)
+
+    @staticmethod
+    def _draw_haloed_text(painter, pos, text, color, halo):
+        """Draw ``text`` with a 1px ``halo`` offset ring so class labels stay
+        readable wherever they land on the spectrogram."""
+        painter.setPen(QPen(QColor(*halo)))
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            painter.drawText(QPointF(pos.x() + dx, pos.y() + dy), text)
+        painter.setPen(QPen(QColor(*color)))
+        painter.drawText(pos, text)
+
     # --- overlay render -----------------------------------------------
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -937,6 +1190,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
             code = 2 if st == 'prediction' else (3 if st == 'rejected' else 0)
             if not code:
                 continue
+            if self._score_hidden(ann):
+                continue
             af0 = max(ann['f0'], f_start); af1 = min(ann['f1'], f_end)
             at0 = max(ann['t0'], t_start); at1 = min(ann['t1'], t_end)
             if af1 > af0 and at1 > at0:
@@ -952,41 +1207,46 @@ class MADSpectrogramWidget(SpectrogramWidget):
               if pend_view is not None else None)
         rgba = np.zeros((h, w_img, 4), dtype=np.uint8)
 
+        # Overlay fills come from the colormap-matched palette so masks never
+        # blend into the spectrogram underneath them (see _OVERLAY_PALETTES).
+        pal = self.palette_colors()
         if self.view_mode == 'mask_only':
             rgba[:] = (32, 32, 32, 255)
-            rgba[tm == 1] = (40, 200, 90, 255)
-            rgba[tm == 2] = (255, 230, 90, 255)
-            rgba[tm == 3] = (255, 70, 70, 255)
+            rgba[tm == 1] = (*pal['confirmed'], 255)
+            rgba[tm == 2] = (*pal['pending'], 255)
+            rgba[tm == 3] = (*pal['rejected'], 255)
             if pv is not None:
-                rgba[pv] = (255, 230, 90, 255)
+                rgba[pv] = (*pal['drawing'], 255)
         elif self.view_mode == 'overlay':
             pos_alpha = int(self.mask_alpha * 255)
-            rgba[tm == 1] = (40, 200, 90, pos_alpha)
-            rgba[tm == 2] = (255, 230, 90, max(60, pos_alpha - 50))
-            rgba[tm == 3] = (255, 70, 70, max(60, pos_alpha - 50))
+            faint = max(60, pos_alpha - 50)
+            rgba[tm == 1] = (*pal['confirmed'], pos_alpha)
+            rgba[tm == 2] = (*pal['pending'], faint)
+            rgba[tm == 3] = (*pal['rejected'], faint)
             if pv is not None:
-                rgba[pv] = (255, 230, 90, max(60, pos_alpha - 50))
+                rgba[pv] = (*pal['drawing'], faint)
         # else: 'spec' — leave rgba all-zero so only the spec shows.
 
-        # Predicted blob mask shading (cyan, low alpha) if present.
+        # Predicted probability shading (low alpha) if present.
         if (self.view_mode != 'spec' and self.pred_mask is not None and
                 self.pred_mask.shape == self.mask.shape):
             pview = self.pred_mask[f_start:f_end, t_start:t_end]
             if pview.size > 0:
                 pview = _ds(pview)
                 active = pview > 0
-                cyan_alpha = (pview[active] * 180).astype(np.uint8)
+                prob_alpha = (pview[active] * 180).astype(np.uint8)
+                pr, pg, pb = pal['prob']
                 if active.any():
                     rgba[active, 0] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 0], 0
+                        rgba[active, 3] > 0, rgba[active, 0], pr
                     )
                     rgba[active, 1] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 1], 220
+                        rgba[active, 3] > 0, rgba[active, 1], pg
                     )
                     rgba[active, 2] = np.where(
-                        rgba[active, 3] > 0, rgba[active, 2], 255
+                        rgba[active, 3] > 0, rgba[active, 2], pb
                     )
-                    rgba[active, 3] = np.maximum(rgba[active, 3], cyan_alpha)
+                    rgba[active, 3] = np.maximum(rgba[active, 3], prob_alpha)
 
         rgba = np.flipud(rgba).copy()
         qimg = QImage(rgba.data, w_img, h, 4 * w_img,
@@ -1006,20 +1266,16 @@ class MADSpectrogramWidget(SpectrogramWidget):
             frac = (f - f_start) / max(1, (f_end - f_start))
             return spec_rect.bottom() - frac * spec_rect.height()
 
-        # Dotted yellow outline tracing the actively-drawn (SAM/Paint) pending
-        # mask — dotted distinguishes it from inference predictions (solid
-        # yellow), so you can tell what you're labeling vs reviewing.
+        # Dotted outline tracing the actively-drawn (SAM/Paint) pending mask —
+        # dotted distinguishes it from inference predictions (solid), so you
+        # can tell what you're labeling vs reviewing.
         if (HAS_CV2 and overlays_visible and self._pending is not None
                 and pend_view is not None and pend_view.any()):
             cnts, _ = cv2.findContours(
                 pend_view.astype(np.uint8), cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
-            pen = QPen(QColor(255, 225, 60))
-            pen.setWidth(2)
-            pen.setStyle(Qt.DotLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
+            polys = []
             for cnt in cnts:
                 if len(cnt) < 2:
                     continue
@@ -1030,7 +1286,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         _t_to_x(t_start + int(pt[0])),
                         _f_to_y(f_start + int(pt[1])),
                     ))
-                painter.drawPolygon(poly)
+                polys.append(poly)
+            self._stroke_polys(painter, polys, pal['drawing'], 2, pal['halo'],
+                               style=Qt.DotLine)
 
         # (SAM prompt clicks are not drawn — only the proposed mask is shown.)
 
@@ -1042,6 +1300,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
             for ai, ann in enumerate(self.annotations):
                 if ai == self._editing_ann_idx:
                     continue
+                if self._score_hidden(ann):
+                    continue
                 if (ann['t1'] <= t_start or ann['t0'] >= t_end or
                         ann['f1'] <= f_start or ann['f0'] >= f_end):
                     continue
@@ -1049,18 +1309,14 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 is_rej = ann.get('status') == 'rejected'
                 is_sel = (ai == self._selected_ann_idx)
                 if is_sel:
-                    # Selected detection: mask outline AND label both white so
-                    # tiny detections are easy to spot.
-                    outline_color = QColor(255, 255, 255)
-                    label_color = QColor(255, 255, 255)
+                    # Selected detection: outline AND label take the palette's
+                    # selection hue so tiny detections are easy to spot.
+                    outline_color = pal['selected']
                 elif is_rej:
-                    outline_color = QColor(255, 80, 80)
-                    label_color = QColor(255, 110, 110)
+                    outline_color = pal['rejected']
                 else:
-                    outline_color = (QColor(255, 225, 60) if is_pred
-                                     else QColor(60, 210, 110))   # green confirmed
-                    label_color = (QColor(255, 230, 100) if is_pred
-                                   else QColor(130, 235, 150))
+                    outline_color = pal['pending'] if is_pred else pal['confirmed']
+                label_color = outline_color
                 # Thin outline around the mask contour.
                 lf0 = max(ann['f0'], f_start) - f_start
                 lf1 = min(ann['f1'], f_end) - f_start
@@ -1081,10 +1337,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         view_ann[:, :] = msk[af0:af1, at0:at1].astype(np.uint8)
                     cnts, _ = cv2.findContours(
                         view_ann, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    pen = QPen(outline_color)
-                    pen.setWidth(2)
-                    painter.setPen(pen)
-                    painter.setBrush(Qt.NoBrush)
+                    polys = []
                     for cnt in cnts:
                         if len(cnt) < 2:
                             continue
@@ -1095,9 +1348,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                                 _t_to_x(t_start + lt0 + int(pt[0])),
                                 _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
-                        painter.drawPolygon(poly)
+                        polys.append(poly)
+                    self._stroke_polys(painter, polys, outline_color, 2,
+                                       pal['halo'])
                 # Class label centered horizontally over the mask, just above it.
-                painter.setPen(QPen(label_color))
                 f = painter.font()
                 f.setPointSize(8)
                 painter.setFont(f)
@@ -1110,9 +1364,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 tw = painter.fontMetrics().horizontalAdvance(label)
                 lx = cx - tw / 2.0
                 ly = _f_to_y(min(ann['f1'], f_end)) - 3
-                painter.drawText(QPointF(lx, ly), label)
+                self._draw_haloed_text(painter, QPointF(lx, ly), label,
+                                       label_color, pal['halo'])
 
-        # White highlight outline on the selected annotation(s) — the single
+        # Highlight outline on the selected annotation(s) — the single
         # click-selected one plus any rubber-band multi-selection. Drawn even
         # when zoomed out (per-call overlays hidden) so the selection stays
         # visible; bbox-sized alloc keeps it cheap.
@@ -1143,10 +1398,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         view_sel[:, :] = smsk[sf0:sf1, st0:st1].astype(np.uint8)
                     scnts, _ = cv2.findContours(
                         view_sel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    pen = QPen(QColor(255, 255, 255))
-                    pen.setWidth(3)
-                    painter.setPen(pen)
-                    painter.setBrush(Qt.NoBrush)
+                    polys = []
                     for cnt in scnts:
                         if len(cnt) < 2:
                             continue
@@ -1156,32 +1408,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
                                 _t_to_x(t_start + lt0 + int(pt[0])),
                                 _f_to_y(f_start + lf0 + int(pt[1])),
                             ))
-                        painter.drawPolygon(poly)
+                        polys.append(poly)
+                    self._stroke_polys(painter, polys, pal['selected'], 3,
+                                       pal['halo'])
 
-        # Blue draggable outline + vertices for the annotation being edited.
+        # Draggable outline + vertices for the annotation being edited.
         if (self._editing_ann_idx is not None and
                 0 <= self._editing_ann_idx < len(self.annotations) and
                 self._edit_points):
-            pen = QPen(QColor(60, 150, 255))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
             poly = QPolygonF()
             for (tt, ff) in self._edit_points:
                 poly.append(QPointF(_t_to_x(tt), _f_to_y(ff)))
-            painter.drawPolygon(poly)
-            painter.setBrush(QBrush(QColor(60, 150, 255)))
+            self._stroke_polys(painter, [poly], pal['edit'], 2, pal['halo'])
+            painter.setPen(QPen(QColor(*pal['halo'])))
+            painter.setBrush(QBrush(QColor(*pal['edit'])))
             for (tt, ff) in self._edit_points:
                 cx, cy = _t_to_x(tt), _f_to_y(ff)
                 painter.drawEllipse(QRectF(cx - 4, cy - 4, 8, 8))
 
-        # Rubber-band selection rectangle (dotted) while dragging.
+        # Rubber-band selection rectangle (dotted) while dragging. Uses the
+        # palette's contrast color so it shows on light maps too.
+        guide = (0, 0, 0) if pal['halo'] == (255, 255, 255) else (255, 255, 255)
         if self._rubber_start is not None and self._rubber_cur is not None:
-            pen = QPen(QColor(255, 255, 255))
+            pen = QPen(QColor(*guide))
             pen.setStyle(Qt.DashLine)
             pen.setWidth(1)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(255, 255, 255, 30)))
+            painter.setBrush(QBrush(QColor(*guide, 30)))
             painter.drawRect(QRectF(self._rubber_start, self._rubber_cur))
 
         # Brush / eraser cursor preview circle.
@@ -1199,9 +1452,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 (px_per_tframe * px_per_fbin) ** 0.5
             )
             radius_screen = max(2.0, radius_screen)
-            color = (QColor(255, 255, 255, 220)
-                     if self.paint_mode == 'brush'
-                     else QColor(255, 80, 80, 220))
+            color = QColor(*(pal['confirmed'] if self.paint_mode == 'brush'
+                             else pal['rejected']), 220)
             pen = QPen(color)
             pen.setWidth(1)
             painter.setPen(pen)
@@ -1243,7 +1495,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # horizontal middle of the spectrogram. Auto-advance centers the
         # selected call on this line, giving a fixed marker to read against.
         cx_mid = int(spec_rect.center().x())
-        pen = QPen(QColor(255, 255, 255, 150))
+        pen = QPen(QColor(*guide, 150))
         pen.setStyle(Qt.DashLine)
         pen.setWidth(2)
         painter.setPen(pen)
@@ -1257,20 +1509,69 @@ class MADSpectrogramWidget(SpectrogramWidget):
 # ======================================================================
 # Helpers
 # ======================================================================
-def _list_wavs_in_folder(folder: str) -> List[str]:
-    """Non-recursive: just .wav files directly inside ``folder``."""
+def _split_report(info: dict) -> List[str]:
+    """Human-readable lines describing a train/val split.
+
+    Validation numbers only mean "will this work on a new recording" when whole
+    recordings were held out. When the label set can't support that, the run has
+    to say so in the same breath as the score — a Dice printed without that
+    caveat is how an over-fitted model gets reported as a working one.
+    """
+    level = info.get('split_level', 'tile')
+    n_tr = info.get('n_train_tiles', 0)
+    n_va = info.get('n_val_tiles', 0)
+    n_vg = info.get('n_val_groups', 0)
+    n_g = info.get('n_groups', 0)
+    names = info.get('val_groups') or []
+    shown = ", ".join(os.path.basename(str(g)) for g in names[:4])
+    if len(names) > 4:
+        shown += f", +{len(names) - 4} more"
+    if level == 'file':
+        return [f"Split: {n_vg}/{n_g} recording(s) held out for validation "
+                f"({n_tr} train / {n_va} val tiles) — {shown}"]
+    if level == 'call':
+        return [
+            f"Split: {n_vg}/{n_g} call(s) held out ({n_tr} train / {n_va} val "
+            f"tiles). All labels are on ONE recording.",
+            "  ⚠ Validation shares a recording with training, so val scores "
+            "flatter the model. Label a second recording for an honest number.",
+        ]
+    return [
+        f"Split: tile-level ({n_tr} train / {n_va} val tiles) — only one "
+        f"labeled call available.",
+        "  ⚠ Train and validation overlap. These val scores are NOT a held-out "
+        "measurement. Label more calls, on more recordings.",
+    ]
+
+
+def _list_wavs_in_folder(folder: str, recursive: bool = False) -> List[str]:
+    """``.wav`` files in ``folder`` — directly inside it, or in the whole tree.
+
+    24/7 multi-mic recording sets are nested (experiment / mic / day), so a
+    non-recursive scan silently finds nothing at the level a user naturally
+    points at. ``recursive`` walks the tree, skipping dot-directories and the
+    project's own ``models``/``datasets``/``batch_runs`` folders so re-scanning a
+    project directory doesn't pick up its internals.
+    """
     root = Path(folder)
     if not root.exists() or not root.is_dir():
         return []
+    _SKIP_DIRS = {'models', 'datasets', 'batch_runs', '.scratch',
+                  'legacy_pre_h5'}
     out: List[str] = []
-    for p in sorted(root.iterdir()):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() != ".wav":
-            continue
-        if p.name.startswith("."):
-            continue
-        out.append(str(p))
+    if not recursive:
+        for p in sorted(root.iterdir()):
+            if (p.is_file() and p.suffix.lower() == ".wav"
+                    and not p.name.startswith(".")):
+                out.append(str(p))
+        return out
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = sorted(d for d in dirnames
+                             if not d.startswith('.')
+                             and d.lower() not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fn.lower().endswith('.wav') and not fn.startswith('.'):
+                out.append(os.path.join(dirpath, fn))
     return out
 
 
@@ -1297,7 +1598,7 @@ class RunTrainingDialog(QDialog):
         form = QFormLayout()
 
         self.spin_epochs = QSpinBox()
-        self.spin_epochs.setRange(1, 500)
+        self.spin_epochs.setRange(1, 10000)
         self.spin_epochs.setValue(100)
         self.spin_epochs.setSingleStep(10)
         self.spin_epochs.setToolTip(
@@ -1332,9 +1633,19 @@ class RunTrainingDialog(QDialog):
         self.spin_lr.setSingleStep(1e-4)
         self.spin_lr.setValue(1e-3)
         self.spin_lr.setToolTip(
-            "Step size for weight updates. The 1e-3 default is a safe starting "
-            "point. Too high → unstable / diverging loss; too low → very slow "
-            "training. Usually leave as-is."
+            "<b>Learning rate (LR)</b> — how far each weight moves along its "
+            "gradient on every batch (Adam optimizer). It is held fixed for the "
+            "whole run (no LR schedule/decay here).<br><br>"
+            "<b>Too high</b> (&gt; ~5e-3): steps overshoot — loss spikes, "
+            "oscillates, or diverges to NaN and never settles.<br>"
+            "<b>Too low</b> (&lt; ~1e-4): steps are tiny — loss falls very "
+            "slowly, needing far more epochs, and early-stopping may cut the run "
+            "off before it converges.<br>"
+            "<b>Well-tuned:</b> loss drops steadily then flattens, reaching good "
+            "accuracy in the fewest epochs.<br><br>"
+            "<b>1e-3 is a safe default.</b> Lower it (3e-4 / 1e-4) if loss "
+            "diverges; raise it slightly if training is stable but very slow. "
+            "Usually leave as-is."
         )
         form.addRow("Learning rate:", self.spin_lr)
 
@@ -1570,16 +1881,19 @@ class RunInferenceDialog(QDialog):
         self.chk_save_csv.setChecked(True)
         vbox.addWidget(self.chk_save_csv)
 
-        self.chk_preserve = QCheckBox(
-            "Preserve user-painted labels (skip time regions already labeled)"
+        self.chk_redetect = QCheckBox(
+            "Re-detect from scratch (ignore prior labels & reviews)"
         )
-        self.chk_preserve.setChecked(True)
-        self.chk_preserve.setToolTip(
-            "When enabled, the model's probability mask is zeroed in any\n"
-            "time column that already contains a manually-painted label.\n"
-            "Manual detections are never overwritten by inference."
+        self.chk_redetect.setChecked(False)
+        self.chk_redetect.setToolTip(
+            "Off (default): a re-run keeps hand-labels and Accepted/Rejected\n"
+            "calls, and the model won't re-detect over them — only pending\n"
+            "predictions are regenerated.\n"
+            "On: ignore every prior decision and re-detect everywhere (pending,\n"
+            "Accepted and Rejected are all discarded); hand-label rows are kept\n"
+            "as data but the model may predict over them too."
         )
-        vbox.addWidget(self.chk_preserve)
+        vbox.addWidget(self.chk_redetect)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -1612,7 +1926,7 @@ class RunInferenceDialog(QDialog):
             min_blob_pixels=self.spin_min_blob.value(),
             device=self.combo_device.currentText(),
             save_blob_csv=self.chk_save_csv.isChecked(),
-            preserve_labels=self.chk_preserve.isChecked(),
+            preserve_labels=not self.chk_redetect.isChecked(),
         )
 
 
@@ -1721,12 +2035,16 @@ class MADViewInferenceWorker(QThread):
             tile_time = int(ckpt.get('tile_time_frames', 256))
 
             self.progress_signal.emit(0.3)
+            # float32 here: this is one visible window (a few MB), and the
+            # downstream overlay/threshold code reads probabilities directly.
+            # The full-file path uses the default uint8 grid instead.
             prob = infer_probability_mask(
                 model, spec,
                 tile_freq_bins=tile_freq,
                 tile_time_frames=tile_time,
                 overlap_fraction=0.25,
                 device=device,
+                out_dtype=np.float32,
                 progress=lambda i, n: self.progress_signal.emit(
                     0.3 + 0.6 * (i / max(1, n))),
             )
@@ -1930,10 +2248,11 @@ class MADRunPanel(QWidget):
     run_finished = pyqtSignal(bool)   # ok — lets the section re-enable its button
 
     def __init__(self, parent=None, show_plot: bool = False,
-                 external_log: QTextEdit = None):
+                 external_log: QTextEdit = None, stop_label: str = "Stop"):
         super().__init__(parent)
         self._show_plot = show_plot
         self._external_log = external_log
+        self._stop_label = stop_label
         self._plot = None
         self._batches_x: list = []
         self._batch_losses: list = []
@@ -1974,7 +2293,7 @@ class MADRunPanel(QWidget):
         else:
             self.log = external_log
 
-        self.btn_stop = QPushButton("Stop")
+        self.btn_stop = QPushButton(self._stop_label)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._on_stop)
         vbox.addWidget(self.btn_stop)
@@ -2170,6 +2489,898 @@ class MADTrainGraphDialog(QDialog):
         self._main._on_train_dialog_close(event)
 
 
+class MADGalleryDialog(QDialog):
+    """Contact sheet of pending detections — accept or reject by clicking tiles.
+
+    Reviewing one call at a time in the spectrogram is the throughput ceiling
+    after a large batch run. This shows a grid of mask crops instead, so a
+    screenful of decisions replaces a screenful of navigation.
+
+    It costs almost nothing to build: the per-call crops are already stored in
+    each recording's ``_FNT_masks.h5`` (that is why MAD saves crops rather than
+    the probability grid), so a page is a few hundred KB of reads and no audio
+    is touched.
+    """
+
+    TILE = 132
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Detection Gallery")
+        self.resize(980, 700)
+        self._tiles: List[dict] = []
+        self._page = 0
+        self._per_page = 48
+        self._marks: Dict[str, str] = {}   # ann id -> 'accept' | 'reject'
+        self._token = None                 # detection set these tiles came from
+
+        v = QVBoxLayout(self)
+        head = QLabel(
+            "Pending detections for the current file, newest inference first. "
+            "<b>Click</b> a tile to cycle accept → reject → undecided, then "
+            "<b>Apply</b>. Sorted by confidence so the model's weakest guesses "
+            "come last.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        v.addWidget(head)
+
+        bar = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev page")
+        self.btn_prev.clicked.connect(lambda: self._go(-1))
+        bar.addWidget(self.btn_prev)
+        self.lbl_page = QLabel("")
+        self.lbl_page.setAlignment(Qt.AlignCenter)
+        bar.addWidget(self.lbl_page, 1)
+        self.btn_next = QPushButton("Next page ▶")
+        self.btn_next.clicked.connect(lambda: self._go(1))
+        bar.addWidget(self.btn_next)
+        v.addLayout(bar)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self._grid_host = QWidget()
+        self.scroll.setWidget(self._grid_host)
+        v.addWidget(self.scroll, 1)
+
+        row = QHBoxLayout()
+        self.lbl_marks = QLabel("Nothing marked")
+        self.lbl_marks.setStyleSheet("font-size: 10px; color: #bbbbbb;")
+        row.addWidget(self.lbl_marks, 1)
+        btn_all_acc = QPushButton("Mark page Accept")
+        btn_all_acc.clicked.connect(lambda: self._mark_page('accept'))
+        row.addWidget(btn_all_acc)
+        btn_all_rej = QPushButton("Mark page Reject")
+        btn_all_rej.clicked.connect(lambda: self._mark_page('reject'))
+        row.addWidget(btn_all_rej)
+        btn_clear = QPushButton("Clear marks")
+        btn_clear.clicked.connect(self._clear_marks)
+        row.addWidget(btn_clear)
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setStyleSheet(
+            MADMainWindow._review_btn_qss("#2d6cdf", "#3b7ae8"))
+        self.btn_apply.clicked.connect(self._apply)
+        row.addWidget(self.btn_apply)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+    # -- data ----------------------------------------------------------
+    def reload(self):
+        """Collect the current file's pending predictions, best score first."""
+        m = self._main
+        sg = m.spectrogram
+        self._marks.clear()
+        self._page = 0
+        # Bind these tiles to the detection set they came from, so marks made
+        # here can never be applied to a different file's calls.
+        self._token = m._review_token()
+        tiles = []
+        for i, ann in enumerate(sg.annotations):
+            if ann.get('status') != 'prediction':
+                continue
+            if sg._score_hidden(ann):
+                continue
+            mask = ann.get('mask')
+            if mask is None or not np.any(mask):
+                continue
+            tiles.append({'idx': i, 'id': ann.get('id'),
+                          'score': float(ann.get('score') or 0.0),
+                          'mask': mask, 'ann': ann})
+        tiles.sort(key=lambda t: -t['score'])
+        self._tiles = tiles
+        self._render()
+
+    def _pages(self) -> int:
+        return max(1, (len(self._tiles) + self._per_page - 1) // self._per_page)
+
+    def _go(self, delta: int):
+        self._page = max(0, min(self._pages() - 1, self._page + delta))
+        self._render()
+
+    def _tile_pixmap(self, mask) -> 'QPixmap':
+        """Render one call's mask crop as a small image, scaled to the tile.
+
+        Aspect is not preserved: calls are extremely wide or tall depending on
+        zoom, and squashing every crop into the same box makes the *shape* of
+        the call comparable at a glance, which is what the eye is scanning for.
+        """
+        from PyQt5.QtGui import QPixmap
+        pal = self._main._overlay_palette()
+        h, w = mask.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = pal['halo']
+        rgba[..., 3] = 255
+        r, g, b = pal['pending']
+        m = mask > 0
+        rgba[m] = (r, g, b, 255)
+        # flipud returns a view, so make it contiguous *after* the flip — QImage
+        # needs a contiguous buffer (frequency also increases upward on screen).
+        rgba = np.ascontiguousarray(np.flipud(rgba))
+        img = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        return QPixmap.fromImage(img).scaled(
+            self.TILE, self.TILE - 26, Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation)
+
+    def _render(self):
+        self._grid_host = QWidget()
+        from PyQt5.QtWidgets import QGridLayout
+        grid = QGridLayout(self._grid_host)
+        grid.setSpacing(6)
+        start = self._page * self._per_page
+        page = self._tiles[start:start + self._per_page]
+        cols = max(1, (self.scroll.viewport().width() - 20) // (self.TILE + 8))
+        for n, t in enumerate(page):
+            btn = QPushButton()
+            btn.setFixedSize(self.TILE, self.TILE)
+            btn.setIcon(QIcon(self._tile_pixmap(t['mask'])))
+            btn.setIconSize(QSize(self.TILE - 8, self.TILE - 30))
+            btn.setText(f"{t['score']:.2f}")
+            btn.setStyleSheet(self._tile_qss(self._marks.get(t['id'])))
+            btn.setToolTip(
+                f"score {t['score']:.3f} · {t['mask'].shape[1]}×"
+                f"{t['mask'].shape[0]} px\nClick to cycle "
+                "accept → reject → undecided")
+            btn.clicked.connect(lambda _c=False, tid=t['id']: self._cycle(tid))
+            grid.addWidget(btn, n // cols, n % cols)
+        grid.setRowStretch(grid.rowCount(), 1)
+        # setWidget takes ownership and destroys the previous widget, so the old
+        # host must NOT also be deleteLater()'d — that double-frees it.
+        self.scroll.setWidget(self._grid_host)
+        self.lbl_page.setText(
+            f"{len(self._tiles)} pending · page {self._page + 1}/{self._pages()}"
+            if self._tiles else "No pending detections on this file")
+        self.btn_prev.setEnabled(self._page > 0)
+        self.btn_next.setEnabled(self._page < self._pages() - 1)
+        self._update_marks_label()
+
+    @staticmethod
+    def _tile_qss(mark: Optional[str]) -> str:
+        border = {'accept': "#3fbf5f", 'reject': "#d64545"}.get(mark, "#4a4a4a")
+        width = 3 if mark else 1
+        return (f"QPushButton {{ border: {width}px solid {border}; "
+                f"border-radius: 4px; background: #232323; color: #cccccc; "
+                f"font-size: 9px; text-align: bottom; padding-bottom: 2px; }}")
+
+    # -- marking -------------------------------------------------------
+    def _cycle(self, tid):
+        cur = self._marks.get(tid)
+        nxt = {None: 'accept', 'accept': 'reject', 'reject': None}[cur]
+        if nxt is None:
+            self._marks.pop(tid, None)
+        else:
+            self._marks[tid] = nxt
+        self._render()
+
+    def _mark_page(self, what: str):
+        start = self._page * self._per_page
+        for t in self._tiles[start:start + self._per_page]:
+            self._marks[t['id']] = what
+        self._render()
+
+    def _clear_marks(self):
+        self._marks.clear()
+        self._render()
+
+    def _update_marks_label(self):
+        n_a = sum(1 for v in self._marks.values() if v == 'accept')
+        n_r = sum(1 for v in self._marks.values() if v == 'reject')
+        self.lbl_marks.setText(
+            f"{n_a} to accept · {n_r} to reject" if (n_a or n_r)
+            else "Nothing marked")
+        self.btn_apply.setEnabled(bool(self._marks))
+
+    # -- apply ---------------------------------------------------------
+    def _apply(self):
+        """Commit the marks through the main window's normal review paths, so
+        training examples, CSV status and undo all behave exactly as they do
+        when reviewing one call at a time."""
+        if not self._marks:
+            return
+        # The previewed file (or its detection set) may have changed since these
+        # tiles were built. Applying anyway would decide calls the user never
+        # looked at, so refuse and show the current file instead.
+        if self._token != self._main._review_token():
+            QMessageBox.information(
+                self, "Detection Gallery",
+                "The previewed recording changed since these tiles were "
+                "loaded, so the marks were discarded rather than applied to "
+                "a different file's detections.\n\nThe gallery now shows the "
+                "current file.")
+            self._marks.clear()
+            self.reload()
+            return
+        n = self._main._apply_gallery_marks(dict(self._marks))
+        self._marks.clear()
+        self.reload()
+        self._main.status_bar.showMessage(f"Gallery: applied {n} decision(s)")
+
+
+class MADEvalWorker(QThread):
+    """Run a call-level threshold sweep off the UI thread."""
+    progress_signal = pyqtSignal(int, int, str)
+    finished_signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, cfg, wav_paths, iou_min=0.3, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.wav_paths = list(wav_paths)
+        self.iou_min = iou_min
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            from fnt.usv.usv_detector.mad_eval import evaluate_wavs
+            res = evaluate_wavs(
+                self.wav_paths, self.cfg, iou_min=self.iou_min,
+                progress=lambda i, n, name: self.progress_signal.emit(i, n, name),
+                should_stop=lambda: self._stop,
+            )
+            self.finished_signal.emit(res)
+        except Exception as e:
+            import traceback
+            self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+class MADEvalDialog(QDialog):
+    """Call-level evaluation of the selected model, swept across thresholds.
+
+    Answers the question that decides whether to commit hours of compute: how
+    many real calls will this model find, and how much junk will I reject? Tile
+    Dice (what training reports) cannot answer that.
+    """
+
+    COLS = ["Threshold", "Precision", "Recall", "F1", "TP", "FP", "FN"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self._worker = None
+        self._result = None
+        self.setModal(False)
+        self.setWindowTitle("Evaluate Model (call-level)")
+        self.resize(760, 560)
+        v = QVBoxLayout(self)
+
+        blurb = QLabel(
+            "Scores the selected model against the calls you have "
+            "<b>confirmed</b> — hand-drawn labels and accepted predictions, "
+            "one call at a time — not pixel Dice. Every threshold is evaluated "
+            "from a single inference pass, so the whole curve costs one run.<br>"
+            "<i>Use recordings you have labeled but that the model has not been "
+            "trained on; otherwise the numbers flatter the model.</i>")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        v.addWidget(blurb)
+
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Evaluate on:"))
+        self.combo_scope = QComboBox()
+        self.combo_scope.addItem("All audio files", 'all')
+        self.combo_scope.addItem("Current file only", 'current')
+        self.combo_scope.setToolTip(
+            "Which recordings in the Audio list to score. Only files that carry "
+            "confirmed calls are used; the rest are reported as skipped.")
+        opts.addWidget(self.combo_scope, 1)
+        opts.addWidget(QLabel("Match IoU ≥"))
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.05, 0.95)
+        self.spin_iou.setSingleStep(0.05)
+        self.spin_iou.setValue(0.30)
+        self.spin_iou.setToolTip(
+            "How much a prediction's time/frequency box must overlap a "
+            "confirmed call to count as the same call. 0.3 is forgiving "
+            "about exact mask edges while still requiring the right call.")
+        opts.addWidget(self.spin_iou)
+        v.addLayout(opts)
+
+        self.btn_run = QPushButton("Run Evaluation")
+        self.btn_run.clicked.connect(self._run)
+        v.addWidget(self.btn_run)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        v.addWidget(self.progress)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_status.setWordWrap(True)
+        v.addWidget(self.lbl_status)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(self.COLS)
+        self.table.setRootIsDecorated(False)
+        self.table.setAllColumnsShowFocus(True)
+        self.table.header().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+
+        self.lbl_best = QLabel("")
+        self.lbl_best.setWordWrap(True)
+        self.lbl_best.setStyleSheet("font-size: 10px;")
+        v.addWidget(self.lbl_best)
+
+        row = QHBoxLayout()
+        self.btn_apply = QPushButton("Use Selected Threshold")
+        self.btn_apply.setToolTip(
+            "Copy the highlighted threshold into the Run Inference settings.")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self._apply_threshold)
+        row.addWidget(self.btn_apply)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+    def _targets(self):
+        m = self._main
+        if self.combo_scope.currentData() == 'current':
+            cur = m._active_wav_path()
+            return [cur] if cur and os.path.isfile(cur) else []
+        return [p for p in m.audio_files if os.path.isfile(p)]
+
+    def _run(self):
+        m = self._main
+        model = m._selected_deploy_model_path() or m._default_model_path()
+        if not model or not os.path.isfile(model):
+            QMessageBox.warning(self, "Model missing",
+                                "Select a trained model first.")
+            return
+        wavs = self._targets()
+        if not wavs:
+            QMessageBox.warning(
+                self, "No files",
+                "No recordings available in the chosen scope.")
+            return
+        from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
+        cfg = MADInferenceConfig(
+            model_path=model,
+            threshold=0.2,          # sweep floor; higher cutoffs re-score it
+            min_blob_pixels=m.spin_infer_min_blob.value(),
+            device=m._device_value(m.combo_infer_device),
+            save_blob_csv=False,    # evaluation must never touch stored results
+            preserve_labels=False,  # score the raw model, not a shielded re-run
+            **m._infer_perf_kwargs(),
+        )
+        self.btn_run.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(wavs))
+        self.progress.setValue(0)
+        self.lbl_status.setText(f"Evaluating {len(wavs)} file(s)…")
+        self._worker = MADEvalWorker(cfg, wavs, self.spin_iou.value(), self)
+        self._worker.progress_signal.connect(self._on_progress)
+        self._worker.finished_signal.connect(self._on_done)
+        self._worker.error_signal.connect(self._on_error)
+        self._worker.start()
+
+    def _on_progress(self, i, n, name):
+        self.progress.setValue(i)
+        self.lbl_status.setText(f"[{i + 1}/{n}] {name}")
+
+    def _on_error(self, msg):
+        self.btn_run.setEnabled(True)
+        self.progress.setVisible(False)
+        self.lbl_status.setText("Evaluation failed.")
+        QMessageBox.warning(self, "Evaluation failed", msg[:2000])
+
+    def _on_done(self, res):
+        self._worker = None
+        self._result = res
+        self.btn_run.setEnabled(True)
+        self.progress.setVisible(False)
+        skipped = [f for f in res.files if f.get('skipped')]
+        self.lbl_status.setText(
+            f"Scored {res.n_files} file(s) / {res.n_labels} confirmed call(s)"
+            + (f" · {len(skipped)} file(s) skipped (no confirmed calls)"
+               if skipped else ""))
+        self.table.clear()
+        if not res.per_threshold or res.n_labels == 0:
+            self.lbl_best.setText(
+                "<span style='color:#c8a05a;'>No confirmed calls found in "
+                "the chosen scope — label or accept some calls first, or "
+                "switch scope.</span>")
+            self.btn_apply.setEnabled(False)
+            return
+        best = res.best('f1') or {}
+        for d in res.per_threshold:
+            none_found = int(d.get('n_pred', 0)) == 0
+            item = SortableTreeWidgetItem([
+                f"{d['threshold']:.2f}",
+                "—" if none_found else f"{d['precision']:.3f}",
+                f"{d['recall']:.3f}",
+                "—" if none_found else f"{d['f1']:.3f}",
+                str(d['tp']), str(d['fp']), str(d['fn']),
+            ])
+            item.setData(0, Qt.UserRole, d['threshold'])
+            if none_found:
+                item.setToolTip(
+                    0, "No detections at this threshold — precision is "
+                       "undefined, not zero.")
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(150, 150, 150))
+            elif d is best:
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(120, 230, 150))
+            self.table.addTopLevelItem(item)
+            if d is best:
+                self.table.setCurrentItem(item)
+        self.btn_apply.setEnabled(True)
+        # An unreviewed prediction is not ground truth, so the model
+        # re-detecting one scores as a false positive even though nobody has
+        # judged it. That understates precision, and saying so is the
+        # difference between a number the user can act on and one that quietly
+        # misleads them.
+        warn = ""
+        if res.n_unreviewed:
+            warn = (
+                f"<br><span style='color:#c8a05a;'>Precision is understated: "
+                f"{res.n_unreviewed} prediction(s) on these files are still "
+                "unreviewed, so re-detecting them counts against the model. "
+                "Finish reviewing, or evaluate on fully-reviewed files, for a "
+                "number you can trust.</span>")
+        self.lbl_best.setText(
+            f"Best F1 <b>{best.get('f1', 0):.3f}</b> at threshold "
+            f"<b>{best.get('threshold', 0):.2f}</b> "
+            f"(precision {best.get('precision', 0):.3f}, recall "
+            f"{best.get('recall', 0):.3f}).<br>"
+            "<i>Raise the threshold when false positives cost you review time; "
+            "lower it when missed calls matter more.</i>" + warn)
+
+    def _apply_threshold(self):
+        item = self.table.currentItem()
+        if item is None:
+            return
+        thr = item.data(0, Qt.UserRole)
+        if thr is None:
+            return
+        self._main.spin_infer_threshold.setValue(float(thr))
+        self._main._log(f"Probability threshold set to {float(thr):.2f} "
+                        "from evaluation")
+        self._main.status_bar.showMessage(
+            f"Inference threshold set to {float(thr):.2f}")
+
+
+class MADRunSummaryDialog(QDialog):
+    """Per-file results of a finished (or interrupted) batch run.
+
+    After a few thousand recordings the bottleneck stops being compute and
+    becomes "which of these actually contain calls?". This reads the run
+    manifest — never the audio or the mask crops — so it opens instantly on a
+    3,000-file run, sorts by detection count or rate, and hands a chosen file
+    straight to the reviewer.
+    """
+
+    COLS = ["File", "Detections", "Calls/min", "Duration", "Scan time",
+            "× realtime", "Status"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Batch Run Summary")
+        self.resize(880, 560)
+        v = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Run:"))
+        self.combo_run = QComboBox()
+        self.combo_run.setToolTip("Batch runs recorded for this project, "
+                                  "newest first.")
+        self.combo_run.currentIndexChanged.connect(lambda _i: self._reload())
+        top.addWidget(self.combo_run, 1)
+        v.addLayout(top)
+
+        self.lbl_stats = QLabel("")
+        self.lbl_stats.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        self.lbl_stats.setWordWrap(True)
+        v.addWidget(self.lbl_stats)
+
+        filt = QHBoxLayout()
+        self.chk_only_calls = QCheckBox("Only files with detections")
+        self.chk_only_calls.setToolTip(
+            "Hide silent recordings. On a 24/7 set most files are empty, and "
+            "this is usually the first thing you want.")
+        self.chk_only_calls.toggled.connect(lambda _b: self._render())
+        filt.addWidget(self.chk_only_calls)
+        self.chk_only_errors = QCheckBox("Only failures")
+        self.chk_only_errors.toggled.connect(lambda _b: self._render())
+        filt.addWidget(self.chk_only_errors)
+        filt.addStretch(1)
+        v.addLayout(filt)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(self.COLS)
+        self.table.setRootIsDecorated(False)
+        self.table.setSortingEnabled(True)
+        self.table.setAllColumnsShowFocus(True)
+        self.table.header().setStretchLastSection(True)
+        self.table.itemDoubleClicked.connect(self._open_selected)
+        v.addWidget(self.table, 1)
+
+        hint = QLabel("Double-click a row to open that recording for review.")
+        hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
+        v.addWidget(hint)
+
+        row = QHBoxLayout()
+        btn_open = QPushButton("Open for Review")
+        btn_open.clicked.connect(lambda: self._open_selected(
+            self.table.currentItem(), 0))
+        row.addWidget(btn_open)
+        btn_folder = QPushButton("Reveal Run Folder")
+        btn_folder.clicked.connect(self._reveal)
+        row.addWidget(btn_folder)
+        row.addStretch(1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+        self._records: List[dict] = []
+        self._populate_runs()
+
+    # -- data ----------------------------------------------------------
+    def _populate_runs(self):
+        from fnt.usv.usv_detector.mad_batch import RunManifest, list_runs
+        root = self._main._batch_run_root()
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        runs = list_runs(root) if root else []
+        for rd in runs:
+            info = RunManifest(rd).read_info()
+            model = info.get('model_name', '?')
+            n = info.get('n_files', '?')
+            self.combo_run.addItem(
+                f"{os.path.basename(rd)}  —  {model}, {n} file(s)", rd)
+        self.combo_run.blockSignals(False)
+        if runs:
+            self._reload()
+        else:
+            self.lbl_stats.setText(
+                "No batch runs recorded yet. Run inference over a folder or the "
+                "Audio list and the run is logged automatically.")
+
+    def _reload(self):
+        from fnt.usv.usv_detector.mad_batch import RunManifest, summarize
+        rd = self.combo_run.currentData()
+        if not rd:
+            return
+        m = RunManifest(rd)
+        self._records = m.records()
+        info = m.read_info()
+        s = summarize(self._records)
+        self.lbl_stats.setText(
+            f"<b>{s['n_detections']:,}</b> detection(s) across "
+            f"<b>{s['n_files_with_calls']:,}</b> of {s['n_ok']:,} analyzed "
+            f"file(s) &nbsp;·&nbsp; {s['n_error']} failed, {s['n_skipped']} "
+            f"skipped<br>"
+            f"{s['audio_hours']:.1f} h audio in {s['wall_hours']:.2f} h "
+            f"({s['realtime_factor']:.0f}× realtime) &nbsp;·&nbsp; "
+            f"model <b>{info.get('model_name', '?')}</b>, threshold "
+            f"{info.get('threshold', '?')}, min blob "
+            f"{info.get('min_blob_pixels', '?')}px")
+        self._render()
+
+    def _render(self):
+        only_calls = self.chk_only_calls.isChecked()
+        only_err = self.chk_only_errors.isChecked()
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        for r in self._records:
+            status = r.get('status', '')
+            n_det = int(r.get('n_detections') or 0)
+            if only_err and status != 'error':
+                continue
+            if only_calls and (status == 'error' or n_det == 0):
+                continue
+            dur = float(r.get('audio_dur_s') or 0.0)
+            wall = float(r.get('t_total') or 0.0)
+            rt = float(r.get('realtime_factor') or 0.0)
+            rate = (n_det / (dur / 60.0)) if dur > 0 else 0.0
+            item = SortableTreeWidgetItem([
+                r.get('name', ''),
+                f"{n_det:,}" if status != 'error' else "—",
+                f"{rate:.2f}" if dur > 0 else "—",
+                f"{dur:.0f}s" if dur else "—",
+                f"{wall:.1f}s" if wall else "—",
+                f"{rt:.0f}×" if rt else "—",
+                status,
+            ])
+            item.setData(0, _SORT_ROLE, r.get('name', '').lower())
+            item.setData(1, _SORT_ROLE, float(n_det))
+            item.setData(2, _SORT_ROLE, rate)
+            item.setData(3, _SORT_ROLE, dur)
+            item.setData(4, _SORT_ROLE, wall)
+            item.setData(5, _SORT_ROLE, rt)
+            item.setData(0, Qt.UserRole, r.get('wav_path', ''))
+            if status == 'error':
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(235, 90, 90))
+                item.setToolTip(0, str(r.get('error') or 'failed'))
+            elif n_det == 0:
+                for c in range(len(self.COLS)):
+                    item.setForeground(c, QColor(150, 150, 150))
+            self.table.addTopLevelItem(item)
+        self.table.setSortingEnabled(True)
+        # Most detections first — the files worth a human's attention.
+        self.table.sortByColumn(1, Qt.DescendingOrder)
+        for c in range(len(self.COLS) - 1):
+            self.table.resizeColumnToContents(c)
+
+    # -- actions -------------------------------------------------------
+    def _open_selected(self, item, _col=0):
+        if item is None:
+            return
+        wav = item.data(0, Qt.UserRole)
+        if not wav or not os.path.isfile(wav):
+            QMessageBox.information(
+                self, "Open for Review",
+                f"Recording not found:\n{wav}")
+            return
+        self._main._open_wav_for_review(wav)
+
+    def _reveal(self):
+        rd = self.combo_run.currentData()
+        if rd and os.path.isdir(rd):
+            os.startfile(rd) if hasattr(os, 'startfile') else None
+
+
+class MADPreviewDialog(QDialog):
+    """Non-modal window showing per-epoch prediction previews. Each epoch adds a
+    page of tiles (spectrogram + ground-truth outline + predicted-mask overlay);
+    the user can scrub back through earlier epochs to watch the model improve.
+    Auto-follows the latest epoch unless the user scrolls back or unticks
+    'Follow latest'. History is capped to bound memory on very long runs."""
+
+    MAX_HISTORY = 200
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Live Prediction Previews")
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
+        self.resize(860, 640)
+        self._pages = []   # list of (epoch:int, val_dice:float|None, tiles:list)
+        self._view = 0
+        self._dirty = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_latest = QPushButton("Latest")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(0)
+        self.chk_follow = QCheckBox("Follow latest")
+        self.chk_follow.setChecked(True)
+        self.btn_prev.clicked.connect(lambda: self._go(self._view - 1))
+        self.btn_next.clicked.connect(lambda: self._go(self._view + 1))
+        self.btn_latest.clicked.connect(
+            lambda: self._go(len(self._pages) - 1))
+        self.slider.valueChanged.connect(self._on_slider)
+        nav.addWidget(self.btn_prev)
+        nav.addWidget(self.slider, 1)
+        nav.addWidget(self.btn_next)
+        nav.addWidget(self.btn_latest)
+        nav.addWidget(self.chk_follow)
+        v.addLayout(nav)
+
+        self.lbl = QLabel("waiting for first epoch…")
+        self.lbl.setStyleSheet("color:#cccccc; font-size:10px;")
+        v.addWidget(self.lbl)
+        legend = QLabel(
+            "<span style='color:#39ff88'>▢ outline = ground truth</span>"
+            "&nbsp;&nbsp;&nbsp;"
+            "<span style='color:#ff6666'>■ fill = predicted mask</span>")
+        legend.setStyleSheet("font-size:10px;")
+        v.addWidget(legend)
+
+        self._plot_ok = False
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import (
+                FigureCanvasQTAgg as FigureCanvas,
+            )
+            self._figure = Figure(tight_layout=True)
+            self._figure.patch.set_facecolor("#1e1e1e")
+            self._canvas = FigureCanvas(self._figure)
+            v.addWidget(self._canvas, 1)
+            self._plot_ok = True
+        except Exception:
+            msg = QLabel("matplotlib not installed — previews disabled.")
+            msg.setStyleSheet("color:#888888;")
+            v.addWidget(msg, 1)
+
+        # Coalesce rapid epochs into at most ~7 redraws/s so fast runs don't
+        # flood the UI thread with matplotlib draws.
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render)
+        self._update_nav()
+
+    def clear(self):
+        self._pages = []
+        self._view = 0
+        self.chk_follow.setChecked(True)
+        if self._plot_ok:
+            self._figure.clear()
+            try:
+                self._canvas.draw_idle()
+            except Exception:
+                pass
+        self._update_nav()
+
+    def add_page(self, epoch, val_dice, tiles):
+        if not tiles:
+            return
+        was_latest = (not self._pages) or (self._view == len(self._pages) - 1)
+        self._pages.append((int(epoch), val_dice, tiles))
+        if len(self._pages) > self.MAX_HISTORY:
+            self._pages.pop(0)
+            if not was_latest:
+                self._view = max(0, self._view - 1)
+        if self.chk_follow.isChecked() or was_latest:
+            self._view = len(self._pages) - 1
+            self._update_nav()
+            if not self._render_timer.isActive():
+                self._render_timer.start(140)
+        else:
+            self._update_nav()  # count/label change, but keep current view
+
+    def _on_slider(self, val):
+        if val != self._view:
+            self._go(val)
+
+    def _go(self, idx):
+        if not self._pages:
+            return
+        idx = max(0, min(len(self._pages) - 1, idx))
+        self._view = idx
+        if idx < len(self._pages) - 1:
+            self.chk_follow.setChecked(False)
+        self._update_nav()
+        self._render()
+
+    def _update_nav(self):
+        n = len(self._pages)
+        self.slider.blockSignals(True)
+        self.slider.setMaximum(max(0, n - 1))
+        self.slider.setValue(self._view)
+        self.slider.blockSignals(False)
+        self.btn_prev.setEnabled(self._view > 0)
+        self.btn_next.setEnabled(self._view < n - 1)
+        self.btn_latest.setEnabled(n > 0 and self._view < n - 1)
+        if n:
+            ep, dice, _ = self._pages[self._view]
+            tail = "  (latest)" if self._view == n - 1 else ""
+            ds = f"   val_dice={dice:.3f}" if dice is not None else ""
+            self.lbl.setText(
+                f"Epoch {ep}{ds}   —   {self._view + 1}/{n}{tail}")
+
+    def _render(self):
+        if not self._plot_ok or not self._pages:
+            return
+        _, _, tiles = self._pages[self._view]
+        fig = self._figure
+        fig.clear()
+        n = len(tiles)
+        cols = min(3, n) or 1
+        rows = int(np.ceil(n / cols))
+        for i, t in enumerate(tiles):
+            ax = fig.add_subplot(rows, cols, i + 1)
+            ax.imshow(t['spec'], cmap='gray', origin='lower', aspect='auto',
+                      vmin=0, vmax=255)
+            pm = (t['pred'].astype(np.float32) / 255.0) > 0.5
+            overlay = np.zeros((pm.shape[0], pm.shape[1], 4), dtype=np.float32)
+            overlay[pm] = (1.0, 0.4, 0.4, 0.45)
+            ax.imshow(overlay, origin='lower', aspect='auto')
+            if t.get('gt') is not None:
+                ax.contour(t['gt'].astype(np.float32), levels=[0.5],
+                           colors='#39ff88', linewidths=1.1)
+                title = (f"call · dice={t['dice']:.2f}"
+                         if t.get('dice') is not None else "call")
+            else:
+                title = "background (no call)"
+            ax.set_title(title, color="#cccccc", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # Just hide — the run keeps emitting previews (cheap) and the window can
+        # be reopened. The main window drops the reference on teardown.
+        event.accept()
+
+
+class MADDeviceProbeWorker(QThread):
+    """Detect the compute device 'auto' will resolve to, off the UI thread.
+
+    Importing torch can take a second or two, so this runs in the background at
+    startup and reports (kind, name, note) once ready — the Device combo and the
+    info label under it are updated when it finishes."""
+
+    done_signal = pyqtSignal(str, str, str)  # kind ('cuda'|'mps'|'cpu'), name, note
+
+    @staticmethod
+    def _nvidia_smi_name() -> Optional[str]:
+        import subprocess
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=6)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+        return None
+
+    def run(self):
+        kind, name, note = 'cpu', '', ''
+        try:
+            import torch
+            if torch.cuda.is_available():
+                kind = 'cuda'
+                try:
+                    name = torch.cuda.get_device_name(0)
+                except Exception:
+                    name = 'NVIDIA GPU'
+                note = f"{name} detected — training/inference will use CUDA."
+            elif getattr(getattr(torch, 'backends', None), 'mps', None) is not None \
+                    and torch.backends.mps.is_available():
+                kind, name = 'mps', 'Apple GPU'
+                note = "Apple-Silicon GPU (MPS) detected — will use MPS."
+            else:
+                nv = self._nvidia_smi_name()
+                if nv:
+                    name = nv
+                    note = (f"{nv} present, but this PyTorch is CPU-only — will "
+                            "run on CPU. Fix: Help ▸ Check GPU / CUDA setup.")
+                else:
+                    note = "No GPU detected — will run on CPU."
+        except Exception:
+            nv = self._nvidia_smi_name()
+            if nv:
+                name = nv
+                note = f"{nv} present, but PyTorch isn't installed — will run on CPU."
+            else:
+                note = "PyTorch not found — will run on CPU."
+        self.done_signal.emit(kind, name, note)
+
+
 # ======================================================================
 # Main window
 # ======================================================================
@@ -2253,16 +3464,14 @@ class MADMainWindow(QMainWindow):
         # can reverse the last few. Reset on file change.
         self._undo_stack: List[dict] = []
 
-        # Training Data list (project recordings the model trains on). Backed
-        # by deploy_files/deploy_list (repurposed from the old inference queue).
-        self.deploy_files: List[str] = []
-        self._deploy_file_idx: Optional[int] = None
+        # Normcased absolute paths of registered recordings whose audio can't be
+        # found right now. A soft state — see _rescan_project_wavs.
+        self._missing_audio: set = set()
+        # Batch-scale inference target: a folder tree scanned once, kept as a
+        # plain path list so thousands of recordings never become list widgets.
+        self._infer_folder: Optional[str] = None
+        self._infer_folder_wavs: List[str] = []
         self._infer_model_project_dir: Optional[str] = None
-        # Which list owns the single preview: 'session' or 'training'. Drives
-        # _review_mode (training → accept saves a training example; session →
-        # accept/reject only writes status to the sibling CSV).
-        self._active_source: str = 'session'
-        self._review_mode: str = 'deploy'
 
         # Rubber-band multi-selection: stable ids of box-selected detections.
         self._box_sel_ids: List = []
@@ -2271,7 +3480,9 @@ class MADMainWindow(QMainWindow):
         self._session_classes: List[str] = ["USV"]
         self._session_last_class: str = "USV"
         # Persisted per-file total annotation count cache.
-        self._file_count_cache: Dict[str, int] = {}
+        # basename -> (accepted, pending, rejected) counts for the file lists
+        self._file_count_cache: Dict[str, tuple] = {}
+        self._loaded_wav_path: Optional[str] = None  # wav the annotations are for
 
         # SAM2-assisted labeling state
         self._sam_ckpt: Optional[str] = None
@@ -2293,6 +3504,10 @@ class MADMainWindow(QMainWindow):
         self._update_project_state()
         self._update_paint_buttons_enabled()
         self._update_playback_buttons_enabled()
+
+        # Probe the compute device in the background and annotate the Device
+        # pickers ("Auto (NVIDIA GPU)") plus the info label under them.
+        self._start_device_probe()
 
         # No startup dialog — user loads wavs freely, project created on demand.
 
@@ -2319,7 +3534,8 @@ class MADMainWindow(QMainWindow):
         # can wire its signals; it's placed in the right preview area below and
         # only shown while training runs (mirrors Mask Tracker).
         self.train_panel = MADRunPanel(show_plot=True,
-                                       external_log=self.session_log)
+                                       external_log=self.session_log,
+                                       stop_label="Stop Training Early")
 
         # ---------- Left panel: workflow-stage tabs over a shared canvas ----
         # Mask tab = label + train; Inference tab = run + blob review. Both
@@ -2331,8 +3547,8 @@ class MADMainWindow(QMainWindow):
 
         # Single scrolled left column (no tabs): everything acts on the one
         # shared spectrogram canvas. Order top→bottom mirrors the workflow:
-        # open project → load session audio → curate Training Data → review
-        # detections → label → train/infer → logs.
+        # open project → add audio → label → review detections → train/infer →
+        # logs.
         self.left_column = QScrollArea()
         self.left_column.setWidgetResizable(True)
         self.left_column.setMinimumWidth(_min_w)
@@ -2343,10 +3559,9 @@ class MADMainWindow(QMainWindow):
         _page_layout.setContentsMargins(5, 5, 5, 5)
         _page_layout.setSpacing(8)
         for build in (
-            self._create_session_audio_section,
+            self._create_audio_section,              # Audio
             self._create_paint_tools_section,        # Labeling Tools
             self._create_annotation_list_section,    # Detections
-            self._create_training_data_list_section, # Training Data
             self._create_model_section,
             self._create_session_log_section,
         ):
@@ -2380,9 +3595,6 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.zoom_requested.connect(self._on_wheel_zoom)
         self.spectrogram.stroke_committed.connect(self._on_stroke_committed)
         self.spectrogram.sam_points_changed.connect(self._on_sam_points_changed)
-        self.spectrogram.brush_radius_changed.connect(
-            self._on_brush_radius_scrolled
-        )
         self.spectrogram.request_context_menu.connect(
             self._on_annotation_context_menu
         )
@@ -2401,6 +3613,7 @@ class MADMainWindow(QMainWindow):
         # (_train_dialog) so the spectrogram stays visible/usable while a run is
         # in progress — see _show_training_dialog. Not added to this layout.
         self._train_dialog = None
+        self._preview_dialog = None
         self._training_active = False
 
         self.waveform_overview = WaveformOverviewWidget()
@@ -2508,17 +3721,24 @@ class MADMainWindow(QMainWindow):
 
         controls_layout.addWidget(QLabel("Color Map:"))
         self.combo_colormap = QComboBox()
-        self.combo_colormap.addItems(
-            ['grayscale_inv', 'grayscale', 'viridis', 'magma', 'inferno']
-        )
-        self.combo_colormap.setFixedWidth(110)
+        # Display label -> internal colormap key (kept as userData so the LUT
+        # lookups and saved values keep using the short keys).
+        for label, key in (
+            ("Grayscale Inverted", 'grayscale_inv'),
+            ("Grayscale", 'grayscale'),
+            ("Viridis", 'viridis'),
+            ("Magma", 'magma'),
+            ("Inferno", 'inferno'),
+        ):
+            self.combo_colormap.addItem(label, key)
+        self.combo_colormap.setFixedWidth(140)
         self.combo_colormap.setToolTip(
-            "Spectrogram color palette (display only). 'viridis/magma/inferno' "
-            "are perceptually uniform; 'grayscale_inv' shows loud = dark.")
-        # Default to inverted grayscale (soft = white, loud = dark).
-        self.combo_colormap.setCurrentText('viridis')
+            "Spectrogram color palette (display only). 'Viridis/Magma/Inferno' "
+            "are perceptually uniform; 'Grayscale Inverted' shows loud = dark.")
+        # Default to viridis.
+        self.combo_colormap.setCurrentIndex(self.combo_colormap.findData('viridis'))
         self.spectrogram.set_colormap('viridis')
-        self.combo_colormap.currentTextChanged.connect(self._on_colormap_changed)
+        self.combo_colormap.currentIndexChanged.connect(self._on_colormap_changed)
         controls_layout.addWidget(self.combo_colormap)
 
         sep3 = QFrame(); sep3.setFrameShape(QFrame.VLine)
@@ -2584,36 +3804,53 @@ class MADMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Left-panel section builders
     # ------------------------------------------------------------------
-    def _create_session_audio_section(self, layout):
-        group = QGroupBox("Load Session Audio")
-        self._grp_session_audio = group
+    def _create_audio_section(self, layout):
+        group = QGroupBox("Audio")
+        self._grp_audio = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
+
+        hint = QLabel(
+            "Every recording this project knows about — referenced where it "
+            "lives, never copied in. Label any of them; the model trains on all "
+            "of them. A ⚠ row means the audio moved: labels, training and saved "
+            "detections are fine, use File ▸ Locate Missing Recordings… to "
+            "restore preview.")
+        hint.setStyleSheet("color: #999999; font-size: 9px;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
 
         add_row = QHBoxLayout()
         add_row.setSpacing(4)
         self.btn_add_folder = QPushButton("Add Folder…")
         self.btn_add_folder.setToolTip(
-            "Load every .wav directly inside a folder (non-recursive) into the "
-            "working session. Loading does NOT copy files into the project — "
-            "labels/predictions save next to the original audio. Use 'Copy to "
-            "Training Data' to add a file to the project's training set."
+            "Add every .wav directly inside a folder (non-recursive). Files are "
+            "REFERENCED IN PLACE, not copied: labels and detections save next "
+            "to the original audio, and the project stays small.\n\n"
+            "With a project open the files are recorded in it and reappear next "
+            "time you open it; with no project they are loaded for this session "
+            "only."
         )
         self.btn_add_folder.clicked.connect(self._menu_add_folder)
         add_row.addWidget(self.btn_add_folder)
 
         self.btn_add_files = QPushButton("Add Files…")
         self.btn_add_files.setToolTip(
-            "Load individual .wav files into the working session. Does not copy "
-            "them into the project — labels save next to the source audio."
+            "Add individual .wav files. Referenced in place, not copied — "
+            "labels save next to the source audio."
         )
         self.btn_add_files.clicked.connect(self._add_audio_files)
         add_row.addWidget(self.btn_add_files)
         vbox.addLayout(add_row)
 
         self.file_list = QListWidget()
-        self.file_list.setMaximumHeight(180)
+        self.file_list.setMaximumHeight(220)
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.file_list.setItemDelegate(
+            FileCountDelegate(self.file_list, palette_fn=self._overlay_palette))
+        self.file_list.setToolTip(
+            "Click a row to preview and label it. The count is "
+            "(accepted, pending, rejected) calls for that recording.")
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
         vbox.addWidget(self.file_list)
@@ -2622,25 +3859,13 @@ class MADMainWindow(QMainWindow):
         btn_row.setSpacing(4)
         self.btn_remove_files = QPushButton("Remove File(s)")
         self.btn_remove_files.setToolTip(
-            "Unload the selected files from the session list. Does NOT delete "
-            "anything from disk — the .wav and any sibling csv/h5 stay put. "
-            "Use Shift/Cmd+click to select multiple."
+            "Drop the selected recordings from the project. Referenced audio is "
+            "only unregistered — the .wav and any sibling csv/h5 stay exactly "
+            "where they are on disk. Use Shift/Cmd+click to select multiple."
         )
         self.btn_remove_files.clicked.connect(self._remove_selected_files)
         self.btn_remove_files.setEnabled(False)
         btn_row.addWidget(self.btn_remove_files)
-
-        self.btn_copy_to_training = QPushButton("Copy File(s) → Training Data")
-        self.btn_copy_to_training.setToolTip(
-            "Copy the selected file(s) — the .wav plus its sibling csv/h5 "
-            "labels/predictions — into the project's Training Data set. The "
-            "model trains on the Training Data set. Copies are independent "
-            "snapshots; re-copying a file already present asks before "
-            "overwriting. Needs an open project."
-        )
-        self.btn_copy_to_training.clicked.connect(self._copy_to_training_data)
-        self.btn_copy_to_training.setEnabled(False)
-        btn_row.addWidget(self.btn_copy_to_training)
         vbox.addLayout(btn_row)
 
         nav_row = QHBoxLayout()
@@ -2758,22 +3983,9 @@ class MADMainWindow(QMainWindow):
 
         vbox.addLayout(mode_row)
 
-        brush_row = QHBoxLayout()
-        brush_row.setSpacing(2)
-        brush_row.addWidget(QLabel("Brush radius:"))
-        self.spin_brush_radius = QSpinBox()
-        self.spin_brush_radius.setRange(1, 64)
-        self.spin_brush_radius.setValue(3)
-        self.spin_brush_radius.setSuffix(" px")
-        self.spin_brush_radius.setToolTip(
-            "Brush radius in spectrogram pixels (time-frame × freq-bin)"
-        )
-        self.spin_brush_radius.valueChanged.connect(
-            lambda v: self.spectrogram.set_brush_radius(v)
-        )
-        brush_row.addWidget(self.spin_brush_radius)
-        brush_row.addStretch()
-        vbox.addLayout(brush_row)
+        # Brush radius has no dedicated control — scroll the wheel over the
+        # spectrogram (or use the [ / ] shortcuts) to adjust it. The Paint
+        # button's tooltip documents this.
 
         # Paint strokes auto-save to the sibling PNG (see mouseReleaseEvent).
         self.lbl_mask_status = QLabel("No mask")
@@ -2797,70 +4009,60 @@ class MADMainWindow(QMainWindow):
         view_row.addStretch()
         vbox.addLayout(view_row)
 
-        hint = QLabel(
-            "Yellow = pending (solid = prediction, dotted = you're drawing; "
-            "Enter to confirm) · Green = confirmed · Red = rejected. Confirmed "
-            "calls save as self-contained training examples."
-        )
-        hint.setStyleSheet("color: #888888; font-size: 9px; font-style: italic;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
+        # Legend. Colors are colormap-dependent (see _OVERLAY_PALETTES), so the
+        # text is generated rather than hard-coded — otherwise it would lie
+        # about which color means what as soon as you switch color maps.
+        self.lbl_legend = QLabel()
+        self.lbl_legend.setStyleSheet("font-size: 9px;")
+        self.lbl_legend.setWordWrap(True)
+        vbox.addWidget(self.lbl_legend)
+        self._update_legend()
 
-        # Quick inference: button + model selector
-        infer_row = QHBoxLayout()
-        infer_row.setSpacing(4)
-        self.btn_quick_infer = QPushButton("Quick Inference (Q)")
-        self.btn_quick_infer.setToolTip(
-            "Run inference on the current visible view using the selected model.\n"
-            "Predictions appear as yellow annotations. Shortcut: I"
-        )
-        self.btn_quick_infer.clicked.connect(self._quick_inference_current_file)
-        self.btn_quick_infer.setEnabled(False)
-        infer_row.addWidget(self.btn_quick_infer)
-        self.combo_quick_infer_model = QComboBox()
-        self.combo_quick_infer_model.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.combo_quick_infer_model.setToolTip(
-            "Select which trained model to use for quick inference")
-        infer_row.addWidget(self.combo_quick_infer_model, 1)
-        vbox.addLayout(infer_row)
+        # Quick Inference lives in the Model Training & Inference section now
+        # (next to Load Project Models), sharing that section's model dropdown.
 
         group.setLayout(vbox)
         layout.addWidget(group)
 
-    def _refresh_quick_infer_models(self):
-        """Populate the quick-inference model dropdown from project models/."""
-        if not hasattr(self, 'combo_quick_infer_model'):
+    def _infer_perf_kwargs(self) -> dict:
+        """Performance-only inference settings, shared by every place that
+        builds a MADInferenceConfig so the two paths can't drift apart."""
+        return {
+            'batch_size': self.spin_infer_batch.value(),
+            'amp': self.chk_infer_amp.isChecked(),
+        }
+
+    def _overlay_palette(self) -> dict:
+        """Review colors for the loaded spectrogram colormap. Shared by the
+        canvas overlays, the detections list, the file-count badges and the
+        legend so every surface agrees on what each color means."""
+        sp = getattr(self, 'spectrogram', None)
+        if sp is None:
+            return overlay_palette(None)
+        return sp.palette_colors()
+
+    def _update_legend(self):
+        """Rewrite the Labeling Tools legend for the active palette."""
+        lbl = getattr(self, 'lbl_legend', None)
+        if lbl is None:
             return
-        prev = self.combo_quick_infer_model.currentData()
-        self.combo_quick_infer_model.blockSignals(True)
-        self.combo_quick_infer_model.clear()
-        if self._project is None:
-            self.combo_quick_infer_model.blockSignals(False)
-            return
-        models_root = os.path.join(self._project.project_dir, 'models')
-        if not os.path.isdir(models_root):
-            self.combo_quick_infer_model.blockSignals(False)
-            return
-        for name in sorted(os.listdir(models_root)):
-            w = os.path.join(models_root, name, 'weights.pt')
-            if os.path.isfile(w):
-                self.combo_quick_infer_model.addItem(name, w)
-        if self.combo_quick_infer_model.count() > 0:
-            if prev:
-                for i in range(self.combo_quick_infer_model.count()):
-                    if self.combo_quick_infer_model.itemData(i) == prev:
-                        self.combo_quick_infer_model.setCurrentIndex(i)
-                        break
-                else:
-                    self.combo_quick_infer_model.setCurrentIndex(
-                        self.combo_quick_infer_model.count() - 1)
-            else:
-                self.combo_quick_infer_model.setCurrentIndex(
-                    self.combo_quick_infer_model.count() - 1)
-        self.combo_quick_infer_model.blockSignals(False)
-        has_model = self.combo_quick_infer_model.count() > 0
-        self.btn_quick_infer.setEnabled(has_model)
+        pal = self._overlay_palette()
+
+        def swatch(key, text):
+            r, g, b = pal[key]
+            return (f"<span style='color:rgb({r},{g},{b}); "
+                    f"font-weight:bold;'>{text}</span>")
+
+        lbl.setText(
+            swatch('drawing', "▬ dotted") + " = you're drawing (Enter to "
+            "confirm) · " +
+            swatch('pending', "▬ solid") + " = prediction, pending review · " +
+            swatch('confirmed', "▬") + " = confirmed · " +
+            swatch('rejected', "▬") + " = rejected."
+            "<br><i style='color:#888888;'>Confirmed calls save as "
+            "self-contained training examples. Colors follow the Color Map "
+            "so masks stay visible.</i>"
+        )
 
     def _set_view_mode(self, mode: str):
         if mode == 'mask_only':  # retired view — fall back to overlay
@@ -2869,48 +4071,6 @@ class MADMainWindow(QMainWindow):
         if hasattr(self, 'btn_view_cycle'):
             self.btn_view_cycle.setText(labels.get(mode, 'Spec + Mask (V)'))
         self.spectrogram.set_view_mode(mode)
-
-    def _create_training_data_list_section(self, layout):
-        group = QGroupBox("Training Data")
-        self._grp_training_list = group
-        vbox = QVBoxLayout()
-        vbox.setSpacing(4)
-
-        hint = QLabel(
-            "Recordings copied into the project — the model trains on these. "
-            "Add files with 'Copy File(s) → Training Data' above. Click a row "
-            "to preview/review it (edits modify the training copy).")
-        hint.setStyleSheet("color: #999999; font-size: 9px;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
-
-        # Repurposed from the old inference queue: this is now the project's
-        # Training Data set. deploy_files/deploy_list back it.
-        self.deploy_list = QListWidget()
-        self.deploy_list.setMaximumHeight(150)
-        self.deploy_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.deploy_list.setToolTip(
-            "Training Data recordings (stored in the project). Click to preview "
-            "and review; edits modify this training copy's csv/h5.")
-        self.deploy_list.currentRowChanged.connect(self._on_deploy_file_selected)
-        self.deploy_list.itemSelectionChanged.connect(self._sync_list_buttons)
-        vbox.addWidget(self.deploy_list)
-
-        self.btn_remove_training = QPushButton("Remove from Training Data")
-        self.btn_remove_training.setToolTip(
-            "Delete the selected recording(s) from the project's Training Data "
-            "(removes the copied wav + csv/h5 from the project). Does not touch "
-            "the original session source files. Shift/Cmd+click for multiple.")
-        self.btn_remove_training.clicked.connect(self._remove_from_training_data)
-        self.btn_remove_training.setEnabled(False)
-        vbox.addWidget(self.btn_remove_training)
-
-        self.lbl_deploy_queue = QLabel("0 files in training set")
-        self.lbl_deploy_queue.setStyleSheet("color: #999999; font-size: 9px;")
-        vbox.addWidget(self.lbl_deploy_queue)
-
-        group.setLayout(vbox)
-        layout.addWidget(group)
 
     def _create_model_section(self, layout):
         group = QGroupBox("Model Training && Inference")
@@ -2950,10 +4110,32 @@ class MADMainWindow(QMainWindow):
         self.btn_deploy_load_project.setToolTip(
             "Pick a trained MAD project folder to load its models into the "
             "dropdown above — works with no project open, so you can point a "
-            "trained model at freshly loaded session audio and run inference.")
+            "trained model at freshly added audio and run inference.")
         self.btn_deploy_load_project.clicked.connect(self._browse_infer_project)
         src_row.addWidget(self.btn_deploy_load_project)
+        self.btn_quick_infer = QPushButton("Quick Inference (Q)")
+        self.btn_quick_infer.setToolTip(
+            "Run inference on the current visible view using the model selected "
+            "in the dropdown above.\n"
+            "Predictions appear as yellow annotations. Shortcut: Q\n\n"
+            "Note: quick inference uses fixed, hardcoded settings — probability "
+            "threshold = 0.5 and min blob pixels = 8 — and ignores the Run "
+            "Inference panel's values. Use the full Run Inference to change them."
+        )
+        self.btn_quick_infer.clicked.connect(self._quick_inference_current_file)
+        self.btn_quick_infer.setEnabled(False)
+        src_row.addWidget(self.btn_quick_infer)
         vbox.addLayout(src_row)
+
+        self.btn_eval_model = QPushButton("Evaluate Model…")
+        self.btn_eval_model.setToolTip(
+            "Score this model against your confirmed calls at call level — "
+            "precision / recall / F1 swept across probability thresholds.\n\n"
+            "Training reports pixel Dice on tiles, which does not tell you how "
+            "many real calls you'll catch. Run this before committing hours to "
+            "a large batch.")
+        self.btn_eval_model.clicked.connect(self._show_eval_dialog)
+        src_row.addWidget(self.btn_eval_model)
 
         self.lbl_deploy_model_info = QLabel("No model selected")
         self.lbl_deploy_model_info.setStyleSheet(
@@ -2964,9 +4146,9 @@ class MADMainWindow(QMainWindow):
         # ---- Train a new model (config collapses under a toggle) ----
         self.chk_train_new = QCheckBox("Train a new model")
         self.chk_train_new.setToolTip(
-            "Show the training configuration to train a fresh model on the "
-            "Training Data set. The trained model is added to the dropdown "
-            "above and selected automatically.")
+            "Show the training configuration to train a fresh model on every "
+            "label in the Audio list. The trained model is added to the "
+            "dropdown above and selected automatically.")
         self.chk_train_new.toggled.connect(self._on_train_new_toggled)
         vbox.addWidget(self.chk_train_new)
 
@@ -3016,7 +4198,7 @@ class MADMainWindow(QMainWindow):
         form.addRow("Encoder:", self.combo_train_encoder)
 
         self.spin_train_epochs = QSpinBox()
-        self.spin_train_epochs.setRange(1, 500)
+        self.spin_train_epochs.setRange(1, 10000)
         self.spin_train_epochs.setValue(100)
         self.spin_train_epochs.setSingleStep(10)
         self.spin_train_epochs.setToolTip(
@@ -3054,9 +4236,22 @@ class MADMainWindow(QMainWindow):
         self.spin_train_lr.setSingleStep(1e-4)
         self.spin_train_lr.setValue(1e-3)
         self.spin_train_lr.setToolTip(
-            "<b>Learning rate</b> for the Adam optimizer — the step size for "
-            "weight updates. Too high → unstable/diverging loss; too low → very "
-            "slow convergence. 1e-3 is a sensible default."
+            "<b>Learning rate (LR)</b> — how far each weight moves along its "
+            "gradient on every batch. Adam adapts a per-parameter scale, but "
+            "this value sets the overall step size, and it is held fixed for the "
+            "whole run (no LR schedule/warmup/decay here).<br><br>"
+            "<b>Too high</b> (e.g. &gt; ~5e-3): steps overshoot good minima — "
+            "training loss spikes, oscillates, or diverges to NaN, and "
+            "validation Dice stays low or jumps around. The best checkpoint is "
+            "kept, but the run wastes epochs never settling.<br>"
+            "<b>Too low</b> (e.g. &lt; ~1e-4): steps are tiny — loss creeps down "
+            "very slowly, so you need many more epochs, and early-stopping may "
+            "cut the run off (or it stalls on a plateau) before it converges.<br>"
+            "<b>Well-tuned:</b> loss falls steadily then flattens; the model "
+            "reaches good Dice in the fewest epochs.<br><br>"
+            "<b>1e-3 is a sensible default.</b> If loss diverges or oscillates, "
+            "lower it (try 3e-4 or 1e-4); if training is stable but painfully "
+            "slow, nudge it up. Larger batch sizes tolerate slightly higher LRs."
         )
         form.addRow("Learning rate:", self.spin_train_lr)
 
@@ -3072,14 +4267,40 @@ class MADMainWindow(QMainWindow):
         )
         form.addRow("Validation fraction:", self.spin_train_val)
 
+        self.combo_train_loss = QComboBox()
+        self.combo_train_loss.addItem("BCE + Dice", 'bce_dice')
+        self.combo_train_loss.addItem("Focal-Tversky (recall)", 'focal_tversky')
+        self.combo_train_loss.setToolTip(
+            "<b>Segmentation loss.</b><br>"
+            "<b>BCE + Dice</b> (default): balanced; good general choice.<br>"
+            "<b>Focal-Tversky</b>: penalizes missed pixels (false negatives) more "
+            "than false positives (α=0.3, β=0.7), so it grows masks to cover thin "
+            "/ faint structure like harmonics that BCE+Dice under-segments. Try it "
+            "if your validation <i>recall</i> is much lower than precision.")
+        form.addRow("Loss:", self.combo_train_loss)
+
+        self.chk_train_augment = QCheckBox("Data augmentation")
+        self.chk_train_augment.setChecked(True)
+        self.chk_train_augment.setToolTip(
+            "Augment training tiles on the fly (validation is never augmented): "
+            "SpecAugment-style time/frequency masking, mild noise & gain jitter, "
+            "and a small time shift. The biggest lever against overfitting on a "
+            "modest label set — recommended on. Turn off to reproduce the old "
+            "un-augmented behavior.")
+        form.addRow("", self.chk_train_augment)
+
         self.combo_train_device = QComboBox()
-        self.combo_train_device.addItems(["auto", "cuda", "mps", "cpu"])
+        self._fill_device_combo(self.combo_train_device)
         self.combo_train_device.setToolTip(
             "<b>Compute device</b>: <b>auto</b> picks the best available "
             "(CUDA &gt; MPS &gt; CPU). <b>cuda</b> = NVIDIA GPU, <b>mps</b> = "
             "Apple-Silicon GPU, <b>cpu</b> = portable but much slower."
         )
         form.addRow("Device:", self.combo_train_device)
+        self.lbl_train_device_info = QLabel("Detecting compute device…")
+        self.lbl_train_device_info.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_train_device_info.setWordWrap(True)
+        form.addRow("", self.lbl_train_device_info)
 
         tc.addLayout(form)
 
@@ -3097,9 +4318,7 @@ class MADMainWindow(QMainWindow):
         # preview area (built in _build_ui) and is only shown while training
         # runs — mirroring Mask Tracker. Here we just wire its signals.
         self.train_panel.run_finished.connect(self._on_training_finished)
-        self.train_panel.cancel_requested.connect(
-            lambda: self.status_bar.showMessage("Stopping training…")
-        )
+        self.train_panel.cancel_requested.connect(self._on_training_stop_requested)
 
         # ---- Run inference ----
         _sub("Run Inference")
@@ -3107,39 +4326,49 @@ class MADMainWindow(QMainWindow):
         scope_hint.setStyleSheet("font-size: 9px; color: #bbbbbb;")
         vbox.addWidget(scope_hint)
 
-        sess_row = QHBoxLayout()
-        sess_row.setSpacing(4)
-        self.chk_scope_session = QCheckBox("Session data")
-        self.chk_scope_session.setToolTip(
-            "Run inference on files loaded in Load Session Audio. Predictions "
-            "save as csv/h5 next to each source recording.")
-        self.chk_scope_session.toggled.connect(self._update_run_button)
-        sess_row.addWidget(self.chk_scope_session)
-        self.combo_scope_session = QComboBox()
-        self.combo_scope_session.addItems(["All", "Current file"])
-        self.combo_scope_session.setToolTip(
-            "All session files, or just the currently previewed session file.")
-        self.combo_scope_session.currentIndexChanged.connect(
+        audio_row = QHBoxLayout()
+        audio_row.setSpacing(4)
+        self.chk_scope_audio = QCheckBox("Audio list")
+        self.chk_scope_audio.setToolTip(
+            "Run inference on the recordings in the Audio list. Predictions "
+            "save as csv/h5 next to each recording.")
+        self.chk_scope_audio.toggled.connect(self._update_run_button)
+        audio_row.addWidget(self.chk_scope_audio)
+        self.combo_scope_audio = QComboBox()
+        self.combo_scope_audio.addItems(["All", "Current file"])
+        self.combo_scope_audio.setToolTip(
+            "Every recording in the Audio list, or just the one being previewed.")
+        self.combo_scope_audio.currentIndexChanged.connect(
             self._update_run_button)
-        sess_row.addWidget(self.combo_scope_session, 1)
-        vbox.addLayout(sess_row)
+        audio_row.addWidget(self.combo_scope_audio, 1)
+        vbox.addLayout(audio_row)
 
-        train_row = QHBoxLayout()
-        train_row.setSpacing(4)
-        self.chk_scope_training = QCheckBox("Training data")
-        self.chk_scope_training.setToolTip(
-            "Run inference on the project's Training Data recordings. "
-            "Predictions save into the training copy's csv/h5.")
-        self.chk_scope_training.toggled.connect(self._update_run_button)
-        train_row.addWidget(self.chk_scope_training)
-        self.combo_scope_training = QComboBox()
-        self.combo_scope_training.addItems(["All", "Current file"])
-        self.combo_scope_training.setToolTip(
-            "All training-data files, or just the currently previewed one.")
-        self.combo_scope_training.currentIndexChanged.connect(
-            self._update_run_button)
-        train_row.addWidget(self.combo_scope_training, 1)
-        vbox.addLayout(train_row)
+        # Folder target — the batch-scale path. Deliberately NOT routed through
+        # the Audio list: adding 3,000 recordings there means 3,000 list rows
+        # plus a sibling-CSV stat per row before anything runs, and it would
+        # enrol production recordings you aren't curating into the project's
+        # training set. Here the folder is scanned once and the paths are
+        # streamed straight to the worker.
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(4)
+        self.chk_scope_folder = QCheckBox("Folder")
+        self.chk_scope_folder.setToolTip(
+            "Run the model over every .wav in a folder tree, without loading "
+            "them into the Audio list. This is the path for large batches — "
+            "thousands of recordings scan in seconds because nothing is "
+            "rendered until you review results.\n\n"
+            "Detections save as a standalone CSV next to each recording.")
+        self.chk_scope_folder.toggled.connect(self._update_run_button)
+        folder_row.addWidget(self.chk_scope_folder)
+        self.btn_pick_infer_folder = QPushButton("Choose Folder…")
+        self.btn_pick_infer_folder.clicked.connect(self._pick_inference_folder)
+        folder_row.addWidget(self.btn_pick_infer_folder, 1)
+        vbox.addLayout(folder_row)
+
+        self.lbl_infer_folder = QLabel("No folder chosen")
+        self.lbl_infer_folder.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_infer_folder.setWordWrap(True)
+        vbox.addWidget(self.lbl_infer_folder)
 
         iform = QFormLayout()
         self.spin_infer_threshold = QDoubleSpinBox()
@@ -3161,21 +4390,48 @@ class MADMainWindow(QMainWindow):
         iform.addRow("Min blob pixels:", self.spin_infer_min_blob)
 
         self.combo_infer_device = QComboBox()
-        self.combo_infer_device.addItems(["auto", "cuda", "mps", "cpu"])
+        self._fill_device_combo(self.combo_infer_device)
         self.combo_infer_device.setToolTip(
             "<b>Compute device</b> for inference: <b>auto</b> picks CUDA &gt; "
             "MPS &gt; CPU.")
         iform.addRow("Device:", self.combo_infer_device)
+
+        self.spin_infer_batch = QSpinBox()
+        self.spin_infer_batch.setRange(1, 64)
+        self.spin_infer_batch.setValue(8)
+        self.spin_infer_batch.setToolTip(
+            "<b>Tiles per forward pass.</b> Higher keeps the GPU busy and is a "
+            "near-linear throughput win on a card with spare VRAM (try 16-32 on "
+            "a 16 GB GPU); lower it if you hit out-of-memory. <b>Does not change "
+            "results</b> — only speed.")
+        iform.addRow("Inference batch size:", self.spin_infer_batch)
+
+        self.chk_infer_amp = QCheckBox("Mixed precision (fp16)")
+        self.chk_infer_amp.setChecked(True)
+        self.chk_infer_amp.setToolTip(
+            "Run the model in fp16 on CUDA — typically 1.5-2x faster on modern "
+            "NVIDIA cards. Ignored on CPU/MPS. The probability grid is stored at "
+            "1/255 resolution regardless, so fp16 costs nothing that survives to "
+            "the detections. Turn off only to rule it out when debugging.")
+        iform.addRow("", self.chk_infer_amp)
+        self.lbl_infer_device_info = QLabel("Detecting compute device…")
+        self.lbl_infer_device_info.setStyleSheet("color: #999999; font-size: 9px;")
+        self.lbl_infer_device_info.setWordWrap(True)
+        iform.addRow("", self.lbl_infer_device_info)
         vbox.addLayout(iform)
 
-        self.chk_infer_preserve = QCheckBox(
-            "Preserve painted labels (skip labeled time regions)")
-        self.chk_infer_preserve.setChecked(True)
-        self.chk_infer_preserve.setToolTip(
-            "Skip inference over time ranges you've already hand-labeled on a "
-            "file, so the model doesn't re-detect and duplicate confirmed "
-            "calls. Only matters on files that carry painted labels.")
-        vbox.addWidget(self.chk_infer_preserve)
+        self.chk_infer_redetect = QCheckBox(
+            "Re-detect from scratch (ignore prior labels & reviews)")
+        self.chk_infer_redetect.setChecked(False)
+        self.chk_infer_redetect.setToolTip(
+            "<b>Off (default):</b> a re-run keeps your work — hand-labels and "
+            "Accepted/Rejected calls are preserved and the model won't re-detect "
+            "over them; only pending predictions are regenerated.<br>"
+            "<b>On:</b> ignore every prior decision and re-detect everywhere. "
+            "Pending, Accepted and Rejected predictions are all discarded and "
+            "regenerated; hand-label rows are still kept as data, but the model "
+            "is allowed to predict over them too.")
+        vbox.addWidget(self.chk_infer_redetect)
 
         # Single context-aware action button: "Run Inference" with an existing
         # model, "Run Training" when Train-a-new-model is on with no target
@@ -3225,15 +4481,28 @@ class MADMainWindow(QMainWindow):
         else:
             self._on_deploy_infer()
 
+    def _training_source_paths(self) -> List[str]:
+        """The recordings whose labels train the model.
+
+        With a project open that is its *registry*, not the visible list: a file
+        opened straight from the run summary is shown for review without being
+        enrolled in the project (see :meth:`_open_wav_for_review`), and it must
+        not slip into training just because it's on screen. With no project open
+        the visible list is all there is.
+        """
+        if self._project is None:
+            return list(self.audio_files)
+        return [e.path for e in self._project.audio_entries()]
+
     def _training_label_count(self) -> int:
-        """Total confirmed training-example labels across the Training Data set
-        (what the next training run will use)."""
+        """Total confirmed labels across the training sources — what the next
+        training run will use."""
         n = 0
         try:
             from fnt.usv.usv_detector.fnt_mask_store import (
                 masks_sibling_path, td_count,
             )
-            for fp in self.deploy_files:
+            for fp in self._training_source_paths():
                 n += td_count(masks_sibling_path(fp))
         except Exception:
             n = 0
@@ -3250,8 +4519,8 @@ class MADMainWindow(QMainWindow):
             btn.setEnabled(True)
             return
         train = self.chk_train_new.isChecked()
-        infer = (self.chk_scope_session.isChecked()
-                 or self.chk_scope_training.isChecked())
+        infer = (self.chk_scope_audio.isChecked()
+                 or self.chk_scope_folder.isChecked())
         if train and infer:
             label = "Run Training + Inference"
         elif train:
@@ -3259,9 +4528,12 @@ class MADMainWindow(QMainWindow):
         else:
             label = "Run Inference"
         if train:
+            # Deliberately not gated on a project: with labels but no project,
+            # the button offers to create one (see _on_inline_train) instead of
+            # sitting grayed out with no explanation.
             n = self._training_label_count()
             label += f" ({n} label{'s' if n != 1 else ''})"
-            enabled = bool(self._project) and n > 0
+            enabled = n > 0
         else:
             model = self._selected_deploy_model_path()
             enabled = (bool(model and os.path.isfile(model))
@@ -3320,6 +4592,33 @@ class MADMainWindow(QMainWindow):
         )
         filter_row.addWidget(self.combo_det_filter, 1)
         vbox.addLayout(filter_row)
+
+        # Score filter. MAD deliberately does not persist the probability grid
+        # (see MAD_README), so the threshold is baked in at inference time —
+        # but every prediction stores its own mean-probability score, so
+        # filtering the review list by score gives call-level re-thresholding
+        # for free, with no re-run. Hidden calls are only hidden: nothing is
+        # deleted, and clearing the filter brings them straight back.
+        score_row = QHBoxLayout()
+        score_row.setSpacing(4)
+        score_row.addWidget(QLabel("Min score:"))
+        self.slider_min_score = QSlider(Qt.Horizontal)
+        self.slider_min_score.setRange(0, 100)
+        self.slider_min_score.setValue(0)
+        self.slider_min_score.setToolTip(
+            "Hide predictions scoring below this confidence.\n\n"
+            "Free call-level re-thresholding: the score is already stored per "
+            "detection, so raising this hides marginal calls instantly without "
+            "re-running the model. It only affects what you see — nothing is "
+            "deleted, and accepted/rejected calls are never hidden.")
+        # Label tracks the drag live; the expensive part is debounced below.
+        self.slider_min_score.valueChanged.connect(self._on_min_score_slid)
+        score_row.addWidget(self.slider_min_score, 1)
+        self.lbl_min_score = QLabel("off")
+        self.lbl_min_score.setFixedWidth(58)
+        self.lbl_min_score.setStyleSheet("font-size: 9px; color: #999999;")
+        score_row.addWidget(self.lbl_min_score)
+        vbox.addLayout(score_row)
 
         self.annotation_list = QTreeWidget()
         self.annotation_list.setMaximumHeight(200)
@@ -3426,6 +4725,18 @@ class MADMainWindow(QMainWindow):
         if count_label is not None:
             vbox.addWidget(count_label)
 
+        if not hasattr(self, 'btn_gallery'):
+            self.btn_gallery = QPushButton("Detection Gallery (G)")
+            self.btn_gallery.setToolTip(
+                "Review this file's pending detections as a grid of mask "
+                "thumbnails instead of one at a time — click tiles to mark "
+                "accept/reject, then Apply.\n\nFar faster after a batch run; "
+                "the crops are already stored, so it opens instantly.\n"
+                "Shortcut: G")
+            self.btn_gallery.setFocusPolicy(Qt.NoFocus)
+            self.btn_gallery.clicked.connect(self._show_gallery)
+            vbox.addWidget(self.btn_gallery)
+
         # Review label header
         if review_label is not None:
             vbox.addWidget(review_label)
@@ -3497,7 +4808,26 @@ class MADMainWindow(QMainWindow):
         """Capture the current file's review state (annotations + sibling CSV,
         and the per-blob crops only when ``crops`` is True) so the next
         Cmd/Ctrl+Z can restore it. Accept/Reject only touch the CSV, so they skip
-        the (slightly costly) crop read; Delete/Clear need it."""
+        the (slightly costly) crop read; Delete/Clear need it.
+
+        The training-example store is covered too, in two halves, because review
+        actions both create and destroy examples and undo has to reverse either:
+
+        * ``example_ids`` is a cheap *name* list. Anything present after the
+          operation but not here was MINTED by it (accepting a call saves a
+          training example), and undo deletes it -- otherwise a call you
+          accepted and then undid trains the model forever, invisibly, since
+          nothing in the Detections list reads the example store.
+        * ``removed_examples`` is filled in lazily by
+          :meth:`_remember_undo_example` as an operation DESTROYS examples
+          (rejecting an already-accepted call, Delete, Clear All), so undo can
+          put the content back.
+
+        The destroy half is captured lazily rather than up front on purpose:
+        Reject and Delete run per keystroke, and reading every example's arrays
+        for a heavily-labeled file on each one would make review crawl. Nothing
+        is read unless something is actually being deleted.
+        """
         sg = self.spectrogram
         wav = self._active_review_wav_path()
         snap = {'label': label,
@@ -3507,8 +4837,12 @@ class MADMainWindow(QMainWindow):
                            and sg._selected_ann_idx < len(sg.annotations)
                            else None),
                 'reviewed': self._reviewed_count,
-                'csv': None, 'crops': None}
+                'csv': None, 'crops': None,
+                'examples_h5': None, 'example_ids': set(),
+                'removed_examples': {}}
         if wav:
+            from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+            h5 = masks_sibling_path(wav)
             try:
                 from fnt.usv.usv_detector.mad_inference import read_blob_csv
                 cp = pred_csv_sibling_path(wav)
@@ -3516,17 +4850,118 @@ class MADMainWindow(QMainWindow):
                     snap['csv'] = (cp, read_blob_csv(cp))
             except Exception:
                 pass
+            try:
+                from fnt.usv.usv_detector.fnt_mask_store import td_list_ids
+                snap['examples_h5'] = h5
+                snap['example_ids'] = set(td_list_ids(h5))
+            except Exception:
+                pass
             if crops:
                 try:
                     from fnt.usv.usv_detector.fnt_mask_store import (
-                        masks_sibling_path, read_all_pred_masks)
-                    h5 = masks_sibling_path(wav)
+                        read_all_pred_masks)
                     snap['crops'] = (h5, read_all_pred_masks(h5))
                 except Exception:
                     pass
         self._undo_stack.append(snap)
         if len(self._undo_stack) > 15:  # bound the history
             self._undo_stack.pop(0)
+
+    def _remember_undo_example(self, example_id) -> None:
+        """Stash one training example's content into the active undo snapshot,
+        immediately before the caller deletes it.
+
+        Called from the deletion paths rather than from _snapshot_for_undo so
+        the (decompressing) read only happens for examples actually being
+        destroyed -- see that method for why up-front capture is too slow.
+        """
+        if getattr(self, '_in_undo', False) or not self._undo_stack:
+            return                      # never re-enter while undoing
+        snap = self._undo_stack[-1]
+        store = snap.get('removed_examples')
+        h5 = snap.get('examples_h5')
+        key = str(example_id) if example_id is not None else ''
+        if store is None or not h5 or not key or key in store:
+            return
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import td_read_example
+            ex = td_read_example(h5, key)
+        except Exception:
+            ex = None
+        if ex is not None:
+            store[key] = ex
+
+    def _restore_undo_examples(self, snap: dict, current_anns):
+        """Reverse an operation's effect on the training-example store.
+
+        ``current_anns`` is the annotation list as it stood *after* the
+        operation and *before* undo rolls it back -- the comparison against
+        ``snap['anns']`` is what identifies which examples the operation minted,
+        so it has to be captured by the caller first.
+
+        Returns ``(n_deleted, n_restored)``. Deletions go through the store
+        primitives directly rather than _purge_training_example, which would
+        try to record its own undo entry against whatever snapshot is now on
+        top of the stack.
+        """
+        h5 = snap.get('examples_h5')
+        if not h5:
+            return (0, 0)
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            td_delete, td_list_ids, td_save_example)
+        n_del = n_add = 0
+        try:
+            now_ids = set(td_list_ids(h5))
+        except Exception:
+            return (0, 0)
+        # Examples the undone operation created.
+        #
+        # Deliberately NOT a plain "everything added since the snapshot" diff.
+        # Confirming a painted mask (Enter) and finishing a shape edit both mint
+        # examples without taking a snapshot, so a store-wide diff would delete
+        # hand-drawn labels made after the snapshot -- turning undo into data
+        # loss. An accept is identified instead by what only an accept does: the
+        # same call (same time/frequency box, which accepting never moves) goes
+        # prediction -> accepted and its id becomes the new example id. The
+        # store diff is applied as a second, independent guard, so an id is
+        # removed only when both signals agree it is new.
+        before = {}
+        for a in snap.get('anns') or ():
+            before[(a.get('f0'), a.get('f1'), a.get('t0'), a.get('t1'))] = a
+        minted = set()
+        for a in current_anns or ():
+            if a.get('status') != 'accepted':
+                continue
+            prev = before.get((a.get('f0'), a.get('f1'),
+                               a.get('t0'), a.get('t1')))
+            if prev is None or prev.get('status') != 'prediction':
+                continue
+            aid = a.get('id')
+            if aid is not None and aid != prev.get('id'):
+                minted.add(str(aid))
+        added_since = now_ids - set(snap.get('example_ids') or ())
+        for ex_id in (minted & added_since):
+            try:
+                td_delete(h5, ex_id)
+                n_del += 1
+            except Exception:
+                continue
+            if self._project is not None:
+                try:
+                    from fnt.usv.usv_detector.mad_examples import delete_example
+                    delete_example(self._project.training_data_dir, ex_id)
+                except Exception:
+                    pass
+        # Examples it destroyed.
+        for ex_id, ex in (snap.get('removed_examples') or {}).items():
+            if ex_id in now_ids:
+                continue
+            try:
+                td_save_example(h5, ex['spec'], ex['mask'], ex['meta'], ex_id)
+                n_add += 1
+            except Exception:
+                continue
+        return (n_del, n_add)
 
     def _undo_review_action(self):
         """Reverse the last review action (accept/reject/delete) on this file."""
@@ -3535,6 +4970,13 @@ class MADMainWindow(QMainWindow):
             return
         snap = self._undo_stack.pop()
         sg = self.spectrogram
+        # Guard the deletion paths from recording undo entries against the
+        # snapshot below this one while we reverse this one.
+        self._in_undo = True
+        # Keep the post-operation annotations: _restore_undo_examples diffs
+        # them against the snapshot to work out which training examples the
+        # operation minted, and the next line destroys that evidence.
+        post_anns = [dict(a) for a in sg.annotations]
         # Restore the annotation list.
         sg.annotations = [dict(a) for a in snap['anns']]
         # Restore the sibling CSV.
@@ -3556,6 +4998,17 @@ class MADMainWindow(QMainWindow):
                 write_pred_masks(h5, items)
             except Exception:
                 pass
+        # Reverse the training-example store: drop what this operation minted,
+        # put back what it destroyed. Without this an accept-then-undo leaves a
+        # training example behind that nothing in the UI can show or remove,
+        # and an undone delete never gets its label back.
+        try:
+            n_del, n_add = self._restore_undo_examples(snap, post_anns)
+        except Exception as e:
+            n_del = n_add = 0
+            self._log(f"Undo: training-example rollback failed: {e}")
+        finally:
+            self._in_undo = False
         self._reviewed_count = snap.get('reviewed', 0)
         sg._rebuild_confirmed_mask()
         sg.update()
@@ -3563,7 +5016,15 @@ class MADMainWindow(QMainWindow):
         self._reselect_by_id(snap.get('sel_id'))
         self._update_pred_review_widgets()
         self.status_bar.showMessage(f"Undid: {snap['label']}")
-        self._log(f"Undo: {snap['label']}")
+        detail = ""
+        if n_del or n_add:
+            bits = []
+            if n_del:
+                bits.append(f"-{n_del} training example(s)")
+            if n_add:
+                bits.append(f"+{n_add} training example(s) restored")
+            detail = "  [" + ", ".join(bits) + "]"
+        self._log(f"Undo: {snap['label']}{detail}")
 
     def _purge_review_annotation(self, ann: dict):
         """Remove all persisted traces of one detection — its CSV row, stored
@@ -3574,6 +5035,7 @@ class MADMainWindow(QMainWindow):
         aid = ann.get('id')
         if not aid:
             return
+        self._remember_undo_example(aid)
         if self._project is not None:
             try:
                 from fnt.usv.usv_detector.mad_examples import delete_example
@@ -3666,6 +5128,8 @@ class MADMainWindow(QMainWindow):
     def _refresh_annotation_list(self):
         if not hasattr(self, 'annotation_list'):
             return
+        # Row colors track the canvas overlay palette (colormap-dependent).
+        _lpal = self._overlay_palette()
         self.spectrogram._selected_ann_idx = None
 
         tree = self.annotation_list
@@ -3686,7 +5150,9 @@ class MADMainWindow(QMainWindow):
         sr = self.sample_rate or 1
         dt = self.spectrogram.hop / float(sr) if self.spectrogram.hop else 0
         df = (sr / 2.0) / (sp['nfft'] // 2) if sp.get('nfft') else 0
+        min_score = self._min_score()
         entries = []
+        n_score_hidden = 0
         if dt:
             for ann in self.spectrogram.annotations:
                 st = ann.get('status')
@@ -3698,7 +5164,16 @@ class MADMainWindow(QMainWindow):
                     continue
                 if flt == "Rejected" and not is_rej:
                     continue
+                # Score filtering applies to *pending predictions only*. A call
+                # you already accepted or rejected is a decision, not a guess —
+                # hiding it behind a confidence slider would silently drop your
+                # own work out of the list.
+                if is_pred and min_score > 0.0:
+                    if float(ann.get('score') or 0.0) < min_score:
+                        n_score_hidden += 1
+                        continue
                 entries.append(ann)
+        self._n_score_hidden = n_score_hidden
         entries.sort(key=lambda a: a['t0'])
         n_confirmed, n_pred, n_rej = 0, 0, 0
         ncols = tree.columnCount()
@@ -3719,17 +5194,23 @@ class MADMainWindow(QMainWindow):
             score = ann.get('score', 0)
             icon = "○" if is_pred else ("✕" if is_rej else "●")
             score_s = f"{score:.2f}" if is_pred and score else ""
-            item = QTreeWidgetItem([
+            item = SortableTreeWidgetItem([
                 icon, f"{t0:.2f}s", cls, durs,
                 f"{freq_lo:.0f}-{freq_hi:.0f}",
                 str(pixels), score_s,
             ])
+            # Numeric sort keys so columns sort by value, not display text.
+            item.setData(1, _SORT_ROLE, t0)                    # Time
+            item.setData(3, _SORT_ROLE, dur)                   # Dur
+            item.setData(4, _SORT_ROLE, freq_lo)               # kHz (low edge)
+            item.setData(5, _SORT_ROLE, pixels)                # Px
+            item.setData(6, _SORT_ROLE, score if is_pred else -1.0)  # Score
             kind = ('prediction' if is_pred
                     else 'rejected' if is_rej else 'confirmed')
             item.setData(0, Qt.UserRole, (cur_wav, t0, ann.get('id', ''), kind))
-            color = (QColor(255, 230, 90) if is_pred
-                     else QColor(255, 90, 90) if is_rej
-                     else QColor(80, 210, 120))   # green confirmed
+            color = QColor(*(_lpal['pending'] if is_pred
+                             else _lpal['rejected'] if is_rej
+                             else _lpal['confirmed']))
             for c in range(ncols):
                 item.setForeground(c, color)
             new_items.append(item)
@@ -3739,6 +5220,41 @@ class MADMainWindow(QMainWindow):
                 n_rej += 1
             else:
                 n_confirmed += 1
+        # In-progress SAM/paint masks (drawn but not yet confirmed with Enter)
+        # appear as yellow "○" pending rows so they show up in the list right
+        # away, before a class is assigned. They belong to the current file and
+        # are only listed under the "All"/"Pending" filters.
+        n_draw = 0
+        if dt and flt in ("All", "Pending"):
+            try:
+                comps = self.spectrogram.pending_components()
+            except Exception:
+                comps = []
+            for (pf0, pf1, pt0, pt1, local) in comps:
+                t0 = pt0 * dt
+                t1 = pt1 * dt
+                dur = max(0.0, t1 - t0)
+                durs = f"{dur:.2f}s" if dur >= 1.0 else f"{dur * 1000:.0f}ms"
+                freq_lo = pf0 * df / 1000 if df else 0
+                freq_hi = pf1 * df / 1000 if df else 0
+                pixels = int(local.sum())
+                item = SortableTreeWidgetItem([
+                    "○", f"{t0:.2f}s", "", durs,
+                    f"{freq_lo:.0f}-{freq_hi:.0f}", str(pixels), "",
+                ])
+                item.setData(1, _SORT_ROLE, t0)
+                item.setData(3, _SORT_ROLE, dur)
+                item.setData(4, _SORT_ROLE, freq_lo)
+                item.setData(5, _SORT_ROLE, pixels)
+                item.setData(6, _SORT_ROLE, -1.0)
+                # '__pending__' id never matches a real annotation, so clicking
+                # just pans to the mask without trying to select an annotation.
+                item.setData(0, Qt.UserRole, (cur_wav, t0, '__pending__', 'pending'))
+                color = QColor(*_lpal['drawing'])
+                for c in range(ncols):
+                    item.setForeground(c, color)
+                new_items.append(item)
+                n_draw += 1
         if new_items:  # one batched insert is far faster than N addTopLevelItem
             tree.addTopLevelItems(new_items)
         tree.setSortingEnabled(True)
@@ -3750,40 +5266,70 @@ class MADMainWindow(QMainWindow):
             parts.append(f"{n_pred} prediction(s)")
         if n_rej:
             parts.append(f"{n_rej} rejected")
+        if n_draw:
+            parts.append(f"{n_draw} drawing")
         count_text = (
-            f"{n_confirmed + n_pred + n_rej} detection(s)" +
+            f"{n_confirmed + n_pred + n_rej + n_draw} detection(s)" +
             (f" ({', '.join(parts)})" if len(parts) > 1 else "")
         )
+        # Always say when the score slider is hiding something — a filtered list
+        # that silently under-reports is how a user concludes a file is clean
+        # when it isn't.
+        if getattr(self, '_n_score_hidden', 0):
+            count_text += f"  ·  {self._n_score_hidden} below min score"
         if lbl:
             lbl.setText(count_text)
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
-        self._update_active_training_count()
         self._update_overview_marks()
+        self._refresh_open_gallery()
 
-    def _update_active_training_count(self):
-        """Live-update the active Training Data list row's mask count from the
-        in-memory annotations, so clear / delete / add / confirm reflect
-        immediately (mirrors the session list's live reconcile)."""
-        if getattr(self, '_active_source', 'session') != 'training':
-            return
-        if not hasattr(self, 'deploy_list'):
-            return
-        idx = self._deploy_file_idx
-        if idx is None or not (0 <= idx < len(self.deploy_files)):
-            return
-        item = self.deploy_list.item(idx)
-        if item is None:
-            return
-        base = os.path.basename(self.deploy_files[idx])
-        n = len(self.spectrogram.annotations)
-        if n:
-            item.setText(f"✓  {base}  ({n})")
-            item.setForeground(QColor(80, 200, 120))
-        else:
-            item.setText(base)
-            item.setData(Qt.ForegroundRole, None)
+    def _min_score(self) -> float:
+        """Current minimum-score filter as a probability in [0, 1]. 0 = off."""
+        s = getattr(self, 'slider_min_score', None)
+        return (s.value() / 100.0) if s is not None else 0.0
+
+    def _on_min_score_slid(self, value: int):
+        """Slider moved: update the readout now, defer the expensive work.
+
+        Applying the filter rebuilds every row of the detections tree plus the
+        file counts, the overview marks and the spectrogram. Doing that on every
+        intermediate value of a drag means ~70 full rebuilds for one gesture,
+        which visibly locks up a file carrying thousands of detections after a
+        batch run. The readout still tracks the drag live so it feels immediate.
+        """
+        self.lbl_min_score.setText("off" if value <= 0 else f"≥ {value / 100:.2f}")
+        self.lbl_min_score.setStyleSheet(
+            "font-size: 9px; color: #999999;" if value <= 0
+            else "font-size: 9px; color: #7ec87e;")
+        timer = getattr(self, '_min_score_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_min_score)
+            self._min_score_timer = timer
+        timer.start(120)
+
+    def _apply_min_score(self):
+        """Apply the current filter value to the review list and the canvas."""
+        value = self.slider_min_score.value()
+        # The canvas hides the same calls, so what you review and what you see
+        # can't disagree.
+        self.spectrogram.set_min_score(value / 100.0)
+        self._refresh_annotation_list()
+
+    def _on_min_score_changed(self, value: int):
+        """Set the filter and apply it immediately (no debounce).
+
+        Used by code that changes the slider programmatically and needs the
+        effect to be visible before it returns.
+        """
+        self.slider_min_score.setValue(value)
+        timer = getattr(self, '_min_score_timer', None)
+        if timer is not None:
+            timer.stop()
+        self._apply_min_score()
 
     def _update_overview_marks(self):
         """Place one status-colored tick per detection on the waveform overview
@@ -3798,9 +5344,10 @@ class MADMainWindow(QMainWindow):
             self.waveform_overview.set_status_marks([])
             return
         dt = hop / float(sr)
-        pending = QColor(255, 225, 60)
-        rejected = QColor(255, 80, 80)
-        confirmed = QColor(60, 210, 110)   # green
+        pal = self._overlay_palette()
+        pending = QColor(*pal['pending'])
+        rejected = QColor(*pal['rejected'])
+        confirmed = QColor(*pal['confirmed'])
         marks = []
         for ann in self.spectrogram.annotations:
             st = ann.get('status')
@@ -3826,9 +5373,8 @@ class MADMainWindow(QMainWindow):
         if not data:
             return
         wav, t0, eid, status = data
-        # The detection belongs to the currently-previewed file in the common
-        # case (session OR training). Only switch files if it names a DIFFERENT
-        # session file; a Training Data file is already the active preview.
+        # The detection almost always belongs to the previewed file; only
+        # switch files if the row names a DIFFERENT one.
         active = self._active_wav_path()
         if not (active and os.path.basename(active) == wav):
             for i, p in enumerate(self.audio_files):
@@ -3863,45 +5409,54 @@ class MADMainWindow(QMainWindow):
             return self.annotation_list
         return None
 
+    def _review_token(self):
+        """Identifies the detection set currently on screen.
+
+        The path alone is not enough: re-loading the same recording rebuilds
+        every annotation with fresh ids, so a dialog holding the old ones is
+        just as stale as if the file had changed. ``_ann_load_seq`` is bumped on
+        every load, which covers both.
+        """
+        return (os.path.normcase(os.path.abspath(self._active_wav_path() or '')),
+                getattr(self, '_ann_load_seq', 0))
+
+    def _bump_review_token(self):
+        """Mark the on-screen detection set as a new generation.
+
+        Deliberately does NOT refresh dependent views: this fires the moment the
+        old annotations are replaced, which during a file load is *before* the
+        new file's predictions have been appended. Refreshing here would show a
+        half-built set. :meth:`_refresh_open_gallery` does the showing, once.
+        """
+        self._ann_load_seq = getattr(self, '_ann_load_seq', 0) + 1
+
+    def _refresh_open_gallery(self):
+        """Re-show an open gallery when the detection set it was built from is
+        no longer the one on screen. Cheap to call often -- a token compare --
+        so it can hang off the ordinary list refresh and stay correct without
+        every caller having to remember it."""
+        dlg = getattr(self, '_gallery_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        if getattr(dlg, '_token', None) == self._review_token():
+            return
+        dlg.reload()
+
     def _active_wav_path(self) -> Optional[str]:
-        """Path of the file currently shown in the preview — from whichever
-        list (session or training) owns the selection, or None."""
-        if getattr(self, '_active_source', 'session') == 'training':
-            if (self.deploy_files and self._deploy_file_idx is not None and
-                    0 <= self._deploy_file_idx < len(self.deploy_files)):
-                return self.deploy_files[self._deploy_file_idx]
-        else:
-            if (self.audio_files and
-                    0 <= self.current_file_idx < len(self.audio_files)):
-                return self.audio_files[self.current_file_idx]
+        """Path of the file currently shown in the preview, or None."""
+        if (self.audio_files and
+                0 <= self.current_file_idx < len(self.audio_files)):
+            return self.audio_files[self.current_file_idx]
         return None
 
-    def _clear_session_selection(self):
-        lw = getattr(self, 'file_list', None)
-        if lw is not None:
-            lw.blockSignals(True)
-            lw.clearSelection()
-            lw.setCurrentRow(-1)
-            lw.blockSignals(False)
-
-    def _clear_training_selection(self):
-        lw = getattr(self, 'deploy_list', None)
-        if lw is not None:
-            lw.blockSignals(True)
-            lw.clearSelection()
-            lw.setCurrentRow(-1)
-            lw.blockSignals(False)
-
     def _update_scope_labels(self):
-        """Refresh the 'All (N)' counts on the inference-scope combos."""
-        if not hasattr(self, 'combo_scope_session'):
+        """Refresh the 'All (N)' count on the inference-scope combo."""
+        if not hasattr(self, 'combo_scope_audio'):
             return
-        self.combo_scope_session.setItemText(0, f"All ({len(self.audio_files)})")
-        self.combo_scope_training.setItemText(
-            0, f"All ({len(self.deploy_files)})")
+        self.combo_scope_audio.setItemText(0, f"All ({len(self.audio_files)})")
 
     def _update_review_buttons_for_source(self):
-        """Refresh widgets that depend on which list owns the preview."""
+        """Refresh widgets that depend on which file owns the preview."""
         self._update_scope_labels()
         self._update_pred_review_widgets()
         self._update_run_button()  # "current file" target may have changed
@@ -3911,18 +5466,10 @@ class MADMainWindow(QMainWindow):
         self._update_run_button()
 
     def _sync_list_buttons(self):
-        """Enable the Session/Training action buttons based on list selection."""
+        """Enable the Audio-list action buttons based on the list selection."""
         if hasattr(self, 'btn_remove_files'):
             self.btn_remove_files.setEnabled(
                 bool(self.file_list.selectedItems()))
-        if hasattr(self, 'btn_copy_to_training'):
-            # Enabled whenever a session file is selected; if no project is open
-            # yet, clicking offers to create/open one (Training Data lives in it).
-            self.btn_copy_to_training.setEnabled(
-                bool(self.file_list.selectedItems()))
-        if hasattr(self, 'btn_remove_training'):
-            self.btn_remove_training.setEnabled(
-                bool(self.deploy_list.selectedItems()))
 
     def _pred_indices(self) -> List[int]:
         """Annotation indices with status='prediction', ordered by the
@@ -3941,14 +5488,18 @@ class MADMainWindow(QMainWindow):
                              if a.get('status') == 'prediction'}
                 return [id_to_ann[eid] for eid in ordered_ids
                         if eid in id_to_ann]
-        return [i for i, a in enumerate(self.spectrogram.annotations)
-                if a.get('status') == 'prediction']
+        # Fallback (list not built yet): honor the score filter here too, or
+        # Back/Next would walk through calls the user can't see.
+        sg = self.spectrogram
+        return [i for i, a in enumerate(sg.annotations)
+                if a.get('status') == 'prediction' and not sg._score_hidden(a)]
 
     def _review_order(self) -> List[int]:
         """ALL annotation indices in the detection table's display order — the
         order Back/Next walk through (any status, not just pending)."""
         tree = self._active_annotation_tree()
-        anns = self.spectrogram.annotations
+        sg = self.spectrogram
+        anns = sg.annotations
         if tree is not None:
             id_to_idx = {a.get('id'): i for i, a in enumerate(anns)}
             ordered = []
@@ -3958,7 +5509,7 @@ class MADMainWindow(QMainWindow):
                     ordered.append(id_to_idx[data[2]])
             if ordered:
                 return ordered
-        return list(range(len(anns)))
+        return [i for i, a in enumerate(anns) if not sg._score_hidden(a)]
 
     def _selected_review_pos(self, order=None):
         """Position of the selected annotation within ``_review_order``."""
@@ -4147,16 +5698,11 @@ class MADMainWindow(QMainWindow):
             self._after_review_decision(ann.get('id'), was_pending=False)
             return  # already accepted — just move on
         self._snapshot_for_undo("Accept", crops=False)
-        self._log(f"Accept {self._pred_describe(sel)} [{self._review_mode}]")
+        self._log(f"Accept {self._pred_describe(sel)}")
         was_pending = st == 'prediction'
-        if self._review_mode == 'deploy':
-            # Keep the detection visible (blue) and recorded 'accepted' in the
-            # CSV — same as the Label tab, minus saving a training example.
-            self._write_pred_csv_status(ann, 'accepted')
-            ann['status'] = 'accepted'
-            self.spectrogram._rebuild_confirmed_mask()
-        else:
-            self._accept_prediction(sel)
+        # One list, one meaning: accepting a call in the Audio list confirms it
+        # as a label, so it trains the model on the next run.
+        self._accept_prediction(sel)
         self._after_review_decision(self.spectrogram.annotations[sel].get('id')
                                     if sel < len(self.spectrogram.annotations)
                                     else ann.get('id'), was_pending)
@@ -4173,7 +5719,7 @@ class MADMainWindow(QMainWindow):
             self._after_review_decision(ann.get('id'), was_pending=False)
             return  # already rejected — just move on
         self._snapshot_for_undo("Reject", crops=False)
-        self._log(f"Reject {self._pred_describe(sel)} [{self._review_mode}]")
+        self._log(f"Reject {self._pred_describe(sel)}")
         was_pending = st == 'prediction'
         # Converting a confirmed/accepted call to rejected: drop its saved
         # training example (train mode) so it no longer trains the model.
@@ -4191,24 +5737,32 @@ class MADMainWindow(QMainWindow):
         """Delete the saved training example(s) backing a confirmed annotation
         from both the project store and the per-wav sibling, so a rejected call
         stops training the model. Keyed by id AND blob_id (they can differ once a
-        prediction is accepted), best-effort."""
-        if self._project is None:
-            return
+        prediction is accepted), best-effort.
+
+        The sibling h5 is cleaned whether or not a project is open — labels live
+        next to the audio, so rejecting one must not leave a stale example behind
+        for whichever project later picks that recording up."""
         ids = {ann.get('id'), ann.get('blob_id')}
         ids = {str(i) for i in ids if i is not None}
         if not ids:
             return
+        # Hand the content to the active undo snapshot first: once these are
+        # deleted the pixels are gone, and Ctrl+Z has to be able to put a
+        # wrongly-rejected label back.
+        for aid in ids:
+            self._remember_undo_example(aid)
         wav = self._active_review_wav_path()
         h5 = None
         if wav:
             from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
             h5 = masks_sibling_path(wav)
         for aid in ids:
-            try:
-                from fnt.usv.usv_detector.mad_examples import delete_example
-                delete_example(self._project.training_data_dir, aid)
-            except Exception:
-                pass
+            if self._project is not None:
+                try:
+                    from fnt.usv.usv_detector.mad_examples import delete_example
+                    delete_example(self._project.training_data_dir, aid)
+                except Exception:
+                    pass
             if h5:
                 try:
                     from fnt.usv.usv_detector.fnt_mask_store import td_delete
@@ -4244,41 +5798,72 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage("All predictions reviewed")
             self._maybe_prompt_next_file()
 
+    def _hidden_pending_count(self) -> int:
+        """Pending predictions the Min score filter is currently hiding.
+
+        Computed from the annotations rather than read off the last list
+        refresh, so it is right whatever order the caller runs in.
+        """
+        sg = self.spectrogram
+        if self._min_score() <= 0.0:
+            return 0
+        return sum(1 for a in sg.annotations if sg._score_hidden(a))
+
     def _maybe_prompt_next_file(self):
-        """When the last pending detection in a file has just been reviewed,
-        offer to jump to the next file (Yes is the default, so Enter advances)."""
+        """When the last *visible* pending detection has been reviewed, offer to
+        jump to the next file.
+
+        "Visible" is the catch. _pred_indices() is scoped by the Min score
+        filter, so with a filter set this fires while lower-scoring predictions
+        are still pending. Saying "all reviewed" there is how someone sweeps
+        3,000 files taking the default and finishes believing the batch is
+        done — so when the filter is hiding calls the prompt says so, offers to
+        reveal them, and does not default to advancing.
+        """
         if self._pred_indices():
             return  # still pending — nothing to prompt
         n = self._reviewed_count
         if n <= 0:
             return  # nothing was actually reviewed this file — no prompt
-        if self._review_mode == 'deploy':
-            idx = self._deploy_file_idx
-            has_next = idx is not None and idx + 1 < len(self.deploy_files)
+        hidden = self._hidden_pending_count()
+        has_next = self.current_file_idx + 1 < len(self.audio_files)
+        if hidden:
+            base = (f"Reviewed {n} mask(s) — but {hidden} more are still "
+                    f"pending on this file, hidden by the Min score filter "
+                    f"(≥ {self._min_score():.2f}).")
         else:
-            has_next = self.current_file_idx + 1 < len(self.audio_files)
-        base = f"All {n} pending mask(s) reviewed."
-        if not has_next:
+            base = f"All {n} pending mask(s) reviewed."
+        if not has_next and not hidden:
             self.status_bar.showMessage(base + " (last file)")
             return
         box = QMessageBox(self)
-        box.setWindowTitle("Review complete")
-        box.setText(base + "\n\nMove to the next file?")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.Yes)
-        if box.exec_() == QMessageBox.Yes:
+        box.setWindowTitle("Review complete" if not hidden
+                           else "Some detections are hidden")
+        box.setText(base + ("\n\nMove to the next file?" if has_next
+                            else "\n\nThis is the last file."))
+        b_show = box.addButton(f"Show the {hidden} hidden",
+                               QMessageBox.AcceptRole) if hidden else None
+        b_next = (box.addButton("Next file", QMessageBox.AcceptRole)
+                  if has_next else None)
+        b_stay = box.addButton("Stay", QMessageBox.RejectRole)
+        # Only default to advancing when there is genuinely nothing left here.
+        box.setDefaultButton(b_show if hidden else (b_next or b_stay))
+        box.exec_()
+        clicked = box.clickedButton()
+        if b_show is not None and clicked is b_show:
+            self._on_min_score_changed(0)
+            self.status_bar.showMessage(
+                f"Min score filter cleared — {hidden} pending detection(s) "
+                "back in the list")
+            return
+        if b_next is not None and clicked is b_next:
             self._advance_to_next_review_file()
 
     def _advance_to_next_review_file(self):
-        """Select the next file in the active tab's list (loads it for review)."""
-        if self._review_mode == 'deploy':
-            nxt = (self._deploy_file_idx or 0) + 1
-            if 0 <= nxt < len(self.deploy_files):
-                self.deploy_list.setCurrentRow(nxt)
-        else:
-            nxt = self.current_file_idx + 1
-            if 0 <= nxt < len(self.audio_files):
-                self.file_list.setCurrentRow(nxt)
+        """Select the next file in the Audio list (loads it for review)."""
+        nxt = self.current_file_idx + 1
+        if 0 <= nxt < len(self.audio_files):
+            self.file_list.setCurrentRow(nxt)
 
     @staticmethod
     def _ann_csv_id(ann: dict):
@@ -4297,16 +5882,24 @@ class MADMainWindow(QMainWindow):
             return ann.get('csv_path')
         return pred_csv_sibling_path(wav)
 
-    def _upsert_call_csv_row(self, ann: dict, status: str, score=None):
-        """Insert or update one call's row in the unified per-wav CSV (matched
-        by blob_id/id). Used for hand-labels and for syncing review decisions."""
-        csv_path = self._pred_csv_path(ann)
+    def _frame_time_origin_s(self) -> float:
+        """Seconds at spectrogram frame 0. scipy centres frame 0 half a window
+        in, so frame→seconds is ``origin + idx*dt`` and seconds→frame is
+        ``(s - origin)/dt``. See ``mad_inference._frame_time_origin``."""
+        from fnt.usv.usv_detector.mad_inference import _frame_time_origin
+        sp = self._spec_params()
+        return _frame_time_origin(sp['nperseg'], self.sample_rate or 1)
+
+    def _ann_to_csv_row(self, ann: dict, status: str, score=None):
+        """Build the unified-CSV row dict for one annotation — no file I/O, so
+        bulk callers can assemble many rows for a single write."""
         bid = self._ann_csv_id(ann)
-        if not csv_path or bid is None or self.sample_rate is None:
-            return
+        if bid is None or self.sample_rate is None:
+            return None
+        from fnt.usv.usv_detector.mad_inference import (
+            CALL_METRIC_KEYS, frames_to_seconds)
         sp = self._spec_params()
         sr = self.sample_rate or 1
-        dt = (sp['nperseg'] - sp['noverlap']) / float(sr)
         df = (sr / 2.0) / (sp['nfft'] // 2) if sp.get('nfft') else 0.0
         msk = ann.get('mask')
         area = int(msk.sum()) if msk is not None else int(ann.get('area_pixels', 0))
@@ -4315,8 +5908,10 @@ class MADMainWindow(QMainWindow):
         row = {
             'blob_id': bid,
             'class': ann.get('category', '') or '',
-            'start_s': round(ann['t0'] * dt, 6),
-            'stop_s': round(ann['t1'] * dt, 6),
+            'start_s': round(frames_to_seconds(
+                ann['t0'], sp['nperseg'], sp['noverlap'], sr), 6),
+            'stop_s': round(frames_to_seconds(
+                ann['t1'], sp['nperseg'], sp['noverlap'], sr), 6),
             'min_freq_hz': minf,
             'max_freq_hz': maxf,
             'area_pixels': area,
@@ -4325,11 +5920,20 @@ class MADMainWindow(QMainWindow):
             'source': ann.get('source', 'label'),
         }
         # Carry the full quantification set the annotation computed at confirm.
-        from fnt.usv.usv_detector.mad_inference import CALL_METRIC_KEYS
         for k in CALL_METRIC_KEYS:
             if ann.get(k) is not None:
                 row[k] = ann.get(k)
         row.setdefault('freq_bandwidth_hz', round(maxf - minf, 2))
+        return row
+
+    def _upsert_call_csv_row(self, ann: dict, status: str, score=None):
+        """Insert or update one call's row in the unified per-wav CSV (matched
+        by blob_id/id). Used for hand-labels and for syncing review decisions."""
+        csv_path = self._pred_csv_path(ann)
+        row = self._ann_to_csv_row(ann, status, score)
+        if not csv_path or row is None:
+            return
+        bid = row['blob_id']
         try:
             from fnt.usv.usv_detector.mad_inference import (
                 read_blob_csv, write_blob_csv)
@@ -4381,6 +5985,52 @@ class MADMainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _batch_write_pred_csv_status(self, anns, status: str) -> int:
+        """Persist an accept/reject decision for MANY detections in ONE CSV
+        read + ONE write (vs once per item), for fast Accept All / Reject All /
+        box-select. Rows with no existing CSV entry (a hand-label confirmed this
+        session) are synthesized, matching :meth:`_write_pred_csv_status`.
+
+        Doing this per item made bulk review quadratic in the file's call count
+        — a 5000-detection file took over an hour of frozen UI. Returns the
+        number of annotations recorded.
+        """
+        anns = list(anns)
+        if not anns:
+            return 0
+        wav = self._active_review_wav_path()
+        csv_path = pred_csv_sibling_path(wav) if wav else None
+        if not csv_path:
+            return 0
+        want = {}
+        for a in anns:
+            bid = self._ann_csv_id(a)
+            if bid is not None:
+                want[str(bid)] = a
+        if not want:
+            return 0
+        try:
+            from fnt.usv.usv_detector.mad_inference import (
+                read_blob_csv, write_blob_csv)
+            rows = read_blob_csv(csv_path) if os.path.isfile(csv_path) else []
+            seen = set()
+            for r in rows:
+                key = str(r.get('blob_id'))
+                if key in want:
+                    r['status'] = status
+                    seen.add(key)
+            # Anything with no row yet (hand-label confirmed this session).
+            for key, a in want.items():
+                if key in seen:
+                    continue
+                row = self._ann_to_csv_row(a, status)
+                if row is not None:
+                    rows.append(row)
+            write_blob_csv(csv_path, rows)
+        except Exception:
+            return 0
+        return len(want)
+
     def _skip_current_pred(self):
         """Leave the current detection undecided and jump to the next pending
         one after it (no decision recorded)."""
@@ -4408,7 +6058,8 @@ class MADMainWindow(QMainWindow):
             cls_name = ann.get('category') or self._session_last_class or 'USV'
         comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
         try:
-            ex_id = self._save_component_example(cls_name, comp)
+            ex_id = self._save_component_example(cls_name, comp,
+                                                 blob_id=ann.get('blob_id'))
         except Exception as e:
             self.status_bar.showMessage(f"Failed to save: {e}")
             return
@@ -4425,40 +6076,30 @@ class MADMainWindow(QMainWindow):
         if not preds:
             return
         self._snapshot_for_undo("Accept All", crops=False)
-        self._log(f"Accept All — {len(preds)} prediction(s) [{self._review_mode}]")
-        if self._review_mode == 'deploy':
-            # Keep accepted detections visible (blue), recorded in the CSV.
-            for ann_idx in preds:
-                ann = self.spectrogram.annotations[ann_idx]
-                self._write_pred_csv_status(ann, 'accepted')
-                ann['status'] = 'accepted'
-            self.spectrogram._rebuild_confirmed_mask()
-            self.spectrogram.update()
-            self._pred_review_idx = None
-            self._refresh_annotation_list()
-            self._update_pred_review_widgets()
-            self.status_bar.showMessage(f"Accepted {len(preds)} prediction(s)")
-            self._reviewed_count += len(preds)
-            self._maybe_prompt_next_file()
-            return
+        self._log(f"Accept All — {len(preds)} prediction(s)")
         if self.audio_data is None or self._active_wav_path() is None:
             return
         if self._project is not None:
             cls_name = self._project.last_class or 'USV'
         else:
             cls_name = self._session_last_class or 'USV'
-        n = 0
+        # Save each training example (unavoidably per-call), then record every
+        # decision in ONE CSV write. The join key is blob_id, which the new
+        # example id doesn't change, so the batch can run after the loop.
+        done = []
         for ann_idx in preds:
             ann = self.spectrogram.annotations[ann_idx]
             comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
             try:
-                ex_id = self._save_component_example(cls_name, comp)
-                self._write_pred_csv_status(ann, 'accepted')
+                ex_id = self._save_component_example(
+                    cls_name, comp, blob_id=ann.get('blob_id'))
                 ann['status'] = 'accepted'
                 ann['id'] = ex_id
-                n += 1
+                done.append(ann)
             except Exception:
                 continue
+        self._batch_write_pred_csv_status(done, 'accepted')
+        n = len(done)
         self.spectrogram._rebuild_confirmed_mask()
         self.spectrogram.update()
         self._pred_review_idx = None
@@ -4473,11 +6114,11 @@ class MADMainWindow(QMainWindow):
         if not preds:
             return
         self._snapshot_for_undo("Reject All", crops=False)
-        self._log(f"Reject All — {len(preds)} prediction(s) [{self._review_mode}]")
+        self._log(f"Reject All — {len(preds)} prediction(s)")
         # Recorded decisions: mark each rejected and keep it visible (red).
-        for ann_idx in preds:
-            ann = self.spectrogram.annotations[ann_idx]
-            self._write_pred_csv_status(ann, 'rejected')
+        anns = [self.spectrogram.annotations[i] for i in preds]
+        self._batch_write_pred_csv_status(anns, 'rejected')
+        for ann in anns:
             ann['status'] = 'rejected'
         self.spectrogram.update()
         self._pred_review_idx = None
@@ -4486,6 +6127,83 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(f"Rejected {len(preds)} prediction(s)")
         self._reviewed_count += len(preds)
         self._maybe_prompt_next_file()
+
+    def _apply_gallery_marks(self, marks: Dict[str, str]) -> int:
+        """Commit a batch of gallery accept/reject decisions.
+
+        Routed through the same persistence the one-at-a-time reviewer uses —
+        a training example per accept, batched CSV status writes, one undo
+        snapshot for the whole batch — so a gallery decision is indistinguishable
+        from a keyboard one afterward.
+        """
+        sg = self.spectrogram
+        if not marks:
+            return 0
+        by_id = {a.get('id'): a for a in sg.annotations}
+        to_accept = [by_id[i] for i, v in marks.items()
+                     if v == 'accept' and i in by_id]
+        to_reject = [by_id[i] for i, v in marks.items()
+                     if v == 'reject' and i in by_id]
+        if not to_accept and not to_reject:
+            return 0
+        self._snapshot_for_undo("Gallery review", crops=False)
+        self._log(f"Gallery: {len(to_accept)} accept, {len(to_reject)} reject")
+
+        if to_reject:
+            self._batch_write_pred_csv_status(to_reject, 'rejected')
+            for ann in to_reject:
+                ann['status'] = 'rejected'
+
+        n_acc = 0
+        if to_accept:
+            if self.audio_data is None:
+                # No audio loaded, so there is no spectrogram to carve a patch
+                # out of — record the decision now; the label is minted the next
+                # time the file is opened and accepted from the reviewer.
+                self._batch_write_pred_csv_status(to_accept, 'accepted')
+                for ann in to_accept:
+                    ann['status'] = 'accepted'
+                n_acc = len(to_accept)
+            else:
+                cls_name = ((self._project.last_class if self._project
+                             else self._session_last_class) or 'USV')
+                done = []
+                for ann in to_accept:
+                    comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'],
+                            ann['mask'])
+                    try:
+                        ex_id = self._save_component_example(
+                            cls_name, comp, blob_id=ann.get('blob_id'))
+                    except Exception:
+                        continue
+                    ann['status'] = 'accepted'
+                    ann['id'] = ex_id
+                    done.append(ann)
+                self._batch_write_pred_csv_status(done, 'accepted')
+                n_acc = len(done)
+
+        sg._rebuild_confirmed_mask()
+        sg.update()
+        self._pred_review_idx = None
+        self._refresh_annotation_list()
+        self._update_pred_review_widgets()
+        n = n_acc + len(to_reject)
+        self._reviewed_count += n
+        return n
+
+    def _show_gallery(self):
+        """Open (or refresh) the detection gallery for the current file."""
+        if self.audio_data is None:
+            self.status_bar.showMessage("Load a file first")
+            return
+        dlg = getattr(self, '_gallery_dialog', None)
+        if dlg is None:
+            dlg = MADGalleryDialog(self)
+            self._gallery_dialog = dlg
+        dlg.reload()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _migrate_legacy_prob(self, h5_path, sp, rows=None):
         """One-time upgrade of a legacy ``/prob`` file: read the full grid
@@ -4511,11 +6229,12 @@ class MADMainWindow(QMainWindow):
         try:
             if rows:
                 dt = (sp['nperseg'] - sp['noverlap']) / float(self.sample_rate)
+                t_org = self._frame_time_origin_s()
                 df = (self.sample_rate / 2.0) / (sp['nfft'] // 2)
                 crops = []
                 for r in rows:
-                    t0 = int(round(r['start_s'] / dt))
-                    t1 = int(round(r['stop_s'] / dt))
+                    t0 = int(round((r['start_s'] - t_org) / dt))
+                    t1 = int(round((r['stop_s'] - t_org) / dt))
                     f0 = int(round(r['min_freq_hz'] / df))
                     f1 = min(int(round(r['max_freq_hz'] / df)),
                              pred_mask.shape[0])
@@ -4553,7 +6272,8 @@ class MADMainWindow(QMainWindow):
         or None."""
         if dt <= 0 or df <= 0:
             return None
-        rt0, rt1 = r['start_s'] / dt, r['stop_s'] / dt
+        t_org = self._frame_time_origin_s()
+        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
         rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
         for a in self.spectrogram.annotations:
             if a.get('status'):  # only status-less confirmed (green) masks
@@ -4619,12 +6339,14 @@ class MADMainWindow(QMainWindow):
         # synthesize minimal rows straight from the crops.
         if not rows and crops:
             rows = []
+            t_org = self._frame_time_origin_s()
             for bid, c in crops.items():
                 h, w = c['mask'].shape
                 f_off, t_off = c['f_off'], c['t_off']
                 rows.append({
                     'blob_id': int(bid) if str(bid).isdigit() else bid,
-                    'start_s': t_off * dt, 'stop_s': (t_off + w) * dt,
+                    'start_s': t_org + t_off * dt,
+                    'stop_s': t_org + (t_off + w) * dt,
                     'min_freq_hz': f_off * df, 'max_freq_hz': (f_off + h) * df,
                     'area_pixels': int(c['mask'].sum()), 'score': 0.0,
                     'status': 'pending',
@@ -4635,14 +6357,12 @@ class MADMainWindow(QMainWindow):
 
         sg = self.spectrogram
         # Re-load review detections from the CSV — drop existing ones first so we
-        # don't duplicate. In deploy mode accepted detections live in the CSV
-        # too (restored blue here); in train mode they come from the example
-        # store, so we leave those (status-less) confirmed annotations alone.
-        in_deploy = self._review_mode == 'deploy'
-        strip = (('prediction', 'rejected', 'accepted') if in_deploy
-                 else ('prediction', 'rejected'))
+        # don't duplicate. Confirmed labels (status-less) come from the example
+        # store and are left alone; 'accepted' here means a CSV row with no
+        # example behind it (see below).
         sg.annotations = [a for a in sg.annotations
-                          if a.get('status') not in strip]
+                          if a.get('status') not in
+                          ('prediction', 'rejected', 'accepted')]
         # Reconcile rejected calls against confirmed h5 masks. A 'rejected' CSV
         # row overrules any confirmed (green) annotation it overlaps — drop the
         # green so it doesn't linger, and if the row has no prediction crop,
@@ -4662,9 +6382,12 @@ class MADMainWindow(QMainWindow):
                 pass
         # Hand-labels live in BOTH the h5 (loaded above as confirmed) and the
         # unified CSV (as 'accepted' rows). Skip any CSV row already represented
-        # by a confirmed annotation so it isn't shown twice.
+        # by a confirmed annotation so it isn't shown twice — matching on the
+        # example id AND on the blob_id an accepted prediction carried over.
         confirmed_ids = {str(a.get('id')) for a in sg.annotations
                          if a.get('id') is not None}
+        confirmed_ids |= {str(a.get('blob_id')) for a in sg.annotations
+                          if a.get('blob_id') is not None}
         wav_name = os.path.basename(wav)
         n_added = 0
         n_pending = 0
@@ -4675,10 +6398,10 @@ class MADMainWindow(QMainWindow):
             if str(r.get('blob_id')) in confirmed_ids:
                 continue  # already loaded from the h5 as a confirmed label
             if st == 'accepted':
-                # Train mode loads confirmed from the example store; only deploy
-                # restores accepted detections (blue) from the CSV.
-                if not in_deploy:
-                    continue
+                # An accepted row with no example behind it: written by an older
+                # MAD version, where accepting in the session list only recorded
+                # status. Restore it (blue) rather than hiding the user's work —
+                # re-accepting it mints the training example.
                 ann_status = 'accepted'
             elif st == 'rejected':
                 ann_status = 'rejected'
@@ -4700,8 +6423,9 @@ class MADMainWindow(QMainWindow):
                 t1 = t0 + blob_region.shape[1]
             else:
                 # No crop (e.g. CSV-only legacy) — fall back to the box rect.
-                t0 = int(round(r['start_s'] / dt))
-                t1 = int(round(r['stop_s'] / dt))
+                t_org = self._frame_time_origin_s()
+                t0 = int(round((r['start_s'] - t_org) / dt))
+                t1 = int(round((r['stop_s'] - t_org) / dt))
                 f0 = int(round(r['min_freq_hz'] / df))
                 f1 = int(round(r['max_freq_hz'] / df))
                 if t1 <= t0 or f1 <= f0:
@@ -4710,7 +6434,7 @@ class MADMainWindow(QMainWindow):
             if not blob_region.any():
                 continue
             sg.annotations.append({
-                'id': f'pred_{n_added}',
+                'id': _new_ann_id('pred'),
                 'category': (self._project.last_class if self._project else
                              self._session_last_class) or 'USV',
                 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
@@ -4732,6 +6456,7 @@ class MADMainWindow(QMainWindow):
             pass
         sg._rebuild_confirmed_mask()
         sg.update()
+        self._bump_review_token()
         self._pred_review_idx = 0 if n_pending > 0 else None
         self._refresh_annotation_list()
         self._update_pred_review_widgets()
@@ -4760,10 +6485,13 @@ class MADMainWindow(QMainWindow):
             batch_size=self.spin_train_batch.value(),
             learning_rate=self.spin_train_lr.value(),
             val_fraction=self.spin_train_val.value(),
-            device=self.combo_train_device.currentText(),
+            device=self._device_value(self.combo_train_device),
             nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
             db_min=sp['db_min'], db_max=sp['db_max'],
             training_data_dir=self._project.training_data_dir,
+            emit_previews=True,  # live per-epoch prediction preview window
+            augment=self.chk_train_augment.isChecked(),
+            loss=self.combo_train_loss.currentData() or 'bce_dice',
         )
 
     def _apply_latest_training_config(self):
@@ -4813,20 +6541,31 @@ class MADMainWindow(QMainWindow):
                 self.spin_train_lr.setValue(float(cfg['learning_rate']))
             if cfg.get('val_fraction') is not None:
                 self.spin_train_val.setValue(float(cfg['val_fraction']))
-            _set_combo_text(self.combo_train_device, cfg.get('device'))
+            if cfg.get('loss') is not None:
+                _set_combo_data(self.combo_train_loss, cfg.get('loss'))
+            if cfg.get('augment') is not None:
+                self.chk_train_augment.setChecked(bool(cfg['augment']))
+            _set_combo_data(self.combo_train_device, cfg.get('device'))
             # Keep the encoder picker's enabled state in sync with HRNet.
             self._on_arch_changed()
         except Exception as e:
             self._log(f"Could not apply latest training config: {e}")
 
     def _on_inline_train(self):
-        if self._project is None:
-            return
         # Already training? The Train button doubles as "re-show the graph".
         if self._training_active:
             self._show_training_dialog()
             return
-        self._consolidate_sibling_examples()
+        # Training is the one thing that needs a project — the model, its
+        # checkpoints and the consolidated example store all live in one. Offer
+        # to make one rather than dead-ending; the loaded audio comes along.
+        if self._project is None:
+            if not self._prompt_make_project_for_training():
+                return
+        # Abort before any long run if the label set couldn't be fully rebuilt
+        # (the method has already told the user why).
+        if not self._consolidate_sibling_examples():
+            return
         from fnt.usv.usv_detector.mad_examples import count_examples
         n_examples = count_examples(self._project.training_data_dir)
         if n_examples == 0:
@@ -4856,47 +6595,91 @@ class MADMainWindow(QMainWindow):
         self._training_active = True
         self._update_run_button()
         self._set_train_config_enabled(False)  # lock config while running
+        self._closing_train_windows = False  # re-arm the close-confirm prompt
         self._show_training_dialog()
+        self._show_preview_dialog(reset=True)  # live per-epoch previews
         self.train_panel.start_run()
         self._start_training(cfg, post_inference_wavs=infer_wavs,
                              reporter=self.train_panel)
 
-    def _consolidate_sibling_examples(self):
+    def _consolidate_sibling_examples(self) -> bool:
         """Rebuild the project's consolidated ``training_data.h5`` from the
-        Training Data list's per-wav sibling examples — the source of truth.
+        Audio list's per-wav sibling examples — the source of truth.
 
         Non-destructive to the siblings (the central store is just a training
         cache), and rebuilt fresh each time so removed/edited labels never
-        linger. A file therefore only trains the model once it's been copied
-        into Training Data."""
+        linger. A recording therefore trains the model exactly when it is in the
+        project's Audio list — which is also the only list there is.
+
+        The rebuild goes into a temp file and is swapped in with ``os.replace``
+        only after a complete, error-free pass, so an interruption (full disk,
+        dropped network share, unreadable sibling h5) can never leave the
+        project with a truncated store — or none at all. Returns False, with
+        the previous store intact and the user told why, if anything failed:
+        silently training on a subset of the labels is worse than not training.
+        """
         if self._project is None:
-            return
+            return True
         from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, td_iter_examples, td_count,
+            masks_sibling_path, td_iter_examples, td_count, td_save_example,
         )
-        from fnt.usv.usv_detector.mad_examples import save_example, _store_path
+        from fnt.usv.usv_detector.mad_examples import _store_path
         td_dir = self._project.training_data_dir
         os.makedirs(td_dir, exist_ok=True)
         store = _store_path(td_dir)
+        tmp = store + ".rebuild.tmp"
+
+        def _drop_tmp():
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        _drop_tmp()
+        n, failed = 0, []
         try:
-            if os.path.isfile(store):
-                os.remove(store)
-        except Exception as e:
-            self._log(f"could not reset training store: {e}")
-        n = 0
-        for fp in self.deploy_files:
-            h5 = masks_sibling_path(fp)
-            if td_count(h5) == 0:
-                continue
-            for ex in list(td_iter_examples(h5)):
-                meta = ex['meta']
-                eid = meta.get('id', '')
+            for fp in self._training_source_paths():
+                h5 = masks_sibling_path(fp)
                 try:
-                    save_example(td_dir, ex['spec'], ex['mask'], meta, eid)
-                    n += 1
-                except Exception:
+                    if td_count(h5) == 0:
+                        continue
+                    examples = list(td_iter_examples(h5))
+                except Exception as e:
+                    failed.append(f"{os.path.basename(fp)}: {e}")
                     continue
-        self._log(f"Built training store from {n} Training Data label(s)")
+                for ex in examples:
+                    meta = ex['meta']
+                    try:
+                        td_save_example(tmp, ex['spec'], ex['mask'], meta,
+                                        meta.get('id') or None)
+                        n += 1
+                    except Exception as e:
+                        failed.append(f"{os.path.basename(fp)}: {e}")
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} label(s) could not be copied. "
+                    f"First error — {failed[0]}")
+            if n:
+                os.replace(tmp, store)      # atomic swap; old store until now
+            else:
+                _drop_tmp()                 # there really are no labels
+                if os.path.isfile(store):
+                    os.remove(store)
+        except Exception as e:
+            _drop_tmp()                     # keep the previous store as-is
+            self._log(f"Training store rebuild FAILED — {e}")
+            QMessageBox.critical(
+                self, "Could not rebuild training store",
+                f"The training store could not be rebuilt from the labels in "
+                f"the Audio list:\n\n{e}\n\nThe previous store was left "
+                f"untouched and training was NOT started, so the model is never "
+                f"fitted on a partial label set.\n\nIf the audio lives on a "
+                f"network drive, check it is still connected."
+            )
+            return False
+        self._log(f"Built training store from {n} label(s)")
+        return True
 
     def _show_training_dialog(self):
         """Show (or re-show) the floating training-graph window. The spectrogram
@@ -4911,11 +6694,37 @@ class MADMainWindow(QMainWindow):
         self._train_dialog.show()
         self._train_dialog.raise_()
         self._train_dialog.activateWindow()
+        # Bring the preview window back alongside the graph if it exists.
+        if self._preview_dialog is not None:
+            self._show_preview_dialog()
+
+    def _show_preview_dialog(self, reset: bool = False):
+        """Show (or re-show) the live prediction-preview window. Created lazily;
+        ``reset`` clears prior pages at the start of a new run."""
+        if self._preview_dialog is None:
+            self._preview_dialog = MADPreviewDialog(self)
+        if reset:
+            self._preview_dialog.clear()
+        self._preview_dialog.show()
+        self._preview_dialog.raise_()
+
+    def _on_training_stop_requested(self):
+        """User clicked 'Stop Training Early' — request the stop and close the
+        training + preview windows immediately (the run winds down in the
+        background). Overrides the old 'keep the window open until you close it'
+        behavior."""
+        self.status_bar.showMessage("Stopping training…")
+        self._closing_train_windows = True
+        for dlg in (self._train_dialog, self._preview_dialog):
+            if dlg is not None:
+                dlg.close()
 
     def _on_train_dialog_close(self, event):
         """Closing the training window mid-run: keep it in the background (just
-        hide) or stop the run — never silently kill a long run."""
-        if not self._training_active:
+        hide) or stop the run — never silently kill a long run. When the close
+        is triggered by 'Stop Training Early', skip the prompt entirely."""
+        if not self._training_active or getattr(self, '_closing_train_windows',
+                                                 False):
             event.accept()
             return
         box = QMessageBox(self)
@@ -4972,7 +6781,6 @@ class MADMainWindow(QMainWindow):
         if self._train_dialog is not None:
             self._train_dialog.setWindowTitle(
                 "Segmentation Training — complete (close when ready)")
-        self._refresh_quick_infer_models()
         if not ok or self._project is None:
             return
         if getattr(self, '_post_train_infer_wavs', None):
@@ -5074,23 +6882,51 @@ class MADMainWindow(QMainWindow):
             return
         self._remove_files_by_path(to_remove)
 
-    def _remove_files_by_path(self, paths_to_remove: list):
-        """Unload files from the session list. Does NOT delete anything from
-        disk — sources and their sibling csv/h5 are left untouched."""
+    def _remove_files_by_path(self, paths_to_remove: list,
+                              delete_embedded: bool = False):
+        """Drop files from the Audio list and unregister them from the project.
+
+        Referenced audio is only unregistered — the wav and its sibling csv/h5
+        stay exactly where they are on disk, because MAD never owned them. Only
+        project-owned copies (a legacy ``recordings/`` file, or one made by Pack
+        Project) can be deleted, and only when ``delete_embedded`` says the user
+        was told that in as many words.
+        """
         self._auto_save_mask_if_dirty()
         current_path = (self.audio_files[self.current_file_idx]
                         if self.audio_files else None)
         remove_set = set(paths_to_remove)
+        remove_keys = {os.path.normcase(os.path.abspath(p))
+                       for p in paths_to_remove}
         self.audio_files = [p for p in self.audio_files if p not in remove_set]
         if self._project is not None:
-            self._project.audio_files = [
-                p for p in self._project.audio_files if p not in remove_set
-            ]
+            entries = self._project.audio_entries()
+            if delete_embedded:
+                from fnt.usv.usv_detector.fnt_mask_store import (
+                    masks_sibling_path)
+                for e in entries:
+                    if (not e.embedded
+                            or os.path.normcase(os.path.abspath(e.path))
+                            not in remove_keys):
+                        continue
+                    for path in (e.path, pred_csv_sibling_path(e.path),
+                                 masks_sibling_path(e.path)):
+                        try:
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        except Exception as ex:
+                            self._log(f"remove failed "
+                                      f"({os.path.basename(path)}): {ex}")
+            self._project.set_audio_entries([
+                e for e in entries
+                if os.path.normcase(os.path.abspath(e.path)) not in remove_keys
+            ])
             try:
                 self._project.save()
             except Exception:
                 pass
-        # Fix the session index.
+        self._missing_audio -= remove_keys
+        # Fix the current-file index.
         if not self.audio_files:
             self.current_file_idx = 0
         elif current_path in remove_set:
@@ -5102,25 +6938,24 @@ class MADMainWindow(QMainWindow):
             except ValueError:
                 self.current_file_idx = 0
         self._refresh_file_list()
-        # Only disturb the preview when the session list currently owns it.
-        if self._active_source == 'session':
-            self.file_list.blockSignals(True)
-            self.file_list.setCurrentRow(self.current_file_idx
-                                         if self.audio_files else -1)
-            self.file_list.blockSignals(False)
-            if not self.audio_files:
-                self.spectrogram.set_audio_data(None, None)
-                self.waveform_overview.set_audio_data(None, None)
-                self.spectrogram.annotations.clear()
-                self._refresh_annotation_list()
-            elif current_path in remove_set:
-                self._load_current_file()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(self.current_file_idx
+                                     if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if not self.audio_files:
+            self.spectrogram.set_audio_data(None, None)
+            self.waveform_overview.set_audio_data(None, None)
+            self.spectrogram.annotations.clear()
+            self._refresh_annotation_list()
+        elif current_path in remove_set:
+            self._load_current_file()
         self._update_project_state()
         self.btn_remove_files.setEnabled(bool(self.audio_files))
         self._update_scope_labels()
+        self._update_run_button()
         n = len(paths_to_remove)
-        self.status_bar.showMessage(f"Unloaded {n} file(s)")
-        self._log(f"Unloaded {n} file(s) from the session")
+        self.status_bar.showMessage(f"Removed {n} file(s) from the list")
+        self._log(f"Removed {n} file(s) from the Audio list")
 
     def _default_model_path(self) -> Optional[str]:
         if self._project and self._project.models:
@@ -5254,6 +7089,9 @@ class MADMainWindow(QMainWindow):
                 os.path.basename(os.path.dirname(path)))
         else:
             self.lbl_deploy_model_info.setText("No model selected")
+        # Quick Inference shares this dropdown — enable it when a model is set.
+        if hasattr(self, 'btn_quick_infer'):
+            self.btn_quick_infer.setEnabled(bool(path))
         self._update_infer_run_enabled()
 
     def _update_infer_run_enabled(self):
@@ -5261,268 +7099,229 @@ class MADMainWindow(QMainWindow):
         :meth:`_update_run_button` now."""
         self._update_run_button()
 
+    def _pick_inference_folder(self):
+        """Choose a folder tree to run inference over, and cache its wav list."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder of recordings to analyze",
+            self._default_browse_dir())
+        if not folder:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            wavs = _list_wavs_in_folder(folder, recursive=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._infer_folder = folder
+        self._infer_folder_wavs = wavs
+        if wavs:
+            self.chk_scope_folder.setChecked(True)
+            self.lbl_infer_folder.setText(
+                f"{len(wavs):,} .wav file(s) under {folder}")
+            self.lbl_infer_folder.setStyleSheet(
+                "color: #7ec87e; font-size: 9px;")
+            self._log(f"Batch target: {len(wavs)} wav(s) under {folder}")
+        else:
+            self.chk_scope_folder.setChecked(False)
+            self.lbl_infer_folder.setText(f"No .wav files found under {folder}")
+            self.lbl_infer_folder.setStyleSheet(
+                "color: #c8a05a; font-size: 9px;")
+        self._update_run_button()
+
     def _gather_inference_targets(self) -> List[str]:
-        """Wav paths to run inference on, from the Session/Training scope
-        checkboxes (All vs Current file each). De-duplicated, order preserved."""
-        if not hasattr(self, 'chk_scope_session'):
+        """Wav paths to run inference on, from the Audio-list and Folder scope
+        checkboxes (All vs Current file). De-duplicated, order preserved."""
+        if not hasattr(self, 'chk_scope_audio'):
             return []
         targets: List[str] = []
-        if self.chk_scope_session.isChecked():
-            if self.combo_scope_session.currentText().startswith("Current"):
+        if (getattr(self, 'chk_scope_folder', None) is not None
+                and self.chk_scope_folder.isChecked()):
+            targets.extend(getattr(self, '_infer_folder_wavs', []) or [])
+        if self.chk_scope_audio.isChecked():
+            if self.combo_scope_audio.currentText().startswith("Current"):
                 if (self.audio_files and
                         0 <= self.current_file_idx < len(self.audio_files)):
                     targets.append(self.audio_files[self.current_file_idx])
             else:
                 targets.extend(self.audio_files)
-        if self.chk_scope_training.isChecked():
-            if self.combo_scope_training.currentText().startswith("Current"):
-                if (self.deploy_files and self._deploy_file_idx is not None and
-                        0 <= self._deploy_file_idx < len(self.deploy_files)):
-                    targets.append(self.deploy_files[self._deploy_file_idx])
-            else:
-                targets.extend(self.deploy_files)
+        # Drop referenced recordings whose audio can't be found — inference needs
+        # the wav, unlike training. Silently skipping keeps a 3,000-file run from
+        # aborting on one unplugged drive; the Audio list already flags them ⚠.
         seen, out = set(), []
         for p in targets:
-            if p and p not in seen:
+            if p and p not in seen and not self._is_missing(p):
                 seen.add(p)
                 out.append(p)
         return out
 
-    # --- Training Data list (project recordings the model trains on) -----
-    def _file_call_count(self, fp) -> Optional[int]:
-        """Total masks recorded for a wav — every call in the unified CSV,
-        regardless of source (label/prediction) or status. Falls back to the h5
-        (confirmed /td + predicted /pred_calls) when there's no CSV. Returns
-        None if the file has no masks. Shared by the session + Training lists."""
-        from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, get_prob_blob_count, td_count,
-        )
-        from fnt.usv.usv_detector.mad_inference import read_blob_csv
+    # --- per-file status breakdown (accepted / pending / rejected) --------
+    def _mem_status_counts(self):
+        """(accepted, pending, rejected) from the in-memory annotations of the
+        currently-loaded file. Accepted = confirmed labels + accepted predictions
+        (anything that isn't a pending prediction or a rejection)."""
+        a = p = r = 0
+        for ann in self.spectrogram.annotations:
+            st = ann.get('status')
+            if st == 'rejected':
+                r += 1
+            elif st == 'prediction':
+                p += 1
+            else:
+                a += 1
+        return (a, p, r)
+
+    def _csv_status_counts(self, fp):
+        """(accepted, pending, rejected) from a file's persisted CSV (or h5
+        fallback). Read straight from disk, so it's correct for files that
+        aren't the one currently loaded in the preview."""
         csv_p = pred_csv_sibling_path(fp)
         if os.path.isfile(csv_p):
             try:
-                return len(read_blob_csv(csv_p)) or None
+                from fnt.usv.usv_detector.mad_inference import read_blob_csv
+                a = p = r = 0
+                for row in read_blob_csv(csv_p):
+                    st = row.get('status') or 'pending'
+                    if st == 'rejected':
+                        r += 1
+                    elif st == 'pending':
+                        p += 1
+                    else:  # 'accepted', hand-labels, anything else
+                        a += 1
+                return (a, p, r)
             except Exception:
                 pass
         try:
+            from fnt.usv.usv_detector.fnt_mask_store import (
+                masks_sibling_path, get_prob_blob_count, td_count,
+            )
             h5 = masks_sibling_path(fp)
-            n = (td_count(h5) or 0) + (get_prob_blob_count(h5) or 0)
-            return n or None
+            return (td_count(h5) or 0, get_prob_blob_count(h5) or 0, 0)
         except Exception:
-            return None
+            return (0, 0, 0)
 
-    def _refresh_deploy_queue(self):
-        """Render the Training Data list, showing a green ✓ + the recorded call
-        count (labels + predictions) on each file that has any."""
-        if not hasattr(self, 'deploy_list'):
-            return
-        self.deploy_list.blockSignals(True)
-        self.deploy_list.clear()
-        for p in self.deploy_files:
-            base = os.path.basename(p)
-            cnt = self._file_call_count(p)
-            if cnt:
-                item = QListWidgetItem(f"✓  {base}  ({cnt})")
-                item.setForeground(QColor(80, 200, 120))
-                item.setToolTip("Has labeled/predicted calls — click to review")
-            else:
-                item = QListWidgetItem(base)
-            self.deploy_list.addItem(item)
-        self.deploy_list.blockSignals(False)
-        self.lbl_deploy_queue.setText(
-            f"{len(self.deploy_files)} file(s) in training set")
-        self._update_infer_run_enabled()
-        self._update_train_button_count()
+    def _file_status_counts(self, fp):
+        """(accepted, pending, rejected) for a wav. Uses the live in-memory
+        annotations when ``fp`` is the file actually loaded in the preview (so
+        edits show instantly); otherwise reads the persisted CSV. The
+        loaded-file check is what stops a row's count from briefly showing the
+        *previous* file's number while a new file loads."""
+        loaded = getattr(self, '_loaded_wav_path', None)
+        if (loaded and self.audio_data is not None
+                and os.path.normpath(loaded) == os.path.normpath(fp)):
+            return self._mem_status_counts()
+        return self._csv_status_counts(fp)
 
-    def _set_deploy_item_state(self, wav_path, state: str, count=None):
-        """Mark a queue row by inference state: 'pending' | 'done' | 'error'.
+    def _apply_file_row(self, item, base, counts):
+        """Set a list row's display text + delegate data for ``base`` with an
+        optional ``(accepted, pending, rejected)`` tuple. The DisplayRole text is
+        a plain string (for sizing); :class:`FileCountDelegate` recolors it."""
+        if counts is not None and any(counts):
+            a, p, r = counts
+            item.setText(f"✓  {base}  ({a}, {p}, {r})")
+        else:
+            item.setText(base)
+        item.setData(_ROLE_FILE_LABEL, base)
+        item.setData(_ROLE_FILE_COUNTS, counts)
+        item.setData(Qt.ForegroundRole, None)  # delegate owns the colors
+
+    def _set_file_item_state(self, wav_path, state: str, count=None):
+        """Mark an Audio-list row by inference state: 'pending'|'done'|'error'.
         Finished files get a green ✓ and the detection count so the user can see
         how many calls were found and click in to QC them as the run progresses."""
-        if not hasattr(self, 'deploy_list'):
+        if not hasattr(self, 'file_list'):
             return
         try:
-            row = self.deploy_files.index(wav_path)
+            row = self.audio_files.index(wav_path)
         except ValueError:
             return
-        item = self.deploy_list.item(row)
+        item = self.file_list.item(row)
         if item is None:
             return
         base = os.path.basename(wav_path)
         if state == 'done':
-            tag = f"  ({count})" if count is not None else ""
-            item.setText(f"✓  {base}{tag}")
-            item.setForeground(QColor(80, 200, 120))
+            # Freshly inferred — show the accepted/pending/rejected breakdown,
+            # and keep the cache in step so the next full refresh agrees.
+            counts = self._file_status_counts(wav_path)
+            self._apply_file_row(item, base, counts)
+            if any(counts):
+                self._file_count_cache[base] = counts
             item.setToolTip(
                 f"Inference done — {count} detection(s); click to review"
                 if count is not None else
                 "Inference done — click to review detections")
         elif state == 'error':
+            item.setData(_ROLE_FILE_LABEL, None)
+            item.setData(_ROLE_FILE_COUNTS, None)
             item.setText(f"✗  {base}")
             item.setForeground(QColor(220, 90, 90))
             item.setToolTip("Inference failed")
-        else:  # pending
+        else:  # queued (not yet run)
+            item.setData(_ROLE_FILE_LABEL, None)
+            item.setData(_ROLE_FILE_COUNTS, None)
             item.setText(base)
             item.setData(Qt.ForegroundRole, None)
             item.setToolTip("")
 
-    def _on_deploy_file_selected(self, row: int):
-        if 0 <= row < len(self.deploy_files):
-            # Training Data owns the preview now; clear the session selection.
-            self._active_source = 'training'
-            self._review_mode = 'train'
-            self._clear_session_selection()
-            self._deploy_file_idx = row
-            self._load_deploy_file(self.deploy_files[row])
-            self._update_review_buttons_for_source()
-
-    def _clear_deploy_files(self):
-        """Empty the Training Data list (used on project close)."""
-        self.deploy_files = []
-        self._deploy_file_idx = None
-        self._refresh_deploy_queue()
-
     def _prompt_make_project_for_training(self) -> bool:
-        """Offer to create or open a project so there's somewhere to put the
-        Training Data set. Returns True if a project is open afterward."""
+        """Offer to create or open a project so there's somewhere to train into.
+        Returns True if a project is open afterward."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("Project needed")
-        box.setText("Training Data is stored inside a MAD project.")
+        box.setText("Training a model needs a MAD project to save into.")
         box.setInformativeText(
-            "Create a new project or open an existing one to hold the "
-            "training set?")
+            "Create a new project or open an existing one? Your currently "
+            "loaded audio is added to it.")
         b_new = box.addButton("New Project…", QMessageBox.AcceptRole)
         b_open = box.addButton("Open Project…", QMessageBox.AcceptRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
         box.exec_()
         clicked = box.clickedButton()
+        # New Project carries the loaded audio over itself; opening an existing
+        # one replaces the list with that project's, so fold the files in after.
+        carry = list(self.audio_files)
         if clicked is b_new:
             self._menu_new_project()
         elif clicked is b_open:
             self._menu_open_project()
+            if self._project is not None and carry:
+                if self._register_audio_files(carry):
+                    self._rescan_project_wavs()
         return self._project is not None
 
-    def _copy_to_training_data(self):
-        """Copy the selected Session-audio file(s) — wav + sibling csv/h5 — into
-        the project's Training Data set (recordings/). Independent snapshots:
-        re-copying a name already present prompts before overwriting."""
-        # Capture the selection up front — creating/opening a project below may
-        # rebuild the session list, but the source files stay put on disk.
-        rows = sorted({i.row() for i in self.file_list.selectedIndexes()})
-        srcs = [self.audio_files[r] for r in rows
-                if 0 <= r < len(self.audio_files)]
-        if not srcs:
-            self.status_bar.showMessage("Select session file(s) to copy first")
-            return
-        if not self._project:
-            if not self._prompt_make_project_for_training():
-                return
-            # Re-load the session files (closing the old project cleared the
-            # list) so they stay visible after the copy.
-            self._append_audio_paths(srcs)
-        dest_dir = self._project.recordings_dir
-        os.makedirs(dest_dir, exist_ok=True)
-        copied, overwrite_all, skip_all = 0, False, False
-        for src in srcs:
-            base = os.path.basename(src)
-            dest = os.path.join(dest_dir, base)
-            if os.path.exists(dest) and os.path.normpath(dest) != os.path.normpath(src):
-                if skip_all:
-                    continue
-                if not overwrite_all:
-                    box = QMessageBox(self)
-                    box.setIcon(QMessageBox.Question)
-                    box.setWindowTitle("Already in Training Data")
-                    box.setText(
-                        f"“{base}” is already in the Training Data set.\n\n"
-                        "Overwrite the training copy (wav + csv/h5) with the "
-                        "current session version?")
-                    bt_yes = box.addButton("Overwrite", QMessageBox.YesRole)
-                    bt_all = box.addButton("Overwrite All", QMessageBox.YesRole)
-                    bt_skip = box.addButton("Skip", QMessageBox.NoRole)
-                    box.addButton("Skip All", QMessageBox.NoRole)
-                    box.exec_()
-                    clicked = box.clickedButton()
-                    if clicked is bt_skip:
-                        continue
-                    if clicked is bt_all:
-                        overwrite_all = True
-                    elif clicked is not bt_yes:  # Skip All
-                        skip_all = True
-                        continue
-            self._copy_one_to_training(src, dest)
-            if dest not in self.deploy_files:
-                self.deploy_files.append(dest)
-            copied += 1
-        if copied:
-            self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
-            self._refresh_deploy_queue()
-            self._log(f"Copied {copied} file(s) to Training Data")
-            self.status_bar.showMessage(
-                f"Copied {copied} file(s) to Training Data")
-            self._update_train_button_enabled()
+    def _register_audio_files(self, paths, embedded: bool = False) -> int:
+        """Record wavs in the open project's audio registry **by reference** —
+        the wav is never copied. Returns how many were new (already-registered
+        paths are skipped, not duplicated); 0 with no project open.
 
-    def _copy_one_to_training(self, src: str, dest: str):
-        """Copy a wav and its sibling csv/h5 from ``src`` to ``dest``."""
-        import shutil
-        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-        if os.path.normpath(src) != os.path.normpath(dest):
-            shutil.copy2(src, dest)
-        # Prediction CSV.
-        for src_side, dest_side in (
-            (pred_csv_sibling_path(src), pred_csv_sibling_path(dest)),
-            (masks_sibling_path(src), masks_sibling_path(dest)),
-        ):
-            try:
-                if (os.path.isfile(src_side) and
-                        os.path.normpath(src_side) != os.path.normpath(dest_side)):
-                    shutil.copy2(src_side, dest_side)
-            except Exception as e:
-                self._log(f"copy sibling failed ({os.path.basename(src_side)}): {e}")
-
-    def _remove_from_training_data(self):
-        """Delete the selected recording(s) from the project's Training Data —
-        the copied wav + its csv/h5. Leaves the original session source alone."""
-        rows = sorted({i.row() for i in self.deploy_list.selectedIndexes()},
-                      reverse=True)
-        victims = [self.deploy_files[r] for r in rows
-                   if 0 <= r < len(self.deploy_files)]
-        if not victims:
-            return
-        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
-        names = "\n".join(f"   • {os.path.basename(v)}" for v in victims[:10])
-        reply = QMessageBox.question(
-            self, "Remove from Training Data",
-            f"Delete {len(victims)} recording(s) from the project's Training "
-            f"Data set?\n\n{names}\n\n"
-            "This removes the copied wav + csv/h5 from the project. The "
-            "original session files are not touched.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        for v in victims:
-            for path in (v, pred_csv_sibling_path(v), masks_sibling_path(v)):
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except Exception as e:
-                    self._log(f"remove failed ({os.path.basename(path)}): {e}")
-            try:
-                self.deploy_files.remove(v)
-            except ValueError:
-                pass
-        self._deploy_file_idx = None
-        self._refresh_deploy_queue()
-        self._update_train_button_enabled()
-        self._log(f"Removed {len(victims)} file(s) from Training Data")
+        MAD bakes each confirmed call into training_data.h5 as a self-contained
+        spec patch + mask, and training reads only that store, so the project has
+        no training-time dependency on the wav. Referencing keeps projects
+        lightweight (a 10-min 250 kHz recording is ~300 MB) and leaves one source
+        of truth per recording. See mad_registry for how moved files are found
+        again."""
+        from fnt.usv.usv_detector.mad_registry import RegisteredFile
+        if self._project is None:
+            return 0
+        entries = self._project.audio_entries()
+        known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
+        added = 0
+        for p in paths:
+            ap = os.path.abspath(p)
+            if os.path.normcase(ap) in known:
+                continue
+            entries.append(RegisteredFile.from_path(ap, embedded=embedded))
+            known.add(os.path.normcase(ap))
+            added += 1
+        if added:
+            self._project.set_audio_entries(entries)
+            self._project.save()
+        return added
 
     def _file_source_label(self, w) -> str:
-        """'Session' / 'Training Data' / '' — which list a wav belongs to."""
+        """'Audio' when the wav is in the list, '' otherwise."""
         wn = os.path.normpath(w)
-        if any(os.path.normpath(p) == wn for p in self.deploy_files):
-            return "Training Data"
         if any(os.path.normpath(p) == wn for p in self.audio_files):
-            return "Session"
+            return "Audio"
         return ""
 
     def _file_has_predictions(self, w) -> bool:
@@ -5546,12 +7345,44 @@ class MADMainWindow(QMainWindow):
                 pass
         return False
 
+    def _file_has_pending_predictions(self, w) -> bool:
+        """True if the wav carries *pending* (unreviewed) predictions — the only
+        rows a re-run replaces. Accepted/Rejected predictions and hand-labels
+        are now preserved, so files with only reviewed detections don't warn."""
+        csv = pred_csv_sibling_path(w)
+        if os.path.isfile(csv):
+            try:
+                from fnt.usv.usv_detector.mad_inference import read_blob_csv
+                for r in read_blob_csv(csv):
+                    if (isinstance(r.get('blob_id'), int)
+                            and r.get('status') not in ('accepted', 'rejected')):
+                        return True
+                return False
+            except Exception:
+                pass
+        # No readable CSV — fall back to "has any prediction crops" (unreviewed).
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, has_pred_masks,
+        )
+        return has_pred_masks(masks_sibling_path(w))
+
     def _confirm_overwrite_predictions(self, wavs) -> bool:
-        """If any of ``wavs`` already carry model predictions, warn that
-        re-running inference replaces them and resets the accept/reject/delete
-        decisions made on those predictions. Hand-labels are NOT affected, so
-        label-only files don't trigger the prompt. Returns True to proceed."""
-        existing = [w for w in wavs if self._file_has_predictions(w)]
+        """Warn before a re-run touches existing detections. Two modes:
+
+        • Normal (default): only *pending* predictions are regenerated, so we
+          prompt only for files that still have unreviewed predictions and
+          reassure that reviewed calls / hand-labels are kept.
+        • "Re-detect from scratch": all prior predictions (including Accepted /
+          Rejected) are discarded, so we prompt for any file with predictions
+          and spell out that review decisions will be lost.
+
+        Returns True to proceed."""
+        redetect = bool(getattr(self, 'chk_infer_redetect', None)
+                        and self.chk_infer_redetect.isChecked())
+        if redetect:
+            existing = [w for w in wavs if self._file_has_predictions(w)]
+        else:
+            existing = [w for w in wavs if self._file_has_pending_predictions(w)]
         if not existing:
             return True
 
@@ -5562,18 +7393,33 @@ class MADMainWindow(QMainWindow):
         shown = "\n".join(_line(w) for w in existing[:8])
         more = (f"\n   …and {len(existing) - 8} more"
                 if len(existing) > 8 else "")
+        if redetect:
+            title = "Re-detect from scratch?"
+            body = (
+                f"'Re-detect from scratch' is on. {len(existing)} of "
+                f"{len(wavs)} file(s) carry predictions from a previous "
+                f"run:\n\n{shown}{more}\n\n"
+                "This will discard ALL of those predictions — including every "
+                "Accepted and Rejected decision — and re-detect everywhere.\n"
+                "Your painted / SAM labels are kept as data, but the model is "
+                "allowed to predict over them too.\n\n"
+                "Continue?")
+        else:
+            title = "Re-run inference on these files?"
+            body = (
+                f"{len(existing)} of {len(wavs)} file(s) still have pending "
+                f"(unreviewed) predictions from a previous run:\n\n"
+                f"{shown}{more}\n\n"
+                "Re-running inference will replace those pending predictions "
+                "with fresh ones. Everything you've already decided is kept:\n"
+                "   • Accepted and Rejected calls stay as they are, and the "
+                "model won't re-detect over them, and\n"
+                "   • your painted / SAM labels are untouched.\n"
+                "Deleted calls stay deleted — but their region re-opens for "
+                "fresh detection.\n\n"
+                "Continue?")
         reply = QMessageBox.warning(
-            self, "Overwrite existing predictions?",
-            f"{len(existing)} of {len(wavs)} file(s) already carry model "
-            f"predictions from a previous inference run:\n\n{shown}{more}\n\n"
-            "Re-running inference on those files will:\n"
-            "   • replace their predictions with fresh ones, and\n"
-            "   • reset every Accept / Reject / Delete decision you made on "
-            "those predictions back to pending.\n\n"
-            "Your confirmed (painted / SAM) labels are NOT affected — they're "
-            "kept, and 'Preserve painted labels' additionally skips "
-            "re-detecting over them. Files with no predictions are untouched.\n\n"
-            "Continue?",
+            self, title, body,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         return reply == QMessageBox.Yes
@@ -5606,78 +7452,16 @@ class MADMainWindow(QMainWindow):
             model_path=model,
             threshold=self.spin_infer_threshold.value(),
             min_blob_pixels=self.spin_infer_min_blob.value(),
-            device=self.combo_infer_device.currentText(),
+            device=self._device_value(self.combo_infer_device),
             save_blob_csv=True,  # always — it's the summary output + review state
-            preserve_labels=self.chk_infer_preserve.isChecked(),
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
+            **self._infer_perf_kwargs(),
         )
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()
         self._start_inference(cfg, wavs, reporter=self.infer_panel)
-
-    def _load_deploy_file(self, filepath: str):
-        """Preview a queued deployment file in the shared spectrogram.
-
-        Loads audio + grid only; deploy-mode prediction correction is added in
-        Phase 3. Does not touch the training example store."""
-        if not filepath or not os.path.isfile(filepath):
-            return
-        self._stop_playback()
-        self._clear_predictions()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            audio, sr = load_audio(filepath)
-            if audio.ndim > 1:
-                audio = np.mean(audio, axis=1)
-            self.audio_data = audio.astype(np.float32, copy=False)
-            self.sample_rate = int(sr)
-            has_previous = self.spectrogram.total_duration > 0
-            self.spectrogram.set_audio_data(
-                self.audio_data, self.sample_rate, preserve_view=has_previous
-            )
-            self.waveform_overview.set_audio_data(self.audio_data, self.sample_rate)
-            self.waveform_overview.set_view_range(
-                self.spectrogram.view_start, self.spectrogram.view_end
-            )
-            # Predictions live in the sibling CSV/h5 — load them whether or not
-            # a project is open. Use the grid params recorded in the h5 (exactly
-            # what the predictions were computed with) so the masks align; fall
-            # back to the project's / default params when the h5 has none.
-            from fnt.usv.usv_detector.fnt_mask_store import (
-                masks_sibling_path, get_grid_attrs,
-            )
-            grid = get_grid_attrs(masks_sibling_path(filepath))
-            sp = self._spec_params()
-            self.spectrogram.init_mask(
-                audio_len=len(self.audio_data), sample_rate=self.sample_rate,
-                nperseg=int(grid.get('nperseg', sp['nperseg'])),
-                noverlap=int(grid.get('noverlap', sp['noverlap'])),
-                nfft=int(grid.get('nfft', sp['nfft'])),
-            )
-            # Show this Training-Data file's confirmed labels (green) plus any
-            # predictions (yellow) so it can be reviewed and edited like a
-            # session file.
-            gridhw = (self.spectrogram.n_freq_bins,
-                      self.spectrogram.n_time_frames)
-            self.spectrogram.set_annotations(
-                self._load_confirmed_annotations(filepath, gridhw))
-            n_pred = self._load_predictions_as_annotations(wav=filepath) or 0
-            self._sync_scrollbar_from_view()
-            suffix = f"  |  {n_pred} prediction(s)" if n_pred else ""
-            self.status_bar.showMessage(
-                f"Training Data — {os.path.basename(filepath)}  |  "
-                f"{len(self.audio_data) / self.sample_rate:.2f}s @ "
-                f"{self.sample_rate} Hz{suffix}"
-            )
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Load error", f"{os.path.basename(filepath)}:\n{e}")
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._update_paint_buttons_enabled()
-        self._update_playback_buttons_enabled()
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -5714,10 +7498,41 @@ class MADMainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        # Recordings are referenced by path, so a moved recording tree is
+        # repaired here rather than by re-importing files.
+        self.act_locate_missing = QAction("&Locate Missing Recordings…", self)
+        self.act_locate_missing.setToolTip(
+            "Repoint the project at recordings that moved. Pick one file and "
+            "every sibling that moved with it is fixed too.")
+        self.act_locate_missing.triggered.connect(
+            self._locate_missing_recordings)
+        self.act_locate_missing.setEnabled(False)
+        file_menu.addAction(self.act_locate_missing)
+
+        self.act_run_summary = QAction("Batch Run &Summary…", self)
+        self.act_run_summary.setShortcut("Ctrl+B")
+        self.act_run_summary.setToolTip(
+            "Per-file results of a batch run — which recordings have calls, "
+            "how many, and how fast the run went.")
+        self.act_run_summary.triggered.connect(self._show_run_summary)
+        file_menu.addAction(self.act_run_summary)
+
+        self.act_pack_project = QAction("&Pack Project (embed audio)…", self)
+        self.act_pack_project.setToolTip(
+            "Copy every referenced recording into the project so it is fully "
+            "self-contained — for archiving, or moving to another machine.")
+        self.act_pack_project.triggered.connect(self._pack_project)
+        self.act_pack_project.setEnabled(False)
+        file_menu.addAction(self.act_pack_project)
+
+        file_menu.addSeparator()
+
         self.act_close_project = QAction("&Close Project", self)
         self.act_close_project.triggered.connect(self._menu_close_project)
         self.act_close_project.setEnabled(False)
         file_menu.addAction(self.act_close_project)
+
+        file_menu.addSeparator()
 
         # The Labels and Predict menus are hidden — every command is reachable
         # from the GUI itself. We still register their keyboard shortcuts (and
@@ -5760,75 +7575,204 @@ class MADMainWindow(QMainWindow):
         help_menu.addAction(act_gpu)
 
     # ------------------------------------------------------------------
+    # Compute device pickers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fill_device_combo(combo):
+        """Populate a Device combo. Display labels are friendly; the internal
+        short key ('auto'/'cuda'/'mps'/'cpu') is kept as userData so training/
+        inference and saved configs keep using the short keys. The 'Auto' label
+        is refined to name the detected accelerator once the probe finishes."""
+        for label, key in (
+            ("Auto", 'auto'),
+            ("CUDA (NVIDIA GPU)", 'cuda'),
+            ("MPS (Apple GPU)", 'mps'),
+            ("CPU", 'cpu'),
+        ):
+            combo.addItem(label, key)
+
+    @staticmethod
+    def _device_value(combo) -> str:
+        """The short device key for a combo built by :meth:`_fill_device_combo`."""
+        return combo.currentData() or combo.currentText() or 'auto'
+
+    def _start_device_probe(self):
+        """Kick off the background compute-device probe (once)."""
+        self._device_probe = MADDeviceProbeWorker(self)
+        self._device_probe.done_signal.connect(self._on_device_probe_done)
+        self._device_probe.start()
+
+    def _on_device_probe_done(self, kind: str, name: str, note: str):
+        auto_label = {
+            'cuda': 'Auto (NVIDIA GPU)',
+            'mps': 'Auto (Apple GPU)',
+        }.get(kind, 'Auto (CPU)')
+        for combo in (getattr(self, 'combo_train_device', None),
+                      getattr(self, 'combo_infer_device', None)):
+            if combo is None:
+                continue
+            i = combo.findData('auto')
+            if i >= 0:
+                combo.setItemText(i, auto_label)
+        color = "#7ec87e" if kind in ('cuda', 'mps') else "#c8a05a"
+        for lbl in (getattr(self, 'lbl_train_device_info', None),
+                    getattr(self, 'lbl_infer_device_info', None)):
+            if lbl is not None:
+                lbl.setText(note)
+                lbl.setStyleSheet(f"color: {color}; font-size: 9px;")
+
+    # ------------------------------------------------------------------
     # GPU / CUDA readiness
     # ------------------------------------------------------------------
     @staticmethod
-    def _detect_nvidia_gpu() -> Optional[str]:
-        """Return an NVIDIA GPU name via nvidia-smi, or None if absent."""
+    def _nvidia_driver_info() -> Optional[dict]:
+        """Query ``nvidia-smi`` for the GPU name, driver version and the highest
+        CUDA runtime that driver supports. None when nvidia-smi is absent.
+
+        The supported-CUDA number is what decides which PyTorch wheel index to
+        recommend — an NVIDIA driver runs any CUDA runtime at or below it, so a
+        13.x driver can run cu126 wheels but a 12.6 driver cannot run cu130."""
+        import re
         import subprocess
+        info: dict = {}
         try:
             out = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                ['nvidia-smi',
+                 '--query-gpu=name,driver_version', '--format=csv,noheader'],
                 capture_output=True, text=True, timeout=6)
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip().splitlines()[0].strip()
+            if out.returncode != 0 or not out.stdout.strip():
+                return None
+            first = out.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first.split(',')]
+            info['name'] = parts[0]
+            info['driver'] = parts[1] if len(parts) > 1 else '?'
+        except Exception:
+            return None
+        # The max supported CUDA runtime only appears in the banner, not in the
+        # --query-gpu fields, so parse it out of the plain nvidia-smi output.
+        try:
+            banner = subprocess.run(['nvidia-smi'], capture_output=True,
+                                    text=True, timeout=6)
+            m = re.search(r'CUDA Version:\s*([0-9]+\.[0-9]+)', banner.stdout)
+            if m:
+                info['cuda'] = float(m.group(1))
         except Exception:
             pass
-        return None
+        return info
+
+    @staticmethod
+    def _detect_nvidia_gpu() -> Optional[str]:
+        """Return an NVIDIA GPU name via nvidia-smi, or None if absent."""
+        info = MADMainWindow._nvidia_driver_info()
+        return info.get('name') if info else None
+
+    @staticmethod
+    def _recommended_cuda_tag(driver_cuda: Optional[float]) -> str:
+        """PyTorch wheel index tag for a driver's max CUDA runtime.
+
+        Kept conservative: every tag here is one PyTorch publishes Windows +
+        Linux wheels for. When the driver version is unknown, cu126 is the
+        safest broadly-available choice."""
+        if driver_cuda is None:
+            return 'cu126'
+        if driver_cuda >= 13.0:
+            return 'cu130'
+        if driver_cuda >= 12.6:
+            return 'cu126'
+        if driver_cuda >= 12.1:
+            return 'cu121'
+        return 'cu118'
 
     def _gpu_status(self):
         """Return ``(ready: bool, title, message)`` describing GPU readiness."""
+        import sys as _sys
+        pyver = f"{_sys.version_info.major}.{_sys.version_info.minor}"
+        env = os.environ.get('CONDA_DEFAULT_ENV') or Path(_sys.prefix).name
         try:
             import torch
         except Exception:
-            return (False, "PyTorch not found",
-                    "PyTorch isn't installed in this environment, so training "
-                    "and inference can't run at all. Install it (see the CUDA "
-                    "command below) in your 'fnt' conda env.")
-        ver = getattr(torch, '__version__', '?')
-        if torch.cuda.is_available():
+            torch = None
+
+        if torch is not None and torch.cuda.is_available():
             try:
                 name = torch.cuda.get_device_name(0)
             except Exception:
                 name = "CUDA GPU"
             return (True, "GPU ready ✓",
-                    f"PyTorch {ver} can use your GPU:\n\n    {name}\n\n"
+                    f"PyTorch {torch.__version__} can use your GPU:\n\n"
+                    f"    {name}\n\n"
                     "Training and inference will run on CUDA (Device = auto).")
-        nv = self._detect_nvidia_gpu()
-        import sys as _sys
-        pyver = f"{_sys.version_info.major}.{_sys.version_info.minor}"
-        cuda_cmd = (
-            "    conda activate fnt\n"
+
+        nv = self._nvidia_driver_info()
+        driver_cuda = (nv or {}).get('cuda')
+        tag = self._recommended_cuda_tag(driver_cuda)
+        # torch's own version string carries the build variant: '2.13.0+cpu' is
+        # a CPU-only wheel, '2.13.0+cu130' a CUDA one. This is the single most
+        # useful line for diagnosing "my GPU is there but torch won't use it".
+        ver = getattr(torch, '__version__', None) if torch is not None else None
+        built_cuda = getattr(getattr(torch, 'version', None), 'cuda', None)
+
+        cmds = (
+            f"    conda activate {env}\n"
             "    pip uninstall -y torch torchvision\n"
-            "    pip install torch torchvision --index-url "
-            "https://download.pytorch.org/whl/cu124\n")
+            f"    pip install torch torchvision --index-url "
+            f"https://download.pytorch.org/whl/{tag}\n")
         guidance = (
-            "Get the EXACT command for your setup from:\n"
-            "    https://pytorch.org/get-started/locally/\n"
-            "(choose Stable · Windows · Pip · Python · your CUDA version)\n\n"
-            "Or run, in the 'fnt' env:\n\n" + cuda_cmd +
-            "\nNotes:\n"
-            f"  • Match the CUDA tag to what's offered — cu124/cu126 are current; "
-            "an old tag like cu121 may have no wheels (that's the\n"
-            "    'Could not find a version… (from versions: none)' error).\n"
-            "  • Double-check the URL host is exactly 'download.pytorch.org'.\n"
-            f"  • Your Python is {pyver}; the chosen torch must publish wheels "
-            "for it.\n"
-            "  • You only need a recent NVIDIA driver — not the full CUDA "
-            "Toolkit.\n"
-            "  • If the GPU install fails, get back to a working CPU setup with:"
-            "  pip install torch torchvision")
+            "HOW TO FIX\n"
+            "Install a CUDA build of PyTorch into this environment:\n\n"
+            + cmds + "\n"
+            "Then fully restart MAD and re-open this dialog — it should say "
+            "'GPU ready'.\n\n"
+            "WHY THIS HAPPENS\n"
+            "  • Plain 'pip install torch' pulls the default PyPI wheel, which "
+            "on Windows is CPU-only.\n"
+            "    The CUDA builds live on PyTorch's own index, which is what the "
+            "--index-url above selects.\n"
+            f"  • The CUDA tag must be <= what your driver supports"
+            + (f" (yours: CUDA {driver_cuda:g})" if driver_cuda else "")
+            + f"; '{tag}' is the right one here.\n"
+            f"  • Your Python is {pyver} — the chosen torch must publish wheels "
+            "for it. If pip reports\n"
+            "    'Could not find a version … (from versions: none)', the tag or "
+            "the Python version has no wheels;\n"
+            "    check https://pytorch.org/get-started/locally/ for the current "
+            "combination.\n"
+            "  • You only need a recent NVIDIA driver — the full CUDA Toolkit is "
+            "NOT required.\n"
+            "  • To go back to a working CPU setup:  pip install torch "
+            "torchvision")
+
+        if torch is None:
+            return (False, "PyTorch not found",
+                    f"PyTorch isn't installed in this environment ({env}), so "
+                    "training and inference can't run at all.\n\n" + guidance)
+
         if nv:
+            detail = [
+                f"Detected NVIDIA GPU:      {nv.get('name', '?')}",
+                f"Driver version:           {nv.get('driver', '?')}",
+            ]
+            if driver_cuda:
+                detail.append(f"Driver supports up to:    CUDA {driver_cuda:g}")
+            detail += [
+                f"Installed PyTorch:        {ver}",
+                f"PyTorch built against:    "
+                + (f"CUDA {built_cuda}" if built_cuda
+                   else "CPU only (no CUDA)"),
+                f"Environment:              {env}  (Python {pyver})",
+            ]
             return (False, "GPU present, but PyTorch is CPU-only",
-                    f"Detected NVIDIA GPU:\n\n    {nv}\n\n"
-                    f"…but the installed PyTorch ({ver}) is a CPU-only build, "
-                    "so training/inference run on the CPU (slow).\n\n"
-                    + guidance + "\n\nRestart MAD afterward and re-check here.")
+                    "\n".join(detail) +
+                    "\n\nThe GPU and driver are fine — the PyTorch wheel is the "
+                    "problem. It has no CUDA support\ncompiled in, so training "
+                    "and inference fall back to the CPU (typically 10-50x "
+                    "slower).\n\n" + guidance)
+
         return (False, "No NVIDIA GPU detected",
                 "No NVIDIA GPU was found (nvidia-smi isn't available), so "
                 "training/inference will use the CPU.\n\nIf this machine does "
                 "have an NVIDIA GPU, install its driver first, then a CUDA "
-                "build of PyTorch:\n\n" + guidance)
+                "build of PyTorch.\n\n" + guidance)
 
     def _show_gpu_setup_dialog(self, force: bool = False):
         """Show the GPU readiness dialog. When ``force`` is False it only shows
@@ -5883,6 +7827,7 @@ class MADMainWindow(QMainWindow):
         # instead of QShortcuts, so they work even when a scrollbar, list, or
         # button holds focus and would otherwise swallow the arrow key. Up/Down
         # are fully dedicated to zoom; B/N step Back/Next through detections.
+        make(Qt.Key_G, self._show_gallery)         # Gallery (grid review)
         make(Qt.Key_B, self._shortcut_pred_prev)   # Back (previous detection)
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
@@ -6013,12 +7958,16 @@ class MADMainWindow(QMainWindow):
     def _shortcut_brush_smaller(self):
         if self._focus_is_edit():
             return
-        self.spin_brush_radius.setValue(max(1, self.spin_brush_radius.value() - 1))
+        sg = self.spectrogram
+        sg.set_brush_radius(max(1, sg.brush_radius_px - 1))
+        sg.update()
 
     def _shortcut_brush_bigger(self):
         if self._focus_is_edit():
             return
-        self.spin_brush_radius.setValue(min(64, self.spin_brush_radius.value() + 1))
+        sg = self.spectrogram
+        sg.set_brush_radius(min(64, sg.brush_radius_px + 1))
+        sg.update()
 
     def _shortcut_cycle_view(self):
         if self._focus_is_edit():
@@ -6096,8 +8045,18 @@ class MADMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create project:\n{e}")
             return
+        # Carry over whatever is already loaded: "open some wavs, look at them,
+        # then decide to make a project" is the common path, and losing the list
+        # at exactly that moment would be a needless re-import. Only from the
+        # no-project state, though — creating a project while one is open starts
+        # clean rather than silently cloning the old project's file list.
+        carry = list(self.audio_files) if self._project is None else []
         self._close_project(silent=True)
         self._activate_project(cfg)
+        if carry:
+            n = self._register_audio_files(carry)
+            self._rescan_project_wavs()
+            self._log(f"Added {n} already-loaded file(s) to the new project")
         self._remember_recent(project_dir)
         self.status_bar.showMessage(f"Created project: {project_dir}")
 
@@ -6162,43 +8121,69 @@ class MADMainWindow(QMainWindow):
 
     def _menu_add_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Add folder of .wav files (non-recursive)",
+            self, "Add folder of .wav files",
             self._default_browse_dir()
         )
         if not folder:
             return
-        # Browse the folder in place for this session only — files are not
-        # copied or persisted; a file joins the project once a call is accepted
-        # on it. (Re-add the folder next session to keep browsing.)
-        wavs = _list_wavs_in_folder(folder)
+        # Recording sets are nested (experiment / mic / day), so offer the whole
+        # tree — but only when there's actually something deeper to find, so the
+        # common flat-folder case stays a single click.
+        flat = _list_wavs_in_folder(folder)
+        deep = _list_wavs_in_folder(folder, recursive=True)
+        wavs = flat
+        if len(deep) > len(flat):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Include subfolders?")
+            box.setText(
+                f"{os.path.basename(folder) or folder} contains "
+                f"{len(flat)} .wav file(s) directly, and {len(deep)} including "
+                "subfolders.")
+            box.setInformativeText("Which do you want to load?")
+            b_deep = box.addButton(f"All {len(deep)} (recursive)",
+                                   QMessageBox.AcceptRole)
+            box.addButton(f"Just these {len(flat)}", QMessageBox.AcceptRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+                return
+            wavs = deep if clicked is b_deep else flat
+        if not wavs:
+            self.status_bar.showMessage(f"No .wav files found in {folder}")
+            return
+        # Browsed in place for this session — files are never copied, and their
+        # labels/predictions save next to the source audio.
         added = self._append_audio_paths(wavs)
         self.status_bar.showMessage(
-            f"Browsing folder in place: {folder} (+{added} wavs, "
-            f"not copied until you accept a call)")
+            f"Loaded {added} wav(s) from {folder} — referenced in place")
 
-    def _append_audio_paths(self, paths, persist_files: bool = False) -> int:
-        """Load wav paths into the session list (in place — never copied into
-        the project). Labels/predictions save next to the source audio. Returns
-        the count added."""
+    def _append_audio_paths(self, paths, persist_files: bool = True) -> int:
+        """Add wav paths to the Audio list (in place — never copied into the
+        project). Labels/predictions save next to the source audio. With a
+        project open the files are also registered in it so they come back next
+        time it's opened; ``persist_files=False`` skips that, for paths opened
+        transiently (e.g. jumping to a batch-run result). Returns the count
+        added."""
         existing = set(self.audio_files)
         to_add = [p for p in paths
                   if p and p not in existing and os.path.isfile(p)]
         if not to_add:
             return 0
         self.audio_files.extend(to_add)
+        if persist_files and self._project is not None:
+            self._register_audio_files(to_add)
         if self.current_file_idx >= len(self.audio_files):
             self.current_file_idx = 0
         self._refresh_file_list()
-        self._active_source = 'session'
-        self._review_mode = 'deploy'
-        self._clear_training_selection()
-        self._deploy_file_idx = None
         self.file_list.blockSignals(True)
         self.file_list.setCurrentRow(self.current_file_idx)
         self.file_list.blockSignals(False)
         self._load_current_file()
         self._update_project_state()
         self._update_scope_labels()
+        self._update_run_button()
         self._sync_list_buttons()  # selection was set with signals blocked
         return len(to_add)
 
@@ -6213,15 +8198,16 @@ class MADMainWindow(QMainWindow):
         self.act_add_folder.setEnabled(True)
         self.act_add_files.setEnabled(True)
         self.act_close_project.setEnabled(True)
+        self.act_locate_missing.setEnabled(True)
+        self.act_pack_project.setEnabled(True)
         self.act_run_training.setEnabled(True)
         self.act_run_inference.setEnabled(True)
         self.act_load_pred.setEnabled(True)
         self.act_clear_pred.setEnabled(True)
-        self._refresh_quick_infer_models()
         self._set_train_sections_enabled(True)
         self._offer_training_store_migration()
         self._refresh_deploy_models()
-        self._rescan_project_wavs()         # loads recordings/ → Training Data
+        self._rescan_project_wavs()         # registered audio → Audio list
         self._apply_latest_training_config()  # prefill train options from last run
         self._update_source_folders_label()
         self._update_model_info_label()
@@ -6286,19 +8272,20 @@ class MADMainWindow(QMainWindow):
         # Add Folder / Add Files stay enabled — loading audio doesn't require
         # a project.
         self.act_close_project.setEnabled(False)
+        self.act_locate_missing.setEnabled(False)
+        self.act_pack_project.setEnabled(False)
         self.act_run_training.setEnabled(False)
         self.act_run_inference.setEnabled(False)
         self.act_load_pred.setEnabled(False)
         self.act_clear_pred.setEnabled(False)
-        self._active_source = 'session'
-        self._review_mode = 'deploy'
+        self._missing_audio = set()
+        self._n_missing_audio = 0
         self._update_run_button()
         self._set_train_sections_enabled(False)
         self.spectrogram.mask = None
         self.spectrogram.set_audio_data(None, None)
         self.waveform_overview.set_audio_data(None, None)
         self._clear_predictions()
-        self._clear_deploy_files()
         self._refresh_deploy_models()
         self._update_project_state()
         self._update_paint_buttons_enabled()
@@ -6323,60 +8310,287 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(msg)
 
     def _rescan_project_wavs(self) -> int:
-        """Load the project's Training Data set — every wav in recordings/ —
-        into the Training Data list. Session audio is loaded separately by the
-        user and is never auto-populated on open."""
+        """Load the project's registered audio into the Audio list.
+
+        Files are referenced by path, so each registered entry is resolved
+        against disk first (see mad_registry.resolve_entries — a moved file is
+        found again by basename + fingerprint in a sibling's directory). Any wav
+        sitting in a legacy ``recordings/`` copy is adopted into the registry as
+        project-owned. Unresolved entries stay in the list as a soft "missing"
+        state: training still works, only preview is unavailable.
+
+        Registration order is preserved rather than sorted, so the list reads the
+        same after a reopen as it did while the user was building it."""
         if self._project is None:
             return 0
+        from fnt.usv.usv_detector.mad_registry import (
+            RegisteredFile, file_fingerprint, resolve_entries)
+
+        entries = self._project.audio_entries()
+        # Adopt legacy recordings/ copies the registry doesn't know about yet.
         rdir = self._project.recordings_dir
-        os.makedirs(rdir, exist_ok=True)
-        existing = {os.path.normpath(p) for p in self.deploy_files}
-        added = 0
-        for w in _list_wavs_in_folder(rdir):
-            if os.path.normpath(w) not in existing:
-                self.deploy_files.append(w)
-                existing.add(os.path.normpath(w))
-                added += 1
-        self.deploy_files.sort(key=lambda p: os.path.basename(p).lower())
-        self._refresh_deploy_queue()
+        known = {os.path.normcase(os.path.abspath(e.path)) for e in entries}
+        adopted = 0
+        if os.path.isdir(rdir):
+            for w in _list_wavs_in_folder(rdir):
+                if os.path.normcase(os.path.abspath(w)) not in known:
+                    entries.append(RegisteredFile.from_path(w, embedded=True))
+                    known.add(os.path.normcase(os.path.abspath(w)))
+                    adopted += 1
+
+        resolved = resolve_entries(
+            entries, extra_roots=list(self._project.source_folders or []))
+        moved = 0
+        for e in entries:
+            found = resolved.get(e.path)
+            if found and os.path.normcase(found) != os.path.normcase(e.path):
+                e.path = found
+                e.basename = os.path.basename(found)
+                moved += 1
+
+        # Backfill the size/fingerprint on entries that predate them (including
+        # ones folded in from an older project's plain-path session list), so a
+        # later move can be resolved by content rather than by name alone.
+        backfilled = 0
+        for e in entries:
+            if e.size or not e.exists():
+                continue
+            try:
+                e.size = os.path.getsize(e.path)
+                e.fingerprint = file_fingerprint(e.path)
+                backfilled += 1
+            except OSError:
+                pass
+
+        self._project.set_audio_entries(entries)
+        if adopted or moved or backfilled:
+            self._project.save()
+
+        self.audio_files = [e.path for e in entries]
+        self.current_file_idx = 0
+        self._missing_audio = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
+        self._refresh_file_list()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(0 if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if self.audio_files:
+            self._load_current_file()
         self._update_train_button_enabled()
         self._update_scope_labels()
         self._update_project_state()
-        return added
+        self._sync_list_buttons()
+        if moved:
+            self._log(f"Relocated {moved} recording(s) automatically")
+        if self._missing_audio:
+            n = len(self._missing_audio)
+            self._log(f"{n} recording(s) missing — "
+                      "File ▸ Locate Missing Recordings…")
+            self.status_bar.showMessage(
+                f"{n} recording(s) could not be found — training and existing "
+                "detections are unaffected; use File ▸ Locate Missing "
+                "Recordings… to restore preview")
+        return len(entries)
+
+    def _is_missing(self, path: str) -> bool:
+        """True when a registered recording's audio can't be found on disk."""
+        return (os.path.normcase(os.path.abspath(path))
+                in getattr(self, '_missing_audio', set()))
+
+    def _locate_missing_recordings(self):
+        """Point the project at one relocated recording, then repoint every
+        sibling that moved with it.
+
+        Recordings move as whole trees, so deducing the prefix change from a
+        single file and applying it in bulk is what keeps referencing cheap —
+        fix one, fix all of them."""
+        if self._project is None:
+            return
+        from fnt.usv.usv_detector.mad_registry import (
+            infer_prefix_change, remap_prefix, resolve_entries)
+        entries = self._project.audio_entries()
+        missing = [e for e in entries if not e.exists()]
+        if not missing:
+            QMessageBox.information(
+                self, "Locate Recordings",
+                "Every recording in this project was found.")
+            return
+        first = missing[0]
+        QMessageBox.information(
+            self, "Locate Recordings",
+            f"{len(missing)} recording(s) are missing.\n\n"
+            f"Pick the new location of:\n    {first.basename}\n\n"
+            "Every other missing file that moved the same way will be "
+            "repointed automatically.")
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, f"Locate {first.basename}",
+            self._default_browse_dir(), "WAV files (*.wav)")
+        if not new_path:
+            return
+        old_path = first.path
+        first.path = os.path.abspath(new_path)
+        first.basename = os.path.basename(new_path)
+        fixed = 1
+        change = infer_prefix_change(old_path, new_path)
+        if change:
+            fixed += remap_prefix(entries, change[0], change[1])
+        # Second pass: anything still missing may live beside a file we just
+        # fixed, so re-run the normal resolver over the updated set.
+        resolved = resolve_entries(
+            entries, extra_roots=list(self._project.source_folders or []))
+        for e in entries:
+            found = resolved.get(e.path)
+            if found and os.path.normcase(found) != os.path.normcase(e.path):
+                e.path = found
+                e.basename = os.path.basename(found)
+                fixed += 1
+        self._project.set_audio_entries(entries)
+        self._project.save()
+        self._sync_list_from_entries(entries)
+        still = len(self._missing_audio)
+        self._log(f"Located {fixed} recording(s); {still} still missing")
+        QMessageBox.information(
+            self, "Locate Recordings",
+            f"Relocated {fixed} recording(s)."
+            + (f"\n\n{still} still missing — run this again to fix another "
+               "group that moved somewhere else." if still else ""))
+
+    def _pack_project(self):
+        """Copy every referenced recording into the project (recordings/).
+
+        The escape hatch for the reference-by-path default: use it to archive a
+        project, hand it to a collaborator, or move it to a machine that can't
+        see the original recording tree. After packing, the project is fully
+        self-contained again and the copies are project-owned."""
+        if self._project is None:
+            return
+        import shutil
+        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        entries = self._project.audio_entries()
+        outside = [e for e in entries if e.exists() and not e.embedded]
+        if not outside:
+            QMessageBox.information(
+                self, "Pack Project",
+                "Every available recording is already stored in the project.")
+            return
+        total_mb = sum(e.size for e in outside) / (1024 * 1024)
+        reply = QMessageBox.question(
+            self, "Pack Project",
+            f"Copy {len(outside)} recording(s) into the project "
+            f"({total_mb:,.0f} MB)?\n\n"
+            "The project becomes fully self-contained — portable to another "
+            "machine or archive — but stops tracking the originals. The source "
+            "files are not modified.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        rdir = self._project.recordings_dir
+        os.makedirs(rdir, exist_ok=True)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        packed = 0
+        try:
+            for e in outside:
+                dest = os.path.join(rdir, e.basename)
+                try:
+                    if os.path.normcase(os.path.abspath(dest)) != \
+                            os.path.normcase(os.path.abspath(e.path)):
+                        shutil.copy2(e.path, dest)
+                        for src_side, dst_side in (
+                            (pred_csv_sibling_path(e.path),
+                             pred_csv_sibling_path(dest)),
+                            (masks_sibling_path(e.path),
+                             masks_sibling_path(dest)),
+                        ):
+                            if os.path.isfile(src_side):
+                                shutil.copy2(src_side, dst_side)
+                    e.path = os.path.abspath(dest)
+                    e.embedded = True
+                    packed += 1
+                except Exception as ex:
+                    self._log(f"pack failed ({e.basename}): {ex}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._project.set_audio_entries(entries)
+        self._project.save()
+        self._sync_list_from_entries(entries)
+        self._log(f"Packed {packed} recording(s) into the project")
+        QMessageBox.information(
+            self, "Pack Project",
+            f"Copied {packed} recording(s) into:\n{rdir}")
+
+    def _sync_list_from_entries(self, entries):
+        """Re-point the Audio list at ``entries`` after their paths changed
+        (Locate Missing Recordings, Pack Project), keeping the previewed file
+        selected where it survived the move."""
+        current = (self.audio_files[self.current_file_idx]
+                   if 0 <= self.current_file_idx < len(self.audio_files)
+                   else None)
+        self.audio_files = [e.path for e in entries]
+        self._missing_audio = {
+            os.path.normcase(os.path.abspath(e.path))
+            for e in entries if not e.exists()}
+        if current in self.audio_files:
+            self.current_file_idx = self.audio_files.index(current)
+        else:
+            self.current_file_idx = min(self.current_file_idx,
+                                        max(0, len(self.audio_files) - 1))
+        self._refresh_file_list()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(
+            self.current_file_idx if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        self._update_project_state()
+        self._update_scope_labels()
+        self._update_run_button()
 
     def _refresh_file_list(self):
+        """Rebuild the Audio list. Rows whose audio can't be found are flagged
+        ⚠ rather than dropped: that state is soft — labels, training and saved
+        detections are all fine, only preview and playback need the wav."""
         self.file_list.blockSignals(True)
         self.file_list.clear()
+        n_missing = 0
         for fp in self.audio_files:
             item = QListWidgetItem(os.path.basename(fp))
             item.setData(Qt.UserRole, fp)
-            item.setToolTip(fp)
+            if self._is_missing(fp):
+                n_missing += 1
+                item.setText(f"⚠  {os.path.basename(fp)}")
+                item.setForeground(QColor(180, 150, 90))
+                item.setToolTip(
+                    f"Recording not found at:\n{fp}\n\nTraining examples and "
+                    "detections for this file are safe — only preview and "
+                    "playback need the audio. Use File ▸ Locate Missing "
+                    "Recordings… to repoint it.")
+            else:
+                item.setToolTip(fp)
             self.file_list.addItem(item)
         self.file_list.blockSignals(False)
+        self._n_missing_audio = n_missing
         self._scan_all_file_counts()
 
     def _scan_all_file_counts(self):
-        """Populate ``_file_count_cache`` with the total mask count per session
-        file — every call in the unified CSV, regardless of source or status —
-        via the shared :meth:`_file_call_count` (same number the Training Data
-        list shows). One cheap sibling read per file; the multi-GB probability
-        grid is never touched. Call on project open / file-list rebuild, NOT on
-        file switch.
+        """Populate ``_file_count_cache`` with the (accepted, pending, rejected)
+        breakdown per file, via the shared :meth:`_csv_status_counts`. One cheap
+        sibling read per file; the multi-GB probability grid is never touched.
+        Call on project open / file-list rebuild, NOT on file switch.
         """
-        cache: Dict[str, int] = {}
+        cache: Dict[str, tuple] = {}
         for fp in self.audio_files:
-            cnt = self._file_call_count(fp)
-            if cnt:
-                cache[os.path.basename(fp)] = cnt
+            counts = self._csv_status_counts(fp)
+            if any(counts):
+                cache[os.path.basename(fp)] = counts
         self._file_count_cache = cache
         self._update_file_list_counts(sync_current=False)
 
     def _update_file_list_counts(self, sync_current: bool = True):
-        """Refresh the file-list labels from the cached counts (fast).
+        """Refresh the file-list labels from the cached (accepted, pending,
+        rejected) counts (fast).
 
         With ``sync_current`` (the default, used after a file is loaded or its
         calls are edited), the *currently displayed* file's entry is reconciled
-        with the live in-memory annotation count so edits show immediately.
+        with the live in-memory annotation breakdown so edits show immediately.
         The scan passes ``sync_current=False`` so it renders purely from the
         stored counts and never clobbers a not-yet-loaded current file.
         """
@@ -6384,42 +8598,35 @@ class MADMainWindow(QMainWindow):
             return
         if not hasattr(self, '_file_count_cache'):
             self._file_count_cache = {}
-        # Reconcile the current file only once its annotations are loaded, and
-        # only when the session list owns the preview (else the in-memory
-        # annotations belong to a Training Data file, not this list).
+        # Reconcile the current file only once its annotations are loaded.
         if (sync_current and hasattr(self, 'spectrogram')
-                and self._active_source == 'session'
-                and self.audio_files and self.audio_data is not None):
+                and self.audio_files and self.audio_data is not None
+                and 0 <= self.current_file_idx < len(self.audio_files)):
             cur_wav = os.path.basename(
                 self.audio_files[self.current_file_idx])
-            n_mem = len(self.spectrogram.annotations)
-            if n_mem > 0:
-                self._file_count_cache[cur_wav] = n_mem
+            counts = self._mem_status_counts()
+            if any(counts):
+                self._file_count_cache[cur_wav] = counts
             elif cur_wav in self._file_count_cache:
                 del self._file_count_cache[cur_wav]
         self.file_list.blockSignals(True)
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
             fp = item.data(Qt.UserRole)
+            if self._is_missing(fp):
+                continue  # ⚠ row — leave the missing marker in place
             bn = os.path.basename(fp)
-            n = self._file_count_cache.get(bn, 0)
-            if n > 0:
-                item.setText(f"{bn}  ({n})")
-            else:
-                item.setText(bn)
+            self._apply_file_row(item, bn, self._file_count_cache.get(bn))
         self.file_list.blockSignals(False)
 
     def _set_train_sections_enabled(self, enabled: bool):
-        # Only the Training Data list is gated on a project (it lives in the
-        # project folder). The Model section stays enabled so a user can Load
-        # Project Models from any trained project and run inference on session
-        # audio with NO project open. Labeling Tools + Detections stay enabled
-        # too. The single action button's own logic disables training when
-        # there's no project/labels (see _update_run_button).
-        for attr in ('_grp_training_list',):
-            grp = getattr(self, attr, None)
-            if grp is not None:
-                grp.setEnabled(enabled)
+        # Nothing in the left column is gated on a project any more. MAD is
+        # usable standalone: add audio, label it, load a model from any trained
+        # project, run inference and review — all with no project open. Only
+        # *training* needs somewhere to save, and the action button's own logic
+        # handles that (see _update_run_button). Kept as a no-op so the
+        # open/close-project paths don't need special-casing.
+        return
 
     def _set_train_config_enabled(self, enabled: bool):
         """Enable/disable the training-config controls while a run is active, so
@@ -6427,7 +8634,8 @@ class MADMainWindow(QMainWindow):
         left enabled — during a run it doubles as 'show graph'."""
         for name in ('combo_arch', 'combo_train_encoder', 'spin_train_epochs',
                      'spin_train_patience', 'spin_train_batch', 'spin_train_lr',
-                     'spin_train_val', 'combo_train_device'):
+                     'spin_train_val', 'combo_train_loss', 'chk_train_augment',
+                     'combo_train_device'):
             w = getattr(self, name, None)
             if w is not None:
                 w.setEnabled(enabled)
@@ -6444,28 +8652,27 @@ class MADMainWindow(QMainWindow):
         self.lbl_file_num.setText(
             f"File {self.current_file_idx + 1}/{n}" if n else "File 0/0"
         )
+        n_missing = getattr(self, '_n_missing_audio', 0)
         if n == 0:
-            self.lbl_data_summary.setText("No files loaded — add files or a folder")
+            self.lbl_data_summary.setText("No files — add files or a folder")
         else:
-            self.lbl_data_summary.setText(f"{n} file(s) loaded")
+            label = f"{n} file(s)"
+            if self._project is None:
+                label += " (session only — no project open)"
+            if n_missing:
+                label += f" — {n_missing} missing"
+            self.lbl_data_summary.setText(label)
 
     def _on_file_selected(self, row: int):
         if 0 <= row < len(self.audio_files):
-            # Session list now owns the single preview — drop any Training Data
-            # selection and switch review mode (session = CSV-only accept).
-            switching = (self._active_source != 'session' or
-                         row != self.current_file_idx)
-            self._active_source = 'session'
-            self._review_mode = 'deploy'
-            self._clear_training_selection()
-            self._deploy_file_idx = None
-            if switching:
-                self._dismiss_training_view()
-                self._auto_save_mask_if_dirty()
-                self.current_file_idx = row
-                self._load_current_file()
-                self._update_project_state()
-                self._update_review_buttons_for_source()
+            if row == self.current_file_idx and self.audio_data is not None:
+                return
+            self._dismiss_training_view()
+            self._auto_save_mask_if_dirty()
+            self.current_file_idx = row
+            self._load_current_file()
+            self._update_project_state()
+            self._update_review_buttons_for_source()
 
     def _prev_file(self):
         if self.current_file_idx > 0:
@@ -6476,23 +8683,105 @@ class MADMainWindow(QMainWindow):
             self.file_list.setCurrentRow(self.current_file_idx + 1)
 
     def _remove_selected_files(self):
-        """Unload the selected files from the session list. Nothing is deleted
-        from disk — the .wav and any sibling csv/h5 stay where they are."""
+        """Drop the selected recordings from the Audio list (and the project).
+
+        Referenced audio is only unregistered; nothing is deleted from disk. The
+        exception is project-owned audio — a legacy ``recordings/`` copy or one
+        made by Pack Project — which is deleted, and the prompt says so rather
+        than leaving orphaned copies inside the project."""
         sel = self.file_list.selectedItems()
         if not sel:
             return
         rows = sorted({self.file_list.row(item) for item in sel}, reverse=True)
-        removed_paths = [self.audio_files[r] for r in rows]
-        self._remove_files_by_path(removed_paths)
+        victims = [self.audio_files[r] for r in rows
+                   if 0 <= r < len(self.audio_files)]
+        if not victims:
+            return
+        owned = []
+        if self._project is not None:
+            by_path = {os.path.normcase(os.path.abspath(e.path)): e
+                       for e in self._project.audio_entries()}
+            owned = [v for v in victims
+                     if getattr(by_path.get(os.path.normcase(os.path.abspath(v))),
+                                'embedded', False)]
+        if not owned:
+            # Nothing leaves the disk — no need to interrupt the user for it.
+            self._remove_files_by_path(victims)
+            return
+        names = "\n".join(f"   • {os.path.basename(v)}" for v in victims[:10])
+        reply = QMessageBox.question(
+            self, "Remove from project",
+            f"Remove {len(victims)} recording(s) from this project?\n\n"
+            f"{names}\n\n"
+            f"{len(owned)} of these are stored inside the project and WILL be "
+            "deleted from disk (wav + csv/h5). The rest are only unregistered — "
+            "their files stay where they are.\n\nConfirmed calls already saved "
+            "as training examples are kept; remove those from the Detections "
+            "list instead.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._remove_files_by_path(victims, delete_embedded=True)
+
+    def _clear_review_canvas(self):
+        """Blank the preview and every piece of per-file review state.
+
+        Used when the selected recording cannot be opened. Leaving the previous
+        file's audio, annotations and undo history on screen while
+        current_file_idx already points elsewhere is what allowed a review
+        decision to be written against the wrong recording: _active_wav_path()
+        follows the index, so Accept wrote the old file's call into the new
+        file's CSV and stamped a training example with the wrong source_wav.
+
+        Showing nothing is the honest state. The Audio list still marks the row
+        with a warning, and File > Locate Missing Recordings can repoint it.
+        """
+        sg = self.spectrogram
+        self._stop_playback()
+        self.audio_data = None
+        self.sample_rate = None
+        self._loaded_wav_path = None
+        sg.set_predicted_mask(None)
+        sg.mask = None
+        sg.set_annotations([])
+        sg._selected_ann_idx = None
+        sg._selected_set = set()
+        sg.set_audio_data(None, None)
+        self.waveform_overview.set_audio_data(None, None)
+        # Per-file state that would otherwise still describe the file we left.
+        # The undo stack matters most: its snapshots restore annotations AND
+        # rewrite the sibling CSV, and _active_review_wav_path() would resolve
+        # to the recording we could not open.
+        self._undo_stack = []
+        self._reviewed_count = 0
+        self._pred_review_idx = None
+        self._bump_review_token()
+        self._refresh_annotation_list()
+        self._update_pred_review_widgets()
+        self._update_paint_buttons_enabled()
+        self._update_playback_buttons_enabled()
 
     def _load_current_file(self):
         if not self.audio_files or self.current_file_idx >= len(self.audio_files):
+            return
+        filepath = self.audio_files[self.current_file_idx]
+        if not os.path.isfile(filepath):
+            # Referenced recording moved. Clear the canvas rather than leaving
+            # the previous file's detections on screen under this file's name —
+            # see _clear_review_canvas. Nothing else about the project is
+            # broken by this, and the ⚠ row already flags it.
+            name = os.path.basename(filepath)
+            self._clear_review_canvas()
+            self.lbl_mask_status.setText(f"{name} not found")
+            self.status_bar.showMessage(
+                f"{name} not found — File ▸ Locate Missing Recordings… to "
+                "repoint it")
+            self._log(f"Cannot open {name} — recording not found")
             return
         self._stop_playback()
         # Wipe any prediction overlay from the previous file — a new
         # file's predictions must be explicitly reloaded.
         self._clear_predictions()
-        filepath = self.audio_files[self.current_file_idx]
         self.status_bar.showMessage(f"Loading {os.path.basename(filepath)}…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
@@ -6518,6 +8807,9 @@ class MADMainWindow(QMainWindow):
                 self.spectrogram.view_start, self.spectrogram.view_end
             )
             self._init_or_load_mask_for_current_file()
+            # In-memory annotations now belong to this file — record it so the
+            # session-list count reads them live rather than the prior file's.
+            self._loaded_wav_path = filepath
             self._sync_scrollbar_from_view()
             if self._project is not None:
                 self._project.last_opened_file = filepath
@@ -6526,11 +8818,11 @@ class MADMainWindow(QMainWindow):
                 except Exception:
                     pass
             self.status_bar.showMessage(
-                f"Session — {os.path.basename(filepath)}  |  "
+                f"{os.path.basename(filepath)}  |  "
                 f"{len(self.audio_data) / self.sample_rate:.2f}s @ "
                 f"{self.sample_rate} Hz"
             )
-            self._log(f"Open session file {self.current_file_idx + 1}/"
+            self._log(f"Open file {self.current_file_idx + 1}/"
                       f"{len(self.audio_files)}: {os.path.basename(filepath)}")
         except Exception as e:
             QMessageBox.warning(
@@ -6547,20 +8839,37 @@ class MADMainWindow(QMainWindow):
 
     def _init_or_load_mask_for_current_file(self):
         """Initialize the spec-pixel grid, then rebuild the confirmed mask for
-        this file from the saved example store and/or per-wav h5 sibling."""
+        this file from the saved example store and/or per-wav h5 sibling.
+
+        The grid comes from the params recorded in the sibling h5 when it has
+        them — those are exactly what any stored predictions/labels were computed
+        on, so reusing them is what makes the masks land on the right pixels.
+        Files with no h5 yet fall back to the project's (or default) params."""
         if self.audio_data is None or self.sample_rate is None:
             return
+        wav_path = self.audio_files[self.current_file_idx]
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, get_grid_attrs,
+        )
+        try:
+            grid = get_grid_attrs(masks_sibling_path(wav_path)) or {}
+        except Exception:
+            grid = {}
         sp = self._spec_params()
         self.spectrogram.init_mask(
             audio_len=len(self.audio_data),
             sample_rate=self.sample_rate,
-            nperseg=sp['nperseg'], noverlap=sp['noverlap'], nfft=sp['nfft'],
+            nperseg=int(grid.get('nperseg', sp['nperseg'])),
+            noverlap=int(grid.get('noverlap', sp['noverlap'])),
+            nfft=int(grid.get('nfft', sp['nfft'])),
         )
-        wav_path = self.audio_files[self.current_file_idx]
         wav_name = os.path.basename(wav_path)
         grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
         anns = self._load_confirmed_annotations(wav_path, grid)
         self.spectrogram.set_annotations(anns)
+        # New annotation objects with new ids: anything holding the old ones
+        # (an open gallery) is now stale.
+        self._bump_review_token()
         # _load_predictions_as_annotations refreshes the list itself when it adds
         # predictions (returns an int); it returns None on its early-out paths
         # (no predictions) without refreshing — only then do we refresh here, so
@@ -6587,7 +8896,7 @@ class MADMainWindow(QMainWindow):
     def _load_confirmed_annotations(self, wav_path, grid):
         """Confirmed (human-labeled) annotations for ``wav_path`` — from the
         project store (by source wav) plus the per-wav h5 sibling — de-duped by
-        id. Shared by the session and Training-Data preview load paths."""
+        id."""
         from fnt.usv.usv_detector.mad_examples import iter_file_annotations
         wav_name = os.path.basename(wav_path)
         anns = []
@@ -6681,6 +8990,9 @@ class MADMainWindow(QMainWindow):
         else:
             self.lbl_mask_status.setText(
                 "No pending masks — paint or SAM, then Enter to confirm")
+        # Reflect the drawn (not-yet-confirmed) masks as yellow pending rows in
+        # the detections list.
+        self._refresh_annotation_list()
 
     def _on_stroke_committed(self):
         # A brush stroke just ended; nothing is persisted until the user
@@ -6695,7 +9007,6 @@ class MADMainWindow(QMainWindow):
         for btn in (self.btn_paint, self.btn_erase, self.btn_clear_mask,
                     self.btn_sam, self.btn_sam_model, self.btn_undo):
             btn.setEnabled(has_audio)
-        self.spin_brush_radius.setEnabled(has_audio)
         if not has_audio:
             self.btn_paint.setChecked(False)
             self.btn_erase.setChecked(False)
@@ -7065,13 +9376,18 @@ class MADMainWindow(QMainWindow):
             "choose a project directory."
         )
 
-    def _save_component_example(self, class_name: str, comp) -> str:
+    def _save_component_example(self, class_name: str, comp,
+                                blob_id=None) -> str:
         """Save one connected-component mask as a self-contained example.
         ``comp`` is ``(f0, f1, t0, t1, local_bool)``. Returns the example id.
 
         With a project: saves to ``training_data.h5`` (consolidated store).
         Without: saves to the per-wav ``_FNT_masks.h5`` sibling so labels
         survive across sessions without a project.
+
+        ``blob_id`` is the detection row this example came from, when it came
+        from accepting a prediction. Storing it lets the reviewer recognize the
+        CSV row as already on screen instead of drawing the call a second time.
         """
         from datetime import datetime
         from scipy import signal as _signal
@@ -7081,10 +9397,16 @@ class MADMainWindow(QMainWindow):
         cfg = self._project
         sp = self._spec_params()
         f0, f1, t0, t1, local = comp
+        # Take the grid from the canvas, not the project config: the loaded file
+        # may be rendered on the params recorded in its own h5 (see
+        # _init_or_load_mask_for_current_file). Reading nperseg from the config
+        # while hop comes from the canvas would stamp the example with metadata
+        # that doesn't describe the patch it holds.
         hop = sg.hop
-        nperseg = sp['nperseg']
-        nfft = sp['nfft']
-        noverlap_val = sp['noverlap']
+        nperseg = sg.nperseg if sg.nperseg is not None else sp['nperseg']
+        nfft = sg.nfft if sg.nfft is not None else sp['nfft']
+        noverlap_val = (sg.noverlap if sg.noverlap is not None
+                        else sp['noverlap'])
         n_time, n_freq = sg.n_time_frames, sg.n_freq_bins
         sr = self.sample_rate
         margin = 64
@@ -7113,6 +9435,7 @@ class MADMainWindow(QMainWindow):
 
         df = (sr / 2.0) / (nfft // 2)
         dt = hop / float(sr)
+        t_org = self._frame_time_origin_s()
         # Full per-call quantification over the labeled pixels — uses the SAME
         # shared function as the prediction path so label/prediction rows are
         # directly comparable in the unified CSV.
@@ -7139,8 +9462,10 @@ class MADMainWindow(QMainWindow):
             'class': class_name,
             'source_wav': wav_name,
             'patch_t_off': int(pt0), 'patch_f_off': 0,
-            't_start_s': round(t0 * dt, 6), 't_stop_s': round(t1 * dt, 6),
-            'patch_t0_s': round(pt0 * dt, 6), 'patch_t1_s': round(pt1 * dt, 6),
+            't_start_s': round(t_org + t0 * dt, 6),
+            't_stop_s': round(t_org + t1 * dt, 6),
+            'patch_t0_s': round(t_org + pt0 * dt, 6),
+            'patch_t1_s': round(t_org + pt1 * dt, 6),
             'f_low_hz': round(f0 * df, 2), 'f_high_hz': round(f1 * df, 2),
             'patch_t_frames': int(W), 'f_bins': int(n_freq),
             'nperseg': nperseg, 'noverlap': noverlap_val, 'nfft': nfft,
@@ -7148,10 +9473,11 @@ class MADMainWindow(QMainWindow):
             'db_min': sp['db_min'], 'db_max': sp['db_max'],
             'created': datetime.now().isoformat(timespec='seconds'),
         }
-        # Labels always save to the sibling h5 next to the active file (session
-        # source or training copy). The project's consolidated training_data.h5
-        # is rebuilt from the Training Data list at train time, so a file only
-        # trains the model once it's been copied into Training Data.
+        if blob_id is not None:
+            meta['blob_id'] = blob_id
+        # Labels always save to the sibling h5 next to the recording — one
+        # source of truth per wav, project or not. The project's consolidated
+        # training_data.h5 is rebuilt from the Audio list at train time.
         import uuid
         from fnt.usv.usv_detector.fnt_mask_store import (
             masks_sibling_path, set_grid_attrs, td_save_example,
@@ -7174,6 +9500,7 @@ class MADMainWindow(QMainWindow):
             sg.clear_pending()
             sg.clear_sam_prompts()
             self.status_bar.showMessage("Pending masks cleared")
+            self._refresh_annotation_list()  # drop the yellow pending rows
 
     # --- undo / context menu / shape-edit (Phases D-F) ----------------
     def _undo_last(self):
@@ -7341,26 +9668,42 @@ class MADMainWindow(QMainWindow):
                     self._delete_annotation(i, refresh=False)
                     n_done += 1
         else:
-            # Process high→low so earlier removals don't shift later indices.
-            for i in sorted(idxs, reverse=True):
-                if not (0 <= i < len(sg.annotations)):
-                    continue
-                ann = sg.annotations[i]
-                is_pred = ann.get('status') == 'prediction'
-                if action == 'accept':
-                    if is_pred:
-                        if self._review_mode == 'deploy':
-                            self._write_pred_csv_status(ann, 'accepted')
-                            ann['status'] = 'accepted'  # keep visible (blue)
-                        else:
-                            self._accept_prediction(i)
-                        n_done += 1
-                elif action == 'reject':
-                    if is_pred:
-                        # Recorded decision: keep visible (red), persist it.
-                        self._write_pred_csv_status(ann, 'rejected')
-                        ann['status'] = 'rejected'
-                        n_done += 1
+            # Collect the targets, then persist every decision in ONE CSV write.
+            # Writing per item (and rebuilding the detection tree per item via
+            # _accept_prediction) made box review quadratic in the file's call
+            # count.
+            status = 'accepted' if action == 'accept' else 'rejected'
+            targets = [sg.annotations[i] for i in sorted(idxs)
+                       if 0 <= i < len(sg.annotations)
+                       and sg.annotations[i].get('status') == 'prediction']
+            if (action == 'accept'
+                    and (self.audio_data is None
+                         or self._active_wav_path() is None)):
+                targets = []          # can't save examples without a loaded file
+            elif action == 'accept':
+                # Each accepted call also becomes a training example.
+                cls_default = ((self._project.last_class if self._project
+                                else self._session_last_class) or 'USV')
+                done = []
+                for ann in targets:
+                    comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'],
+                            ann['mask'])
+                    try:
+                        ex_id = self._save_component_example(
+                            ann.get('category') or cls_default, comp,
+                            blob_id=ann.get('blob_id'))
+                        ann['status'] = 'accepted'
+                        ann['id'] = ex_id
+                        done.append(ann)
+                    except Exception:
+                        continue
+                targets = done
+            else:
+                for ann in targets:
+                    ann['status'] = status
+            self._batch_write_pred_csv_status(targets, status)
+            n_done = len(targets)
+            sg._rebuild_confirmed_mask()
         self._box_sel_ids = []
         sg._selected_set = set()
         sg._selected_ann_idx = None
@@ -7428,7 +9771,7 @@ class MADMainWindow(QMainWindow):
 
     def _active_review_wav_path(self) -> Optional[str]:
         """The wav whose sibling stores hold the currently-reviewed detections —
-        the file owning the preview (session or Training Data)."""
+        the file owning the preview."""
         return self._active_wav_path()
 
     def _delete_pred_crop(self, ann: dict):
@@ -7450,6 +9793,10 @@ class MADMainWindow(QMainWindow):
         ann = sg.remove_annotation(ann_idx)
         if ann:
             aid = ann.get('id', '')
+            # Hand the training example to the active undo snapshot before it
+            # is destroyed. This path deletes from the store directly rather
+            # than via _purge_training_example, so it needs its own hook.
+            self._remember_undo_example(aid)
             if self._project is not None:
                 from fnt.usv.usv_detector.mad_examples import delete_example
                 try:
@@ -7525,14 +9872,8 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.clear_pending()
         self.spectrogram.clear_sam_prompts()
         self.lbl_mask_status.setText("Pending mask cleared")
+        self._refresh_annotation_list()  # drop the yellow pending rows
         self._log("Cleared pending mask(s)")
-
-    def _on_brush_radius_scrolled(self, value: int):
-        # Reflect a wheel-driven radius change in the spin box without
-        # re-triggering set_brush_radius (the widget already applied it).
-        self.spin_brush_radius.blockSignals(True)
-        self.spin_brush_radius.setValue(value)
-        self.spin_brush_radius.blockSignals(False)
 
     # ==================================================================
     # Spectrogram view controls
@@ -7556,12 +9897,27 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.max_freq = self.spin_display_max_freq.value()
         self._invalidate_spec_cache()
 
-    def _on_colormap_changed(self, name: str):
+    def _on_colormap_changed(self, _index: int = 0):
+        name = self.combo_colormap.currentData() or 'viridis'
         self.spectrogram.set_colormap(name)
+        # The overlay palette is derived from the colormap, so every surface
+        # that paints review colors has to be repainted with the new one.
+        self._update_legend()
+        self._refresh_annotation_list()
+        self._update_overview_marks()
+        lst = getattr(self, 'file_list', None)
+        if lst is not None:
+            lst.viewport().update()
 
     def _on_wheel_zoom(self, factor: float, center_time: float):
         if self.spectrogram.total_duration <= 0:
             return
+        # Anchor the zoom on the center of the current view (the current time
+        # point) rather than the mouse position. This keeps the wheel zoom
+        # stationary: scrolling in and out cyclically returns to the same view
+        # instead of drifting sideways. Panning is done with the arrow keys or
+        # scroll bar, not the wheel.
+        center_time = (self.spectrogram.view_start + self.spectrogram.view_end) / 2
         new_window = max(0.1, min(300.0, self.spin_view_window.value() * factor))
         self.spin_view_window.blockSignals(True)
         self.spin_view_window.setValue(new_window)
@@ -7710,11 +10066,25 @@ class MADMainWindow(QMainWindow):
                 return
             from scipy import signal
             segment = signal.resample(segment, n_output_samples).astype(np.float32)
+            import time as _time
             sd.play(segment, output_sr)
+            # Record the wall-clock start as close to sd.play() as possible so
+            # the playhead math isn't skewed by unrelated work below.
+            self._playback_start_time = _time.time()
+            # Compensate the playhead for the *actual* output latency (the gap
+            # between sd.play() and sound leaving the device) rather than a fixed
+            # 0.15 s guess, so the moving line stays in sync with what's heard.
+            try:
+                stream = sd.get_stream()
+                lat = getattr(stream, 'latency', None) if stream is not None else None
+                if isinstance(lat, (tuple, list)):
+                    lat = lat[-1]  # output latency of the (in, out) pair
+                if lat:
+                    self._playback_latency = float(lat)
+            except Exception:
+                pass
             self.is_playing = True
             self.btn_play.setText("Stop (Space)")
-            import time as _time
-            self._playback_start_time = _time.time()
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
@@ -7858,6 +10228,10 @@ class MADMainWindow(QMainWindow):
                 progress.set_main(metrics.get('file_i', 0),
                                   max(1, metrics.get('file_n', 1)))
                 progress.set_sub(0, 1)
+            elif status == 'split':
+                for line in _split_report(metrics):
+                    progress.append(line)
+                    self._log(line)
             elif status == 'batch':
                 bi = metrics.get('batch_i', 0)
                 bn = max(1, metrics.get('batches_per_epoch', 1))
@@ -7882,13 +10256,22 @@ class MADMainWindow(QMainWindow):
                     f"  epoch {epoch}: "
                     f"train={metrics.get('train_loss', 0):.4f} "
                     f"val={metrics.get('val_loss', 0):.4f} "
-                    f"dice={metrics.get('val_dice', 0):.3f}"
+                    f"dice={metrics.get('val_dice', 0):.3f} "
+                    f"prec={metrics.get('val_precision', 0):.3f} "
+                    f"rec={metrics.get('val_recall', 0):.3f}"
                 )
                 progress.plot_epoch(
                     metrics.get('global_batch', 0),
                     metrics.get('train_loss', float('nan')),
                     metrics.get('val_loss', float('nan')),
                 )
+            elif status == 'epoch_preview':
+                if self._preview_dialog is not None:
+                    self._preview_dialog.add_page(
+                        metrics.get('epoch', epoch),
+                        metrics.get('val_dice'),
+                        metrics.get('tiles', []),
+                    )
             elif status == 'early_stop':
                 progress.append(
                     f"  Early stop at epoch {epoch} — best_val_loss="
@@ -7903,10 +10286,17 @@ class MADMainWindow(QMainWindow):
                     "\nEarly stopped — val_loss plateaued for "
                     f"{cfg.early_stop_patience} epoch(s)."
                 )
+            dice = summary.get('best_val_dice')
+            dice_str = f"{dice:.3f}" if isinstance(dice, (int, float)) else "?"
             progress.append(
-                f"\nFinished. best_val_loss={summary.get('best_val_loss', 0):.4f}\n"
+                f"\nFinished. best_val_loss={summary.get('best_val_loss', 0):.4f}"
+                f"  val_dice={dice_str}\n"
                 f"Model: {summary.get('model_path')}"
             )
+            # Repeat the split caveat next to the final score, not just at the
+            # top of a long log the user has already scrolled past.
+            for line in _split_report(summary):
+                progress.append(line)
             progress.mark_done(ok=True)
             self.status_bar.showMessage(
                 f"Training complete — {summary.get('model_path')}"
@@ -7914,7 +10304,8 @@ class MADMainWindow(QMainWindow):
             self._log(
                 f"Train DONE — best_val_loss="
                 f"{summary.get('best_val_loss', 0):.4f}, "
-                f"epochs={summary.get('n_epochs_run', '?')}, "
+                f"val_dice={dice_str} ({summary.get('split_level', '?')}-level "
+                f"split), epochs={summary.get('n_epochs_run', '?')}, "
                 f"model={Path(str(summary.get('model_path', ''))).parent.name}"
             )
             if self._project is not None:
@@ -7932,8 +10323,14 @@ class MADMainWindow(QMainWindow):
                             'path': mpath,
                             'date': _dt.now().isoformat(timespec='seconds'),
                             'best_val_loss': summary.get('best_val_loss'),
+                            'best_val_dice': summary.get('best_val_dice'),
                             'n_train_tiles': summary.get('n_train_tiles'),
                             'n_val_tiles': summary.get('n_val_tiles'),
+                            # Recorded per model so the picker can say what a
+                            # stored val score actually measured.
+                            'split_level': summary.get('split_level'),
+                            'val_held_out': summary.get('val_held_out'),
+                            'n_val_groups': summary.get('n_val_groups'),
                         })
                         self._project.models = models
                         try:
@@ -7970,12 +10367,10 @@ class MADMainWindow(QMainWindow):
         if self._project is None:
             QMessageBox.information(self, "No project", "Open a MAD project first.")
             return
-        files = list(self.audio_files) + [
-            f for f in self.deploy_files if f not in self.audio_files]
+        files = list(self.audio_files)
         if not files:
             QMessageBox.warning(
-                self, "No files",
-                "Load session audio or add Training Data files first.")
+                self, "No files", "Add audio to the project first.")
             return
         current = self._active_wav_path()
         default_model = None
@@ -8013,11 +10408,12 @@ class MADMainWindow(QMainWindow):
             model_path=model_path,
             threshold=self.spin_infer_threshold.value(),
             min_blob_pixels=self.spin_infer_min_blob.value(),
-            device=self.combo_infer_device.currentText(),
+            device=self._device_value(self.combo_infer_device),
             save_blob_csv=True,
-            preserve_labels=self.chk_infer_preserve.isChecked(),
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
             training_data_dir=(self._project.training_data_dir
                                if self._project else ""),
+            **self._infer_perf_kwargs(),
         )
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()
@@ -8037,21 +10433,108 @@ class MADMainWindow(QMainWindow):
                 candidates.append(w)
         return candidates[-1] if candidates else None
 
-    def _quick_inference_current_file(self):
-        """Run inference on the visible view using the selected model.
-        Mapped to the I key. Produces in-memory predictions only."""
-        if self._project is None:
-            self.status_bar.showMessage(
-                "Open a project first to run inference")
+    def _log_model_info_for_q(self, model_path: str,
+                              threshold: float, min_blob: int):
+        """Log the selected model's training summary + the spec params this
+        inference actually uses, so subpar masks can be diagnosed — most often a
+        train-vs-inference spectrogram mismatch. Logged once per model per
+        session (the block stays in the copyable log for later Q presses)."""
+        if getattr(self, '_q_info_logged_for', None) == model_path:
             return
-        model = (self.combo_quick_infer_model.currentData()
-                 if hasattr(self, 'combo_quick_infer_model')
-                 and self.combo_quick_infer_model.count() > 0
-                 else self._latest_model_path())
+        self._q_info_logged_for = model_path
+        import json
+        run = os.path.basename(os.path.dirname(model_path))
+        summ_path = os.path.join(os.path.dirname(model_path),
+                                 'training_summary.json')
+        summ, cfg = {}, {}
+        if os.path.isfile(summ_path):
+            try:
+                with open(summ_path) as f:
+                    summ = json.load(f) or {}
+                cfg = summ.get('config', {}) or {}
+            except Exception:
+                pass
+        self._log(f"── Quick-inference model: {run} ──")
+        if cfg:
+            hist = summ.get('history') or []
+            last = hist[-1] if hist else {}
+            self._log(
+                f"   arch={cfg.get('model_arch')} encoder={cfg.get('encoder_name')}"
+                f" weights={cfg.get('encoder_weights')}")
+            self._log(
+                f"   tiles: train={summ.get('n_train_tiles','?')} "
+                f"val={summ.get('n_val_tiles','?')}   "
+                f"epochs_run={summ.get('n_epochs_run','?')}/{cfg.get('n_epochs','?')}"
+                f"{'  (early-stopped)' if summ.get('early_stopped') else ''}")
+            def _f(x):
+                try:
+                    return f"{float(x):.4f}"
+                except (TypeError, ValueError):
+                    return str(x)
+            self._log(
+                f"   best_val_loss={_f(summ.get('best_val_loss'))} "
+                f"@epoch {summ.get('best_epoch','?')}  "
+                f"final val_loss={_f(last.get('val_loss'))}")
+            # Best-checkpoint validation quality (the deployed weights).
+            bd = summ.get('best_val_dice', last.get('val_dice'))
+            bp = summ.get('best_val_precision', last.get('val_precision'))
+            br = summ.get('best_val_recall', last.get('val_recall'))
+            self._log(
+                f"   best-ckpt val: dice={_f(bd)} precision={_f(bp)} "
+                f"recall={_f(br)}")
+            sweep = summ.get('best_val_dice_sweep')
+            if isinstance(sweep, dict) and sweep:
+                sw = "  ".join(f"{k}:{_f(v)}" for k, v in sweep.items())
+                self._log(f"   Dice vs threshold: {sw}   "
+                          f"(best≈{summ.get('best_threshold','?')})")
+            pf = summ.get('val_pos_frac')
+            if pf is not None:
+                self._log(f"   label sparsity: {_f(pf)} of supervised pixels "
+                          f"are call (mask foreground)")
+            loss_name = cfg.get('loss', 'bce_dice')
+            aug = "on" if cfg.get('augment') else "off"
+            extra = ""
+            if loss_name == 'focal_tversky':
+                extra = (f" (a={cfg.get('tversky_alpha')} b={cfg.get('tversky_beta')} "
+                         f"g={cfg.get('tversky_gamma')})")
+            self._log(
+                f"   loss={loss_name}{extra}  augment={aug}")
+            self._log(
+                f"   lr={cfg.get('learning_rate')} batch={cfg.get('batch_size')} "
+                f"val_frac={cfg.get('val_fraction')}")
+            self._log(
+                f"   TRAIN spec: nperseg={cfg.get('nperseg')} "
+                f"noverlap={cfg.get('noverlap')} nfft={cfg.get('nfft')} "
+                f"db=[{cfg.get('db_min')},{cfg.get('db_max')}] "
+                f"tile={cfg.get('tile_freq_bins')}x{cfg.get('tile_time_frames')}")
+        else:
+            self._log("   (no training_summary.json beside the model — trained "
+                      "by an older version? spec params can't be compared)")
+        sp = self._spec_params()
+        self._log(
+            f"   INFER spec: nperseg={sp['nperseg']} noverlap={sp['noverlap']} "
+            f"nfft={sp['nfft']} db=[{sp['db_min']},{sp['db_max']}]   "
+            f"threshold={threshold} min_blob_pixels={min_blob}")
+        if cfg:
+            mism = [k for k in ('nperseg', 'noverlap', 'nfft', 'db_min', 'db_max')
+                    if cfg.get(k) is not None
+                    and str(cfg.get(k)) != str(sp.get(k))]
+            if mism:
+                self._log(
+                    f"   ⚠ SPEC MISMATCH vs training ({', '.join(mism)}) — the "
+                    "spectrogram fed to the model differs from what it trained "
+                    "on; this alone can wreck masks. Match the project spec "
+                    "params to training, or retrain.")
+
+    def _quick_inference_current_file(self):
+        """Run inference on the visible view using the model selected in the
+        Model dropdown. Shortcut: Q. Produces in-memory predictions only."""
+        model = self._selected_deploy_model_path() or self._default_model_path()
         if not model:
             self.status_bar.showMessage(
-                "No trained model found — train a model first")
+                "No trained model selected — train or load a model first")
             return
+        self._log_model_info_for_q(model, threshold=0.5, min_blob=8)
         if self._active_wav_path() is None:
             return
         sg = self.spectrogram
@@ -8128,8 +10611,9 @@ class MADMainWindow(QMainWindow):
             return
 
         # Remove existing predictions that overlap the inferred view range
-        t0_view = int(round(view_start / dt))
-        t1_view = int(round(view_end / dt))
+        t_org = self._frame_time_origin_s()
+        t0_view = int(round((view_start - t_org) / dt))
+        t1_view = int(round((view_end - t_org) / dt))
         sg.annotations = [
             a for a in sg.annotations
             if a.get('status') != 'prediction'
@@ -8139,8 +10623,8 @@ class MADMainWindow(QMainWindow):
         n_added = 0
         new_crops = []  # small per-blob masks to persist (NOT the full grid)
         for r in rows:
-            t0 = int(round(r['start_s'] / dt))
-            t1 = int(round(r['stop_s'] / dt))
+            t0 = int(round((r['start_s'] - t_org) / dt))
+            t1 = int(round((r['stop_s'] - t_org) / dt))
             f0 = int(round(r['min_freq_hz'] / df))
             f1 = int(round(r['max_freq_hz'] / df))
             if t1 <= t0 or f1 <= f0:
@@ -8164,7 +10648,7 @@ class MADMainWindow(QMainWindow):
             f1 = f0 + blob_region.shape[0]
             t1 = t0 + blob_region.shape[1]
             sg.annotations.append({
-                'id': f'vpred_{n_added}',
+                'id': _new_ann_id('vpred'),
                 'category': (self._project.last_class if self._project else
                              self._session_last_class) or 'USV',
                 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
@@ -8209,6 +10693,7 @@ class MADMainWindow(QMainWindow):
             pass
         sg._rebuild_confirmed_mask()
         sg.update()
+        self._bump_review_token()
         self._pred_review_idx = None
         self._refresh_annotation_list()
         if n_added:
@@ -8231,13 +10716,193 @@ class MADMainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Found {n_added} detection(s) in current view")
 
+    def _open_wav_for_review(self, wav_path: str):
+        """Load an arbitrary recording into the reviewer and show its detections.
+
+        Used by the run-summary table: a batch run's files usually aren't in the
+        Audio list (that's the point of the folder target), so the file is
+        appended on demand rather than requiring the user to go find and import
+        it. It is NOT registered in the project — opening one result to look at
+        it shouldn't quietly enrol a production recording in the training set;
+        use Add Files… for that.
+        """
+        if not wav_path or not os.path.isfile(wav_path):
+            return
+        ap = os.path.abspath(wav_path)
+        idx = next((i for i, p in enumerate(self.audio_files)
+                    if os.path.normcase(os.path.abspath(p))
+                    == os.path.normcase(ap)), None)
+        if idx is None:
+            self.audio_files.append(ap)
+            self._refresh_file_list()
+            idx = len(self.audio_files) - 1
+        # setCurrentRow must be the thing that triggers the load. Assigning
+        # current_file_idx first makes _on_file_selected's "already on this
+        # row" guard fire, so the file is never loaded and the summary's
+        # detections get painted onto whatever recording was on screen before.
+        self.file_list.setCurrentRow(idx)
+        if self.current_file_idx != idx or self.audio_data is None:
+            self.current_file_idx = idx
+            self._load_current_file()
+        n = self._load_predictions_as_annotations(wav=ap) or 0
+        if self._project is not None:
+            self._log(f"Opened {os.path.basename(ap)} for review — not added to "
+                      "the project (use Add Files… to train on it)")
+        self.status_bar.showMessage(
+            f"{os.path.basename(ap)} — {n} detection(s) loaded"
+            if n else f"{os.path.basename(ap)} — no detections recorded")
+
+    def _show_eval_dialog(self):
+        """Open (or re-focus) the call-level model evaluation window."""
+        dlg = getattr(self, '_eval_dialog', None)
+        if dlg is None:
+            dlg = MADEvalDialog(self)
+            self._eval_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _show_run_summary(self):
+        """Open (or re-focus) the batch run summary window."""
+        dlg = getattr(self, '_run_summary_dialog', None)
+        if dlg is None:
+            dlg = MADRunSummaryDialog(self)
+            self._run_summary_dialog = dlg
+        else:
+            dlg._populate_runs()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _close_manifest(self):
+        """Flush and release the batch-run manifest, if one is open."""
+        m = getattr(self, '_manifest', None)
+        if m is not None:
+            try:
+                m.close()
+            except Exception:
+                pass
+        self._manifest = None
+
+    def _batch_run_root(self) -> Optional[str]:
+        """Where to keep batch-run manifests: the project if one is open, else
+        the chosen inference folder. None when neither exists (a one-off run on
+        loose files needs no run record)."""
+        if self._project is not None:
+            return self._project.project_dir
+        folder = getattr(self, '_infer_folder', None)
+        return folder if folder and os.path.isdir(folder) else None
+
+    def _resume_filter(self, cfg, wav_paths: List[str]) -> List[str]:
+        """Drop files already analyzed by this model at these settings.
+
+        Turns a re-run — after a crash, a stop, or pointing at an overlapping
+        folder — into a resume rather than a restart. Skipped entirely when
+        'Re-detect from scratch' is on, since that explicitly means redo
+        everything.
+        """
+        from fnt.usv.usv_detector.mad_batch import RunSettings, partition_done
+        if getattr(self, 'chk_infer_redetect', None) is not None and \
+                self.chk_infer_redetect.isChecked():
+            return wav_paths
+        if len(wav_paths) < 2:
+            return wav_paths
+        settings = RunSettings.from_config(cfg)
+        manifest_done: set = set()
+        root = self._batch_run_root()
+        if root:
+            try:
+                # Only manifests written at THESE settings count. Unioning
+                # every prior run would mean a retrained model re-run over the
+                # same folder found all of it "already done" and analyzed
+                # nothing while reporting success.
+                from fnt.usv.usv_detector.mad_batch import completed_by_settings
+                manifest_done = completed_by_settings(root, settings)
+            except Exception:
+                pass
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        def _scan_progress(i, n):
+            self.status_bar.showMessage(
+                f"Checking which of {n:,} file(s) are already analyzed… "
+                f"({i:,})")
+            QApplication.processEvents()
+
+        try:
+            todo, done = partition_done(wav_paths, settings, manifest_done,
+                                        progress=_scan_progress)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.status_bar.clearMessage()
+        if not done:
+            return wav_paths
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Resume batch run?")
+        box.setText(
+            f"{len(done):,} of {len(wav_paths):,} file(s) already have "
+            f"detections from '{settings.model_name}' at threshold "
+            f"{settings.threshold:g} / min blob {settings.min_blob_pixels}px.")
+        box.setInformativeText(
+            f"Analyze only the remaining {len(todo):,}, or redo all "
+            f"{len(wav_paths):,}?")
+        b_resume = box.addButton(f"Resume ({len(todo):,})",
+                                 QMessageBox.AcceptRole)
+        box.addButton(f"Redo all ({len(wav_paths):,})", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_resume)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+            return []
+        if clicked is b_resume:
+            self._log(f"Resuming: skipping {len(done)} already-analyzed file(s)")
+            return todo
+        return wav_paths
+
     def _start_inference(self, cfg, wav_paths: List[str], reporter=None):
+        wav_paths = self._resume_filter(cfg, wav_paths)
+        if not wav_paths:
+            self.status_bar.showMessage("Nothing to analyze")
+            self._update_infer_run_enabled()
+            return
         owns_modal = reporter is None
         progress = reporter or MADRunProgressDialog(self, "MAD Inference")
         progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
         progress.append(f"Model: {cfg.model_path}")
         progress.append(f"Threshold: {cfg.threshold}  "
                         f"Min blob: {cfg.min_blob_pixels}px")
+
+        # Open a run manifest. Every completed file is appended and flushed
+        # immediately, so a crash at file 2,800 of 3,000 leaves a manifest that
+        # is valid up to 2,799 and the next run resumes from there.
+        self._manifest = None
+        root = self._batch_run_root()
+        if root and len(wav_paths) > 1:
+            try:
+                from fnt.usv.usv_detector.mad_batch import (
+                    RunManifest, new_run_dir)
+                run_dir = new_run_dir(root)
+                self._manifest = RunManifest(run_dir).open()
+                # The settings block comes from RunSettings so what a later
+                # resume checks is exactly what this run recorded.
+                from fnt.usv.usv_detector.mad_batch import RunSettings as _RS
+                info = dict(_RS.from_config(cfg).to_info())
+                info.update({
+                    'started': time.time(),
+                    'model_path': cfg.model_path,
+                    'n_files': len(wav_paths),
+                    'device': cfg.device,
+                    'batch_size': cfg.batch_size,
+                    'amp': cfg.amp,
+                    'preserve_labels': cfg.preserve_labels,
+                })
+                self._manifest.write_info(info)
+                progress.append(f"Run log: {run_dir}")
+                self._log(f"Batch run log: {run_dir}")
+            except Exception as e:
+                self._log(f"Could not open run manifest: {e}")
+                self._manifest = None
 
         worker = MADInferenceWorker(cfg, wav_paths, parent=self)
         self._infer_worker = worker
@@ -8247,7 +10912,7 @@ class MADMainWindow(QMainWindow):
 
         # Reset queue markers so completion shows live as the run progresses.
         for w in wav_paths:
-            self._set_deploy_item_state(w, 'pending')
+            self._set_file_item_state(w, 'pending')
         self._infer_counted = set()
 
         # Human-readable stage labels so the X/Y is obviously *tiles* scanned by
@@ -8298,10 +10963,11 @@ class MADMainWindow(QMainWindow):
                         cnt = get_prob_blob_count(masks_sibling_path(wav_paths[j]))
                     except Exception:
                         pass
-                    self._set_deploy_item_state(wav_paths[j], 'done', cnt)
+                    self._set_file_item_state(wav_paths[j], 'done', cnt)
 
         def on_finished(results):
             self._infer_worker = None
+            self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")
                 self.btn_infer_pause.setEnabled(False)
@@ -8312,9 +10978,9 @@ class MADMainWindow(QMainWindow):
                 wp = r.get('wav_path')
                 if wp:
                     if 'error' in r:
-                        self._set_deploy_item_state(wp, 'error')
+                        self._set_file_item_state(wp, 'error')
                     else:
-                        self._set_deploy_item_state(wp, 'done', r.get('n_blobs'))
+                        self._set_file_item_state(wp, 'done', r.get('n_blobs'))
             # Aggregate timing across the batch (helps spot CPU vs GPU).
             tt = [r['timing'] for r in results if r.get('timing')]
             timing_line = ""
@@ -8345,10 +11011,11 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"Inference complete — {len(results)} file(s), {total} blob(s)"
             )
-            # Refresh the Training Data status ticks, then auto-open something
-            # for review: the currently-previewed file if it was inferred, else
-            # the first target file.
-            self._refresh_deploy_queue()
+            # Refresh the Audio-list status ticks, then auto-open something for
+            # review: the currently-previewed file if it was inferred, else the
+            # first target file.
+            self._scan_all_file_counts()
+            self._update_run_button()
             active = self._active_wav_path()
             if active and active in wav_paths:
                 n = self._load_predictions_as_annotations(wav=active)
@@ -8358,13 +11025,12 @@ class MADMainWindow(QMainWindow):
                         f"/ Skip (S)")
             elif wav_paths:
                 first = wav_paths[0]
-                if first in self.deploy_files:
-                    self.deploy_list.setCurrentRow(self.deploy_files.index(first))
-                elif first in self.audio_files:
+                if first in self.audio_files:
                     self.file_list.setCurrentRow(self.audio_files.index(first))
 
         def on_error(msg: str):
             self._infer_worker = None
+            self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")
                 self.btn_infer_pause.setEnabled(False)
@@ -8390,6 +11056,14 @@ class MADMainWindow(QMainWindow):
             self._log(line)
 
         def on_file_done(summary: dict):
+            # Record before logging: the manifest is the durable artifact, and
+            # it must be flushed even if this file errored or the run is killed
+            # a moment later.
+            if self._manifest is not None:
+                try:
+                    self._manifest.record(summary)
+                except Exception:
+                    pass
             t = summary.get('timing')
             name = os.path.basename(str(summary.get('wav_path', '')))
             if not t:

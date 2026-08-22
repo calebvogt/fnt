@@ -301,12 +301,19 @@ def _examples_to_annotations(examples, wav_name, grid_shape):
         if f1 <= f0 or t1 <= t0:
             continue
         local = m[lf0:lf0 + (f1 - f0), lt0:lt0 + (t1 - t0)]
-        yield {
+        ann = {
             "id": meta.get("id", ex.get("meta", {}).get("id")),
             "category": meta.get("class", ""),
             "f0": f0, "f1": f1, "t0": t0, "t1": t1,
             "mask": np.ascontiguousarray(local),
         }
+        # Examples created by accepting a model prediction remember the blob_id
+        # of the row they came from, so the reviewer can tell "this CSV row is
+        # already on screen as a confirmed label" from "this is an accepted row
+        # with no example behind it" and not draw the call twice.
+        if meta.get("blob_id") is not None:
+            ann["blob_id"] = meta["blob_id"]
+        yield ann
 
 
 def iter_file_annotations(
@@ -370,7 +377,8 @@ def collect_training_examples(
     tile_time_frames: int = TILE_TIME_FRAMES,
     tile_freq_bins: int = TILE_FREQ_BINS,
     progress=None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_groups: bool = False,
+):
     """Assemble ``(specs, targets, weights)`` stacks from saved examples.
 
     Each example patch is sliced into one or more tiles of shape
@@ -378,17 +386,30 @@ def collect_training_examples(
     ``weight`` is 1 everywhere a tile overlaps the patch (and 0 in any pad).
     Mirrors the return contract of
     :func:`fnt.usv.usv_detector.mad_dataset.collect_training_tiles`.
+
+    With ``return_groups``, a fourth value is returned: a list of
+    ``(source_wav, example_id)`` pairs, one per tile, identifying where each
+    tile came from. A train/val split MUST be made over those groups rather
+    than over tiles — one long call is sliced into several tiles, so a
+    tile-level shuffle would put the same call on both sides of the split. See
+    :func:`fnt.usv.usv_detector.mad_training.grouped_split`.
     """
     examples = list(iter_examples(dataset_dir))
     specs: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []
+    groups: List[Tuple[str, str]] = []
     n = len(examples)
     for i, ex in enumerate(examples):
+        meta = ex["meta"]
         if progress is not None:
-            progress(i, n, ex["meta"].get("id", ""))
+            progress(i, n, meta.get("id", ""))
         spec = ex["spec"]
         mask = ex["mask"]
+        # Provenance for the split. Fall back to the positional index for
+        # examples with no id, so distinct calls never collapse into one group.
+        src = Path(str(meta.get("source_wav", ""))).name or "<unknown>"
+        eid = str(meta.get("id") or f"<example {i}>")
         # Patch occupancy = 1 (supervised) everywhere the real patch exists;
         # used as the tile weight so any zero-padding stays unsupervised.
         occ = np.ones_like(spec, dtype=np.float32)
@@ -399,6 +420,7 @@ def collect_training_examples(
             specs.append(_crop_or_pad(spec, tile_freq_bins, tile_time_frames, 0, t))
             targets.append(_crop_or_pad(mask, tile_freq_bins, tile_time_frames, 0, t))
             weights.append(_crop_or_pad(occ, tile_freq_bins, tile_time_frames, 0, t))
+            groups.append((src, eid))
             t += tile_time_frames
             if t >= W:
                 break
@@ -406,9 +428,11 @@ def collect_training_examples(
         progress(n, n, "done")
     if not specs:
         empty = np.zeros((0, tile_freq_bins, tile_time_frames), dtype=np.float32)
-        return empty, empty.copy(), empty.copy()
-    return (
+        out = (empty, empty.copy(), empty.copy())
+        return (*out, []) if return_groups else out
+    out = (
         np.stack(specs, axis=0),
         np.stack(targets, axis=0),
         np.stack(weights, axis=0),
     )
+    return (*out, groups) if return_groups else out
