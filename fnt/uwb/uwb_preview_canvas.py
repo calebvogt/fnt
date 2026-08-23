@@ -658,7 +658,7 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = False
 
     def update_frame(self, x, y, colors, tracks=None, raw_pts=None,
-                     labels=None, batteries=None, behavior=None):
+                     labels=None, batteries=None, readouts=None, behavior=None):
         """Draw one frame by blitting the moving tags over the cached scene.
 
         ``tracks``: list of (xy Nx2 array, rgb tuple) — one fading polyline per
@@ -666,11 +666,13 @@ class UWBPreview2D(FigureCanvas):
         ``labels``: optional per-tag ID strings drawn above each marker.
         ``batteries``: optional per-tag battery voltages drawn under the label in
         small black font (only shown alongside ``labels``).
+        ``readouts``: optional per-tag strings (speed / step distance) drawn
+        under the voltage, or None for a tag with nothing to report.
         Only these dynamic artists are drawn per frame; the arena/zones/anchors
         come from the cached static background.
         """
         self._last_frame = (x, y, colors, tracks, raw_pts, labels, batteries,
-                            behavior)
+                            readouts, behavior)
         if self._static_dirty or self._blit_bg is None:
             self._draw_static()
 
@@ -743,10 +745,13 @@ class UWBPreview2D(FigureCanvas):
         #    (inactive)    <- behaviour state, smaller, under the ID
         #       o          <- marker
         #     3.91 V       <- battery, below so nothing collides
+        #  0.083 m/s · 0.09 m   <- raw speed / step distance, below that
         #
         states = (behavior or {}).get("states") or []
         state_parts = (behavior or {}).get("state_parts") or []
-        if (labels is not None or batteries is not None or states) and ok.any():
+        if (labels is not None or batteries is not None or readouts is not None
+                or states) and ok.any():
+            pal = _THEMES[self._theme]
             colarr = np.asarray(colors)
             # Clear whichever circle is larger. The icon size is already in
             # points, but the social radius is in metres, so convert it through
@@ -809,14 +814,24 @@ class UWBPreview2D(FigureCanvas):
                         xytext=(0, pad + (8.0 if state_text else 0.0)),
                         fontsize=8, ha="center", va="bottom",
                         color=tuple(colarr[i]), fontweight="bold", zorder=6))
+                below = pad
                 if batteries is not None and i < len(batteries):
                     bv = batteries[i]
                     if bv is not None and np.isfinite(bv):
                         dynamic.append(self.ax.annotate(
                             f"{bv:.2f} V", (x[i], y[i]),
-                            textcoords="offset points", xytext=(0, -pad),
+                            textcoords="offset points", xytext=(0, -below),
                             fontsize=6, ha="center", va="top",
                             color="#000000", zorder=6))
+                        below += 8.0
+                if readouts is not None and i < len(readouts) and readouts[i]:
+                    # Theme foreground, not the battery line's hard black: this
+                    # text is unreadable on the dark palette otherwise.
+                    dynamic.append(self.ax.annotate(
+                        readouts[i], (x[i], y[i]),
+                        textcoords="offset points", xytext=(0, -below),
+                        fontsize=6, ha="center", va="top",
+                        color=pal["mpl_fg"], zorder=6))
 
         for art in dynamic:
             self.ax.draw_artist(art)

@@ -108,10 +108,10 @@ def list_visible_files(directory):
         return []
 
 
-# Default spatial context layers for exported plots/animation. The user picks
-# these per-export in PlotLayersDialog; the choice is stored on the window and
-# in the config. Kept separate from the Preview Options 'Show ...' toggles,
-# which only affect the live preview.
+# Fallback spatial context layers for exported plots/animation, used only
+# before a preview exists (a config restored for a trial that has not been
+# opened yet). In normal use the layers are INHERITED from the Preview Options
+# 'Show ...' toggles - see plot_layers_from_preview.
 DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True}
 
 # ── Displacement (supplant) detection: PARKED, not removed ────────────────
@@ -1033,71 +1033,6 @@ class ExportConflictDialog(QDialog):
 
         layout.addLayout(btn_layout)
         self.setLayout(layout)
-
-
-class PlotLayersDialog(QDialog):
-    """Choose which spatial context layers exported plots/animation include.
-
-    Shown on export when plots or an animation are requested and at least one
-    layer (background image / XML zones / anchors) is available. Each toggle is
-    independent — unchecking all draws tag positions only. Options with no data
-    are disabled. OK applies the choice; Cancel aborts the export.
-    """
-
-    def __init__(self, has_background, has_zones, has_anchors, defaults=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Plot & Animation Layers")
-        self.setModal(True)
-        defaults = defaults or DEFAULT_PLOT_LAYERS
-
-        layout = QVBoxLayout()
-        info = QLabel(
-            "Choose the spatial context to draw under the tag trajectories in "
-            "exported plots and animations. Unavailable layers are greyed out; "
-            "with none checked, only the tag positions are drawn.")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        def _make(text, available, default, tip):
-            cb = QCheckBox(text)
-            cb.setEnabled(available)
-            cb.setChecked(bool(default) and available)
-            if not available:
-                cb.setToolTip("Not available for this dataset")
-            else:
-                cb.setToolTip(tip)
-            layout.addWidget(cb)
-            return cb
-
-        self.chk_background = _make(
-            "Background image", has_background, defaults.get('background', True),
-            "Draw the loaded floorplan / site-map image beneath the tracks.")
-        self.chk_zones = _make(
-            "Zones (from XML)", has_zones, defaults.get('zones', True),
-            "Draw the surveyed zone polygons parsed from the site XML.")
-        self.chk_anchors = _make(
-            "Anchor positions", has_anchors, defaults.get('anchors', True),
-            "Draw the UWB anchor/antenna positions as triangles.")
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        ok_btn = QPushButton("OK")
-        ok_btn.setToolTip("Use these layers for this export")
-        ok_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(ok_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setToolTip("Cancel the export")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
-
-    def get_layers(self):
-        return {
-            'background': self.chk_background.isChecked(),
-            'zones': self.chk_zones.isChecked(),
-            'anchors': self.chk_anchors.isChecked(),
-        }
 
 
 class IdentityAssignmentDialog(QDialog):
@@ -3422,31 +3357,37 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_scale = None  # Scale from XML in inches/pixel (first Map element)
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
-        # Manual background-image transform (option (b)): the loaded floorplan is
-        # placed by pixels * bg_scale(in/px), then shifted by (bg_offset_x,
-        # bg_offset_y) metres. Defaults come from the XML but the user can nudge
-        # them live to match the Wiser server frame — needed when the loaded
-        # image is a different render (resolution/decoration) than the one the
-        # XML scale was calibrated against.
-        self.bg_scale = None          # effective in/px for the loaded image
+        # Manual background transform (option (b)): the background is placed by
+        # pixels * bg_scale(in/px), then shifted by (bg_offset_x, bg_offset_y)
+        # metres. Defaults come from the XML but the user can nudge them live to
+        # match the Wiser server frame — needed when the image is a different
+        # render (resolution/decoration) than the one the XML scale was
+        # calibrated against, and when the XML's own site map does not land on
+        # the surveyed zones. It governs whichever background is ACTIVE: the
+        # loaded floorplan if there is one, otherwise the XML site map.
+        self.bg_scale = None          # effective in/px for the active background
         self.bg_offset_x = 0.0        # metres: world X of the image's left edge
         self.bg_offset_y = 0.0        # metres: world Y of the image's bottom edge
         self.arena_zones = None  # DataFrame with zone coordinates from XML
         self.anchor_positions = []  # List of dicts: {'shortid': int, 'x': float, 'y': float, 'z': float}
         self.xml_zones = []         # [{name, color, points:(N,2) m}] from the site XML
         self.xml_map_image = None   # site map decoded from the XML
-        self.xml_map_extent = None  # (x0, x1, y0, y1) in metres
+        self.xml_map_extent = None  # (x0, x1, y0, y1) in metres, AS PLACED
+        self.xml_map_px = None      # (w_px, h_px) of that map, for re-placing it
+        self.xml_map_scale = None   # in/px the XML authored for that map
         # Every embedded <Map>/<Image> render, each with its own pixel dims and
         # scale: Wiser writes several (e.g. 'default' + a decorated 'Dark2d').
         # Used to pick the correct default scale for a loaded external image by
         # matching its resolution.
         self.xml_maps = []          # [{name, scale, w_px, h_px}]
 
-        # Spatial context layers drawn on exported plots/animation. Chosen per
-        # export via PlotLayersDialog, persisted in the config, and applied to
+        # Spatial context layers drawn on exported plots/animation, applied to
         # every spatial output (trajectory plots, animation, occupancy,
-        # last-known). Independent of the Preview Options 'Show ...' toggles,
-        # which only affect the live preview.
+        # last-known). NOT an independent setting: plot_layers_from_preview
+        # copies the Preview Options 'Show ...' toggles into it at export /
+        # add-to-queue time, so the export draws the arena the preview drew.
+        # Persisted in the config so a queued or re-run job replays the layers
+        # it was queued with.
         self.plot_layers = dict(DEFAULT_PLOT_LAYERS)
         self._exported_sitemap = None  # {filename, extent_m} once an export writes it
         self._animation_tags = None    # None = all; else a subset of shortids
@@ -3466,6 +3407,9 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_raw_x = None       # same grid, pre-smoothing
         self.preview_raw_y = None
         self.preview_batt = None        # battery voltage per tag, same grid
+        self.preview_step = None        # raw step distance (m) per tag, same grid
+        self.preview_speed = None       # raw step speed (m/s) per tag, same grid
+        self._preview_step_pool = None  # (step, speed) over the chunk, PRE-filter
         self.preview_colors = None
 
         self.preview_cache = OrderedDict()   # chunk_index -> frame arrays (LRU)
@@ -5198,11 +5142,19 @@ class UWBQuickVisualizationWindow(QWidget):
         v.addWidget(self.lbl_background_status)
 
         self.chk_show_background = QCheckBox("Show background image")
-        self.chk_show_background.setChecked(True)
+        # OFF by default. The XML's embedded site map is a fallback background
+        # nobody asked for, and it is often a bare render that does not land on
+        # the surveyed frame — drawing it uninvited put a stray rectangle under
+        # every figure. Loading a floorplan yourself ticks this on.
+        self.chk_show_background.setChecked(False)
         self.chk_show_background.setToolTip(
-            "Toggle the loaded floorplan/background image in the LIVE PREVIEW "
-            "only, without unloading it. Exported plots and animations take "
-            "their layers from the dialog shown when you click Export.")
+            "Draw the site map under the tracks: the loaded floorplan image if "
+            "there is one, otherwise the map embedded in the site XML. Turning "
+            "it off hides it without unloading it.\n\n"
+            "Off by default; loading a floorplan turns it on. Use Background "
+            "alignment to register the image onto the anchors and tracks.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when there is no image.")
         self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_background)
 
@@ -5215,11 +5167,14 @@ class UWBQuickVisualizationWindow(QWidget):
         # XML; live values feed the preview AND exported plots/animation.
         self._bg_transform_box = QGroupBox("Background alignment")
         self._bg_transform_box.setToolTip(
-            "Rescale and reposition the loaded background image so it lines up "
-            "with the anchors and tracks. Scale is inches per pixel (larger = "
-            "bigger image); offsets shift the image's bottom-left corner in "
-            "metres. Defaults come from the site XML. Anchors/tracks use "
-            "absolute coordinates and never move.")
+            "Rescale and reposition the background so it lines up with the "
+            "anchors and tracks. Applies to the loaded floorplan, or to the "
+            "site map embedded in the XML when no floorplan is loaded. Scale is "
+            "inches per pixel (larger = bigger image); offsets shift the "
+            "image's bottom-left corner in metres. Defaults come from the site "
+            "XML. Anchors/tracks use absolute coordinates and never move, and "
+            "there is no rotation control — a rotated render can only be "
+            "approximated.")
         bg_tf = QGridLayout()
         bg_tf.setContentsMargins(6, 2, 6, 2)
         bg_tf.addWidget(QLabel("Scale (in/px):"), 0, 0)
@@ -5346,12 +5301,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
-        self.chk_show_anchors.setEnabled(False)
+        self.chk_show_anchors.setEnabled(False)   # enabled once anchors are parsed
         self.chk_show_anchors.stateChanged.connect(self.on_show_background_toggled)
         self.chk_show_anchors.setToolTip(
-            "Draw UWB anchor/antenna positions as triangles in the LIVE PREVIEW "
-            "only. Exported plots/animations take their layers from the dialog "
-            "shown when you click Export. Anchors are parsed from the XML config."
+            "Draw the UWB anchor/antenna positions as triangles. Anchors are "
+            "parsed from the XML config.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when the XML has no anchors."
         )
         v.addWidget(self.chk_show_anchors)
 
@@ -5359,8 +5315,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_zones.setChecked(True)
         self.chk_show_zones.setEnabled(False)   # enabled once XML zones are parsed
         self.chk_show_zones.setToolTip(
-            "Draw the XML-derived zone polygons over the 2D preview, in their "
-            "authored colours. Preview only. Zones are parsed from the site XML.")
+            "Draw the XML-derived zone polygons in their authored colours.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when the site XML defines no "
+            "zones.")
         self.chk_show_zones.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_zones)
 
@@ -5394,6 +5352,34 @@ class UWBQuickVisualizationWindow(QWidget):
             "its marker. Independent of 'Show Tag ID'. Off by default.")
         self.chk_show_battery.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_battery)
+
+        # Per-fix kinematics under the marker, measured on the track AS DRAWN:
+        # they follow the smoothing method, and "None" makes them the unsmoothed
+        # fixes. This means they are not what the velocity and jump thresholds
+        # see (those run before smoothing) — the summary line under those
+        # thresholds is the readout for that question.
+        self.chk_show_speed = QCheckBox("Display Speed (m/s)")
+        self.chk_show_speed.setChecked(False)
+        self.chk_show_speed.setToolTip(
+            "Show each tag's speed from its previous fix, under the marker, "
+            "over the real elapsed time between them.\n\n"
+            "Measured on the track as drawn, so it follows the smoothing "
+            "method — set that to None to read the unsmoothed fixes. Heavy "
+            "smoothing depresses these numbers substantially.\n\n"
+            "Blank at the first fix after a Time gap, which has no predecessor.")
+        self.chk_show_speed.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_speed)
+
+        self.chk_show_step = QCheckBox("Display Step Distance (m)")
+        self.chk_show_step.setChecked(False)
+        self.chk_show_step.setToolTip(
+            "Show how far each tag moved from its previous fix, under the "
+            "marker.\n\n"
+            "Measured on the track as drawn, so it follows the smoothing "
+            "method — set that to None to read the unsmoothed fixes.\n\n"
+            "Blank at the first fix after a Time gap, which has no predecessor.")
+        self.chk_show_step.stateChanged.connect(self.on_show_background_toggled)
+        v.addWidget(self.chk_show_step)
 
         self.chk_show_tracking = QCheckBox("Show Tag Tracking Data")
         self.chk_show_tracking.setChecked(True)
@@ -5513,6 +5499,24 @@ class UWBQuickVisualizationWindow(QWidget):
         pjump_row.addWidget(self.spin_preview_jump)
         pjump_row.addStretch()
         v.addLayout(pjump_row)
+
+        # What the two thresholds above would actually do to the chunk in view.
+        # Computed BEFORE thresholding, so it can count the fixes that get
+        # removed — the surviving track can no longer show them.
+        self.lbl_step_stats = QLabel("")
+        self.lbl_step_stats.setStyleSheet("color: #9fb3c8; font-size: 9px;")
+        self.lbl_step_stats.setWordWrap(True)
+        self.lbl_step_stats.setToolTip(
+            "The distribution of step distances and speeds across the chunk in "
+            "view, and how many fixes each threshold removes from it.\n\n"
+            "Measured on the PRE-SMOOTHING coordinates and before any "
+            "thresholding, because that is what these two thresholds are "
+            "applied to — so it counts the fixes that get filtered out, which "
+            "the surviving track can no longer show. It therefore does not "
+            "follow the smoothing method, unlike the per-tag readouts.\n\n"
+            "A threshold that removes a large share is eating real movement, "
+            "not just noise.")
+        v.addWidget(self.lbl_step_stats)
 
         # Smoothing method: how the live track is drawn — None (actual fixes) or
         # a smoothing method, so you can compare before committing to export.
@@ -6098,6 +6102,7 @@ class UWBQuickVisualizationWindow(QWidget):
         """Rebuild arena geometry for the selected view mode and offsets."""
         if not hasattr(self, "combo_arena") or not hasattr(self, "chk_show_anchors"):
             return
+        self._sync_layer_toggles()
         mode = self.combo_view_mode.currentText()
         dx = self.spin_arena_dx.value()
         dy = self.spin_arena_dy.value()
@@ -6174,11 +6179,19 @@ class UWBQuickVisualizationWindow(QWidget):
         #     shown UPRIGHT, north at top, exactly as the file looks
         #   • the canvas expands the view to include the whole image so it is
         #     never clipped by the data-fit arena bounds
-        # Honour the show/hide toggle: only hand the canvas an image when the
-        # user has the background enabled.
-        show_bg = self.background_image is not None and self.chk_show_background.isChecked()
-        self.preview_canvas_2d.background_image = self.background_image if show_bg else None
-        self.preview_canvas_2d.bg_extent = self._bg_placed_extent() if show_bg else None
+        # ONE source for the background, the same one the exports use
+        # (_context_bg_source): the loaded floorplan if there is one, else the
+        # XML's embedded site map. Routed through the canvas's background_image
+        # rather than the arena's own map_image so that (a) the site map shows
+        # in every view mode, not only "XML (site map)", and (b) the show/hide
+        # toggle governs it — an export must never draw a map the preview
+        # silently withheld.
+        arena.map_image = None
+        arena.map_extent = None
+        bg_image, bg_extent = self._context_bg_source()
+        show_bg = bg_image is not None and self.chk_show_background.isChecked()
+        self.preview_canvas_2d.background_image = bg_image if show_bg else None
+        self.preview_canvas_2d.bg_extent = list(bg_extent) if show_bg else None
         if self.preview_canvas_3d is not None:
             self.preview_canvas_3d.set_arena(arena)
         self.render_preview_frame()
@@ -6691,7 +6704,72 @@ class UWBQuickVisualizationWindow(QWidget):
         merged = self._processed_slice(df)
         if merged is None:
             return None
-        return self._build_preview_frames(merged, self.selected_preview_tags(), idx)
+        frames = self._build_preview_frames(merged, self.selected_preview_tags(), idx)
+        if frames is not None:
+            # Travels WITH the chunk: a prefetched neighbour also runs through
+            # _processed_slice, so a pool left on the window would describe some
+            # other chunk than the one on screen.
+            frames['step_pool'] = self._preview_step_pool
+        return frames
+
+    def _update_step_stats_label(self):
+        """Say what the velocity/jump thresholds do to the chunk in view.
+
+        Counts are reproduced the way apply_filters_to_data applies them: both
+        quantities are measured once on the raw track, the velocity cut runs
+        first, and the jump cut then runs on what is left.
+        """
+        if not hasattr(self, 'lbl_step_stats'):
+            return
+        pool = getattr(self, '_preview_step_pool', None)
+        if not pool:
+            self.lbl_step_stats.setText("")
+            return
+        step, speed = pool
+        ok = np.isfinite(step) & np.isfinite(speed)
+        step, speed = step[ok], speed[ok]
+        if not len(step):
+            self.lbl_step_stats.setText("")
+            return
+        vthr = self.spin_preview_velocity.value()
+        jthr = self.spin_preview_jump.value()
+        cut_v = speed > vthr
+        cut_j = (step > jthr) & ~cut_v          # jump sees only what velocity left
+        n = len(step)
+        pct = lambda k: 100.0 * k / n
+        self.lbl_step_stats.setText(
+            "Steps before smoothing: half below {:.2f} m, fastest 1% above "
+            "{:.2f} m ({:.3f} m/s); largest {:.2f} m. Velocity >{:g} m/s "
+            "removes {:,} ({:.1f}%), jump >{:g} m removes {:,} ({:.1f}%) of "
+            "{:,} fixes."
+            .format(float(np.percentile(step, 50)),
+                    float(np.percentile(step, 99)),
+                    float(np.percentile(speed, 99)),
+                    float(step.max()), vthr, int(cut_v.sum()), pct(cut_v.sum()),
+                    jthr, int(cut_j.sum()), pct(cut_j.sum()), n))
+
+    def _step_columns(self, g, prefix='', x_col=None, y_col=None):
+        """Add per-fix step distance / speed to one tag's frame.
+
+        Grouped by the Time gap setting so no step is measured across a battery
+        restart, and the first fix of each group stays NaN rather than reading
+        zero. ``x_col``/``y_col`` default to the SMOOTHED track when it exists,
+        so the marker readout describes the track actually drawn — select
+        "None" as the smoothing method and it describes the unsmoothed fixes.
+        The threshold summary passes the pre-smoothing columns explicitly,
+        because that is what the thresholds are applied to.
+        """
+        x_col = x_col or ('smoothed_x' if 'smoothed_x' in g.columns else 'location_x')
+        y_col = y_col or ('smoothed_y' if 'smoothed_y' in g.columns else 'location_y')
+        gap = self.spin_time_gap.value()
+        dt = g['Timestamp'].diff().dt.total_seconds()
+        grp = (np.ceil(dt.fillna(0)).astype(int) > gap).cumsum()
+        x, y = g[x_col], g[y_col]
+        step = np.hypot(x - x.groupby(grp).shift(), y - y.groupby(grp).shift())
+        g[prefix + 'step_m'] = step
+        with np.errstate(divide='ignore', invalid='ignore'):
+            g[prefix + 'speed_ms'] = step / dt.where(dt > 0)
+        return g
 
     def _processed_slice(self, df):
         """One raw time slice, trimmed/thresholded/smoothed, in long form.
@@ -6711,6 +6789,10 @@ class UWBQuickVisualizationWindow(QWidget):
         do_filter = use_vel or use_jump
 
         chunks = []
+        # Pre-filter step/speed for every fix in view, kept BEFORE thresholding
+        # drops anything: the whole point of the summary is to show the fixes a
+        # threshold would remove, which the surviving rows can no longer show.
+        pre_step, pre_speed = [], []
         for tag, g in df.groupby('shortid', sort=False):
             g = g.copy()
             g['Timestamp'] = pd.to_datetime(
@@ -6733,6 +6815,9 @@ class UWBQuickVisualizationWindow(QWidget):
             # figures an export writes into runSummary.csv. Preview uses its own
             # Smoothing Window / units so the effect can be tuned live,
             # independent of the Export Options values.
+            g = self._step_columns(g, prefix='pre_', x_col='raw_x', y_col='raw_y')
+            pre_step.append(g['pre_step_m'].to_numpy(float))
+            pre_speed.append(g['pre_speed_ms'].to_numpy(float))
             g = self._filter_and_smooth(
                 g, smoothing_method, collect_stats=False,
                 velocity=use_vel, jump=use_jump,
@@ -6741,7 +6826,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 window=self.spin_preview_window.value(),
                 units=self.combo_preview_window_units.currentText())
             if len(g):
-                chunks.append(g)
+                # Re-measure on the SURVIVING, SMOOTHED fixes: the marker
+                # readout describes the track actually drawn, whose steps both
+                # span whatever thresholding removed and follow the smoothing.
+                chunks.append(self._step_columns(g))
+        self._preview_step_pool = (
+            (np.concatenate(pre_step), np.concatenate(pre_speed))
+            if pre_step else None)
         if not chunks:
             return None
         return pd.concat(chunks, ignore_index=True)
@@ -6798,6 +6889,19 @@ class UWBQuickVisualizationWindow(QWidget):
         # Battery voltage per tag on the same grid, forward-filled so the reading
         # persists between the tag's sparse fixes. None when the table carries no
         # battery column. 'last' per bin (battery varies slowly, so any fix does).
+        # Raw step distance / speed per fix, forward-filled like the battery so
+        # the label persists on a held marker instead of blinking.
+        def _readout(col):
+            if col not in df.columns:
+                return None
+            pv = df.pivot_table(index='tbin', columns='shortid', values=col,
+                                aggfunc='last')
+            pv = pv.reindex(columns=cols).reindex(grid)
+            return pd.DataFrame(pv.to_numpy(float)).ffill().to_numpy()
+
+        STEP = _readout('step_m')
+        SPEED = _readout('speed_ms')
+
         if 'battery_voltage' in df.columns:
             pb = df.pivot_table(index='tbin', columns='shortid',
                                 values='battery_voltage', aggfunc='last')
@@ -6819,11 +6923,12 @@ class UWBQuickVisualizationWindow(QWidget):
             t_end = int(times[-1].timestamp() * 1000)
 
         return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, batt=BAT,
-                    times=times,
+                    step=STEP, speed=SPEED, times=times,
                     tags=cols, hz=hz, t_start=t_start, t_end=t_end,
                     nbytes=X.nbytes + Y.nbytes + XF.nbytes + YF.nbytes
                            + RX.nbytes + RY.nbytes
-                           + (BAT.nbytes if BAT is not None else 0))
+                           + sum(a.nbytes for a in (BAT, STEP, SPEED)
+                                 if a is not None))
 
     # Default preview marker colours: blue for male, red for female. Tags with
     # no configured identity default to male (matching the codebase's
@@ -6913,6 +7018,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_xf, self.preview_yf = c["xf"], c["yf"]
         self.preview_raw_x, self.preview_raw_y = c["raw_x"], c["raw_y"]
         self.preview_batt = c.get("batt")
+        self.preview_step = c.get("step")
+        self.preview_speed = c.get("speed")
+        self._preview_step_pool = c.get("step_pool")
+        self._update_step_stats_label()
         self.preview_times = c["times"]
         self.preview_hz = c["hz"]
         self.preview_colors = self._preview_tag_colors(self.preview_tags)
@@ -7266,10 +7375,27 @@ class UWBQuickVisualizationWindow(QWidget):
             if batt is not None and idx < len(batt):
                 batteries = batt[idx]
 
+        # Speed / step distance share one line under the marker: the stack
+        # already carries ID, behaviour state and voltage, and two more rows
+        # collide as soon as two animals are in contact.
+        readouts = None
+        parts = []
+        for cb, attr, fmt in ((self.chk_show_speed, "preview_speed", "{:.3f} m/s"),
+                              (self.chk_show_step, "preview_step", "{:.2f} m")):
+            arr = getattr(self, attr, None)
+            if cb.isChecked() and arr is not None and idx < len(arr):
+                parts.append((arr[idx], fmt))
+        if parts:
+            readouts = []
+            for i in range(len(x)):
+                bits = [fmt.format(a[i]) for a, fmt in parts
+                        if i < len(a) and np.isfinite(a[i])]
+                readouts.append(" · ".join(bits) if bits else None)
+
         behavior = self._behavior_overlay(idx)
         backend.update_frame(x, y, colors, tracks=tracks, raw_pts=None,
                              labels=labels, batteries=batteries,
-                             behavior=behavior)
+                             readouts=readouts, behavior=behavior)
         self._update_time_label()
 
     # -- transport --------------------------------------------------------- #
@@ -7325,36 +7451,66 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"Warning: could not export site-map image: {e}")
 
-    def _prompt_plot_layers(self):
-        """Prompt for the spatial context layers; update self.plot_layers.
+    def _layer_sources(self):
+        """Which spatial context layers actually have data behind them.
 
-        Shared by the Export button and the Occupancy / Last-Known buttons so
-        every spatial output asks the same question each time. Returns True to
-        proceed, False if the user cancelled. If no layer is available, sets all
-        layers off and proceeds without a dialog.
-
-        'Background image' is offered when the user has loaded one (via Load
-        Background) or the site XML carries an embedded map (used as a fallback).
+        'Background' counts a user-loaded floorplan (via Load Background) OR the
+        site XML's embedded map, which is the fallback both the preview and the
+        exports draw when no image was loaded.
         """
-        has_background = (self.background_image is not None
-                          or self.xml_map_image is not None)
-        has_zones = bool(self.xml_zones) or (
-            self.arena_zones is not None and not self.arena_zones.empty)
-        has_anchors = bool(self.anchor_positions)
-        if not (has_background or has_zones or has_anchors):
-            self.plot_layers = {'background': False, 'zones': False, 'anchors': False}
-            return True
-        dlg = PlotLayersDialog(has_background, has_zones, has_anchors,
-                               defaults=self.plot_layers, parent=self)
-        if dlg.exec_() != QDialog.Accepted:
-            return False
-        self.plot_layers = dlg.get_layers()
-        self.log_message(
-            "Plot/animation layers — "
-            f"background: {'on' if self.plot_layers['background'] else 'off'}, "
-            f"zones: {'on' if self.plot_layers['zones'] else 'off'}, "
-            f"anchors: {'on' if self.plot_layers['anchors'] else 'off'}")
-        return True
+        return {
+            'background': (self.background_image is not None
+                           or self.xml_map_image is not None),
+            'zones': bool(self.xml_zones) or (
+                self.arena_zones is not None and not self.arena_zones.empty),
+            'anchors': bool(self.anchor_positions),
+        }
+
+    def _sync_layer_toggles(self):
+        """Grey out the preview layer toggles that have no data behind them.
+
+        The checked state is left alone — a toggle greyed out because the XML
+        has not been parsed yet must come back the way the user left it, not
+        cleared. `plot_layers_from_preview` resolves checked-but-unavailable to
+        off, the same way `_anim_show` does for the animation rows.
+        """
+        have = self._layer_sources()
+        for attr, key in (('chk_show_background', 'background'),
+                          ('chk_show_zones', 'zones'),
+                          ('chk_show_anchors', 'anchors')):
+            cb = getattr(self, attr, None)
+            if cb is not None:
+                cb.setEnabled(have[key])
+
+    def plot_layers_from_preview(self, announce=True):
+        """Take the spatial context layers straight from the preview toggles.
+
+        STRICT INHERITANCE: exported plots and animations draw the background,
+        zones and anchors exactly as the preview has them — there is no separate
+        per-export choice to get out of step with what you were looking at. A
+        layer with no data behind it resolves to off however its toggle sits.
+
+        Sets and returns self.plot_layers, which is what the exports read and
+        what get_config_dict captures for a queued job.
+        """
+        have = self._layer_sources()
+
+        def _on(attr, key):
+            cb = getattr(self, attr, None)
+            return bool(cb is not None and cb.isChecked() and have[key])
+
+        self.plot_layers = {
+            'background': _on('chk_show_background', 'background'),
+            'zones': _on('chk_show_zones', 'zones'),
+            'anchors': _on('chk_show_anchors', 'anchors'),
+        }
+        if announce:
+            self.log_message(
+                "Plot/animation layers, inherited from the preview — "
+                f"background: {'on' if self.plot_layers['background'] else 'off'}, "
+                f"zones: {'on' if self.plot_layers['zones'] else 'off'}, "
+                f"anchors: {'on' if self.plot_layers['anchors'] else 'off'}")
+        return self.plot_layers
 
     # -- quick snapshot plot ---------------------------------------------- #
     def plot_last_known_locations(self):
@@ -7373,9 +7529,8 @@ class UWBQuickVisualizationWindow(QWidget):
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
             return
 
-        # Ask which context layers to draw (background/zones/anchors).
-        if not self._prompt_plot_layers():
-            return
+        # Background/zones/anchors come from the preview, as drawn.
+        self.plot_layers_from_preview()
 
         try:
             tz = pytz.timezone(self.combo_timezone.currentText())
@@ -7495,9 +7650,8 @@ class UWBQuickVisualizationWindow(QWidget):
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
             return
 
-        # Ask which context layers to draw (zones/anchors overlay the heatmap).
-        if not self._prompt_plot_layers():
-            return
+        # Zones/anchors overlay the heatmap, as the preview has them.
+        self.plot_layers_from_preview()
 
         db = self.current_indexed_db() or self.preview_db_path or self.db_path
         tz = pytz.timezone(self.combo_timezone.currentText())
@@ -8040,6 +8194,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_x = self.preview_y = None
         self.preview_xf = self.preview_yf = None
         self.preview_raw_x = self.preview_raw_y = None
+        self.preview_step = self.preview_speed = None
+        self._preview_step_pool = None
         self.preview_batt = None
         self.preview_times = None
         self.preview_tags = []
@@ -8047,7 +8203,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_zones = []
         self.xml_map_image = None
         self.xml_map_extent = None
+        self.xml_map_px = None
+        self.xml_map_scale = None
         self._sync_bg_transform_controls()
+        # Nothing is parsed yet, so no layer has data behind it; the next XML
+        # parse / config load re-offers whatever this database actually has.
+        self._sync_layer_toggles()
         if hasattr(self, 'slider_timeline'):
             self._timeline_guard = True
             self.slider_timeline.setRange(0, 0)
@@ -8558,8 +8719,6 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.arena_zones = pd.DataFrame(zone_data)
                     num_zones = len(self.arena_zones['zone'].unique())
                     self.log_message(f"Parsed {num_zones} zones with {len(zone_data)} coordinate points from XML")
-                    if hasattr(self, 'chk_show_zones'):
-                        self.chk_show_zones.setEnabled(True)
                 else:
                     self.log_message("No valid zone coordinates found in XML")
             else:
@@ -8591,7 +8750,6 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if self.anchor_positions:
                 self.log_message(f"Parsed {len(self.anchor_positions)} anchor positions from XML")
-                self.chk_show_anchors.setEnabled(True)
             else:
                 self.log_message("No anchor positions found in XML")
 
@@ -8601,6 +8759,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # any other dialect.
             self.xml_map_image = None
             self.xml_map_extent = None
+            self.xml_map_px = None
+            self.xml_map_scale = None
             self.xml_maps = []
             for elem in root.iter():
                 if elem.tag not in ('Map', 'BackgroundImage', 'Image'):
@@ -8624,8 +8784,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     if self.xml_map_image is None:
                         # First decodable map drives the XML site view.
                         self.xml_map_image = img
-                        # origin='upper' when drawn, so y runs top-down from h_m
-                        self.xml_map_extent = (0.0, w_m, 0.0, h_m)
+                        self.xml_map_px = (w_px, h_px)
+                        self.xml_map_scale = px_scale
+                        # With no floorplan loaded, the map owns the manual
+                        # transform: seed it from the map's OWN scale so the
+                        # alignment box reads a real number and can nudge the
+                        # map onto the surveyed frame. A scale already restored
+                        # from the config is a saved nudge — leave it alone.
+                        if self.background_image is None and not self.bg_scale:
+                            self.bg_scale = px_scale
+                        self._recompute_xml_map_extent()
                     map_label = elem.get('name') or ''
                     map_label = f" '{map_label}'" if map_label else ''
                     self.log_message(
@@ -8636,6 +8804,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if self.xml_map_image is None:
                 self.log_message("No embedded background image found in XML")
+
+            # One pass over the layer toggles now that zones, anchors and the
+            # site map are all known: each is offered only if this XML actually
+            # carries it, whatever the previous database had.
+            self._sync_layer_toggles()
 
             # Set last: a parse that threw part-way leaves the marker unset so
             # the next call retries rather than trusting half-filled state.
@@ -8722,6 +8895,43 @@ class UWBQuickVisualizationWindow(QWidget):
         self.bg_width_meters = w_px * self.bg_scale * 0.0254
         self.bg_height_meters = h_px * self.bg_scale * 0.0254
 
+    def _xml_map_owns_transform(self):
+        """True when the manual transform is placing the XML site map.
+
+        A loaded floorplan takes precedence as the drawn background, so it owns
+        the transform; the XML map only owns it when there is no loaded image.
+        """
+        return self.background_image is None and self.xml_map_image is not None
+
+    def _recompute_xml_map_extent(self):
+        """Place the XML site map, honouring the manual transform when it owns it.
+
+        The map's authored scale (the <Map scale=...> attribute) is its default,
+        but that render need not land on the surveyed zone/anchor frame — the
+        arena it draws can be inset and rotated relative to the survey. Scale and
+        offset let the drawn map be registered onto that frame; rotation is not
+        offered, so a rotated render can only be approximated.
+
+        Writes self.xml_map_extent, which every consumer reads: the preview
+        background, the exported figures, the axis fit, and the extent recorded
+        in the exported site map's config entry.
+        """
+        if self.xml_map_image is None or not self.xml_map_px:
+            self.xml_map_extent = None
+            return
+        w_px, h_px = self.xml_map_px
+        if self._xml_map_owns_transform():
+            scale = self.bg_scale or self.xml_map_scale or self.xml_scale or 1.0
+            x0, y0 = self.bg_offset_x, self.bg_offset_y
+        else:
+            # A loaded image owns the transform, so the map falls back to the
+            # placement the XML authored for it.
+            scale = self.xml_map_scale or self.xml_scale or 1.0
+            x0 = y0 = 0.0
+        # origin='upper' when drawn, so y runs top-down from the top edge.
+        self.xml_map_extent = (x0, x0 + w_px * scale * 0.0254,
+                               y0, y0 + h_px * scale * 0.0254)
+
     def _bg_placed_extent(self):
         """(x0, x1, y0, y1) metres for the loaded background, honouring offsets.
 
@@ -8767,6 +8977,9 @@ class UWBQuickVisualizationWindow(QWidget):
         matched = self._default_bg_scale(img_width_px, img_height_px, file_path)
         self.bg_scale = matched if matched else 1.0
         self._recompute_bg_size()
+        # This image now owns the transform, so the XML map (no longer drawn)
+        # falls back to the placement the XML authored for it.
+        self._recompute_xml_map_extent()
         if matched:
             self.log_message(
                 f"✓ Background {source}: {name} "
@@ -8782,13 +8995,20 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_remove_background.setEnabled(True)
         self._sync_bg_transform_controls()
 
+        # The background layer is off by default, so picking a file deliberately
+        # has to turn it on — loading an image and seeing nothing happen is not
+        # a defensible interaction. An auto-loaded or config-restored image does
+        # NOT flip it: that would overrule a saved 'off' the user chose.
+        if source == "loaded" and getattr(self, 'chk_show_background', None) is not None:
+            self.chk_show_background.setChecked(True)
+
         self._log_background_alignment()
 
-        # Switch the live preview to 2D (the only view that shows the
-        # background) and redraw so the floorplan appears immediately.
+        # Redraw so the floorplan appears immediately. Every view mode draws it
+        # now (the canvas takes one background from _context_bg_source), so the
+        # view no longer has to be forced to 2D to see what was just loaded.
+        self._sync_layer_toggles()
         if self._preview_active:
-            if self.combo_view_mode.currentText() != self.VIEW_2D:
-                self.combo_view_mode.setCurrentText(self.VIEW_2D)
             self.refresh_preview_arena()
         return True
 
@@ -8885,9 +9105,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.background_image_path = None
         self.bg_width_meters = None
         self.bg_height_meters = None
-        self.bg_scale = None
+        # Hand the transform back to the XML site map, which becomes the active
+        # background again: seed its own scale rather than leaving None behind.
+        self.bg_scale = (self.xml_map_scale or self.xml_scale
+                         if self.xml_map_image is not None else None)
         self.bg_offset_x = 0.0
         self.bg_offset_y = 0.0
+        self._recompute_xml_map_extent()
         self.lbl_background_status.setText("No background image loaded")
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.btn_remove_background.setEnabled(False)
@@ -8896,6 +9120,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.preview_canvas_2d is not None:
             self.preview_canvas_2d.background_image = None
             self.preview_canvas_2d.bg_extent = None
+        # The XML's embedded site map may still stand behind the layer, so let
+        # the refresh below decide what the background toggle now offers.
+        self._sync_layer_toggles()
         if self._preview_active:
             self.refresh_preview_arena()
 
@@ -8907,15 +9134,23 @@ class UWBQuickVisualizationWindow(QWidget):
     def _sync_bg_transform_controls(self):
         """Push the current scale/offset onto the spinboxes without re-firing.
 
-        Enables the control group only when a background image is loaded. Signals
-        are blocked so seeding the widgets does not trigger a redraw loop.
+        Enabled whenever there is a background to place — a loaded floorplan OR
+        the XML's own site map. The scale shown is the one actually in force for
+        that image, never a placeholder: a disabled 1.0000 sitting under a map
+        drawn at 0.299 in/px reads as a wrong number rather than an absent one.
+        Signals are blocked so seeding the widgets does not trigger a redraw
+        loop.
         """
         if not hasattr(self, 'spin_bg_scale'):
             return   # controls not built yet (early call during startup)
-        have_img = self.background_image is not None
+        have_img = (self.background_image is not None
+                    or self.xml_map_image is not None)
+        effective = self.bg_scale
+        if not effective and self._xml_map_owns_transform():
+            effective = self.xml_map_scale or self.xml_scale
         for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
             w.blockSignals(True)
-        self.spin_bg_scale.setValue(self.bg_scale if self.bg_scale else 1.0)
+        self.spin_bg_scale.setValue(effective if effective else 1.0)
         self.spin_bg_offx.setValue(self.bg_offset_x)
         self.spin_bg_offy.setValue(self.bg_offset_y)
         for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
@@ -8928,27 +9163,37 @@ class UWBQuickVisualizationWindow(QWidget):
 
         Re-sizes the background from the new scale, shifts it by the new offset,
         and refreshes the live preview so the user sees the alignment update as
-        they nudge. No-op when no image is loaded.
+        they nudge. Applies to whichever background is active — the loaded
+        floorplan, or the XML site map when no floorplan is loaded.
         """
-        if self.background_image is None:
+        if self.background_image is None and self.xml_map_image is None:
             return
         self.bg_scale = self.spin_bg_scale.value()
         self.bg_offset_x = self.spin_bg_offx.value()
         self.bg_offset_y = self.spin_bg_offy.value()
         self._recompute_bg_size()
+        self._recompute_xml_map_extent()
         if self._preview_active:
             self.refresh_preview_arena()
 
     def reset_bg_transform(self):
-        """Restore scale to the XML default (matched to this image) and offset to 0."""
-        if self.background_image is None:
+        """Restore scale to the XML default for the active background, offset to 0.
+
+        For a loaded floorplan that is the scale of the embedded render it
+        matches; for the XML site map it is the scale the XML authored for it.
+        """
+        if self.background_image is not None:
+            h_px, w_px = self.background_image.shape[:2]
+            matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
+        elif self.xml_map_image is not None:
+            matched = self.xml_map_scale or self.xml_scale
+        else:
             return
-        h_px, w_px = self.background_image.shape[:2]
-        matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
         self.bg_scale = matched if matched else 1.0
         self.bg_offset_x = 0.0
         self.bg_offset_y = 0.0
         self._recompute_bg_size()
+        self._recompute_xml_map_extent()
         self._sync_bg_transform_controls()
         self.log_message(
             f"Background transform reset to XML: scale {self.bg_scale:.4f} in/px, "
@@ -9959,6 +10204,8 @@ class UWBQuickVisualizationWindow(QWidget):
         'show_tag_id': ('chk_show_tag_id', 'checked'),
         'tag_id_type': ('combo_tag_id_type', 'text'),
         'show_battery': ('chk_show_battery', 'checked'),
+        'show_speed': ('chk_show_speed', 'checked'),
+        'show_step': ('chk_show_step', 'checked'),
         'time_gap': ('spin_time_gap', 'value'),
         # Pinned drawing window. Persisted here because it now governs the
         # exports too, so a trial must reopen framed the way it was exported.
@@ -10386,23 +10633,32 @@ class UWBQuickVisualizationWindow(QWidget):
                 elif os.path.exists(os.path.join(db_dir, os.path.basename(bg_path))):
                     resolved = os.path.join(db_dir, os.path.basename(bg_path))
 
-                if resolved and self._apply_background_image(resolved, source="restored"):
-                    # Honour a saved manual transform (overrides the XML default).
-                    saved_scale = config.get('background_scale_inpx')
-                    saved_off = config.get('background_offset_m')
-                    if saved_scale:
-                        self.bg_scale = float(saved_scale)
-                    if saved_off and len(saved_off) == 2:
-                        self.bg_offset_x = float(saved_off[0])
-                        self.bg_offset_y = float(saved_off[1])
-                    if saved_scale or saved_off:
-                        self._recompute_bg_size()
-                        self._sync_bg_transform_controls()
-                        self.log_message(
-                            f"Restored background transform: scale {self.bg_scale:.4f} in/px, "
-                            f"offset ({self.bg_offset_x:.2f}, {self.bg_offset_y:.2f}) m")
-                elif not resolved:
+                if resolved:
+                    self._apply_background_image(resolved, source="restored")
+                else:
                     self.log_message(f"Warning: Saved background image not found: {bg_path}")
+
+            # Honour a saved manual transform (overrides the XML default). Kept
+            # outside the image block above because the transform now places the
+            # XML site map too, so a nudge made with no floorplan loaded has to
+            # survive the reload as well.
+            saved_scale = config.get('background_scale_inpx')
+            saved_off = config.get('background_offset_m')
+            if saved_scale:
+                self.bg_scale = float(saved_scale)
+            if saved_off and len(saved_off) == 2:
+                self.bg_offset_x = float(saved_off[0])
+                self.bg_offset_y = float(saved_off[1])
+            # Every config carries a [0, 0] offset, so only say something when
+            # the trial was actually nudged away from the XML default.
+            if saved_scale or self.bg_offset_x or self.bg_offset_y:
+                self._recompute_bg_size()
+                self._recompute_xml_map_extent()
+                self._sync_bg_transform_controls()
+                scale_txt = f"{self.bg_scale:.4f} in/px" if self.bg_scale else "XML default"
+                self.log_message(
+                    f"Restored background transform: scale {scale_txt}, "
+                    f"offset ({self.bg_offset_x:.2f}, {self.bg_offset_y:.2f}) m")
             
             # Note: selected_tags will be loaded after tags are populated from table
             if 'selected_tags' in config:
@@ -10417,6 +10673,11 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"Loaded {num_zones} zones with {num_points} coordinate points from config")
             
             self.log_message(f"Loaded previous configuration from {config_path}")
+
+            # A config can carry zones (and a background path) for a trial whose
+            # site XML is missing, so re-offer the layers those restored sources
+            # support rather than leaving them greyed out.
+            self._sync_layer_toggles()
 
             # Update tag labels if identities were loaded
             if self.tag_identities and self.tag_checkboxes:
@@ -10600,6 +10861,11 @@ class UWBQuickVisualizationWindow(QWidget):
             'video_quality': self.combo_video_quality.currentText(),
             'tag_size': self.spin_anim_tag_size.value(),
             'show_battery': self.chk_show_battery_export.isChecked(),
+            # Inherited straight from the preview's display toggles, like the
+            # battery line: the video labels what the preview labels.
+            'show_speed': self.chk_show_speed.isChecked(),
+            'show_step': self.chk_show_step.isChecked(),
+            'gap_s': self.spin_time_gap.value(),
             'layers': self.anim_layer_flags(),
             'animation_tags': (list(self._animation_tags)
                                if self._animation_tags else None),
@@ -10910,6 +11176,9 @@ class UWBQuickVisualizationWindow(QWidget):
             f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} at {speed_text}...")
         prev_cursor = self.cursor()
         self.setCursor(Qt.WaitCursor)
+        # Same inheritance the real export uses, so the clip is drawn over the
+        # arena on screen rather than whatever a previous export left behind.
+        self.plot_layers_from_preview(announce=False)
         # The adapter reads the frozen snapshot; take one now so the clip uses
         # exactly what is on screen, and put back whatever was there after.
         prev_snapshot = getattr(self, "_anim_settings", None)
@@ -11372,10 +11641,14 @@ class UWBQuickVisualizationWindow(QWidget):
             frame_interval=frame_interval, trailing_window=trailing_window, fps=fps,
             dpi=dpi, speed_text=speed_text,
             layers=self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
-            arena_zones=self.arena_zones, anchors=self.anchor_positions,
+            zones_xml=self.xml_zones, arena_zones=self.arena_zones,
+            anchors=self.anchor_positions,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
             color_by=color_by, marker_size=s['tag_size'],
-            show_battery=s['show_battery'], axis_limits=axis_limits,
+            show_battery=s['show_battery'],
+            show_speed=s.get('show_speed', False),
+            show_step=s.get('show_step', False),
+            gap_s=s.get('gap_s', 60.0), axis_limits=axis_limits,
             behavior=behavior,
             show_trail=layers_on.get('trail', True),
             show_labels=layers_on.get('tag_id', True),
@@ -11414,11 +11687,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Make ALL interactive decisions NOW, at add-to-queue time, so the batch
         # run itself never blocks on a dialog. (1) Plot/animation spatial layers
-        # — sets self.plot_layers, which get_config_dict captures below.
+        # — taken from the preview as it stands NOW and frozen into the job by
+        # get_config_dict below, so later preview fiddling cannot change what a
+        # queued trial renders.
         if save_plots or save_animation:
-            if not self._prompt_plot_layers():
-                self.log_message("Add to queue cancelled at layer selection.")
-                return
+            self.plot_layers_from_preview()
 
         self._sync_export_from_preview()
 
@@ -12431,15 +12704,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
         batch = getattr(self, '_batch_active', False)
 
-        # --- Spatial layer choice for plots/animation ---
-        # Interactively: prompt for the context layers when there is spatial
-        # output. In a batch this was chosen at add-to-queue time and is already
-        # in self.plot_layers (restored from the job's captured config), so no
-        # prompt here. Cancelling the dialog aborts the whole export.
+        # --- Spatial layers for plots/animation ---
+        # Interactively: inherited from the preview toggles, so the export draws
+        # the arena you were just looking at. In a batch they were frozen at
+        # add-to-queue time and are already in self.plot_layers (restored from
+        # the job's captured config), so the preview is not consulted here.
         if (save_plots or save_animation) and not batch:
-            if not self._prompt_plot_layers():
-                self.log_message("Export cancelled at layer selection.")
-                return
+            self.plot_layers_from_preview()
 
         # --- Animation temp-frames location ---
         # Interactively: ask up-front so the user can start and walk away. In a
@@ -12991,8 +13262,10 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_timezone.currentText(),
                     self.tag_identities,
                     bool(self.tag_identities),  # Use identities if any are configured
-                    # Always pass the image; whether it is drawn is decided by the
-                    # export layer choice (self.plot_layers), not the preview toggle.
+                    # Always pass the image; whether it is drawn is decided by
+                    # self.plot_layers, which for an interactive export mirrors
+                    # the preview toggle and for a batch job replays the layers
+                    # the job was queued with.
                     self.background_image,
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height

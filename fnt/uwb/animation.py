@@ -20,6 +20,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.patches import Circle, Polygon as MplPolygon
 from matplotlib.collections import LineCollection
+import matplotlib.patheffects as pe
 
 import cv2
 
@@ -128,29 +129,55 @@ def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
 
 
 def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
-                        arena_zones=None, anchors=None, log=None):
+                        zones_xml=None, arena_zones=None, anchors=None, log=None):
     """Draw the background image, zone polygons (with labels) and anchors.
 
     Gated by ``layers`` (dict with 'background'/'zones'/'anchors' booleans).
-    ``arena_zones`` is a DataFrame with columns ('zone', 'x', 'y'); ``anchors``
-    is a list of dicts with 'x'/'y'. Must be idempotent — the frame loop calls
-    it after every ``ax.clear()``.
+    ``zones_xml`` is the preview's list of {name, color, points} polygons and is
+    preferred, so the video shows the zones in the SAME authored colours the
+    preview drew them in; ``arena_zones`` (a DataFrame with columns
+    ('zone', 'x', 'y')) is the fallback for a config that carries only the flat
+    table. ``anchors`` is a list of dicts with 'x'/'y'. Must be idempotent — the
+    frame loop calls it after every ``ax.clear()``.
     """
     layers = layers or {}
     if layers.get('background') and bg_image is not None and bg_extent is not None:
         ax.imshow(bg_image, extent=list(bg_extent), origin='upper',
                   aspect='auto', alpha=0.6, zorder=0)
-    if layers.get('zones') and arena_zones is not None and not arena_zones.empty:
+    if layers.get('zones'):
         try:
-            for zone_name in arena_zones['zone'].unique():
-                coords = arena_zones[arena_zones['zone'] == zone_name][['x', 'y']].values
-                if len(coords) >= 3:  # need >=3 points for a polygon
-                    ax.add_patch(MplPolygon(coords, fill=False, edgecolor='black',
-                                            linewidth=1.5, linestyle='--', zorder=1))
-                    cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
-                    ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
-                            zorder=1)
+            if zones_xml:
+                for z in zones_xml:
+                    pts = np.asarray(z.get('points'), float)
+                    if pts.ndim != 2 or len(pts) < 3:
+                        continue
+                    # "Arena" is the enclosure boundary, not a zone: outline
+                    # only, so it never tints the floor it encloses.
+                    is_bounds = (z.get('name', '') or '').strip().lower() == 'arena'
+                    color = z.get('color', '#888888')
+                    ax.add_patch(MplPolygon(
+                        pts, closed=True,
+                        facecolor='none' if is_bounds else color,
+                        edgecolor=color,
+                        alpha=1.0 if is_bounds else 0.28,
+                        linewidth=2.0 if is_bounds else 1.2, zorder=1))
+                    if not is_bounds:
+                        cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+                        ax.text(cx, cy, z.get('name', ''), fontsize=8,
+                                color='#111111', fontweight='bold',
+                                ha='center', va='center', zorder=1,
+                                path_effects=[pe.withStroke(linewidth=2.2,
+                                                            foreground='white')])
+            elif arena_zones is not None and not arena_zones.empty:
+                for zone_name in arena_zones['zone'].unique():
+                    coords = arena_zones[arena_zones['zone'] == zone_name][['x', 'y']].values
+                    if len(coords) >= 3:  # need >=3 points for a polygon
+                        ax.add_patch(MplPolygon(coords, fill=False, edgecolor='black',
+                                                linewidth=1.5, linestyle='--', zorder=1))
+                        cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
+                        ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
+                                zorder=1)
         except Exception as e:  # never let a zone glitch abort the render
             if log:
                 log(f"Error drawing zones in animation: {e}")
@@ -175,9 +202,10 @@ def compute_axis_limits(data, layers=None, bg_extent=None, pad_frac=0.05):
 def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      dpi=100, speed_text="", title="UWB Tracking Animation",
                      layers=None, bg_image=None, bg_extent=None,
-                     arena_zones=None, anchors=None,
+                     zones_xml=None, arena_zones=None, anchors=None,
                      tag_identities=None, use_custom_identities=False,
                      color_by="None", marker_size=10, show_battery=False,
+                     show_speed=False, show_step=False, gap_s=60.0,
                      axis_limits=None, behavior=None, show_trail=True,
                      show_labels=True, time_range=None,
                      is_cancelled=None, progress=None, log=None):
@@ -255,13 +283,33 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         sub = data[data[id_col] == tag][keep_cols].sort_values('Timestamp')
         bat = (sub['battery_voltage'].to_numpy(dtype='float64')
                if 'battery_voltage' in sub.columns else None)
+        t_ns = sub['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy()
+        xs = sub['smoothed_x'].to_numpy(dtype='float64')
+        ys = sub['smoothed_y'].to_numpy(dtype='float64')
+        step = speed = None
+        if show_speed or show_step:
+            # Measured here rather than taken from a column, so every caller
+            # (clip, export, batch worker) gets the same numbers, on the same
+            # coordinates the frame actually draws. A step spanning more than
+            # gap_s is dropped, matching the preview's Time gap grouping.
+            step = np.full(len(xs), np.nan)
+            speed = np.full(len(xs), np.nan)
+            if len(xs) > 1:
+                dt = np.diff(t_ns) / 1e9
+                d = np.hypot(np.diff(xs), np.diff(ys))
+                ok = (dt > 0) & (dt <= gap_s)
+                step[1:] = np.where(ok, d, np.nan)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    speed[1:] = np.where(ok, d / dt, np.nan)
         tag_data_dict[tag] = {
             # int64 nanoseconds: directly comparable to a Timestamp's own
             # .value, and free of any per-comparison timezone handling.
-            't_ns': sub['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy(),
-            'xs': sub['smoothed_x'].to_numpy(dtype='float64'),
-            'ys': sub['smoothed_y'].to_numpy(dtype='float64'),
+            't_ns': t_ns,
+            'xs': xs,
+            'ys': ys,
             'battery': bat,
+            'step': step,
+            'speed': speed,
             'label': styles[tag]['label'],
             'color': styles[tag]['color']}
 
@@ -277,7 +325,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # on *every* frame — very slow, and a heavy source of per-frame native memory
     # churn in the Agg/NumPy layer. Caching removes essentially all of that work.
     draw_static_context(ax, layers, bg_image=bg_image, bg_extent=bg_extent,
-                        arena_zones=arena_zones, anchors=anchors, log=log)
+                        zones_xml=zones_xml, arena_zones=arena_zones,
+                        anchors=anchors, log=log)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect('equal')
@@ -307,7 +356,10 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         # show_battery is on). va='top' so it hangs beneath the shared anchor.
         batt_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
                              color='#000000', animated=True)
-        dyn[tag] = (trail_line, marker, label, batt_label)
+        # Speed / step distance on one line under the voltage.
+        readout_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
+                                color='#000000', animated=True)
+        dyn[tag] = (trail_line, marker, label, batt_label, readout_label)
 
     # Behaviour overlays get the same treatment as everything else here: one
     # persistent artist per tag, repositioned each frame rather than recreated,
@@ -381,7 +433,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         ax.draw_artist(title_artist)
 
         for tag, tag_info in tag_data_dict.items():
-            trail_line, marker, label, batt_label = dyn[tag]
+            trail_line, marker, label, batt_label, readout_label = dyn[tag]
             state_txt = beh_states.get(tag)
             circ = beh_circles.get(tag)
             t_ns = tag_info['t_ns']
@@ -393,6 +445,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 marker.set_data([], [])
                 label.set_text('')
                 batt_label.set_text('')
+                readout_label.set_text('')
                 if state_txt is not None:
                     state_txt.set_text('')
                 if circ is not None:
@@ -442,6 +495,17 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 # The state line sits where the ID normally does, so lift the
                 # ID clear of it when both are shown.
                 lift = y_range * 0.028 if state_text else 0.0
+                # Speed / step distance share one line, as in the preview.
+                bits = []
+                if show_speed and tag_info['speed'] is not None:
+                    sv = tag_info['speed'][hi - 1]
+                    if np.isfinite(sv):
+                        bits.append(f"{sv:.3f} m/s")
+                if show_step and tag_info['step'] is not None:
+                    dv = tag_info['step'][hi - 1]
+                    if np.isfinite(dv):
+                        bits.append(f"{dv:.2f} m")
+                readout_text = ' · '.join(bits)
                 if show_battery:
                     # Lift the label and hang the voltage beneath it (shared
                     # anchor at cy+off: label grows up, voltage grows down).
@@ -458,10 +522,17 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                     label.set_verticalalignment('baseline')
                     label.set_text(tag_info['label'] if show_labels else '')
                     batt_label.set_text('')
+                # BELOW the marker, not appended to the ID/voltage stack above
+                # it: that stack hangs downward and would put this line on top
+                # of the dot. Clearance is a share of the view, so it holds at
+                # any arena size.
+                readout_label.set_position((cx, cy - y_range * 0.035))
+                readout_label.set_text(readout_text)
             ax.draw_artist(trail_line)
             ax.draw_artist(marker)
             ax.draw_artist(label)
             ax.draw_artist(batt_label)
+            ax.draw_artist(readout_label)
             if tag in beh_circles and beh_circles[tag].get_visible():
                 ax.draw_artist(beh_circles[tag])
             if tag in beh_states:
