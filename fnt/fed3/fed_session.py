@@ -75,6 +75,67 @@ def _atomic_write_json(path, payload):
     os.replace(tmp, path)
 
 
+def device_archive_dir(sessions_root, device_name):
+    """Where a device's historical SD files are kept, across all sessions.
+
+    Deliberately outside any one session folder. The card's back catalogue is a
+    property of the device, not of the run that happened to be recording when it
+    was copied; keeping it here means it is downloaded once ever rather than
+    re-downloaded from byte zero into every new session folder.
+    """
+    path = os.path.join(sessions_root, "device_archive", _safe_name(device_name))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class DeviceNames:
+    """User-assigned device labels, remembered between launches.
+
+    Keyed by the on-board FED3 ID rather than by slot or port, because that is
+    the only identifier that survives a replug: ports get renumbered by the
+    kernel and slots are a UI concept. A cage labelled "Cage A — FR1" keeps that
+    label when it is unplugged, moved to another USB socket, and plugged back in.
+    """
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(default_session_root(), "device_names.json")
+        self._labels = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, ValueError):
+            return
+        if isinstance(loaded, dict):
+            self._labels = {str(k): str(v) for k, v in loaded.items() if v}
+
+    def get(self, device_id):
+        """The stored label for a device ID, or "" if it has never been named."""
+        if device_id in (None, ""):
+            return ""
+        return self._labels.get(str(device_id), "")
+
+    def set(self, device_id, label):
+        """Store (or, for an empty label, forget) the name for a device ID."""
+        if device_id in (None, ""):
+            return
+        key = str(device_id)
+        label = (label or "").strip()
+        if label:
+            if self._labels.get(key) == label:
+                return
+            self._labels[key] = label
+        elif key in self._labels:
+            del self._labels[key]
+        else:
+            return
+        try:
+            _atomic_write_json(self.path, self._labels)
+        except OSError:
+            # A name that cannot be written back is not worth interrupting a
+            # recording over; it just will not survive this launch.
+            pass
+
+
 class RecordingSession:
     """The on-disk tree for one recording, plus its logs."""
 

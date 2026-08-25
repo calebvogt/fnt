@@ -25,10 +25,15 @@ class FedDevice:
         # --- identity ----------------------------------------------------
         # Tracks the last committed display name so a rename can be propagated
         # to anything that references the device by name (scheduled events).
-        self.last_known_name = f"Device {slot_num}"
+        # It has to be updated whenever *anything* feeding ``name`` changes, not
+        # just when the label is edited: identifying a device changes its
+        # default name too.
+        self.last_known_name = f"Slot {slot_num}"
         self.saved_port = ""
         self.device_id = None           # on-board ID reported by PING
-        self.firmware = None            # firmware version string, None if legacy
+        self.firmware = None            # FW reported by PING; None until handshake
+        self.refused = False            # firmware too old; not to be reconnected
+        self.current_file = None        # SD log the device is writing to now
 
         # --- connection --------------------------------------------------
         self.link = None                # Fed3Link while connected
@@ -36,6 +41,8 @@ class FedDevice:
         self.mirror = None              # DeviceMirror while a session is recording
         self.has_connected = False      # ever connected, so a drop is unexpected
         self.connect_attempts = 0
+        self.awaiting_pong_since = None  # host_now() when a heartbeat PING went out
+        self.reconnect_gave_up = False   # backoff exhausted; already reported
         self.last_sync_time = None
         self.last_device_time = None    # device RTC at the last sync
 
@@ -49,9 +56,28 @@ class FedDevice:
     # --- naming -----------------------------------------------------------
 
     @property
+    def label(self):
+        """The user's own name for this device, or "" if they have not set one."""
+        return self.name_edit.text().strip()
+
+    @property
+    def default_name(self):
+        """The name to use when the user has not supplied a label.
+
+        A device that has identified itself is called by the number printed on
+        it, matching how the devices are referred to at the bench. A slot that
+        has no device yet is deliberately *not* called "FED n": it would be
+        claiming an identity it has not been given, and an empty card reading
+        "FED 1" is indistinguishable from a real FED 1 that has stopped talking.
+        """
+        if self.device_id:
+            return f"FED {self.device_id}"
+        return f"Slot {self.slot_num}"
+
+    @property
     def name(self):
-        """Display name: the user's label, else the slot title."""
-        return self.name_edit.text().strip() or f"Device {self.slot_num}"
+        """Display name: the user's label, else :attr:`default_name`."""
+        return self.label or self.default_name
 
     @property
     def port(self):
@@ -87,9 +113,11 @@ class FedDevice:
         return {
             "slot_num": self.slot_num,
             "name": self.name,
+            "label": self.label,
             "port": self.port,
             "device_id": self.device_id,
             "firmware": self.firmware,
+            "current_file": self.current_file,
             "mode": self.mode_combo.currentText(),
             "ratio": self.ratio_spin.value(),
             "timeout": self.timeout_spin.value(),
