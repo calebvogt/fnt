@@ -129,7 +129,8 @@ def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
 
 
 def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
-                        zones_xml=None, arena_zones=None, anchors=None, log=None):
+                        zones_xml=None, arena_zones=None, anchors=None,
+                        rois=None, log=None):
     """Draw the background image, zone polygons (with labels) and anchors.
 
     Gated by ``layers`` (dict with 'background'/'zones'/'anchors' booleans).
@@ -181,6 +182,27 @@ def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
         except Exception as e:  # never let a zone glitch abort the render
             if log:
                 log(f"Error drawing zones in animation: {e}")
+    # The user's own regions (see fnt.uwb.uwb_roi): outline plus a faint
+    # wash, so a track running through one stays readable.
+    if layers.get('rois', True) and rois:
+        from fnt.uwb.uwb_preview_canvas import label_halo
+        for r in rois:
+            pts = np.asarray(r.get('points'), dtype=float).reshape(-1, 2)
+            if len(pts) < 3:
+                continue
+            col = r.get('color', '#e6194b')
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor=col,
+                                    alpha=0.10, edgecolor='none', zorder=1.5))
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor='none',
+                                    edgecolor=col,
+                                    linewidth=float(r.get('linewidth', 2.0)),
+                                    zorder=1.6))
+            ax.annotate(r.get('name', ''),
+                        (pts[:, 0].mean(), pts[:, 1].mean()), color=col,
+                        fontsize=8, fontweight='bold', ha='center',
+                        va='center', zorder=5,
+                        path_effects=label_halo(col, 2.2))
+
     if layers.get('anchors') and anchors:
         ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
@@ -203,9 +225,11 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      dpi=100, speed_text="", title="UWB Tracking Animation",
                      layers=None, bg_image=None, bg_extent=None,
                      zones_xml=None, arena_zones=None, anchors=None,
+                     rois=None,
                      tag_identities=None, use_custom_identities=False,
                      color_by="None", marker_size=10, show_battery=False,
                      show_speed=False, show_step=False, gap_s=60.0,
+                     label_color=None, label_outline=True,
                      axis_limits=None, behavior=None, show_trail=True,
                      show_labels=True, time_range=None,
                      is_cancelled=None, progress=None, log=None):
@@ -326,7 +350,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # churn in the Agg/NumPy layer. Caching removes essentially all of that work.
     draw_static_context(ax, layers, bg_image=bg_image, bg_extent=bg_extent,
                         zones_xml=zones_xml, arena_zones=arena_zones,
-                        anchors=anchors, log=log)
+                        anchors=anchors, rois=rois, log=log)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect('equal')
@@ -341,6 +365,24 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # rather than created/destroyed — no artist-list growth, minimal allocation.
     # animated=True keeps them out of canvas.draw(), so they never bake into the
     # cached background; they are drawn only via draw_artist during blitting.
+    # Per-tag label styling, inherited from the preview. The readouts used to
+    # be hard-coded black, which vanished over a dark floorplan; the halo is
+    # what makes any of this text survive an arbitrary background image.
+    from fnt.uwb.uwb_preview_canvas import label_halo
+    read_col = label_color or '#000000'
+    read_fx = label_halo(read_col, 1.8) if label_outline else []
+    # The behaviour state changes colour per frame, so its halo has to follow.
+    # Memoised on the colour: the palette is a handful of entries and this sits
+    # inside the per-frame loop of a render that can run for hours.
+    _state_fx = {}
+
+    def state_halo(col):
+        if not label_outline:
+            return []
+        if col not in _state_fx:
+            _state_fx[col] = label_halo(col, 1.8)
+        return _state_fx[col]
+
     title_artist = ax.set_title("", fontsize=14, fontweight='bold')
     title_artist.set_animated(True)
     dyn = {}
@@ -351,14 +393,18 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         (marker,) = ax.plot([], [], 'o', color=color, markersize=marker_size,
                             animated=True)
         label = ax.text(0, 0, '', fontsize=10, ha='center', color=color,
-                        fontweight='bold', animated=True)
-        # Battery voltage under the ID label, small black font (drawn only when
-        # show_battery is on). va='top' so it hangs beneath the shared anchor.
+                        fontweight='bold', animated=True,
+                        path_effects=(label_halo(color, 2.0) if label_outline
+                                      else []))
+        # Battery voltage under the ID label (drawn only when show_battery is
+        # on). va='top' so it hangs beneath the shared anchor.
         batt_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
-                             color='#000000', animated=True)
+                             color=read_col, animated=True,
+                             path_effects=read_fx)
         # Speed / step distance on one line under the voltage.
         readout_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
-                                color='#000000', animated=True)
+                                color=read_col, animated=True,
+                                path_effects=read_fx)
         dyn[tag] = (trail_line, marker, label, batt_label, readout_label)
 
     # Behaviour overlays get the same treatment as everything else here: one
@@ -491,6 +537,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 if state_txt is not None:
                     state_txt.set_text(state_text)
                     state_txt.set_color(state_col)
+                    state_txt.set_path_effects(state_halo(state_col))
                     state_txt.set_position((cx, cy + y_range * 0.02))
                 # The state line sits where the ID normally does, so lift the
                 # ID clear of it when both are shown.

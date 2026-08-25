@@ -45,7 +45,7 @@ except Exception as _e:  # pragma: no cover - depends on optional PyOpenGL
     HAVE_GL = False
     GL_ERROR = f"{type(_e).__name__}: {_e}"
 
-from PyQt5.QtCore import Qt          # cursor shapes for drag-panning
+from PyQt5.QtCore import Qt, pyqtSignal   # cursor shapes; ROI draw signals
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
@@ -396,8 +396,46 @@ class UWBPreview3D(gl.GLViewWidget if HAVE_GL else object):
                                elevation=89.9, azimuth=-90)
 
 
+def label_halo(color, linewidth=2.0):
+    """Path effects that keep ``color`` text legible on any background.
+
+    The halo is the OPPOSITE of the text: light text gets a dark edge and
+    dark text a light one. That is what makes a label survive an arbitrary
+    floorplan image - a fixed white halo disappears the moment the text is
+    drawn over something pale, which is the same failure as the text itself.
+
+    Returns a list suitable for ``path_effects=``; empty if ``color`` cannot
+    be interpreted, so a bad value degrades to plain text rather than raising
+    inside a render loop.
+    """
+    import matplotlib.patheffects as pe
+    from matplotlib.colors import to_rgb
+
+    try:
+        r, g, b = to_rgb(color)
+    except (ValueError, TypeError):
+        return []
+    # Rec. 601 luma: how bright the text reads, not how bright its channels are.
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return [pe.withStroke(linewidth=linewidth,
+                          foreground="#000000" if luma > 0.5 else "#ffffff")]
+
+
 class UWBPreview2D(FigureCanvas):
     """Top-down matplotlib preview. The only backend that draws a background image."""
+
+    # ROI drawing. Emitted as the user works so the panel can keep its
+    # buttons and hint text in step without polling the canvas.
+    roi_draft_changed = pyqtSignal(int)     # number of points placed so far
+    roi_completed = pyqtSignal(object)      # list of (x, y) in metres
+    roi_cancelled = pyqtSignal()
+    # A finished region was right-clicked: the window pops the menu, because
+    # the canvas has no business knowing what the options are.
+    roi_context_requested = pyqtSignal(int)
+    # A region's geometry changed in place (moved, or a corner dragged).
+    roi_edited = pyqtSignal(int)
+    # Move/edit mode ended, so the window can put its hint away.
+    roi_edit_ended = pyqtSignal()
 
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(6, 6))
@@ -426,8 +464,239 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = True
         self._blit_bg = None
         self._last_frame = None     # (x, y, colors, tracks, raw_pts) for re-render
+        # User-drawn regions of interest, in the same shape as XML zones:
+        # dicts of name / color / linewidth / points (N,2) in metres. Finished
+        # ROIs belong to the static scene; only the one being drawn moves.
+        self.rois = []
+        self.show_rois = True
+        # Per-tag label styling, pushed in by the window alongside tag_size.
+        # None means "follow the theme", which is only right over a plain
+        # figure - hence the option.
+        self.label_color = None
+        self.label_outline = True
+        self._roi_mode = False      # True while the user is placing points
+        self._roi_draft = []        # points confirmed so far, in metres
+        self._roi_style = {"color": "#e6194b", "linewidth": 2.0}
+        self._roi_cursor = None     # live cursor position, for the rubber band
+        # Editing a FINISHED region. Separate from draw mode: there is an
+        # existing polygon on screen and the gesture changes it, rather than
+        # building a new one.
+        self._roi_action = None     # None | 'move' | 'edit'
+        self._roi_active = None     # index into self.rois being acted on
+        self._roi_drag = None       # in-flight drag state, or None
+        self._roi_grab = None       # index of the corner being dragged
+        self.setFocusPolicy(Qt.StrongFocus)   # so Enter/Esc reach key_press
+        self.mpl_connect('key_press_event', self._on_roi_key)
         self._apply_theme()
         self.show_placeholder()
+
+    # ── ROI drawing ──────────────────────────────────────────────────────
+    def set_rois(self, rois, show=True):
+        """Replace the finished ROI list and redraw the static scene."""
+        self.rois = list(rois or [])
+        self.show_rois = bool(show)
+        # An edit in progress refers to a region by INDEX, and the list just
+        # changed under it. Dropping out of the edit is the honest response:
+        # the polygon it was holding may not be there any more.
+        if self._roi_active is not None and self._roi_active >= len(self.rois):
+            self._roi_action = None
+            self._roi_active = None
+            self._roi_drag = None
+            self._roi_grab = None
+            self.unsetCursor()
+            self.roi_edit_ended.emit()
+        self._static_dirty = True
+        self._rerender()
+
+    def begin_roi(self, color=None, linewidth=None):
+        """Enter draw mode: left-click places corners until the user finishes."""
+        self._roi_mode = True
+        self._roi_draft = []
+        self._roi_cursor = None
+        if color:
+            self._roi_style["color"] = color
+        if linewidth:
+            self._roi_style["linewidth"] = float(linewidth)
+        # A closed hand or resize cursor would suggest dragging; a crosshair
+        # says "this click lands somewhere exact".
+        self.setCursor(Qt.CrossCursor)
+        self.roi_draft_changed.emit(0)
+        self._rerender()
+
+    # Corner handles are grabbed within this many PIXELS, not metres, so the
+    # grab feels the same at every zoom level - which is the whole point of
+    # being able to zoom while adjusting one.
+    ROI_GRAB_PX = 11.0
+
+    def roi_at(self, x, y):
+        """Index of the topmost region containing (x, y) in metres, else None.
+
+        Searched last-drawn-first so the region on top is the one you get,
+        matching what is actually under the cursor where two overlap.
+        """
+        from matplotlib.path import Path
+
+        for i in range(len(self.rois) - 1, -1, -1):
+            pts = np.asarray(self.rois[i].get("points"),
+                             dtype=float).reshape(-1, 2)
+            if len(pts) >= 3 and Path(pts).contains_point((x, y)):
+                return i
+        return None
+
+    def _roi_vertex_at(self, event):
+        """Index of the corner of the active region under the cursor, or None."""
+        if self._roi_active is None or event.x is None:
+            return None
+        pts = np.asarray(self.rois[self._roi_active].get("points"),
+                         dtype=float).reshape(-1, 2)
+        if not len(pts):
+            return None
+        px = self.ax.transData.transform(pts)
+        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
+        i = int(np.argmin(d))
+        return i if d[i] <= self.ROI_GRAB_PX else None
+
+    def begin_roi_move(self, index):
+        """Enter move mode: drag the whole region to a new place."""
+        self._begin_roi_action('move', index)
+
+    def begin_roi_edit(self, index):
+        """Enter edit mode: drag individual corners."""
+        self._begin_roi_action('edit', index)
+
+    def _begin_roi_action(self, action, index):
+        if not (0 <= index < len(self.rois)):
+            return
+        if self._roi_mode:
+            self.cancel_roi()
+        self._roi_action = action
+        self._roi_active = index
+        self._roi_drag = None
+        self._roi_grab = None
+        # The active region leaves the static cache for the duration, so a
+        # drag re-blits one polygon instead of redrawing the whole scene.
+        self._static_dirty = True
+        self.setCursor(Qt.SizeAllCursor if action == 'move' else Qt.CrossCursor)
+        self.setFocus()
+        self._rerender()
+
+    def end_roi_edit(self):
+        """Leave move/edit mode, keeping whatever the region now looks like."""
+        if self._roi_action is None:
+            return
+        self._roi_action = None
+        self._roi_active = None
+        self._roi_drag = None
+        self._roi_grab = None
+        self._static_dirty = True
+        self.unsetCursor()
+        self.roi_edit_ended.emit()
+        self._rerender()
+
+    def finish_roi(self):
+        """Close the polygon if it encloses anything, otherwise cancel."""
+        pts = list(self._roi_draft)
+        self._end_roi_mode()
+        if len(pts) >= 3:
+            self.roi_completed.emit(pts)
+        else:
+            self.roi_cancelled.emit()
+        self._rerender()
+
+    def cancel_roi(self):
+        """Leave draw mode, discarding whatever was placed."""
+        self._end_roi_mode()
+        self.roi_cancelled.emit()
+        self._rerender()
+
+    def _end_roi_mode(self):
+        self._roi_mode = False
+        self._roi_draft = []
+        self._roi_cursor = None
+        self.unsetCursor()
+
+    def undo_roi_point(self):
+        """Drop the last corner placed (right-click, or the panel's button)."""
+        if self._roi_mode and self._roi_draft:
+            self._roi_draft.pop()
+            self.roi_draft_changed.emit(len(self._roi_draft))
+            self._rerender()
+
+    def _on_roi_key(self, event):
+        # The window also watches these keys application-wide, because a click
+        # in the preview pane hands focus to the timeline slider; this handler
+        # covers the case where the canvas does hold focus.
+        if self._roi_action is not None:
+            if event.key in ('enter', 'return', 'escape'):
+                self.end_roi_edit()
+            return
+        if not self._roi_mode:
+            return
+        if event.key in ('enter', 'return'):
+            self.finish_roi()
+        elif event.key == 'escape':
+            self.cancel_roi()
+        elif event.key in ('backspace', 'delete'):
+            self.undo_roi_point()
+
+    def _roi_artists(self):
+        """Artists for the in-progress polygon: edges, corners, rubber band.
+
+        Kept out of the static cache because the rubber band follows the mouse;
+        baking it in would mean a full redraw on every motion event.
+        """
+        if self._roi_action is not None and self._roi_active is not None:
+            return self._roi_active_artists()
+        if not self._roi_mode or not self._roi_draft:
+            return []
+        col = self._roi_style["color"]
+        lw = self._roi_style["linewidth"]
+        pts = np.asarray(self._roi_draft, dtype=float)
+        out = []
+        if len(pts) > 1:
+            out.append(self.ax.plot(pts[:, 0], pts[:, 1], '-', color=col,
+                                    linewidth=lw, zorder=8, animated=True)[0])
+        out.append(self.ax.plot(pts[:, 0], pts[:, 1], 'o', color=col,
+                                markersize=5, markeredgecolor='white',
+                                markeredgewidth=0.8, zorder=9,
+                                animated=True)[0])
+        if self._roi_cursor is not None:
+            cx, cy = self._roi_cursor
+            # Two dashed leaders: one from the last corner to the cursor, one
+            # back to the first, so the shape the click would close is visible
+            # before committing to it.
+            out.append(self.ax.plot([pts[-1, 0], cx], [pts[-1, 1], cy], '--',
+                                    color=col, linewidth=lw, alpha=0.9,
+                                    zorder=8, animated=True)[0])
+            if len(pts) >= 2:
+                out.append(self.ax.plot([cx, pts[0, 0]], [cy, pts[0, 1]], ':',
+                                        color=col, linewidth=lw, alpha=0.5,
+                                        zorder=8, animated=True)[0])
+        return out
+
+    def _roi_active_artists(self):
+        """The region being moved or edited, with grab handles on its corners.
+
+        Drawn brighter than a settled region and with its corners exposed, so
+        it is obvious which one the next drag will affect.
+        """
+        r = self.rois[self._roi_active]
+        pts = np.asarray(r.get("points"), dtype=float).reshape(-1, 2)
+        if len(pts) < 2:
+            return []
+        col = r.get("color", "#e6194b")
+        lw = float(r.get("linewidth", 2.0))
+        loop = np.vstack([pts, pts[:1]])
+        out = [self.ax.plot(loop[:, 0], loop[:, 1], '-', color=col,
+                            linewidth=lw + 1.0, zorder=8, animated=True)[0]]
+        if self._roi_action == 'edit':
+            # Handles only in edit mode: in move mode the corners are not
+            # individually grabbable, and showing them would say they were.
+            out.append(self.ax.plot(pts[:, 0], pts[:, 1], 'o', color=col,
+                                    markersize=7, markeredgecolor='white',
+                                    markeredgewidth=1.2, zorder=9,
+                                    animated=True)[0])
+        return out
 
     def _arena_view_bounds(self):
         """Full view bounds: the arena, expanded to include any background."""
@@ -488,7 +757,64 @@ class UWBPreview2D(FigureCanvas):
         self._rerender()
 
     def _on_button(self, event):
-        """Double-click resets zoom; left-press starts a drag-pan (when zoomed)."""
+        """Double-click resets zoom; left-press starts a drag-pan (when zoomed).
+
+        While an ROI is being drawn the left button belongs to the polygon, so
+        panning moves to the middle button for the duration. Scroll-to-zoom is
+        untouched either way - placing a corner accurately is the whole reason
+        to zoom in, so it has to keep working mid-polygon.
+        """
+        if self._roi_mode and event.inaxes is self.ax:
+            if event.button == 1 and event.xdata is not None:
+                if getattr(event, 'dblclick', False):
+                    self.finish_roi()       # double-click closes the polygon
+                else:
+                    self._roi_draft.append((float(event.xdata),
+                                            float(event.ydata)))
+                    self.roi_draft_changed.emit(len(self._roi_draft))
+                    self._rerender()
+                return
+            if event.button == 3:
+                self.undo_roi_point()       # right-click takes one back
+                return
+            if event.button == 2:           # middle-drag pans while drawing
+                self._pan = (event.x, event.y,
+                             self.ax.get_xlim(), self.ax.get_ylim())
+                return
+
+        # Moving or reshaping a finished region. Like draw mode, this owns the
+        # left button and leaves the middle button to pan.
+        if self._roi_action is not None and event.inaxes is self.ax:
+            if event.button == 1 and event.xdata is not None:
+                pts = np.asarray(self.rois[self._roi_active].get("points"),
+                                 dtype=float).reshape(-1, 2)
+                if self._roi_action == 'move':
+                    self._roi_drag = (float(event.xdata), float(event.ydata),
+                                      pts.copy())
+                else:
+                    self._roi_grab = self._roi_vertex_at(event)
+                    if self._roi_grab is not None:
+                        self._roi_drag = (float(event.xdata),
+                                          float(event.ydata), pts.copy())
+                return
+            if event.button == 3:
+                self.end_roi_edit()         # right-click finishes the edit
+                return
+            if event.button == 2:
+                self._pan = (event.x, event.y,
+                             self.ax.get_xlim(), self.ax.get_ylim())
+                return
+
+        # Right-click on a finished region asks the window for its menu. Only
+        # when nothing else is in progress, so it can never interrupt a
+        # polygon halfway through being placed.
+        if (event.button == 3 and event.inaxes is self.ax
+                and event.xdata is not None and self.show_rois):
+            hit = self.roi_at(float(event.xdata), float(event.ydata))
+            if hit is not None:
+                self.roi_context_requested.emit(hit)
+            return
+
         if getattr(event, 'dblclick', False):
             self._user_zoom = None
             self._pan = None
@@ -504,6 +830,34 @@ class UWBPreview2D(FigureCanvas):
 
     def _on_motion(self, event):
         """Drag-pan: translate the view by the pixel delta since button-press."""
+        if self._roi_mode and self._pan is None:
+            # Redraw only once at least one corner exists; before that there
+            # is no rubber band to follow the cursor with.
+            inside = event.inaxes is self.ax and event.xdata is not None
+            self._roi_cursor = ((float(event.xdata), float(event.ydata))
+                                if inside else None)
+            if self._roi_draft:
+                self._rerender()
+            return
+        if self._roi_action is not None and self._pan is None:
+            if self._roi_drag is not None and event.xdata is not None:
+                x0, y0, pts = self._roi_drag
+                dx, dy = float(event.xdata) - x0, float(event.ydata) - y0
+                moved = pts.copy()
+                if self._roi_action == 'move':
+                    moved += (dx, dy)
+                else:
+                    moved[self._roi_grab] = pts[self._roi_grab] + (dx, dy)
+                self.rois[self._roi_active]["points"] = moved
+                self._rerender()
+            elif self._roi_action == 'edit':
+                # Say when a corner is grabbable before the click, rather than
+                # leaving the user to discover the tolerance by missing it.
+                over = self._roi_vertex_at(event)
+                self.setCursor(Qt.PointingHandCursor if over is not None
+                               else Qt.CrossCursor)
+            return
+
         if self._pan is None:
             # Advertise that the view can be grabbed, but only where it can.
             if event.inaxes is self.ax and self._user_zoom is not None:
@@ -524,6 +878,13 @@ class UWBPreview2D(FigureCanvas):
         self._rerender()
 
     def _on_release(self, event):
+        if self._roi_drag is not None:
+            # Announce the new geometry once per drag, not once per motion
+            # event: the listener rewrites the config file.
+            self._roi_drag = None
+            self._roi_grab = None
+            self.roi_edited.emit(self._roi_active)
+            return
         if self._pan is not None:
             self.unsetCursor()
         self._pan = None
@@ -537,6 +898,18 @@ class UWBPreview2D(FigureCanvas):
         """Redraw the current frame (used after the static scene changes)."""
         if self._last_frame is not None:
             self.update_frame(*self._last_frame)
+        elif self._roi_mode or self._roi_action is not None:
+            # No tracking frame yet - a region can be drawn or adjusted against
+            # a bare site map, so it still needs a blit pass of its own.
+            if self._static_dirty or self._blit_bg is None:
+                self._draw_static()
+            self.restore_region(self._blit_bg)
+            arts = self._roi_artists()
+            for a in arts:
+                self.ax.draw_artist(a)
+            self.blit(self.ax.bbox)
+            for a in arts:
+                a.remove()
         else:
             self.draw_idle()
 
@@ -582,8 +955,21 @@ class UWBPreview2D(FigureCanvas):
         self._rerender()
 
     def set_arena(self, arena):
+        """Install the arena, keeping the scroll-zoom if the framing is the same.
+
+        A genuine re-framing - a different view mode, a moved origin, a fit to
+        new data - invalidates a zoom expressed in the old coordinates, so it
+        is dropped. An arena that lands on the SAME bounds is not a re-framing
+        even though it is a new object, and dropping the zoom there threw away
+        the user's view every time the scene was rebuilt for an unrelated
+        reason: toggling zones, or nudging the tag icon size.
+        """
+        before = self._arena_view_bounds() if self.arena is not None else None
         self.arena = arena
-        self._user_zoom = None    # new framing drops any scroll-zoom
+        after = self._arena_view_bounds()
+        if before is None or any(abs(a - b) > 1e-9
+                                 for a, b in zip(before, after)):
+            self._user_zoom = None
         self._static_dirty = True
 
     def _draw_static(self):
@@ -630,7 +1016,30 @@ class UWBPreview2D(FigureCanvas):
                 self.ax.annotate(
                     z.get("name", ""), (cx, cy), color="#111111", fontsize=7,
                     fontweight="bold", ha="center", va="center", zorder=6,
-                    path_effects=[pe.withStroke(linewidth=2.2, foreground="white")])
+                    path_effects=label_halo(z.get("color", "#888888"), 2.2))
+
+        # User-drawn ROIs sit above the zones and the map but below the tags.
+        # Outline only, with a faint wash: an ROI is a boundary the user placed
+        # to read tracks against, so it must not hide the tracks.
+        if self.show_rois:
+            for i, r in enumerate(self.rois or []):
+                if i == self._roi_active:
+                    continue        # drawn as a dynamic artist while edited
+                pts = np.asarray(r.get("points"), dtype=float).reshape(-1, 2)
+                if len(pts) < 3:
+                    continue
+                col = r.get("color", "#e6194b")
+                self.ax.add_patch(Polygon(
+                    pts, closed=True, facecolor=col, alpha=0.12,
+                    edgecolor="none", zorder=3))
+                self.ax.add_patch(Polygon(
+                    pts, closed=True, facecolor="none", edgecolor=col,
+                    linewidth=float(r.get("linewidth", 2.0)), zorder=4))
+                cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+                self.ax.annotate(
+                    r.get("name", ""), (cx, cy), color=col, fontsize=8,
+                    fontweight="bold", ha="center", va="center", zorder=7,
+                    path_effects=label_halo(col, 2.4))
 
         for p in a.poles:
             self.ax.add_patch(Circle(
@@ -753,6 +1162,11 @@ class UWBPreview2D(FigureCanvas):
                 or states) and ok.any():
             pal = _THEMES[self._theme]
             colarr = np.asarray(colors)
+            # One colour for the plain readouts; the ID and the state keep
+            # their own, because those colours mean something.
+            read_col = self.label_color or pal["mpl_fg"]
+            halo = (lambda c: label_halo(c)) if self.label_outline else (
+                lambda c: [])
             # Clear whichever circle is larger. The icon size is already in
             # points, but the social radius is in metres, so convert it through
             # the data transform - which also means the label keeps its
@@ -791,6 +1205,10 @@ class UWBPreview2D(FigureCanvas):
                         chunks.append(TextArea(
                             ptxt, textprops=dict(color=pcol, **props)))
                     chunks.append(TextArea(")", textprops=dict(color="white", **props)))
+                    if self.label_outline:
+                        for chunk in chunks:
+                            t = chunk.get_children()[0]
+                            t.set_path_effects(label_halo(t.get_color(), 1.8))
                     packed = HPacker(children=chunks, align="baseline", pad=0, sep=0)
                     abox = AnnotationBbox(
                         packed, (x[i], y[i]), xybox=(0, pad),
@@ -800,11 +1218,12 @@ class UWBPreview2D(FigureCanvas):
                     self.ax.add_artist(abox)
                     dynamic.append(abox)
                 elif state_text:
+                    _c = state_col or "#cccccc"
                     dynamic.append(self.ax.annotate(
                         f"({state_text})", (x[i], y[i]),
                         textcoords="offset points", xytext=(0, pad),
                         fontsize=6.5, ha="center", va="bottom",
-                        color=state_col or "#cccccc", zorder=6))
+                        color=_c, zorder=6, path_effects=halo(_c)))
                 if lbl:
                     # ID matches the marker colour, so 'Color by: Sex' tints it
                     # blue=M / red=F exactly like the export animation.
@@ -813,7 +1232,8 @@ class UWBPreview2D(FigureCanvas):
                         textcoords="offset points",
                         xytext=(0, pad + (8.0 if state_text else 0.0)),
                         fontsize=8, ha="center", va="bottom",
-                        color=tuple(colarr[i]), fontweight="bold", zorder=6))
+                        color=tuple(colarr[i]), fontweight="bold", zorder=6,
+                        path_effects=halo(tuple(colarr[i]))))
                 below = pad
                 if batteries is not None and i < len(batteries):
                     bv = batteries[i]
@@ -822,16 +1242,18 @@ class UWBPreview2D(FigureCanvas):
                             f"{bv:.2f} V", (x[i], y[i]),
                             textcoords="offset points", xytext=(0, -below),
                             fontsize=6, ha="center", va="top",
-                            color="#000000", zorder=6))
+                            color=read_col, zorder=6,
+                            path_effects=halo(read_col)))
                         below += 8.0
                 if readouts is not None and i < len(readouts) and readouts[i]:
-                    # Theme foreground, not the battery line's hard black: this
-                    # text is unreadable on the dark palette otherwise.
                     dynamic.append(self.ax.annotate(
                         readouts[i], (x[i], y[i]),
                         textcoords="offset points", xytext=(0, -below),
                         fontsize=6, ha="center", va="top",
-                        color=pal["mpl_fg"], zorder=6))
+                        color=read_col, zorder=6,
+                        path_effects=halo(read_col)))
+
+        dynamic.extend(self._roi_artists())
 
         for art in dynamic:
             self.ax.draw_artist(art)
