@@ -1323,6 +1323,15 @@ class FEDTabWidget(QWidget):
             self._record_clock_sync(device, stripped.split(",", 1)[1])
             return
 
+        feeding = proto.parse_feeding(stripped)
+        if feeding is not None:
+            turn, total = feeding
+            device.status_label.setText(
+                f"Dispensing — attempt {turn + 1} of {total}"
+                if turn else "Dispensing...")
+            device.status_label.setStyleSheet("color: #f1c40f; font-size: 11px;")
+            return
+
         if stripped.startswith(proto.REPLY_NEW_TRIAL):
             self._adopt_current_file(
                 device, stripped[len(proto.REPLY_NEW_TRIAL):])

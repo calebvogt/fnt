@@ -90,6 +90,11 @@ CMD_LIGHTS_OFF = "LIGHTS:OFF"
 # Reply prefix naming the SD log a device rolled onto after NEW_TRIAL.
 REPLY_NEW_TRIAL = "NEW_TRIAL_STARTED:"
 
+# Progress during a dispense, one line per attempt: ``FEEDING:<turn>/<max>``.
+# A jammed hopper can take minutes of motor work before the device gives up, and
+# without this the host cannot tell that from a device that has stopped talking.
+REPLY_FEEDING = "FEEDING:"
+
 
 def cmd_sync(when=None):
     return (when or datetime.now()).strftime("SYNC:%Y,%m,%d,%H,%M,%S")
@@ -222,6 +227,18 @@ def parse_pong(text):
     return device_id, firmware
 
 
+def parse_feeding(line):
+    """``FEEDING:<turn>/<max>`` -> ``(turn, max)``, or None."""
+    stripped = line.strip()
+    if not stripped.startswith(REPLY_FEEDING):
+        return None
+    turn, _, total = stripped[len(REPLY_FEEDING):].partition("/")
+    try:
+        return int(turn), int(total)
+    except ValueError:
+        return None
+
+
 def parse_status(line):
     """Parse a ``STATUS,K:V,...`` line into a dict, or None."""
     stripped = line.strip()
@@ -303,6 +320,7 @@ _OUT_OF_BAND_PREFIXES = (
     "SYNCED,",
     "PONG_FED3",
     REPLY_NEW_TRIAL,
+    REPLY_FEEDING,
     "ABORT_OK",
     "Mode set to",
     "Pellet dispensed manually.",
