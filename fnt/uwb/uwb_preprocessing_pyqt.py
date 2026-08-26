@@ -10,6 +10,7 @@ import time
 import sqlite3
 import struct
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 import pytz
 import json
@@ -155,6 +156,117 @@ def _polygon_len(region):
 # resident leaves" is separable from two animals happening to swap places,
 # which is what the current thresholds cannot distinguish.
 DISPLACEMENT_ENABLED = False
+
+# A parked tag reports the same spot over and over, so its MAD is 0 and every
+# fix is infinitely many deviations from the median. The floor says "never
+# call anything an outlier for being more than 5 cm off a perfectly still
+# track", which is below the positional noise of the system anyway.
+HAMPEL_MAD_FLOOR_M = 0.05
+
+OUTLIER_FILTER_TOOLTIP = (
+    "Remove fixes that sit far off the LOCAL track, judged against the median of a window of neighbouring fixes rather than against the previous fix alone (a Hampel filter).\n\nWHY THIS AND NOT JUST THE JUMP THRESHOLD. A jump test asks how far a fix is from the one before it, so a RUN of consecutive ghosts defeats it: the first ghost is caught, the second looks like a small step from the first and survives, and the real fix after the run gets deleted in its place. A median over many samples cannot be moved by a few wild values, so every fix in the run is rejected and the honest ones are kept.\n\nOn this project's pilot data, adding it alongside the jump threshold took physically impossible steps (over a metre inside a second) from 884 down to 69 across six tags, while keeping 99% of fixes.")
+
+OUTLIER_WINDOW_TOOLTIP = (
+    "How many neighbouring fixes the local median is taken over. Forced odd so the window has a centre.\n\nIt must be more than TWICE the longest run of consecutive ghosts you want to survive - a run longer than half the window becomes the majority and moves the median it is being judged against. Short windows fail quietly for exactly this reason: on the pilot data a window of 11 left MORE impossible steps than the jump threshold alone, while 31 removed almost all of them.\n\nThis is in SAMPLES, not seconds, so its real-time span follows the reporting rate.")
+
+OUTLIER_SIGMA_TOOLTIP = (
+    "How far off the local median a fix may sit before it is rejected, in MADs (median absolute deviations) of the same window.\n\nMAD is the median of each fix's distance from the window's median - a spread measure built from medians, so, unlike a standard deviation, a wild value cannot inflate it and hide inside it. It is scaled by 1.4826 so that on ordinary noise one MAD equals one standard deviation, which is why this reads on the familiar sigma scale.\n\n6 means 'further out than essentially any honest fix'. Lower it to cut harder; raise it if a real fast movement is being clipped at its onset.")
+
+VELOCITY_MIN_DT_TOOLTIP = (
+    "The shortest interval the velocity threshold is allowed to divide by.\n\nSpeed is distance over time, and this system's reports can arrive a millisecond apart. Dividing a few centimetres of positional noise by a millisecond gives tens of m/s, so an unfloored velocity threshold mostly measures HOW CLOSELY SPACED THE REPORTS WERE rather than how fast the animal moved - it deletes tightly spaced fixes wherever they occur.\n\nOn this project's pilot data the raw interval put 41% of fixes over 1 m/s with a median step of only 9 cm; flooring at 0.5 s brings that to 2%.\n\nSet 0 for the old unfloored behaviour (what configs written before this option restore, so an old trial reproduces exactly).")
+
+
+def hampel_deviation(x, y, window=31, group=None,
+                     mad_floor=HAMPEL_MAD_FLOOR_M):
+    """How many MADs each fix sits from its local median, worst of x and y.
+
+    The score the threshold is compared against, returned separately so the
+    live stats can re-price a different sigma without recomputing the medians
+    - and so the preview can show what a change would cost before it is made.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    out = np.zeros(len(x), dtype=float)
+    if len(x) == 0:
+        return out
+    if group is not None:
+        g = np.asarray(group)
+        if g.ndim != 1:
+            raise ValueError("group must be one scalar key per fix")
+        for val in np.unique(g):
+            m = g == val
+            out[m] = hampel_deviation(x[m], y[m], window, None, mad_floor)
+        return out
+    k = max(3, int(window) | 1)
+    if len(x) < k:
+        return out
+    pad = k // 2
+    for arr in (x, y):
+        filled = pd.Series(arr).ffill().bfill().to_numpy()
+        win = sliding_window_view(np.pad(filled, pad, mode='edge'), k)
+        med = np.median(win, axis=1)
+        mad = np.median(np.abs(win - med[:, None]), axis=1) * 1.4826
+        out = np.maximum(out, np.abs(filled - med)
+                         / np.maximum(mad, float(mad_floor)))
+    return out
+
+
+def hampel_keep(x, y, window=31, n_sigma=6.0, group=None,
+                mad_floor=HAMPEL_MAD_FLOOR_M):
+    """Boolean mask of fixes that are NOT spatial outliers of the local track.
+
+    A Hampel filter compares each coordinate against the MEDIAN of a window
+    centred on it, and measures the distance in units of that window's median
+    absolute deviation (MAD). A fix further than ``n_sigma`` MADs from the
+    local median in x or y is an outlier.
+
+    Median and MAD are used rather than mean and standard deviation because
+    both are ROBUST: a handful of wild values inside the window cannot drag
+    them, whereas one 20 m ghost moves a mean and inflates an SD enough to
+    hide itself. That is the whole reason this catches what a step-distance
+    threshold cannot - a ghost fix is an outlier against the surrounding
+    track even when it lands close to the ghost before it, so RUNS of
+    consecutive ghosts (which defeat a step test, because the second ghost
+    looks like a small step from the first) are still rejected as long as the
+    run is shorter than half the window.
+
+    MAD is scaled by 1.4826 so that for normally distributed noise one MAD
+    equals one standard deviation; ``n_sigma`` then reads on the familiar
+    scale, and 6 means "further out than essentially any honest fix".
+
+    ``window`` is in SAMPLES, not seconds, and is forced odd so it can be
+    centred. ``group`` optionally splits the track (per tag, per time-gap
+    segment) so no window ever spans two animals or a dropout.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.ones(len(x), dtype=bool)
+    if len(x) == 0:
+        return keep
+    if group is not None:
+        g = np.asarray(group)
+        if g.ndim != 1:
+            raise ValueError("group must be one scalar key per fix")
+        for val in np.unique(g):
+            m = g == val
+            keep[m] = hampel_keep(x[m], y[m], window, n_sigma, None, mad_floor)
+        return keep
+
+    k = max(3, int(window) | 1)          # odd, so the window has a centre
+    if len(x) < k:
+        return keep                      # too short to have a local median
+    pad = k // 2
+    for arr in (x, y):
+        # A NaN inside the window would poison its median, so hold the last
+        # good value; a NaN fix is dropped by the coordinate check anyway.
+        filled = pd.Series(arr).ffill().bfill().to_numpy()
+        win = sliding_window_view(np.pad(filled, pad, mode='edge'), k)
+        med = np.median(win, axis=1)
+        mad = np.median(np.abs(win - med[:, None]), axis=1) * 1.4826
+        keep &= np.abs(filled - med) <= float(n_sigma) * np.maximum(
+            mad, float(mad_floor))
+    return keep & np.isfinite(x) & np.isfinite(y)
+
 
 # The smoothing methods that read the window control as something other than a
 # window, spelled once so the config writer and the loader cannot drift apart.
@@ -4118,6 +4230,30 @@ class UWBQuickVisualizationWindow(QWidget):
         self.on_smoothing_changed(self.combo_smoothing.currentText())
 
         # ---- CSV / plot / animation export options (continue the same group) --
+        # Spatial-outlier threshold. Lives beside the other two thresholds so
+        # the export record and the run summary carry it; the visible controls
+        # are the preview's.
+        self.chk_outlier_filter = QCheckBox("Outlier threshold (Hampel)")
+        self.chk_outlier_filter.setChecked(True)
+        self.chk_outlier_filter.setToolTip(OUTLIER_FILTER_TOOLTIP)
+        self.spin_outlier_window = QSpinBox()
+        self.spin_outlier_window.setRange(5, 501)
+        self.spin_outlier_window.setSingleStep(2)
+        self.spin_outlier_window.setValue(31)
+        self.spin_outlier_sigma = QDoubleSpinBox()
+        self.spin_outlier_sigma.setRange(1.0, 20.0)
+        self.spin_outlier_sigma.setDecimals(1)
+        self.spin_outlier_sigma.setSingleStep(0.5)
+        self.spin_outlier_sigma.setValue(6.0)
+        self.spin_velocity_min_dt = QDoubleSpinBox()
+        self.spin_velocity_min_dt.setRange(0.0, 10.0)
+        self.spin_velocity_min_dt.setDecimals(2)
+        self.spin_velocity_min_dt.setSingleStep(0.05)
+        self.spin_velocity_min_dt.setValue(0.50)
+        for _w in (self.chk_outlier_filter, self.spin_outlier_window,
+                   self.spin_outlier_sigma, self.spin_velocity_min_dt):
+            _w.setVisible(False)
+
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
         self.chk_export_raw_csv.setChecked(False)
         self.chk_export_raw_csv.setToolTip(
@@ -5204,7 +5340,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.slider_timeline.setToolTip(
             "Scrub the whole recording. Drag, or use the \u2190 / \u2192 arrow keys "
             "(hold to scan) to step back and forth. Nothing is read while you "
-            "move \u2014 the chunk under the playhead loads once you stop.")
+            "move \u2014 the chunk under the playhead loads once you stop.\n"
+            "\n"
+            "Or press Play below (Space) to run it forward at a chosen speed. "
+            "Dragging this slider, or an arrow key, takes the playhead back "
+            "and pauses playback.")
         self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
         layout.addWidget(self.slider_timeline)
 
@@ -5578,7 +5718,17 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_roi_rename.clicked.connect(self.rename_roi)
         roi_btns.addWidget(self.btn_roi_rename)
         self.btn_roi_delete = QPushButton("Delete")
-        self.btn_roi_delete.setToolTip("Remove the selected region.")
+        self.btn_roi_delete.setToolTip(
+            "Remove the selected region from this trial.\n"
+            "\n"
+            "It goes from the preview, from exported plots and animations, "
+            "and from the occupancy outputs - a region that is not here is "
+            "not measured. The change is written to this trial's "
+            "fnt_config.json straight away, so it outlives the window; "
+            "re-drawing it is the only way back.\n"
+            "\n"
+            "Only this trial is affected. Regions are never shared between "
+            "trials, so deleting one here cannot touch another recording.")
         self.btn_roi_delete.clicked.connect(self.delete_roi)
         roi_btns.addWidget(self.btn_roi_delete)
         for _b in (self.btn_roi_draw, self.btn_roi_rename, self.btn_roi_delete):
@@ -5813,7 +5963,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_preview_velocity.setChecked(True)
         self.chk_preview_velocity.setToolTip(
             "Apply a velocity threshold to the PREVIEW track. Toggle to compare "
-            "with/without; adjust the value to see the cutoff's effect live.")
+            "with/without; adjust the value to see the cutoff's effect live.\n"
+            "\n"
+            "RUNS SECOND, after the outlier threshold and before the jump "
+            "threshold, and only ever sees the fixes the one before it left. "
+            "The live figures underneath are counted the same way, so the "
+            "three percentages add up instead of each claiming the same wild "
+            "fix.")
         self.chk_preview_velocity.stateChanged.connect(self.invalidate_preview_cache)
         pvel_row.addWidget(self.chk_preview_velocity)
         self.spin_preview_velocity = QDoubleSpinBox()
@@ -5823,7 +5979,18 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_velocity.setDecimals(1)
         self.spin_preview_velocity.setSingleStep(0.1)
         self.spin_preview_velocity.setToolTip(
-            "Remove preview fixes whose speed from the previous fix exceeds this.")
+            "Remove preview fixes whose speed exceeds this.\n"
+            "\n"
+            "Speed is the distance from the previous fix divided by the "
+            "interval between them - but NOT the raw interval: it is floored "
+            "by the box below, because this system can report a millisecond "
+            "apart and dividing a few centimetres of noise by a millisecond "
+            "gives tens of m/s.\n"
+            "\n"
+            "Watch the live line underneath while you set this. If the fixes "
+            "it is cutting have a small median STEP, the threshold is "
+            "removing tightly spaced reports rather than fast movement, and "
+            "the time base below is the control to reach for.")
         self.spin_preview_velocity.valueChanged.connect(self.invalidate_preview_cache)
         pvel_row.addWidget(self.spin_preview_velocity)
         pvel_row.addStretch()
@@ -5834,7 +6001,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_preview_jump.setChecked(True)
         self.chk_preview_jump.setToolTip(
             "Apply a distance-jump threshold to the PREVIEW track. Toggle to "
-            "compare with/without; adjust the value to see the cutoff's effect live.")
+            "compare with/without; adjust the value to see the cutoff's "
+            "effect live.\n"
+            "\n"
+            "RUNS LAST, on whatever the outlier and velocity thresholds left. "
+            "On its own it cannot contain a RUN of consecutive ghosts - it "
+            "measures the distance INTO each fix, so the second ghost looks "
+            "like a small step from the first and survives, while the honest "
+            "fix after the run is deleted in its place. That is what the "
+            "outlier threshold is for; this one is the backstop for a single "
+            "wild fix.")
         self.chk_preview_jump.stateChanged.connect(self.invalidate_preview_cache)
         pjump_row.addWidget(self.chk_preview_jump)
         self.spin_preview_jump = QDoubleSpinBox()
@@ -5845,11 +6021,69 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_jump.setSingleStep(0.1)
         self.spin_preview_jump.setToolTip(
             "Remove preview fixes that leap more than this distance from the "
-            "previous fix.")
+            "previous fix.\n"
+            "\n"
+            "A pure distance test, with no division by time, so unlike the "
+            "velocity threshold it is unaffected by how closely spaced the "
+            "reports are. Set it to the furthest an animal could actually "
+            "travel between two fixes.\n"
+            "\n"
+            "A fix after a long gap legitimately lands far away, so the "
+            "Time gap setting above splits the track first and no step is "
+            "measured across a dropout.")
         self.spin_preview_jump.valueChanged.connect(self.invalidate_preview_cache)
         pjump_row.addWidget(self.spin_preview_jump)
         pjump_row.addStretch()
         v.addLayout(pjump_row)
+
+        # Minimum time base for the velocity threshold, right under it so the
+        # pair reads as one setting: "faster than X, measured over at least Y".
+        pvmin_row = QHBoxLayout()
+        pvmin_row.setContentsMargins(22, 0, 0, 0)
+        pvmin_row.addWidget(QLabel("measured over at least"))
+        self.spin_preview_velocity_min_dt = QDoubleSpinBox()
+        self.spin_preview_velocity_min_dt.setRange(0.0, 10.0)
+        self.spin_preview_velocity_min_dt.setDecimals(2)
+        self.spin_preview_velocity_min_dt.setSingleStep(0.05)
+        self.spin_preview_velocity_min_dt.setValue(0.50)
+        self.spin_preview_velocity_min_dt.setSuffix(" s")
+        self.spin_preview_velocity_min_dt.setFixedWidth(84)
+        self.spin_preview_velocity_min_dt.setToolTip(VELOCITY_MIN_DT_TOOLTIP)
+        self.spin_preview_velocity_min_dt.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pvmin_row.addWidget(self.spin_preview_velocity_min_dt)
+        pvmin_row.addStretch()
+        v.addLayout(pvmin_row)
+
+        pout_row = QHBoxLayout()
+        self.chk_preview_outlier = QCheckBox("Outlier threshold (remove >")
+        self.chk_preview_outlier.setChecked(True)
+        self.chk_preview_outlier.setToolTip(OUTLIER_FILTER_TOOLTIP)
+        self.chk_preview_outlier.stateChanged.connect(self.invalidate_preview_cache)
+        pout_row.addWidget(self.chk_preview_outlier)
+        self.spin_preview_outlier_sigma = QDoubleSpinBox()
+        self.spin_preview_outlier_sigma.setRange(1.0, 20.0)
+        self.spin_preview_outlier_sigma.setValue(6.0)
+        self.spin_preview_outlier_sigma.setDecimals(1)
+        self.spin_preview_outlier_sigma.setSingleStep(0.5)
+        self.spin_preview_outlier_sigma.setSuffix(" MAD)")
+        self.spin_preview_outlier_sigma.setToolTip(OUTLIER_SIGMA_TOOLTIP)
+        self.spin_preview_outlier_sigma.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pout_row.addWidget(self.spin_preview_outlier_sigma)
+        pout_row.addWidget(QLabel("over"))
+        self.spin_preview_outlier_window = QSpinBox()
+        self.spin_preview_outlier_window.setRange(5, 501)
+        self.spin_preview_outlier_window.setSingleStep(2)
+        self.spin_preview_outlier_window.setValue(31)
+        self.spin_preview_outlier_window.setSuffix(" fixes")
+        self.spin_preview_outlier_window.setFixedWidth(90)
+        self.spin_preview_outlier_window.setToolTip(OUTLIER_WINDOW_TOOLTIP)
+        self.spin_preview_outlier_window.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pout_row.addWidget(self.spin_preview_outlier_window)
+        pout_row.addStretch()
+        v.addLayout(pout_row)
 
         # What the two thresholds above would actually do to the chunk in view.
         # Computed BEFORE thresholding, so it can count the fixes that get
@@ -5861,12 +6095,23 @@ class UWBQuickVisualizationWindow(QWidget):
             "The distribution of step distances and speeds across the chunk in "
             "view, and how many fixes each threshold removes from it.\n\n"
             "Measured on the PRE-SMOOTHING coordinates and before any "
-            "thresholding, because that is what these two thresholds are "
+            "thresholding, because that is what the three thresholds are "
             "applied to — so it counts the fixes that get filtered out, which "
             "the surviving track can no longer show. It therefore does not "
             "follow the smoothing method, unlike the per-tag readouts.\n\n"
-            "A threshold that removes a large share is eating real movement, "
-            "not just noise.")
+            "ONE LINE PER THRESHOLD, in the order they are applied - outlier, "
+            "then velocity, then jump - each counting only the fixes the ones "
+            "before it left. So the three counts add up to the total removed "
+            "rather than each claiming the same wild fix, and moving one "
+            "threshold changes what the ones after it have left to find. Each "
+            "line also says what the fixes it cut actually looked like, which "
+            "is how you tell a threshold that is catching ghosts from one "
+            "that is eating real movement.\n"
+            "\n"
+            "THE LAST LINE is the one to judge a setting by: how many fixes "
+            "survive, and the largest step into a surviving fix against what "
+            "it was before. That second number is what the smoother would "
+            "otherwise have had to chase.")
         v.addWidget(self.lbl_step_stats)
 
         # Smoothing method: how the live track is drawn — None (actual fixes) or
@@ -7128,28 +7373,89 @@ class UWBQuickVisualizationWindow(QWidget):
         if not pool:
             self.lbl_step_stats.setText("")
             return
-        step, speed = pool
-        ok = np.isfinite(step) & np.isfinite(speed)
+        if len(pool) == 2:                 # a chunk cached before the rewrite
+            self.lbl_step_stats.setText("")
+            return
+        step, speed, gap, dev = pool
+        ok = np.isfinite(step)
         step, speed = step[ok], speed[ok]
+        gap, dev = gap[ok], dev[ok]
         if not len(step):
             self.lbl_step_stats.setText("")
             return
-        vthr = self.spin_preview_velocity.value()
-        jthr = self.spin_preview_jump.value()
-        cut_v = speed > vthr
-        cut_j = (step > jthr) & ~cut_v          # jump sees only what velocity left
         n = len(step)
         pct = lambda k: 100.0 * k / n
-        self.lbl_step_stats.setText(
-            "Steps before smoothing: half below {:.2f} m, fastest 1% above "
-            "{:.2f} m ({:.3f} m/s); largest {:.2f} m. Velocity >{:g} m/s "
-            "removes {:,} ({:.1f}%), jump >{:g} m removes {:,} ({:.1f}%) of "
-            "{:,} fixes."
-            .format(float(np.percentile(step, 50)),
-                    float(np.percentile(step, 99)),
-                    float(np.percentile(speed, 99)),
-                    float(step.max()), vthr, int(cut_v.sum()), pct(cut_v.sum()),
-                    jthr, int(cut_j.sum()), pct(cut_j.sum()), n))
+        min_dt = self.spin_preview_velocity_min_dt.value()
+        # Recompute the speed at the CURRENT time base, so moving the floor
+        # re-prices the velocity cut in front of the user.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            eff_speed = step / np.maximum(gap, min_dt if min_dt else 1e-9)
+
+        def _median(a, mask=None):
+            v = a if mask is None else a[mask]
+            v = v[np.isfinite(v)]
+            return float(np.median(v)) if v.size else float('nan')
+
+        # Applied in the order apply_filters_to_data applies them, each seeing
+        # only what the one before it left: the counts add up to the total
+        # removed instead of triple-counting the same wild fix.
+        on_o = self.chk_preview_outlier.isChecked()
+        on_v = self.chk_preview_velocity.isChecked()
+        on_j = self.chk_preview_jump.isChecked()
+        sig = self.spin_preview_outlier_sigma.value()
+        win = int(self.spin_preview_outlier_window.value())
+        vthr = self.spin_preview_velocity.value()
+        jthr = self.spin_preview_jump.value()
+        cut_o = (dev > sig) & np.isfinite(dev) if on_o else np.zeros(n, bool)
+        cut_v = (eff_speed > vthr) & ~cut_o if on_v else np.zeros(n, bool)
+        cut_j = (step > jthr) & ~cut_o & ~cut_v if on_j else np.zeros(n, bool)
+        kept = ~(cut_o | cut_v | cut_j)
+
+        def _line(label, mask, tail=""):
+            txt = "  {} removes {:,} ({:.1f}%)".format(
+                label, int(mask.sum()), pct(mask.sum()))
+            return txt + (tail if mask.any() else "")
+
+        lines = [
+            # Every percentage below is out of THIS number, so it leads.
+            "{:,} fixes in view before thresholding \u00b7 reporting every "
+            "{:.2f} s (median) \u00b7 steps: half below {:.2f} m, 99th "
+            "{:.2f} m, largest {:.2f} m".format(
+                n, _median(gap), float(np.percentile(step, 50)),
+                float(np.percentile(step, 99)), float(step.max())),
+        ]
+        if on_o:
+            lines.append(_line(
+                "Outlier > {:g} MAD (over {:,} fixes)".format(sig, win), cut_o,
+                "  \u2014 median {:.2f} MAD out, {:.2f} m off the local track"
+                .format(_median(dev, cut_o), _median(step, cut_o))))
+        if on_v:
+            # Without this tail a large percentage reads as "the animal
+            # teleported a lot", when at this reporting rate it usually means
+            # the interval was short: a 10 cm step in 30 ms is 3 m/s.
+            lines.append(_line(
+                "Velocity > {:g} m/s over \u2265{:g} s".format(vthr, min_dt),
+                cut_v,
+                "  \u2014 those fixes moved a median {:.2f} m in {:.3f} s"
+                .format(_median(step, cut_v), _median(gap, cut_v))))
+        if on_j:
+            lines.append(_line(
+                "Jump > {:g} m".format(jthr), cut_j,
+                "  \u2014 median {:.2f} m".format(_median(step, cut_j))))
+        if not (on_o or on_v or on_j):
+            lines.append("  No thresholds enabled \u2014 every fix is kept.")
+        else:
+            # The bottom line: what survives, and whether the wild steps the
+            # smoother would have chased are actually gone.
+            worst_before = float(step.max())
+            worst_after = (float(np.nanmax(step[kept]))
+                           if kept.any() and np.isfinite(step[kept]).any()
+                           else float('nan'))
+            lines.append(
+                "  \u2192 keeps {:,} ({:.1f}%); largest step into a surviving "
+                "fix {:.2f} m, was {:.2f} m".format(
+                    int(kept.sum()), pct(kept.sum()), worst_after, worst_before))
+        self.lbl_step_stats.setText("\n".join(lines))
 
     def _step_columns(self, g, prefix='', x_col=None, y_col=None):
         """Add per-fix step distance / speed to one tag's frame.
@@ -7189,13 +7495,14 @@ class UWBQuickVisualizationWindow(QWidget):
         # user can compare the track with/without each threshold live.
         use_vel = self.chk_preview_velocity.isChecked()
         use_jump = self.chk_preview_jump.isChecked()
-        do_filter = use_vel or use_jump
+        use_out = self.chk_preview_outlier.isChecked()
+        do_filter = use_vel or use_jump or use_out
 
         chunks = []
         # Pre-filter step/speed for every fix in view, kept BEFORE thresholding
         # drops anything: the whole point of the summary is to show the fixes a
         # threshold would remove, which the surviving rows can no longer show.
-        pre_step, pre_speed = [], []
+        pre_step, pre_speed, pre_gap, pre_dev = [], [], [], []
         for tag, g in df.groupby('shortid', sort=False):
             g = g.copy()
             g['Timestamp'] = pd.to_datetime(
@@ -7221,20 +7528,32 @@ class UWBQuickVisualizationWindow(QWidget):
             g = self._step_columns(g, prefix='pre_', x_col='raw_x', y_col='raw_y')
             pre_step.append(g['pre_step_m'].to_numpy(float))
             pre_speed.append(g['pre_speed_ms'].to_numpy(float))
+            # The interval itself, rather than inferring it from step/speed:
+            # a fix that did not move has speed 0 and no recoverable interval.
+            _dt = g['Timestamp'].diff().dt.total_seconds().to_numpy(float)
+            pre_gap.append(_dt)
+            pre_dev.append(hampel_deviation(
+                g['raw_x'].to_numpy(float), g['raw_y'].to_numpy(float),
+                window=self.spin_preview_outlier_window.value()))
             g = self._filter_and_smooth(
                 g, smoothing_method, collect_stats=False,
                 velocity=use_vel, jump=use_jump,
                 velocity_thresh=self.spin_preview_velocity.value(),
                 jump_thresh=self.spin_preview_jump.value(),
                 window=self.spin_preview_window.value(),
-                units=self.combo_preview_window_units.currentText())
+                units=self.combo_preview_window_units.currentText(),
+                outlier=use_out,
+                outlier_window=self.spin_preview_outlier_window.value(),
+                outlier_sigma=self.spin_preview_outlier_sigma.value(),
+                velocity_min_dt=self.spin_preview_velocity_min_dt.value())
             if len(g):
                 # Re-measure on the SURVIVING, SMOOTHED fixes: the marker
                 # readout describes the track actually drawn, whose steps both
                 # span whatever thresholding removed and follow the smoothing.
                 chunks.append(self._step_columns(g))
         self._preview_step_pool = (
-            (np.concatenate(pre_step), np.concatenate(pre_speed))
+            (np.concatenate(pre_step), np.concatenate(pre_speed),
+             np.concatenate(pre_gap), np.concatenate(pre_dev))
             if pre_step else None)
         if not chunks:
             return None
@@ -9440,6 +9759,14 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_zone_occupancy.setChecked(False)
         self.chk_occ_xml_zones.setChecked(True)
         self.chk_occ_rois.setChecked(True)
+        self.chk_outlier_filter.setChecked(True)
+        self.spin_outlier_window.setValue(31)
+        self.spin_outlier_sigma.setValue(6.0)
+        self.spin_velocity_min_dt.setValue(0.50)
+        self.chk_preview_outlier.setChecked(True)
+        self.spin_preview_outlier_window.setValue(31)
+        self.spin_preview_outlier_sigma.setValue(6.0)
+        self.spin_preview_velocity_min_dt.setValue(0.50)
         self.chk_export_behavior.setChecked(False)
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
@@ -11135,7 +11462,9 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def _filter_and_smooth(self, data, smoothing_method, *, collect_stats=True,
                            velocity=None, jump=None, velocity_thresh=None,
-                           jump_thresh=None, window=None, units=None):
+                           jump_thresh=None, window=None, units=None,
+                           outlier=None, outlier_window=None,
+                           outlier_sigma=None, velocity_min_dt=None):
         """Threshold, then smooth (the original order).
 
         BOTH the velocity and jump thresholds run on the raw coordinates BEFORE
@@ -11145,11 +11474,15 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
+        use_out = (self.chk_outlier_filter.isChecked()
+                   if outlier is None else outlier)
 
-        if (use_vel or use_jmp) and len(data):
+        if (use_vel or use_jmp or use_out) and len(data):
             data = self.apply_filters_to_data(
                 data, collect_stats=collect_stats, velocity=use_vel, jump=use_jmp,
-                velocity_thresh=velocity_thresh, jump_thresh=jump_thresh)
+                velocity_thresh=velocity_thresh, jump_thresh=jump_thresh,
+                outlier=use_out, outlier_window=outlier_window,
+                outlier_sigma=outlier_sigma, velocity_min_dt=velocity_min_dt)
         if smoothing_method != "None" and len(data):
             data = self.apply_smoothing_to_data(data, smoothing_method,
                                                 window=window, units=units)
@@ -11157,7 +11490,9 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None,
                               velocity_thresh=None, jump_thresh=None,
-                              x_col='location_x', y_col='location_y'):
+                              x_col='location_x', y_col='location_y',
+                              outlier=None, outlier_window=None,
+                              outlier_sigma=None, velocity_min_dt=None):
         """Apply velocity and jump thresholding with time-window grouping.
 
         ``velocity``/``jump`` override whether each threshold is applied and
@@ -11170,9 +11505,12 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
+        use_outlier = (self.chk_outlier_filter.isChecked()
+                       if outlier is None else outlier)
         initial_count = len(data)
         removed_velocity = 0
         removed_jump = 0
+        removed_outlier = 0
         
         # Make explicit copy at start to avoid any SettingWithCopyWarning
         data = data.copy()
@@ -11193,7 +11531,44 @@ class UWBQuickVisualizationWindow(QWidget):
             (data[xc] - data.groupby(['shortid', 'tw_group'])[xc].shift())**2 +
             (data[yc] - data.groupby(['shortid', 'tw_group'])[yc].shift())**2
         )
-        data['velocity'] = data['distance'] / data['time_diff']
+        # A minimum time base. The raw interval can be a millisecond, and
+        # dividing by it turns a few centimetres of positional noise into
+        # tens of m/s - so an unfloored velocity threshold mostly measures how
+        # closely spaced the reports were, not how fast the animal moved.
+        min_dt = (self.spin_velocity_min_dt.value()
+                  if velocity_min_dt is None else velocity_min_dt)
+        data['velocity'] = data['distance'] / np.maximum(
+            data['time_diff'], float(min_dt) if min_dt else 0.0).replace(
+                0, np.nan)
+
+        # Spatial-outlier pass FIRST. It is the only one of the three that
+        # survives a run of consecutive ghosts, and clearing them here stops
+        # the step-based tests below from deleting the GOOD fix that follows a
+        # ghost (they measure the distance INTO a fix, so a ghost condemns its
+        # innocent successor as well).
+        if use_outlier:
+            win = (self.spin_outlier_window.value()
+                   if outlier_window is None else outlier_window)
+            sig = (self.spin_outlier_sigma.value()
+                   if outlier_sigma is None else outlier_sigma)
+            before_outlier = len(data)
+            keep = hampel_keep(
+                data[xc].values, data[yc].values, window=win, n_sigma=sig,
+                group=data.groupby(['shortid', 'tw_group']).ngroup().values)
+            data = data[keep].copy()
+            removed_outlier = before_outlier - len(data)
+            if removed_outlier > 0:
+                self.log_message(
+                    f"  Removed {removed_outlier} spatial outliers "
+                    f"(>{sig:g} MAD of a {int(win)}-sample local median)")
+            # Steps and speeds describe the track, and the track just changed.
+            data['distance'] = np.sqrt(
+                (data[xc] - data.groupby(['shortid', 'tw_group'])[xc].shift())**2 +
+                (data[yc] - data.groupby(['shortid', 'tw_group'])[yc].shift())**2
+            )
+            data['velocity'] = data['distance'] / np.maximum(
+                data['time_diff'], float(min_dt) if min_dt else 0.0).replace(
+                    0, np.nan)
 
         # Apply velocity filtering if enabled
         if use_velocity:
@@ -11238,6 +11613,7 @@ class UWBQuickVisualizationWindow(QWidget):
             s = getattr(self, 'filter_stats', None) or {}
             self.filter_stats = {
                 'initial_count': s.get('initial_count', 0) + initial_count,
+                'removed_outlier': s.get('removed_outlier', 0) + removed_outlier,
                 'removed_velocity': s.get('removed_velocity', 0) + removed_velocity,
                 'removed_jump': s.get('removed_jump', 0) + removed_jump,
                 'final_count': s.get('final_count', 0) + final_count,
@@ -11312,6 +11688,10 @@ class UWBQuickVisualizationWindow(QWidget):
             'velocity_threshold': self.spin_velocity_threshold.value(),
             'jump_filter': self.chk_jump_filter.isChecked(),
             'jump_threshold': self.spin_jump_threshold.value(),
+            'outlier_filter': self.chk_outlier_filter.isChecked(),
+            'outlier_window': self.spin_outlier_window.value(),
+            'outlier_sigma': self.spin_outlier_sigma.value(),
+            'velocity_min_dt': self.spin_velocity_min_dt.value(),
             'time_gap': self.spin_time_gap.value(),
             'smoothing_method': self.combo_smoothing.currentText(),
             # rolling_window / rolling_window_units are null unless the method
@@ -11412,6 +11792,10 @@ class UWBQuickVisualizationWindow(QWidget):
         'velocity_threshold': ('spin_preview_velocity', 'value'),
         'jump_filter': ('chk_preview_jump', 'checked'),
         'jump_threshold': ('spin_preview_jump', 'value'),
+        'outlier_filter': ('chk_preview_outlier', 'checked'),
+        'outlier_window': ('spin_preview_outlier_window', 'value'),
+        'outlier_sigma': ('spin_preview_outlier_sigma', 'value'),
+        'velocity_min_dt': ('spin_preview_velocity_min_dt', 'value'),
         'color_by': ('combo_preview_color', 'text'),
         'dark_mode': ('chk_preview_dark', 'checked'),
         'trail_seconds': ('spin_preview_trail', 'value'),
@@ -11710,6 +12094,33 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'jump_threshold' in config:
                 self.spin_jump_threshold.setValue(config['jump_threshold'])
+
+            # A trial configured before the outlier threshold existed was not
+            # filtered by it, and one configured before the velocity time base
+            # existed divided by the RAW interval. Re-running either has to
+            # reproduce what it produced, so an absent key means OFF here
+            # rather than the new default - the defaults apply to new work.
+            if 'outlier_filter' in config:
+                self.chk_outlier_filter.setChecked(bool(config['outlier_filter']))
+                self.chk_preview_outlier.setChecked(bool(config['outlier_filter']))
+            else:
+                self.chk_outlier_filter.setChecked(False)
+                self.chk_preview_outlier.setChecked(False)
+                self.log_message(
+                    "This config predates the outlier threshold, so it is off "
+                    "for this trial (re-running it reproduces what it "
+                    "produced). Tick it to adopt the new default.")
+            for key, wid, pwid in (
+                    ('outlier_window', self.spin_outlier_window,
+                     self.spin_preview_outlier_window),
+                    ('outlier_sigma', self.spin_outlier_sigma,
+                     self.spin_preview_outlier_sigma)):
+                if config.get(key) is not None:
+                    wid.setValue(type(wid.value())(config[key]))
+                    pwid.setValue(type(pwid.value())(config[key]))
+            _min_dt = float(config.get('velocity_min_dt') or 0.0)
+            self.spin_velocity_min_dt.setValue(_min_dt)
+            self.spin_preview_velocity_min_dt.setValue(_min_dt)
             
             if 'time_gap' in config:
                 self.spin_time_gap.setValue(config['time_gap'])
