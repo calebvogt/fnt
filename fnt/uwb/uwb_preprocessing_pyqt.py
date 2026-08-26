@@ -2842,7 +2842,7 @@ class PlotSaverWorker(QThread):
         grid = np.arange(t0, t1 + step_ns, step_ns, dtype='int64')
         n_frames, n_tags = len(grid), len(tags)
         if n_frames == 0 or n_tags == 0:
-            return None, None, None
+            return None, None, None, None, None, None
 
         # Bin fixes onto the grid, one column per tag.
         binned = data.copy()
@@ -2865,6 +2865,21 @@ class PlotSaverWorker(QThread):
             fi = g['fi'].to_numpy()
             X[fi, j] = g[x_col].to_numpy()
             Y[fi, j] = g[y_col].to_numpy()
+
+        # True millisecond observation window per frame: the earliest and latest
+        # real fix (any tag) that landed in each 1 Hz slot. The grid itself is a
+        # regular lattice anchored at t0, so a lattice time carries only t0's
+        # constant sub-second offset - exported as-is it reads as millisecond
+        # precision while every row shares the same fraction. Bout edges are
+        # reported from these instead, so a behaviour's start/stop is a time an
+        # animal was actually observed. -1 marks a frame with no fixes.
+        _fr = pd.DataFrame({'fi': binned['fi'].to_numpy(), 'ts': t.to_numpy()})
+        _agg = _fr.groupby('fi')['ts'].agg(['min', 'max'])
+        frame_first = np.full(n_frames, -1, dtype='int64')
+        frame_last = np.full(n_frames, -1, dtype='int64')
+        _idx = _agg.index.to_numpy()
+        frame_first[_idx] = _agg['min'].to_numpy()
+        frame_last[_idx] = _agg['max'].to_numpy()
 
         # classify() derives dt by reading these as datetime64[ns] (that is
         # what the live preview hands it). Passing float SECONDS made every
@@ -2943,7 +2958,7 @@ class PlotSaverWorker(QThread):
             # Sorted by frame so a renderer can slice one frame's links with
             # two searchsorted calls instead of scanning.
             link_arr = link_arr[np.argsort(link_arr[:, 0], kind='stable')]
-        return grid, loc, soc, events, link_arr
+        return grid, loc, soc, events, link_arr, (frame_first, frame_last)
 
     # (key, result) for the last classification, shared across every worker in
     # this process. An export classifies the same data twice - once to write
@@ -2988,13 +3003,17 @@ class PlotSaverWorker(QThread):
         """
         cols = ['behavior', 'actor', 'target', 'actor_sex', 'target_sex',
                 'dyad_type', 'Day', 'Date', 'start', 'stop', 'duration_s']
-        grid, loc, soc, events, _links = self._behavior_classification(data, tags)
+        grid, loc, soc, events, _links, ftimes = self._behavior_classification(data, tags)
         if grid is None or not events:
             return pd.DataFrame(columns=cols)
 
         times = pd.to_datetime(grid, utc=True)
         if tz is not None:
             times = times.tz_convert(tz)
+
+        def _as_local(ns):
+            ts = pd.Timestamp(int(ns), unit='ns', tz='UTC')
+            return ts.tz_convert(tz) if tz is not None else ts
         dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
 
         def _label(i):
@@ -3019,6 +3038,13 @@ class PlotSaverWorker(QThread):
             if not DISPLACEMENT_ENABLED and ev['behavior'] == 'displacement':
                 continue
             i, j = ev['start_frame'], ev['stop_frame']
+            # Prefer the true observation times bounding this bout over the
+            # lattice times, so start/stop are moments an animal was actually
+            # seen. Falls back to the lattice for a frame with no fixes.
+            t_i = ftimes[0][i] if ftimes is not None else -1
+            t_j = ftimes[1][j] if ftimes is not None else -1
+            ev_start = _as_local(t_i) if t_i > 0 else times[i]
+            ev_stop = _as_local(t_j) if t_j > 0 else times[j]
             sa, sb = _sex(ev['actor']), _sex(ev['target'])
             rows.append({
                 'behavior': ev['behavior'],
@@ -3026,10 +3052,13 @@ class PlotSaverWorker(QThread):
                 'target': _label(ev['target']),
                 'actor_sex': sa, 'target_sex': sb,
                 'dyad_type': ''.join(sorted((sa, sb))) if 'U' not in (sa, sb) else 'NA',
-                'start': times[i], 'stop': times[j],
-                # +1 frame: start and stop are both inclusive frame indices, so
-                # a single-frame bout lasts one sampling interval, not zero.
-                'duration_s': float((j - i + 1) * dt_s),
+                'start': ev_start, 'stop': ev_stop,
+                # Observed span between the true edge fixes. A single-frame
+                # bout is credited one sampling interval (the classifier's
+                # resolution) rather than the sub-second gap between two fixes,
+                # since that is genuinely how long the state was resolved for.
+                'duration_s': float(max((ev_stop - ev_start).total_seconds(),
+                                        (j - i + 1) * dt_s)),
             })
         if not rows:
             # Every bout was filtered out - all of them displacement,
@@ -3267,7 +3296,7 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, loc, soc, _events, _links = self._behavior_classification(data, tags)
+        grid, loc, soc, _events, _links, _ft = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping ethogram")
             return 0
@@ -3342,7 +3371,7 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, loc, soc, _events, _links = self._behavior_classification(data, tags)
+        grid, loc, soc, _events, _links, _ft = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping social budget")
             return False
@@ -3647,164 +3676,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"✓ Message log saved: {os.path.basename(log_path)}")
         except Exception as e:
             self.log_message(f"Warning: Could not save message log: {str(e)}")
-    
-    def save_run_summary(self, output_dir):
-        """Save run summary with filtering statistics to CSV"""
-        try:
-            from datetime import datetime
-            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            summary_path = os.path.join(output_dir, f"{db_name}_runSummary.csv")
-            
-            # Collect run parameters
-            summary_data = {
-                'Parameter': [],
-                'Value': []
-            }
-            
-            # General info
-            summary_data['Parameter'].append('FNT Version')
-            summary_data['Value'].append(get_fnt_version())
-
-            summary_data['Parameter'].append('Run Date')
-            summary_data['Value'].append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-
-            summary_data['Parameter'].append('Database')
-            summary_data['Value'].append(os.path.basename(self.db_path))
-            
-            summary_data['Parameter'].append('Table')
-            summary_data['Value'].append(self.table_name)
-            
-            summary_data['Parameter'].append('Timezone')
-            summary_data['Value'].append(self.combo_timezone.currentText())
-            
-            # Selected tags
-            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
-            summary_data['Parameter'].append('Selected Tags')
-            summary_data['Value'].append(', '.join([str(t) for t in selected_tags]))
-            
-            # Thresholding settings (pre-smoothing outlier rejection)
-            summary_data['Parameter'].append('Velocity Threshold Enabled')
-            summary_data['Value'].append('Yes' if self.chk_velocity_filter.isChecked() else 'No')
-
-            if self.chk_velocity_filter.isChecked():
-                summary_data['Parameter'].append('Velocity Threshold (m/s)')
-                summary_data['Value'].append(self.spin_velocity_threshold.value())
-
-            summary_data['Parameter'].append('Jump Threshold Enabled')
-            summary_data['Value'].append('Yes' if self.chk_jump_filter.isChecked() else 'No')
-
-            if self.chk_jump_filter.isChecked():
-                summary_data['Parameter'].append('Jump Threshold (m)')
-                summary_data['Value'].append(self.spin_jump_threshold.value())
-
-            summary_data['Parameter'].append('Time Gap Threshold (s)')
-            summary_data['Value'].append(self.spin_time_gap.value())
-            
-            # Smoothing settings
-            summary_data['Parameter'].append('Smoothing')
-            summary_data['Value'].append(self.combo_smoothing.currentText())
-
-            smoothing_method = self.get_smoothing_method()
-            if smoothing_method in ("Rolling Average", "Rolling Median"):
-                unit = "s" if self.combo_window_units.currentText() == "Seconds" else "samples"
-                summary_data['Parameter'].append('Smoothing Window')
-                summary_data['Value'].append(f"{self.spin_rolling_window.value()} {unit}")
-            elif smoothing_method == "Forward-Backward Exponentially Weighted Moving Average":
-                summary_data['Parameter'].append('EWMA Span (samples)')
-                summary_data['Value'].append(self.spin_rolling_window.value())
-
-            # Filtering statistics (if available)
-            if hasattr(self, 'filter_stats') and self.filter_stats:
-                summary_data['Parameter'].append('')
-                summary_data['Value'].append('')
-                
-                summary_data['Parameter'].append('--- Filtering Statistics (all tags) ---')
-                summary_data['Value'].append('')
-
-                summary_data['Parameter'].append('Tags Processed')
-                summary_data['Value'].append(self.filter_stats.get('tags_processed', 'N/A'))
-
-                summary_data['Parameter'].append('Initial Data Points')
-                summary_data['Value'].append(self.filter_stats.get('initial_count', 'N/A'))
-                
-                summary_data['Parameter'].append('Points Removed (Velocity)')
-                summary_data['Value'].append(self.filter_stats.get('removed_velocity', 0))
-                
-                summary_data['Parameter'].append('Points Removed (Jump)')
-                summary_data['Value'].append(self.filter_stats.get('removed_jump', 0))
-                
-                summary_data['Parameter'].append('Final Data Points')
-                summary_data['Value'].append(self.filter_stats.get('final_count', 'N/A'))
-                
-                summary_data['Parameter'].append('Percent Filtered')
-                summary_data['Value'].append(f"{self.filter_stats.get('percent_filtered', 0):.2f}%")
-            
-            # Export options
-            summary_data['Parameter'].append('')
-            summary_data['Value'].append('')
-            
-            summary_data['Parameter'].append('--- Export Options ---')
-            summary_data['Value'].append('')
-            
-            summary_data['Parameter'].append('Raw CSV Exported')
-            summary_data['Value'].append('Yes' if self.chk_export_raw_csv.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Smoothed CSV Exported')
-            summary_data['Value'].append('Yes' if self.chk_export_smoothed_csv.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Plots Generated')
-            summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
-            
-            summary_data['Parameter'].append('Animation Generated')
-            summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
-
-            # All three social products share one contact criterion, so the
-            # threshold is recorded once and each file is listed separately.
-            thr = self.spin_proximity_threshold.value()
-            summary_data['Parameter'].append('Contact Threshold (centre-to-centre)')
-            summary_data['Value'].append(f'{thr} m')
-
-            summary_data['Parameter'].append('Proximity Bout CSV')
-            summary_data['Value'].append(
-                'Yes' if self.chk_proximity_detection.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Social GBI')
-            summary_data['Value'].append(
-                'Yes' if self.chk_export_gbi.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Social Edge List CSV')
-            if self.chk_export_edgelist.isChecked():
-                summary_data['Value'].append(
-                    f'Yes ({self.spin_el_window.value():g} h windows)')
-            else:
-                summary_data['Value'].append('No')
-            
-            summary_data['Parameter'].append('Zone/ROI Occupancy CSV')
-            if self.chk_export_zone_occupancy.isChecked():
-                # Name the sources: "Yes" alone cannot say whether the XML
-                # zones, the drawn regions or both were measured, and that is
-                # exactly what a reader of the occupancy file needs to know.
-                labels = {'zone': 'site XML zones', 'roi': 'drawn regions'}
-                counts = ', '.join(f'{len(r)} {labels[c]}'
-                                   for c, r in self.region_sets())
-                summary_data['Value'].append(
-                    f'Yes ({counts})' if counts else 'Yes (nothing to measure)')
-            else:
-                summary_data['Value'].append('No')
-
-            summary_data['Parameter'].append('Occupancy Sources Selected')
-            picked = [n for n, cb in (('site XML zones', self.chk_occ_xml_zones),
-                                      ('drawn regions', self.chk_occ_rois))
-                      if cb.isChecked()]
-            summary_data['Value'].append(', '.join(picked) or 'none')
-
-            # Create DataFrame and save
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_csv(summary_path, index=False)
-            
-            self.log_message(f"✓ Run summary saved: {os.path.basename(summary_path)}")
-        except Exception as e:
-            self.log_message(f"Warning: Could not save run summary: {str(e)}")
     
     def initUI(self):
         self.setWindowTitle("UWB PreProcessing Tool")
@@ -4269,10 +4140,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # within 2x the social radius set in the preview. Ticking either social
         # product runs the proximity computation whether or not the bouts CSV
         # itself is written.
-        self.chk_proximity_detection = QCheckBox("Export Proximity Bout CSV")
+        self.chk_proximity_detection = QCheckBox("Export Social Overlap Bouts CSV")
         self.chk_proximity_detection.setChecked(True)
         self.chk_proximity_detection.setToolTip(
-            "FILE: {db}_proximity_bouts.csv\n"
+            "FILE: {db}_SocialOverlapBouts.csv\n"
             "\n"
             "One row per dyad per contiguous contact bout: animal1, animal2, "
             "bout_start, bout_stop, duration_s, mean_distance, n_obs, Day, "
@@ -6137,7 +6008,15 @@ class UWBQuickVisualizationWindow(QWidget):
         row, self.spin_social_radius = _beh_spin(
             "Social radius:", 0.01, 5.0, 0.25, 0.05, 2, " m",
             "Radius of each animal's social circle. Overlap (contact) occurs "
-            "when two circles intersect, i.e. centre-to-centre <= 2x this.")
+            "when two circles intersect, i.e. centre-to-centre <= 2x this.\n"
+            "\n"
+            "This is the single source of truth for contact across every social "
+            "product: the Social Overlap Bouts CSV, the GBI and the edge list "
+            "are all computed at centre-to-centre <= 2x this radius.")
+        # Keep the hidden export mirror (centre-to-centre threshold) in step as
+        # soon as the radius changes, so the UI, fnt_config.json and the
+        # exported data can never disagree about the contact criterion.
+        self.spin_social_radius.valueChanged.connect(self._sync_export_from_preview)
         lab_col = QLabel("colour:")
         lab_col.setStyleSheet("font-size: 9px;")
         row.insertWidget(2, lab_col)
@@ -7336,7 +7215,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # smooth (see _filter_and_smooth: thresholding velocity on the
             # smoothed track was tried and produced a jumpy result).
             # collect_stats=False: preview scrubbing must not overwrite the
-            # figures an export writes into runSummary.csv. Preview uses its own
+            # filter_stats an export records in fnt_config.json. Preview uses its own
             # Smoothing Window / units so the effect can be tuned live,
             # independent of the Export Options values.
             g = self._step_columns(g, prefix='pre_', x_col='raw_x', y_col='raw_y')
@@ -11509,6 +11388,11 @@ class UWBQuickVisualizationWindow(QWidget):
             # Anchor/antenna positions, zones, scale and map extent from the
             # site XML (all in meters); None when no XML was detected.
             'xml_config': self.xml_config_summary(),
+            # Outcome of this run's threshold filtering, summed across every
+            # tag processed (previously the only non-redundant content of
+            # runSummary.csv). None until an export has actually filtered.
+            'filter_stats': (dict(self.filter_stats)
+                             if getattr(self, 'filter_stats', None) else None),
             # Live-preview display/analysis settings. Nested under one key so
             # they are clearly NOT part of the export's reproducibility record —
             # nothing here affects exported data — while still surviving a
@@ -12411,7 +12295,7 @@ class UWBQuickVisualizationWindow(QWidget):
         data, remap = worker.merge_tag_data(data)
         if remap:
             tags = [t for t in tags if t not in remap]
-        grid, loc, soc, _events, links = worker._behavior_classification(
+        grid, loc, soc, _events, links, _ft = worker._behavior_classification(
             data, tags, hz=hz, collect_links=True)
         if grid is None:
             return None
@@ -13988,7 +13872,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if export_smoothed_csv:
             predicted_files.append(f'{db_name}_smoothed.csv')
         if detect_proximity:
-            predicted_files.append(f'{db_name}_proximity_bouts.csv')
+            predicted_files.append(f'{db_name}_SocialOverlapBouts.csv')
         if export_edgelist:
             predicted_files.append(self._edgelist_filename(db_name))
         if export_gbi:
@@ -14093,7 +13977,16 @@ class UWBQuickVisualizationWindow(QWidget):
         # interactive — so clicking the controls mid-export can't change a render
         # already queued. Everything downstream reads this snapshot, not widgets.
         self._anim_settings = self._snapshot_anim_settings()
-        
+
+        # Pull the preview's live values onto the hidden export mirrors BEFORE
+        # reading any of them. The preview is the single source of truth, but
+        # its widgets are wired only to redraw (e.g. Social radius ->
+        # render_preview_frame), so without this the mirrors can still hold the
+        # values from whenever they were last synced — and the proximity/social
+        # products would silently be computed at a stale contact threshold
+        # while fnt_config.json recorded the new one.
+        self._sync_export_from_preview()
+
         # Gather export settings
         db_dir = os.path.dirname(self.db_path)
         db_filename = os.path.basename(self.db_path)
@@ -14570,9 +14463,11 @@ class UWBQuickVisualizationWindow(QWidget):
             self._export_sitemap(output_dir, db_name)
             self.save_config(output_dir)
 
-            # Save message log and run summary
+            # Save the message log. There is no separate runSummary.csv: every
+            # setting it listed already lives in fnt_config.json, and the one
+            # thing it uniquely carried - the filtering statistics - is now a
+            # 'filter_stats' block in that same JSON.
             self.save_message_log(output_dir)
-            self.save_run_summary(output_dir)
             
             # Detect proximity bouts if requested
             # Proximity is the source for the social-network products, so run it
@@ -14633,7 +14528,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
                         # Export proximity bouts (only when explicitly requested)
                         if detect_proximity:
-                            bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
+                            bouts_path = os.path.join(output_dir, f'{db_name}_SocialOverlapBouts.csv')
                             if skip_existing and os.path.exists(bouts_path):
                                 self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
                             else:

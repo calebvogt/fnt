@@ -82,8 +82,16 @@ def build_edgelist(proximity_bouts, tag_identities=None, window_hours=24.0):
     hours = float(window_hours) if window_hours and window_hours > 0 else 24.0
     sexmap = _label_sex_map(tag_identities)
     b = proximity_bouts.copy()
+    # Parse via UTC (a recording crossing DST carries two offsets, which would
+    # otherwise yield an object column), then return to the recording's own
+    # timezone. Windows are anchored to clock boundaries, so this is what makes
+    # a 24 h window a LOCAL day: parsed as UTC the day would break at UTC
+    # midnight, splitting a night's activity across two rows.
     b['bout_start'] = pd.to_datetime(b['bout_start'], errors='coerce', utc=True)
     b = b.dropna(subset=['bout_start'])
+    _tz = _series_tz(proximity_bouts.get('bout_start'))
+    if _tz is not None:
+        b['bout_start'] = b['bout_start'].dt.tz_convert(_tz)
     if b.empty:
         return pd.DataFrame(columns=cols)
 
@@ -158,24 +166,33 @@ def build_gbi(events, tag_identities=None, gap_s=5, min_group=2):
         return pd.DataFrame(columns=meta_cols)
 
     all_animals = sorted(set(events['animal1']) | set(events['animal2']))
-    prox = events.loc[events['in_proximity'],
-                      ['timestamp', 'animal1', 'animal2', 'Day']]
+    # ts_first/ts_last carry the true millisecond evidence window for each 1 s
+    # pairing bin (see detect_proximity_bouts). Grouping still happens on the
+    # bin — that is what makes animals co-occur — but the reported group edges
+    # come from the real fixes, so no precision is thrown away.
+    has_ms = {'ts_first', 'ts_last'}.issubset(events.columns)
+    keep = ['timestamp', 'animal1', 'animal2', 'Day'] + (
+        ['ts_first', 'ts_last'] if has_ms else [])
+    prox = events.loc[events['in_proximity'], keep]
     if prox.empty:
         return pd.DataFrame(columns=meta_cols + all_animals)
 
     # Per timestamp: connected components -> one record per group (>= min_group).
-    recs = []   # (timestamp, day, key, members-tuple)
+    recs = []   # (bin_ts, true_first, true_last, day, key, members-tuple)
     for ts, g in prox.groupby('timestamp', sort=True):
         day = g['Day'].iloc[0]
+        t_first = g['ts_first'].min() if has_ms else ts
+        t_last = g['ts_last'].max() if has_ms else ts
         for members in _components_at(g['animal1'].to_numpy(),
                                       g['animal2'].to_numpy()):
             if len(members) >= min_group:
                 mt = tuple(sorted(members))
-                recs.append((ts, day, '|'.join(mt), mt))
+                recs.append((ts, t_first, t_last, day, '|'.join(mt), mt))
     if not recs:
         return pd.DataFrame(columns=meta_cols + all_animals)
 
-    r = pd.DataFrame(recs, columns=['ts', 'day', 'key', 'members'])
+    r = pd.DataFrame(recs, columns=['ts', 't_first', 't_last', 'day',
+                                    'key', 'members'])
     r = r.sort_values(['key', 'ts']).reset_index(drop=True)
 
     # Run-length encode each group signature into contiguous events.
@@ -185,11 +202,14 @@ def build_gbi(events, tag_identities=None, gap_s=5, min_group=2):
     r['seg'] = new_seg.groupby(r['key']).cumsum()
 
     ev = (r.groupby(['key', 'seg'], sort=False)
-            .agg(group_start=('ts', 'min'), group_stop=('ts', 'max'),
+            .agg(group_start=('t_first', 'min'), group_stop=('t_last', 'max'),
                  day=('day', 'first'), members=('members', 'first'))
             .reset_index())
+    # True observed span, not clipped to a 1 s floor (matching the bouts CSV):
+    # a flock seen in a single bin spans only the milliseconds between its
+    # supporting fixes, and rounding that up to a second overstated group time.
     ev['duration_s'] = ((ev['group_stop'] - ev['group_start'])
-                        .dt.total_seconds().clip(lower=1))
+                        .dt.total_seconds())
 
     # 0/1 membership matrix + sex sums.
     mat = np.zeros((len(ev), len(all_animals)), dtype=int)
@@ -217,6 +237,26 @@ def build_gbi(events, tag_identities=None, gap_s=5, min_group=2):
 
 
 # ── sliding-window dynamic network animation ─────────────────────────────────
+def _series_tz(s):
+    """Timezone of a bout-time column, whether it arrives parsed or as strings.
+
+    The bouts frame reaches build_edgelist either straight from
+    detect_proximity_bouts (already tz-aware) or re-read from CSV (ISO strings
+    carrying an offset). Both need to keep local time so day windows break at
+    local midnight.
+    """
+    if s is None or len(s) == 0:
+        return None
+    tz = getattr(getattr(s, 'dt', None), 'tz', None)
+    if tz is not None:
+        return tz
+    try:
+        parsed = pd.to_datetime(s.iloc[:200], errors='coerce')
+        return getattr(getattr(parsed, 'dt', None), 'tz', None)
+    except Exception:
+        return None
+
+
 def _ensure_dt(s):
     """Parse to UTC then drop tz, so numpy datetime64 comparisons are clean."""
     out = pd.to_datetime(s, utc=True, errors='coerce')
