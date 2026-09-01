@@ -42,7 +42,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
             timestamp, Day, Date, animal1, animal2, distance, in_proximity
         proximity_bouts columns:
             animal1, animal2, Day, Date, bout_start, bout_stop,
-            duration_s, mean_distance, n_observations
+            duration_s, mean_distance, n_reads
     """
     def _log(msg):
         if log_callback:
@@ -123,7 +123,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return empty_events, empty_bouts
 
     _log(f"Computing pairwise distances for {len(animals)} animals "
@@ -183,7 +183,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return empty_events, empty_bouts
 
     proximity_events = pd.concat(events_list, ignore_index=True)
@@ -207,7 +207,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return proximity_events, empty_bouts
 
     prox_only = prox_only.sort_values(['animal1', 'animal2', 'timestamp'])
@@ -235,7 +235,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         bout_start=('ts_first', 'min'),
         bout_stop=('ts_last', 'max'),
         mean_distance=('distance', 'mean'),
-        n_observations=('distance', 'count'),
+        n_reads=('distance', 'count'),
         Day=('Day', 'first'),
         Date=('Date', 'first')
     ).reset_index()
@@ -243,7 +243,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     # Observed duration at full resolution. Deliberately NOT clipped to a 1 s
     # floor as the original R port was: a bout supported by a single pair of
     # near-simultaneous fixes genuinely spans only milliseconds, and rounding it
-    # up to a second overstated contact time. Sum n_observations instead if a
+    # up to a second overstated contact time. Sum n_reads instead if a
     # sampling-interval-weighted budget is wanted.
     proximity_bouts['duration_s'] = (
         proximity_bouts['bout_stop'] - proximity_bouts['bout_start']
@@ -252,7 +252,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     # Select and order columns to match VoleCosm schema
     proximity_bouts = proximity_bouts[
         ['animal1', 'animal2', 'Day', 'Date', 'bout_start', 'bout_stop',
-         'duration_s', 'mean_distance', 'n_observations']
+         'duration_s', 'mean_distance', 'n_reads']
     ].sort_values(['animal1', 'animal2', 'bout_start']).reset_index(drop=True)
 
     # Present Date as a plain calendar date, matching the previous output.

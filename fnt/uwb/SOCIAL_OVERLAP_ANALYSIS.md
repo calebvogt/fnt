@@ -27,7 +27,11 @@ definition better owned by the analysis.
 | `bout_stop` | Last real fix |
 | `duration_s` | `bout_stop − bout_start`, full millisecond resolution |
 | `mean_distance` | Mean centre-to-centre distance over the bout, metres |
-| `n_observations` | Number of 1 s pairing bins supporting the bout |
+| `n_reads` | Number of 1 s pairing bins supporting the bout |
+
+A bout spanning a single instant reports `duration_s` 0.0 with `n_reads` 1 —
+the same lone-read convention the ROI files use. `duration_s` is always
+`bout_stop − bout_start`, with no exceptions in any file.
 
 ---
 
@@ -55,7 +59,7 @@ which carries only `mean_distance` per bout, not per-instant distances.
 
 **5. `duration_s` is exact, not floored.** A bout supported by a single pair of
 near-simultaneous fixes genuinely spans milliseconds. If you want a
-sampling-interval-weighted budget instead, sum `n_observations`.
+sampling-interval-weighted budget instead, sum `n_reads`.
 
 ---
 

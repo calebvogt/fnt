@@ -195,12 +195,65 @@ _KNOWN_EXPORT_DIRS = ('plots', 'animation_Tracking', 'animation_SocialNetworks',
 CSV_SUBDIR = 'csvs'
 
 
+def ensure_dir(path, attempts=12, delay=0.25):
+    """Create a directory, tolerating a delete that has not landed yet.
+
+    On a NETWORK SHARE a removed directory lingers in a pending-delete state
+    until every handle closes. CreateDirectory then fails with ERROR_ALREADY
+    EXISTS while os.path.isdir() reports False, so makedirs(exist_ok=True)
+    re-raises rather than succeeding - and Clear & Re-export, which deletes
+    this very folder moments earlier, walks straight into it.
+
+    Retries briefly instead of failing the export over a race that resolves
+    itself in well under a second.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.path.isdir(path):
+                return path
+        except OSError as e:
+            last = e
+        time.sleep(delay * (i + 1))
+        if os.path.isdir(path):
+            return path
+    if last is not None:
+        raise last
+    raise OSError(f"could not create {path}")
+
+
 def csv_output_dir(output_dir, create=False):
     """The folder CSV products are written to."""
     path = os.path.join(output_dir, CSV_SUBDIR)
     if create:
-        os.makedirs(path, exist_ok=True)
+        ensure_dir(path)
     return path
+
+
+def check_dir_usable(path):
+    """Why ``path`` cannot serve as an output folder, or None if it can.
+
+    Creating and writing a file is not enough: a directory can accept writes
+    while refusing to be ENUMERATED, which is the state a network share can
+    leave one in after a delete that did not complete. Everything still
+    exports, but the folder can never be cleared again, so each run's output
+    silently accumulates on the last one's.
+
+    Checked before a long export rather than after, because finding out at the
+    end costs the whole run.
+    """
+    if not os.path.isdir(path):
+        return None
+    try:
+        os.listdir(path)
+    except OSError as e:
+        return (f"{path} cannot be listed ({e.strerror or e}). It still "
+                f"accepts files, so an export would appear to work - but it "
+                f"can never be cleared, and old products would survive beside "
+                f"the new ones looking identical. Delete this folder in "
+                f"Explorer; the next export recreates it.")
+    return None
 
 
 def export_csv_path(output_dir, filename, create=False):
@@ -275,7 +328,23 @@ def clear_analysis_folder(folder, log=None):
         full = os.path.join(folder, name)
         try:
             if is_dir:
-                shutil.rmtree(full)
+                # EMPTIED, not removed. Deleting a directory and recreating it
+                # moments later races on a network share, where the removal is
+                # pending until every handle closes - which is exactly what
+                # Clear & Re-export does to csvs/. Leaving the (now empty)
+                # directory in place removes the race entirely.
+                entries = os.listdir(full)
+                if not entries:
+                    # Already empty, so there is nothing to clear and nothing
+                    # to report: a second clear must be a genuine no-op, not a
+                    # count of the directories the first one left behind.
+                    continue
+                for entry in entries:
+                    child = os.path.join(full, entry)
+                    if os.path.isdir(child):
+                        shutil.rmtree(child)
+                    else:
+                        os.remove(child)
             else:
                 os.remove(full)
             removed += 1
@@ -285,8 +354,18 @@ def clear_analysis_folder(folder, log=None):
     if log:
         log(f"Cleared {removed} item(s) from "
             f"{os.path.basename(folder)} ({human_bytes(freed)} freed)")
-        for f in failures:
-            log(f"  could not remove {f}")
+        if failures:
+            # A clear that did not clear is not a detail. Whatever survived is
+            # about to sit beside this run's output looking exactly like it,
+            # and a product this run does not write would be read as if it did.
+            log(f"  ⚠ CLEAR INCOMPLETE - {len(failures)} item(s) could "
+                f"NOT be removed:")
+            for f in failures:
+                log(f"      {f}")
+            log("      Files left behind are from an EARLIER run. Anything "
+                "this export does not overwrite will survive and look "
+                "current. Delete the folder by hand before trusting a "
+                "product this run did not write.")
     return removed, freed, failures
 
 
@@ -316,7 +395,7 @@ SOCIAL_BOUTS_TOOLTIP = (
     "\n"
     "THE social product. One row per dyad per contiguous contact bout: "
     "animal1, animal2, Day, Date, bout_start, bout_stop, duration_s, "
-    "mean_distance, n_observations.\n"
+    "mean_distance, n_reads.\n"
     "\n"
     "CONTACT = centres within 2x the social radius (the preview's dotted "
     "circles overlapping). Measured on the filtered and smoothed track at "
@@ -343,18 +422,22 @@ SOCIAL_BOUTS_TOOLTIP = (
 ROI_BOUTS_TOOLTIP = (
     "FILE: {db}_ROI_bout_occupancy.csv\n"
     "\n"
-    "One row per VISIT: a run of consecutive fixes inside one drawn region. "
-    "Columns: SexID, Day, ROI, bout_start, bout_stop, duration_s.\n"
+    "One row per VISIT: a run of consecutive reads inside one drawn region. "
+    "Columns: SexID, Day, ROI, bout_start, bout_stop, duration_s, n_reads.\n"
     "\n"
     "STRICT. A single fix outside the region ends the bout, and the next fix "
     "back inside starts a new one. Nothing is bridged, no dropout is filled "
     "in, and no duration is rounded — millisecond edges throughout.\n"
     "\n"
-    "A LONE FIX inside a region reports identical bout_start and bout_stop "
-    "and is credited exactly 1.0 s. Its real span cannot be observed, and "
-    "crediting it zero would drop a genuine visit from every total. Those "
-    "rows are the one place duration_s is NOT bout_stop - bout_start, so do "
-    "not recompute the column downstream.\n"
+    "A LONE READ inside a region reports identical bout_start and bout_stop "
+    "and duration 0.0 s, with n_reads = 1. That is what was observed: the "
+    "visit is real but its length is not measurable from a single read. So "
+    "duration_s IS bout_stop - bout_start on every row without exception, "
+    "occupancy totals are a strict LOWER BOUND on the truth, and n_reads is "
+    "what tells you how much evidence stands behind a row.\n"
+    "\n"
+    "Count entrances with the ROW COUNT, not with time — a lone-read visit "
+    "adds 1 to the count and 0 to the seconds.\n"
     "\n"
     "NOT SPLIT AT MIDNIGHT. A bout that crosses midnight stays one row and "
     "Day is the day it STARTED. Splitting would destroy the difference "
@@ -375,7 +458,12 @@ ROI_DAILY_TOOLTIP = (
     "\n"
     "Who held each region, each day. One row per animal per region per day, "
     "for animals that actually entered it. Columns: SexID, Day, ROI, "
-    "total_ROI_time_s, focal_ROI_time_s, focal_ROI_perc_time, rank_order.\n"
+    "total_ROI_time_s, focal_ROI_time_s, focal_ROI_perc_time, rank_order, "
+    "n_reads.\n"
+    "\n"
+    "A row may show 0 s with n_reads ≥ 1: the animal was there, in lone reads "
+    "whose duration cannot be measured. Ranking is by TIME, so those rows sit "
+    "last — n_reads is how you see them at all.\n"
     "\n"
     "total_ROI_time_s is EVERY animal's time in that region that day, so "
     "focal_ROI_perc_time is a share of the region's whole traffic and "
@@ -461,11 +549,27 @@ ADJACENCY_FILTER_TOOLTIP = (
     "sensibly without it — the test that separates a ghost from an animal "
     "that really went somewhere.\n"
     "\n"
-    "The value is how long a run may be and still count as an excursion. "
-    "Anything longer is left in place and reported instead, because deleting "
-    "minutes of data on a guess is worse than saying the track is broken "
-    "there. Judged on SPEED, not distance: 7 m in half a second is a "
-    "teleport, 7 m in a minute is a walk."
+    "WHAT THE NUMBER MEANS. It is a LENGTH LIMIT on what may be deleted, not "
+    "a detection threshold. A stranded run SHORTER than this many seconds is "
+    "removed; a run LONGER is kept and reported. Raising it deletes more; "
+    "lowering it deletes less and leaves more flagged.\n"
+    "\n"
+    "Nothing is deleted for merely being long. A run is only ever removed "
+    "when the join into it is impossible AND the track reads sensibly once "
+    "it is gone. The seconds are the cap on how much evidence may be "
+    "discarded on that judgement, because deleting minutes of data on an "
+    "inference is worse than saying the track is broken there and letting "
+    "you look.\n"
+    "\n"
+    "Judged on SPEED, not distance: 7 m in half a second is a teleport, 7 m "
+    "in a minute is a walk.\n"
+    "\n"
+    "HOW MANY IT TAKES is in the threshold read-out under the preview, on "
+    "its own Excursion row. Expect it to remove MORE than the three tests "
+    "above on a tag with long ghost runs - those tests strand the runs, this "
+    "one clears them. If the read-out still warns that the largest remaining "
+    "step exceeds the jump threshold, this filter looked at that join and "
+    "declined: the run was longer than the seconds set here."
 )
 
 OUTLIER_FILTER_TOOLTIP = (
@@ -683,6 +787,20 @@ def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
     if layers.get('anchors') and anchors:
         ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+
+
+def _dyad_type(sex_a, sex_b):
+    """MM / FF / MF / NA for a pair of sexes.
+
+    Mixed pairs are ALWAYS 'MF'. Sorting the two letters would yield 'FM',
+    which is not the convention used elsewhere and would silently break a
+    downstream filter written against 'MF'.
+    """
+    a = str(sex_a or 'U')[:1].upper()
+    b = str(sex_b or 'U')[:1].upper()
+    if 'U' in (a, b) or a not in 'MF' or b not in 'MF':
+        return 'NA'
+    return a + b if a == b else 'MF'
 
 
 def is_network_path(path):
@@ -2325,8 +2443,8 @@ class PlotSaverWorker(QThread):
             plots_dir = self.plots_dir if self.plots_dir else os.path.join(output_dir, 'plots')
 
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            os.makedirs(output_dir, exist_ok=True)
-            os.makedirs(plots_dir, exist_ok=True)
+            ensure_dir(output_dir)
+            ensure_dir(plots_dir)
             
             # Generate and save plots based on selection
             generated_count = 0
@@ -3714,7 +3832,11 @@ class PlotSaverWorker(QThread):
                 'actor': _label(ev['actor']),
                 'target': _label(ev['target']),
                 'actor_sex': sa, 'target_sex': sb,
-                'dyad_type': ''.join(sorted((sa, sb))) if 'U' not in (sa, sb) else 'NA',
+                # MM / FF / MF / NA. Mixed is always 'MF', never 'FM':
+                # sorting the two letters would give 'FM', which is not the
+                # convention the rest of the work uses and would make a
+                # downstream filter on "MF" match nothing at all.
+                'dyad_type': _dyad_type(sa, sb),
                 'bout_start': ev_start, 'bout_stop': ev_stop,
                 # Observed span between the true edge fixes. A single-frame
                 # bout is credited one sampling interval (the classifier's
@@ -5307,6 +5429,10 @@ class UWBQuickVisualizationWindow(QWidget):
         _anim_show_box(
             'chk_anim_data_view', "Data View (live ROI counters)",
             DATA_VIEW_TOOLTIP)
+        # Hidden until a region exists, and set HERE as well as in
+        # on_rois_changed: a freshly opened window has not had a region change
+        # yet, so without this the option would show on a trial with none.
+        self.chk_anim_data_view.setVisible(bool(getattr(self, 'rois', None)))
 
         _anim_show_box(
             'chk_anim_show_trail', "Show trail",
@@ -8028,7 +8154,36 @@ class UWBQuickVisualizationWindow(QWidget):
         cut_o = (dev > sig) & np.isfinite(dev) if on_o else np.zeros(n, bool)
         cut_v = (eff_speed > vthr) & ~cut_o if on_v else np.zeros(n, bool)
         cut_j = (step > jthr) & ~cut_o & ~cut_v if on_j else np.zeros(n, bool)
-        kept = ~(cut_o | cut_v | cut_j)
+        # The excursion pass, run here for real rather than described. It is
+        # the LAST filter and it works on what the other three left behind, so
+        # reporting the first three alone understates the export badly - on a
+        # tag with a long run of bad fixes this pass removes more than all of
+        # them together.
+        first_pass = ~(cut_o | cut_v | cut_j)
+        # Gated exactly as the EXPORT gates it (see apply_filters_to_data):
+        # excursion re-tests the joins that velocity and jump removals create,
+        # so with both of those off it has no test to apply and never runs.
+        # A row here in that case would promise a pass the export skips.
+        on_a = self.chk_preview_adjacency.isChecked() and (on_v or on_j)
+        if on_a and n > 2:
+            # A seconds clock rebuilt from the intervals the pool carries.
+            # resolve_adjacency only ever differences times WITHIN a group, so
+            # a single running clock is enough - the group boundaries it must
+            # not cross are handed to it separately.
+            _newgrp = np.empty(n, bool)
+            _newgrp[0] = True
+            _newgrp[1:] = pgrp[1:] != pgrp[:-1]
+            pt = np.cumsum(np.where(_newgrp, 0.0, np.nan_to_num(gap, nan=0.0)))
+            adj_keep, _n_adj, adj_converged = resolve_adjacency(
+                pt, px, py, first_pass, group=pgrp,
+                v_thresh=vthr if on_v else None, min_dt=min_dt,
+                j_thresh=jthr if on_j else None,
+                max_excursion_s=self.spin_preview_excursion.value())
+            cut_a = first_pass & ~adj_keep
+        else:
+            cut_a = np.zeros(n, bool)
+            adj_converged = True
+        kept = first_pass & ~cut_a
         # What the surviving track is supposed to respect. With the jump
         # threshold off there is no claim to check, so nothing is flagged.
         worst_step_limit = jthr if on_j else float('inf')
@@ -8066,11 +8221,20 @@ class UWBQuickVisualizationWindow(QWidget):
         if on_j:
             rows.append(("Jump", "> {:g} m".format(jthr), cut_j,
                          "median {:.2f} m".format(_median(step, cut_j))))
+        if on_a:
+            # Says what it DOES, not what it is named: these points survived
+            # the three tests above and only became impossible once their
+            # neighbours were removed and the track closed up around them.
+            rows.append(("Excursion",
+                         "runs < {:g} s stranded by the above".format(
+                             self.spin_preview_excursion.value()),
+                         cut_a,
+                         "re-tested after removal closed the gaps"))
         if not rows:
             lines.append("  none enabled \u2014 every point is kept")
         else:
             for name, spec, mask, tail in rows:
-                lines.append("  {:<9} {:<26} {:>7,} removed ({:>5.1f}%)   {}"
+                lines.append("  {:<10} {:<34} {:>7,} removed ({:>5.1f}%)   {}"
                              .format(name, spec, int(mask.sum()),
                                      pct(mask.sum()),
                                      tail if mask.any() else ""))
@@ -8102,12 +8266,29 @@ class UWBQuickVisualizationWindow(QWidget):
                          "(largest before filtering {:.2f} m)"
                          .format(worst_after, worst_before))
             if np.isfinite(worst_after) and worst_after > worst_step_limit:
-                # The filters cut the points either side of a bad stretch and
-                # then join what is left; nothing re-tests that join.
+                if on_a:
+                    # Excursion IS the re-test, so when it is on and a long
+                    # stride survives, that is the filter declining to delete
+                    # rather than nobody having looked.
+                    lines.append(
+                        "     ⚠ exceeds the {:.2f} m jump threshold. Excursion "
+                        "re-tested this join and did NOT cut it: the run is "
+                        "longer than {:g} s, so it is treated as a real "
+                        "relocation, not a glitch. Raise the excursion seconds "
+                        "to remove longer runs.".format(
+                            worst_step_limit,
+                            self.spin_preview_excursion.value()))
+                else:
+                    lines.append(
+                        "     ⚠ exceeds the {:.2f} m jump threshold — removing "
+                        "a point makes its neighbours adjacent, and with "
+                        "Excursion OFF that new step is never re-tested. Tick "
+                        "Excursion threshold to test it.".format(
+                            worst_step_limit))
+            if on_a and not adj_converged:
                 lines.append(
-                    "     ⚠ exceeds the {:.2f} m jump threshold — removing a "
-                    "point makes its neighbours adjacent, and that new step is "
-                    "not re-tested".format(worst_step_limit))
+                    "     ⚠ excursion did not settle within its pass limit — "
+                    "the track may still contain an untested join")
         lines.append("")
         lines.append("IN VIEW  reporting every {:.2f} s (median) \u00b7 steps: "
                      "half below {:.2f} m, 99th {:.2f} m, largest {:.2f} m"
@@ -8905,7 +9086,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # each fix its sampling interval instead - what this used to do -
             # ran exactly one second per visit ahead of the CSV.
             t_ns = ts.values.astype('datetime64[ns]').astype('int64')
-            for r_i, t0, t1, secs in RB.region_bouts(zi, t_ns):
+            for r_i, t0, t1, secs, _n in RB.region_bouts(zi, t_ns):
                 by_animal.setdefault((label, r_i), []).append(
                     (t0 / 1e9, t1 / 1e9, secs))
             if label not in seen:
@@ -9231,19 +9412,19 @@ class UWBQuickVisualizationWindow(QWidget):
         # nothing to show, like the other layer toggles, and the occupancy
         # source list gains or loses the drawn-regions option with it.
         self._sync_layer_toggles()
-        # The Data View counts time in regions, so with none drawn there is
-        # nothing for it to count. Greying it out says that, where an enabled
-        # box that quietly produces no panel does not.
+        # The Data View counts time in regions, so with none drawn it is not
+        # an option that happens to be unavailable - it is not an option at
+        # all. Hidden rather than greyed, matching the two ROI export boxes,
+        # which gate on the same thing.
         if hasattr(self, 'chk_anim_data_view'):
             has_rois = bool(self.rois)
-            self.chk_anim_data_view.setEnabled(has_rois)
+            self.chk_anim_data_view.setVisible(has_rois)
             if not has_rois:
+                # Cleared as well as hidden: unlike the ROI export settings
+                # this one is not carried in fnt_config.json, so there is no
+                # inherited intent to preserve - and a hidden box left ticked
+                # would ask the renderer for a panel with nothing to count.
                 self.chk_anim_data_view.setChecked(False)
-            self.chk_anim_data_view.setToolTip(
-                DATA_VIEW_TOOLTIP if has_rois else
-                "Draw at least one region of interest first — the Data View "
-                "counts time spent in regions, so with none drawn there is "
-                "nothing to count.")
         if hasattr(self, 'chk_export_roi_bouts'):
             self.on_zone_occupancy_toggled()
         # The row text carries the corner count and area, so a width or colour
@@ -9432,26 +9613,31 @@ class UWBQuickVisualizationWindow(QWidget):
         return out
 
     def on_zone_occupancy_toggled(self, _state=None):
-        """Say what the ROI exports will measure, or why they will measure nothing.
+        """Show the ROI exports only once there are regions to measure.
 
-        Both files come from the same visits and are ticked independently, so
-        the note appears when either is on.
+        HIDDEN, not greyed, when nothing is drawn: these two files measure
+        time spent in drawn regions, so with none drawn they are not an option
+        that happens to be unavailable, they are not an option at all. They
+        appear the moment a region is drawn or imported.
+
+        The CHECKED state is deliberately left alone while hidden. These are
+        analysis settings that ride along in fnt_config.json and are inherited
+        between trials, so clearing them here would silently turn ROI export
+        off for every later trial that DOES have regions.
         """
-        on = (self.chk_export_roi_bouts.isChecked()
-              or self.chk_export_roi_daily.isChecked())
+        regions = self.region_sets()
+        have_regions = bool(regions)
+        for cb in (self.chk_export_roi_bouts, self.chk_export_roi_daily):
+            cb.setVisible(have_regions)
+
+        # With the boxes gone there is nothing for the note to qualify, so it
+        # goes too; it only ever says what the visible boxes will measure.
+        on = have_regions and (self.chk_export_roi_bouts.isChecked()
+                               or self.chk_export_roi_daily.isChecked())
         self.occ_source_widget.setVisible(on)
-        if not on:
-            return
-        chosen = self.region_sets()
-        if chosen:
-            n = sum(len(r) for _c, r in chosen)
-            self.lbl_occ_sources.setText(
-                f"Measuring {n} drawn region(s).")
-        else:
-            self.lbl_occ_sources.setText(
-                "No regions drawn, so nothing will be measured. Draw them in "
-                "the preview, or import the site XML's zones with 'Import "
-                "XML' beside the region list.")
+        if on:
+            n = sum(len(r) for _c, r in regions)
+            self.lbl_occ_sources.setText(f"Measuring {n} drawn region(s).")
 
     def annotate_regions(self, frame, sets):
         """Add a name column per region set to ``frame``, in place.
@@ -9524,13 +9710,14 @@ class UWBQuickVisualizationWindow(QWidget):
         for column, regions in sets:
             names = [r.get('name', f'{column} {i + 1}')
                      for i, r in enumerate(regions)]
-            for r_i, t0, t1, secs in RB.region_bouts(idx[column], t_ns):
+            for r_i, t0, t1, secs, n_reads in RB.region_bouts(idx[column], t_ns):
                 rows.append({
                     'SexID': label,
                     'ROI': names[r_i],
                     'bout_start': _stamp(t0),
                     'bout_stop': _stamp(t1),
                     'duration_s': secs,
+                    'n_reads': int(n_reads),
                 })
         return rows
 
@@ -9569,6 +9756,38 @@ class UWBQuickVisualizationWindow(QWidget):
             return ''
         return os.path.splitext(os.path.basename(self.db_path))[0]
 
+    def log_audit(self, title, results):
+        """Log a product's self-check. Returns True if everything held.
+
+        Written so a clean export reads as a short list of ticks and a broken
+        one is impossible to skim past: a failure is prefixed, capitalised and
+        repeated in a summary line. These files feed statistics run days later,
+        where a silent error looks like biology.
+
+        ``results`` may be a callable, which is how a caller hands over the
+        checks WITHOUT risking the export on them: a bug in a check must never
+        cost the user the file it was verifying. A check that raises is
+        reported as an unrunnable check, not propagated.
+        """
+        if callable(results):
+            try:
+                results = results()
+            except Exception as e:
+                self.log_message(
+                    f"  ⚠ {title}: the self-check could not run ({e!r}). The "
+                    f"file itself is written and unaffected — this is a fault "
+                    f"in the CHECK, not evidence about the data.")
+                return False
+        bad = [m for ok, m in results if not ok]
+        self.log_message(f"  {title} — self-check:")
+        for ok, msg in results:
+            self.log_message(f"    {'✓' if ok else '✗ FAILED:'} {msg}")
+        if bad:
+            self.log_message(
+                f"  ⚠ {title}: {len(bad)} CHECK(S) FAILED — do NOT analyse "
+                f"this file until the cause is understood.")
+        return not bad
+
     def write_roi_bout_csv(self, rows, output_dir, db_name,
                            skip_existing=False):
         """Publish the per-visit bout list. Returns the path, or None."""
@@ -9594,11 +9813,22 @@ class UWBQuickVisualizationWindow(QWidget):
         df['_k'] = df['SexID'].map(RB.natural_animal_key)
         df = (df.sort_values(['_k', 'Day', 'bout_start'], kind='mergesort')
                 .drop(columns='_k').reset_index(drop=True))
-        df = df[['SexID', 'Day', 'ROI', 'bout_start', 'bout_stop', 'duration_s']]
+        df = df[['SexID', 'Day', 'ROI', 'bout_start', 'bout_stop', 'duration_s',
+                 'n_reads']]
+        # Audited on the FINISHED frame, not on the rows that build it: the
+        # checks cover Day and the row order, which do not exist until here.
+        self.log_audit(fname, lambda: RB.audit_bouts(df))
         df.to_csv(path, index=False)
         self.log_message(
             f"\u2713 Exported {fname} ({len(df)} bout(s), "
             f"{df['SexID'].nunique()} animal(s), {df['ROI'].nunique()} region(s))")
+        # Per-region time, so a region nobody used \u2014 or one drawn so large it
+        # swallowed the trial \u2014 is visible here rather than in R a week later.
+        per = (df.groupby('ROI')['duration_s'].agg(['count', 'sum'])
+                 .sort_values('sum', ascending=False))
+        for roi, r in per.iterrows():
+            self.log_message(f"      {roi}: {int(r['count']):,} visit(s), "
+                             f"{r['sum'] / 3600:,.2f} h")
         return path
 
     def write_roi_daily_summary_csv(self, rows, output_dir, db_name,
@@ -9614,9 +9844,14 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"Skipped (exists): {fname}")
             return path
 
-        summary = RB.daily_summary(RB.merge_animal_bouts(rows))
+        merged = RB.merge_animal_bouts(rows)
+        summary = RB.daily_summary(merged)
         if not summary:
             return None
+        # Audited against the very bouts it was derived from, so the
+        # reconciliation is checked on this trial's own numbers rather than
+        # assumed from the code being correct.
+        self.log_audit(fname, lambda: RB.audit_daily(summary, merged))
         df = pd.DataFrame(summary)
         df.to_csv(path, index=False)
         self.log_message(
@@ -11654,6 +11889,12 @@ class UWBQuickVisualizationWindow(QWidget):
         image ends up the wrong physical size even though its corner still sits
         at (0, 0). Comparing the image extent to the anchor bounding box makes
         that visible and suggests the scale that would fit.
+
+        The comparison is only DIAGNOSTIC when the anchors ring the tracked
+        area. On a rig whose anchors sit on a wall set back from the arena the
+        span exceeds the image by design, so a verdict is offered only when
+        both axes are off by the same factor - the signature of a real scale
+        error, which is uniform and therefore preserves aspect.
         """
         if self.background_image is None:
             return
@@ -11692,16 +11933,53 @@ class UWBQuickVisualizationWindow(QWidget):
                 rx = self.bg_width_meters / span_x
                 ry = self.bg_height_meters / span_y
                 self.log_message(
-                    f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f} "
-                    "(≈1.0–1.3 expected; far from 1 = image mis-scaled)")
-                if self.bg_scale:
-                    # Scale that would make the image span exactly the anchor
-                    # bbox (the true arena is a bit larger, so nudge from here).
+                    f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f}")
+                # A SCALE error is uniform, so it preserves aspect and moves
+                # both ratios together. Only then can one 'Bg scale' value fix
+                # it, and only then is suggesting one honest. Ratios that
+                # DISAGREE mean the image and the anchor box are different
+                # shapes, which a single scale cannot reconcile - and the
+                # ordinary cause is anchors mounted off the tracked area
+                # (a wall set back from the arena), where the span SHOULD
+                # exceed the image and nothing is wrong.
+                agree = abs(rx - ry) <= 0.15 * max(rx, ry)
+                if agree and not (0.9 <= rx <= 1.4):
                     self.log_message(
-                        f"  Scale to fit image to anchor span: x≈"
-                        f"{self.bg_scale / rx:.4f}, y≈{self.bg_scale / ry:.4f} in/px "
-                        f"(current {self.bg_scale:.4f}) — set via the Preview "
-                        "'Bg scale' control")
+                        "  Both axes are off by the same factor, which is what "
+                        "a mis-scaled image looks like (a re-rendered floorplan "
+                        "at a different resolution).")
+                    if self.bg_scale:
+                        self.log_message(
+                            f"  Scale to fit the anchor span: "
+                            f"≈{self.bg_scale / rx:.4f} in/px (current "
+                            f"{self.bg_scale:.4f}) — set via the Preview "
+                            "'Bg scale' control. The arena is usually a little "
+                            "larger than the anchor box, so nudge up from there.")
+                elif agree:
+                    self.log_message(
+                        "  Consistent on both axes and close to 1 — the "
+                        "image scale agrees with the anchors.")
+                else:
+                    # Deliberately NO scale suggestion here: the two axes want
+                    # different numbers, so any single one is wrong, and
+                    # entering it would break an alignment that may be correct.
+                    self.log_message(
+                        "  The axes disagree, so this is NOT a uniform scale "
+                        "error and no single 'Bg scale' can fix it. Expected "
+                        "when the anchors are not mounted around the tracked "
+                        "area — a wall set back from the arena makes the "
+                        "span exceed the image legitimately. Only treat it as "
+                        "a fault if your anchors DO ring the tracked area.")
+                if ext:
+                    out = []
+                    if ax0 < ext[0] or ax1 > ext[1]:
+                        out.append("x")
+                    if ay0 < ext[2] or ay1 > ext[3]:
+                        out.append("y")
+                    if out:
+                        self.log_message(
+                            f"  Anchors fall outside the image on {'/'.join(out)}"
+                            f" — expected if they are mounted off the arena.")
         else:
             self.log_message("  No anchors parsed — cannot cross-check the image scale.")
 
@@ -13583,7 +13861,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 if reply == QMessageBox.Yes:
                     moved = 0
                     if loose_plots:
-                        os.makedirs(plots_subdir, exist_ok=True)
+                        ensure_dir(plots_subdir)
                         for plot_file in loose_plots:
                             src = os.path.join(analysis_dir, plot_file)
                             dst = os.path.join(plots_subdir, plot_file)
@@ -13593,7 +13871,7 @@ class UWBQuickVisualizationWindow(QWidget):
                             except Exception as move_err:
                                 self.log_message(f"Warning: Could not move {plot_file}: {move_err}")
                     if loose_animations:
-                        os.makedirs(animations_subdir, exist_ok=True)
+                        ensure_dir(animations_subdir)
                         for anim_file in loose_animations:
                             src = os.path.join(analysis_dir, anim_file)
                             dst = os.path.join(animations_subdir, anim_file)
@@ -14227,7 +14505,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Resolve animations output directory
             if animations_dir is None:
                 animations_dir = os.path.join(output_dir, 'animation_Tracking')
-            os.makedirs(animations_dir, exist_ok=True)
+            ensure_dir(animations_dir)
 
             # Temp-frames folder was chosen up-front when Export was clicked
             # (see _prompt_animation_temp_dir); fall back to the default if the
@@ -14576,7 +14854,8 @@ class UWBQuickVisualizationWindow(QWidget):
         # defines them. The plot is skipped at the very end of the plot run,
         # so without this the queue looks like it is going to produce it.
         zone_cb = self.plot_type_checkboxes.get('zone_occupancy')
-        if zone_cb is not None and zone_cb.isChecked() and not self.region_sets():
+        if (zone_cb is not None and zone_cb.isChecked()
+                and self.chk_save_plots.isChecked() and not self.region_sets()):
             self.log_message(
                 "  Note: Zone Occupancy is ticked but no regions are drawn "
                 "for this trial, so that plot will be skipped.")
@@ -15806,13 +16085,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 return
 
         # Create output directory and subfolders only as needed
-        os.makedirs(output_dir, exist_ok=True)
+        ensure_dir(output_dir)
         plots_dir = os.path.join(output_dir, 'plots')
         if save_plots:
-            os.makedirs(plots_dir, exist_ok=True)
+            ensure_dir(plots_dir)
         animations_dir = os.path.join(output_dir, 'animation_Tracking')
         if save_animation:
-            os.makedirs(animations_dir, exist_ok=True)
+            ensure_dir(animations_dir)
 
         try:
             # Busy cursor for the whole synchronous prep. The heavy pandas /
@@ -15822,6 +16101,13 @@ class UWBQuickVisualizationWindow(QWidget):
             # looking dead. Restored in the finally so every exit path clears it.
             QApplication.setOverrideCursor(Qt.WaitCursor)
             self.log_message(f"Starting export to {output_dir}")
+            # Before the long part, not after: a folder that accepts writes but
+            # refuses to be listed exports fine and can never be cleared again,
+            # so every later run's output piles onto this one's.
+            for _d in (output_dir, csv_output_dir(output_dir)):
+                _why = check_dir_usable(_d)
+                if _why:
+                    self.log_message(f"  ⚠ OUTPUT FOLDER PROBLEM: {_why}")
             self.lbl_export_progress.setText("Initializing export...")
 
             # Calculate total steps for progress
@@ -16175,9 +16461,13 @@ class UWBQuickVisualizationWindow(QWidget):
                             csv_path, region_sets,
                             [t for t, cb in self.tag_checkboxes.items()
                              if cb.isChecked()])
-                    self.write_roi_bout_csv(
-                        roi_bout_rows, output_dir, db_name,
-                        skip_existing=skip_existing)
+                    # Both files come from the same visits, but each is ticked
+                    # on its own: asking for the summary alone must not also
+                    # drop a bout file the user did not request.
+                    if export_roi_bouts:
+                        self.write_roi_bout_csv(
+                            roi_bout_rows, output_dir, db_name,
+                            skip_existing=skip_existing)
                     if export_roi_daily:
                         self.write_roi_daily_summary_csv(
                             roi_bout_rows, output_dir, db_name,
@@ -16260,6 +16550,11 @@ class UWBQuickVisualizationWindow(QWidget):
                             if skip_existing and os.path.exists(bouts_path):
                                 self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
                             else:
+                                from fnt.uwb import roi_bouts as _RB
+                                self.log_audit(
+                                    os.path.basename(bouts_path),
+                                    lambda: _RB.audit_social(
+                                        proximity_bouts, proximity_threshold))
                                 proximity_bouts.to_csv(bouts_path, index=False)
                                 self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
                                                  f"{os.path.basename(bouts_path)}")
@@ -16296,6 +16591,28 @@ class UWBQuickVisualizationWindow(QWidget):
                         chosen = [t for t, cb in self.tag_checkboxes.items()
                                   if cb.isChecked()]
                         ev = self._export_behavior_events(csv_path, chosen)
+                        if len(ev):
+                            # Displacement is parked, so its bouts must never
+                            # reach this file; dyad_type must be one of the
+                            # four documented values, with MIXED always 'MF'
+                            # so a downstream filter on it cannot miss.
+                            seen_b = sorted(set(ev['behavior']))
+                            seen_d = sorted(set(ev['dyad_type']))
+                            self.log_audit(os.path.basename(ev_path), [
+                                (ev.notna().all().all().item(),
+                                 f"{len(ev):,} bout(s), no missing values"),
+                                (set(seen_b) <= {'chase'},
+                                 f"behaviours present: {', '.join(seen_b)}"),
+                                (set(seen_d) <= {'MM', 'MF', 'FF', 'NA'},
+                                 f"dyad types present: {', '.join(seen_d)}"),
+                                ((ev['actor'] != ev['target']).all().item(),
+                                 "actor is never its own target"),
+                                ((ev['duration_s'] > 0).all().item(),
+                                 "every duration is positive"),
+                                (((ev['bout_stop'] - ev['bout_start'])
+                                  .dt.total_seconds() >= 0).all().item(),
+                                 "bout_stop is never before bout_start"),
+                            ])
                         ev.to_csv(ev_path, index=False)
                         by = ev['behavior'].value_counts().to_dict() if len(ev) else {}
                         self.log_message(
