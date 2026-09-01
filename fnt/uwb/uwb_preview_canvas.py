@@ -1156,13 +1156,16 @@ class UWBPreview2D(FigureCanvas):
                                   edgecolor=edge_col, alpha=0.9, zorder=4.5)
                     self.ax.add_patch(circ)
                     dynamic.append(circ)
-            # Dotted like the social circles they connect, but heavier so the
-            # link reads as a connection rather than another radius outline.
+            # Dotted like the social circles they connect and at the same
+            # weight, so the radius and the link it produced read as one thing;
+            # the longer dash is what tells them apart. Drawn ABOVE the markers
+            # (zorder 5) so the line runs across the tag icons rather than
+            # disappearing under them, but below the labels at zorder 6.
             for i, j, col in behavior.get("links") or ():
                 if i < len(x) and j < len(x) and ok[i] and ok[j]:
                     ln = self.ax.plot([x[i], x[j]], [y[i], y[j]], color=col,
-                                      linewidth=2.2, alpha=0.95,
-                                      linestyle=(0, (3, 2)), zorder=4.6)[0]
+                                      linewidth=1.2, alpha=0.95,
+                                      linestyle=(0, (3, 2)), zorder=5.5)[0]
                     dynamic.append(ln)
 
         if ok.any():

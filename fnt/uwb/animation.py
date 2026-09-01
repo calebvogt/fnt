@@ -462,9 +462,13 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 beh_circles[tag] = circ
             beh_states[tag] = ax.text(0, 0, '', fontsize=7, ha='center',
                                       va='bottom', animated=True)
-        # Dashed like the circles they join, but heavier, so a link reads as a
-        # connection rather than as another radius outline.
-        link_lc = LineCollection([], linewidths=2.2, alpha=0.95,
+        # Dashed like the circles they join and at the same weight, so the
+        # radius and the link it produced read as one thing; the longer dash is
+        # what tells them apart. Matches the preview. The tag markers here are
+        # Line2D at the default zorder 2, so 4.6 already puts the link across
+        # the icons (the preview needs 5.5 because its markers are a scatter at
+        # zorder 5); staying under 5 keeps ROI name labels readable.
+        link_lc = LineCollection([], linewidths=1.2, alpha=0.95,
                                  linestyle=(0, (3, 2)), zorder=4.6,
                                  animated=True)
         ax.add_collection(link_lc)
