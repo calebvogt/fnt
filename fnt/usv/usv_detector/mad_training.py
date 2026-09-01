@@ -120,7 +120,11 @@ def grouped_split(
 
     Groups are consumed in a seeded shuffle until the validation set reaches
     ``val_fraction`` of tiles, and at least one group is always left for
-    training. Because groups differ in size, the realized fraction is
+    training. A group that would push validation past **half the data** is
+    skipped in favour of a smaller one: per-recording label counts are very
+    uneven in practice, and without that guard one dominant recording is
+    swallowed whole, leaving the model fit on a small remainder and scored on
+    the bulk. Because groups differ in size the realized fraction is still
     approximate — correctness of the split beats hitting the ratio exactly.
     """
     order: List[str] = []
@@ -138,17 +142,35 @@ def grouped_split(
 
     n_total = len(group_keys)
     target = max(1, int(round(n_total * float(val_fraction))))
+    # Never hand more than half the data to validation. Label counts per
+    # recording are wildly uneven in practice — one long, heavily-labeled file
+    # against several sparse ones — and a plain "consume groups until you reach
+    # the target" rule will swallow the dominant group whole. On real VoleCosm
+    # data that produced a 4152/668 val/train split: the reported score was
+    # measured on 86% of the labels, and the model was fit on 14% of them.
+    cap = max(target, n_total // 2)
+    # The largest group always trains. That is what guarantees the train side
+    # is never empty *and* never trivial: reserving an arbitrary group (say,
+    # the last one drawn) satisfies "non-empty" while still allowing the bulk
+    # of the labels into validation.
+    largest = max(order, key=lambda k: len(members[k]))
+    candidates = [k for k in shuffled if k != largest]
     val_groups: List[str] = []
     n_val = 0
-    # Leave the final group for training no matter what, so neither side is ever
-    # empty. The first iteration always appends (n_val starts at 0 and target is
-    # at least 1), and there are at least two groups here, so val_groups cannot
-    # come out empty either — no fallback needed.
-    for key in shuffled[:-1]:
+    for key in candidates:
         if n_val >= target:
             break
+        size = len(members[key])
+        if n_val + size > cap:
+            continue        # would overshoot; try a smaller one
         val_groups.append(key)
-        n_val += len(members[key])
+        n_val += size
+    if not val_groups:
+        # Every candidate exceeds the cap on its own. Take the smallest, so
+        # validation is still a held-out recording rather than nothing.
+        smallest = min(candidates, key=lambda k: len(members[k]))
+        val_groups = [smallest]
+        n_val = len(members[smallest])
 
     val_set = set(val_groups)
     val_idx = np.array(
