@@ -709,18 +709,27 @@ class UWBPreview2D(FigureCanvas):
             ymin, ymax = min(ymin, by0), max(ymax, by1)
         return xmin, xmax, ymin, ymax
 
+    # 400%: the view may not be narrower than a quarter of the whole scene.
+    # Without a floor the scroll wheel zooms for ever, and a few extra clicks
+    # land on a blank square metre with no landmark to say where it is.
+    MAX_ZOOM = 4.0
+
     def _clamp_view(self, x0, x1, y0, y1):
         """Keep a view within the arena/background extent (plus a small margin).
 
         Bounds how far the user can zoom OUT (never past the whole window) and
-        keeps pans from leaving the scene."""
+        IN (MAX_ZOOM), and keeps pans from leaving the scene."""
         axmin, axmax, aymin, aymax = self._arena_view_bounds()
         mx = max((axmax - axmin) * 0.05, 0.25)
         my = max((aymax - aymin) * 0.05, 0.25)
         axmin, axmax, aymin, aymax = axmin - mx, axmax + mx, aymin - my, aymax + my
-        # Never wider/taller than the full scene.
+        # Never wider/taller than the full scene, nor narrower than MAX_ZOOM.
+        # Both dimensions are scaled by the same factor on every zoom, so they
+        # reach the floor together and the aspect ratio is preserved.
         w = min(x1 - x0, axmax - axmin)
         h = min(y1 - y0, aymax - aymin)
+        w = max(w, (axmax - axmin) / self.MAX_ZOOM)
+        h = max(h, (aymax - aymin) / self.MAX_ZOOM)
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
         x0, x1, y0, y1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
         # Shift back inside the bounds.
@@ -740,8 +749,16 @@ class UWBPreview2D(FigureCanvas):
         if event.inaxes is not self.ax or event.xdata is None:
             return
         factor = 0.8 if event.button == 'up' else 1.25
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        # Zoom from the view we last COMMITTED, not from the axes. They are the
+        # same once a redraw has run, but reading the axes makes each step
+        # depend on that redraw having happened - so a clamped step could be
+        # re-zoomed from the unclamped limits and walk straight through the
+        # cap.
+        if self._user_zoom is not None:
+            (x0, x1), (y0, y1) = self._user_zoom
+        else:
+            x0, x1 = self.ax.get_xlim()
+            y0, y1 = self.ax.get_ylim()
         xd, yd = event.xdata, event.ydata
         nx0, nx1 = xd - (xd - x0) * factor, xd + (x1 - xd) * factor
         ny0, ny1 = yd - (yd - y0) * factor, yd + (y1 - yd) * factor
@@ -1106,6 +1123,18 @@ class UWBPreview2D(FigureCanvas):
                 lc = LineCollection(segs, colors=seg_cols, linewidths=1.7, zorder=4)
                 self.ax.add_collection(lc)
                 dynamic.append(lc)
+                # One dot per surviving fix. The line between two dots is
+                # DRAWN, not measured, so a long clean stretch carrying no
+                # dots is a stretch whose fixes were removed - which the bare
+                # polyline renders as smooth travel.
+                if getattr(self, "show_trail_points", False):
+                    pt_cols = np.empty((len(xy), 4), float)
+                    pt_cols[:, :3] = np.array(rgb[:3])
+                    pt_cols[:, 3] = np.linspace(0.20, 1.0, len(xy))
+                    dynamic.append(self.ax.scatter(
+                        xy[:, 0], xy[:, 1],
+                        s=max(3.0, getattr(self, "_tag_pt_size", 6.0) * 0.9),
+                        c=pt_cols, edgecolors="none", zorder=5))
 
         x = np.asarray(x, float)
         y = np.asarray(y, float)
@@ -1192,8 +1221,8 @@ class UWBPreview2D(FigureCanvas):
                 # and pushes the ID up by one line only when both are shown.
                 parts = state_parts[i] if i < len(state_parts) else None
                 if parts:
-                    # Each half in its own colour with a white separator, so
-                    # locomotion and social state read as two separate facts.
+                    # Each part in its own colour, separated in white. Only
+                    # the social state remains, so there is normally one.
                     from matplotlib.offsetbox import (TextArea, HPacker,
                                                       AnnotationBbox)
                     props = dict(size=6.5, weight="bold")

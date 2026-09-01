@@ -74,7 +74,14 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     work['Timestamp'] = pd.to_datetime(work['Timestamp'], format='ISO8601',
                                        utc=True, errors='coerce')
     work = work.dropna(subset=['Timestamp', x_col, y_col])
-    src_tz = getattr(df['Timestamp'].dt, 'tz', None) if 'Timestamp' in df else None
+    # The tz is read off the CALLER's column, to convert back to it. That
+    # column may legitimately be strings - the line above parses them - and
+    # `.dt` on a string Series raises AttributeError rather than returning a
+    # default, so the guard has to sit on `.dt` itself, not on `.tz`. With
+    # string input there is no source timezone to return to and the parsed
+    # UTC value stands, which is the honest answer rather than a guess.
+    src = df['Timestamp'] if 'Timestamp' in df.columns else None
+    src_tz = getattr(getattr(src, 'dt', None), 'tz', None)
     if src_tz is not None:
         work['Timestamp'] = work['Timestamp'].dt.tz_convert(src_tz)
 

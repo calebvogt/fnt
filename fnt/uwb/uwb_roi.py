@@ -131,6 +131,67 @@ def polygon_centroid(points):
     return (float(cx), float(cy))
 
 
+def polygons_overlap(a, b):
+    """True if two ROI polygons share any area.
+
+    Uses matplotlib's filled path intersection, which catches BOTH cases that
+    matter: edges that cross, and one polygon sitting wholly inside another.
+    An edge test alone would miss containment, which is the easier mistake to
+    make when copying an ROI and dragging it only a little.
+
+    Touching along an edge without enclosing area is not an overlap: fixes are
+    points, and a shared boundary has no area for one to land in.
+    """
+    from matplotlib.path import Path
+
+    pa = np.asarray(a, dtype=float).reshape(-1, 2)
+    pb = np.asarray(b, dtype=float).reshape(-1, 2)
+    if len(pa) < MIN_ROI_POINTS or len(pb) < MIN_ROI_POINTS:
+        return False
+    # Cheap rejection first: disjoint bounding boxes cannot overlap, and this
+    # is the common case when several ROIs are laid out side by side.
+    if (pa[:, 0].max() <= pb[:, 0].min() or pb[:, 0].max() <= pa[:, 0].min()
+            or pa[:, 1].max() <= pb[:, 1].min() or pb[:, 1].max() <= pa[:, 1].min()):
+        return False
+    return bool(Path(pa).intersects_path(Path(pb), filled=True))
+
+
+def overlapping_pairs(rois, only=None):
+    """Index pairs (i, j), i < j, whose ROIs share area.
+
+    ``only`` restricts the search to pairs involving that index - what the
+    canvas wants after a single ROI is drawn or dragged, rather than re-testing
+    every pair each time.
+    """
+    rois = list(rois or [])
+    out = []
+    for i in range(len(rois)):
+        for j in range(i + 1, len(rois)):
+            if only is not None and only not in (i, j):
+                continue
+            if polygons_overlap(rois[i].get("points"), rois[j].get("points")):
+                out.append((i, j))
+    return out
+
+
+def set_precedence(rois, winner, loser):
+    """Reorder so ``winner`` is tested before ``loser``, returning a new list.
+
+    Precedence IS list order: assign_zones takes the first region containing a
+    fix, so moving one ahead of another is the whole mechanism. Nothing else
+    about the list changes - the other ROIs keep their relative order, so
+    resolving one overlap cannot silently reshuffle an earlier decision.
+    """
+    rois = list(rois or [])
+    if not (0 <= winner < len(rois)) or not (0 <= loser < len(rois)):
+        return rois
+    if winner < loser:
+        return rois
+    item = rois.pop(winner)
+    rois.insert(loser, item)
+    return rois
+
+
 def points_in_roi(x, y, roi):
     """Boolean mask of which (x, y) fall inside one ROI.
 

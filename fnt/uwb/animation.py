@@ -231,7 +231,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      show_speed=False, show_step=False, gap_s=60.0,
                      label_color=None, label_outline=True,
                      axis_limits=None, behavior=None, show_trail=True,
-                     show_labels=True, time_range=None,
+                     show_labels=True, time_range=None, data_view=None,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -246,12 +246,11 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         circle_color edge colour for those circles
         grid         int64 ns timestamps of the classification frames
         tags         tag ids, in the column order of `loc`/`soc`
-        loc          (frames, tags) locomotor codes, or None
         soc          (frames, tags) social codes, or None
         links        (n, 4) int32 rows of (frame, i, j, kind), sorted by frame
         link_colors  {kind: colour}
-        state_labels {"loc": {code: text}, "soc": {code: text}}
-        state_colors {"loc": {code: colour}, "soc": {code: colour}}
+        state_labels {"soc": {code: text}}
+        state_colors {"soc": {code: colour}}
 
     The classification grid is independent of the video frame rate: each video
     frame takes the classification row nearest its own timestamp, so the
@@ -338,9 +337,28 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
             'color': styles[tag]['color']}
 
     # GUI-free Agg figure/canvas (no pyplot global state).
-    fig = Figure(figsize=(10, 8), dpi=dpi)
+    # The Data View widens the CANVAS rather than shrinking the arena: the
+    # arena is the thing being watched, and squeezing it to make room for the
+    # numbers would trade the more important half for the less.
+    arena_w, fig_h = 10.0, 8.0
+    panel = None
+    panel_w = 0.0
+    dv_fmt = None
+    if data_view:
+        from fnt.uwb import dataview_panel as DVP
+        from fnt.uwb.dataview import human_duration as _hd
+        dv_fmt = data_view.get('fmt') or _hd
+        n_a = len(data_view.get('animals') or ())
+        n_r = len(data_view.get('roi_names') or ())
+        dyad_mode = data_view.get('dyad_mode', 'partner')
+        dyad_rows = max(n_a - 1, 0) if dyad_mode == 'triangle' else n_a
+        rows = (2 + n_a) + 2 + (2 + dyad_rows)
+        fs = DVP._fit_fontsize(rows, fig_h)
+        panel_w = DVP.panel_width_in(n_a, n_r, fs, dyad_mode)
+    fig = Figure(figsize=(arena_w + panel_w, fig_h), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    frac = arena_w / (arena_w + panel_w)
+    ax = fig.add_axes([0.08 * frac, 0.08, 0.86 * frac, 0.86])
     ax.grid(False)
 
     # Draw the unchanging scene (background image, zones, anchors, axes) ONCE and
@@ -356,6 +374,21 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     ax.set_aspect('equal')
     ax.set_xlabel("X Position (m)", fontsize=12)
     ax.set_ylabel("Y Position (m)", fontsize=12)
+
+    # Built BEFORE the background is cached, so the panel's furniture (titles,
+    # headers, row labels, frame) bakes into the cached scene and only the
+    # numbers are redrawn per frame.
+    if data_view:
+        panel = DVP.DataViewPanel(
+            fig, [frac + 0.012, 0.06, (1.0 - frac) - 0.024, 0.88],
+            data_view['animals'], data_view.get('roi_names') or [],
+            data_view.get('occupancy') or {},
+            data_view.get('overlaps') or {},
+            text_color=data_view.get('text_color', '#e6e6e6'),
+            grid_color=data_view.get('grid_color', '#4a4a4a'),
+            bg_color=data_view.get('bg_color', '#1b1b1b'),
+            accent=data_view.get('accent', '#ffd166'),
+            dyad_mode=dyad_mode)
 
     canvas.draw()
     width, height = canvas.get_width_height()
@@ -508,32 +541,20 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 if circ is not None:
                     circ.set_center((cx, cy))
                     circ.set_visible(True)
-                # 'moving - chasing': the locomotor half and the social half,
-                # either of which is dropped when its layer is off or the
-                # animal is not doing it. Colour follows the social state when
-                # there is one, since that is the rarer, more informative half.
+                # The animal's social state, or nothing. An animal doing
+                # nothing social is left unlabelled rather than carrying the
+                # locomotor word that used to fill that space.
                 state_text, state_col = '', '#cccccc'
                 if state_txt is not None and beh_i >= 0:
                     j = beh_col_of.get(tag)
-                    if j is not None:
-                        parts = []
-                        lc_ = beh.get('loc')
-                        sc_ = beh.get('soc')
-                        if lc_ is not None:
-                            code = int(lc_[beh_i, j])
-                            txt = beh['state_labels']['loc'].get(code, '')
-                            if txt:
-                                parts.append(txt)
-                                state_col = beh['state_colors']['loc'].get(
-                                    code, state_col)
-                        if sc_ is not None:
-                            code = int(sc_[beh_i, j])
-                            txt = beh['state_labels']['soc'].get(code, '')
-                            if txt:
-                                parts.append(txt)
-                                state_col = beh['state_colors']['soc'].get(
-                                    code, state_col)
-                        state_text = ' - '.join(parts)
+                    sc_ = beh.get('soc')
+                    if j is not None and sc_ is not None:
+                        code = int(sc_[beh_i, j])
+                        txt = beh['state_labels']['soc'].get(code, '')
+                        if txt:
+                            state_text = txt
+                            state_col = beh['state_colors']['soc'].get(
+                                code, state_col)
                 if state_txt is not None:
                     state_txt.set_text(state_text)
                     state_txt.set_color(state_col)
@@ -603,10 +624,23 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 link_lc.set_color(cols)
             ax.draw_artist(link_lc)
 
+        if panel is not None:
+            # Read the cumulative curves at THIS frame's trial time. Nothing
+            # is accumulated frame to frame, so the numbers are independent of
+            # the video's speed and frame rate, and the final frame carries
+            # the same totals the CSV does.
+            panel.update(now_ns / 1e9, dv_fmt)
+            panel.draw()
+
         canvas.blit(fig.bbox)
         buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
         buf = buf.reshape(canvas.get_width_height()[::-1] + (4,))
         video_writer.write(cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR))
+
+    # No end card. The video is the tracking view and its counters, and
+    # nothing else; a wall of totals appended to the end is not what anyone
+    # scrubbing an animation is looking for. DataViewPanel.render_totals_card
+    # is still there if that changes.
 
     video_writer.release()
     fig.clear()
