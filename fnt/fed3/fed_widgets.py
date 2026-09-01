@@ -1013,13 +1013,26 @@ class FEDTabWidget(QWidget):
             if device.port:
                 device.saved_port = device.port
 
-        self._scanner = PortScannerWorker()
+        # Parented so the widget, not a Python reference, owns the thread.
+        self._scanner = PortScannerWorker(self)
         self._scanner.finished_scan.connect(self.scan_finished.emit)
-        self._scanner.finished.connect(self._scanner.deleteLater)
+        self._scanner.finished.connect(self._on_scanner_finished)
         self._scanner.start()
 
+    def _on_scanner_finished(self):
+        """Release the worker only once ``run()`` has actually returned.
+
+        ``finished_scan`` is emitted as the last statement *inside* ``run()``,
+        so releasing the worker from that slot can destroy a QThread that is
+        still running. Qt answers that with abort(), not a warning.
+        """
+        scanner = self.sender()
+        if scanner is self._scanner:
+            self._scanner = None
+        if scanner is not None:
+            scanner.deleteLater()
+
     def _on_scan_finished(self, results, all_ports):
-        self._scanner = None
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("Refresh Ports")
         self._set_status("Ready")
@@ -1185,6 +1198,7 @@ class FEDTabWidget(QWidget):
         device.connect_attempts = 0
         device.reconnect_gave_up = False
         device.awaiting_pong_since = None
+        device.handshake_done = False
         device.is_tracking = True
         device.svg_view.is_tracking = True
         device.svg_view.is_stale = False
@@ -1352,6 +1366,13 @@ class FEDTabWidget(QWidget):
         mirror pull would fail — and it would fail quietly, halfway through an
         experiment, which is exactly when nobody is watching the log.
         """
+        # Every heartbeat PING is answered with a PONG identical to the one that
+        # opened the connection. Liveness is tracked from the receive time in
+        # _check_heartbeats, so a repeat PONG needs nothing done to it; treating
+        # one as a handshake re-set the RTC and re-logged acceptance every 30s.
+        if device.handshake_done:
+            return
+
         device_id, firmware = proto.parse_pong(line)
         device.firmware = firmware
         self._adopt_identity(device, device_id)
@@ -1360,6 +1381,7 @@ class FEDTabWidget(QWidget):
             self._refuse_device(device, firmware)
             return
 
+        device.handshake_done = True
         device.box.setToolTip("")
         device.status_label.setText(f"Connected on {device.port}")
         device.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
@@ -1371,7 +1393,6 @@ class FEDTabWidget(QWidget):
         # thread are queued, so a PONG can arrive after the link was torn down.
         if device.link is not None:
             self._sync_device(device)
-            device.link.send(proto.CMD_STATUS)
 
     def _refuse_device(self, device, firmware):
         """Disconnect a device running firmware FNT cannot drive, and say so."""
@@ -1414,6 +1435,7 @@ class FEDTabWidget(QWidget):
         if counts:
             device.apply_counts(counts)
             device.svg_view.set_counts(device.stats)
+        self._note_clock_drift(device, status.get("time"))
         self._adopt_current_file(device, status.get("file"))
         if status.get("session"):
             device.status_label.setText(
@@ -1486,18 +1508,34 @@ class FEDTabWidget(QWidget):
                          source="device", result="failed")
         self._set_status(f"{device.name} could not dispense — check the hopper")
 
+    def _note_clock_drift(self, device, iso_text):
+        """Log how far the device RTC has wandered, from an unadjusted reading.
+
+        Both sides are truncated to the second before comparing. The device
+        reports whole seconds and SYNC can only set whole seconds, so a device
+        that is exactly right reads 0 here. Comparing a whole-second device time
+        against a sub-second host clock is what made every healthy device report
+        "-1s off" forever, and a permanent false alarm teaches people to skip
+        the line that would have shown them a real one.
+        """
+        device_time = proto._parse_iso(iso_text or "")
+        if device_time is None:
+            return
+        device.last_device_time = device_time
+        offset = (device_time
+                  - datetime.now().replace(microsecond=0)).total_seconds()
+        self._log_action("Clock checked", device=device.name,
+                         detail=f"{iso_text} (device {offset:+.0f}s vs host)",
+                         source="system")
+
     def _record_clock_sync(self, device, iso_text):
         device_time = proto._parse_iso(iso_text)
         device.last_sync_time = datetime.now()
         device.last_device_time = device_time
         if self.session is not None:
             self.session.log_clock_sync(device.name, device_time)
-        drift = ""
-        if device_time is not None:
-            offset = (device_time - device.last_sync_time).total_seconds()
-            drift = f" (device was {offset:+.0f}s off)"
         self._log_action("Clock synced", device=device.name,
-                         detail=f"{iso_text}{drift}", source="system")
+                         detail=iso_text, source="system")
 
     def _on_command_sent(self, device, command, ok, detail):
         if not ok:
@@ -1618,6 +1656,14 @@ class FEDTabWidget(QWidget):
     # --- clock sync --------------------------------------------------------
 
     def _sync_device(self, device):
+        """Read the device clock, then set it.
+
+        STATUS goes first because it reports the RTC as it stands. The SYNCED
+        reply echoes the time the device was just adjusted to, so it can never
+        show drift; this reading is the only evidence over a multi-week run that
+        the clock is holding.
+        """
+        self._send(device, proto.CMD_STATUS, "Read clock", source="system")
         return self._send(device, proto.cmd_sync(), "Sync clock", source="system")
 
     def _sync_all(self):

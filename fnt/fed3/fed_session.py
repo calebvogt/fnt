@@ -372,7 +372,20 @@ def _append_csv(path, fields, row):
         f.flush()
 
 
+# Windows refuses these as file or directory names, with or without an
+# extension, and silently drops trailing dots. A lab that names a cage after the
+# port it is on — "COM3" — would otherwise get an unwritable session folder on
+# the machine that actually runs the experiments.
+_WINDOWS_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)])
+
+
 def _safe_name(name):
     """Filesystem-safe version of a user-supplied device name."""
     cleaned = "".join(c if c.isalnum() or c in "-_. " else "_" for c in str(name)).strip()
-    return cleaned.replace(" ", "_") or "unnamed"
+    cleaned = cleaned.replace(" ", "_").rstrip(".")
+    if cleaned.split(".")[0].lower() in _WINDOWS_RESERVED:
+        cleaned += "_"
+    return cleaned or "unnamed"

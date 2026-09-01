@@ -40,6 +40,10 @@ class FedDevice:
         self.transfer = None            # Fed3Transfer, created with the link
         self.mirror = None              # DeviceMirror while a session is recording
         self.has_connected = False      # ever connected, so a drop is unexpected
+        # The handshake runs once per connection. Heartbeat PINGs are answered
+        # with the same PONG, and re-running the handshake on each one would
+        # re-set the device clock every 30s for the length of an experiment.
+        self.handshake_done = False
         self.connect_attempts = 0
         self.awaiting_pong_since = None  # host_now() when a heartbeat PING went out
         self.reconnect_gave_up = False   # backoff exhausted; already reported
