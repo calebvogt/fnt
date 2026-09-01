@@ -42,6 +42,10 @@ class UNetTrainingConfig:
     # Seed for the train/val split. Recorded in the run summary so a reported
     # number can be reproduced exactly.
     split_seed: int = 42
+    # How many times each labeled call is placed, at a random position, into a
+    # training tile. See mad_examples.collect_training_examples for why this
+    # is what makes the model usable on full recordings.
+    tile_placements: int = 3
     device: str = "auto"             # 'auto' | 'cuda' | 'mps' | 'cpu'
 
     # SLEAP-style early stopping: halt when val_loss fails to improve by
@@ -508,6 +512,8 @@ def train_unet(
             }) if progress else None
         ),
         return_groups=True,
+        placements=cfg.tile_placements,
+        seed=cfg.split_seed,
     )
 
     # Refuse to train on a mix of normalization rules. A patch is normalized

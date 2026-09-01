@@ -9497,7 +9497,11 @@ class MADMainWindow(QMainWindow):
                         else sp['noverlap'])
         n_time, n_freq = sg.n_time_frames, sg.n_freq_bins
         sr = self.sample_rate
-        margin = 64
+        # Context kept on each side of the call. 128 frames (~65 ms at hop
+        # 128 / 250 kHz) makes a typical patch wider than a 256-frame training
+        # tile, so tiles can be cut with real audio on BOTH sides of the call
+        # instead of synthetic fill. Older examples used 64.
+        margin = 128
         pt0 = max(0, t0 - margin)
         pt1 = min(n_time, t1 + margin)
 

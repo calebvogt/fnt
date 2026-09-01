@@ -394,12 +394,58 @@ def db_norm_breakdown(dataset_dir: str) -> Dict[str, int]:
     return out
 
 
+def _background_fill(spec: np.ndarray, mask: np.ndarray, width: int,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Columns that look like this patch's own noise floor.
+
+    Used to fill the part of a training tile the patch does not cover. Filling
+    with zeros was the bug: real audio always has a noise bed, so a flat-zero
+    region is something the model never meets at inference, and because the
+    padding also carried zero weight the model was free to output anything
+    there — it learned to fire in it. Per-row median of the patch's call-free
+    columns, plus that row's own jitter, gives background the model WILL see.
+    """
+    m = np.asarray(mask) > 0
+    bg_cols = ~m.any(axis=0)
+    src = spec[:, bg_cols] if int(bg_cols.sum()) >= 4 else spec
+    row_med = np.median(src, axis=1)
+    row_std = src.std(axis=1) * 0.7 + 1e-3
+    fill = (row_med[:, None]
+            + rng.normal(0.0, 1.0, (spec.shape[0], width)) * row_std[:, None])
+    return np.clip(fill, 0.0, 1.0).astype(np.float32)
+
+
+def _place_in_tile(spec: np.ndarray, mask: np.ndarray, tile_h: int,
+                   tile_w: int, t_off: int, rng: np.random.Generator):
+    """Put a (narrower-than-tile) patch at column ``t_off`` of a fresh tile.
+
+    Everything outside the patch is noise-floor fill supervised as background
+    (weight 1, target 0). Rows are cropped to ``tile_h`` from the bottom, the
+    same convention inference uses.
+    """
+    H, W = spec.shape
+    # Clamp rather than trust the caller: an offset that overruns the tile
+    # would otherwise raise deep inside a training run.
+    W = min(W, tile_w)
+    t_off = max(0, min(int(t_off), tile_w - W))
+    s = _background_fill(spec, mask, tile_w, rng)
+    t = np.zeros((H, tile_w), dtype=np.float32)
+    s[:, t_off:t_off + W] = spec[:, :W]
+    t[:, t_off:t_off + W] = (np.asarray(mask)[:, :W] > 0)
+    w = np.ones((H, tile_w), dtype=np.float32)
+    return (_crop_or_pad(s, tile_h, tile_w, 0, 0),
+            _crop_or_pad(t, tile_h, tile_w, 0, 0),
+            _crop_or_pad(w, tile_h, tile_w, 0, 0))
+
+
 def collect_training_examples(
     dataset_dir: str,
     tile_time_frames: int = TILE_TIME_FRAMES,
     tile_freq_bins: int = TILE_FREQ_BINS,
     progress=None,
     return_groups: bool = False,
+    placements: int = 3,
+    seed: int = 0,
 ):
     """Assemble ``(specs, targets, weights)`` stacks from saved examples.
 
@@ -412,15 +458,29 @@ def collect_training_examples(
     With ``return_groups``, a fourth value is returned: a list of
     ``(source_wav, example_id)`` pairs, one per tile, identifying where each
     tile came from. A train/val split MUST be made over those groups rather
-    than over tiles — one long call is sliced into several tiles, so a
-    tile-level shuffle would put the same call on both sides of the split. See
+    than over tiles — one call yields several tiles, so a tile-level shuffle
+    would put the same call on both sides of the split. See
     :func:`fnt.usv.usv_detector.mad_training.grouped_split`.
+
+    **Placement.** Each patch is placed ``placements`` times at a random column
+    offset within the tile (or, for patches wider than a tile, as random
+    windows into it). This is not decoration. Tiles used to be cut from column
+    0 with zero padding on the right, so every call sat at the same offset with
+    a flat-zero region beside it — a layout that never occurs in a real
+    recording. The model learned the task (Dice ~0.9 inside the patch) but
+    position-locked: on full-file inference it recognized a call only when it
+    happened to land at that one offset, and fired mostly into the padding it
+    had never been penalized for. In-sample F1 was 0.09. Random placement over
+    a noise-floor background is what makes a model trained here usable outside
+    the tile it was trained on.
     """
     examples = list(iter_examples(dataset_dir))
     specs: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []
     groups: List[Tuple[str, str]] = []
+    rng = np.random.default_rng(seed)
+    placements = max(1, int(placements))
     n = len(examples)
     for i, ex in enumerate(examples):
         meta = ex["meta"]
@@ -432,20 +492,23 @@ def collect_training_examples(
         # examples with no id, so distinct calls never collapse into one group.
         src = Path(str(meta.get("source_wav", ""))).name or "<unknown>"
         eid = str(meta.get("id") or f"<example {i}>")
-        # Patch occupancy = 1 (supervised) everywhere the real patch exists;
-        # used as the tile weight so any zero-padding stays unsupervised.
-        occ = np.ones_like(spec, dtype=np.float32)
         H, W = spec.shape
-        # Slide tiles across time if the patch is wider than a tile.
-        t = 0
-        while True:
-            specs.append(_crop_or_pad(spec, tile_freq_bins, tile_time_frames, 0, t))
-            targets.append(_crop_or_pad(mask, tile_freq_bins, tile_time_frames, 0, t))
-            weights.append(_crop_or_pad(occ, tile_freq_bins, tile_time_frames, 0, t))
+        for _k in range(placements):
+            if W <= tile_time_frames:
+                off = int(rng.integers(0, tile_time_frames - W + 1))
+                s_t, t_t, w_t = _place_in_tile(
+                    spec, mask, tile_freq_bins, tile_time_frames, off, rng)
+            else:
+                # Wider than a tile (a long call): a random window into it,
+                # fully supervised — inference cuts long calls this way too.
+                start = int(rng.integers(0, W - tile_time_frames + 1))
+                s_t = _crop_or_pad(spec, tile_freq_bins, tile_time_frames, 0, start)
+                t_t = _crop_or_pad(mask, tile_freq_bins, tile_time_frames, 0, start)
+                w_t = np.ones((tile_freq_bins, tile_time_frames), dtype=np.float32)
+            specs.append(s_t)
+            targets.append(t_t)
+            weights.append(w_t)
             groups.append((src, eid))
-            t += tile_time_frames
-            if t >= W:
-                break
     if progress is not None:
         progress(n, n, "done")
     if not specs:

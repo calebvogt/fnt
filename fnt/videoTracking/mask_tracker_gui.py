@@ -9,6 +9,7 @@ All code written from scratch for FieldNeuroToolbox.
 """
 from __future__ import annotations
 
+import bisect
 import concurrent.futures
 import copy
 import json
@@ -31,11 +32,11 @@ from PyQt5.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
-    QTextEdit, QSplitter,
+    QTextEdit, QSplitter, QToolTip,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer, QSettings
 from PyQt5.QtGui import (
-    QIcon, QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
+    QIcon, QImage, QPixmap, QFont, QFontMetrics, QColor, QPainter, QPen, QBrush,
     QPolygonF, QWheelEvent, QMouseEvent, QKeyEvent, QPainterPath,
 )
 
@@ -291,6 +292,8 @@ class AnnotationPreviewWidget(QWidget):
     zoom_changed = pyqtSignal(float)
     mode_changed = pyqtSignal(str)
     advance_frame_requested = pyqtSignal()
+    # Space: +1 = next tick on the source-video timeline, -1 = previous.
+    timeline_advance_requested = pyqtSignal(int)
     annotation_edited = pyqtSignal(int)
     delete_annotation_requested = pyqtSignal(int)
     approve_annotation_requested = pyqtSignal(int)
@@ -742,7 +745,10 @@ class AnnotationPreviewWidget(QWidget):
                 self.drawing_mode = "navigate"
                 self.mode_changed.emit("Navigate")
         elif event.key() == Qt.Key_Space:
-            self.advance_frame_requested.emit()
+            # Enter walks the queue (next unlabeled frame); Space walks the
+            # timeline of the current source video, tick to tick.
+            backwards = bool(event.modifiers() & Qt.ShiftModifier)
+            self.timeline_advance_requested.emit(-1 if backwards else 1)
         elif event.key() == Qt.Key_A and not self._drawing_active:
             # Approve all inferred annotations on current frame
             has_inferred = any(a.inferred for a in self.annotations)
@@ -948,6 +954,234 @@ class AnnotationPreviewWidget(QWidget):
 # ======================================================================
 # Worker threads
 # ======================================================================
+class FrameScrubber(QWidget):
+    """Timeline of the current source video, drawn under the Mask-tab preview.
+
+    One tick per Training Frames Queue entry cut from this video, coloured by
+    its labeling state with the same palette as the queue list: grey = queued
+    and unlabeled, yellow = model prediction awaiting review, green = has an
+    accepted mask. The white playhead is the frame on screen.
+
+    The widget only reports seeks; the window decides what a seek means
+    (video mode at that frame). Keyboard focus is refused so the arrow keys
+    keep scrubbing through the preview widget after a click here.
+    """
+
+    seek_requested = pyqtSignal(int)
+
+    STATE_COLORS = {
+        "queued": QColor("#cccccc"),
+        "predicted": QColor("#e6c830"),
+        "labeled": QColor("#4fc456"),
+    }
+    # Draw order when several ticks share a pixel: the most advanced state is
+    # painted last, so a labeled frame is never hidden behind a queued one.
+    STATE_RANK = {"queued": 0, "predicted": 1, "labeled": 2}
+
+    _PAD = 6             # groove inset from each edge, px
+    _SNAP_PX = 4         # a click this close to a tick lands on the tick
+    _SEEK_DELAY_MS = 30  # drag seeks are coalesced: decoding is slower than the mouse
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(22)
+        self.setMinimumWidth(120)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setCursor(Qt.PointingHandCursor)
+
+        self._n_frames = 0
+        self._fps = 30.0
+        self._position = 0
+        self._empty_text = ""
+        self._marks: Dict[int, str] = {}
+        self._sorted_marks: List[int] = []
+        self._by_state: Dict[str, List[int]] = {}
+        self._dragging = False
+        self._pending_seek: Optional[int] = None
+        self._seek_timer = QTimer(self)
+        self._seek_timer.setSingleShot(True)
+        self._seek_timer.timeout.connect(self._flush_seek)
+
+    # -- state -----------------------------------------------------------
+    def set_range(self, n_frames: int, fps: float = 30.0):
+        n_frames = max(0, int(n_frames))
+        fps = float(fps) if fps and fps > 0 else 30.0
+        if n_frames != self._n_frames or fps != self._fps:
+            self._n_frames = n_frames
+            self._fps = fps
+            self._position = min(self._position, max(0, n_frames - 1))
+            self.update()
+
+    def set_position(self, frame_idx: int):
+        if self._n_frames == 0:
+            return
+        frame_idx = max(0, min(int(frame_idx), self._n_frames - 1))
+        if frame_idx != self._position:
+            self._position = frame_idx
+            self.update()
+
+    def set_empty_text(self, text: str):
+        """Hint drawn on the bare groove while there is no timeline."""
+        if text != self._empty_text:
+            self._empty_text = text
+            self.update()
+
+    def set_marks(self, marks: Dict[int, str]):
+        """``{frame_idx: state}`` with state one of STATE_COLORS' keys."""
+        self._marks = dict(marks)
+        self._sorted_marks = sorted(self._marks)
+        self._by_state = {s: [] for s in self.STATE_COLORS}
+        for f in self._sorted_marks:
+            self._by_state.setdefault(self._marks[f], []).append(f)
+        self.update()
+
+    def has_marks(self) -> bool:
+        return bool(self._sorted_marks)
+
+    def next_mark(self, after: int) -> Optional[int]:
+        """First tick strictly after ``after``, wrapping to the first tick."""
+        if not self._sorted_marks:
+            return None
+        i = bisect.bisect_right(self._sorted_marks, after)
+        if i < len(self._sorted_marks):
+            return self._sorted_marks[i]
+        return self._sorted_marks[0]
+
+    def prev_mark(self, before: int) -> Optional[int]:
+        """Last tick strictly before ``before``, wrapping to the last tick."""
+        if not self._sorted_marks:
+            return None
+        i = bisect.bisect_left(self._sorted_marks, before) - 1
+        if i >= 0:
+            return self._sorted_marks[i]
+        return self._sorted_marks[-1]
+
+    @staticmethod
+    def format_timecode(frame_idx: int, fps: float) -> str:
+        secs = frame_idx / fps if fps and fps > 0 else 0.0
+        hours, rem = divmod(int(secs), 3600)
+        mins, s = divmod(rem, 60)
+        return f"{hours}:{mins:02d}:{s:02d}"
+
+    # -- geometry --------------------------------------------------------
+    def _groove_span(self) -> Tuple[float, float]:
+        return float(self._PAD), float(max(self._PAD + 1, self.width() - self._PAD))
+
+    def _frame_to_x(self, frame_idx: int) -> float:
+        x0, x1 = self._groove_span()
+        if self._n_frames <= 1:
+            return x0
+        return x0 + (x1 - x0) * frame_idx / (self._n_frames - 1)
+
+    def _x_to_frame(self, x: float) -> int:
+        x0, x1 = self._groove_span()
+        if self._n_frames <= 1:
+            return 0
+        t = (x - x0) / (x1 - x0)
+        return max(0, min(self._n_frames - 1, int(round(t * (self._n_frames - 1)))))
+
+    def _mark_near_x(self, x: float) -> Optional[int]:
+        best, best_d = None, float(self._SNAP_PX)
+        for f in self._sorted_marks:
+            d = abs(self._frame_to_x(f) - x)
+            if d <= best_d:
+                best, best_d = f, d
+        return best
+
+    # -- mouse -----------------------------------------------------------
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and self._n_frames > 0:
+            self._dragging = True
+            self._seek_to_x(event.x(), immediate=True)
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._dragging:
+            self._seek_to_x(event.x())
+        elif self._n_frames > 0:
+            f = self._mark_near_x(event.x())
+            if f is not None:
+                text = (f"frame {f:,} · {self.format_timecode(f, self._fps)}"
+                        f" — {self._marks[f]}")
+            else:
+                f = self._x_to_frame(event.x())
+                text = f"frame {f:,} · {self.format_timecode(f, self._fps)}"
+            QToolTip.showText(event.globalPos(), text, self)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._flush_seek()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _seek_to_x(self, x: float, immediate: bool = False):
+        f = self._x_to_frame(x)
+        if immediate:
+            # A click lands on the tick it was aimed at; a drag stays free.
+            near = self._mark_near_x(x)
+            if near is not None:
+                f = near
+        self.set_position(f)
+        self._pending_seek = f
+        if immediate:
+            self._flush_seek()
+        elif not self._seek_timer.isActive():
+            self._seek_timer.start(self._SEEK_DELAY_MS)
+
+    def _flush_seek(self):
+        self._seek_timer.stop()
+        if self._pending_seek is None:
+            return
+        f, self._pending_seek = self._pending_seek, None
+        self.seek_requested.emit(f)
+
+    # -- painting --------------------------------------------------------
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        h = self.height()
+        x0, x1 = self._groove_span()
+        gy, gh = h / 2 - 3, 6
+        groove = QRectF(x0, gy, x1 - x0, gh)
+
+        if self._n_frames == 0:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#333333"))
+            p.drawRoundedRect(groove, 3, 3)
+            if self._empty_text:
+                p.setPen(QColor("#777777"))
+                font = p.font()
+                font.setPointSize(8)
+                p.setFont(font)
+                p.drawText(self.rect(), Qt.AlignCenter, self._empty_text)
+            return
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#3c3c3c"))
+        p.drawRoundedRect(groove, 3, 3)
+        px = self._frame_to_x(self._position)
+        if px > x0:
+            p.setBrush(QColor("#25497a"))
+            p.drawRoundedRect(QRectF(x0, gy, px - x0, gh), 3, 3)
+
+        for state in sorted(self.STATE_COLORS, key=self.STATE_RANK.get):
+            color = self.STATE_COLORS[state]
+            for f in self._by_state.get(state, ()):
+                x = self._frame_to_x(f)
+                p.fillRect(QRectF(x - 1.0, 2.0, 2.0, h - 4.0), color)
+
+        pen = QPen(QColor("#1e1e1e"))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(QRectF(px - 1.5, 1.0, 3.0, h - 2.0), 1.5, 1.5)
+
+
 class SAM2LoadWorker(QThread):
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -2701,6 +2935,16 @@ class MaskTrackerWindow(QMainWindow):
         self._video_fps: float = 30.0
         self._video_frame_idx: int = 0
         self._annot_in_video_mode: bool = False
+        # Which file _video_cap holds, and the index its next read() returns
+        # (-1 = unknown), so sequential stepping can skip the seek.
+        self._video_cap_path: Optional[str] = None
+        self._video_cap_pos: int = -1
+
+        # Timeline under the preview: the video its ticks belong to, and the
+        # queue row behind each tick so Space can open that frame.
+        self._scrubber_vpath: Optional[str] = None
+        self._scrubber_rows: Dict[int, int] = {}
+        self._scrubber_refresh_pending = False
 
         self._extracted_frames: List[Tuple[str, int, str]] = []
         self.current_frame_idx: int = -1
@@ -2953,6 +3197,7 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.preview.mode_changed.connect(self._on_mode_changed)
         self.preview.advance_frame_requested.connect(self._on_advance_frame)
+        self.preview.timeline_advance_requested.connect(self._on_timeline_advance)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -2961,6 +3206,43 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.category_hotkey.connect(self._on_category_hotkey)
         self.preview.reassign_annotation_requested.connect(self._on_reassign_annotation)
         right_layout.addWidget(self.preview, 1)
+
+        # Source-video timeline directly under the preview (Mask tab only).
+        self._scrubber_row = QWidget()
+        scrub_layout = QHBoxLayout(self._scrubber_row)
+        scrub_layout.setContentsMargins(5, 0, 5, 0)
+        scrub_layout.setSpacing(8)
+        self._scrubber = FrameScrubber()
+        self._scrubber.seek_requested.connect(self._on_scrubber_seek)
+        scrub_layout.addWidget(self._scrubber, 1)
+        self._lbl_scrub_time = QLabel("")
+        self._lbl_scrub_time.setStyleSheet("color: #999999; font-size: 10px;")
+        # Reserve room for the widest value at the label's own 10px size so
+        # the timeline does not jitter as the frame number grows.
+        small_font = QFont(self.font())
+        small_font.setPixelSize(10)
+        self._lbl_scrub_time.setMinimumWidth(
+            QFontMetrics(small_font).horizontalAdvance("frame 0,000,000 · 0:00:00")
+        )
+        scrub_layout.addWidget(self._lbl_scrub_time)
+        self._lbl_scrub_legend = QLabel(
+            '<span style="color:#cccccc">&#9632;</span> queued&nbsp;&nbsp;'
+            '<span style="color:#e6c830">&#9632;</span> predicted&nbsp;&nbsp;'
+            '<span style="color:#4fc456">&#9632;</span> labeled'
+        )
+        self._lbl_scrub_legend.setStyleSheet("color: #999999; font-size: 9px;")
+        self._lbl_scrub_legend.setToolTip(
+            "Timeline of the source video. Each tick is a Training Frames\n"
+            "Queue entry cut from this video:\n"
+            "  grey = queued, no masks yet\n"
+            "  yellow = model prediction awaiting review\n"
+            "  green = has an accepted mask\n\n"
+            "Click or drag to seek. Arrow keys step (Shift ±10, Ctrl ±100).\n"
+            "Space opens the next tick's frame, Shift+Space the previous.\n"
+            "Enter still walks the queue to the next unlabeled frame."
+        )
+        scrub_layout.addWidget(self._lbl_scrub_legend)
+        right_layout.addWidget(self._scrubber_row)
 
         # Info row below preview
         self._info_row = QWidget()
@@ -3247,7 +3529,12 @@ class MaskTrackerWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         max_left = max(520, fm.averageCharWidth() * 80 + 40)
-        splitter.setSizes([min_w, 800])
+        # Open a little wider than the minimum: at the minimum the queue's
+        # Frame column truncates every long video stem. An offset above
+        # min_w (not a second character count) so it still widens when the
+        # 300 px floor is what set min_w.
+        init_left = min(max_left, min_w + max(70, fm.averageCharWidth() * 10))
+        splitter.setSizes([init_left, 800])
         right_panel.setMinimumWidth(300)
         self.tab_widget.setMaximumWidth(max_left)
         main_layout.addWidget(splitter)
@@ -3338,10 +3625,12 @@ class MaskTrackerWindow(QMainWindow):
             "  right-click to exclude, Enter to accept.\n"
             "Editing: drag vertices, right-click to insert one.\n"
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
-            "Left-click + drag to pan. Scroll to zoom. Space/Enter = next frame.\n"
+            "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
+            "Space = next queued frame on this video's timeline (Shift+Space = previous).\n"
+            "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
+            "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
-            "E = extract current video frame to Training Frames Queue.\n"
-            "Arrow keys scrub video (Shift ±10, Ctrl ±100)."
+            "E = extract current video frame to Training Frames Queue."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
         info.setWordWrap(True)
@@ -5242,7 +5531,10 @@ class MaskTrackerWindow(QMainWindow):
         self.lbl_frame_num.setToolTip("Position of the open frame within the queue.")
         nav_row.addWidget(self.lbl_frame_num, 1)
         self.btn_next_frame = QPushButton("Next >")
-        self.btn_next_frame.setToolTip("Go to the next frame in the queue (Space / Enter).")
+        self.btn_next_frame.setToolTip(
+            "Go to the next unlabeled frame in the queue (Enter).\n"
+            "Space instead walks the source video's timeline, tick to tick."
+        )
         self.btn_next_frame.clicked.connect(self._next_frame)
         nav_row.addWidget(self.btn_next_frame)
 
@@ -5256,7 +5548,7 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton:checked { background-color: #2979ff; color: white; }"
         )
         self.btn_shuffle.setToolTip(
-            "When enabled, Space/Enter advances to a\n"
+            "When enabled, Enter / Next advances to a\n"
             "random unlabeled/inferred frame instead of\n"
             "the next one in list order."
         )
@@ -5763,15 +6055,40 @@ class MaskTrackerWindow(QMainWindow):
         if self.current_video_idx < len(self.video_paths) - 1:
             self.video_list.setCurrentRow(self.current_video_idx + 1)
 
-    def _load_video(self, path: str):
+    def _ensure_source_video_open(self, path: str) -> bool:
+        """Make ``_video_cap`` hold ``path`` without displaying anything.
+
+        The timeline under the preview needs the source video's frame count
+        even while a queue frame (a .png) is on screen, and the arrow keys
+        step from that frame into the video, so the capture is opened as soon
+        as a frame with a linked source is selected. Reopening is skipped when
+        the capture already holds this file.
+        """
+        if self._video_cap is not None and self._video_cap_path == path:
+            return True
         self._close_video()
-        self._video_cap = cv2.VideoCapture(path)
-        if not self._video_cap.isOpened():
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        self._video_cap = cap
+        self._video_cap_path = path
+        self._video_cap_pos = 0
+        self._video_frame_idx = 0
+        self._video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if path in self.video_paths:
+            self.current_video_idx = self.video_paths.index(path)
+        return True
+
+    def _load_video(self, path: str):
+        already_open = self._video_cap is not None and self._video_cap_path == path
+        if not self._ensure_source_video_open(path):
             QMessageBox.warning(self, "Error", f"Could not open video:\n{path}")
             return
-        self._video_frame_count = int(self._video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self._video_fps = self._video_cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self._show_video_frame(0)
+        # Re-selecting the video whose frame was just being labeled resumes
+        # where the timeline is, instead of dropping back to frame 0.
+        self._show_video_frame(self._video_frame_idx if already_open else 0)
         self.status_bar.showMessage(
             f"Loaded: {os.path.basename(path)} "
             f"({self._video_frame_count} frames, {self._video_fps:.1f} fps)"
@@ -5781,6 +6098,8 @@ class MaskTrackerWindow(QMainWindow):
         if self._video_cap is not None:
             self._video_cap.release()
             self._video_cap = None
+        self._video_cap_path = None
+        self._video_cap_pos = -1
         self._video_frame_count = 0
         self._video_frame_idx = 0
 
@@ -5789,8 +6108,12 @@ class MaskTrackerWindow(QMainWindow):
             return
         frame_idx = max(0, min(frame_idx, self._video_frame_count - 1))
         self._video_frame_idx = frame_idx
-        self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        # Stepping to the very next frame skips the seek: one decode per
+        # arrow press instead of a keyframe seek plus decode-forward.
+        if self._video_cap_pos != frame_idx:
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = self._video_cap.read()
+        self._video_cap_pos = frame_idx + 1 if ret else -1
         if ret:
             if self.preview.annotations:
                 self.preview.annotations.clear()
@@ -5798,6 +6121,166 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_frame_info.setText(
                 f"Frame: {frame_idx + 1} / {self._video_frame_count}"
             )
+        self._sync_scrubber()
+
+    def _enter_video_mode_at(self, vpath: str, fidx: int) -> bool:
+        """Show the source video ``vpath`` at ``fidx`` in the preview.
+
+        Used by Show in Source Video, the timeline, and the arrow keys when
+        stepping out of a queue frame. Selects the video in the list without
+        firing its handler, which would reload from frame 0.
+        """
+        if vpath not in self.video_paths or not self._ensure_source_video_open(vpath):
+            return False
+        vrow = self.video_paths.index(vpath)
+        self._annot_in_video_mode = True
+        self.frame_list.blockSignals(True)
+        self.frame_list.clearSelection()
+        self._select_frame_row(-1)
+        self.frame_list.blockSignals(False)
+        if self.video_list.currentRow() != vrow:
+            self.video_list.blockSignals(True)
+            self.video_list.setCurrentRow(vrow)
+            self.video_list.blockSignals(False)
+        self.preview.annotations.clear()
+        self._show_video_frame(fidx)
+        self._update_nav_state()
+        return True
+
+    # ------------------------------------------------------------------
+    # Source-video timeline (scrubber under the preview)
+    # ------------------------------------------------------------------
+    def _scrubber_source(self) -> Optional[Tuple[str, int]]:
+        """(video path, frame index) the timeline should show, else None.
+
+        Video mode shows the open video at its playhead. Frame mode shows the
+        queue frame's position in the video it was cut from, so the same
+        timeline sits under the preview however the frame was reached.
+        """
+        if self._annot_in_video_mode:
+            if self._video_cap_path is not None:
+                return self._video_cap_path, self._video_frame_idx
+            return None
+        if 0 <= self.current_frame_idx < len(self._extracted_frames):
+            vpath, fidx, _ = self._extracted_frames[self.current_frame_idx]
+            if self._frame_source_available(vpath):
+                return vpath, fidx
+        return None
+
+    def _sync_scrubber(self):
+        """Point the timeline at the current source video and frame."""
+        src = self._scrubber_source()
+        if src is not None and not self._ensure_source_video_open(src[0]):
+            src = None
+        if src is None:
+            self._scrubber_vpath = None
+            self._scrubber_rows = {}
+            self._scrubber.set_marks({})
+            self._scrubber.set_range(0)
+            showing_frame = (
+                not self._annot_in_video_mode
+                and 0 <= self.current_frame_idx < len(self._extracted_frames)
+            )
+            self._scrubber.set_empty_text(
+                "No source video linked to this frame" if showing_frame else ""
+            )
+            self._lbl_scrub_time.setText("")
+            return
+        vpath, pos = src
+        # Keep the video playhead on the frame being labeled, so selecting
+        # this video in the list opens here rather than at frame 0.
+        self._video_frame_idx = pos
+        if vpath != self._scrubber_vpath:
+            self._scrubber_vpath = vpath
+            self._rebuild_scrubber_marks()
+        self._scrubber.set_range(self._video_frame_count, self._video_fps)
+        self._scrubber.set_position(pos)
+        self._lbl_scrub_time.setText(
+            f"frame {pos:,} · {FrameScrubber.format_timecode(pos, self._video_fps)}"
+        )
+
+    def _rebuild_scrubber_marks(self):
+        """Recompute the tick for every queue frame cut from the timeline's video."""
+        vpath = self._scrubber_vpath
+        if vpath is None:
+            return
+        # One pass over the annotations rather than a scan per queue frame.
+        id_to_name = {img["id"]: img["file_name"] for img in self._coco.images}
+        counts: Dict[str, Tuple[int, int]] = {}
+        for ann in self._coco.annotations:
+            name = id_to_name.get(ann["image_id"])
+            if name is None:
+                continue
+            total, inferred = counts.get(name, (0, 0))
+            counts[name] = (total + 1, inferred + (1 if ann.get("inferred", False) else 0))
+
+        marks: Dict[int, str] = {}
+        rows: Dict[int, int] = {}
+        rank = FrameScrubber.STATE_RANK
+        for row, (v, fidx, png) in enumerate(self._extracted_frames):
+            if v != vpath:
+                continue
+            total, inferred = counts.get(os.path.basename(png), (0, 0))
+            if total > inferred:
+                state = "labeled"
+            elif total:
+                state = "predicted"
+            else:
+                state = "queued"
+            if fidx in marks and rank[marks[fidx]] >= rank[state]:
+                continue
+            marks[fidx] = state
+            rows[fidx] = row
+        self._scrubber_rows = rows
+        self._scrubber.set_marks(marks)
+
+    def _schedule_scrubber_refresh(self):
+        """Rebuild ticks once the current batch of list updates has landed."""
+        if self._scrubber_refresh_pending:
+            return
+        self._scrubber_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_scrubber)
+
+    def _refresh_scrubber(self):
+        self._scrubber_refresh_pending = False
+        self._scrubber_vpath = None  # force the ticks to be recomputed
+        self._sync_scrubber()
+
+    def _on_scrubber_seek(self, frame_idx: int):
+        src = self._scrubber_source()
+        if src is None:
+            return
+        self._enter_video_mode_at(src[0], frame_idx)
+        self.preview.setFocus()
+
+    def _on_timeline_advance(self, direction: int):
+        """Space: open the next (Shift+Space: previous) tick's queue frame."""
+        src = self._scrubber_source()
+        target = None
+        if src is not None:
+            pos = src[1]
+            if direction < 0:
+                target = self._scrubber.prev_mark(pos)
+            else:
+                target = self._scrubber.next_mark(pos)
+        if target is None:
+            # No timeline, or nothing queued from this video: behave like
+            # Enter and walk the queue instead.
+            self._on_advance_frame()
+            return
+        row = self._scrubber_rows.get(target)
+        if row is None:
+            self._enter_video_mode_at(src[0], target)
+            return
+        wrapped = (target <= pos) if direction >= 0 else (target >= pos)
+        if wrapped and len(self._scrubber_rows) > 1:
+            self.status_bar.showMessage(
+                "Wrapped to the first queued frame of this video"
+                if direction >= 0 else
+                "Wrapped to the last queued frame of this video",
+                2500,
+            )
+        self._select_frame_row(row)
 
     def _extract_frame_from_video(self):
         if self._video_cap is None or self.current_video_idx < 0:
@@ -5827,6 +6310,7 @@ class MaskTrackerWindow(QMainWindow):
         else:
             self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
             ret, frame = self._video_cap.read()
+            self._video_cap_pos = fidx + 1 if ret else -1
             if not ret:
                 self.status_bar.showMessage("Failed to read frame from video", 3000)
                 return
@@ -6057,6 +6541,7 @@ class MaskTrackerWindow(QMainWindow):
         self.frame_list.setSortingEnabled(True)
         self.frame_list.blockSignals(False)
         self._update_nav_state()
+        self._schedule_scrubber_refresh()
 
     def _recalc_current_frame_confidence(self):
         """Recalculate confidence for the current frame after approval/deletion."""
@@ -6164,6 +6649,9 @@ class MaskTrackerWindow(QMainWindow):
 
         _, _, img_path = self._extracted_frames[row]
         self._load_annotation_frame(img_path)
+        # Before the nav labels: opening the source video moves the video
+        # counter to the frame's origin.
+        self._sync_scrubber()
         self._update_nav_state()
 
     def _frame_source_available(self, vpath: str) -> bool:
@@ -6203,19 +6691,8 @@ class MaskTrackerWindow(QMainWindow):
 
     def _jump_to_source_frame(self, vpath: str, fidx: int):
         """Open the source video at the frame an extracted png came from."""
-        try:
-            vrow = self.video_paths.index(vpath)
-        except ValueError:
+        if not self._enter_video_mode_at(vpath, fidx):
             return
-        if self.current_video_idx == vrow and self._video_cap is not None:
-            self._annot_in_video_mode = True
-            self.frame_list.blockSignals(True)
-            self.frame_list.clearSelection()
-            self._select_frame_row(-1)
-            self.frame_list.blockSignals(False)
-        else:
-            self.video_list.setCurrentRow(vrow)
-        self._show_video_frame(fidx)
         self.status_bar.showMessage(
             f"{os.path.basename(vpath)} @ frame {fidx}", 4000
         )
@@ -7513,6 +7990,7 @@ class MaskTrackerWindow(QMainWindow):
 
         self._training_viz_panel.setVisible(True)
         self.preview.setVisible(False)
+        self._scrubber_row.setVisible(False)
         self._info_row.setVisible(False)
 
     def _toggle_pause(self):
@@ -7566,6 +8044,7 @@ class MaskTrackerWindow(QMainWindow):
         if self._training_viz_panel.isVisible():
             self._training_viz_panel.setVisible(False)
             self.preview.setVisible(True)
+            self._scrubber_row.setVisible(True)
             self._info_row.setVisible(True)
 
     def _on_train_finished(self, summary: dict):
@@ -8368,28 +8847,29 @@ class MaskTrackerWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         if self.tab_widget.currentIndex() == 0:  # Annotation tab
-            if self._annot_in_video_mode and self._video_cap is not None:
-                if event.key() == Qt.Key_Left:
+            key = event.key()
+            if key in (Qt.Key_Left, Qt.Key_Right):
+                src = self._scrubber_source()
+                if src is not None:
                     mod = event.modifiers()
-                    if mod & Qt.ShiftModifier:
-                        delta = -10
-                    elif mod & Qt.ControlModifier:
-                        delta = -100
+                    if mod & Qt.ControlModifier:
+                        step = 100
+                    elif mod & Qt.ShiftModifier:
+                        step = 10
                     else:
-                        delta = -1
-                    self._show_video_frame(self._video_frame_idx + delta)
-                    return
-                elif event.key() == Qt.Key_Right:
-                    mod = event.modifiers()
-                    if mod & Qt.ShiftModifier:
-                        delta = 10
-                    elif mod & Qt.ControlModifier:
-                        delta = 100
+                        step = 1
+                    if key == Qt.Key_Left:
+                        step = -step
+                    vpath, pos = src
+                    if self._annot_in_video_mode:
+                        self._show_video_frame(pos + step)
                     else:
-                        delta = 1
-                    self._show_video_frame(self._video_frame_idx + delta)
+                        # From a queue frame, the arrows step out into the
+                        # video it was cut from.
+                        self._enter_video_mode_at(vpath, pos + step)
                     return
-                elif event.key() == Qt.Key_E:
+            elif key == Qt.Key_E:
+                if self._annot_in_video_mode and self._video_cap is not None:
                     self._extract_frame_from_video()
                     return
         elif self.tab_widget.currentIndex() == 1:  # Classify tab
@@ -11017,14 +11497,20 @@ class MaskTrackerWindow(QMainWindow):
         # Preview + info row: hidden during any training viz
         show_preview = not cls_show_loss and not cls_graph_visible and not mask_show_viz
         self.preview.setVisible(show_preview)
+        self._scrubber_row.setVisible(is_annotation and show_preview)
         self._info_row.setVisible(show_preview)
 
         if is_annotation:
             self._refresh_training_summary()
             self._refresh_device_label()
-            if self.current_frame_idx >= 0 and self.current_frame_idx < len(self._extracted_frames):
+            if self._annot_in_video_mode and self._video_cap is not None:
+                # Coming back to the tab restores the video playhead rather
+                # than a stale queue frame the arrow keys would then ignore.
+                self._show_video_frame(self._video_frame_idx)
+            elif self.current_frame_idx >= 0 and self.current_frame_idx < len(self._extracted_frames):
                 _, _, path = self._extracted_frames[self.current_frame_idx]
                 self._load_annotation_frame(path)
+            self._sync_scrubber()
         elif is_classifier:
             self.preview.annotations.clear()
             self.preview._cls_mask_handler = self._on_cls_mask_right_click
@@ -11168,6 +11654,7 @@ class MaskTrackerWindow(QMainWindow):
         if item is None:
             return
         self._render_frame_item(item, row)
+        self._schedule_scrubber_refresh()
 
     def closeEvent(self, event):
         self._close_video()

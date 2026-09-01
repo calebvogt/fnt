@@ -387,6 +387,42 @@ build a label set, not after.
 
 ---
 
+## How a labeled call becomes training tiles
+
+A saved example is a spectrogram **patch** — the call plus context on each side —
+not a tile. Turning patches into fixed-size tiles is where a subtle and
+expensive bug lived, so the rules are worth stating.
+
+Each patch is placed **at a random column offset** inside the tile,
+`tile_placements` times (default 3), on a background of the patch's own
+noise floor, with the **entire tile supervised** (weight 1, target 0 outside the
+call). Patches wider than a tile yield random windows into themselves.
+
+The original cutter did none of that: it placed every patch at column 0, padded
+the rest of the tile with **zeros**, and gave the padding **zero weight**. Three
+consequences compounded.
+
+- Every call sat at the same offset, so the model learned *call at column ~64*
+  rather than *call*.
+- The flat-zero region does not occur in any real recording, so half of every
+  training tile was a distribution the model would never meet again.
+- Because the padding was unsupervised, firing into it cost nothing. The model
+  duly learned to.
+
+The result looked fine by every number training reported — validation Dice
+0.64, and 0.89 measured inside the patch region — while being close to useless
+on a real file. Sliding real calls across a tile of real audio showed the model
+detecting them **63% of the time at the training offset and under 31% everywhere
+else**, and 98% of its positive pixels landing in the zero padding. Call-level
+F1 on its own training recordings was **0.094**.
+
+The lesson generalizes: a segmentation model trained on tiles will learn the
+tile layout as readily as the signal, and tile-level metrics cannot see it.
+Evaluate at call level on a full recording — that is what `Evaluate Model…`
+is for.
+
+---
+
 ## Hard negatives from rejections
 
 Rejecting a prediction stores a **negative example**: the same spectrogram patch

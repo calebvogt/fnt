@@ -50,6 +50,7 @@ nav:
       - Imaging: tools/imaging.md
   - MAD Detector:
       - Overview: mad/overview.md
+      - Workflow (step by step): mad/workflow.md
 
 markdown_extensions:
   - admonition
