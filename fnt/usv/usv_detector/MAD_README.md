@@ -187,6 +187,30 @@ Project-wide:
 - `.scratch/` — temporary masks/predictions for files you're **browsing in
   place** but haven't accepted a call on yet. Wiped on close (see below).
 
+### The Audio list
+
+One list, and everything in it is the project. There is no separate "session"
+vs "training" set: any recording you add is labelable, and **the model trains on
+every confirmed call across all of them**. Add files with **Add Folder…**
+(offers the whole tree when there is one) or **Add Files…**.
+
+What the rows mean:
+
+- `name (a, p, r)` — accepted / pending / rejected call counts, colored to match
+  the spectrogram overlay (see *Review colors*). A green ✓ means the file has
+  recorded calls.
+- **⚠ name** — the audio moved or its drive is not mounted. This is a **soft**
+  state: labels, the training store, saved detections and batch inference are
+  all unaffected; only preview and playback need the file. Selecting one blanks
+  the canvas rather than leaving the previous file's detections on screen under
+  the wrong name. Use **File ▸ Locate Missing Recordings…**, which infers the
+  move from one file and repoints every sibling that moved with it.
+
+Removing a row only *unregisters* it — the wav and its sibling csv/h5 stay where
+they are, because MAD never owned them. Only project-owned copies (a legacy
+`recordings/` file, or one made by **Pack Project**) are deleted, and the prompt
+says so explicitly.
+
 ### Recordings are referenced, not copied
 
 A project does **not** store your audio. `mad_project_info.json` holds an

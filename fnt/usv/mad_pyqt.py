@@ -3807,18 +3807,20 @@ class MADMainWindow(QMainWindow):
     def _create_audio_section(self, layout):
         group = QGroupBox("Audio")
         self._grp_audio = group
+        # The explanation lives on hover (and in MAD_README's "The Audio list"
+        # section) rather than as a standing paragraph: it is orientation you
+        # need once, and it was costing four lines of vertical space above the
+        # controls on every session thereafter.
+        group.setToolTip(
+            "<b>Every recording this project knows about</b> — referenced where "
+            "it lives, never copied in.<br><br>"
+            "Label any of them; the model trains on all of them.<br><br>"
+            "A <b>⚠</b> row means the audio moved. Labels, training and saved "
+            "detections are unaffected — only preview needs the file. Use "
+            "<b>File ▸ Locate Missing Recordings…</b> to repoint it; fixing one "
+            "file fixes every sibling that moved with it.")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
-
-        hint = QLabel(
-            "Every recording this project knows about — referenced where it "
-            "lives, never copied in. Label any of them; the model trains on all "
-            "of them. A ⚠ row means the audio moved: labels, training and saved "
-            "detections are fine, use File ▸ Locate Missing Recordings… to "
-            "restore preview.")
-        hint.setStyleSheet("color: #999999; font-size: 9px;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
 
         add_row = QHBoxLayout()
         add_row.setSpacing(4)
