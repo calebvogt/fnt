@@ -77,6 +77,7 @@ class UNetTrainingConfig:
     nfft: int = 1024
     db_min: float = -100.0
     db_max: float = -20.0
+    db_norm: str = 'fixed'      # see MADProjectConfig.db_norm
     tile_time_frames: int = 256
     tile_freq_bins: int = 512
     tile_overlap_fraction: float = 0.25
@@ -509,6 +510,34 @@ def train_unet(
         return_groups=True,
     )
 
+    # Refuse to train on a mix of normalization rules. A patch is normalized
+    # and quantized when it is saved, so examples from different rules are on
+    # two incompatible intensity scales and the result would look like a merely
+    # mediocre model rather than a broken setup.
+    try:
+        from .mad_examples import db_norm_breakdown
+        norms = db_norm_breakdown(cfg.training_data_dir)
+    except Exception:
+        norms = {}
+    if len(norms) > 1:
+        detail = ", ".join(f"{k}: {v}" for k, v in sorted(norms.items()))
+        raise RuntimeError(
+            "This project's labels were saved under more than one dB "
+            f"normalization rule ({detail}). A saved patch is already "
+            "normalized, so the two sets cannot be reconciled. Either set "
+            "db_norm back to the rule the majority were labeled with, or "
+            "re-label the minority under the current rule."
+        )
+    if norms and cfg.db_norm not in norms:
+        only = next(iter(norms))
+        raise RuntimeError(
+            f"Labels were saved with db_norm='{only}' but this project "
+            f"is set to db_norm='{cfg.db_norm}'. Training on them would "
+            "feed the model an intensity scale the labels were never "
+            f"drawn on. Set db_norm back to '{only}', or re-label under "
+            f"'{cfg.db_norm}'."
+        )
+
     n_total = specs.shape[0]
     if n_total == 0:
         raise RuntimeError(
@@ -765,6 +794,10 @@ def train_unet(
                     'nfft': cfg.nfft,
                     'db_min': cfg.db_min,
                     'db_max': cfg.db_max,
+                    # Inference reads this back: feeding a per-file-normalized
+                    # model fixed-range input (or vice versa) silently degrades
+                    # every detection.
+                    'db_norm': cfg.db_norm,
                     # Provenance: travels with the weights, so a checkpoint
                     # handed to someone else still says what its val score
                     # actually measured.
@@ -811,6 +844,7 @@ def train_unet(
         'n_train_tiles': int(len(train_idx)),
         'n_val_tiles': n_val,
         'n_labels': n_labels,
+        'db_norm': cfg.db_norm,
         # Rejected detections reused as explicit hard negatives.
         'n_negatives': n_negatives,
         # How the split was made. Every val_* number above must be read through

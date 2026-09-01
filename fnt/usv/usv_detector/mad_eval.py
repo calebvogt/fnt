@@ -272,6 +272,8 @@ def evaluate_wavs(
     nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
     db_min = float(cfg.db_min if cfg.db_min is not None else ckpt.get('db_min', -100.0))
     db_max = float(cfg.db_max if cfg.db_max is not None else ckpt.get('db_max', -20.0))
+    db_norm = str(cfg.db_norm if getattr(cfg, 'db_norm', None) is not None
+                  else ckpt.get('db_norm', 'fixed'))
     tile_f = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
     tile_t = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
 
@@ -302,9 +304,13 @@ def evaluate_wavs(
         audio, sr = load_audio(wav)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
+        from .mad_dataset import db_range_for
+        f_lo, f_hi = db_range_for(
+            db_norm, db_min, db_max, audio=audio, sample_rate=sr,
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft)
         spec = compute_full_spec_image(
             audio.astype(np.float32), sr, nperseg=nperseg, noverlap=noverlap,
-            nfft=nfft, db_min=db_min, db_max=db_max)
+            nfft=nfft, db_min=f_lo, db_max=f_hi)
         prob = infer_probability_mask(
             model, spec, tile_freq_bins=tile_f, tile_time_frames=tile_t,
             overlap_fraction=cfg.tile_overlap_fraction, device=device,

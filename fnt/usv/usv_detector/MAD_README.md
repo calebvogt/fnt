@@ -350,6 +350,43 @@ artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
 
 ---
 
+## dB normalization (`db_norm`)
+
+Before the model sees a spectrogram, dB values are mapped to 0-1. **How** that
+mapping is chosen is a project setting:
+
+- **`fixed`** (default) — every recording uses the project's `db_min`-`db_max`.
+  Simple, and what every model trained before this option existed used.
+- **`per_file`** — each recording's own percentile range (5th to 99.9th,
+  minimum 20 dB span), measured from evenly spaced probe windows.
+
+`per_file` exists because a fixed range assumes every recording shares a gain
+and a noise floor. Across trials with different mics, distances and ambient
+conditions they don't, so the same call arrives at the model at different input
+intensities — a large part of why a model trained on a few recordings
+generalizes poorly to the rest.
+
+Three things make it safe:
+
+- **The range is the recording's, never the patch's.** A window over a loud call
+  and a window of silence must normalize identically, or the model sees the same
+  call at different intensities depending on what happened to be next to it.
+  Measured once per file and cached.
+- **The probes are deterministic**, never random, so labeling and inference
+  derive an identical range for the same audio.
+- **The rule travels with the model.** It is written into the checkpoint, and
+  inference reads it back rather than trusting the caller — feeding a
+  per-file-normalized model fixed-range input silently degrades every detection.
+
+**Switching is not free.** A patch is normalized *and quantized* when it is
+saved, so it can never be re-normalized. Examples saved under different rules sit
+on two incompatible intensity scales, which looks like a merely mediocre model
+rather than a broken setup — so training refuses to start, names both rules and
+their counts, and tells you to either switch back or re-label. Decide before you
+build a label set, not after.
+
+---
+
 ## Hard negatives from rejections
 
 Rejecting a prediction stores a **negative example**: the same spectrogram patch

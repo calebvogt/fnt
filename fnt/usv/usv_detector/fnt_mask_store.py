@@ -535,6 +535,25 @@ def example_kind(meta: Dict) -> str:
     return str((meta or {}).get("kind") or "label")
 
 
+def td_iter_meta(h5_path: str) -> Iterator[Dict]:
+    """Yield every example's metadata, never touching the spec/mask arrays."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return
+    try:
+        with h5py.File(h5_path, "r") as f:
+            ex = f.get("examples")
+            if ex is None:
+                return
+            for key in ex:
+                try:
+                    yield json.loads(ex[key].attrs.get("meta_json", "{}"))
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
 def td_count(h5_path: str, kind: Optional[str] = None) -> int:
     """Number of stored examples; ``kind`` filters to 'label' or 'negative'."""
     _require_h5()

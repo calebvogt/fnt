@@ -80,6 +80,9 @@ class MADInferenceConfig:
     nfft: Optional[int] = None
     db_min: Optional[float] = None
     db_max: Optional[float] = None
+    # Normalization rule. None → take it from the checkpoint, which is what the
+    # model was actually trained with; an explicit value overrides.
+    db_norm: Optional[str] = None
 
 
 # ----------------------------------------------------------------------
@@ -991,6 +994,10 @@ def run_inference_on_file(
     nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
     db_min = float(cfg.db_min if cfg.db_min is not None else ckpt.get('db_min', -100.0))
     db_max = float(cfg.db_max if cfg.db_max is not None else ckpt.get('db_max', -20.0))
+    # The normalization rule has to be the model's, not the caller's: a model
+    # trained on per-file ranges sees garbage if fed fixed-range input.
+    db_norm = str(cfg.db_norm if cfg.db_norm is not None
+                  else ckpt.get('db_norm', 'fixed'))
     tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
     tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
 
@@ -1002,6 +1009,10 @@ def run_inference_on_file(
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     audio_dur = len(audio) / float(sr) if sr else 0.0
+    from .mad_dataset import db_range_for
+    db_min, db_max = db_range_for(
+        db_norm, db_min, db_max, audio=audio, sample_rate=sr,
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft)
     spec = compute_full_spec_image(
         audio.astype(np.float32), sr,
         nperseg=nperseg, noverlap=noverlap, nfft=nfft,

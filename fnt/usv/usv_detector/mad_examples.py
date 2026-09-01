@@ -377,6 +377,23 @@ def reconstruct_file_mask(
 # ----------------------------------------------------------------------
 # Training-tile assembly
 # ----------------------------------------------------------------------
+def db_norm_breakdown(dataset_dir: str) -> Dict[str, int]:
+    """``{db_norm: n_examples}`` across the store, from metadata only.
+
+    A patch is normalized and quantized when it is saved, so it can never be
+    re-normalized afterwards. Mixing examples saved under different rules trains
+    the model on two incompatible intensity scales at once, which looks like a
+    merely mediocre model rather than a broken setup — so callers check this and
+    say so out loud.
+    """
+    from . import fnt_mask_store as _ms
+    out: Dict[str, int] = {}
+    for ex in _ms.td_iter_meta(_store_path(dataset_dir)):
+        k = str(ex.get("db_norm") or "fixed")
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
 def collect_training_examples(
     dataset_dir: str,
     tile_time_frames: int = TILE_TIME_FRAMES,

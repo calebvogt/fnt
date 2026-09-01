@@ -5431,6 +5431,7 @@ class MADMainWindow(QMainWindow):
         half-built set. :meth:`_refresh_open_gallery` does the showing, once.
         """
         self._ann_load_seq = getattr(self, '_ann_load_seq', 0) + 1
+        self._db_range_cache = None      # measured per recording
 
     def _refresh_open_gallery(self):
         """Re-show an open gallery when the detection set it was built from is
@@ -9511,7 +9512,8 @@ class MADMainWindow(QMainWindow):
             nfft=nfft, window='hann',
         )
         spec_db = 10.0 * np.log10(Sxx + 1e-10)
-        spec_patch = spec_to_image(spec_db, sp['db_min'], sp['db_max'])
+        _db_lo, _db_hi = self._file_db_range()
+        spec_patch = spec_to_image(spec_db, _db_lo, _db_hi)
         W = spec_patch.shape[1]
 
         mask_patch = np.zeros((n_freq, W), dtype=np.uint8)
@@ -9557,7 +9559,12 @@ class MADMainWindow(QMainWindow):
             'patch_t_frames': int(W), 'f_bins': int(n_freq),
             'nperseg': nperseg, 'noverlap': noverlap_val, 'nfft': nfft,
             'sample_rate': int(sr),
-            'db_min': sp['db_min'], 'db_max': sp['db_max'],
+            # The range this patch was actually normalized with, plus the
+            # rule that produced it. Training refuses to mix rules, because a
+            # patch is normalized and quantized when it is saved and cannot be
+            # re-normalized afterwards.
+            'db_min': _db_lo, 'db_max': _db_hi,
+            'db_norm': sp.get('db_norm', 'fixed'),
             'created': datetime.now().isoformat(timespec='seconds'),
         }
         if blob_id is not None:
@@ -10273,15 +10280,47 @@ class MADMainWindow(QMainWindow):
                 out.append(w)
         return out
 
+    def _view_db_range(self) -> tuple:
+        """dB range for view-scoped inference — the whole file's, so a Quick
+        Inference on one window agrees with a full run on the same file."""
+        return self._file_db_range()
+
     def _spec_params(self) -> dict:
         cfg = self._project
         if cfg is None:
             return dict(nperseg=512, noverlap=384, nfft=1024,
-                        db_min=-100.0, db_max=-20.0)
+                        db_min=-100.0, db_max=-20.0, db_norm='fixed')
         return dict(
             nperseg=cfg.nperseg, noverlap=cfg.noverlap, nfft=cfg.nfft,
             db_min=cfg.db_min, db_max=cfg.db_max,
+            db_norm=getattr(cfg, 'db_norm', 'fixed'),
         )
+
+    def _file_db_range(self) -> tuple:
+        """The dB range to normalize the loaded recording with.
+
+        Under 'per_file' this is measured from the **whole recording**, never
+        from the patch being saved: a window containing a loud call and a window
+        of silence would otherwise be scaled completely differently, and the
+        model would see the same call at different intensities depending on what
+        else happened to be nearby. Cached per file because the estimate probes
+        the audio.
+        """
+        sp = self._spec_params()
+        fixed = (sp['db_min'], sp['db_max'])
+        if sp.get('db_norm') != 'per_file' or self.audio_data is None:
+            return fixed
+        key = (self._loaded_wav_path, sp['nperseg'], sp['noverlap'], sp['nfft'])
+        cached = getattr(self, '_db_range_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        from fnt.usv.usv_detector.mad_dataset import db_range_for
+        rng = db_range_for(
+            'per_file', sp['db_min'], sp['db_max'], audio=self.audio_data,
+            sample_rate=self.sample_rate or 0, nperseg=sp['nperseg'],
+            noverlap=sp['noverlap'], nfft=sp['nfft'])
+        self._db_range_cache = (key, rng)
+        return rng
 
     def _menu_run_training(self):
         # Training lives inline in the single left column — route the
@@ -10657,7 +10696,11 @@ class MADMainWindow(QMainWindow):
         sg.update()
         self.btn_quick_infer.setEnabled(False)
 
-        sp = self._spec_params()
+        sp = dict(self._spec_params())
+        # Normalize the visible window with the WHOLE file's range, so a Quick
+        # Inference agrees with a full run on the same recording instead of
+        # rescaling to whatever happens to be on screen.
+        sp['db_min'], sp['db_max'] = self._view_db_range()
         worker = MADViewInferenceWorker(
             model_path=model,
             audio_segment=audio_seg,

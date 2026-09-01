@@ -41,6 +41,76 @@ def spec_to_image(spec_db: np.ndarray, db_min: float, db_max: float) -> np.ndarr
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
+# Per-recording dB normalization ---------------------------------------------
+# Percentiles, not min/max: the floor should track the noise bed (not the single
+# quietest bin) and the ceiling should sit just under the loudest calls without
+# being pinned by one broadband click.
+DB_PCT_LO, DB_PCT_HI = 5.0, 99.9
+DB_MIN_SPAN = 20.0          # never map a near-flat recording onto full contrast
+
+
+def estimate_db_range(
+    audio: np.ndarray, sample_rate: int, nperseg: int, noverlap: int,
+    nfft: int, lo_pct: float = DB_PCT_LO, hi_pct: float = DB_PCT_HI,
+    n_windows: int = 24, window_s: float = 1.0,
+) -> tuple:
+    """Estimate a recording's own dB range from evenly spaced probe windows.
+
+    A project-wide fixed range assumes every recording shares a noise floor and
+    gain. Across trials with different mics, distances and ambient conditions
+    they do not, so the same call arrives at the model at different input
+    intensities — which is a large part of why a model trained on a few
+    recordings generalizes poorly to the rest.
+
+    Probes are **evenly spaced and deterministic**, never random: labeling and
+    inference must derive an identical range for the same audio, or a call
+    would be normalized one way when it trains and another way when it is
+    detected. Sampling ~24 s of a long recording is enough for percentiles and
+    avoids computing a full-file spectrogram just to pick two numbers.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    win = max(int(window_s * sample_rate), nperseg * 4)
+    if audio.size <= win:
+        starts = [0]
+    else:
+        n = max(1, int(n_windows))
+        step = max(1, (audio.size - win) // n)
+        starts = [i * step for i in range(n)]
+    noverlap_safe = min(noverlap, nperseg - 1)
+    chunks = []
+    for st in starts:
+        seg = audio[st:st + win]
+        if seg.size < nperseg:
+            continue
+        _f, _t, sxx = compute_spectrogram(
+            seg, sr=sample_rate, nperseg=nperseg, noverlap=noverlap_safe,
+            nfft=nfft)
+        chunks.append(sxx.ravel())
+    if not chunks:
+        return (-100.0, -20.0)
+    vals = np.concatenate(chunks)
+    lo = float(np.percentile(vals, lo_pct))
+    hi = float(np.percentile(vals, hi_pct))
+    if hi - lo < DB_MIN_SPAN:
+        hi = lo + DB_MIN_SPAN
+    return (lo, hi)
+
+
+def db_range_for(
+    db_norm: str, db_min: float, db_max: float,
+    audio=None, sample_rate: int = 0, nperseg: int = 512,
+    noverlap: int = 384, nfft: int = 1024,
+) -> tuple:
+    """Resolve the dB range to normalize with: the project's fixed pair, or this
+    recording's own. Falls back to fixed when there is no audio to measure."""
+    if db_norm == 'per_file' and audio is not None and sample_rate:
+        try:
+            return estimate_db_range(audio, sample_rate, nperseg, noverlap, nfft)
+        except Exception:
+            pass
+    return (float(db_min), float(db_max))
+
+
 def compute_full_spec_image(
     audio: np.ndarray, sample_rate: int,
     nperseg: int, noverlap: int, nfft: int,

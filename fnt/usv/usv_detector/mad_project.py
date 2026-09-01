@@ -58,6 +58,15 @@ class MADProjectConfig:
     nfft: int = 1024
     db_min: float = -100.0
     db_max: float = -20.0
+    # How the spectrogram is normalized before the model sees it.
+    #   'fixed'    — db_min…db_max for every recording (default; what every
+    #                model trained before this option used).
+    #   'per_file' — each recording's own percentile range, so a call looks the
+    #                same to the model regardless of that file's gain and noise
+    #                floor. Better cross-trial generalization, but examples
+    #                labeled under one setting must not be mixed with the other
+    #                (the patch is normalized and quantized when it is saved).
+    db_norm: str = 'fixed'
     colormap: str = 'viridis'
 
     # Model architecture — user-selectable per training run.
