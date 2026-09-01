@@ -9,7 +9,7 @@ import os
 import sys
 from datetime import datetime
 
-from PyQt5.QtCore import (QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal)
+from PyQt5.QtCore import QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFont, QPainter
 from PyQt5.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLayout,
@@ -80,23 +80,44 @@ class FlowLayout(QLayout):
         return size + QSize(left + right, top + bottom)
 
     def _do_layout(self, rect, test_only):
-        x, y, line_height = rect.x(), rect.y(), 0
+        """Place items in rows, then share each row's leftover width among them.
+
+        Placing bare size hints left a ragged right margin — with two device
+        cards on a row, most of a third card's width sat empty. Items on a row
+        also take a common height, so cards keep a shared baseline whether or
+        not one of them has its setup panel open.
+        """
         spacing = self.spacing()
+        rows, row, used = [], [], 0
 
         for item in self._items:
             hint = item.sizeHint()
-            next_x = x + hint.width() + spacing
-            if next_x - spacing > rect.right() and line_height > 0:
-                x = rect.x()
-                y += line_height + spacing
-                next_x = x + hint.width() + spacing
-                line_height = 0
-            if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), hint))
-            x = next_x
-            line_height = max(line_height, hint.height())
+            needed = hint.width() + (spacing if row else 0)
+            if row and used + needed > rect.width():
+                rows.append((row, used))
+                row, used, needed = [], 0, hint.width()
+            row.append((item, hint))
+            used += needed
+        if row:
+            rows.append((row, used))
 
-        return y + line_height - rect.y()
+        y = rect.y()
+        for row, used in rows:
+            height = max(hint.height() for _, hint in row)
+            share = max((rect.width() - used) // len(row), 0)
+            x = rect.x()
+            for item, hint in row:
+                width = hint.width() + share
+                if not test_only:
+                    # Each item keeps its own height so the row shares a top
+                    # edge. Handed the row height instead, QWidgetItem centres
+                    # a widget whose vertical policy is Fixed — which floated a
+                    # collapsed card half-way down beside an expanded one.
+                    item.setGeometry(QRect(x, y, width, hint.height()))
+                x += width + spacing
+            y += height + spacing
+
+        return (y - spacing - rect.y()) if rows else 0
 
 
 class FEDSvgView(QWidget):
@@ -196,6 +217,74 @@ class FEDSvgView(QWidget):
 
     def minimumSizeHint(self):
         return QSize(250, 150)
+
+
+class CollapsibleSection(QWidget):
+    """A titled disclosure whose header carries the state of what it hides.
+
+    Setup controls and the scheduler are needed on the day an experiment is
+    configured and almost never again, but they were holding the top of a window
+    that stays open for weeks. Collapsing them is only an improvement if the
+    header answers the question you would have opened them to ask, so the
+    summary text is part of the header rather than something inside.
+    """
+
+    def __init__(self, title, summary="", expanded=False, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.toggle_button = QPushButton()
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setStyleSheet("""
+            QPushButton {
+                text-align: left; padding: 7px 10px; font-weight: bold;
+                background-color: #333333; color: #ffffff;
+                border: 1px solid #444444; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #3d3d3d; }
+            QPushButton:checked { border-bottom-left-radius: 0px;
+                                  border-bottom-right-radius: 0px; }
+        """)
+        self.toggle_button.toggled.connect(self._on_toggle)
+
+        self.container = QWidget()
+        self.body = QVBoxLayout(self.container)
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.body.setSpacing(0)
+
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.container)
+        self.container.setVisible(expanded)
+        self._summary = summary
+        self._refresh_text()
+
+    def add_widget(self, widget):
+        self.body.addWidget(widget)
+
+    def set_summary(self, summary):
+        """Update the state shown beside the title while it is collapsed."""
+        if summary != self._summary:
+            self._summary = summary
+            self._refresh_text()
+
+    def _refresh_text(self):
+        arrow = "\u25bc" if self.toggle_button.isChecked() else "\u25b6"
+        suffix = f"   \u2014   {self._summary}" if self._summary else ""
+        # A header is a label, not a mnemonic target: unescaped, Qt swallowed
+        # the ampersand and rendered "Setup & bulk actions" as "Setup _bulk
+        # actions". Summaries carry device names, which can contain one too.
+        text = f"{arrow} {self.title}{suffix}".replace("&", "&&")
+        self.toggle_button.setText(text)
+
+    def _on_toggle(self, checked):
+        self.container.setVisible(checked)
+        self._refresh_text()
 
 
 class CollapsibleLogBox(QWidget):

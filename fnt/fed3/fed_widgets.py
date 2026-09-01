@@ -46,8 +46,8 @@ from .fed_mirror import DeviceMirror
 from .fed_plot import WINDOWS, FedPlotManager, PlotSeries
 from .fed_serial import Fed3Link, PortScannerWorker
 from .fed_ui import (
-    CollapsibleLogBox, FEDSvgView, FileSelectorDialog, FlowLayout,
-    ResumeSessionDialog,
+    CollapsibleLogBox, CollapsibleSection, FEDSvgView, FileSelectorDialog,
+    FlowLayout, ResumeSessionDialog,
 )
 
 UI_TICK_MS = 1000               # scheduler countdowns
@@ -55,7 +55,71 @@ RECONNECT_TICK_MS = 5000        # auto-reconnect sweep
 STATE_SAVE_MS = 15000           # session state persistence
 PLOT_TICK_MS = 5000             # activity plot refresh
 HEARTBEAT_TICK_MS = 10000       # device liveness probe
-NARROW_WIDTH = 1120             # below this the panels stack into one column
+
+# Three weights, assigned by consequence rather than by how often a control is
+# used. The application stylesheet paints every QPushButton the same primary
+# blue, which left "Open Folder" and "Dispense All" indistinguishable; a
+# property selector is more specific than the bare QPushButton rule, so these
+# win without the window stylesheet having to change.
+#
+#   primary  the one control that starts or stops the experiment
+#   (default) something real happens: hardware moves, data is written
+#   quiet    housekeeping and navigation, including anything destructive that
+#            should never be the brightest thing on a card
+#
+# Every rule restates padding, and none of them pins a font size. Qt sizes a
+# styled button from the most specific rule that matches it, so a rule that set
+# only a colour produced a box computed without the window sheet's padding while
+# that sheet went on painting the label — which clipped "Start Recording" to
+# "tart Recordin". Leaving the size unpinned lets the box be measured with the
+# widget's own font and painted with the (never larger) sheet font, so the error
+# is always slack rather than a clipped label, on whatever the host UI font is.
+BUTTON_QSS = """
+QPushButton[weight="quiet"] {
+    background-color: transparent; color: #b8c0c4;
+    border: 1px solid #4a4a4a; font-weight: normal;
+    padding: 6px 14px; border-radius: 4px;
+}
+QPushButton[weight="quiet"]:hover {
+    background-color: #3a3a3a; color: #ffffff;
+}
+/* Disabled is a colour change only. Given its own rule, Qt measured the box
+   without the padding declared above and clipped the label. */
+QPushButton[weight="quiet"]:disabled { color: #6a6a6a; }
+QPushButton[weight="normal"] {
+    background-color: #46525c; color: #ffffff; font-weight: normal;
+    border: none; padding: 6px 14px; border-radius: 4px;
+}
+QPushButton[weight="normal"]:hover { background-color: #55636e; }
+QPushButton[weight="normal"]:disabled { background-color: #3a4249; color: #7d868c; }
+"""
+
+
+def _fit(button, *alternates):
+    """Guarantee a button's box fits its label, whatever font the host resolves.
+
+    Qt measures a styled QPushButton from whichever stylesheet rule is most
+    specific, and the window sheet pins a point size the widget font does not
+    share. The computed box therefore came out narrower than the painted label
+    and clipped it — "Start Recording" rendered as "tart Recordin" — and which
+    buttons were affected shifted with every rule added, because each one
+    changed the rule Qt measured from. Measuring here uses the font the label is
+    actually drawn with, so the error can only ever be slack.
+
+    ``alternates`` are the other captions a button will take on later; a toggle
+    must not shrink-wrap the caption it happens to start with.
+    """
+    metrics = button.fontMetrics()
+    widest = max(metrics.boundingRect(text).width()
+                 for text in (button.text(),) + alternates)
+    button.setMinimumWidth(widest + 34)
+    return button
+
+
+def _weigh(button, weight, *alternates):
+    """Tag a button so :data:`BUTTON_QSS` can style it, and return it."""
+    button.setProperty("weight", weight)
+    return _fit(button, *alternates)
 
 # Reconnect backoff: give up automatic retries after this many consecutive
 # failures so a permanently unplugged device stops churning the port list.
@@ -114,6 +178,7 @@ class FEDTabWidget(QWidget):
     # ==================================================================
 
     def _build_ui(self):
+        self.setStyleSheet(BUTTON_QSS)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -127,34 +192,32 @@ class FEDTabWidget(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
+        # Order is the whole point: the window is open for weeks and the things
+        # a running experiment is checked for come first. Setup and scheduling
+        # are needed on the first afternoon and then not again, so they collapse
+        # to a header that states what opening them would have told you.
         self.content_layout.addWidget(self._build_session_group())
 
-        self.columns = QWidget()
-        self.columns_layout = QGridLayout(self.columns)
-        self.columns_layout.setContentsMargins(0, 0, 0, 0)
-        self.columns_layout.setSpacing(12)
-        self.content_layout.addWidget(self.columns)
-
+        self.devices_group = self._build_devices_group()
+        self.plot_group = self._build_plot_group()
         self.control_group = self._build_control_group()
         self.scheduler_group = self._build_scheduler_group()
-        self.devices_group = self._build_devices_group()
-        # The plot shares the left column rather than sitting under both, so the
-        # space the scheduler does not need goes to the graph instead of staying
-        # blank while the device column runs on past it.
-        self.plot_group = self._build_plot_group()
 
-        self.left_column = QWidget()
-        self.left_column_layout = QVBoxLayout(self.left_column)
-        self.left_column_layout.setContentsMargins(0, 0, 0, 0)
-        self.left_column_layout.setSpacing(12)
+        # Full width at every size. The old two-column split put the devices in
+        # a column narrow enough for exactly one card, so widening the window
+        # showed fewer cages than leaving it at its default size did.
+        self.content_layout.addWidget(self.devices_group)
+        self.content_layout.addWidget(self.plot_group, stretch=1)
 
-        self.right_column = QWidget()
-        self.right_column_layout = QVBoxLayout(self.right_column)
-        self.right_column_layout.setContentsMargins(0, 0, 0, 0)
-        self.right_column_layout.setSpacing(12)
+        self.setup_section = CollapsibleSection(
+            "Setup & bulk actions", "applies to every connected device")
+        self.setup_section.add_widget(self.control_group)
+        self.content_layout.addWidget(self.setup_section)
 
-        self._layout_is_narrow = None
-        self._apply_responsive_layout()
+        self.scheduler_section = CollapsibleSection(
+            "Protocol event scheduler", "no events scheduled")
+        self.scheduler_section.add_widget(self.scheduler_group)
+        self.content_layout.addWidget(self.scheduler_section)
 
         self.content_layout.addStretch()
 
@@ -172,7 +235,10 @@ class FEDTabWidget(QWidget):
         row = QHBoxLayout()
         self.record_btn = QPushButton("Start Recording")
         self.record_btn.setStyleSheet("""
-            QPushButton { font-weight: bold; min-height: 26px; }
+            QPushButton {
+                font-weight: bold; min-height: 26px;
+                padding: 6px 16px; border-radius: 4px;
+            }
             QPushButton:checked { background-color: #c0392b; color: white; }
         """)
         self.record_btn.setCheckable(True)
@@ -183,6 +249,7 @@ class FEDTabWidget(QWidget):
             "Every connected device also rolls onto a fresh SD log and zeroes "
             "its counters, so the session owns a clean boundary on the card as "
             "well as on the host. Resuming an interrupted session does not.")
+        _fit(self.record_btn, "Stop Recording")
         self.record_btn.toggled.connect(self._on_record_toggled)
         row.addWidget(self.record_btn)
 
@@ -190,15 +257,29 @@ class FEDTabWidget(QWidget):
         self.session_label.setStyleSheet("color: #999999;")
         row.addWidget(self.session_label, stretch=1)
 
-        self.open_folder_btn = QPushButton("Open Folder")
+        self.open_folder_btn = _weigh(QPushButton("Open Folder"), "quiet")
         self.open_folder_btn.setEnabled(False)
         self.open_folder_btn.clicked.connect(self._open_session_folder)
         row.addWidget(self.open_folder_btn)
 
-        choose_btn = QPushButton("Change Location...")
+        choose_btn = _weigh(QPushButton("Change Location..."), "quiet")
         choose_btn.clicked.connect(self._choose_sessions_dir)
         row.addWidget(choose_btn)
         layout.addLayout(row)
+
+        # The two facts that say whether an unattended run is still healthy, on
+        # the one row that is always visible. Mirror state used to be 11px grey
+        # in the corner of a panel three sections down.
+        status_row = QHBoxLayout()
+        status_row.setSpacing(14)
+        self.fleet_status = QLabel("No devices connected")
+        self.fleet_status.setStyleSheet("color: #999999; font-size: 11px;")
+        self.mirror_status = QLabel("Mirror idle")
+        self.mirror_status.setStyleSheet("color: #999999; font-size: 11px;")
+        status_row.addWidget(self.fleet_status)
+        status_row.addWidget(self.mirror_status)
+        status_row.addStretch()
+        layout.addLayout(status_row)
 
         return group
 
@@ -209,7 +290,7 @@ class FEDTabWidget(QWidget):
         # every connected device at once, and each one is duplicated per-device
         # on the cards opposite; titled "FED Control Panel" there was nothing to
         # say which of the two a given button was.
-        group = QGroupBox("All Connected Devices")
+        group = QGroupBox("Apply to all connected devices")
         layout = QHBoxLayout(group)
         layout.setSpacing(15)
 
@@ -232,17 +313,20 @@ class FEDTabWidget(QWidget):
         left.addWidget(self.global_params)
 
         actions = QHBoxLayout()
-        apply_btn = QPushButton("Apply to All")
-        apply_btn.setStyleSheet("font-weight: bold; min-height: 22px;")
+        apply_btn = _weigh(QPushButton("Apply to All"), "normal")
         apply_btn.clicked.connect(self._apply_global_mode)
-        dispense_btn = QPushButton("Dispense All")
-        dispense_btn.setStyleSheet("font-weight: bold; min-height: 22px;")
+        dispense_btn = _weigh(QPushButton("Dispense All..."), "normal")
+        dispense_btn.setToolTip(
+            "Deliver one pellet to every connected device. Asks first: under a "
+            "fixed-ratio protocol these pellets were not earned by a poke, and "
+            "nothing in the log distinguishes them afterwards.")
         dispense_btn.clicked.connect(self._dispense_all)
-        self.global_lights_btn = QPushButton("Lights: OFF")
+        self.global_lights_btn = _weigh(
+            QPushButton("Lights: OFF"), "normal", "Lights: ON")
         self.global_lights_btn.setCheckable(True)
         self.global_lights_btn.setStyleSheet("""
+            QPushButton { padding: 6px 14px; border-radius: 4px; }
             QPushButton:checked { background-color: #f1c40f; color: black; }
-            QPushButton { min-height: 22px; font-weight: bold; }
         """)
         self.global_lights_btn.clicked.connect(self._toggle_global_lights)
         for widget in (apply_btn, dispense_btn, self.global_lights_btn):
@@ -283,9 +367,9 @@ class FEDTabWidget(QWidget):
             QPushButton:checked { background-color: #4caf50; color: white; }
             QPushButton { font-weight: bold; }
         """)
+        _fit(self.auto_sync_btn, "Auto Sync: OFF")
         self.auto_sync_btn.toggled.connect(self._on_auto_sync_toggled)
-        sync_now_btn = QPushButton("Sync Now")
-        sync_now_btn.setStyleSheet("font-weight: bold;")
+        sync_now_btn = _weigh(QPushButton("Sync Now"), "normal")
         sync_now_btn.clicked.connect(self._sync_all)
         sync_actions.addWidget(self.auto_sync_btn)
         sync_actions.addWidget(sync_now_btn)
@@ -293,14 +377,13 @@ class FEDTabWidget(QWidget):
         right.addLayout(sync_actions)
 
         data_row = QHBoxLayout()
-        export_btn = QPushButton("Export SD Logs...")
-        export_btn.setStyleSheet("font-weight: bold;")
+        export_btn = _weigh(QPushButton("Export SD Logs..."), "normal")
         export_btn.setToolTip(
             "Save a copy of the SD logs to a folder you choose. This is for "
             "taking data elsewhere — while a session is recording, the mirror "
             "is already keeping a complete copy in the session folder.")
         export_btn.clicked.connect(self._export_all)
-        pull_btn = QPushButton("Pull Data Now")
+        pull_btn = _weigh(QPushButton("Pull Data Now"), "normal")
         pull_btn.setToolTip(
             "Force the mirror to pull immediately instead of waiting for the "
             "next event or tick. It pulls into the current session folder, so "
@@ -310,10 +393,6 @@ class FEDTabWidget(QWidget):
             data_row.addWidget(widget)
         data_row.addStretch()
         right.addLayout(data_row)
-
-        self.mirror_status = QLabel("Mirror idle")
-        self.mirror_status.setStyleSheet("color: #999999; font-size: 11px;")
-        right.addWidget(self.mirror_status)
         right.addStretch()
 
         layout.addLayout(left, stretch=1)
@@ -329,14 +408,14 @@ class FEDTabWidget(QWidget):
     # --- devices ----------------------------------------------------------
 
     def _build_devices_group(self):
-        group = QGroupBox("Connected Devices")
+        group = QGroupBox("Devices")
         layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
         controls = QHBoxLayout()
-        add_btn = QPushButton("Add Device")
+        add_btn = _weigh(QPushButton("Add Device"), "quiet")
         add_btn.clicked.connect(lambda: self.add_device_slot())
-        self.refresh_btn = QPushButton("Refresh Ports")
+        self.refresh_btn = _weigh(QPushButton("Refresh Ports"), "quiet")
         self.refresh_btn.setToolTip(
             "Scan for FED3 devices. Ports already held by a connected device are "
             "never reopened, so this is safe to run mid-experiment.")
@@ -436,7 +515,8 @@ class FEDTabWidget(QWidget):
     # ==================================================================
 
     def _build_scheduler_group(self):
-        group = QGroupBox("Protocol Event Scheduler")
+        group = QGroupBox()
+        group.setFlat(True)
         layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
@@ -460,14 +540,18 @@ class FEDTabWidget(QWidget):
                 border: 1px solid #333333; font-weight: bold;
             }
         """)
-        self.sched_table.setMinimumHeight(70)
+        # An empty table used to reserve 190px to say nothing. It now shrinks
+        # to a single row of chrome until there is something to list, and the
+        # section header carries the "nothing scheduled" state instead.
+        self.sched_table.setMinimumHeight(0)
         self.sched_table.setMaximumHeight(260)
+        self.sched_table.setVisible(False)
         layout.addWidget(self.sched_table)
 
         layout.addWidget(self._build_scheduler_form())
 
         table_actions = QHBoxLayout()
-        clear_btn = QPushButton("Clear Finished")
+        clear_btn = _weigh(QPushButton("Clear Finished"), "quiet")
         clear_btn.setToolTip("Remove events that have run, failed or been missed.")
         clear_btn.clicked.connect(self._clear_finished_events)
         table_actions.addStretch()
@@ -550,8 +634,7 @@ class FEDTabWidget(QWidget):
         self.sched_preview.setStyleSheet("color: #4fc3f7; font-size: 11px;")
         grid.addWidget(self.sched_preview, 2, 0, 1, 4)
 
-        add_btn = QPushButton("Add Event")
-        add_btn.setStyleSheet("font-weight: bold; min-height: 24px;")
+        add_btn = _weigh(QPushButton("Add Event"), "normal")
         add_btn.clicked.connect(self._add_scheduled_event)
         grid.addWidget(add_btn, 2, 5, Qt.AlignRight)
 
@@ -648,6 +731,7 @@ class FEDTabWidget(QWidget):
         self.scheduler.sort()
         self.sched_table.setRowCount(0)
         self._sched_rows = {}
+        self.sched_table.setVisible(bool(self.scheduler.events))
 
         for event in self.scheduler.events:
             row = self.sched_table.rowCount()
@@ -769,7 +853,8 @@ class FEDTabWidget(QWidget):
             slot_num = next(n for n in range(1, 1000) if n not in used)
 
         box = QGroupBox(f"Slot {slot_num}")
-        grid = QGridLayout(box)
+        card = QVBoxLayout(box)
+        card.setSpacing(5)
 
         name_edit = QLineEdit()
         # The placeholder shows the name that will be used if this is left blank,
@@ -778,10 +863,14 @@ class FEDTabWidget(QWidget):
         name_edit.setPlaceholderText(f"Slot {slot_num}")
         port_combo = QComboBox()
         port_combo.setEditable(True)
-        remove_btn = QPushButton("Remove")
+        # Quiet, small, and down with the housekeeping. It used to be the
+        # brightest control on the card, in the top-right corner where a window
+        # close box lives, immediately beside the port dropdown you go to when a
+        # device needs re-selecting.
+        remove_btn = _weigh(QPushButton("Remove"), "quiet")
         mode_combo = QComboBox()
         mode_combo.addItems(proto.MODE_LABELS)
-        apply_btn = QPushButton("Apply Mode")
+        apply_btn = _weigh(QPushButton("Apply Mode"), "normal")
         params = _ModeParams()
         status_label = QLabel("Not connected")
         status_label.setStyleSheet("color: #999999; font-size: 11px;")
@@ -793,17 +882,28 @@ class FEDTabWidget(QWidget):
             "color: #e74c3c; font-size: 11px; font-weight: bold;")
         rec_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        feed_btn = QPushButton("Dispense")
-        lights_btn = QPushButton("Lights: OFF")
+        feed_btn = _weigh(QPushButton("Dispense"), "normal")
+        lights_btn = _weigh(QPushButton("Lights: OFF"), "normal", "Lights: ON")
         lights_btn.setCheckable(True)
         lights_btn.setStyleSheet("""
+            QPushButton { padding: 6px 14px; border-radius: 4px; }
             QPushButton:checked { background-color: #f1c40f; color: black; }
-            QPushButton { min-height: 22px; font-weight: bold; }
         """)
-        export_btn = QPushButton("Export Logs...")
+        export_btn = _weigh(QPushButton("Export Logs..."), "quiet")
+        setup_btn = _weigh(QPushButton("\u25b6 Setup"), "quiet", "\u25bc Setup")
+        setup_btn.setCheckable(True)
+        setup_btn.setToolTip(
+            "Port, name, mode and ratio. Set once when the cage is assembled; "
+            "hidden while the device is connected so the card can show what it "
+            "is doing instead.")
 
-        manual = _row(QLabel("Manual:"), feed_btn, lights_btn)
-        data = _row(QLabel("Data:"), export_btn)
+        # What a researcher walks over to check, in the order they ask it.
+        # Counts alone cannot answer "is this cage still working" — a device
+        # that stopped feeding an hour ago has exactly the same counters as one
+        # that fed a minute ago.
+        stats_label = QLabel("\u2014")
+        stats_label.setStyleSheet("color: #cccccc; font-size: 11px;")
+        stats_label.setWordWrap(True)
 
         # The live poke/pellet counters sit on the card that controls the
         # device. They used to live in a separate "Device View" group at the
@@ -811,24 +911,35 @@ class FEDTabWidget(QWidget):
         # different columns, hundreds of pixels apart.
         svg_view = FEDSvgView()
         svg_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        svg_view.setMinimumHeight(84)
-        svg_view.setMaximumHeight(110)
+        svg_view.setMinimumHeight(58)
+        svg_view.setMaximumHeight(72)
 
-        grid.addWidget(QLabel("Port:"), 0, 0)
-        grid.addWidget(port_combo, 0, 1, 1, 2)
-        grid.addWidget(remove_btn, 0, 3, Qt.AlignRight)
-        grid.addWidget(QLabel("Name:"), 1, 0)
-        grid.addWidget(name_edit, 1, 1, 1, 3)
-        grid.addWidget(QLabel("Mode:"), 2, 0)
-        grid.addWidget(mode_combo, 2, 1, 1, 2)
-        grid.addWidget(apply_btn, 2, 3)
-        grid.addWidget(params, 3, 0, 1, 4)
-        grid.addWidget(svg_view, 4, 0, 1, 4)
-        grid.addWidget(manual, 5, 0, 1, 4)
-        grid.addWidget(data, 6, 0, 1, 4)
-        grid.addWidget(status_label, 7, 0, 1, 3)
-        grid.addWidget(rec_label, 7, 3)
-        grid.setColumnStretch(1, 1)
+        # Setup: everything set once on the day the cage is built.
+        setup_panel = QWidget()
+        setup_grid = QGridLayout(setup_panel)
+        setup_grid.setContentsMargins(0, 4, 0, 0)
+        setup_grid.setSpacing(6)
+        setup_grid.addWidget(QLabel("Port:"), 0, 0)
+        setup_grid.addWidget(port_combo, 0, 1, 1, 2)
+        setup_grid.addWidget(QLabel("Name:"), 1, 0)
+        setup_grid.addWidget(name_edit, 1, 1, 1, 2)
+        setup_grid.addWidget(QLabel("Mode:"), 2, 0)
+        setup_grid.addWidget(mode_combo, 2, 1)
+        setup_grid.addWidget(apply_btn, 2, 2)
+        setup_grid.addWidget(params, 3, 0, 1, 3)
+        setup_grid.setColumnStretch(1, 1)
+        setup_panel.setVisible(False)
+
+        state_row = _row(status_label, None, rec_label)
+        actions = _row(feed_btn, lights_btn, None)
+        housekeeping = _row(setup_btn, None, export_btn, remove_btn)
+
+        card.addWidget(state_row)
+        card.addWidget(svg_view)
+        card.addWidget(stats_label)
+        card.addWidget(actions)
+        card.addWidget(housekeeping)
+        card.addWidget(setup_panel)
         box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         device = FedDevice(slot_num, {
@@ -836,7 +947,8 @@ class FEDTabWidget(QWidget):
             "mode_combo": mode_combo, "params": params,
             "ratio_spin": params.ratio_spin, "timeout_spin": params.timeout_spin,
             "status_label": status_label, "rec_label": rec_label,
-            "lights_btn": lights_btn,
+            "lights_btn": lights_btn, "stats_label": stats_label,
+            "setup_panel": setup_panel, "setup_btn": setup_btn,
             "svg_view": svg_view, "remove_btn": remove_btn,
         })
 
@@ -855,6 +967,8 @@ class FEDTabWidget(QWidget):
             lambda: self._execute_action(device, sched.ACTION_LIGHTS,
                                          {"lights": lights_btn.isChecked()}))
         export_btn.clicked.connect(lambda: self._export_device(device))
+        setup_btn.toggled.connect(
+            lambda checked, d=device: self._toggle_device_setup(d, checked))
         port_combo.activated.connect(lambda: self._on_port_selected(device))
         port_combo.lineEdit().editingFinished.connect(
             lambda: self._on_port_selected(device))
@@ -862,6 +976,9 @@ class FEDTabWidget(QWidget):
         _sync_mode_params(mode_combo, params)
         port_combo.addItem("Scanning...")
         port_combo.setEnabled(False)
+        # A slot with no device on it is nothing but setup, so it opens showing
+        # setup. Connecting is what turns the card into a readout.
+        setup_btn.setChecked(True)
 
         self.devices_flow.addWidget(box)
         self.devices.append(device)
@@ -870,6 +987,11 @@ class FEDTabWidget(QWidget):
         if refresh:
             self.refresh_ports()
         return device
+
+    def _toggle_device_setup(self, device, checked):
+        """Show or hide a card's set-once controls."""
+        device.setup_panel.setVisible(checked)
+        device.setup_btn.setText(("\u25bc" if checked else "\u25b6") + " Setup")
 
     def _on_label_edited(self, device):
         """The user finished typing in a slot's name field."""
@@ -1208,6 +1330,8 @@ class FEDTabWidget(QWidget):
             device.tracking_start_time = datetime.now()
         device.status_label.setText(f"Connected on {device.port}")
         device.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
+        # The card stops being a form and becomes a readout.
+        device.setup_btn.setChecked(False)
 
         self._log_action("Connected", device=device.name,
                          detail=device.port, source="system")
@@ -1438,9 +1562,12 @@ class FEDTabWidget(QWidget):
         self._note_clock_drift(device, status.get("time"))
         self._adopt_current_file(device, status.get("file"))
         if status.get("session"):
+            # The port belongs to setup and is a click away; the protocol and
+            # the file being written are what a running experiment is checked
+            # against, and the whole string has to fit a half-width card.
             device.status_label.setText(
-                f"Connected on {device.port} — {status['session']} "
-                f"· {status.get('file', 'no file')}")
+                f"{status['session']} \u00b7 {status.get('file', 'no file')}")
+            device.status_label.setToolTip(f"Connected on {device.port}")
 
     def _adopt_current_file(self, device, filename):
         """Note which SD log the device is writing to, and tell its mirror.
@@ -1615,9 +1742,32 @@ class FEDTabWidget(QWidget):
             self._execute_action(device, sched.ACTION_SET_MODE, params)
 
     def _dispense_all(self):
-        for device in self.devices:
-            if device.is_connected:
-                self._execute_action(device, sched.ACTION_DISPENSE, {})
+        """Deliver a pellet to every connected device, after asking.
+
+        Under a fixed-ratio protocol a pellet is meant to have been earned by a
+        poke. One delivered from here is written to the log as an ordinary
+        pellet row and is indistinguishable from an earned one afterwards, so
+        an accidental click silently contaminates every cage at once rather
+        than doing something visibly wrong.
+        """
+        targets = [d for d in self.devices if d.is_connected]
+        if not targets:
+            self._set_status("No connected devices to dispense to")
+            return
+        names = ", ".join(d.name for d in targets)
+        confirm = QMessageBox.question(
+            self, "Dispense to every device?",
+            f"Deliver one pellet to {len(targets)} device"
+            f"{'s' if len(targets) != 1 else ''}?\n\n{names}\n\n"
+            "These pellets are not earned by a poke, and the log will not "
+            "distinguish them from ones that were.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if confirm != QMessageBox.Yes:
+            self._log_action("Dispense to all devices", detail="cancelled",
+                             result="cancelled")
+            return
+        for device in targets:
+            self._execute_action(device, sched.ACTION_DISPENSE, {})
 
     def _toggle_global_lights(self):
         on = self.global_lights_btn.isChecked()
@@ -1781,12 +1931,17 @@ class FEDTabWidget(QWidget):
             device.mirror.failed.connect(
                 lambda message, d=device: self._on_mirror_failed(d, message))
             device.mirror.updated.connect(
-                lambda name, added, total, d=device:
-                self._log_action("Mirrored SD data", device=d.name,
-                                 detail=f"{name}: +{added} bytes ({total} total)",
-                                 source="system"))
+                lambda name, added, total, d=device: self._on_mirror_updated(
+                    d, name, added, total))
             if adopt_current:
                 device.mirror.sync_now(force=True)
+
+    def _on_mirror_updated(self, device, name, added, total):
+        """Record that this device's data reached disk, and when."""
+        device.last_mirror_update = datetime.now()
+        self._log_action("Mirrored SD data", device=device.name,
+                         detail=f"{name}: +{added} bytes ({total} total)",
+                         source="system")
 
     def _on_mirror_failed(self, device, message):
         self.mirror_status.setText(message)
@@ -2150,9 +2305,92 @@ class FEDTabWidget(QWidget):
     def _on_ui_tick(self):
         self._run_due_events()
         self._tick_scheduler_display()
+        self._refresh_readouts()
         # Cheap, and genuinely clock-dependent: a delay-based trigger resolves
         # relative to now, so a frozen preview would misstate when it fires.
         self._update_sched_preview()
+
+    # ------------------------------------------------------------ readouts
+
+    @staticmethod
+    def _age(moment, now):
+        """"4s", "12m", "3h 20m" — how long ago, at a glance."""
+        if moment is None:
+            return None
+        seconds = int((now - moment).total_seconds())
+        if seconds < 0:
+            return "0s"
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        hours, minutes = divmod(seconds // 60, 60)
+        if hours < 24:
+            return f"{hours}h {minutes:02d}m"
+        return f"{hours // 24}d {hours % 24}h"
+
+    def _device_summary(self, device, now):
+        """One line answering "is this cage still working?".
+
+        Counters alone cannot: a device that stopped feeding an hour ago shows
+        exactly the same numbers as one that fed a minute ago. The time since
+        the last pellet is what separates them.
+        """
+        if not device.is_connected:
+            return "\u2014"
+
+        today = now.date()
+        parts = [f"{sum(1 for e in device.events if e.date() == today)} today",
+                 f"{device.stats['pellet']} total"]
+
+        last = self._age(device.events[-1] if device.events else None, now)
+        parts.append(f"last pellet {last} ago" if last else "no pellets yet")
+
+        if device.mirror is not None:
+            mirrored = self._age(device.last_mirror_update, now)
+            parts.append(f"mirrored {mirrored} ago" if mirrored
+                         else "mirror pending")
+        return "  \u00b7  ".join(parts)
+
+    def _refresh_readouts(self):
+        """Keep the card summaries, the fleet line and the section headers current."""
+        now = datetime.now()
+        for device in self.devices:
+            summary = self._device_summary(device, now)
+            if device.stats_label.text() != summary:
+                device.stats_label.setText(summary)
+
+        connected = [d for d in self.devices if d.is_connected]
+        recording = [d for d in connected if d.mirror is not None]
+        if not self.devices:
+            fleet = "No devices connected"
+        else:
+            fleet = (f"{len(connected)} of {len(self.devices)} connected")
+            if recording:
+                fleet += f"  \u00b7  {len(recording)} recording"
+            silent = [d for d in connected if d.refused or d.reconnect_gave_up]
+            if silent:
+                fleet += f"  \u00b7  {len(silent)} needs attention"
+        self.fleet_status.setText(fleet)
+        self.fleet_status.setStyleSheet(
+            "color: %s; font-size: 11px;"
+            % ("#4caf50" if connected and len(connected) == len(self.devices)
+               else "#999999"))
+
+        pending = [e for e in self.scheduler.events
+                   if e.enabled and e.status == sched.STATUS_PENDING
+                   and e.target_time is not None]
+        if not self.scheduler.events:
+            summary = "no events scheduled"
+        elif pending:
+            soonest = min(pending, key=lambda e: e.target_time)
+            summary = (f"next: {soonest.describe_action()} on "
+                       f"{soonest.target} {soonest.describe_trigger(now)}")
+            if len(pending) > 1:
+                summary += f"  \u00b7  {len(pending) - 1} more pending"
+        else:
+            summary = f"{len(self.scheduler.events)} events, none pending"
+        self.scheduler_section.set_summary(summary)
 
     def _on_plot_tick(self):
         """Redraw only when something changed, or when a live trace must advance.
@@ -2228,53 +2466,6 @@ class FEDTabWidget(QWidget):
             self.lights_off_spin.value(), self.lights_on_spin.value(),
             self.dark_cycle_check.isChecked())
         self._mark_plot_dirty()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._apply_responsive_layout()
-
-    def _apply_responsive_layout(self):
-        """Two columns when wide, a single stack when narrow."""
-        is_narrow = self.width() < NARROW_WIDTH
-        if is_narrow == self._layout_is_narrow:
-            return
-        self._layout_is_narrow = is_narrow
-
-        for widget in (self.control_group, self.scheduler_group, self.devices_group,
-                       self.plot_group, self.left_column, self.right_column):
-            self.columns_layout.removeWidget(widget)
-        for layout, widget in ((self.left_column_layout, self.control_group),
-                               (self.left_column_layout, self.scheduler_group),
-                               (self.left_column_layout, self.plot_group),
-                               (self.right_column_layout, self.devices_group)):
-            layout.removeWidget(widget)
-
-        for layout in (self.left_column_layout, self.right_column_layout):
-            _drop_spacers(layout)
-
-        if is_narrow:
-            self.left_column.hide()
-            self.right_column.hide()
-            for row, widget in enumerate(
-                    (self.control_group, self.scheduler_group, self.devices_group,
-                     self.plot_group)):
-                self.columns_layout.addWidget(widget, row, 0)
-                widget.show()
-            self.columns_layout.setColumnStretch(0, 1)
-            self.columns_layout.setColumnStretch(1, 0)
-        else:
-            self.left_column_layout.addWidget(self.control_group)
-            self.left_column_layout.addWidget(self.scheduler_group)
-            self.left_column_layout.addWidget(self.plot_group, stretch=1)
-            self.right_column_layout.addWidget(self.devices_group)
-            self.right_column_layout.addStretch()
-            self.columns_layout.addWidget(self.left_column, 0, 0)
-            self.columns_layout.addWidget(self.right_column, 0, 1)
-            for widget in (self.left_column, self.right_column, self.control_group,
-                           self.scheduler_group, self.devices_group, self.plot_group):
-                widget.show()
-            self.columns_layout.setColumnStretch(0, 1)
-            self.columns_layout.setColumnStretch(1, 1)
 
     def cleanup(self):  # noqa: D401
         """Close every connection, timer and file before the window goes away."""
@@ -2404,22 +2595,19 @@ def _section_label(text):
     return label
 
 
-def _drop_spacers(layout):
-    """Remove trailing stretch items so a re-layout does not accumulate them."""
-    for index in reversed(range(layout.count())):
-        item = layout.itemAt(index)
-        if item is not None and item.widget() is None and item.layout() is None:
-            layout.takeAt(index)
-
-
 def _row(*widgets):
+    """A horizontal strip. ``None`` places a stretch; one is appended if absent."""
     container = QWidget()
     layout = QHBoxLayout(container)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
     for widget in widgets:
-        layout.addWidget(widget)
-    layout.addStretch()
+        if widget is None:
+            layout.addStretch()
+        else:
+            layout.addWidget(widget)
+    if None not in widgets:
+        layout.addStretch()
     return container
 
 

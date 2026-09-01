@@ -226,6 +226,12 @@ class FNTMainWindow(QMainWindow):
             QPushButton:disabled {
                 background-color: #3f3f3f;
                 color: #cccccc;
+                /* Qt sizes a styled button from the most specific rule that
+                   matches it. Without the padding restated here, a disabled
+                   button was measured for a box narrower than the label the
+                   enabled rule paints, and clipped it. */
+                padding: 6px 14px;
+                border-radius: 4px;
             }
             QGroupBox {
                 font-weight: bold;

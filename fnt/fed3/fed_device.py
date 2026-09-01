@@ -49,6 +49,10 @@ class FedDevice:
         self.reconnect_gave_up = False   # backoff exhausted; already reported
         self.last_sync_time = None
         self.last_device_time = None    # device RTC at the last sync
+        # When this device's data last reached disk. Shown on the card, because
+        # in an unattended run "still connected" and "still being recorded" are
+        # different questions and only the second one matters to the data.
+        self.last_mirror_update = None
 
         # --- recorded state ----------------------------------------------
         self.is_tracking = False
