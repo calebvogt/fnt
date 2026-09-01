@@ -396,7 +396,12 @@ class FileSelectorDialog(QDialog):
             if len(device_files) > 1:
                 header = QLabel(f"<b>{device.name}</b>")
                 content_layout.addWidget(header)
-            mirrored = set(device.mirror.offsets) if device.mirror else set()
+            # A DeviceMirror owns two stores (session and archive); the offsets
+            # live on those, not on the mirror itself.
+            mirrored = set()
+            if device.mirror is not None:
+                mirrored = (set(device.mirror.session.offsets)
+                            | set(device.mirror.archive.offsets))
             for filename, size in files:
                 label = f"{filename} ({_format_size(size)})"
                 if filename in mirrored:

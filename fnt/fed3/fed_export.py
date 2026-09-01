@@ -72,6 +72,8 @@ class Fed3Transfer(QObject):
 
     def file_size(self, filename, callback):
         """``callback(ok, size | error_message)``."""
+        if self._reject_if_busy(callback):
+            return False
         self._filename = filename
         return self._begin(_SIZING, callback, proto.cmd_file_size(filename))
 
@@ -82,6 +84,13 @@ class Fed3Transfer(QObject):
         offset is echoed back because the device clamps it when the host's
         mirror is somehow ahead of the file (e.g. the log was rotated).
         """
+        # Refused before anything is stored. Writing ``_filename``/``_offset``
+        # first and only then noticing the link was busy overwrote the *running*
+        # transfer's start offset: the in-flight mirror chunk then reported back
+        # as starting at this request's offset, and the mirror rewrote its copy
+        # of the log from there — truncating it to the last chunk pulled.
+        if self._reject_if_busy(callback):
+            return False
         self._filename = filename
         self._offset = offset
         return self._begin(_DOWNLOADING, callback,
@@ -212,9 +221,15 @@ class Fed3Transfer(QObject):
 
     # --- plumbing ---------------------------------------------------------
 
+    def _reject_if_busy(self, callback):
+        """Fail ``callback`` when another operation owns the link. True if so."""
+        if not self.busy:
+            return False
+        self._invoke(callback, False, "device is busy with another transfer")
+        return True
+
     def _begin(self, state, callback, command):
-        if self.busy:
-            self._invoke(callback, False, "device is busy with another transfer")
+        if self._reject_if_busy(callback):
             return False
         self._state = state
         self._callback = callback

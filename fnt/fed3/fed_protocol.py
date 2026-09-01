@@ -54,7 +54,13 @@ MIN_FIRMWARE = (2, 0)
 
 
 def parse_version(firmware):
-    """``"2.1"`` -> ``(2, 1)``. None for anything unparseable."""
+    """``"2.1"`` -> ``(2, 1)``. None for anything unparseable.
+
+    Short versions are zero-padded to the length of :data:`MIN_FIRMWARE`.
+    Without that, ``"2"`` parsed to ``(2,)``, and a shorter tuple sorts *below*
+    a longer one with the same prefix — so a device announcing ``FW:2`` was
+    refused as too old while ``FW:3`` was accepted.
+    """
     if not firmware:
         return None
     parts = []
@@ -63,7 +69,10 @@ def parse_version(firmware):
         if not digits:
             break
         parts.append(int(digits))
-    return tuple(parts) or None
+    if not parts:
+        return None
+    parts += [0] * (len(MIN_FIRMWARE) - len(parts))
+    return tuple(parts)
 
 
 def is_supported(firmware):

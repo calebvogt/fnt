@@ -157,6 +157,7 @@ class FEDTabWidget(QWidget):
         self.logger = session_mod.SessionLogger()
         self.scheduler = sched.Scheduler()
         self.sessions_dir = session_mod.default_session_root()
+        self.last_session_root = None        # so "Open Folder" survives a stop
         self.device_names = session_mod.DeviceNames()
         self.removed_ports = set()
         self._port_info = {}                 # port -> {"id":.., "firmware":..}
@@ -1160,10 +1161,14 @@ class FEDTabWidget(QWidget):
         self._set_status("Ready")
 
         # A rescan is the documented remedy after reflashing, so it clears the
-        # refusal and lets the device be tried again.
+        # refusal and lets the device be tried again. Only the refusal: clearing
+        # every card's frame also erased the orange JAM border and the red
+        # disconnected border, neither of which a port scan resolves.
         for device in self.devices:
-            device.refused = False
-            device.box.setStyleSheet("")
+            if device.refused:
+                device.refused = False
+                device.box.setStyleSheet("")
+                device.box.setToolTip("")
 
         active = []
         for port, status, device_id, firmware in results:
@@ -1682,7 +1687,12 @@ class FEDTabWidget(QWidget):
             self._log_action(description, device=device.name, detail=command,
                              source=source, result="not connected")
             return False
-        device.link.send(command)
+        if not device.link.send(command):
+            # The link stopped between the is_connected check and the write.
+            self.log.append_log(f"[{device.name}] {command}: link closed", False)
+            self._log_action(description, device=device.name, detail=command,
+                             source=source, result="link closed")
+            return False
         self._log_action(description, device=device.name, detail=command,
                          source=source)
         return True
@@ -1974,6 +1984,9 @@ class FEDTabWidget(QWidget):
         self.record_btn.setText("Start Recording")
         self.session_label.setText(f"Last session: {self.session.name}")
         self.session_label.setStyleSheet("color: #999999;")
+        # Kept so the button the label points at still opens something: it stayed
+        # enabled after a stop while _open_session_folder returned silently.
+        self.last_session_root = self.session.root
         self.session = None
 
     def _drain_mirrors(self, timeout_ms=FINAL_PULL_TIMEOUT_MS):
@@ -2105,9 +2118,9 @@ class FEDTabWidget(QWidget):
             self._log_action("Session location changed", detail=chosen)
 
     def _open_session_folder(self):
-        if self.session is None:
+        path = self.session.root if self.session else self.last_session_root
+        if not path:
             return
-        path = self.session.root
         if sys.platform == "darwin":
             subprocess.Popen(["open", path])
         elif os.name == "nt":
@@ -2164,7 +2177,10 @@ class FEDTabWidget(QWidget):
         def cancel():
             state["cancelled"] = True
             for device in available:
-                device.transfer.cancel("export cancelled")
+                # A device that dropped since the export started has had its
+                # transfer torn down by _disconnect_device.
+                if device.transfer is not None:
+                    device.transfer.cancel("export cancelled")
 
         progress.canceled.connect(cancel)
 
@@ -2176,6 +2192,11 @@ class FEDTabWidget(QWidget):
                 self._choose_and_download(listings)
                 return
             device = available[index]
+            if device.transfer is None:
+                self.log.append_log(
+                    f"[{device.name}] disconnected; skipped in export", False)
+                query(index + 1)
+                return
             progress.setLabelText(f"Listing files on {device.name}...")
             progress.setValue(index)
 
@@ -2222,7 +2243,8 @@ class FEDTabWidget(QWidget):
         def cancel():
             state["cancelled"] = True
             for device, _ in selected:
-                device.transfer.cancel("download cancelled")
+                if device.transfer is not None:
+                    device.transfer.cancel("download cancelled")
 
         progress.canceled.connect(cancel)
 
@@ -2239,6 +2261,11 @@ class FEDTabWidget(QWidget):
                 return
 
             device, filename = selected[index]
+            if device.transfer is None:
+                self.log.append_log(
+                    f"[{device.name}] disconnected; {filename} not exported", False)
+                download(index + 1)
+                return
             progress.setLabelText(
                 f"{filename} from {device.name} ({index + 1}/{len(selected)})")
             progress.setValue(index)

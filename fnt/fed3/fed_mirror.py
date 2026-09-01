@@ -231,8 +231,14 @@ class DeviceMirror(QObject):
 
     @property
     def busy(self):
-        """Whether a pull is in flight. Used to wait one out at session close."""
-        return self._syncing
+        """Whether a pull is in flight *or* waiting for the link to free up.
+
+        The debounce timer counts: ``sync_now`` defers to a link that is busy
+        with an export by re-arming it, without ever setting ``_syncing``. Read
+        as idle, the final pull at session close returned immediately and the
+        bytes written since the previous pull were left on the SD card.
+        """
+        return self._syncing or self._debounce.isActive()
 
     def stop(self):
         """Stop scheduling new pulls. Any pull already in flight still finishes."""

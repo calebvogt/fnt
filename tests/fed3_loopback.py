@@ -38,7 +38,9 @@ import os
 import sys
 
 if not hasattr(os, "openpty"):      # pty is POSIX-only
-    raise SystemExit("fed3_loopback needs a POSIX pty; run it on Linux or macOS.")
+    # A skip, not a failure: the emulator needs a pty, and Windows has none.
+    print("SKIPPED — fed3_loopback needs a POSIX pty; run it on Linux or macOS.")
+    raise SystemExit(0)
 
 import pty
 import threading
