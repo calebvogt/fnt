@@ -587,8 +587,16 @@ def train_unet(
     try:
         from .mad_examples import count_examples
         n_labels = count_examples(cfg.training_data_dir) or n_total
+        # Hard negatives harvested from rejections. They train the model but are
+        # not calls, so they stay out of the run name and are reported
+        # separately — a silent change to what the model is taught would be
+        # impossible to notice later.
+        n_negatives = count_examples(cfg.training_data_dir, kind='negative')
     except Exception:
-        n_labels = n_total
+        n_labels, n_negatives = n_total, 0
+    if progress and n_negatives:
+        progress(0, cfg.n_epochs, {
+            'status': 'negatives', 'n_negatives': n_negatives})
     run_dir = Path(cfg.resolve_run_dir(n_examples=n_labels))
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -802,6 +810,9 @@ def train_unet(
         'early_stopped': early_stopped,
         'n_train_tiles': int(len(train_idx)),
         'n_val_tiles': n_val,
+        'n_labels': n_labels,
+        # Rejected detections reused as explicit hard negatives.
+        'n_negatives': n_negatives,
         # How the split was made. Every val_* number above must be read through
         # this: only 'file' means "measured on a recording the model never saw".
         'split_level': split['split_level'],

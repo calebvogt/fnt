@@ -528,19 +528,42 @@ def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
         return None
 
 
-def td_count(h5_path: str) -> int:
+def example_kind(meta: Dict) -> str:
+    """An example's role in training: ``'label'`` (painted call, the default for
+    anything written before negatives existed) or ``'negative'`` (a rejected
+    detection, kept as an explicit hard negative)."""
+    return str((meta or {}).get("kind") or "label")
+
+
+def td_count(h5_path: str, kind: Optional[str] = None) -> int:
+    """Number of stored examples; ``kind`` filters to 'label' or 'negative'."""
     _require_h5()
     if not os.path.isfile(h5_path):
         return 0
     with h5py.File(h5_path, "r") as f:
         ex = f.get("examples")
-        return len(ex) if ex is not None else 0
+        if ex is None:
+            return 0
+        if kind is None:
+            return len(ex)
+        n = 0
+        for key in ex:
+            try:
+                meta = json.loads(ex[key].attrs.get("meta_json", "{}"))
+            except Exception:
+                continue
+            if example_kind(meta) == kind:
+                n += 1
+        return n
 
 
-def td_count_by_source_wav(h5_path: str) -> Dict[str, int]:
+def td_count_by_source_wav(h5_path: str,
+                           kind: Optional[str] = None) -> Dict[str, int]:
     """Return ``{wav_basename: n_examples}`` reading **only** each example's
     metadata attribute — never decompressing the spec/mask arrays. Cheap enough
-    to call for a whole project when populating a file list."""
+    to call for a whole project when populating a file list.
+
+    ``kind`` filters to 'label' or 'negative'; None counts both."""
     _require_h5()
     out: Dict[str, int] = {}
     if not os.path.isfile(h5_path):
@@ -554,6 +577,8 @@ def td_count_by_source_wav(h5_path: str) -> Dict[str, int]:
                 try:
                     meta = json.loads(ex[key].attrs.get("meta_json", "{}"))
                 except Exception:
+                    continue
+                if kind is not None and example_kind(meta) != kind:
                     continue
                 bn = os.path.basename(str(meta.get("source_wav", "")))
                 if bn:

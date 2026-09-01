@@ -83,8 +83,9 @@ Per recording `<wav>`:
     for hand-labels).
   - `status` — `pending` (unreviewed) · `accepted` (hand-labels write accepted,
     and accepting a prediction in train mode also saves a training example) ·
-    `rejected` (a **recorded** human "no", kept visible as an audit trail;
-    *not* used as negative training data). **Delete** drops the row + mask
+    `rejected` (a **recorded** human "no", kept visible as an audit trail
+    **and reused as a hard negative** — see *Hard negatives* below).
+    **Delete** drops the row + mask
     entirely (no `deleted` status). The on-screen color of each status depends
     on the active spectrogram colormap — see *Review colors* below.
   - `source` — `prediction` or `label`.
@@ -346,6 +347,37 @@ artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
 
 `mad analyze` has the same behavior headless (`--no-resume`, `--run-dir`,
 `--log-root`, `--batch-size`, `--no-amp`) for HPC or overnight runs.
+
+---
+
+## Hard negatives from rejections
+
+Rejecting a prediction stores a **negative example**: the same spectrogram patch
+with an empty mask, so training supervises every pixel of it as background.
+
+These are the most informative negatives available — they are exactly the things
+this model got wrong, picked out by a human. Previously a rejection was an audit
+trail only, so the model never learned from its own false positives and would
+keep making them.
+
+Details that matter:
+
+- **Only detections become negatives.** A rejected *hand-label* is you
+  withdrawing a call you drew, not evidence the region is noise, so it is
+  ignored.
+- **Retracted when the rejection stops being true.** Negatives use a
+  deterministic id (`<stem>_neg_<call_id>`), so accepting the call after all —
+  or deleting the detection — removes the negative. Otherwise the model would
+  keep being taught to suppress a call you changed your mind about, invisibly,
+  since nothing in the UI lists negatives.
+- **They never inflate label counts.** `count_examples()` reports labels by
+  default; run names and the UI keep meaning "calls you drew". The training
+  summary records `n_negatives` separately.
+
+This is what makes rejecting worth the keystroke: every rejection is a training
+signal, not just bookkeeping. It also does the work of teaching harmonic
+suppression if your labeling policy is fundamentals-only — reject the harmonics
+the model finds and it learns to stop.
 
 ---
 

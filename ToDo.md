@@ -36,6 +36,13 @@
 - 
 
 
+## MAD (Mask Audio Detector)
+- self-supervised pretraining on our own unlabeled audio. ImageNet-pretrained resnet50 is a poor prior for spectrograms; we have ~3.7 TB of unlabeled VoleCosm USV audio sitting there. Masked-autoencoder or contrastive pretraining of the encoder on our own spectrograms, then fine-tune the U-Net. Highest ceiling of the generalization ideas, also the most work — do it once labeling breadth stops being the bottleneck.
+- harmonic linker. MAD has no way to relate a harmonic to its fundamental (CAD's harmonic columns are deliberately omitted). Current labeling policy is fundamentals only, so this only matters if harmonic structure itself becomes a variable of interest.
+- cross-recording call-type clustering / UMAP off the stored per-call embeddings (`mad embeddings`) — overlaps with the UMAP item above.
+- active learning is a *workflow* change not a code one: label the calls whose score sits near the decision threshold rather than labeling in file order. Sort the Detections list by Score and work the middle.
+- watch the train/val split when adding labeled recordings. With very unbalanced per-file label counts, `grouped_split` can hold out most of the data; the run summary reports `split_level` and val tile count — check it rather than trusting the number.
+
 # video tracking
 - improve the video tracking/optical flow SAM module tab; still underperforming
 

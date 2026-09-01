@@ -5730,6 +5730,7 @@ class MADMainWindow(QMainWindow):
         # Reject is a *recorded* decision: keep the mask visible (red, labeled
         # "Reject") and persist 'rejected' to the CSV. Use Delete to remove it.
         self._write_pred_csv_status(ann, 'rejected')
+        self._save_rejection_negative(ann)
         ann['status'] = 'rejected'
         self.spectrogram._rebuild_confirmed_mask()
         self.spectrogram.update()
@@ -5746,6 +5747,11 @@ class MADMainWindow(QMainWindow):
         for whichever project later picks that recording up."""
         ids = {ann.get('id'), ann.get('blob_id')}
         ids = {str(i) for i in ids if i is not None}
+        # Also drop the hard negative harvested when this call was rejected, so
+        # changing your mind actually changes what the model is taught.
+        _wav = self._active_review_wav_path()
+        if _wav and isinstance(ann.get('blob_id'), int):
+            ids.add(self._negative_example_id(_wav, ann['blob_id']))
         if not ids:
             return
         # Hand the content to the active undo snapshot first: once these are
@@ -6121,6 +6127,7 @@ class MADMainWindow(QMainWindow):
         anns = [self.spectrogram.annotations[i] for i in preds]
         self._batch_write_pred_csv_status(anns, 'rejected')
         for ann in anns:
+            self._save_rejection_negative(ann)
             ann['status'] = 'rejected'
         self.spectrogram.update()
         self._pred_review_idx = None
@@ -6154,6 +6161,7 @@ class MADMainWindow(QMainWindow):
         if to_reject:
             self._batch_write_pred_csv_status(to_reject, 'rejected')
             for ann in to_reject:
+                self._save_rejection_negative(ann)
                 ann['status'] = 'rejected'
 
         n_acc = 0
@@ -9378,10 +9386,87 @@ class MADMainWindow(QMainWindow):
             "choose a project directory."
         )
 
+    @staticmethod
+    def _negative_example_id(wav_path: str, blob_id) -> str:
+        """Deterministic id for the hard negative harvested from one rejection.
+
+        Deterministic so that un-rejecting a call can find and remove it — a
+        uuid would leave the negative behind, quietly training the model to
+        suppress a call the user changed their mind about.
+        """
+        stem = os.path.splitext(os.path.basename(wav_path))[0]
+        return f"{stem}_neg_{blob_id}"
+
+    def _save_rejection_negative(self, ann: dict) -> Optional[str]:
+        """Store a rejected detection as an explicit hard negative.
+
+        Rejections are the most informative negatives available: they are
+        exactly the things this model got wrong, chosen by a human. Previously
+        they were an audit trail only, so the model never learned from its own
+        false positives.
+
+        Only rejections that carry a detection row (an int blob_id) become
+        negatives — a rejected hand-label is the user withdrawing a call they
+        drew, not evidence that the region is noise.
+        """
+        blob_id = ann.get('blob_id')
+        if blob_id is None or not isinstance(blob_id, int):
+            return None
+        if self.audio_data is None:
+            return None
+        wav = self._active_review_wav_path()
+        if not wav:
+            return None
+        mask = ann.get('mask')
+        if mask is None:
+            return None
+        comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], mask)
+        try:
+            return self._save_component_example(
+                ann.get('category') or 'USV', comp, blob_id=blob_id,
+                kind='negative')
+        except Exception as e:
+            self._log(f"Could not store hard negative: {e}")
+            return None
+
+    def _drop_rejection_negative(self, ann_or_blob_id) -> None:
+        """Remove the hard negative harvested from a detection's rejection.
+
+        Called whenever the rejection stops being true: the call is accepted
+        after all, or the detection is deleted outright. Without this the model
+        keeps being taught to suppress a call the user changed their mind about
+        — and because nothing in the UI lists negatives, invisibly.
+        """
+        bid = (ann_or_blob_id.get('blob_id')
+               if isinstance(ann_or_blob_id, dict) else ann_or_blob_id)
+        if not isinstance(bid, int):
+            return
+        wav = self._active_review_wav_path()
+        if not wav:
+            return
+        ex_id = self._negative_example_id(wav, bid)
+        self._remember_undo_example(ex_id)
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import (
+                masks_sibling_path, td_delete)
+            td_delete(masks_sibling_path(wav), ex_id)
+        except Exception:
+            pass
+        if self._project is not None:
+            try:
+                from fnt.usv.usv_detector.mad_examples import delete_example
+                delete_example(self._project.training_data_dir, ex_id)
+            except Exception:
+                pass
+
     def _save_component_example(self, class_name: str, comp,
-                                blob_id=None) -> str:
+                                blob_id=None, kind: str = 'label') -> str:
         """Save one connected-component mask as a self-contained example.
         ``comp`` is ``(f0, f1, t0, t1, local_bool)``. Returns the example id.
+
+        ``kind='negative'`` stores the same spectrogram patch with an **empty**
+        mask, so training supervises every pixel of it as "not a call". Used to
+        turn rejections into hard negatives; see :meth:`_save_rejection_negative`.
 
         With a project: saves to ``training_data.h5`` (consolidated store).
         Without: saves to the per-wav ``_FNT_masks.h5`` sibling so labels
@@ -9477,6 +9562,12 @@ class MADMainWindow(QMainWindow):
         }
         if blob_id is not None:
             meta['blob_id'] = blob_id
+        if kind != 'label':
+            meta['kind'] = kind
+        if kind == 'negative':
+            # Same patch, nothing marked positive: every pixel is supervised as
+            # background, which is the whole point of a hard negative.
+            mask_patch = np.zeros_like(mask_patch)
         # Labels always save to the sibling h5 next to the recording — one
         # source of truth per wav, project or not. The project's consolidated
         # training_data.h5 is rebuilt from the Audio list at train time.
@@ -9484,11 +9575,18 @@ class MADMainWindow(QMainWindow):
         from fnt.usv.usv_detector.fnt_mask_store import (
             masks_sibling_path, set_grid_attrs, td_save_example,
         )
-        ex_id = f"{os.path.splitext(wav_name)[0]}_{uuid.uuid4().hex[:10]}"
+        if kind == 'negative' and blob_id is not None:
+            ex_id = self._negative_example_id(wav_path, blob_id)
+        else:
+            ex_id = f"{os.path.splitext(wav_name)[0]}_{uuid.uuid4().hex[:10]}"
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap_val, nfft=nfft,
                        n_freq_bins=n_freq, n_time_frames=n_time)
+        if kind == 'label':
+            # This detection is a call after all — retract any hard negative
+            # stored when it was rejected.
+            self._drop_rejection_negative(blob_id)
         td_save_example(h5_path, spec_patch, mask_patch, meta, ex_id)
         return ex_id
 
@@ -9702,6 +9800,8 @@ class MADMainWindow(QMainWindow):
                 targets = done
             else:
                 for ann in targets:
+                    if status == 'rejected':
+                        self._save_rejection_negative(ann)
                     ann['status'] = status
             self._batch_write_pred_csv_status(targets, status)
             n_done = len(targets)
@@ -9799,6 +9899,7 @@ class MADMainWindow(QMainWindow):
             # is destroyed. This path deletes from the store directly rather
             # than via _purge_training_example, so it needs its own hook.
             self._remember_undo_example(aid)
+            self._drop_rejection_negative(ann)
             if self._project is not None:
                 from fnt.usv.usv_detector.mad_examples import delete_example
                 try:

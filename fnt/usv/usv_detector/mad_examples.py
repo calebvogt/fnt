@@ -126,9 +126,13 @@ def iter_examples(dataset_dir: str) -> Iterator[Dict]:
             yield ex
 
 
-def count_examples(dataset_dir: str) -> int:
+def count_examples(dataset_dir: str, kind: Optional[str] = "label") -> int:
+    """Examples in the consolidated store. Defaults to **labels only** — the
+    counts that appear in run names and the UI mean "calls you drew", and hard
+    negatives harvested from rejections would otherwise inflate them. Pass
+    ``kind=None`` for the raw total or ``'negative'`` for the negatives."""
     from . import fnt_mask_store as _ms
-    n = _ms.td_count(_store_path(dataset_dir))
+    n = _ms.td_count(_store_path(dataset_dir), kind=kind)
     # add legacy triplets not already in the h5 (ids are unique uuids)
     d = Path(dataset_dir)
     if d.is_dir():
@@ -140,12 +144,13 @@ def count_examples(dataset_dir: str) -> int:
     return n
 
 
-def count_by_source_wav(dataset_dir: str) -> Dict[str, int]:
+def count_by_source_wav(dataset_dir: str,
+                        kind: Optional[str] = "label") -> Dict[str, int]:
     """Return ``{wav_basename: n_confirmed_examples}`` cheaply (metadata only,
     no spec/mask decompression). Combines the consolidated h5 store with any
     legacy PNG/JSON triplets."""
     from . import fnt_mask_store as _ms
-    out = dict(_ms.td_count_by_source_wav(_store_path(dataset_dir)))
+    out = dict(_ms.td_count_by_source_wav(_store_path(dataset_dir), kind=kind))
     d = Path(dataset_dir)
     if d.is_dir():
         for meta_path in d.glob("*.json"):
