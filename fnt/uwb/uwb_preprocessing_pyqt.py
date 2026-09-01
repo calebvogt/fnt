@@ -15690,7 +15690,13 @@ class UWBQuickVisualizationWindow(QWidget):
     _SMOOTHED_NUMERIC_COLS = ('shortid', 'timestamp', 'location_x', 'location_y',
                               'smoothed_x', 'smoothed_y')
 
-    def verify_smoothed_csv(self, path, chunksize=2_000_000):
+    #: Columns of the social-overlap bouts CSV that must parse as numbers.
+    _BOUTS_NUMERIC_COLS = ('Day', 'duration_s', 'mean_distance', 'n_reads')
+
+    #: Columns of the behaviour-events CSV that must parse as numbers.
+    _BEHAVIOR_NUMERIC_COLS = ('Day', 'duration_s')
+
+    def verify_smoothed_csv(self, path, chunksize=2_000_000, numeric_cols=None):
         """Check every numeric column of the written CSV actually parses.
 
         This exists because a written value was once observed to come back as
@@ -15705,6 +15711,10 @@ class UWBQuickVisualizationWindow(QWidget):
         strings. Catching it here names the file, the line and the value, and
         lets the batch retry the trial - a re-run usually writes it cleanly.
 
+        ``numeric_cols`` defaults to the smoothed CSV's columns; pass another
+        tuple to check a different file with the same machinery. Only columns
+        actually present are checked, so one list can cover several layouts.
+
         Returns (ok, list_of_problem_strings).
         """
         problems = []
@@ -15712,7 +15722,8 @@ class UWBQuickVisualizationWindow(QWidget):
             cols = list(pd.read_csv(path, nrows=0).columns)
         except Exception as e:
             return False, [f"could not read the header: {e}"]
-        check = [c for c in self._SMOOTHED_NUMERIC_COLS if c in cols]
+        check = [c for c in (numeric_cols or self._SMOOTHED_NUMERIC_COLS)
+                 if c in cols]
         if not check:
             return True, []
 
@@ -15739,16 +15750,24 @@ class UWBQuickVisualizationWindow(QWidget):
         line0 = 1                       # 1-based, after the header
         try:
             for chunk in pd.read_csv(path, usecols=check, dtype=str,
-                                     chunksize=chunksize):
+                                     chunksize=chunksize, index_col=False):
                 for col in check:
                     raw = chunk[col]
-                    bad = raw[pd.to_numeric(raw, errors='coerce').isna() & raw.notna()]
-                    for pos, value in list(bad.items())[:3]:
+                    # Locate the bad cells by POSITION in the chunk, never by
+                    # index label: a file whose header lost a column comes back
+                    # with a string index, and naming a line from that would
+                    # fail with a TypeError instead of reporting the value.
+                    mask = (pd.to_numeric(raw, errors='coerce').isna()
+                            & raw.notna()).to_numpy()
+                    values = raw.to_numpy()
+                    at = np.flatnonzero(mask)
+                    for off in at[:3]:
                         problems.append(
-                            f"line {line0 + pos + 1:,}, column '{col}': {value!r}")
-                    if len(bad) > 3:
+                            f"line {line0 + int(off) + 1:,}, column '{col}': "
+                            f"{values[off]!r}")
+                    if len(at) > 3:
                         problems.append(
-                            f"  ...and {len(bad) - 3} more bad value(s) in '{col}'")
+                            f"  ...and {len(at) - 3} more bad value(s) in '{col}'")
                 line0 += len(chunk)
                 if len(problems) > 12:
                     problems.append("  (stopping the scan; enough evidence)")
@@ -15756,6 +15775,113 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             return False, [f"scan failed: {e}"]
         return (not problems), problems
+
+    #: An object column with at most this many distinct values is treated as a
+    #: vocabulary (animal labels, sexes, dyad types, dates) and round-tripped
+    #: exactly. Above it a column is free text — timestamps, mostly — and is
+    #: checked by parsing instead, since re-rendering may differ harmlessly.
+    _VOCAB_MAX_UNIQUE = 64
+
+    def verify_written_frame(self, df, path, numeric_cols=()):
+        """Compare a CSV on disk against the frame that produced it.
+
+        ``verify_smoothed_csv`` catches a mangled number. This adds the checks
+        that only make sense when the source frame is still in hand: the file
+        has to have the same number of rows, the same columns in the same
+        order, and — for every short-vocabulary column — no value that was not
+        in the frame. A stray byte in an animal label invents an animal that
+        no downstream join will match, so it has to fail here, loudly.
+
+        Returns (ok, list_of_problem_strings).
+        """
+        # Shape first, and only then the values. A file whose header lost a
+        # column still parses — pandas just promotes a column to the index —
+        # and the numeric scan would then report nonsense about the wrong
+        # column instead of the one plain fact that explains everything.
+        try:
+            back = pd.read_csv(path, dtype=str, keep_default_na=False,
+                               index_col=False)
+        except Exception as e:
+            return False, [f"could not read it back: {e}"]
+
+        if list(back.columns) != list(df.columns):
+            return False, [f"columns on disk {list(back.columns)} do not match "
+                           f"the frame {list(df.columns)}"]
+        if len(back) != len(df):
+            return False, [f"{len(back):,} row(s) on disk, {len(df):,} written "
+                           f"— the file is truncated or duplicated"]
+
+        ok, problems = self.verify_smoothed_csv(path, numeric_cols=numeric_cols)
+        if not ok:
+            return False, problems
+
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue                       # already parsed above
+            want = df[col].astype(str)
+            if want.nunique() > self._VOCAB_MAX_UNIQUE:
+                # Free text (timestamps): re-rendering can differ legitimately,
+                # so require only that it still parses as the time it was.
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    bad = pd.to_datetime(back[col], errors='coerce').isna()
+                    if bad.any():
+                        first = back[col][bad].iloc[0]
+                        problems.append(
+                            f"column '{col}': {int(bad.sum()):,} value(s) are "
+                            f"no longer a time, e.g. {first!r}")
+                continue
+            stray = set(back[col]) - set(want)
+            if stray:
+                problems.append(
+                    f"column '{col}': value(s) on disk that were never "
+                    f"written: {sorted(stray)[:3]}")
+        return (not problems), problems
+
+    def write_verified_csv(self, df, path, numeric_cols=()):
+        """Write an analysis CSV, and read it back before publishing it.
+
+        The smoothed CSV has been verified since this machine was first caught
+        corrupting a pandas write. These files go through the same formatter
+        onto the same disk, so they need the same protection — and their own
+        self-checks cannot provide it, because those run on the DataFrame and
+        so cannot see damage introduced AFTER the check, on the way to disk.
+
+        Writes to ``path + '.partial'`` and renames only once the bytes on
+        disk read back intact, so a fault can never leave behind a half-written
+        file that looks complete. Returns True when the file was published;
+        on failure the export is stopped so the batch retries the trial.
+        """
+        name = os.path.basename(path)
+        partial = path + '.partial'
+        try:
+            df.to_csv(partial, index=False)
+            ok, problems = self.verify_written_frame(df, partial, numeric_cols)
+        except Exception as e:
+            ok, problems = False, [f"the write itself failed: {e}"]
+
+        if ok:
+            os.replace(partial, path)
+            self.log_message(f"  ✓ {name} verified on disk "
+                             f"({len(df):,} row(s), {len(df.columns)} columns)")
+            return True
+
+        self.log_message(f"✗ {name} did NOT verify — what landed on disk is "
+                         f"not what was written:")
+        for p in problems:
+            self.log_message(f"    {p}")
+        self.log_message(
+            "  Nothing in FNT writes such a value, so this is the file being "
+            "corrupted between formatting and disk. Aborting rather than "
+            "publishing it; a re-run usually writes it cleanly.")
+        try:
+            if os.path.exists(partial):
+                os.remove(partial)
+        except OSError as exc:
+            self.log_message(f"  ⚠ could not remove {name}.partial: {exc}")
+        self._last_export_failed = True
+        self._export_output_corrupt = True
+        self.stop_export()
+        return False
 
     def _predict_export_conflicts(self):
         """Predict output files and split into (conflicting, new) vs. what's on disk.
@@ -16555,7 +16681,10 @@ class UWBQuickVisualizationWindow(QWidget):
                                     os.path.basename(bouts_path),
                                     lambda: _RB.audit_social(
                                         proximity_bouts, proximity_threshold))
-                                proximity_bouts.to_csv(bouts_path, index=False)
+                                if not self.write_verified_csv(
+                                        proximity_bouts, bouts_path,
+                                        self._BOUTS_NUMERIC_COLS):
+                                    return
                                 self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
                                                  f"{os.path.basename(bouts_path)}")
                             self.log_message("✓ Proximity detection complete!")
@@ -16613,7 +16742,9 @@ class UWBQuickVisualizationWindow(QWidget):
                                   .dt.total_seconds() >= 0).all().item(),
                                  "bout_stop is never before bout_start"),
                             ])
-                        ev.to_csv(ev_path, index=False)
+                        if not self.write_verified_csv(
+                                ev, ev_path, self._BEHAVIOR_NUMERIC_COLS):
+                            return
                         by = ev['behavior'].value_counts().to_dict() if len(ev) else {}
                         self.log_message(
                             f"\u2713 Exported behaviour events ({len(ev)} bouts"
