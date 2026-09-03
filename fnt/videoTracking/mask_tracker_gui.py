@@ -1476,9 +1476,28 @@ class InferenceWorker(QThread):
         self._pause_flag = False
 
     def _load_classifier(self):
-        """Load the behavior classifier model. Returns (model, class_names, device) or None."""
+        """Load the behavior classifier.
+
+        Returns ``(model, class_names, device, scene_cfg)``, where scene_cfg is
+        the stored configuration for a scene-aware checkpoint and None for a
+        legacy single-silhouette one. Returns None outright when nothing
+        loadable is there.
+        """
         if not self.classifier_dir:
             return None
+
+        from .behavior_classifier import load_scene_classifier
+        scene = load_scene_classifier(self.classifier_dir)
+        if scene is not None:
+            model, class_names, device, cfg = scene
+            n_soc = cfg.get("n_social_samples")
+            print(f"[Classifier Inference] Loaded scene-aware "
+                  f"{cfg.get('backbone', '?')} ({len(class_names)} classes: "
+                  f"{', '.join(class_names)}) on {device.upper()}"
+                  + (f"; trained with {n_soc} multi-animal samples"
+                     if n_soc is not None else ""))
+            return model, class_names, device, cfg
+
         import torch
         from torchvision import models
         cfg_path = os.path.join(self.classifier_dir, "classifier_config.json")
@@ -1514,9 +1533,11 @@ class InferenceWorker(QThread):
         model = model.to(device)
         model.eval()
 
-        print(f"[Classifier Inference] Loaded {backbone} ({n_classes} classes: "
-              f"{', '.join(class_names)}) on {device.upper()}")
-        return model, class_names, device
+        print(f"[Classifier Inference] Loaded legacy single-silhouette {backbone} "
+              f"({n_classes} classes: {', '.join(class_names)}) on {device.upper()}. "
+              f"Social categories cannot be represented by this checkpoint — "
+              f"retrain to get a scene-aware model.")
+        return model, class_names, device, None
 
     @staticmethod
     def _apply_min_bout_filter(rows, min_bout):
@@ -1557,16 +1578,20 @@ class InferenceWorker(QThread):
         sys.stdout = _LogCapture(self, _real_stdout)
         try:
             from .mask_tracker_inference import MaskInferenceConfig, run_inference_on_video
-            from .silhouette_extractor import generate_composite
+            from .behavior_classifier import predict_scene
+            from .silhouette_extractor import (
+                generate_composite, generate_scene_composite, pairwise_features,
+                pairwise_vector,
+            )
             import time as _pause_time
 
             config = MaskInferenceConfig(**self.config_dict)
 
             cls_info = self._load_classifier()
-            cls_model = cls_class_names = cls_device = None
+            cls_model = cls_class_names = cls_device = cls_scene_cfg = None
             torch = None
             if cls_info:
-                cls_model, cls_class_names, cls_device = cls_info
+                cls_model, cls_class_names, cls_device, cls_scene_cfg = cls_info
                 import torch
 
             def _check_stop():
@@ -1591,46 +1616,80 @@ class InferenceWorker(QThread):
                     if cls_model is None:
                         return None
 
-                    for obj_id, det in matched.items():
+                    # Every known object gets an entry every frame, present or
+                    # not, so the per-object buffers stay aligned in time and a
+                    # neighbour's position can be read at the same index as the
+                    # focal animal's. Appending only for detected objects would
+                    # silently shear the windows apart whenever one is missed.
+                    for obj_id in set(mask_buffers) | set(matched):
                         if obj_id not in mask_buffers:
                             mask_buffers[obj_id] = deque(maxlen=self.cls_window)
-                        mask = det.get("mask")
+                        det = matched.get(obj_id)
+                        entry = None
+                        mask = det.get("mask") if det is not None else None
                         if mask is not None:
                             bbox = det["bbox"]
-                            h_f = mask.shape[0]
-                            w_f = mask.shape[1]
+                            h_f, w_f = mask.shape[:2]
                             x1 = max(0, int(round(float(bbox[0]))))
                             y1 = max(0, int(round(float(bbox[1]))))
                             x2 = min(w_f, int(round(float(bbox[2]))))
                             y2 = min(h_f, int(round(float(bbox[3]))))
                             if x2 > x1 and y2 > y1:
-                                mask_buffers[obj_id].append({
+                                entry = {
                                     "crop": mask[y1:y2, x1:x2],
                                     "bbox": (x1, y1, x2, y2),
-                                })
-                            else:
-                                mask_buffers[obj_id].append(None)
-                        else:
-                            mask_buffers[obj_id].append(None)
+                                }
+                        mask_buffers[obj_id].append(entry)
+
+                    # Snapshot once rather than per focal animal: the inner
+                    # loop below is quadratic in object count otherwise.
+                    windows = {oid: list(buf) for oid, buf in mask_buffers.items()}
+                    for obj_id, window in windows.items():
+                        if all(e is None for e in window):
+                            # Gone for a whole window. Drop it so a long video
+                            # does not accumulate dead buffers, and so it stops
+                            # counting as a neighbour of anyone.
+                            mask_buffers.pop(obj_id, None)
+                            current_labels.pop(obj_id, None)
 
                     for obj_id in list(mask_buffers.keys()):
-                        buf = mask_buffers[obj_id]
-                        if len(buf) < self.cls_window:
+                        window = windows.get(obj_id) or []
+                        if len(window) < self.cls_window:
                             continue
 
-                        window = list(buf)
-                        crops = [w["crop"] if w is not None else None for w in window]
-                        boxes = [w["bbox"] if w is not None else None for w in window]
-                        composite = generate_composite(crops, output_size=(128, 128), bboxes=boxes)
-                        img = composite.astype(np.float32) / 255.0
-                        inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
-                        with torch.no_grad():
-                            logits = cls_model(inp)
-                            probs = torch.softmax(logits, dim=1)[0]
-                            sorted_probs, sorted_idx = probs.sort(descending=True)
-                            conf = sorted_probs[0].item()
-                            pred_idx = sorted_idx[0].item()
-                            gap = (sorted_probs[0] - sorted_probs[1]).item() if len(sorted_probs) > 1 else conf
+                        if cls_scene_cfg is not None:
+                            neighbors = []
+                            for i in range(len(window)):
+                                neighbors.append([
+                                    other[i] for oid, other in windows.items()
+                                    if oid != obj_id and oid in mask_buffers
+                                    and len(other) == len(window)
+                                    and other[i] is not None
+                                ])
+                            scene = generate_scene_composite(
+                                window, neighbors, output_size=(128, 128),
+                            )
+                            vec = pairwise_vector(
+                                pairwise_features(window, neighbors, fps=fps)
+                            )
+                            probs_np = predict_scene(
+                                cls_model, cls_scene_cfg, scene, vec, cls_device,
+                            )
+                            probs = torch.from_numpy(probs_np)
+                        else:
+                            crops = [w["crop"] if w is not None else None for w in window]
+                            boxes = [w["bbox"] if w is not None else None for w in window]
+                            composite = generate_composite(
+                                crops, output_size=(128, 128), bboxes=boxes)
+                            img = composite.astype(np.float32) / 255.0
+                            inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
+                            with torch.no_grad():
+                                probs = torch.softmax(cls_model(inp), dim=1)[0].cpu()
+
+                        sorted_probs, sorted_idx = probs.sort(descending=True)
+                        conf = sorted_probs[0].item()
+                        pred_idx = sorted_idx[0].item()
+                        gap = (sorted_probs[0] - sorted_probs[1]).item() if len(sorted_probs) > 1 else conf
 
                         if conf < self.nc_threshold or gap < self.uncertain_gap:
                             beh_name = "NC"
@@ -1996,7 +2055,15 @@ class _ClassifierTrainWorker(QThread):
         from torch.utils.data import DataLoader, Dataset, random_split
         from torchvision import transforms, models
 
-        composite_paths = self.config["composite_paths"]
+        from .behavior_classifier import (
+            INPUT_KIND_SCENE, build_scene_model, feature_stats,
+            normalize_features,
+        )
+        from .silhouette_extractor import (
+            PAIRWISE_FIELDS, load_clip_masks_npz, scene_sample_from_clip,
+        )
+
+        samples = self.config["samples"]
         labels = self.config["labels"]
         class_names = self.config["class_names"]
         epochs = self.config["epochs"]
@@ -2013,7 +2080,7 @@ class _ClassifierTrainWorker(QThread):
 
         self.log_message.emit(f"[Classifier] Output directory: {output_dir}")
         self.log_message.emit(
-            f"[Classifier] Dataset: {len(composite_paths)} composites, "
+            f"[Classifier] Dataset: {len(samples)} labeled animals, "
             f"{len(class_names)} classes ({', '.join(class_names)})"
         )
         self.log_message.emit(
@@ -2021,24 +2088,83 @@ class _ClassifierTrainWorker(QThread):
             f"lr={lr:.4f}, batch_size={batch_size}, val_split={val_split}, augment={augment}"
         )
 
-        class CompositeDataset(Dataset):
-            def __init__(self, paths, targets, transform=None):
-                self.paths = paths
-                self.targets = targets
+        # Build every sample up front. A six-channel 128px composite is under
+        # 100 kB, so a few hundred clips sit comfortably in memory, and doing
+        # it here means the neighbour geometry is computed once rather than
+        # once per epoch.
+        self.log_message.emit("[Classifier] Building scene composites...")
+        images: list = []
+        vectors: list = []
+        kept_labels: list = []
+        n_social = 0
+        cache: Dict[str, Dict] = {}
+        for sample, label in zip(samples, labels):
+            clip_dir = sample["clip_dir"]
+            if self._stop_flag:
+                break
+            if clip_dir not in cache:
+                cache[clip_dir] = load_clip_masks_npz(clip_dir)
+            masks_dict = cache[clip_dir]
+            if not masks_dict:
+                continue
+            obj_id = int(sample["obj_id"])
+            if obj_id not in masks_dict:
+                continue
+            scene, vec = scene_sample_from_clip(
+                masks_dict, obj_id, fps=sample.get("fps", 30.0),
+            )
+            images.append(scene)
+            vectors.append(vec)
+            kept_labels.append(label)
+            if len(masks_dict) > 1:
+                n_social += 1
+        cache.clear()
+
+        if len(images) < 2:
+            raise RuntimeError(
+                "Could not build training samples from the labeled clips. "
+                "Check that each clip folder still contains masks.npz."
+            )
+
+        labels = kept_labels
+        vectors = np.stack(vectors).astype(np.float32)
+        self.log_message.emit(
+            f"[Classifier] Built {len(images)} samples; {n_social} have a "
+            f"neighbour in frame, {len(images) - n_social} are solo"
+        )
+        if n_social == 0:
+            self.log_message.emit(
+                "[Classifier] ⚠ No clip contains more than one animal. Social "
+                "categories such as huddle or attack cannot be learned from "
+                "solo clips — extract clips at moments with two animals."
+            )
+
+        class SceneDataset(Dataset):
+            """Six-channel composite plus its whitened pairwise vector.
+
+            Augmentation rotates and flips the image only. The pairwise
+            entries are deliberately left alone because they are already
+            invariant to it: distances do not change under rotation, and the
+            angles are relative to the focal animal's own axis rather than to
+            the frame.
+            """
+
+            def __init__(self, idxs, transform=None):
+                self.idxs = list(idxs)
                 self.transform = transform
+                self.targets = [labels[i] for i in self.idxs]
 
             def __len__(self):
-                return len(self.paths)
+                return len(self.idxs)
 
-            def __getitem__(self, idx):
-                img = cv2.imread(self.paths[idx])
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, (128, 128))
-                img = img.astype(np.float32) / 255.0
-                img = torch.from_numpy(img).permute(2, 0, 1)
+            def __getitem__(self, k):
+                i = self.idxs[k]
+                img = torch.from_numpy(
+                    images[i].astype(np.float32) / 255.0
+                ).permute(2, 0, 1)
                 if self.transform:
                     img = self.transform(img)
-                return img, self.targets[idx]
+                return img, torch.from_numpy(normed[i]), labels[i]
 
         aug_transform = None
         if augment:
@@ -2054,7 +2180,7 @@ class _ClassifierTrainWorker(QThread):
             if aug_list:
                 aug_transform = transforms.Compose(aug_list)
 
-        n_total = len(composite_paths)
+        n_total = len(images)
         n_val = max(1, int(n_total * val_split)) if val_split > 0 else 0
 
         if n_val > 0:
@@ -2073,21 +2199,22 @@ class _ClassifierTrainWorker(QThread):
 
             if not train_idx:
                 train_idx = val_idx[:]
-
-            train_paths = [composite_paths[i] for i in train_idx]
-            train_labels = [labels[i] for i in train_idx]
-            val_paths = [composite_paths[i] for i in val_idx]
-            val_labels = [labels[i] for i in val_idx]
-
-            train_ds = CompositeDataset(train_paths, train_labels, aug_transform)
-            val_ds = CompositeDataset(val_paths, val_labels, None)
-            n_train = len(train_idx)
-            n_val = len(val_idx)
         else:
-            train_ds = CompositeDataset(composite_paths, labels, aug_transform)
-            val_ds = None
-            n_train = n_total
-            n_val = 0
+            train_idx = list(range(n_total))
+            val_idx = []
+
+        # Whitening statistics come from the training split alone, so the
+        # validation score is not quietly inflated by having seen the
+        # distribution of the data it is judging.
+        feat_mean, feat_std = feature_stats(vectors[train_idx])
+        normed = np.stack([
+            normalize_features(v, feat_mean, feat_std) for v in vectors
+        ]).astype(np.float32)
+
+        train_ds = SceneDataset(train_idx, aug_transform)
+        val_ds = SceneDataset(val_idx, None) if val_idx else None
+        n_train = len(train_idx)
+        n_val = len(val_idx)
 
         self.log_message.emit(
             f"[Classifier] Split: {n_train} train, {n_val} val (stratified per class)"
@@ -2112,28 +2239,16 @@ class _ClassifierTrainWorker(QThread):
                 f"Val metrics will be noisy."
             )
 
+        # Batches of one break BatchNorm in train mode, and a stratified split
+        # can easily leave a remainder of one on a small clip set.
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  drop_last=False)
+                                  drop_last=len(train_ds) % batch_size == 1)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
-        if backbone == "ResNet-34":
-            model = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
-        elif backbone == "MobileNetV3":
-            model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_classes)
-        else:
-            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
 
-        if freeze_backbone:
-            for param in model.parameters():
-                param.requires_grad = False
-            if backbone == "MobileNetV3":
-                for param in model.classifier[-1].parameters():
-                    param.requires_grad = True
-            else:
-                for param in model.fc.parameters():
-                    param.requires_grad = True
+        model = build_scene_model(
+            backbone, n_classes, n_features=vectors.shape[1],
+            freeze_backbone=freeze_backbone, in_channels=6,
+        )
 
         device = "cpu"
         if torch.cuda.is_available():
@@ -2184,11 +2299,12 @@ class _ClassifierTrainWorker(QThread):
             model.train()
             running_loss = 0.0
             n_batches = 0
-            for imgs, targets in train_loader:
+            for imgs, feats, targets in train_loader:
                 imgs = imgs.to(device)
+                feats = feats.to(device)
                 targets = targets.to(device)
                 optimizer.zero_grad()
-                outputs = model(imgs)
+                outputs = model(imgs, feats)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
@@ -2205,10 +2321,11 @@ class _ClassifierTrainWorker(QThread):
                 correct = 0
                 total = 0
                 with torch.no_grad():
-                    for imgs, targets in val_loader:
+                    for imgs, feats, targets in val_loader:
                         imgs = imgs.to(device)
+                        feats = feats.to(device)
                         targets = targets.to(device)
-                        outputs = model(imgs)
+                        outputs = model(imgs, feats)
                         v_loss += criterion(outputs, targets).item()
                         preds = outputs.argmax(dim=1)
                         correct += (preds == targets).sum().item()
@@ -2263,6 +2380,14 @@ class _ClassifierTrainWorker(QThread):
             "n_classes": n_classes,
             "input_size": 128,
             "epochs_trained": final_epoch,
+            # Marks this as a scene-aware checkpoint. Inference falls back to
+            # the legacy single-silhouette path when it is absent.
+            "input_kind": INPUT_KIND_SCENE,
+            "in_channels": 6,
+            "feature_fields": list(PAIRWISE_FIELDS),
+            "feature_mean": feat_mean,
+            "feature_std": feat_std,
+            "n_social_samples": n_social,
         }
         with open(os.path.join(output_dir, "classifier_config.json"), "w") as f:
             json.dump(config_out, f, indent=2)
@@ -9395,30 +9520,10 @@ class MaskTrackerWindow(QMainWindow):
         return frames
 
     def _load_clip_masks(self, clip_dir):
-        npz_path = os.path.join(clip_dir, "masks.npz")
-        if not os.path.exists(npz_path):
-            return {}
-        data = np.load(npz_path)
-        masks_dict = {}
-        for key in data.files:
-            obj_id = int(key.replace("obj_", ""))
-            arr = data[key]  # (N, H, W) bool
-            frames_data = []
-            for i in range(arr.shape[0]):
-                mask = arr[i]
-                ys, xs = np.where(mask)
-                if len(ys) == 0:
-                    frames_data.append(None)
-                    continue
-                x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                frames_data.append({
-                    "mask": mask,
-                    "bbox": (x1, y1, x2, y2),
-                    "centroid": (cx, cy),
-                })
-            masks_dict[obj_id] = frames_data
-        return masks_dict
+        # Shared with the training worker, which builds scene composites from
+        # the same file and must see identical geometry.
+        from .silhouette_extractor import load_clip_masks_npz
+        return load_clip_masks_npz(clip_dir)
 
     def _save_clip_label(self, clip_dir, obj_id, behavior, color):
         meta_path = os.path.join(clip_dir, "meta.json")
@@ -9434,43 +9539,19 @@ class MaskTrackerWindow(QMainWindow):
 
         masks_dict = self._load_clip_masks(clip_dir)
         if obj_id in masks_dict:
-            from .silhouette_extractor import generate_composite
-
-            ux1, uy1, ux2, uy2 = float("inf"), float("inf"), 0, 0
-            for det in masks_dict[obj_id]:
-                if det is None:
-                    continue
-                bx1, by1, bx2, by2 = (
-                    int(det["bbox"][0]), int(det["bbox"][1]),
-                    int(det["bbox"][2]), int(det["bbox"][3]),
-                )
-                ux1 = min(ux1, bx1)
-                uy1 = min(uy1, by1)
-                ux2 = max(ux2, bx2)
-                uy2 = max(uy2, by2)
-
-            if ux2 <= ux1 or uy2 <= uy1:
-                return
-
-            pad = int(max(ux2 - ux1, uy2 - uy1) * 0.05)
-            ux1 = max(0, int(ux1) - pad)
-            uy1 = max(0, int(uy1) - pad)
-            ux2 = int(ux2) + pad
-            uy2 = int(uy2) + pad
-
-            mask_crops = []
-            for det in masks_dict[obj_id]:
-                if det is None:
-                    mask_crops.append(None)
-                    continue
-                mask = det["mask"]
-                uy2_c = min(uy2, mask.shape[0])
-                ux2_c = min(ux2, mask.shape[1])
-                crop = mask[uy1:uy2_c, ux1:ux2_c]
-                mask_crops.append(crop.astype(bool))
-            composite = generate_composite(mask_crops, output_size=(128, 128))
+            # The thumbnail shows what the classifier reads: the focal animal
+            # in its blue-to-red time ramp, plus any neighbour in grey.
+            # Reviewing a lone silhouette while the model sees company would
+            # hide exactly the information a social label rests on.
+            from .silhouette_extractor import (
+                scene_composite_preview, scene_sample_from_clip,
+            )
+            scene, _ = scene_sample_from_clip(
+                masks_dict, obj_id, fps=float(meta.get("fps", 30.0)),
+            )
+            preview = scene_composite_preview(scene)
             comp_path = os.path.join(clip_dir, f"composite_obj{obj_id}.png")
-            cv2.imwrite(comp_path, cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(comp_path, cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
 
     def _delete_clip_from_disk(self, clip_dir):
         if os.path.isdir(clip_dir):
@@ -9639,11 +9720,13 @@ class MaskTrackerWindow(QMainWindow):
                 beh = v.get("behavior")
                 if beh:
                     counts[beh] += 1
-                    comp = os.path.join(
-                        clip.get("clip_dir", ""),
-                        f"composite_obj{obj_id_str}.png",
-                    )
-                    if clip.get("clip_dir") and os.path.isfile(comp):
+                    # Gate readiness on masks.npz, which training actually
+                    # reads. The composite PNG beside it is only a thumbnail
+                    # now, so counting those would call a perfectly trainable
+                    # clip unusable whenever a thumbnail failed to render.
+                    if clip.get("clip_dir") and os.path.isfile(
+                        os.path.join(clip["clip_dir"], "masks.npz")
+                    ):
                         n_composites += 1
         if not counts:
             total_clips = len(self._batch_clips)
@@ -9667,7 +9750,7 @@ class MaskTrackerWindow(QMainWindow):
         n_categories = len(counts)
         total_labels = sum(counts.values())
         data_lines = [
-            f"Composites: {n_composites}  |  Classes: {n_categories}",
+            f"Trainable animals: {n_composites}  |  Classes: {n_categories}",
             "  ".join(f"{name}: {n}" for name, n in counts.most_common()),
         ]
         self.lbl_cls_train_data.setText("\n".join(data_lines))
@@ -10487,31 +10570,38 @@ class MaskTrackerWindow(QMainWindow):
         self._refresh_cls_annotation_stats()
 
     def _start_classifier_training(self):
-        composite_paths = []
+        # Samples reference the clip on disk rather than a rendered composite.
+        # The scene image is derived from masks.npz at training time, so the
+        # representation can change without re-extracting or re-labeling
+        # anything, and clips recorded before it existed still train.
+        samples = []
         labels = []
         class_name_set = set()
 
         for clip in self._batch_clips:
             if clip["status"] != "labeled" or clip["clip_dir"] is None:
                 continue
+            if not os.path.isfile(os.path.join(clip["clip_dir"], "masks.npz")):
+                continue
             for obj_id_str, obj_info in clip.get("objects", {}).items():
                 beh = obj_info.get("behavior")
                 if not beh:
                     continue
-                comp_path = os.path.join(
-                    clip["clip_dir"], f"composite_obj{obj_id_str}.png"
-                )
-                if os.path.isfile(comp_path):
-                    composite_paths.append(comp_path)
-                    class_name_set.add(beh)
-                    labels.append(beh)
+                samples.append({
+                    "clip_dir": clip["clip_dir"],
+                    "obj_id": int(obj_id_str),
+                    "fps": float(clip.get("fps", 30.0)),
+                })
+                class_name_set.add(beh)
+                labels.append(beh)
 
         class_names = sorted(class_name_set)
         if len(class_names) < 2:
             QMessageBox.warning(
                 self, "Insufficient Data",
-                "Need at least 2 behavior categories with composite images.\n"
-                "Label more clips and ensure composites were generated."
+                "Need at least 2 behavior categories among the labeled clips.\n"
+                "Label more clips, and check that each clip folder still "
+                "contains its masks.npz."
             )
             return
 
@@ -10519,7 +10609,7 @@ class MaskTrackerWindow(QMainWindow):
 
         from datetime import datetime
         backbone_tag = self.combo_cls_backbone.currentText().replace("-", "").replace(" ", "")
-        n_clips = len(composite_paths)
+        n_clips = len(samples)
         run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{backbone_tag}_n={n_clips}"
         output_dir = os.path.join(
             self._project_dir, "action_classifier", "model", run_name
@@ -10532,7 +10622,7 @@ class MaskTrackerWindow(QMainWindow):
         early_stop = patience_val < self.spin_cls_epochs.value()
 
         config = {
-            "composite_paths": composite_paths,
+            "samples": samples,
             "labels": label_indices,
             "class_names": class_names,
             "epochs": self.spin_cls_epochs.value(),

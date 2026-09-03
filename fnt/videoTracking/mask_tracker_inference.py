@@ -9,6 +9,7 @@ Heavy deps (torch, torchvision, scipy) are imported lazily.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
@@ -230,6 +231,108 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(intersection / union)
 
 
+# Shape descriptors written for every detection, in output column order.
+# Defined once here because three places have to agree on them: the CSV
+# inference writes, the HDF5 track store, and the CSV the proofreader
+# regenerates after editing identities.
+SHAPE_FIELDS = (
+    "major_axis_px",
+    "minor_axis_px",
+    "elongation",
+    "orientation_deg",
+    "eccentricity",
+    "perimeter_px",
+    "solidity",
+)
+_EMPTY_SHAPE = {f: None for f in SHAPE_FIELDS}
+
+
+def mask_shape_features(
+    mask: Optional[np.ndarray],
+    ys: Optional[np.ndarray] = None,
+    xs: Optional[np.ndarray] = None,
+) -> Dict:
+    """Posture descriptors for one instance mask.
+
+    Segmenting instead of landmarking is this tool's whole bet, and until
+    now the trajectory table spent each mask on a centroid and a pixel
+    count. These are the classical overhead-rodent posture discriminators:
+    a rearing animal is compact and round, a walking one is elongated along
+    its heading, and a grooming one is neither.
+
+    Everything comes from the equivalent-ellipse image moments plus one
+    contour pass, both taken on the mask's bounding-box crop, so cost scales
+    with the animal rather than the frame.
+
+    ``orientation_deg`` is the major axis measured anticlockwise from the
+    image x axis and wrapped to [0, 180). A silhouette has no head, so that
+    is a genuine 180-degree ambiguity rather than a rounding artefact;
+    resolve it downstream against the direction of travel where it matters.
+
+    ``perimeter_px`` traces the pixel boundary, which overestimates a smooth
+    outline by a few percent because it walks a staircase — a drawn circle
+    of radius 60 measures about 400 rather than 377. That bias is stable, so
+    the value compares cleanly across frames and animals, but do not read a
+    circularity computed from it as an absolute.
+
+    Every key in :data:`SHAPE_FIELDS` is always present, set to None when
+    there is no mask, so box-only runs still produce a uniform table.
+    """
+    if mask is None:
+        return dict(_EMPTY_SHAPE)
+    if ys is None or xs is None:
+        ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return dict(_EMPTY_SHAPE)
+
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = np.ascontiguousarray(mask[y0:y1, x0:x1]).astype(np.uint8)
+
+    m = cv2.moments(sub, binaryImage=True)
+    area = m["m00"]
+    if area <= 0:
+        return dict(_EMPTY_SHAPE)
+
+    mu20 = m["mu20"] / area
+    mu02 = m["mu02"] / area
+    mu11 = m["mu11"] / area
+    common = math.sqrt(max(0.0, 4.0 * mu11 * mu11 + (mu20 - mu02) ** 2))
+    lam1 = max(0.0, (mu20 + mu02 + common) / 2.0)
+    lam2 = max(0.0, (mu20 + mu02 - common) / 2.0)
+    major = 4.0 * math.sqrt(lam1)
+    minor = 4.0 * math.sqrt(lam2)
+
+    # The moment angle is computed in image coordinates, where y grows
+    # downward, so it is negated to report the anticlockwise angle a reader
+    # of the CSV would assume.
+    theta = 0.5 * math.atan2(2.0 * mu11, mu20 - mu02)
+    orientation = math.degrees(-theta) % 180.0
+
+    perimeter = None
+    solidity = None
+    contours, _ = cv2.findContours(sub, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        outline = max(contours, key=cv2.contourArea)
+        perimeter = float(cv2.arcLength(outline, True))
+        hull_area = float(cv2.contourArea(cv2.convexHull(outline)))
+        if hull_area > 0:
+            # Pixel count over polygon area, so the ratio can drift just
+            # past 1 on small convex blobs. Cap it rather than emit 1.03.
+            solidity = min(1.0, float(area) / hull_area)
+
+    return {
+        "major_axis_px": round(major, 2),
+        "minor_axis_px": round(minor, 2),
+        "elongation": round(major / minor, 3) if minor > 1e-6 else None,
+        "orientation_deg": round(orientation, 1),
+        "eccentricity": (round(math.sqrt(max(0.0, 1.0 - lam2 / lam1)), 3)
+                         if lam1 > 1e-12 else None),
+        "perimeter_px": round(perimeter, 2) if perimeter is not None else None,
+        "solidity": round(solidity, 3) if solidity is not None else None,
+    }
+
+
 class MaskRCNNInference:
     """Loads a trained Mask R-CNN and runs per-frame inference."""
 
@@ -416,11 +519,16 @@ class MultiObjectTracker:
                 else:
                     cx, cy = float(xs.mean()), float(ys.mean())
                 area = int(mask.sum())
+                # Reuses the nonzero indices already computed above, so the
+                # shape descriptors cost one small crop rather than a second
+                # pass over the full frame.
+                shape = mask_shape_features(mask, ys, xs)
             else:
                 mask = None
                 cx = float((box[0] + box[2]) / 2)
                 cy = float((box[1] + box[3]) / 2)
                 area = int((box[2] - box[0]) * (box[3] - box[1]))
+                shape = dict(_EMPTY_SHAPE)
             current_dets.append({
                 "centroid": (cx, cy),
                 "bbox": box,
@@ -428,6 +536,7 @@ class MultiObjectTracker:
                 "score": float(detections["scores"][i]),
                 "label": int(detections["labels"][i]),
                 "area": area,
+                "shape": shape,
             })
 
         if not self.active_tracks:
@@ -562,7 +671,7 @@ class MultiObjectTracker:
     def _record(self, obj_id: int, det: Dict, frame_idx: int, fps: float):
         cx, cy = det["centroid"]
         bbox = det["bbox"]
-        self.records.append({
+        row = {
             "frame": frame_idx,
             "time_s": round(frame_idx / fps, 4),
             "object_id": obj_id,
@@ -575,7 +684,9 @@ class MultiObjectTracker:
             "bbox_y2": round(float(bbox[3]), 2),
             "mask_area": det["area"],
             "confidence": round(det["score"], 4),
-        })
+        }
+        row.update(det.get("shape") or _EMPTY_SHAPE)
+        self.records.append(row)
 
     def get_trajectories(self, categories: Optional[Dict] = None) -> pd.DataFrame:
         if not self.records:
@@ -606,7 +717,8 @@ class MultiObjectTracker:
 
         col_order = ["frame", "time_s", "object_id", "object_name", "label",
                      "x", "y", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-                     "mask_area", "confidence", "vx", "vy", "speed"]
+                     "mask_area", *SHAPE_FIELDS,
+                     "confidence", "vx", "vy", "speed"]
         col_order = [c for c in col_order if c in df.columns]
         return df[col_order]
 
