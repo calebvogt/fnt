@@ -22,7 +22,7 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
 )
@@ -239,8 +239,24 @@ class LiveSignalView(QWidget):
         bar.addWidget(self.hint)
         root.addLayout(bar)
 
+        # An empty plot area is indistinguishable from a broken one. Until the
+        # first samples arrive this says what to do next, in the place the user
+        # is already looking, rather than leaving a black rectangle.
+        self.placeholder = QLabel(
+            "No signal yet.\n\n"
+            "Put the headband on and switch it on — MuseStudio looks for it and "
+            "connects on its own.\nTraces appear here the moment data arrives.\n\n"
+            "If it does not find the headband, use Scan then Connect in the Muse "
+            "panel on the left.")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; background: {theme.PLOT_BG}; "
+            "font-size: 13px; line-height: 150%;")
+
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground(theme.PLOT_BG)
+        self.glw.hide()
+        root.addWidget(self.placeholder, stretch=1)
         root.addWidget(self.glw, stretch=1)
 
         self._panels = {}
@@ -284,6 +300,9 @@ class LiveSignalView(QWidget):
                                  fs=self._rates.get(stream_name, 256.0))
             panel.set_filtering(self.filter_check.isChecked())
             self._panels[stream_name] = panel
+            if self.placeholder.isVisible():
+                self.placeholder.hide()
+                self.glw.show()
             self._relayout()
         panel.add(timestamps, data)
 
@@ -306,8 +325,16 @@ class LiveSignalView(QWidget):
             panel.refresh(gain, window)
 
     def clear(self):
+        """Drop every panel and return to the placeholder.
+
+        Called on connect (fresh views for a new session) and on disconnect, so
+        an idle window explains itself rather than showing an empty black plot
+        that looks identical to a crashed one.
+        """
         self.glw.clear()
         self._panels.clear()
+        self.glw.hide()
+        self.placeholder.show()
 
 
 # Backwards-compatible alias (the window previously used this name).

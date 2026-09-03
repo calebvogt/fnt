@@ -15,6 +15,7 @@ duplicate the descriptor into a pipe and forward every line to both the real
 terminal and this buffer.
 """
 
+import faulthandler
 import os
 import platform
 import sys
@@ -70,6 +71,58 @@ class LogBuffer:
         head.append(f"log lines : {self.count()}")
         head.append("=" * 36)
         return "\n".join(head) + "\n" + self.text()
+
+    # --- crash capture ----------------------------------------------------
+    def crash_dir(self):
+        d = os.path.join(os.path.expanduser("~"), ".fnt", "crash_logs")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def write_crash(self, reason):
+        """Dump the whole buffer plus an environment header to a file.
+
+        In-memory logs are worthless for the failures that matter most: a hard
+        abort takes the buffer with it, and the operator is left saying "it
+        crashed" with nothing to hand over. Written to ~/.fnt/crash_logs so it
+        survives the process.
+        """
+        try:
+            path = os.path.join(
+                self.crash_dir(),
+                f"crash_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"REASON: {reason}\n\n")
+                f.write(self.report())
+            return path
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def install_crash_handlers(self):
+        """Persist a log on Python exceptions AND on hard aborts.
+
+        ``faulthandler`` is the part that matters for the crash seen on
+        2026-09-02: Qt called qFatal from a thread constructor and the process
+        died by SIGABRT, so no Python except-hook ever ran. faulthandler writes
+        native tracebacks for exactly those signals.
+        """
+        try:
+            path = os.path.join(self.crash_dir(), "faulthandler.log")
+            self._fault_file = open(path, "a", buffering=1)
+            faulthandler.enable(file=self._fault_file, all_threads=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+        prev = sys.excepthook
+
+        def hook(exc_type, exc, tb):
+            try:
+                self.add("UNCAUGHT: " + "".join(
+                    traceback.format_exception(exc_type, exc, tb)), "error")
+                self.write_crash(f"uncaught {exc_type.__name__}: {exc}")
+            finally:
+                prev(exc_type, exc, tb)
+
+        sys.excepthook = hook
 
     # --- installation -----------------------------------------------------
     def install(self):

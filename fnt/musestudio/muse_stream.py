@@ -12,9 +12,11 @@ OpenMuse has no direct Python callback API, hence the LSL hop. OpenMuse and
 its decoding (especially fNIRS) are reverse-engineered and experimental.
 """
 
+import collections
 import csv
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -98,12 +100,27 @@ def _parse_find_output(text):
 
 
 def _openmuse_exe():
-    """Resolve the OpenMuse entry point.
+    """Resolve the OpenMuse console script.
 
-    Prefer the installed console script, but fall back to ``python -m`` form is
-    handled by callers if needed. Returns a string suitable as argv[0].
+    Looks beside the running interpreter FIRST, then on PATH. That order matters:
+    the console script is installed into the same environment as this package,
+    but PATH only contains that environment's ``bin`` when the env was activated
+    in the launching shell. Launch the app any other way -- a bare interpreter
+    path, an IDE, a .app bundle, a desktop launcher -- and a PATH-only lookup
+    fails with "OpenMuse CLI not found. Reinstall project dependencies", which
+    sends the user off reinstalling a package that is already correctly
+    installed. Observed doing exactly that on 2026-09-02.
+
+    Returns an absolute path when one is found, otherwise the bare name so the
+    existing FileNotFoundError path still reports something sensible.
     """
-    return "OpenMuse"
+    exe_dir = os.path.dirname(sys.executable)
+    for name in ("OpenMuse", "openmuse"):
+        candidate = os.path.join(exe_dir, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("OpenMuse") or shutil.which("openmuse")
+    return found or "OpenMuse"
 
 
 class MuseStreamProcess:
@@ -112,10 +129,13 @@ class MuseStreamProcess:
     def __init__(self, address):
         self.address = address
         self._proc = None
+        self._lines = collections.deque(maxlen=400)
+        self._pump = None
 
     def start(self):
         if self._proc is not None and self._proc.poll() is None:
             return  # already running
+        self._lines.clear()
         self._proc = subprocess.Popen(
             [_openmuse_exe(), "stream", "--address", self.address],
             stdout=subprocess.PIPE,
@@ -123,15 +143,39 @@ class MuseStreamProcess:
             text=True,
             bufsize=1,
         )
+        # Drain stdout continuously. This is NOT bookkeeping: the pipe buffer is
+        # about 64 KB, OpenMuse logs steadily, and a full pipe BLOCKS the writer.
+        # Left unread the streamer stalls and then dies, which presents as
+        # "connected, no data, no battery" with no explanation anywhere -- the
+        # exact symptom hit on 2026-09-02, where the app held inlets to streams
+        # whose producer was gone. Draining also makes the streamer's own error
+        # messages available to show the operator instead of discarding them.
+        self._pump = threading.Thread(target=self._drain, daemon=True)
+        self._pump.start()
+
+    def _drain(self):
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                self._lines.append(line.rstrip())
+        except Exception:  # noqa: BLE001
+            pass
 
     def is_alive(self):
         return self._proc is not None and self._proc.poll() is None
 
+    def exit_code(self):
+        return self._proc.poll() if self._proc is not None else None
+
     def read_output_nonblocking(self):
-        """Drain any buffered subprocess output (for surfacing errors)."""
-        # We don't actively pump stdout here to keep things simple; on stop we
-        # collect whatever is available. Kept for future log-streaming.
-        return ""
+        """Everything the streamer has printed since it started."""
+        return "\n".join(self._lines)
+
+    def tail(self, n=12):
+        """The last few streamer lines — usually where the real error is."""
+        return "\n".join(list(self._lines)[-n:])
 
     def stop(self, timeout=5):
         """Terminate the streamer and return its captured output, if any."""
@@ -231,10 +275,14 @@ class LSLReaderThread(QThread):
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, resolve_timeout=10.0, address=None, parent=None):
+    def __init__(self, resolve_timeout=45.0, address=None, parent=None,
+                 streamer_dead=None):
         super().__init__(parent)
         self._running = False
         self._resolve_timeout = resolve_timeout
+        # Optional callable: True when the producer process has exited, so a
+        # dead streamer is reported as such instead of as a 45 s timeout.
+        self._streamer_dead = streamer_dead
         self._address = address       # restrict to this device's streams if given
         self._recorder = None
         self._rec_lock = threading.Lock()
@@ -271,9 +319,54 @@ class LSLReaderThread(QThread):
         try:
             from mne_lsl.lsl import StreamInlet, resolve_streams
 
-            self.status.emit("Resolving LSL streams from OpenMuse...")
-            infos = resolve_streams(timeout=self._resolve_timeout)
-            muse_infos = [si for si in infos if si.name.startswith(MUSE_STREAM_PREFIX)]
+            # Retry until the streamer has had time to come up.
+            #
+            # A single 10 s attempt was not enough and this was the real cause
+            # of "No Muse LSL streams found": OpenMuse's own start-up runs
+            # connect -> subscribe to notifications -> "Waiting for device
+            # info..." -> "Streaming data...", which takes well over ten
+            # seconds on this headband. The reader gave up while the streamer
+            # was still starting, reported a missing stream, and tore itself
+            # down — and that teardown is what then aborted the process.
+            #
+            # Polling also lets us notice the streamer DYING, which is a
+            # different failure needing a different message.
+            deadline = time.monotonic() + self._resolve_timeout
+            muse_infos = []
+            attempt = 0
+            while time.monotonic() < deadline and self._running:
+                attempt += 1
+                left = max(1, int(deadline - time.monotonic()))
+                self.status.emit(
+                    f"Waiting for the headband to start streaming… ({left}s left)")
+                infos = resolve_streams(timeout=2.0)
+                muse_infos = [si for si in infos
+                              if si.name.startswith(MUSE_STREAM_PREFIX)]
+                # Wait for the FULL expected set, not merely the first stream to
+                # appear. Accepting whatever the first successful poll returned
+                # is a race, and it silently cost real data: session 204249
+                # recorded only EEG and ACCGYRO — no optics, no battery — and
+                # 205111 lost battery, with nothing anywhere saying so. For
+                # fNIRS work a missing optics stream makes the session useless
+                # and it is only discoverable by reading the config afterwards.
+                kinds = {k for k in EXPECTED_STREAM_KINDS
+                         if any(k in si.name.upper() for si in muse_infos)}
+                if len(kinds) >= len(EXPECTED_STREAM_KINDS):
+                    break
+                if muse_infos and time.monotonic() > deadline - 8.0:
+                    # Out of time but something is there: take it and say what
+                    # is missing rather than failing outright.
+                    missing = sorted(set(EXPECTED_STREAM_KINDS) - kinds)
+                    self.status.emit(
+                        "Started WITHOUT " + ", ".join(missing)
+                        + " — those sensors will be absent from this recording.")
+                    break
+                if self._streamer_dead is not None and self._streamer_dead():
+                    self.error.emit(
+                        "The OpenMuse streamer exited before it published any "
+                        "data. The headband may have refused the connection — "
+                        "switch it off and on, then try again.")
+                    return
             # If we know the device address, prefer its streams (OpenMuse embeds
             # the id in the stream name) so a second headband/app doesn't leak in.
             if self._address:

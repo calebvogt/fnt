@@ -32,6 +32,16 @@ class Phase:
     # What the eyes are doing: "fixate" (open, show a fixation target),
     # "closed" (dim the screen), or "" to infer it from the text.
     gaze: str = ""
+    # Capability token this phase needs (e.g. "stereo_audio"). When the host
+    # cannot supply it, the phase is skipped rather than run degraded.
+    #
+    # This exists because the available hardware should decide what data gets
+    # collected. A block that tests left/right audio is meaningless over laptop
+    # speakers, where both ears hear both channels -- running it anyway would
+    # produce a row of data that looks comparable to a headphone session and is
+    # not. Skipping is recorded in events.csv, so a later analysis can see that
+    # the block was omitted rather than failed.
+    requires: str = ""
 
     def spoken(self):
         return self.speech or self.instruction.replace("\n", " ")
@@ -480,9 +490,217 @@ def _hemisync_probe_quick():
     )
 
 
-PROTOCOLS = {p.key: p for p in [_hemisync_probe_quick(), _hemisync_probe_a(),
-                                _hemisync_probe_s(), _binaural_10min(),
-                                _heterodyne()]}
+
+def _flight_calibration():
+    """5-minute calibration for Flight Mode. Answers what M01's data cannot.
+
+    Flight Mode flies on relative alpha normalized against the pilot's own
+    baseline, and every constant in that control law -- dead zone, full-scale,
+    artifact vetoes -- currently rests on a single 9-minute session in which
+    both ear electrodes failed within two minutes and the subject was only
+    half-engaged. This protocol exists to replace those numbers with real ones.
+
+    Five blocks, each answering a specific open question:
+
+    1. EYES OPEN (45 s) -- establishes the baseline.
+
+       The length is measured, not guessed. It was 75 s, sized for M01's poor
+       recording (1.04 clean windows per second on her best electrode). A clean
+       subject is far better: CV01 measured 9.65/s on AF7 at 93% clean, with an
+       EMG ratio of 0.03 against M01's 0.99. At that yield the flight
+       controller's 100-window baseline is satisfied in ten seconds.
+
+       45 s is therefore NOT set by window count -- it is set by independence.
+       Overlapping 2 s windows are not separate observations, and resting alpha
+       waxes and wanes over tens of seconds, so the block has to span several of
+       those cycles to characterise the distribution rather than a single crest.
+       45 s gives ~22 non-overlapping windows and covers several alpha cycles.
+       Going much shorter buys comfort by making every later z-score noisier.
+
+    2. EYES CLOSED, REST (75 s) -- the neutral flight state. Fixes how far above
+       the eyes-open baseline simply closing the eyes puts the pilot, which sets
+       where the craft trims out.
+
+    3. EYES CLOSED, DEEPEN (60 s) -- THE decisive block. Can the pilot
+       voluntarily push alpha ABOVE their own eyes-closed rest? If yes, Flight
+       Mode is genuine continuous neurofeedback. If no, it is a one-shot
+       eyes-open/eyes-closed switch dressed up as flying, and the honest move is
+       to redesign around that rather than pretend.
+
+    4. EYES CLOSED, ALERT (45 s) -- serial subtraction, eyes still closed. Tests
+       the DOWN direction: can alpha be voluntarily suppressed without opening
+       the eyes and without moving? Gives the control law a bidirectional range
+       instead of relying on passive decay for descent.
+
+    5. ARTIFACTS, DELIBERATE (45 s) -- blink, then clench, then move the head, on
+       cue. A positive control for the rejection path: the veto thresholds are
+       currently calibrated on one subject, and this measures directly whether
+       they fire on THIS pilot's artifacts. It also gives every later analysis a
+       labelled example of each contaminant.
+
+    AUDIO POLICY: spoken guidance only, and no stimulus tone in any measurement
+    block. The control signal is alpha, and a rhythmic sound is exactly the wrong
+    thing to introduce while measuring it -- any block-to-block difference has to
+    be attributable to the pilot's mental state rather than to a soundtrack. The
+    Set-up phase plays one quiet reference tone so the subject can set a safe
+    volume for the guidance, and after that the session is silent apart from the
+    voice. Earbuds are strongly preferred: the subject's eyes are closed, so
+    speech is their only channel, and headphones keep it off the room.
+    """
+    return Protocol(
+        key="flight_cal",
+        name="Flight Calibration  (4 min)",
+        description=("Calibrates Flight Mode: eyes-open baseline, eyes-closed "
+                     "rest, voluntary deepen, voluntary alert, and a labelled "
+                     "artifact block. No audio stimulus."),
+        phases=[
+            Phase(
+                "Set up",
+                "1. Put in your earbuds. The status line shows which output the "
+                "Mac will use — if it does not say headphones, switch it now.\n\n"
+                "2. A quiet reference tone is playing. Raise your system volume "
+                "until the spoken guidance is comfortably clear. It starts "
+                "deliberately soft; do not set it loud.\n\n"
+                "3. Settle the headband until all four contact dots are green — "
+                "get the ear sensors onto bare skin, clipping hair back if "
+                "needed.\n\n4. Sit comfortably, rest your hands in your lap, and "
+                "unclench your jaw.\n\nClick Continue when ready.",
+                None,
+                actions=["audio_check"],
+                speech="Put in your earbuds, and raise your volume until this "
+                       "voice is comfortably clear. It is deliberately quiet to "
+                       "start with. Then settle the headband until the contact "
+                       "indicators are good, clipping any hair away from the ear "
+                       "sensors. Sit comfortably, rest your hands, and let your "
+                       "jaw hang loose. Press continue when you are ready.",
+            ),
+            Phase(
+                "Eyes open",
+                "Eyes OPEN. Rest your gaze on the cross and hold still.\n\n"
+                "Try not to clench your jaw. Blink normally — don't suppress it.",
+                45,
+                actions=["start_recording"],
+                gaze="fixate",
+                speech="Block one. Keep your eyes open and rest your gaze on the "
+                       "cross. Hold still, let your jaw stay loose, and blink "
+                       "normally. The ring shows the time left.",
+            ),
+            Phase(
+                "Eyes closed rest",
+                "Close your eyes. Rest. Do nothing in particular.\n\n"
+                "Don't try to relax or concentrate — just let your mind idle.",
+                60,
+                gaze="closed",
+                speech="Block two. Close your eyes now and simply rest. Do not try "
+                       "to relax and do not try to concentrate — let your mind "
+                       "idle. One minute.",
+            ),
+            Phase(
+                "Deepen",
+                "Eyes still closed.\n\nNow go DEEPER — let yourself sink, soften "
+                "your attention, and drift inward as far as you can.",
+                60,
+                gaze="closed",
+                speech="Block three, and this is the important one. Keep your eyes "
+                       "closed, and now go deeper. Let yourself sink. Soften your "
+                       "attention and drift inward as far as you can, and hold it "
+                       "there. Sixty seconds.",
+            ),
+            Phase(
+                "Alert",
+                "Eyes still closed — do NOT open them.\n\nNow become sharply "
+                "alert: count backwards from 300 in steps of 7, silently and as "
+                "fast as you can.",
+                30,
+                gaze="closed",
+                speech="Block four. Keep your eyes closed, but now become sharply "
+                       "alert. Silently count backwards from three hundred in "
+                       "sevens, as quickly as you can. Do not move or speak. "
+                       "Thirty seconds.",
+            ),
+            # Split into three separately-labelled 15 s phases rather than one
+            # 45 s block with pauses in the script. Two reasons: spoken cues land
+            # on time (a single string is read straight through in about 25 s,
+            # so the pilot would be clenching during the head-turn window), and
+            # each contaminant gets its own interval in events.csv, which is what
+            # lets the analysis report a veto rate per artifact type instead of
+            # one blended number.
+            # Eye movement leads the artifact set because it is the contaminant
+            # most likely to be mistaken for frontal signal: AF7/AF8 sit directly
+            # over the eyes, so a gaze sweep drags the corneo-retinal dipole
+            # across them. Having a labelled example makes it separable later.
+            # It is deliberately NOT part of the eyes-open baseline, which has to
+            # stay the cleanest reference in the session.
+            Phase(
+                "Artifact: eye movement",
+                "Eyes OPEN.\n\nFollow the moving dot smoothly with your eyes.\n\n"
+                "Keep your head still — move only your eyes.",
+                12,
+                gaze="pursuit",
+                speech="Now open your eyes and follow the moving dot smoothly, "
+                       "using only your eyes. Keep your head completely still.",
+            ),
+            Phase(
+                "Artifact: blinks",
+                "Eyes closed.\n\nBlink HARD, about once a second.",
+                12,
+                gaze="closed",
+                speech="Close your eyes again. Now blink hard, about once a "
+                       "second, starting now.",
+            ),
+            Phase(
+                "Artifact: jaw clench",
+                "Eyes closed.\n\nStop blinking. Now CLENCH your jaw hard, "
+                "release, and clench again.",
+                12,
+                gaze="closed",
+                speech="Stop blinking. Now clench your jaw hard, release, and "
+                       "clench again, over and over.",
+            ),
+            Phase(
+                "Artifact: head motion",
+                "Eyes closed.\n\nUnclench. Now slowly turn your head "
+                "left and right.",
+                12,
+                gaze="closed",
+                speech="Unclench your jaw. Now slowly turn your head left and "
+                       "right, and keep going until I tell you to stop.",
+            ),
+            # HEADPHONES ONLY. Skipped entirely on speakers, where both ears
+            # hear both channels and a left/right block would produce data that
+            # looks comparable to a headphone session but is not. Placed after
+            # every measurement block so the core five minutes are identical
+            # regardless of gear -- only this optional extra appears or does not.
+            Phase(
+                "Lateral audio check",
+                "Eyes closed. Quiet tones will alternate between your ears.\n\n"
+                "Do nothing — just listen.",
+                24,
+                gaze="closed",
+                requires="stereo_audio",
+                actions=["lateral_cues"],
+                speech="One extra block, because you are wearing headphones. "
+                       "Quiet tones will alternate between your left and right "
+                       "ear. Do nothing at all — just listen with your eyes "
+                       "closed.",
+            ),
+            Phase(
+                "Done",
+                "Stop moving and hold still.\n\nCalibration complete — you can "
+                "open your eyes and take the headband off.\n\nThe recording has been saved.",
+                None,
+                actions=["stop_recording"],
+                speech="And stop. Hold still. Calibration complete — you can open "
+                       "your eyes and remove the headband. The recording has been "
+                       "saved.",
+            ),
+        ],
+    )
+
+
+PROTOCOLS = {p.key: p for p in [_flight_calibration(), _hemisync_probe_quick(),
+                                _hemisync_probe_a(), _hemisync_probe_s(),
+                                _binaural_10min(), _heterodyne()]}
 
 
 class ProtocolRunner(QObject):
@@ -492,6 +710,7 @@ class ProtocolRunner(QObject):
     tick = pyqtSignal(float, float)                # remaining, phase_duration
     finished = pyqtSignal()
     aborted = pyqtSignal()
+    phase_skipped = pyqtSignal(object, str)        # phase, missing capability
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -500,9 +719,14 @@ class ProtocolRunner(QObject):
         self._phase_end = 0.0
         self._phase_dur = 0.0
         self._waiting = False
+        self._capabilities = set()
         self._timer = QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._on_tick)
+
+    def set_capabilities(self, tokens):
+        """Declare what the current hardware can do (see audio_output)."""
+        self._capabilities = set(tokens or ())
 
     def start(self, protocol):
         self._protocol = protocol
@@ -523,6 +747,10 @@ class ProtocolRunner(QObject):
             self.finished.emit()
             return
         phase = self._protocol.phases[self._i]
+        if phase.requires and phase.requires not in self._capabilities:
+            self.phase_skipped.emit(phase, phase.requires)
+            self._enter_next()
+            return
         self.phase_started.emit(phase, self._i, len(self._protocol.phases))
         if phase.duration is None:
             self._waiting = True

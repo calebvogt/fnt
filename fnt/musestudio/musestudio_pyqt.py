@@ -8,28 +8,40 @@ and a guided session runner (free record or a timed protocol).
 """
 
 import csv
+import json
+import logging
 import math
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox,
+    QInputDialog,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
     QPushButton,
-    QRadioButton, QScrollArea, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QRadioButton, QScrollArea, QSizePolicy, QSplitter, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from fnt.musestudio import theme
+from fnt.musestudio.mindball_controller import MindballController, latest_ghost
+from fnt.musestudio.mindball_view import MindballView
+from fnt.musestudio.flight.controller import FlightController
+from fnt.musestudio.flight.view import FlightView
+from fnt.musestudio.audio_output import (
+    advice as audio_advice, capability as audio_capability,
+)
 from fnt.musestudio.analysis import BandPowerAnalyzer, HemodynamicsAnalyzer
 from fnt.musestudio.binaural import (
-    BinauralPanel, play_alert, play_complete, play_cue, play_resolved,
+    BinauralPanel, play_alert, play_complete, play_cue,
+    play_lateral_sequence, play_resolved,
 )
 from fnt.musestudio.channel_table import LiveValuesPanel
 from fnt.musestudio.device_status import DeviceStatusBar
-from fnt.musestudio.dsp import curated_channels
+from fnt.musestudio.dsp import EEG_ELECTRODES, curated_channels
 from fnt.musestudio.live_plot import LiveSignalView
 from fnt.musestudio.log_view import LogDialog
 from fnt.musestudio.logbuffer import LOG
@@ -73,6 +85,18 @@ _SYNC_GATE_HOLD_S = 10.0
 # alarm (with tones and speech) every battery sample, all session long.
 _STALL_SECONDS = 2.5
 _STALL_ESCALATE_S = 15.0
+# How long a session may run with no EEG before it is stopped outright. Long
+# enough to ride out a brief BLE hiccup (liblsl reconnects on its own), short
+# enough that nobody sits through a five-minute protocol collecting nothing.
+_EEG_LOSS_ABORT_S = 20.0
+# How often to look again while nothing is connected. The operator usually
+# switches the headband on after opening the app, so a single scan at start-up
+# misses it entirely.
+_RESCAN_EVERY_S = 20.0
+# A stream can be open while the headband sends nothing. Idle (no session), that
+# state is dropped after this long so the UI stops claiming a connection it does
+# not have and the next scan can retry cleanly.
+_IDLE_SILENT_DROP_S = 25.0
 _STALL_UNKNOWN_RATE_S = 12.0     # streams whose rate we couldn't resolve
 
 
@@ -114,15 +138,57 @@ def _short(stream_name):
     return re.sub(r"^Muse[-_]?", "", s) or s
 
 
+# Reference-tone level for the pre-session audio check. Deliberately low:
+# the subject raises their system volume to meet it, rather than the app
+# picking a loudness for someone who may be wearing in-ear buds.
+AUDIO_CHECK_VOLUME = 0.12
+
+def _git_sha():
+    """Short git SHA of the working tree, or "" outside a checkout."""
+    try:
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        out = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        sha = (out.stdout or "").strip()
+        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5)
+        return sha + ("+dirty" if (dirty.stdout or "").strip() else "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 _local_clock = None
 
 
 def _lsl_now():
-    """Current LSL clock value (shared with Muse/webcam timestamps)."""
+    """Current LSL clock value (shared with Muse/webcam timestamps).
+
+    Falls back to ``time.monotonic`` when mne_lsl is unavailable. That is not a
+    cosmetic guard: this function is called while writing every event row, and
+    when it raised, the exception propagated out of ``_open_event_log`` and
+    ``_close_audio_log`` mid-recording. The protocol then ran happily to
+    completion having written no events.csv at all -- the same silent-empty-
+    recording failure this project has already been bitten by once, and worse
+    here because events.csv is what every downstream analysis aligns against.
+
+    The fallback clock does not share an origin with the Muse stream, so
+    cross-stream alignment is meaningless in that mode; a recording made this
+    way is for smoke-testing the plumbing, not for analysis. It is still far
+    better than losing the timeline without saying so.
+    """
     global _local_clock
     if _local_clock is None:
-        from mne_lsl.lsl import local_clock
-        _local_clock = local_clock
+        try:
+            from mne_lsl.lsl import local_clock
+            _local_clock = local_clock
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "mne_lsl unavailable — event timestamps fall back to a local "
+                "monotonic clock and will NOT align with Muse stream timestamps."
+            )
+            _local_clock = time.monotonic
     return _local_clock()
 
 
@@ -144,6 +210,7 @@ class SessionBanner(QFrame):
     progress, and a Continue button for wait-for-user phases."""
 
     continue_clicked = pyqtSignal()
+    stop_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -177,21 +244,43 @@ class SessionBanner(QFrame):
         self.continue_btn = QPushButton("Continue")
         self.continue_btn.clicked.connect(self.continue_clicked.emit)
         bottom.addWidget(self.continue_btn)
+        # Stop lives here as well as in the left column. During a session the
+        # banner is the one element guaranteed to be on screen and looked at,
+        # and "how do I stop this?" must never be a hunt.
+        self.stop_btn = QPushButton("Stop session")
+        self.stop_btn.setToolTip("End the session now. A recording in progress "
+                                 "is closed and saved.")
+        self.stop_btn.setStyleSheet(
+            f"background-color: #5b2020; border: 1px solid {theme.DANGER}; "
+            f"color: #ffd9d9; font-weight: 600; padding: 4px 12px;")
+        self.stop_btn.clicked.connect(self.stop_clicked.emit)
+        bottom.addWidget(self.stop_btn)
         lay.addLayout(bottom)
         self.hide()
 
-    def show_free(self, recording=True):
+    def show_free(self, recording=True, compact=False):
+        """``compact`` drops the explanatory line for modes that have their own
+        display.
+
+        In Mindball or Flight the banner sat above a full-screen game restating
+        that live monitoring was happening — information the player already has,
+        occupying the top of the very view they are trying to watch. The title,
+        the clock and Stop are kept; the sentence is not.
+        """
         if recording:
-            self.title.setText("Free recording")
+            self.title.setText("Recording")
             self.instruction.setText(
+                "" if compact else
                 "Recording all active streams (EEG, optics, webcam, audio events). "
                 "Press Stop when you are finished."
             )
         else:
-            self.title.setText("Free monitor")
+            self.title.setText("Live")
             self.instruction.setText(
+                "" if compact else
                 "Live monitoring — nothing is being saved. Press Stop when finished."
             )
+        self.instruction.setVisible(not compact)
         self.progress.setRange(0, 0)  # busy indicator
         self.continue_btn.hide()
         self.show()
@@ -219,6 +308,7 @@ class MuseStudioWindow(QMainWindow):
         # Start capturing diagnostics (including native stdout/stderr from
         # liblsl and OpenCV) before anything else can fail.
         LOG.install()
+        LOG.install_crash_handlers()
         self._log_dialog = None
         self.stream_proc = None
         self.reader = None
@@ -229,13 +319,23 @@ class MuseStudioWindow(QMainWindow):
         self._audio_writer = None
         self._sync_file = None
         self._sync_writer = None
+        self._quality_file = None
+        self._quality_writer = None
         self._event_file = None
         self._event_writer = None
         self._eeg_stream = None
         self._eeg_channels = []
         self._optics_channels = []
         self._device_address = None
+        self._auto_connecting = False
+        self._auto_started = False
+        self._connected_at = None
+        self._session_needs_eeg = False
+        self._devices = []
+        self._selected_address = None
+        self._selected_name = ""
         self._session_active = False
+        self._session_needs_eeg = False
         self._recording_enabled = False
         self._free_start = 0.0
         self._current_phase = None
@@ -251,6 +351,31 @@ class MuseStudioWindow(QMainWindow):
         self.resize(1480, 900)
         self.setMinimumSize(1100, 700)
         self.setStyleSheet(theme.STYLESHEET)
+
+        # Built BEFORE _init_ui(): _build_right_view() adds flight_view as a tab,
+        # so the widget has to exist by then.
+        self.flight = FlightController(self)
+        self.flight_view = FlightView()
+        self.flight.frame.connect(
+            lambda st, tr: self.flight_view.set_frame(
+                st, tr, self.flight.cfg.dead_zone, self.flight.cfg.full_scale_z))
+        self.flight.status.connect(self._on_flight_status)
+        self.flight.calibrating.connect(
+            lambda f: self.flight_view.set_status(
+                f"Calibrating baseline… {100*f:.0f}%" if f < 1.0 else ""))
+        self.flight.phase_changed.connect(
+            lambda ph: self._write_event("flight", ph, ""))
+
+        self.mindball = MindballController(self)
+        self.mindball_view = MindballView()
+        self.mindball.frame.connect(
+            lambda st, lab, hist: self.mindball_view.set_frame(st, lab, hist))
+        self.mindball.status.connect(self._on_mindball_status)
+        self.mindball.finished.connect(self._on_mindball_finished)
+        self.flight.altitude_tone.connect(self._on_flight_tone)
+        self.flight.cue.connect(self._on_flight_cue)
+        self.flight.finished.connect(self._on_flight_finished)
+
         self._init_ui()
 
         # Guided-protocol runner and a free-record elapsed timer.
@@ -259,6 +384,15 @@ class MuseStudioWindow(QMainWindow):
         self.runner.tick.connect(self._on_runner_tick)
         self.runner.finished.connect(self._on_runner_finished)
         self.runner.aborted.connect(self._on_runner_aborted)
+        self.runner.phase_skipped.connect(self._on_phase_skipped)
+        self.device_status.connect_clicked.connect(self.on_connect)
+
+        # Keep looking while nothing is connected — the headband is usually
+        # switched on after the app is already open.
+        self._rescan_timer = QTimer(self)
+        self._rescan_timer.timeout.connect(self._retry_scan)
+        self._rescan_timer.start(int(_RESCAN_EVERY_S * 1000))
+
         self._free_timer = QTimer(self)
         self._free_timer.setInterval(500)
         self._free_timer.timeout.connect(self._on_free_tick)
@@ -317,13 +451,12 @@ class MuseStudioWindow(QMainWindow):
         main_split.addWidget(self._build_right_view())
         main_split.setStretchFactor(0, 0)
         main_split.setStretchFactor(1, 1)
-        main_split.setSizes([440, 1040])
+        main_split.setSizes([500, 1040])
         root.addWidget(main_split, stretch=1)
 
         self._wire_analyzer()
         self._load_subjects()
         self._init_speech()
-        self._on_view_changed()   # apply initial Live view
 
     def _build_left_column(self):
         """Scrolling column of controls (like MAD / Mask Tracker)."""
@@ -333,48 +466,8 @@ class MuseStudioWindow(QMainWindow):
         col.setSpacing(8)
 
         # View selector at the very top.
-        view_group = QGroupBox("View")
-        vg = QHBoxLayout(view_group)
-        self.live_radio = QRadioButton("Live View")
-        self.live_radio.setChecked(True)
-        self.live_radio.setToolTip("Stream data and play beats freely — nothing is saved.")
-        self.rec_radio = QRadioButton("Recording View")
-        self.rec_radio.setToolTip("Run a protocol or free recording and save it to disk.")
-        self.live_radio.toggled.connect(self._on_view_changed)
-        vg.addWidget(self.live_radio)
-        vg.addWidget(self.rec_radio)
-        vg.addStretch()
-        col.addWidget(view_group)
 
         # Muse connection.
-        muse_group = QGroupBox("Muse")
-        muse_group.setToolTip(
-            "Muse S Athena via OpenMuse (Bluetooth LE).\n\n"
-            "The decoding — especially fNIRS/optics — is reverse-engineered and "
-            "experimental, and is not affiliated with or endorsed by InteraXon. "
-            "Treat absolute values with caution; within-session changes are the "
-            "reliable signal."
-        )
-        mg = QVBoxLayout(muse_group)
-        self.device_combo = QComboBox()
-        self.device_combo.addItem("No devices — click Scan", None)
-        self.device_combo.setToolTip("Muse devices found by the last scan. Pick one, then Connect.")
-        mg.addWidget(self.device_combo)
-        row = QHBoxLayout()
-        self.scan_btn = QPushButton("Scan")
-        self.scan_btn.clicked.connect(self.on_scan)
-        self.scan_btn.setToolTip("Search over Bluetooth for nearby Muse headbands.")
-        row.addWidget(self.scan_btn)
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self.on_connect)
-        self.connect_btn.setToolTip("Start streaming EEG/optics from the selected Muse.")
-        row.addWidget(self.connect_btn)
-        mg.addLayout(row)
-        self.battery_label = QLabel("Battery: —")
-        self.battery_label.setStyleSheet("color: #cccccc; font-weight: bold;")
-        self.battery_label.setToolTip("Muse battery level (updates every few seconds).")
-        mg.addWidget(self.battery_label)
-        col.addWidget(muse_group)
 
         # Webcam.
         cam_group = QGroupBox("Webcam")
@@ -523,32 +616,119 @@ class MuseStudioWindow(QMainWindow):
         # Recording controls (shown only in Recording View).
         self.recording_group = QGroupBox("Recording")
         rg = QVBoxLayout(self.recording_group)
-        rg.addWidget(QLabel("Recording protocol"))
+        # The session selector. This control used to be a flat list labelled
+        # "Recording protocol" holding three unrelated kinds of thing —
+        # open-ended modes, an interactive mode, and timed protocols — with the
+        # only explanation buried in a tooltip. Nobody found Flight Calibration
+        # in it, which is a fair verdict on the design rather than on the user.
+        # Now: grouped under headings, and whatever is selected explains itself
+        # in the label underneath, so the choice is legible without hovering.
+        rg.addWidget(QLabel("Session"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Free", "free")
-        self.mode_combo.addItem("Sleep (overnight)", "sleep")
+        self._mode_blurbs = {}
+
+        def _add_heading(text):
+            self.mode_combo.addItem(text)
+            i = self.mode_combo.count() - 1
+            item = self.mode_combo.model().item(i)
+            item.setEnabled(False)
+            f = item.font()
+            f.setBold(True)
+            item.setFont(f)
+
+        def _add_mode(label, key, blurb):
+            self.mode_combo.addItem(f"   {label}", key)
+            self._mode_blurbs[key] = blurb
+
+        _add_heading("Open-ended")
+        _add_mode("Free monitor", "free",
+                  "Capture whatever is streaming until you press Stop. "
+                  "No guidance, no timing, no phases.")
+        _add_mode("Sleep (overnight)", "sleep",
+                  "Unattended all-night recording. Keeps the Mac awake, "
+                  "silences every alert, pauses the live plots, and writes at "
+                  "reduced precision — about 1 GB a night.")
+        _add_mode("Mindball (vs your past self)", "mindball",
+                  "Push a ball into your opponent's end by being the calmer "
+                  "one — the science-museum game. You play a recording of a "
+                  "previous match, or a practice partner if you have none yet.")
+        _add_mode("Flight test (cued, 2:20)", "flight",
+                  "Fly a craft on your own cortical alpha. Spoken cues alternate "
+                  "CLIMB (eyes closed) and DESCEND (eyes open), so altitude can "
+                  "be checked against the instruction. Stops on its own.")
+
+        self.mode_combo.insertSeparator(self.mode_combo.count())
+        _add_heading("Guided protocols")
         for key, proto in PROTOCOLS.items():
-            self.mode_combo.addItem(proto.name, key)
+            # Count only phases that always run. Hardware-gated blocks (a
+            # stereo-only check, say) are skipped on some setups, so including
+            # them would advertise a length the session does not have.
+            total = sum(ph.duration or 0 for ph in proto.phases if not ph.requires)
+            mins = f"{int(total // 60)}:{int(total % 60):02d}"
+            name = proto.name.split("(")[0].strip()
+            self.mode_combo.addItem(f"   {name}  ·  {mins}", key)
+            self._mode_blurbs[key] = proto.description
+
         self.mode_combo.setToolTip(
-            "Free: capture live streams until you press Stop.\n\n"
-            "Sleep (overnight): a long unattended recording. Keeps the Mac "
-            "awake (screen may still sleep), silences every alert so nothing "
-            "wakes you, pauses live plots to keep the fans quiet, and writes "
-            "at reduced numeric precision (~1 GB/night instead of 1.5).\n\n"
-            "Protocols: a guided, timed trial with on-screen instructions."
-        )
+            "What this session will do. Open-ended runs until you stop it; "
+            "a guided protocol steps through timed phases with spoken "
+            "instructions.")
         rg.addWidget(self.mode_combo)
+
+        # Says what the selected session actually does. The point is that no
+        # choice here should require hovering, reading source, or guessing.
+        self.mode_blurb = QLabel()
+        self.mode_blurb.setWordWrap(True)
+        self.mode_blurb.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # A word-wrapped QLabel defaults to a Preferred vertical policy, which in
+        # a QVBoxLayout lets it soak up every spare pixel — this one grew to 480
+        # px against a 38 px hint and pushed the whole Recording group out from
+        # underneath the panel below it, so Recording rendered *behind* Webcam
+        # and looked like it had disappeared. Minimum policy plus a ceiling keeps
+        # it to its content, and the fixed ceiling also stops the left column
+        # reflowing every time the selection changes.
+        self.mode_blurb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.mode_blurb.setMaximumHeight(74)
+        self.mode_blurb.setStyleSheet(
+            f"color: {theme.TEXT_DIM}; padding: 2px 4px 6px 4px;")
+        rg.addWidget(self.mode_blurb)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        # Restore whatever was run last — most sessions are a repeat of the
+        # previous one, so the common case should need no interaction at all.
+        last = self._settings.value("last_session", "")
+        restored = False
+        for i in range(self.mode_combo.count()):
+            if last and self.mode_combo.itemData(i) == last:
+                self.mode_combo.setCurrentIndex(i)
+                restored = True
+                break
+        if not restored:
+            self.mode_combo.setCurrentIndex(1)   # index 0 is the "Open-ended" heading
+        self._on_mode_changed()
+
         brow = QHBoxLayout()
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self.on_start_or_stop)
         self.start_btn.setToolTip("Run the selected session live, without saving any files.")
-        brow.addWidget(self.start_btn)
+        self.start_btn.setMinimumHeight(38)
+        brow.addWidget(self.start_btn, stretch=1)
         self.record_btn = QPushButton("Start + Record")
+        self.record_btn.setMinimumHeight(38)
+        # The recording button is the primary action — an unrecorded session is
+        # the exception, not the default.
+        self.record_btn.setProperty("accent", "true")
         self.record_btn.clicked.connect(lambda: self.on_start_session(record=True))
         self.record_btn.setToolTip("Run the selected session and save it to the recording folder.")
-        brow.addWidget(self.record_btn)
+        brow.addWidget(self.record_btn, stretch=2)
         rg.addLayout(brow)
-        rg.addWidget(QLabel("Default recording location:"))
+        # Only the recording-*management* rows follow the Live/Recording view
+        # toggle. The session selector and Start buttons never hide: they are
+        # the primary action, and the app opens in Live View, so hiding them
+        # meant a fresh window offered no visible way to start anything at all.
+        self.recording_extras = QWidget()
+        ex = QVBoxLayout(self.recording_extras)
+        ex.setContentsMargins(0, 0, 0, 0)
+        ex.addWidget(QLabel("Default recording location:"))
         loc_row = QHBoxLayout()
         self.folder_label = QLabel(self.output_dir)
         self.folder_label.setStyleSheet("color: #999999;")
@@ -560,20 +740,23 @@ class MuseStudioWindow(QMainWindow):
         self.folder_btn.clicked.connect(self.on_choose_folder)
         self.folder_btn.setToolTip("Choose the default folder where each recording is created.")
         loc_row.addWidget(self.folder_btn)
-        rg.addLayout(loc_row)
+        ex.addLayout(loc_row)
         self.review_btn = QPushButton("Review a recording…")
         self.review_btn.clicked.connect(self.on_review_recording)
         self.review_btn.setToolTip(
             "Open a finished recording and compare each protocol phase "
             "against baseline.")
-        rg.addWidget(self.review_btn)
-        # Final column order is set here rather than by the order things were
-        # constructed above. Reading down the column should follow the order you
-        # actually do them: connect the headband, pick a view, say who this is,
-        # then choose what to run.
-        col.insertWidget(1, self.recording_group)
-        col.insertWidget(1, self.subject_group)
-        col.insertWidget(0, muse_group)             # connect first, always on top
+        ex.addWidget(self.review_btn)
+        rg.addWidget(self.recording_extras)
+        self.recording_extras.setVisible(True)
+        # Final column order: who is being recorded, then what to run. The Muse
+        # panel that used to sit above these is gone — connecting is automatic,
+        # and its status plus a fallback Connect button now live in the
+        # always-visible strip above the tabs. The Live/Recording View radios
+        # are gone too: they toggled two rows and, by hiding the whole Recording
+        # group in their default state, made the primary action invisible.
+        col.insertWidget(0, self.recording_group)
+        col.insertWidget(0, self.subject_group)
 
         col.addStretch()
 
@@ -613,8 +796,11 @@ class MuseStudioWindow(QMainWindow):
         cl.addWidget(diag)
         # Wide enough for the two-button Recording row plus the scrollbar and
         # collapse rail — at 330 the "Start + Record" button was clipped.
-        container.setMinimumWidth(400)
-        container.setMaximumWidth(520)
+        # 470/620, not 400/520: at 400 the Subject fields and the session
+        # description were clipped on the right, which is what made the column
+        # look broken rather than merely narrow.
+        container.setMinimumWidth(470)
+        container.setMaximumWidth(620)
         return container
 
     def _build_right_view(self):
@@ -632,6 +818,7 @@ class MuseStudioWindow(QMainWindow):
 
         self.session_banner = SessionBanner()
         self.session_banner.continue_clicked.connect(self._on_continue)
+        self.session_banner.stop_clicked.connect(self.on_stop_session)
         rlay.addWidget(self.session_banner)
 
         self.view_tabs = QTabWidget()
@@ -641,6 +828,8 @@ class MuseStudioWindow(QMainWindow):
         self.view_tabs.addTab(self._build_spectrogram_tab(), "Spectrogram")
         self.view_tabs.addTab(self._build_synchrony_tab(), "Synchrony")
         self.view_tabs.addTab(self._build_camera_tab(), "Camera")
+        self.view_tabs.addTab(self.flight_view, "Flight")
+        self.view_tabs.addTab(self.mindball_view, "Mindball")
         self.review = ReviewPanel()
         self.view_tabs.addTab(self.review, "Review")
 
@@ -848,10 +1037,17 @@ class MuseStudioWindow(QMainWindow):
         else:
             self.camera_combo.addItem("No camera detected", None)
 
-    def _on_view_changed(self, *_):
-        """Recording controls are only shown in Recording View."""
-        recording = self.rec_radio.isChecked()
-        self.recording_group.setVisible(recording)
+    def showEvent(self, event):
+        """Begin looking for the headband as soon as the window appears.
+
+        Deferred one event-loop turn so the window paints first — the operator
+        should see the UI and the "Looking for your headband…" status together,
+        not stare at nothing while a BLE scan blocks the first paint.
+        """
+        super().showEvent(event)
+        if not self._auto_started:
+            self._auto_started = True
+            QTimer.singleShot(0, self.auto_start)
 
     def _on_left_toggled(self, shown):
         self.left_scroll.setVisible(shown)
@@ -866,30 +1062,106 @@ class MuseStudioWindow(QMainWindow):
 
     # --------------------------------------------------------------- actions
     def on_scan(self):
-        self.scan_btn.setEnabled(False)
+        # Never run two scans at once, and never leak the thread.
+        #
+        # This crashed the app. Each QThread needs a pipe for its event
+        # dispatcher, and the periodic re-scan created a brand new _ScanThread
+        # every 20 s while disconnected, dropping the previous one without
+        # waiting for or deleting it. File descriptors ran out, and the next
+        # thread's QEventDispatcherUNIXPrivate constructor called qFatal ->
+        # SIGABRT. The macOS crash report pointed straight at it
+        # (QMessageLogger::fatal inside QEventDispatcherUNIXPrivate).
+        old = getattr(self, "scan_thread", None)
+        if old is not None:
+            try:
+                if old.isRunning():
+                    self._log("Scan already in progress — skipping")
+                    return
+            except RuntimeError:
+                # The C++ object was already deleted by deleteLater; the Python
+                # wrapper outlives it briefly. Treat that as "no scan running".
+                self.scan_thread = None
+        self.device_status.set_connect_enabled(False)
         self._log("Scan for devices")
         self._set_status("Scanning for Muse devices…")
-        self.scan_thread = _ScanThread()
-        self.scan_thread.result.connect(self._on_scan_result)
-        self.scan_thread.failed.connect(self._on_scan_failed)
-        self.scan_thread.start()
+        thread = _ScanThread(self)
+        thread.result.connect(self._on_scan_result)
+        thread.failed.connect(self._on_scan_failed)
+        # Free the thread object once it finishes, so repeated scans over a long
+        # idle period do not accumulate.
+        thread.finished.connect(thread.deleteLater)
+        # Drop our reference too, or the next scan inspects a deleted object.
+        thread.finished.connect(lambda: setattr(self, "scan_thread", None))
+        self.scan_thread = thread
+        thread.start()
 
     def _on_scan_result(self, devices, raw):
-        self.scan_btn.setEnabled(True)
-        self.device_combo.clear()
+        self.device_status.set_connect_enabled(True)
+        self._devices = list(devices or [])
         if not devices:
-            self.device_combo.addItem("No devices found", None)
+            self.device_status.set_connected(False)
             self._set_status("No Muse devices found. Is the headband on and nearby?")
             self._log("Scan found 0 devices")
+            self._auto_connecting = False
             return
-        for d in devices:
-            self.device_combo.addItem(f"{d['name']}  ({d['address']})", d["address"])
         self._set_status(f"Found {len(devices)} device(s).")
         self._log(f"Scan found {len(devices)} device(s): "
                   + ", ".join(d["address"] for d in devices))
 
+        if not self._auto_connecting:
+            return
+        self._auto_connecting = False
+        # Pick the headband we used last; failing that, the only one in range.
+        # Anything more ambiguous is left to the human — silently connecting to
+        # whichever Muse happens to be nearest in a shared lab would be worse
+        # than asking.
+        remembered = self._settings.value("device_address", "")
+        target = next((d for d in devices if d["address"] == remembered), None)
+        if target is None and len(devices) == 1:
+            target = devices[0]
+        if target is None:
+            self.device_status.set_connected(False)
+            self._set_status(f"{len(devices)} headbands found — press Connect to "
+                             "choose one.")
+            return
+        self._selected_address = target["address"]
+        self._selected_name = target.get("name", "")
+        self._log(f"Auto-connecting to {self._selected_address}")
+        self.on_connect()
+
+    def _retry_scan(self):
+        """Keep looking for the headband while nothing is connected.
+
+        The original scan fired once, when the window opened. That loses the
+        natural order of operations: the operator opens the app, THEN picks up
+        the headband and switches it on. By the time the Muse is advertising,
+        the one scan has long finished and nothing ever looks again, so the app
+        sits there saying "not connected" forever while the headband sits there
+        advertising. Retrying closes that gap without any button to find.
+        """
+        if self.reader is not None or self._auto_connecting or self._session_active:
+            return
+        self._log("Re-scanning for the headband")
+        self.auto_start()
+
+    def auto_start(self):
+        """Scan and connect without being asked. Called once when the tab opens.
+
+        The window already knows which headband it used last, so making the
+        operator press Scan, choose from a list, and press Connect is three
+        clicks of pure ceremony. It stays cancellable — the Muse panel still has
+        both buttons — and it never guesses between multiple unknown devices.
+        """
+        if self.reader is not None or self._auto_connecting:
+            return
+        self._auto_connecting = True
+        self._set_status("Looking for your headband…")
+        self.device_status.set_busy("Searching…")
+        self.on_scan()
+
     def _on_scan_failed(self, msg):
-        self.scan_btn.setEnabled(True)
+        self.device_status.set_connect_enabled(True)
+        self.device_status.set_connected(False)
         self._set_status("Scan failed.")
         QMessageBox.critical(self, "Scan failed", msg)
 
@@ -898,11 +1170,32 @@ class MuseStudioWindow(QMainWindow):
             self.disconnect_stream()
             return
 
-        address = self.device_combo.currentData()
+        address = self._selected_address
+        if not address and len(self._devices) > 1:
+            # Ambiguous: ask rather than guess. A one-shot dialog is the right
+            # weight for something that only happens when auto-connect could not
+            # decide; it does not warrant a permanent panel in the column.
+            labels = [f"{d.get('name','Muse')}  ({d['address']})" for d in self._devices]
+            choice, ok = QInputDialog.getItem(
+                self, "Choose a headband",
+                "More than one Muse is in range:", labels, 0, False)
+            if not ok:
+                return
+            picked = self._devices[labels.index(choice)]
+            address = self._selected_address = picked["address"]
+            self._selected_name = picked.get("name", "")
+        elif not address and len(self._devices) == 1:
+            address = self._selected_address = self._devices[0]["address"]
+            self._selected_name = self._devices[0].get("name", "")
         if not address:
-            QMessageBox.warning(self, "No device", "Scan and select a Muse device first.")
+            # Nothing known yet — scanning is the useful answer to "Connect".
+            self.auto_start()
             return
         self._device_address = address
+        # Remembered so the next session can connect without being asked. This
+        # is the single biggest saving in the start-up flow: Scan, pick, Connect
+        # is three clicks that the app already has enough information to skip.
+        self._settings.setValue("device_address", address)
         self._log(f"Connect to {address}")
 
         try:
@@ -919,9 +1212,11 @@ class MuseStudioWindow(QMainWindow):
         # Fresh views for the new session.
         self.plot.clear()
         self.values_panel.clear_values()
-        self.battery_label.setText("Battery: —")
 
-        self.reader = LSLReaderThread(address=address)
+        self.reader = LSLReaderThread(
+            address=address,
+            streamer_dead=lambda: (self.stream_proc is not None
+                                   and not self.stream_proc.is_alive()))
         self.reader.samples_ready.connect(self._on_samples)
         self.reader.connected.connect(self._on_connected)
         self.reader.disconnected.connect(self._on_disconnected)
@@ -929,9 +1224,7 @@ class MuseStudioWindow(QMainWindow):
         self.reader.status.connect(self._set_status)
         self.reader.start()
 
-        self.connect_btn.setText("Disconnect")
-        self.device_combo.setEnabled(False)
-        self.scan_btn.setEnabled(False)
+        self.device_status.set_busy("Connecting…")
         self._set_status("Connecting… (starting OpenMuse stream)")
 
     def _on_connected(self, names):
@@ -941,6 +1234,11 @@ class MuseStudioWindow(QMainWindow):
         if self.reader is None:
             self._log("Ignored a late 'connected' signal — reader already stopped")
             return
+        # When streams resolved. Used to notice a connection that resolves
+        # outlets but never delivers a sample, which looks identical to a
+        # working headband until you check the numbers.
+        self._connected_at = time.monotonic()
+        self._last_sample = {}
         ch_names = self.reader.channel_names()
         # Battery is shown as a number, not plotted or listed as a channel.
         plot_names = {k: v for k, v in ch_names.items() if not _is_battery(k)}
@@ -979,7 +1277,7 @@ class MuseStudioWindow(QMainWindow):
         # channel preset once data has actually started flowing.
         QTimer.singleShot(1200, self._apply_channel_set)
 
-        self.device_status.set_connected(True, self.device_combo.currentText().split('  (')[0])
+        self.device_status.set_connected(True, self._selected_name or "Connected")
         self._set_status(f"Connected. Streaming: {', '.join(names)}")
         self._log(f"Connected — streams: {', '.join(names)}")
 
@@ -997,10 +1295,32 @@ class MuseStudioWindow(QMainWindow):
         self.plot.add_samples(stream_name, timestamps, data)
         self.values_panel.add_samples(stream_name, timestamps, data)
         if stream_name == self._eeg_stream:
+            # Feed the always-visible trace. One channel, decimated ~8x: this is
+            # a liveness indicator, not a measurement, so it costs almost
+            # nothing and must never compete with the real plots.
+            try:
+                col = 0
+                for i, n in enumerate(self._eeg_channels or []):
+                    if "AF8" in str(n).upper():
+                        col = i
+                        break
+                self.device_status.push_signal(data[::8, col])
+            except Exception:  # noqa: BLE001
+                pass
             self.analyzer.add_eeg(self._eeg_channels, data)
             self.bands.add_eeg(self._eeg_channels, data)
+            if self.flight.is_running():
+                self.flight.add_eeg(self._eeg_channels, data)
+            if self.mindball.is_running():
+                self.mindball.add_eeg(self._eeg_channels, data)
         elif _is_optics(stream_name):
             self.hemo.add_optics(self._optics_channels, data)
+        elif ("ACC" in str(stream_name).upper()
+              or "GYRO" in str(stream_name).upper()):
+            if self.flight.is_running():
+                names = self.reader.channel_names().get(stream_name, []) \
+                    if self.reader is not None else []
+                self.flight.add_motion(names, data)
 
     def _update_rate(self):
         """Publish EEG samples/second to the status bar once per second."""
@@ -1023,11 +1343,8 @@ class MuseStudioWindow(QMainWindow):
         session that would be garbage anyway.
         """
         self._battery_last = pct
-        self.battery_label.setText(f"Battery: {pct:.0f}%")
         self.device_status.set_battery(pct)
         if pct < 10:
-            self.battery_label.setStyleSheet(
-                f"color: {theme.DANGER}; font-weight: bold;")
             if not self._battery_warned.get("critical"):
                 self._battery_warned["critical"] = True
                 LOG.add(f"BATTERY CRITICAL: {pct:.0f}% — expect BLE dropouts; "
@@ -1041,16 +1358,11 @@ class MuseStudioWindow(QMainWindow):
                     self._speak("Headband battery is critically low. The "
                                 "recording may cut out.")
         elif pct < 20:
-            self.battery_label.setStyleSheet(
-                f"color: {theme.WARN}; font-weight: bold;")
             if not self._battery_warned.get("low"):
                 self._battery_warned["low"] = True
                 LOG.add(f"Battery low: {pct:.0f}%", "log")
                 self._set_status(f"Battery {pct:.0f}% — consider charging "
                                  "before a long session.")
-        else:
-            self.battery_label.setStyleSheet(
-                f"color: {theme.TEXT}; font-weight: bold;")
 
     # ------------------------------------------------------------- watchdog
     def _check_streams(self):
@@ -1061,7 +1373,14 @@ class MuseStudioWindow(QMainWindow):
         hole. So a stall gets a distinct alert tone, a marker in events.csv, and
         an attempt to restart the streamer if its process died.
         """
-        if self.reader is None or not self._last_sample:
+        if self.reader is None:
+            return
+        if not self._last_sample:
+            # Never received a single sample since connecting. The old early
+            # return here meant a connection that produced nothing was never
+            # examined at all — no stall, no drop, no message — so the UI sat on
+            # "connected" indefinitely. That is the state that wasted a session.
+            self._check_never_delivered()
             return
         now = time.monotonic()
         for stream, last in list(self._last_sample.items()):
@@ -1085,6 +1404,88 @@ class MuseStudioWindow(QMainWindow):
                         f"⚠ {_short(stream)} still down after {gap:.0f}s — "
                         "check the headband is on and in range.")
                     self._sound(play_alert, session_only=True)
+
+        self._abort_if_no_eeg()
+        self._drop_if_silent_idle()
+
+    def _check_never_delivered(self):
+        """Connected, but not one sample has ever arrived."""
+        started = getattr(self, "_connected_at", None)
+        if started is None:
+            return
+        gap = time.monotonic() - started
+        if gap < _IDLE_SILENT_DROP_S:
+            return
+        detail = ""
+        if self.stream_proc is not None and not self.stream_proc.is_alive():
+            code = self.stream_proc.exit_code()
+            detail = f" The streamer exited (code {code})."
+        tail = (self.stream_proc.tail(6) if self.stream_proc is not None else "")
+        if tail:
+            LOG.add("OpenMuse streamer output:\n" + tail, "error")
+        self._log(f"No data ever arrived after {gap:.0f}s.{detail}")
+        self._set_status(
+            f"Connected but no data after {gap:.0f}s.{detail} Dropping the "
+            "connection — switch the headband off and on, and it will retry.")
+        if self._session_active:
+            self.on_stop_session()
+        self.disconnect_stream()
+
+    def _drop_if_silent_idle(self):
+        """Disconnect a stream that is open but delivering nothing.
+
+        "Connected" with no data and no battery is the single most confusing
+        state this app can show — it looks like a working headband, and the
+        Connect button reads "Disconnect", so the obvious recovery is not even
+        offered. Dropping it turns an ambiguous state into an honest one and
+        lets the periodic re-scan pick the device up again.
+        """
+        if self.reader is None or self._session_active:
+            return
+        last = max(self._last_sample.values()) if self._last_sample else None
+        gap = time.monotonic() - last if last else _IDLE_SILENT_DROP_S + 1
+        if gap < _IDLE_SILENT_DROP_S:
+            return
+        self._log(f"Dropping silent connection (no data for {gap:.0f}s)")
+        self._set_status(
+            "Headband stopped sending data — connection dropped. Make sure it is "
+            "switched on, then it will be picked up automatically.")
+        self.disconnect_stream()
+
+    def _abort_if_no_eeg(self):
+        """End a session that has lost the brain data it exists to collect.
+
+        A protocol that keeps running without EEG wastes the subject's time and
+        writes a file with a hole in it, or nothing at all. That has already
+        happened here once: a 9-minute run completed against a browned-out
+        headband that still reported "connected", and the recording was empty.
+
+        Only sessions that STARTED with EEG are aborted. Running a protocol with
+        no headband at all is a deliberate, supported case (audio-only rehearsal),
+        and must not be broken by this.
+        """
+        if not self._session_active or not self._session_needs_eeg:
+            return
+        last = self._last_sample.get(self._eeg_stream)
+        gap = time.monotonic() - last if last else _EEG_LOSS_ABORT_S + 1
+        if gap < _EEG_LOSS_ABORT_S:
+            return
+        LOG.add(f"SESSION ABORTED: no EEG for {gap:.0f}s", "error")
+        self._log(f"Session aborted — no EEG for {gap:.0f}s")
+        self._write_event("session", "aborted_no_eeg", f"{gap:.1f}s")
+        self._speak("Signal lost. Ending the session.")
+        self._set_status(
+            f"Session ended — no EEG for {gap:.0f}s. The headband stopped "
+            "streaming, so there was nothing left to record.")
+        self.on_stop_session()
+        QMessageBox.warning(
+            self, "Session ended — no EEG",
+            f"No EEG arrived for {gap:.0f} seconds, so the session was stopped.\n\n"
+            "The headband reports 'connected' whenever a stream is open, even "
+            "when it has browned out or dropped out of range, so a session can "
+            "otherwise run to completion and record nothing.\n\n"
+            "Check the headband is switched on, charged, and seated, then start "
+            "again.")
 
     def _note_samples(self, stream_name, n_samples=0):
         """Called on every chunk; clears a stall and reports the gap."""
@@ -1122,6 +1523,7 @@ class MuseStudioWindow(QMainWindow):
     def _on_band_metrics(self, m):
         """Band powers -> bars, history and the EEG half of the laterality view."""
         self.device_status.set_contacts(m.contact_per_channel)
+        self._write_quality(m)
         self.band_bars.update_metrics(m)
         self.laterality.update_bands(m)
         times, series = self.bands.history()
@@ -1163,34 +1565,95 @@ class MuseStudioWindow(QMainWindow):
             self._sync_file.flush()
 
     def _on_reader_error(self, msg):
+        # Re-entrancy guard. This handler tears the reader down, and tearing it
+        # down can emit another error, which re-entered here — the crash log
+        # showed _on_reader_error twice in one stack, ending in
+        # QThread::~QThread() calling qFatal ("destroyed while still running")
+        # and SIGABRT. The second entry destroyed the thread the first was
+        # still unwinding.
+        if getattr(self, "_handling_reader_error", False):
+            self._log(f"Suppressed re-entrant stream error: {msg}")
+            return
+        self._handling_reader_error = True
+        try:
+            self._handle_reader_error(msg)
+        finally:
+            self._handling_reader_error = False
+
+    def _handle_reader_error(self, msg):
+        # Append whatever the OpenMuse subprocess actually said. Its output was
+        # captured and then discarded, so the operator saw only the app's guess
+        # ("is the streamer running?") while the streamer's real error — the one
+        # naming the actual problem — sat unread in a pipe.
+        tail = ""
+        if self.stream_proc is not None:
+            tail = self.stream_proc.tail(10)
+            code = self.stream_proc.exit_code()
+            if code is not None:
+                tail = f"(streamer exited, code {code})\n{tail}"
+            if code == -6:
+                # SIGABRT from CoreBluetooth. macOS grants Bluetooth access per
+                # application, and a process launched from a terminal that has
+                # not been granted it is killed the instant it touches the
+                # radio — before printing anything. The symptom is a streamer
+                # that dies silently, which is indistinguishable from a headband
+                # problem unless you know to look at the exit code.
+                msg = ("Bluetooth permission denied.\n\n"
+                       "The OpenMuse streamer was killed by macOS the moment it "
+                       "tried to use Bluetooth (SIGABRT).\n\n"
+                       "This is not a headband problem. macOS grants Bluetooth "
+                       "per application: launch MuseStudio from Terminal.app "
+                       "(or whichever terminal you granted Bluetooth access), "
+                       "not from an embedded/tool terminal.\n\n"
+                       "System Settings → Privacy & Security → Bluetooth lists "
+                       "the apps that have it.")
+                LOG.add("BLUETOOTH PERMISSION DENIED (streamer got SIGABRT)", "error")
+                self._set_status("Bluetooth permission denied — launch from Terminal.app.")
+                QMessageBox.critical(self, "Bluetooth permission denied", msg)
+                self.disconnect_stream()
+                return
         self._set_status("Stream error.")
         LOG.add(f"STREAM ERROR: {msg}", "error")
+        if tail:
+            LOG.add("OpenMuse streamer said:\n" + tail, "error")
+            msg = f"{msg}\n\n--- OpenMuse output ---\n{tail}"
         QMessageBox.critical(self, "Stream error", msg)
         self.disconnect_stream()
 
     def _on_disconnected(self):
+        self.plot.clear()
         # Emitted when the reader loop ends. Sessions may still run headband-free.
         pass
 
     def disconnect_stream(self):
         self._log("Disconnect")
+        # A scan starting during teardown was visible in the crash: a
+        # _ScanThread sat in find_devices while the reader was erroring.
+        self._auto_connecting = False
         if self._session_active:
             self._end_session(aborted=True)
         if self.recorder is not None:
             self._stop_recording()
-        if self.reader is not None:
-            self.reader.stop()
-            self.reader.wait(3000)
-            self.reader = None
+        reader, self.reader = self.reader, None
+        if reader is not None:
+            # Drop our reference FIRST, then shut down: a queued signal
+            # arriving mid-teardown must not find a half-dead reader.
+            reader.stop()
+            if not reader.wait(5000):
+                # Qt calls qFatal from ~QThread if the thread is still running
+                # when the object is destroyed, which aborts the whole process.
+                # Keeping a reference parks the object instead: leaking one
+                # thread is survivable, aborting the session is not.
+                self._log("Reader thread did not stop in 5s — parking it")
+                self._parked_threads = getattr(self, "_parked_threads", [])
+                self._parked_threads.append(reader)
+            else:
+                reader.deleteLater()
         self._eeg_stream = None
         if self.stream_proc is not None:
             self.stream_proc.stop()
             self.stream_proc = None
-        self.connect_btn.setText("Connect")
-        self.connect_btn.setEnabled(True)
-        self.device_combo.setEnabled(True)
-        self.scan_btn.setEnabled(True)
-        self.battery_label.setText("Battery: —")
+        self.device_status.set_connected(False)
         self.device_status.set_connected(False)
         self._set_status("Disconnected.")
 
@@ -1207,6 +1670,26 @@ class MuseStudioWindow(QMainWindow):
         mode = self.mode_combo.currentData()
         self._recording_enabled = record
         self._log(f"Start session (mode={mode}, record={record})")
+
+        if mode == "mindball":
+            if not self._begin_mindball(record):
+                return
+            self._begin_session_ui()
+            self._free_start = time.monotonic()
+            self.session_banner.show_free(recording=record, compact=True)
+            self.session_banner.set_elapsed(0)
+            self._free_timer.start()
+            return
+
+        if mode == "flight":
+            if not self._begin_flight(record):
+                return
+            self._begin_session_ui()
+            self._free_start = time.monotonic()
+            self.session_banner.show_free(recording=record, compact=True)
+            self.session_banner.set_elapsed(0)
+            self._free_timer.start()
+            return
 
         if mode == "sleep":
             if not self._begin_sleep(record):
@@ -1233,6 +1716,161 @@ class MuseStudioWindow(QMainWindow):
             if self.fullscreen_check.isChecked():
                 self._open_fullscreen()
             self.runner.start(PROTOCOLS[mode])
+
+    # -------------------------------------------------------- mindball mode
+    def _begin_mindball(self, record):
+        if not self._has_eeg():
+            QMessageBox.warning(
+                self, "No EEG",
+                "Mindball needs a live EEG stream — connect the Muse first.")
+            return False
+        if record:
+            self._start_recording()
+            if self.recorder is None:
+                return False
+        ghost = latest_ghost(self.output_dir)
+        if ghost is None:
+            self._log("No past Mindball match — using a practice partner")
+        else:
+            self._log(f"Mindball opponent: {ghost.label} "
+                      f"({ghost.duration():.0f}s recorded)")
+        fs = 256.0
+        if self.reader is not None and self._eeg_stream:
+            fs = self.reader.sample_rate(self._eeg_stream) or 256.0
+        self.mindball.set_channels(self._eeg_channels)
+        telemetry = self.session.analysis_dir if (record and self.session) else None
+        self.mindball.start(opponent=ghost, telemetry_dir=telemetry, fs=fs)
+        self.view_tabs.setCurrentWidget(self.mindball_view)
+        return True
+
+    def _end_mindball(self):
+        if self.mindball.is_running():
+            self.mindball.stop()
+            self._log("Mindball ended")
+
+    def _on_mindball_status(self, text):
+        self.mindball_view.set_status(text)
+        self._set_status(text)
+        self._speak(text)
+        # Deliberately NOT written to events.csv. Status is emitted at the
+        # render rate, and it flooded the file: session 205111's events.csv is
+        # 83 status rows out of 86. events.csv is what every downstream analysis
+        # aligns against, so it must carry events, not UI chatter. The text is
+        # still in the session log.
+        self._log(f"mindball: {text}")
+
+    def _on_mindball_finished(self, summary):
+        self._log(f"Mindball result: {summary}")
+        if self._event_writer is not None:
+            self._write_event("mindball", "result", json.dumps(summary))
+        if self._session_active:
+            self.on_stop_session()
+
+    # ---------------------------------------------------------- flight mode
+    def _begin_flight(self, record):
+        """Start a flight. Returns False to abort.
+
+        Requires a live EEG stream, and says so rather than starting: a flight
+        with no signal would sit on the ground while the pilot wondered what
+        they were doing wrong, which is the least useful failure available.
+        """
+        if not self._has_eeg():
+            QMessageBox.warning(
+                self, "No EEG",
+                "Flight Mode needs a live EEG stream — connect the Muse first.\n\n"
+                "The craft is flown on cortical alpha; without the headband there "
+                "is nothing to fly it with.")
+            return False
+        if record:
+            self._start_recording()
+            if self.recorder is None:
+                return False
+        self.flight.set_channels(self._eeg_channels)
+        telemetry = self.session.analysis_dir if (record and self.session) else None
+        from fnt.musestudio.flight.controller import FLIGHT_TEST
+        self.flight.start(telemetry_dir=telemetry, schedule=FLIGHT_TEST)
+        self.view_tabs.setCurrentWidget(self.flight_view)
+        self._log(f"Flight started (record={record})")
+        return True
+
+    def _end_flight(self):
+        if self.flight.is_running():
+            self.flight.stop()
+            self._log("Flight ended")
+        # Unconditional: stopping by any route (Stop button, Escape, EEG loss,
+        # schedule end) must leave silence behind.
+        self._silence_flight_audio()
+
+    def _on_flight_cue(self, label, speech):
+        """Speak the next instruction. The pilot's eyes are shut half the time,
+        so the cue has to be audible, not written."""
+        self._write_event("flight_cue", label, speech)
+        self.flight_view.set_status(speech)
+        self._set_status(speech)
+        self._speak(speech)
+
+    def _on_flight_finished(self):
+        # Order matters: silence, then end the session, then speak. The audio and
+        # the live view must stop the instant the test does — announcing first
+        # left the engine running and the craft on screen for the length of an
+        # utterance, which reads as "it did not actually stop".
+        self._silence_flight_audio()
+        self.flight_view.set_status("Flight test complete.")
+        if self._session_active:
+            self.on_stop_session()
+        self._speak("Flight test complete.")
+
+    def _silence_flight_audio(self):
+        try:
+            self.binaural.player.set_engine(0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        self.binaural.protocol_audio_off()
+
+    def _on_flight_tone(self, height01):
+        """Sonify altitude. Pitch rises with height; silent on the ground.
+
+        Two octaves from 220 Hz, mapped exponentially because pitch perception
+        is logarithmic — a linear frequency map would make the bottom half of
+        the climb almost inaudible as a change. Mono on purpose: this has to
+        work on laptop speakers, where left and right reach both ears anyway.
+        """
+        if not self.flight.is_running():
+            return
+        from fnt.musestudio.flight.sim import FlightPhase
+        phase = self.flight.craft.state.phase
+        player = self.binaural.player
+        # Silent on the ground. Altitude reaches 0 a little before the craft
+        # latches to LANDED (there is a grace period), and a tone still sounding
+        # at zero altitude reads as "something is happening" when nothing is.
+        if (phase in (FlightPhase.GROUNDED, FlightPhase.LANDED)
+                or self.flight.craft.state.altitude <= 0.5):
+            if player.is_playing():
+                player.set_engine(0.0)
+                self.binaural.protocol_audio_off()
+            return
+        freq = 220.0 * (2.0 ** (2.0 * float(height01)))
+        if not player.is_playing():
+            self.binaural.set_voicing("soft", 0.40)
+            player.set_mode("binaural")
+            player.set_volume(self.binaural._volume)
+            try:
+                player.play()
+            except Exception:  # noqa: BLE001
+                return
+            self.binaural.fade_in()
+        player.set_frequencies(freq, freq)
+        # Engine swells with effort, so working to climb sounds different from
+        # coasting down even when the two are at the same height.
+        thrust = max(0.0, float(self.flight.craft.state.thrust))
+        # Pitch an octave under the altitude tone so the engine rises and falls
+        # with the craft; level follows thrust so effort is audible separately.
+        player.set_engine(0.20 + 0.45 * thrust, freq=freq * 0.5)
+
+    def _on_flight_status(self, text):
+        self.flight_view.set_status(text)
+        self._set_status(text)
+        self._log(f"flight: {text}")   # log, not events.csv — see _on_mindball_status
 
     # ----------------------------------------------------------- sleep mode
     def _begin_sleep(self, record):
@@ -1312,22 +1950,57 @@ class MuseStudioWindow(QMainWindow):
 
     def _begin_session_ui(self):
         self._session_active = True
-        self.start_btn.setText("Stop")
-        self.record_btn.setEnabled(False)
+        # Recorded at start: a session begun WITHOUT a headband is a supported
+        # audio-only rehearsal and must never be auto-aborted. One begun WITH
+        # EEG has lost the thing it exists for if the stream dies.
+        self._session_needs_eeg = self._has_eeg()
+        # Swap the emphasis: while a session runs, stopping is the only action
+        # that matters, so it takes the accent and the full width and the other
+        # button gets out of the way. Previously "Stop" was the small secondary
+        # button beside a large accented "Start + Record", which read as
+        # inactive and was easy to miss entirely.
+        self.start_btn.setText("■  Stop session")
+        self.start_btn.setProperty("accent", "true")
+        self.start_btn.setStyleSheet(
+            f"background-color: #5b2020; border: 1px solid {theme.DANGER}; "
+            f"color: #ffd9d9; font-weight: 600;")
+        self.record_btn.hide()
         self.mode_combo.setEnabled(False)
-        self.connect_btn.setEnabled(False)
+        self.device_status.set_connect_enabled(False)
 
     def _open_fullscreen(self):
         """Hand the screen over to the subject-facing phase display."""
         if self.fullscreen_view is None:
             self.fullscreen_view = FullscreenSessionView()
-            self.fullscreen_view.exited.connect(self._close_fullscreen)
+            self.fullscreen_view.exited.connect(self._on_fullscreen_escape)
             self.fullscreen_view.continue_pressed.connect(self._on_continue)
         self.fullscreen_view.showFullScreen()
         self.fullscreen_view.raise_()
         self.fullscreen_view.activateWindow()
         self.fullscreen_view.setFocus()
         self._log("Full-screen session view opened")
+
+    def _on_fullscreen_escape(self):
+        """Escape ends the session, rather than just leaving full screen.
+
+        Previously it dropped back to the main window with the session still
+        running, which reads as "the program is still going in the background"
+        and is genuinely confusing. Escape is the universal get-me-out key, so
+        it now means what it looks like it means. A recording in progress asks
+        first, because an accidental keypress should not throw away a run.
+        """
+        if self._session_active and self.recorder is not None:
+            reply = QMessageBox.question(
+                self, "Stop the session?",
+                "A recording is in progress.\n\nStop the session and save what "
+                "has been captured so far?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self._open_fullscreen()      # they meant to stay
+                return
+        self._close_fullscreen()
+        if self._session_active:
+            self.on_stop_session()
 
     def _close_fullscreen(self):
         if self.fullscreen_view is not None:
@@ -1340,18 +2013,26 @@ class MuseStudioWindow(QMainWindow):
     def _end_session(self, aborted=False):
         self._free_timer.stop()
         self._end_sleep()
+        # Before _stop_recording, so the telemetry file is closed and flushed
+        # while the session directory is still open.
+        self._end_flight()
+        self._end_mindball()
         self._close_fullscreen()
         self.binaural.protocol_audio_off()
         if self.recorder is not None:   # protocol's Done phase may have stopped it already
             self._stop_recording()
         self._session_active = False
+        self._session_needs_eeg = False
         self._recording_enabled = False
         self._current_phase = None
         self._sync_hold_start = None
         self.start_btn.setText("Start")
+        self.start_btn.setProperty("accent", "false")
+        self.start_btn.setStyleSheet("")
+        self.record_btn.show()
         self.record_btn.setEnabled(True)
         self.mode_combo.setEnabled(True)
-        self.connect_btn.setEnabled(True)
+        self.device_status.set_connect_enabled(True)
         self.session_banner.hide()
         if aborted:
             self._set_status("Session stopped.")
@@ -1396,6 +2077,40 @@ class MuseStudioWindow(QMainWindow):
                     self._set_status("Recording failed to start — protocol aborted.")
                     self.runner.abort()
                     return False
+        elif action == "audio_check":
+            # Runs in the Set-up phase, BEFORE recording and before the subject
+            # closes their eyes. Two jobs: say out loud which device the Mac is
+            # about to play through, and give the subject a deliberately QUIET
+            # reference tone to set their system volume against.
+            #
+            # The tone is fixed at a low level on purpose. The safe direction to
+            # get the level wrong is too soft -- the subject raises the system
+            # volume until it is comfortable, and the app never chooses a
+            # loudness on behalf of somebody wearing in-ear buds. Detection is a
+            # prompt, never an interlock: macOS cannot tell us the output volume,
+            # and no API knows what is actually in someone's ears.
+            out, msg = audio_advice()
+            self._audio_output = out
+            # Hardware decides what this session can collect. Re-detected here
+            # rather than at start-up, because the subject may only plug their
+            # earbuds in once they are sitting down.
+            self._audio_cap = audio_capability(out)
+            self.runner.set_capabilities(self._audio_cap.tokens())
+            for note in self._audio_cap.notes:
+                self._log(f"Audio: {note}")
+            self._log(f"Audio output: {out.name!r} transport={out.transport!r} "
+                      f"kind={out.kind}")
+            self._set_status(msg)
+            if out.kind == "speakers":
+                self._log("WARNING: default output is not headphones.")
+            self._sound(lambda: play_cue(freq=660.0, dur=0.5, volume=AUDIO_CHECK_VOLUME))
+        elif action == "lateral_cues":
+            # Alternating L/R tones across the phase. Fire-and-forget: the cue
+            # sequence is scheduled once and runs on the audio device's own
+            # clock, so it costs the GUI thread nothing during the block.
+            sides = ["L", "R"] * 10
+            self._sound(lambda: play_lateral_sequence(sides))
+            self._write_event("marker", "lateral_cues", "".join(sides))
         elif action == "calibrate":
             # Only meaningful with a live EEG signal.
             if self._has_eeg():
@@ -1428,6 +2143,30 @@ class MuseStudioWindow(QMainWindow):
             if self.recorder is not None:
                 self._stop_recording()
         return True
+
+    def _on_mode_changed(self, _index=None):
+        """Keep the blurb in step, and never rest on a heading row."""
+        key = self.mode_combo.currentData()
+        if key is not None:
+            self._settings.setValue("last_session", key)
+        if key is None:                     # a disabled heading or separator
+            for i in range(self.mode_combo.currentIndex() + 1,
+                           self.mode_combo.count()):
+                if self.mode_combo.itemData(i) is not None:
+                    self.mode_combo.setCurrentIndex(i)
+                    return
+            return
+        self.mode_blurb.setText(self._mode_blurbs.get(key, ""))
+
+    def _on_phase_skipped(self, phase, missing):
+        """A phase the current hardware cannot support was skipped.
+
+        Written to events.csv as well as the log, so a later analysis can tell
+        an omitted block from a failed one — the two look identical if all you
+        have is a gap in the timeline.
+        """
+        self._log(f"Phase skipped: {phase.name} (needs {missing})")
+        self._write_event("phase_skipped", phase.name, missing)
 
     def _on_runner_tick(self, remaining, duration):
         self.session_banner.set_countdown(remaining)
@@ -1467,6 +2206,7 @@ class MuseStudioWindow(QMainWindow):
         # Route each artifact to its Data subfolder by provenance.
         self._open_audio_log(self.session.audio_dir)       # stimulus log
         self._open_sync_log(self.session.analysis_dir)     # derived PLV
+        self._open_quality_log(self.session.analysis_dir)  # per-electrode quality
         self._open_event_log(self.session.events_dir)      # protocol timeline
         cam_note = ""
         if self.webcam is not None:
@@ -1491,6 +2231,7 @@ class MuseStudioWindow(QMainWindow):
         self._close_event_log()
         self._close_audio_log()
         self._close_sync_log()
+        self._close_quality_log()
         frames = self.webcam.stop_recording() if self.webcam is not None else 0
         if self.reader is not None:
             self.reader.stop_recording()
@@ -1560,6 +2301,23 @@ class MuseStudioWindow(QMainWindow):
         return {
             "app": "FieldNeuroToolbox / MuseStudio",
             "subject": self._subject_block(),
+            # Reproducibility. The installed-package version is stamped at
+            # install time and read 0.1.7 in every recording while pyproject was
+            # already at 0.1.10 — useless for telling which control law produced
+            # a telemetry file. The git SHA is the only thing that actually
+            # identifies the code.
+            "git_sha": _git_sha(),
+            # Anchor the LSL clock to wall time. Every data file is on the LSL
+            # monotonic clock, which aligns the streams to each other perfectly
+            # but to nothing outside this process — a stimulus PC, a second
+            # recorder, or a camera cannot be aligned without this pair.
+            "clock_anchor": {"lsl": round(_lsl_now(), 6),
+                             "utc": datetime.now(timezone.utc).isoformat()},
+            # Recorded so sessions are never silently pooled across different
+            # audio hardware — a speakers session has strictly fewer feedback
+            # dimensions than a headphones one and is not the same experiment.
+            "audio": (self._audio_cap.as_dict()
+                      if getattr(self, "_audio_cap", None) else None),
             "version": app_version,
             "created": datetime.now().isoformat(timespec="milliseconds"),
             "mode": self.mode_combo.currentData(),
@@ -1782,6 +2540,60 @@ class MuseStudioWindow(QMainWindow):
             return
         self._event_writer.writerow([f"{_lsl_now():.6f}", kind, label, str(detail)])
         self._event_file.flush()
+
+    def _write_quality(self, m):
+        """Per-electrode signal quality, once per band update, on the LSL clock.
+
+        This is the column that was missing from every recording ever made.
+        Contact quality reached the status dots and nothing else: the only path
+        to disk was synchrony.csv's contact_ok, and that writer sits behind a
+        gate that fires for exactly one protocol phase in the whole app, so the
+        file is header-only in all 13 sessions on disk.
+
+        The consequence was that "was TP10 good during minute 12?" — the single
+        most common question about a Muse recording, given that ear electrodes
+        are the documented failure mode — could not be answered after the fact
+        from any file. Now it can.
+        """
+        if self._quality_writer is None:
+            return
+        try:
+            row = [f"{_lsl_now():.6f}"]
+            for ch in EEG_ELECTRODES:
+                ok = None
+                for name, val in (m.contact_per_channel or {}).items():
+                    if ch in str(name).upper():
+                        ok = val
+                        break
+                rel = (m.relative or {}).get(ch) or {}
+                row += ["" if ok is None else int(bool(ok)),
+                        round(float(rel.get("alpha", 0.0)), 5)]
+            self._quality_writer.writerow(row)
+            self._quality_file.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _open_quality_log(self, session_dir):
+        try:
+            self._quality_file = open(
+                os.path.join(session_dir, "signal_quality.csv"), "w", newline="")
+            self._quality_writer = csv.writer(self._quality_file)
+            head = ["lsl_timestamp"]
+            for ch in EEG_ELECTRODES:
+                head += [f"{ch}_ok", f"{ch}_alpha_rel"]
+            self._quality_writer.writerow(head)
+        except Exception:  # noqa: BLE001
+            self._quality_file = None
+            self._quality_writer = None
+
+    def _close_quality_log(self):
+        if getattr(self, "_quality_file", None) is not None:
+            try:
+                self._quality_file.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._quality_file = None
+        self._quality_writer = None
 
     def _open_sync_log(self, session_dir):
         self._sync_file = open(

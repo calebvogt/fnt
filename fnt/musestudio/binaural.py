@@ -51,6 +51,33 @@ def _play_sequence(notes, volume=0.25):
         pass
 
 
+def play_lateral_sequence(sides, freq=520.0, dur=0.6, gap=0.4, volume=0.18):
+    """Play short tones alternating between the ears.
+
+    ``sides`` is a list of "L"/"R". Only meaningful over headphones -- through
+    speakers both ears hear both channels and the whole point is lost, which is
+    why the phase that uses this is gated on the ``stereo_audio`` capability
+    rather than simply sounding worse without it.
+    """
+    try:
+        import sounddevice as sd
+
+        chunks = []
+        for side in sides:
+            t = np.arange(int(dur * SAMPLE_RATE)) / SAMPLE_RATE
+            env = np.clip(np.minimum(t / 0.02, (dur - t) / 0.05), 0, 1)
+            tone = (np.sin(2 * np.pi * freq * t) * volume * env).astype(np.float32)
+            silence = np.zeros_like(tone)
+            stereo = (np.column_stack([tone, silence]) if side.upper() == "L"
+                      else np.column_stack([silence, tone]))
+            chunks.append(stereo)
+            if gap > 0:
+                chunks.append(np.zeros((int(gap * SAMPLE_RATE), 2), dtype=np.float32))
+        sd.play(np.concatenate(chunks).astype(np.float32), SAMPLE_RATE)
+    except Exception:
+        pass
+
+
 # Three deliberately distinct cues, because with your eyes closed the sound is
 # the only channel — a slipped electrode must never be mistaken for "you are
 # not synchronizing well".
@@ -133,6 +160,15 @@ class BinauralPlayer:
         self._phase_aml = 0.0           # AM envelope phases
         self._phase_amr = 0.0
         self._phase_rough = 0.0
+        # Engine layer state (see _callback).
+        self.engine_level = 0.0
+        self.engine_freq = 110.0
+        self._engine_gain = 0.0
+        self._phase_e1 = 0.0
+        self._phase_e2 = 0.0
+        self._phase_e3 = 0.0
+        self._phase_e4 = 0.0
+        self._phase_vib = 0.0
         self._phase_reward = 0.0
         self._noise_zi = np.zeros(1)   # one-pole lowpass state (brown-ish noise)
         self._stream = None
@@ -209,6 +245,43 @@ class BinauralPlayer:
         g_master = self._ramp(self._gain, self._t_gain, n)
         self._gain = self._t_gain
 
+        # --- engine layer -------------------------------------------------
+        # A low filtered-noise rumble mixed under the pitched altitude tone, so
+        # the craft sounds like a machine rather than a test oscillator. Level
+        # follows thrust: it swells as the craft works to climb and falls away
+        # when it is coasting down, which makes effort audible independently of
+        # the pitch that encodes height.
+        eng = 0.0
+        if self.engine_level > 0.0 or self._engine_gain > 0.0:
+            # Two oscillators a few cents apart, plus an octave and a fifth,
+            # all under a slow vibrato. The detuning makes them drift in and
+            # out of phase, which is what gives the sound its shimmer and reads
+            # as "electric" rather than mechanical.
+            #
+            # The first attempt was filtered white noise, which just sounded
+            # like noise -- broadband hiss carries no pitch, so it could not
+            # rise and fall with the craft and had nothing to distinguish it
+            # from a bad connection.
+            f = max(40.0, float(self.engine_freq))
+            vib = 1.0 + 0.006 * np.sin(self._phase_vib + (2 * np.pi * 5.2 / SAMPLE_RATE) * idx)
+            self._phase_vib = (self._phase_vib
+                               + (2 * np.pi * 5.2 / SAMPLE_RATE) * n) % (2 * np.pi)
+            w1 = 2 * np.pi * f / SAMPLE_RATE
+            w2 = 2 * np.pi * (f * 1.008) / SAMPLE_RATE      # ~14 cents sharp
+            w3 = 2 * np.pi * (f * 2.0) / SAMPLE_RATE
+            w4 = 2 * np.pi * (f * 3.0) / SAMPLE_RATE
+            a = np.sin(self._phase_e1 + w1 * idx * vib)
+            b = np.sin(self._phase_e2 + w2 * idx * vib)
+            c = np.sin(self._phase_e3 + w3 * idx) * 0.30
+            dd = np.sin(self._phase_e4 + w4 * idx) * 0.12
+            self._phase_e1 = (self._phase_e1 + w1 * n) % (2 * np.pi)
+            self._phase_e2 = (self._phase_e2 + w2 * n) % (2 * np.pi)
+            self._phase_e3 = (self._phase_e3 + w3 * n) % (2 * np.pi)
+            self._phase_e4 = (self._phase_e4 + w4 * n) % (2 * np.pi)
+            g_eng = self._ramp(self._engine_gain, self.engine_level, n)
+            self._engine_gain = self.engine_level
+            eng = (a + b + c + dd) * g_eng * 0.16
+
         # Only synthesize a feedback layer when it is actually audible now or
         # about to be. A plain tone (control block, open loop) previously still
         # cost three extra oscillators plus a filtered noise generator on every
@@ -239,8 +312,16 @@ class BinauralPlayer:
             shared = 0.0
         left = np.clip((core_l + shared) * g_master, -1.0, 1.0)
         right = np.clip((core_r + shared) * g_master, -1.0, 1.0)
+        left = np.clip(left + eng, -1.0, 1.0)
+        right = np.clip(right + eng, -1.0, 1.0)
         outdata[:, 0] = left.astype(np.float32)
         outdata[:, 1] = right.astype(np.float32)
+
+    def set_engine(self, level, freq=None):
+        """Engine level 0..1 and optional pitch. Ramped, so no clicks."""
+        self.engine_level = float(np.clip(level, 0.0, 1.0))
+        if freq:
+            self.engine_freq = float(max(40.0, freq))
 
     def set_frequencies(self, left_freq, right_freq):
         self.left_freq = float(left_freq)

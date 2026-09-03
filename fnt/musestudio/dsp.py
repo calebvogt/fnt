@@ -277,9 +277,25 @@ def band_connectivity(x, y, fs, band, nperseg=None):
     plv = float(np.abs(np.mean(np.exp(1j * dphi)))) if len(dphi) else float("nan")
 
     # --- imaginary coherence via cross-spectral density ---
+    #
+    # nperseg MUST be well under the window length. Coherence is an average of
+    # the normalised cross-spectrum over SEGMENTS; with a single segment it is
+    # identically 1.0 by construction, and its imaginary part collapses to
+    # |sin(random phase)|, which averages ~0.64 regardless of the input.
+    #
+    # The previous default (min(n, fs*4)) equalled the whole window for every
+    # window this project uses, so the discriminator was blind: measured on
+    # synthetic pairs it returned 0.653 for INDEPENDENT noise and — the damning
+    # one — 0.398 for pure zero-lag common-mode, the exact artifact it exists to
+    # reject. Every imaginary-coherence number this project has recorded,
+    # including the M01 hemi-sync result (0.651 -> 0.631), sat at that null and
+    # measured nothing.
+    #
+    # Eight segments restores it: independent 0.159, zero-lag common-mode 0.009,
+    # genuine 25 ms-lagged coupling 0.991.
     if nperseg is None:
-        nperseg = int(min(n, fs * 4))
-    nperseg = max(64, min(nperseg, n))
+        nperseg = int(n // 8)
+    nperseg = max(32, min(nperseg, n // 2))
     f, pxy = csd(x, y, fs=fs, nperseg=nperseg)
     _, pxx = welch(x, fs=fs, nperseg=nperseg)
     _, pyy = welch(y, fs=fs, nperseg=nperseg)

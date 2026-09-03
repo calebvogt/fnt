@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "<stdin>", line 7, in <module>
+  File "/Users/caleb/Documents/GitHub/fnt/fnt/musestudio/musestudio_pyqt.py", line 40, in <module>
+    from fnt.musestudio.device_status import DeviceStatusBar
+  File "/Users/caleb/Documents/GitHub/fnt/fnt/musestudio/device_status.py", line 245
+    elif expected and samples_per_sec < expected * 0.6:
+    ^^^^
+SyntaxError: invalid syntax

@@ -826,31 +826,6 @@ class FNTMainWindow(QMainWindow):
         group.setLayout(group_layout)
         layout.addWidget(group)
 
-        info_group = QGroupBox("About MuseStudio")
-        info_layout = QVBoxLayout()
-        info_label = QLabel(
-            "<b>MuseStudio</b> connects directly to a Muse S Athena headband over "
-            "Bluetooth LE (no phone or dongle on a modern Mac) using "
-            "<a href='https://github.com/DominiqueMakowski/OpenMuse'>OpenMuse</a>.<br><br>"
-            "• Live scrolling plots of EEG (256 Hz) and optics/fNIRS (64 Hz)<br>"
-            "• Live numeric channel table and battery percentage readout<br>"
-            "• Optional webcam preview + recording, timestamp-synced to the Muse data<br>"
-            "• Binaural-beat generator (base 20–1500 Hz, beat 1–50 Hz) with savable presets<br>"
-            "• Closed-loop biofeedback: interhemispheric synchrony (PLV) drives tone purity, "
-            "with a head-map + synchrony meter<br>"
-            "• Guided sessions: free record, or a one-click timed protocol (10-min binaural trial) "
-            "with on-screen instructions<br>"
-            "• Records each stream to CSV in a timestamped session folder<br><br>"
-            "<b>Note:</b> OpenMuse's decoding — especially fNIRS — is reverse-engineered "
-            "and experimental, and is not affiliated with InteraXon."
-        )
-        info_label.setWordWrap(True)
-        info_label.setOpenExternalLinks(True)
-        info_label.setStyleSheet("color: #cccccc; padding: 10px;")
-        info_layout.addWidget(info_label)
-        info_group.setLayout(info_layout)
-        layout.addWidget(info_group)
-
         layout.addStretch()
 
     def run_musestudio(self):
