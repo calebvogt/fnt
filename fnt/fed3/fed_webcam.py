@@ -128,6 +128,10 @@ class WebcamRecorder(QThread):
         self._running = True
         cap = cv2.VideoCapture(self.camera_index)
         if not cap.isOpened():
+            # Released explicitly: returning here skips the finally block below,
+            # which is what left the device handle open on a failed open.
+            cap.release()
+            self._running = False
             self.error.emit(f"Could not open camera {self.camera_index}.")
             return
         try:

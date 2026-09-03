@@ -34,9 +34,10 @@ BAUD = 115200
 SETTLE_SECONDS = 2.0
 
 # A link that has heard nothing at all for this long is treated as wedged and
-# recycled. Devices are otherwise silent between pokes, so this is only a
-# backstop against a half-open port that never errors.
-SILENCE_TIMEOUT = 0.0   # 0 disables; see Fed3Link(silence_timeout=...)
+# recycled. Devices are silent between pokes, so this cannot stand alone as a
+# liveness check — the tab pairs it with a PING heartbeat, which is what makes
+# silence meaningful. Sized to comfortably outlast the heartbeat's own retry.
+SILENCE_TIMEOUT = 90.0   # seconds; 0 disables
 
 
 class _PortRegistry:
@@ -117,6 +118,12 @@ class Fed3Link(QThread):
 
     def is_live(self):
         return self._running and self.isRunning()
+
+    def seconds_since_rx(self):
+        """Seconds since any byte arrived. Large before the first read."""
+        if not self._last_rx:
+            return 0.0
+        return time.monotonic() - self._last_rx
 
     # --- owning thread ----------------------------------------------------
 
@@ -306,7 +313,11 @@ def _probe_port(port_info):
 
         if "PONG_FED3" in response:
             device_id, firmware = proto.parse_pong(response)
-            return device, "FED3 Active", device_id, firmware
+            # Distinguished here so the tab can refuse the device before an
+            # experiment is started on it, rather than after a transfer fails.
+            status = ("FED3 Active" if proto.is_supported(firmware)
+                      else "FED3 (firmware too old)")
+            return device, status, device_id, firmware
     except Exception as exc:  # noqa: BLE001
         text = str(exc).lower()
         if any(k in text for k in ("busy", "already open", "permission denied", "access is denied")):

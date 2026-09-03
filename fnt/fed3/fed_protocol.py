@@ -19,8 +19,8 @@ Host -> device
 
 Device -> host
 --------------
-``PONG_FED3,ID:<n>,FW:<v>``
-``STATUS,FW:..,ID:..,TIME:..,MODE:..,SESSION:..,FR:..,L:..,R:..,P:..,FILE:..``
+``PONG_FED3,ID:<n>[,FW:<v>]``
+``STATUS,ID:..,FW:..,TIME:..,MODE:..,SESSION:..,FR:..,L:..,R:..,P:..,FILE:..``
 ``EVT,<iso>,<LEFT|RIGHT|PELLET>,<left>,<right>,<pellet>,<millis>``
 ``SYNCED,<iso>``
 ``FILE:<name>,<bytes>`` ... ``END_LIST``
@@ -28,14 +28,62 @@ Device -> host
 ``FILE_DATA_START:<name>,<offset>,<size>`` then raw bytes, ``0x04``, ``CRC32:<hex>``
 ``ERROR:<code>[:<detail>]``
 
-Firmware older than 2.0 emits prose event lines ("Left Poke, Total: 12") and a
-``FILE_DATA_START:<name>`` header with no range. Both are still parsed so a
-device that has not been reflashed keeps working, with reduced fidelity.
+Firmware requirement
+--------------------
+Firmware at :data:`MIN_FIRMWARE` or newer answers ``PING`` with a ``FW:`` field.
+A board that does not is refused outright rather than driven in a reduced mode.
+
+That is a deliberate choice. Older firmware parses ``GET_FILE:`` by taking
+everything after the colon as the filename, so the documented
+``GET_FILE:<name>,<offset>`` asks it for a file literally named ``"<name>,0"``
+and gets ``ERROR:FILE_NOT_FOUND`` — every download and every mirror pull fails.
+Supporting that alongside the current protocol would mean two parsers, two
+transfer modes and two event formats, and it is precisely those extra paths
+where silent data loss has hidden before. :func:`is_supported` gates a clear
+error instead.
 """
 
 from datetime import datetime
 
 EOT = "\x04"
+
+# Firmware from this version on supports ranged GET_FILE, STATUS, FSIZE and
+# structured EVT lines, and announces itself in the PING response. Anything
+# older is refused; see the module docstring.
+MIN_FIRMWARE = (2, 0)
+
+
+def parse_version(firmware):
+    """``"2.1"`` -> ``(2, 1)``. None for anything unparseable.
+
+    Short versions are zero-padded to the length of :data:`MIN_FIRMWARE`.
+    Without that, ``"2"`` parsed to ``(2,)``, and a shorter tuple sorts *below*
+    a longer one with the same prefix — so a device announcing ``FW:2`` was
+    refused as too old while ``FW:3`` was accepted.
+    """
+    if not firmware:
+        return None
+    parts = []
+    for chunk in str(firmware).strip().split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    if not parts:
+        return None
+    parts += [0] * (len(MIN_FIRMWARE) - len(parts))
+    return tuple(parts)
+
+
+def is_supported(firmware):
+    """Whether FNT can drive a device running this firmware at all."""
+    version = parse_version(firmware)
+    return version is not None and version >= MIN_FIRMWARE
+
+
+def firmware_requirement():
+    """Human-readable statement of what a device must be running."""
+    return ".".join(str(part) for part in MIN_FIRMWARE)
 
 # --- commands -------------------------------------------------------------
 
@@ -47,6 +95,14 @@ CMD_NEW_TRIAL = "NEW_TRIAL"
 CMD_FEED = "FEED"
 CMD_LIGHTS_ON = "LIGHTS:ON"
 CMD_LIGHTS_OFF = "LIGHTS:OFF"
+
+# Reply prefix naming the SD log a device rolled onto after NEW_TRIAL.
+REPLY_NEW_TRIAL = "NEW_TRIAL_STARTED:"
+
+# Progress during a dispense, one line per attempt: ``FEEDING:<turn>/<max>``.
+# A jammed hopper can take minutes of motor work before the device gives up, and
+# without this the host cannot tell that from a device that has stopped talking.
+REPLY_FEEDING = "FEEDING:"
 
 
 def cmd_sync(when=None):
@@ -111,13 +167,20 @@ EVENT_LEFT = "LEFT"
 EVENT_RIGHT = "RIGHT"
 EVENT_PELLET = "PELLET"
 
+# Not a behaviour: the device could not deliver a pellet and gave up. It travels
+# as an event so that it is timestamped by the device, queued rather than spliced
+# during a transfer, and lands in events.csv beside the pokes it interrupts.
+EVENT_JAM = "JAM"
+
+EVENT_KINDS = (EVENT_LEFT, EVENT_RIGHT, EVENT_PELLET, EVENT_JAM)
+
 
 class DeviceEvent:
     """One behavioural event reported by the device.
 
     ``counts`` are absolute running totals, not deltas, so a host that dropped a
     line (or reconnected mid-session) resynchronizes on the next event.
-    ``device_time`` is the device RTC; None on legacy firmware.
+    ``device_time`` is the device RTC.
     """
 
     __slots__ = ("kind", "device_time", "counts", "device_millis")
@@ -138,7 +201,7 @@ def parse_event(line):
         if len(parts) < 6:
             return None
         kind = parts[2].strip().upper()
-        if kind not in (EVENT_LEFT, EVENT_RIGHT, EVENT_PELLET):
+        if kind not in EVENT_KINDS:
             return None
         try:
             counts = {
@@ -156,27 +219,7 @@ def parse_event(line):
                 pass
         return DeviceEvent(kind, _parse_iso(parts[1]), counts, millis)
 
-    return _parse_legacy_event(stripped)
-
-
-def _parse_legacy_event(stripped):
-    """Pre-2.0 prose form: ``Left Poke, Total: 12``."""
-    upper = stripped.upper()
-    if "TOTAL:" not in upper:
-        return None
-    if upper.startswith("LEFT POKE"):
-        kind, key = EVENT_LEFT, "left"
-    elif upper.startswith("RIGHT POKE"):
-        kind, key = EVENT_RIGHT, "right"
-    elif upper.startswith("PELLET"):
-        kind, key = EVENT_PELLET, "pellet"
-    else:
-        return None
-    try:
-        total = int(upper.split("TOTAL:")[1].strip().split()[0])
-    except (IndexError, ValueError):
-        return None
-    return DeviceEvent(kind, None, {key: total})
+    return None
 
 
 def parse_pong(text):
@@ -191,6 +234,18 @@ def parse_pong(text):
     if "FW:" in text:
         firmware = text.split("FW:", 1)[1].strip().split(",")[0].split()[0] or None
     return device_id, firmware
+
+
+def parse_feeding(line):
+    """``FEEDING:<turn>/<max>`` -> ``(turn, max)``, or None."""
+    stripped = line.strip()
+    if not stripped.startswith(REPLY_FEEDING):
+        return None
+    turn, _, total = stripped[len(REPLY_FEEDING):].partition("/")
+    try:
+        return int(turn), int(total)
+    except ValueError:
+        return None
 
 
 def parse_status(line):
@@ -231,24 +286,17 @@ def parse_file_size(line):
 
 
 def parse_data_start(line):
-    """``FILE_DATA_START:<name>[,<offset>,<size>]`` -> ``(name, offset, size)``.
-
-    Legacy firmware omits the range; offset 0 and an unknown size are assumed.
-    """
+    """``FILE_DATA_START:<name>,<offset>,<size>`` -> ``(name, offset, size)``."""
     stripped = line.strip()
     if not stripped.startswith("FILE_DATA_START:"):
         return None
     parts = stripped[len("FILE_DATA_START:"):].split(",")
-    name = parts[0].strip()
-    offset, size = 0, None
+    if len(parts) < 3:
+        return None
     try:
-        if len(parts) > 1:
-            offset = int(parts[1])
-        if len(parts) > 2:
-            size = int(parts[2])
+        return parts[0].strip(), int(parts[1]), int(parts[2])
     except ValueError:
-        pass
-    return name, offset, size
+        return None
 
 
 def parse_crc(line):
@@ -264,6 +312,35 @@ def parse_crc(line):
 
 def is_error(line):
     return line.strip().startswith("ERROR:")
+
+
+# Asynchronous device chatter: lines the device can emit at any moment, which are
+# never part of a transfer's own protocol. Firmware 2.0's file streamer runs in
+# loop() alongside event reporting, so a nosepoke during a download lands in the
+# middle of the payload; without this list the line would be written into the
+# mirrored CSV (failing the CRC) *and* lost as an event.
+#
+# None of these prefixes can begin a FED3 CSV row — those start with the header
+# word ``MM:DD:YYYY`` or a ``MM:DD:YYYY hh:mm:ss`` stamp — so matching them
+# cannot swallow file content.
+_OUT_OF_BAND_PREFIXES = (
+    "EVT,",
+    "STATUS,",
+    "SYNCED,",
+    "PONG_FED3",
+    REPLY_NEW_TRIAL,
+    REPLY_FEEDING,
+    "ABORT_OK",
+    "Mode set to",
+    "Pellet dispensed manually.",
+    "Lights turned",
+)
+
+
+def is_out_of_band(line):
+    """Whether a line is asynchronous chatter rather than transfer payload."""
+    stripped = line.strip()
+    return any(stripped.startswith(prefix) for prefix in _OUT_OF_BAND_PREFIXES)
 
 
 def _parse_iso(text):

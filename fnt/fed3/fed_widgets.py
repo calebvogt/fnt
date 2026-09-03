@@ -1,9 +1,8 @@
 """FED3 monitoring and control tab.
 
 Ties together the serial links (:mod:`fed_serial`), the SD-card mirror
-(:mod:`fed_mirror`), the recording session (:mod:`fed_session`), the webcam
-(:mod:`fed_webcam`), the scheduler (:mod:`fed_scheduler`) and the plot
-(:mod:`fed_plot`).
+(:mod:`fed_mirror`), the recording session (:mod:`fed_session`), the scheduler
+(:mod:`fed_scheduler`) and the plot (:mod:`fed_plot`).
 
 Design notes for the parts that changed most:
 
@@ -11,9 +10,8 @@ Design notes for the parts that changed most:
 for the lifetime of its port. Commands are queued onto that link rather than
 opening the port again, which is what previously produced port-busy lockouts.
 
-*Recording.* Behavioural events, camera frames and every user action share one
-host time base, so a pellet and a video frame can be compared without alignment.
-Session state is persisted continuously, so a crash is resumable.
+*Recording.* Behavioural events and every user action share one
+host time base. Session state is persisted continuously, so a crash is resumable.
 
 *Plot refresh.* Events mark the plot dirty; a 1 Hz timer redraws. Redrawing per
 event made a busy rig unresponsive during pellet bursts.
@@ -25,8 +23,8 @@ import subprocess
 import sys
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QTime, QTimer, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QFont, QPixmap
+from PyQt5.QtCore import QEventLoop, Qt, QTime, QTimer, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressDialog,
@@ -48,21 +46,98 @@ from .fed_mirror import DeviceMirror
 from .fed_plot import WINDOWS, FedPlotManager, PlotSeries
 from .fed_serial import Fed3Link, PortScannerWorker
 from .fed_ui import (
-    CollapsibleLogBox, FEDSvgView, FileSelectorDialog, FlowLayout,
-    ResumeSessionDialog,
+    CollapsibleLogBox, CollapsibleSection, FEDSvgView, FileSelectorDialog,
+    FlowLayout, ResumeSessionDialog,
 )
-from .fed_webcam import WebcamRecorder, list_cameras
 
-UI_TICK_MS = 1000               # scheduler countdowns and plot refresh
+UI_TICK_MS = 1000               # scheduler countdowns
 RECONNECT_TICK_MS = 5000        # auto-reconnect sweep
 STATE_SAVE_MS = 15000           # session state persistence
-NARROW_WIDTH = 1120             # below this the panels stack into one column
+PLOT_TICK_MS = 5000             # activity plot refresh
+HEARTBEAT_TICK_MS = 10000       # device liveness probe
+
+# Three weights, assigned by consequence rather than by how often a control is
+# used. The application stylesheet paints every QPushButton the same primary
+# blue, which left "Open Folder" and "Dispense All" indistinguishable; a
+# property selector is more specific than the bare QPushButton rule, so these
+# win without the window stylesheet having to change.
+#
+#   primary  the one control that starts or stops the experiment
+#   (default) something real happens: hardware moves, data is written
+#   quiet    housekeeping and navigation, including anything destructive that
+#            should never be the brightest thing on a card
+#
+# Every rule restates padding, and none of them pins a font size. Qt sizes a
+# styled button from the most specific rule that matches it, so a rule that set
+# only a colour produced a box computed without the window sheet's padding while
+# that sheet went on painting the label — which clipped "Start Recording" to
+# "tart Recordin". Leaving the size unpinned lets the box be measured with the
+# widget's own font and painted with the (never larger) sheet font, so the error
+# is always slack rather than a clipped label, on whatever the host UI font is.
+BUTTON_QSS = """
+QPushButton[weight="quiet"] {
+    background-color: transparent; color: #b8c0c4;
+    border: 1px solid #4a4a4a; font-weight: normal;
+    padding: 6px 14px; border-radius: 4px;
+}
+QPushButton[weight="quiet"]:hover {
+    background-color: #3a3a3a; color: #ffffff;
+}
+/* Disabled is a colour change only. Given its own rule, Qt measured the box
+   without the padding declared above and clipped the label. */
+QPushButton[weight="quiet"]:disabled { color: #6a6a6a; }
+QPushButton[weight="normal"] {
+    background-color: #46525c; color: #ffffff; font-weight: normal;
+    border: none; padding: 6px 14px; border-radius: 4px;
+}
+QPushButton[weight="normal"]:hover { background-color: #55636e; }
+QPushButton[weight="normal"]:disabled { background-color: #3a4249; color: #7d868c; }
+"""
+
+
+def _fit(button, *alternates):
+    """Guarantee a button's box fits its label, whatever font the host resolves.
+
+    Qt measures a styled QPushButton from whichever stylesheet rule is most
+    specific, and the window sheet pins a point size the widget font does not
+    share. The computed box therefore came out narrower than the painted label
+    and clipped it — "Start Recording" rendered as "tart Recordin" — and which
+    buttons were affected shifted with every rule added, because each one
+    changed the rule Qt measured from. Measuring here uses the font the label is
+    actually drawn with, so the error can only ever be slack.
+
+    ``alternates`` are the other captions a button will take on later; a toggle
+    must not shrink-wrap the caption it happens to start with.
+    """
+    metrics = button.fontMetrics()
+    widest = max(metrics.boundingRect(text).width()
+                 for text in (button.text(),) + alternates)
+    button.setMinimumWidth(widest + 34)
+    return button
+
+
+def _weigh(button, weight, *alternates):
+    """Tag a button so :data:`BUTTON_QSS` can style it, and return it."""
+    button.setProperty("weight", weight)
+    return _fit(button, *alternates)
 
 # Reconnect backoff: give up automatic retries after this many consecutive
 # failures so a permanently unplugged device stops churning the port list.
 MAX_RECONNECT_ATTEMPTS = 20
 
-PORT_PLACEHOLDERS = ("Scanning...", "No FED3 found", "")
+# Liveness. A FED3 is silent between pokes, so silence alone proves nothing;
+# after this long without a byte the tab sends PING, which every firmware answers.
+# A device that does not answer within the grace period has wedged its USB stack
+# and the link is recycled rather than left looking connected forever.
+HEARTBEAT_IDLE_S = 30
+HEARTBEAT_GRACE_S = 20
+
+# How long to wait for a final SD pull when a recording stops.
+FINAL_PULL_TIMEOUT_MS = 30000
+
+# Grace period between telling devices to start a new trial and the session's
+# first mirror pull, so the pull is scoped to the log they just rolled onto.
+NEW_TRIAL_SETTLE_MS = 2500
 
 
 class FEDTabWidget(QWidget):
@@ -73,14 +148,17 @@ class FEDTabWidget(QWidget):
     def __init__(self, parent=None, worker_class=None):
         super().__init__(parent)
         self.main_window = parent
-        self._worker_class = worker_class    # retained for API compatibility
+        # worker_class is accepted and ignored: this tab owns QThreads directly
+        # (Fed3Link, PortScannerWorker) and never used the caller's pool.
+        del worker_class
 
         self.devices = []
         self.session = None
         self.logger = session_mod.SessionLogger()
         self.scheduler = sched.Scheduler()
-        self.webcam = None
         self.sessions_dir = session_mod.default_session_root()
+        self.last_session_root = None        # so "Open Folder" survives a stop
+        self.device_names = session_mod.DeviceNames()
         self.removed_ports = set()
         self._port_info = {}                 # port -> {"id":.., "firmware":..}
         self._all_ports = []                 # every system port from the last scan
@@ -101,6 +179,7 @@ class FEDTabWidget(QWidget):
     # ==================================================================
 
     def _build_ui(self):
+        self.setStyleSheet(BUTTON_QSS)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -114,33 +193,33 @@ class FEDTabWidget(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
+        # Order is the whole point: the window is open for weeks and the things
+        # a running experiment is checked for come first. Setup and scheduling
+        # are needed on the first afternoon and then not again, so they collapse
+        # to a header that states what opening them would have told you.
         self.content_layout.addWidget(self._build_session_group())
 
-        self.columns = QWidget()
-        self.columns_layout = QGridLayout(self.columns)
-        self.columns_layout.setContentsMargins(0, 0, 0, 0)
-        self.columns_layout.setSpacing(12)
-        self.content_layout.addWidget(self.columns)
-
+        self.devices_group = self._build_devices_group()
+        self.plot_group = self._build_plot_group()
         self.control_group = self._build_control_group()
         self.scheduler_group = self._build_scheduler_group()
-        self.devices_group = self._build_devices_group()
 
-        self.left_column = QWidget()
-        self.left_column_layout = QVBoxLayout(self.left_column)
-        self.left_column_layout.setContentsMargins(0, 0, 0, 0)
-        self.left_column_layout.setSpacing(12)
+        # Full width at every size. The old two-column split put the devices in
+        # a column narrow enough for exactly one card, so widening the window
+        # showed fewer cages than leaving it at its default size did.
+        self.content_layout.addWidget(self.devices_group)
+        self.content_layout.addWidget(self.plot_group, stretch=1)
 
-        self.right_column = QWidget()
-        self.right_column_layout = QVBoxLayout(self.right_column)
-        self.right_column_layout.setContentsMargins(0, 0, 0, 0)
-        self.right_column_layout.setSpacing(12)
+        self.setup_section = CollapsibleSection(
+            "Setup & bulk actions", "applies to every connected device")
+        self.setup_section.add_widget(self.control_group)
+        self.content_layout.addWidget(self.setup_section)
 
-        self._layout_is_narrow = None
-        self._apply_responsive_layout()
+        self.scheduler_section = CollapsibleSection(
+            "Protocol event scheduler", "no events scheduled")
+        self.scheduler_section.add_widget(self.scheduler_group)
+        self.content_layout.addWidget(self.scheduler_section)
 
-        self.content_layout.addWidget(self._build_plot_group())
-        self.content_layout.addWidget(self._build_device_view_group())
         self.content_layout.addStretch()
 
         self.log = CollapsibleLogBox("Serial Monitor")
@@ -157,14 +236,21 @@ class FEDTabWidget(QWidget):
         row = QHBoxLayout()
         self.record_btn = QPushButton("Start Recording")
         self.record_btn.setStyleSheet("""
-            QPushButton { font-weight: bold; min-height: 26px; }
+            QPushButton {
+                font-weight: bold; min-height: 26px;
+                padding: 6px 16px; border-radius: 4px;
+            }
             QPushButton:checked { background-color: #c0392b; color: white; }
         """)
         self.record_btn.setCheckable(True)
         self.record_btn.setToolTip(
             "Start a timestamped session folder. Behavioural events, the SD-card "
-            "mirror, webcam video and every user action are recorded into it on a "
-            "shared clock.")
+            "mirror and every user action are recorded into it on a shared "
+            "clock.\n\n"
+            "Every connected device also rolls onto a fresh SD log and zeroes "
+            "its counters, so the session owns a clean boundary on the card as "
+            "well as on the host. Resuming an interrupted session does not.")
+        _fit(self.record_btn, "Stop Recording")
         self.record_btn.toggled.connect(self._on_record_toggled)
         row.addWidget(self.record_btn)
 
@@ -172,59 +258,47 @@ class FEDTabWidget(QWidget):
         self.session_label.setStyleSheet("color: #999999;")
         row.addWidget(self.session_label, stretch=1)
 
-        self.open_folder_btn = QPushButton("Open Folder")
+        self.open_folder_btn = _weigh(QPushButton("Open Folder"), "quiet")
         self.open_folder_btn.setEnabled(False)
         self.open_folder_btn.clicked.connect(self._open_session_folder)
         row.addWidget(self.open_folder_btn)
 
-        choose_btn = QPushButton("Change Location...")
+        choose_btn = _weigh(QPushButton("Change Location..."), "quiet")
         choose_btn.clicked.connect(self._choose_sessions_dir)
         row.addWidget(choose_btn)
         layout.addLayout(row)
 
-        camera_row = QHBoxLayout()
-        camera_row.addWidget(QLabel("Camera:"))
-        self.camera_combo = QComboBox()
-        self.camera_combo.setToolTip(
-            "Detected cameras. While a session is recording, video is written "
-            "with a per-frame timestamp CSV on the same clock as FED events.")
-        camera_row.addWidget(self.camera_combo)
+        # The two facts that say whether an unattended run is still healthy, on
+        # the one row that is always visible. Mirror state used to be 11px grey
+        # in the corner of a panel three sections down.
+        status_row = QHBoxLayout()
+        status_row.setSpacing(14)
+        self.fleet_status = QLabel("No devices connected")
+        self.fleet_status.setStyleSheet("color: #999999; font-size: 11px;")
+        self.mirror_status = QLabel("Mirror idle")
+        self.mirror_status.setStyleSheet("color: #999999; font-size: 11px;")
+        status_row.addWidget(self.fleet_status)
+        status_row.addWidget(self.mirror_status)
+        status_row.addStretch()
+        layout.addLayout(status_row)
 
-        self.camera_btn = QPushButton("Start Camera")
-        self.camera_btn.clicked.connect(self._toggle_camera)
-        camera_row.addWidget(self.camera_btn)
-
-        rescan_btn = QPushButton("Rescan")
-        rescan_btn.clicked.connect(self._populate_cameras)
-        camera_row.addWidget(rescan_btn)
-
-        self.camera_status = QLabel("Camera off")
-        self.camera_status.setStyleSheet("color: #999999;")
-        camera_row.addWidget(self.camera_status, stretch=1)
-        layout.addLayout(camera_row)
-
-        self.camera_view = QLabel("Camera off")
-        self.camera_view.setAlignment(Qt.AlignCenter)
-        self.camera_view.setMinimumHeight(240)
-        self.camera_view.setStyleSheet(
-            "background-color: #1e1e1e; color: #777777; "
-            "border: 1px dashed #444444; border-radius: 6px;")
-        self.camera_view.setVisible(False)
-        layout.addWidget(self.camera_view)
-
-        self._populate_cameras()
         return group
 
     # --- global control ---------------------------------------------------
 
     def _build_control_group(self):
-        group = QGroupBox("FED Control Panel")
+        # Named for its scope, not its contents. Every control in here acts on
+        # every connected device at once, and each one is duplicated per-device
+        # on the cards opposite; titled "FED Control Panel" there was nothing to
+        # say which of the two a given button was.
+        group = QGroupBox("Apply to all connected devices")
         layout = QHBoxLayout(group)
         layout.setSpacing(15)
 
         left = QVBoxLayout()
         left.setSpacing(8)
-        left.addWidget(_section_label("Device configuration & commands"))
+        left.addWidget(_section_label(
+            "Configuration & commands — sent to every connected device"))
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Global mode:"))
@@ -240,17 +314,20 @@ class FEDTabWidget(QWidget):
         left.addWidget(self.global_params)
 
         actions = QHBoxLayout()
-        apply_btn = QPushButton("Apply to All")
-        apply_btn.setStyleSheet("font-weight: bold; min-height: 22px;")
+        apply_btn = _weigh(QPushButton("Apply to All"), "normal")
         apply_btn.clicked.connect(self._apply_global_mode)
-        dispense_btn = QPushButton("Dispense All")
-        dispense_btn.setStyleSheet("font-weight: bold; min-height: 22px;")
+        dispense_btn = _weigh(QPushButton("Dispense All..."), "normal")
+        dispense_btn.setToolTip(
+            "Deliver one pellet to every connected device. Asks first: under a "
+            "fixed-ratio protocol these pellets were not earned by a poke, and "
+            "nothing in the log distinguishes them afterwards.")
         dispense_btn.clicked.connect(self._dispense_all)
-        self.global_lights_btn = QPushButton("Lights: OFF")
+        self.global_lights_btn = _weigh(
+            QPushButton("Lights: OFF"), "normal", "Lights: ON")
         self.global_lights_btn.setCheckable(True)
         self.global_lights_btn.setStyleSheet("""
+            QPushButton { padding: 6px 14px; border-radius: 4px; }
             QPushButton:checked { background-color: #f1c40f; color: black; }
-            QPushButton { min-height: 22px; font-weight: bold; }
         """)
         self.global_lights_btn.clicked.connect(self._toggle_global_lights)
         for widget in (apply_btn, dispense_btn, self.global_lights_btn):
@@ -265,7 +342,7 @@ class FEDTabWidget(QWidget):
 
         right = QVBoxLayout()
         right.setSpacing(8)
-        right.addWidget(_section_label("Clock sync & data"))
+        right.addWidget(_section_label("Clock sync & data — all devices"))
 
         sync_row = QHBoxLayout()
         sync_row.addWidget(QLabel("Auto sync every:"))
@@ -291,9 +368,9 @@ class FEDTabWidget(QWidget):
             QPushButton:checked { background-color: #4caf50; color: white; }
             QPushButton { font-weight: bold; }
         """)
+        _fit(self.auto_sync_btn, "Auto Sync: OFF")
         self.auto_sync_btn.toggled.connect(self._on_auto_sync_toggled)
-        sync_now_btn = QPushButton("Sync Now")
-        sync_now_btn.setStyleSheet("font-weight: bold;")
+        sync_now_btn = _weigh(QPushButton("Sync Now"), "normal")
         sync_now_btn.clicked.connect(self._sync_all)
         sync_actions.addWidget(self.auto_sync_btn)
         sync_actions.addWidget(sync_now_btn)
@@ -301,44 +378,45 @@ class FEDTabWidget(QWidget):
         right.addLayout(sync_actions)
 
         data_row = QHBoxLayout()
-        export_btn = QPushButton("Export SD Logs...")
-        export_btn.setStyleSheet("font-weight: bold;")
+        export_btn = _weigh(QPushButton("Export SD Logs..."), "normal")
+        export_btn.setToolTip(
+            "Save a copy of the SD logs to a folder you choose. This is for "
+            "taking data elsewhere — while a session is recording, the mirror "
+            "is already keeping a complete copy in the session folder.")
         export_btn.clicked.connect(self._export_all)
-        pull_btn = QPushButton("Pull Data Now")
+        pull_btn = _weigh(QPushButton("Pull Data Now"), "normal")
         pull_btn.setToolTip(
-            "Force an immediate mirror pull from every connected device.")
+            "Force the mirror to pull immediately instead of waiting for the "
+            "next event or tick. It pulls into the current session folder, so "
+            "it does nothing useful when no session is recording.")
         pull_btn.clicked.connect(self._force_mirror_sync)
-        reset_btn = QPushButton("New Trial (All)")
-        reset_btn.setStyleSheet(
-            "font-weight: bold; background-color: #c0392b; color: white;")
-        reset_btn.clicked.connect(self._new_trial_all)
-        for widget in (export_btn, pull_btn, reset_btn):
+        for widget in (export_btn, pull_btn):
             data_row.addWidget(widget)
         data_row.addStretch()
         right.addLayout(data_row)
-
-        self.mirror_status = QLabel("Mirror idle")
-        self.mirror_status.setStyleSheet("color: #999999; font-size: 11px;")
-        right.addWidget(self.mirror_status)
         right.addStretch()
 
         layout.addLayout(left, stretch=1)
         layout.addWidget(divider)
         layout.addLayout(right, stretch=1)
         _sync_mode_params(self.global_mode_combo, self.global_params)
+        # Sized to its contents. Left to expand, it grew to match the scheduler
+        # table beside it and left a few hundred pixels of empty panel below
+        # three rows of buttons.
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         return group
 
     # --- devices ----------------------------------------------------------
 
     def _build_devices_group(self):
-        group = QGroupBox("Connected Devices")
+        group = QGroupBox("Devices")
         layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
         controls = QHBoxLayout()
-        add_btn = QPushButton("Add Device")
+        add_btn = _weigh(QPushButton("Add Device"), "quiet")
         add_btn.clicked.connect(lambda: self.add_device_slot())
-        self.refresh_btn = QPushButton("Refresh Ports")
+        self.refresh_btn = _weigh(QPushButton("Refresh Ports"), "quiet")
         self.refresh_btn.setToolTip(
             "Scan for FED3 devices. Ports already held by a connected device are "
             "never reopened, so this is safe to run mid-experiment.")
@@ -348,10 +426,26 @@ class FEDTabWidget(QWidget):
         controls.addWidget(self.refresh_btn)
         layout.addLayout(controls)
 
+        # Shown instead of the cards when nothing is plugged in. The previous
+        # version kept one permanently empty card here, titled "Device 1", which
+        # read as a device that existed and had failed rather than as an absence.
+        self.devices_empty = QLabel(
+            "No FED3 devices found.\n\n"
+            "Plug one in and press Refresh Ports. If a device is connected but "
+            "not listed, press Add Device to assign its port by hand.")
+        self.devices_empty.setWordWrap(True)
+        self.devices_empty.setAlignment(Qt.AlignCenter)
+        self.devices_empty.setStyleSheet(
+            "color: #999999; font-size: 12px; padding: 24px;")
+        layout.addWidget(self.devices_empty)
+
         self.devices_container = QWidget()
         self.devices_flow = FlowLayout(margin=4, spacing=8)
         self.devices_container.setLayout(self.devices_flow)
         layout.addWidget(self.devices_container)
+        # Kept in step by _reorder_devices from here on.
+        self.devices_container.setVisible(False)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         return group
 
     # --- plot -------------------------------------------------------------
@@ -417,21 +511,13 @@ class FEDTabWidget(QWidget):
             self.canvas, figure.add_subplot(111), self.plot_placeholder)
         return group
 
-    def _build_device_view_group(self):
-        group = QGroupBox("Device View")
-        layout = QVBoxLayout(group)
-        container = QWidget()
-        self.device_view_flow = FlowLayout(margin=10, spacing=20)
-        container.setLayout(self.device_view_flow)
-        layout.addWidget(container)
-        return group
-
     # ==================================================================
     # Scheduler UI
     # ==================================================================
 
     def _build_scheduler_group(self):
-        group = QGroupBox("Protocol Event Scheduler")
+        group = QGroupBox()
+        group.setFlat(True)
         layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
@@ -455,19 +541,24 @@ class FEDTabWidget(QWidget):
                 border: 1px solid #333333; font-weight: bold;
             }
         """)
-        self.sched_table.setMinimumHeight(140)
+        # An empty table used to reserve 190px to say nothing. It now shrinks
+        # to a single row of chrome until there is something to list, and the
+        # section header carries the "nothing scheduled" state instead.
+        self.sched_table.setMinimumHeight(0)
         self.sched_table.setMaximumHeight(260)
+        self.sched_table.setVisible(False)
         layout.addWidget(self.sched_table)
 
         layout.addWidget(self._build_scheduler_form())
 
         table_actions = QHBoxLayout()
-        clear_btn = QPushButton("Clear Finished")
+        clear_btn = _weigh(QPushButton("Clear Finished"), "quiet")
         clear_btn.setToolTip("Remove events that have run, failed or been missed.")
         clear_btn.clicked.connect(self._clear_finished_events)
         table_actions.addStretch()
         table_actions.addWidget(clear_btn)
         layout.addLayout(table_actions)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         return group
 
     def _build_scheduler_form(self):
@@ -544,8 +635,7 @@ class FEDTabWidget(QWidget):
         self.sched_preview.setStyleSheet("color: #4fc3f7; font-size: 11px;")
         grid.addWidget(self.sched_preview, 2, 0, 1, 4)
 
-        add_btn = QPushButton("Add Event")
-        add_btn.setStyleSheet("font-weight: bold; min-height: 24px;")
+        add_btn = _weigh(QPushButton("Add Event"), "normal")
         add_btn.clicked.connect(self._add_scheduled_event)
         grid.addWidget(add_btn, 2, 5, Qt.AlignRight)
 
@@ -642,6 +732,7 @@ class FEDTabWidget(QWidget):
         self.scheduler.sort()
         self.sched_table.setRowCount(0)
         self._sched_rows = {}
+        self.sched_table.setVisible(bool(self.scheduler.events))
 
         for event in self.scheduler.events:
             row = self.sched_table.rowCount()
@@ -677,6 +768,12 @@ class FEDTabWidget(QWidget):
             self.sched_table.setCellWidget(row, 6, delete_btn)
 
     def _tick_scheduler_display(self):
+        """Refresh countdowns in place.
+
+        Only the text changes. Replacing the status cell every second — as this
+        did — allocated a QTableWidgetItem per row per tick and defeated the
+        in-place refresh the rebuild logic exists to allow.
+        """
         now = datetime.now()
         for event in self.scheduler.events:
             row = self._sched_rows.get(event.id)
@@ -685,7 +782,10 @@ class FEDTabWidget(QWidget):
             countdown = self.sched_table.item(row, 2)
             if countdown is not None:
                 countdown.setText(event.describe_trigger(now))
-            self.sched_table.setItem(row, 5, _status_item(event))
+            status = self.sched_table.item(row, 5)
+            label = event.status if event.enabled else sched.STATUS_DISABLED
+            if status is not None and status.text() != label:
+                _style_status_item(status, event)
 
     def _set_event_enabled(self, event_id, enabled):
         event = self.scheduler.get(event_id)
@@ -753,77 +853,111 @@ class FEDTabWidget(QWidget):
             used = {d.slot_num for d in self.devices}
             slot_num = next(n for n in range(1, 1000) if n not in used)
 
-        box = QGroupBox(f"Device {slot_num}")
-        grid = QGridLayout(box)
+        box = QGroupBox(f"Slot {slot_num}")
+        card = QVBoxLayout(box)
+        card.setSpacing(5)
 
         name_edit = QLineEdit()
-        name_edit.setPlaceholderText("Optional device name")
+        # The placeholder shows the name that will be used if this is left blank,
+        # so the field reads as an override rather than as something that must be
+        # filled in. It is re-set whenever the device identifies itself.
+        name_edit.setPlaceholderText(f"Slot {slot_num}")
         port_combo = QComboBox()
         port_combo.setEditable(True)
-        remove_btn = QPushButton("Remove")
+        # Quiet, small, and down with the housekeeping. It used to be the
+        # brightest control on the card, in the top-right corner where a window
+        # close box lives, immediately beside the port dropdown you go to when a
+        # device needs re-selecting.
+        remove_btn = _weigh(QPushButton("Remove"), "quiet")
         mode_combo = QComboBox()
         mode_combo.addItems(proto.MODE_LABELS)
-        apply_btn = QPushButton("Apply Mode")
+        apply_btn = _weigh(QPushButton("Apply Mode"), "normal")
         params = _ModeParams()
         status_label = QLabel("Not connected")
         status_label.setStyleSheet("color: #999999; font-size: 11px;")
+        # Connection and recording are different states, and the card used to
+        # show only the first: a connected device ticked its counters and drew a
+        # live plot whether or not anything was being written to disk.
+        rec_label = QLabel("")
+        rec_label.setStyleSheet(
+            "color: #e74c3c; font-size: 11px; font-weight: bold;")
+        rec_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        feed_btn = QPushButton("Dispense")
-        lights_btn = QPushButton("Lights: OFF")
+        feed_btn = _weigh(QPushButton("Dispense"), "normal")
+        lights_btn = _weigh(QPushButton("Lights: OFF"), "normal", "Lights: ON")
         lights_btn.setCheckable(True)
         lights_btn.setStyleSheet("""
+            QPushButton { padding: 6px 14px; border-radius: 4px; }
             QPushButton:checked { background-color: #f1c40f; color: black; }
-            QPushButton { min-height: 22px; font-weight: bold; }
         """)
-        new_trial_btn = QPushButton("New Trial")
-        new_trial_btn.setStyleSheet(
-            "font-weight: bold; background-color: #c0392b; color: white; "
-            "min-height: 22px;")
-        export_btn = QPushButton("Export Logs...")
+        export_btn = _weigh(QPushButton("Export Logs..."), "quiet")
+        setup_btn = _weigh(QPushButton("\u25b6 Setup"), "quiet", "\u25bc Setup")
+        setup_btn.setCheckable(True)
+        setup_btn.setToolTip(
+            "Port, name, mode and ratio. Set once when the cage is assembled; "
+            "hidden while the device is connected so the card can show what it "
+            "is doing instead.")
 
-        manual = _row(QLabel("Manual:"), feed_btn, lights_btn)
-        data = _row(QLabel("Data:"), new_trial_btn, export_btn)
+        # What a researcher walks over to check, in the order they ask it.
+        # Counts alone cannot answer "is this cage still working" — a device
+        # that stopped feeding an hour ago has exactly the same counters as one
+        # that fed a minute ago.
+        stats_label = QLabel("\u2014")
+        stats_label.setStyleSheet("color: #cccccc; font-size: 11px;")
+        stats_label.setWordWrap(True)
 
-        grid.addWidget(QLabel("Port:"), 0, 0)
-        grid.addWidget(port_combo, 0, 1, 1, 2)
-        grid.addWidget(remove_btn, 0, 3, Qt.AlignRight)
-        grid.addWidget(QLabel("Name:"), 1, 0)
-        grid.addWidget(name_edit, 1, 1, 1, 3)
-        grid.addWidget(QLabel("Mode:"), 2, 0)
-        grid.addWidget(mode_combo, 2, 1, 1, 2)
-        grid.addWidget(apply_btn, 2, 3)
-        grid.addWidget(params, 3, 0, 1, 4)
-        grid.addWidget(manual, 4, 0, 1, 4)
-        grid.addWidget(data, 5, 0, 1, 4)
-        grid.addWidget(status_label, 6, 0, 1, 4)
-        grid.setColumnStretch(1, 1)
-        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        view_container = QWidget()
-        view_layout = QVBoxLayout(view_container)
-        view_layout.setContentsMargins(0, 0, 0, 0)
-        view_title = QLabel(f"Device {slot_num}")
-        view_title.setAlignment(Qt.AlignCenter)
-        view_title.setStyleSheet("font-weight: bold; font-size: 14px; color: white;")
+        # The live poke/pellet counters sit on the card that controls the
+        # device. They used to live in a separate "Device View" group at the
+        # bottom of the page, which put a device's readout and its controls in
+        # different columns, hundreds of pixels apart.
         svg_view = FEDSvgView()
-        svg_view.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        view_layout.addWidget(view_title)
-        view_layout.addWidget(svg_view)
+        svg_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        svg_view.setMinimumHeight(58)
+        svg_view.setMaximumHeight(72)
+
+        # Setup: everything set once on the day the cage is built.
+        setup_panel = QWidget()
+        setup_grid = QGridLayout(setup_panel)
+        setup_grid.setContentsMargins(0, 4, 0, 0)
+        setup_grid.setSpacing(6)
+        setup_grid.addWidget(QLabel("Port:"), 0, 0)
+        setup_grid.addWidget(port_combo, 0, 1, 1, 2)
+        setup_grid.addWidget(QLabel("Name:"), 1, 0)
+        setup_grid.addWidget(name_edit, 1, 1, 1, 2)
+        setup_grid.addWidget(QLabel("Mode:"), 2, 0)
+        setup_grid.addWidget(mode_combo, 2, 1)
+        setup_grid.addWidget(apply_btn, 2, 2)
+        setup_grid.addWidget(params, 3, 0, 1, 3)
+        setup_grid.setColumnStretch(1, 1)
+        setup_panel.setVisible(False)
+
+        state_row = _row(status_label, None, rec_label)
+        actions = _row(feed_btn, lights_btn, None)
+        housekeeping = _row(setup_btn, None, export_btn, remove_btn)
+
+        card.addWidget(state_row)
+        card.addWidget(svg_view)
+        card.addWidget(stats_label)
+        card.addWidget(actions)
+        card.addWidget(housekeeping)
+        card.addWidget(setup_panel)
+        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         device = FedDevice(slot_num, {
             "box": box, "name_edit": name_edit, "port_combo": port_combo,
             "mode_combo": mode_combo, "params": params,
             "ratio_spin": params.ratio_spin, "timeout_spin": params.timeout_spin,
-            "status_label": status_label, "lights_btn": lights_btn,
-            "svg_view": svg_view, "view_container": view_container,
-            "view_title": view_title, "remove_btn": remove_btn,
+            "status_label": status_label, "rec_label": rec_label,
+            "lights_btn": lights_btn, "stats_label": stats_label,
+            "setup_panel": setup_panel, "setup_btn": setup_btn,
+            "svg_view": svg_view, "remove_btn": remove_btn,
         })
 
         # The title tracks each keystroke, but the combo boxes only rebuild once
         # editing finishes — refreshing them per keystroke reset the user's plot
         # filter to "All Devices" mid-word.
-        name_edit.textChanged.connect(lambda: device.view_title.setText(device.name))
-        name_edit.editingFinished.connect(lambda: self._on_device_renamed(device))
+        name_edit.textChanged.connect(lambda: device.box.setTitle(device.name))
+        name_edit.editingFinished.connect(lambda: self._on_label_edited(device))
         remove_btn.clicked.connect(lambda: self._remove_device(device))
         apply_btn.clicked.connect(lambda: self._apply_device_mode(device))
         mode_combo.currentTextChanged.connect(
@@ -833,8 +967,9 @@ class FEDTabWidget(QWidget):
         lights_btn.clicked.connect(
             lambda: self._execute_action(device, sched.ACTION_LIGHTS,
                                          {"lights": lights_btn.isChecked()}))
-        new_trial_btn.clicked.connect(lambda: self._new_trial(device))
         export_btn.clicked.connect(lambda: self._export_device(device))
+        setup_btn.toggled.connect(
+            lambda checked, d=device: self._toggle_device_setup(d, checked))
         port_combo.activated.connect(lambda: self._on_port_selected(device))
         port_combo.lineEdit().editingFinished.connect(
             lambda: self._on_port_selected(device))
@@ -842,9 +977,11 @@ class FEDTabWidget(QWidget):
         _sync_mode_params(mode_combo, params)
         port_combo.addItem("Scanning...")
         port_combo.setEnabled(False)
+        # A slot with no device on it is nothing but setup, so it opens showing
+        # setup. Connecting is what turns the card into a readout.
+        setup_btn.setChecked(True)
 
         self.devices_flow.addWidget(box)
-        self.device_view_flow.addWidget(view_container)
         self.devices.append(device)
         self._reorder_devices()
         self._refresh_device_combos()
@@ -852,54 +989,123 @@ class FEDTabWidget(QWidget):
             self.refresh_ports()
         return device
 
-    def _on_device_renamed(self, device):
+    def _toggle_device_setup(self, device, checked):
+        """Show or hide a card's set-once controls."""
+        device.setup_panel.setVisible(checked)
+        device.setup_btn.setText(("\u25bc" if checked else "\u25b6") + " Setup")
+
+    def _on_label_edited(self, device):
+        """The user finished typing in a slot's name field."""
+        # Remembered against the on-board ID so the label comes back the next
+        # time this physical device is plugged in, on whatever port and slot.
+        self.device_names.set(device.device_id, device.label)
+        self._rename_device(device)
+
+    def _rename_device(self, device):
+        """Propagate a change to anything that feeds ``device.name``.
+
+        Called for an edited label *and* for a newly identified device, because
+        identification changes the default name ("Slot 2" becomes "FED 4") for
+        every slot the user has not labelled by hand.
+        """
+        device.name_edit.setPlaceholderText(device.default_name)
         if device.last_known_name == device.name:
+            device.box.setTitle(device.name)
             return
         # Scheduled events reference devices by name, so a rename has to carry
         # them across or they silently stop matching a target.
         self.scheduler.rename_target(device.last_known_name, device.name)
         device.last_known_name = device.name
-        device.view_title.setText(device.name)
+        device.box.setTitle(device.name)
         if device.link is not None:
             device.link.owner = device.name
         self._refresh_device_combos()
         self._rebuild_scheduler_table()
 
+    def _adopt_identity(self, device, device_id, firmware=None, replace=False):
+        """Record what a device says it is, and rename the slot to match.
+
+        ``replace`` distinguishes the two ways identity arrives. A device
+        speaking for itself (PING, STATUS) can only ever add information, so an
+        empty ID is ignored. Pointing a slot at a port replaces its identity
+        outright, empty included: a slot moved to a port that reports no ID must
+        stop calling itself "FED 4".
+        """
+        # Compared as text: the ID arrives as a string from PING and STATUS but
+        # as whatever json.load produced when a session is resumed, and an int/str
+        # mismatch would re-adopt the same identity on every STATUS reply.
+        known = device_id not in (None, "")
+        changed = str(device_id or "") != str(device.device_id or "")
+        if known or replace:
+            device.device_id = device_id or None
+        if firmware or replace:
+            device.firmware = firmware
+        if changed and not known:
+            # Identity withdrawn: the label went with the old device, not the slot.
+            device.name_edit.setText("")
+        changed = changed and known
+        if changed:
+            # A label the user gave this device on a previous run outranks the
+            # "FED n" default, but never overwrites one they typed just now.
+            remembered = self.device_names.get(device.device_id)
+            if remembered and not device.label:
+                device.name_edit.setText(remembered)
+        self._rename_device(device)
+
     def _remove_device(self, device):
-        if len(self.devices) <= 1:
-            QMessageBox.warning(self, "Cannot remove device",
-                                "At least one device slot must remain.")
-            return
         if device.is_tracking and not self._confirm(
-                f"Remove {device.name}? It is currently connected and tracking."):
+                f"Remove {device.name}? It is currently connected and tracking.\n\n"
+                f"{device.port} will be ignored by future scans until you pick it "
+                f"from a slot's port list again."):
             return
 
-        if device.port:
-            self.removed_ports.add(device.port)
+        # Removing a slot is how the user says "leave this device alone", so the
+        # port is skipped by later scans. Without this, the next Refresh Ports —
+        # or the automatic rescan — would put it straight back.
+        port = device.port
+        if port:
+            self.removed_ports.add(port)
         self._disconnect_device(device)
         self.devices_flow.removeWidget(device.box)
         device.box.deleteLater()
-        self.device_view_flow.removeWidget(device.view_container)
-        device.view_container.deleteLater()
         self.devices.remove(device)
 
         self._reorder_devices()
         self._refresh_device_combos()
         self._mark_plot_dirty()
-        self._log_action("Device removed", device=device.name)
+        self._log_action("Device removed", device=device.name,
+                         detail=(f"{port} ignored by future scans" if port
+                                 else "empty slot"))
 
     def _reorder_devices(self):
         self.devices.sort(key=lambda d: d.slot_num)
         for device in self.devices:
-            device.box.setTitle(f"Device {device.slot_num}")
-            device.view_title.setText(device.name)
+            device.box.setTitle(device.name)
+            device.name_edit.setPlaceholderText(device.default_name)
             self.devices_flow.removeWidget(device.box)
-            self.device_view_flow.removeWidget(device.view_container)
         for device in self.devices:
             self.devices_flow.addWidget(device.box)
-            self.device_view_flow.addWidget(device.view_container)
-        for device in self.devices:
-            device.remove_btn.setEnabled(len(self.devices) > 1)
+        self.devices_container.setVisible(bool(self.devices))
+        self.devices_empty.setVisible(not self.devices)
+        if not self.devices:
+            self.devices_empty.setText(self._empty_devices_message())
+
+    def _empty_devices_message(self):
+        """What to say in place of the cards when no slot exists.
+
+        A dismissed port is called out by name, because otherwise "press Refresh
+        Ports" is advice that cannot work: a removed device is deliberately
+        skipped by the scan, and nothing on screen would say so.
+        """
+        message = ("No FED3 devices found.\n\n"
+                   "Plug one in and press Refresh Ports. If a device is connected "
+                   "but not listed, press Add Device to assign its port by hand.")
+        if self.removed_ports:
+            ports = ", ".join(sorted(self.removed_ports))
+            message += ("\n\nScans are currently ignoring " + ports +
+                        ", removed earlier this session. Add Device and pick the "
+                        "port to bring it back.")
+        return message
 
     def _refresh_device_combos(self):
         """Keep the plot filter and scheduler target lists in step with names."""
@@ -930,16 +1136,39 @@ class FEDTabWidget(QWidget):
             if device.port:
                 device.saved_port = device.port
 
-        self._scanner = PortScannerWorker()
+        # Parented so the widget, not a Python reference, owns the thread.
+        self._scanner = PortScannerWorker(self)
         self._scanner.finished_scan.connect(self.scan_finished.emit)
-        self._scanner.finished.connect(self._scanner.deleteLater)
+        self._scanner.finished.connect(self._on_scanner_finished)
         self._scanner.start()
 
+    def _on_scanner_finished(self):
+        """Release the worker only once ``run()`` has actually returned.
+
+        ``finished_scan`` is emitted as the last statement *inside* ``run()``,
+        so releasing the worker from that slot can destroy a QThread that is
+        still running. Qt answers that with abort(), not a warning.
+        """
+        scanner = self.sender()
+        if scanner is self._scanner:
+            self._scanner = None
+        if scanner is not None:
+            scanner.deleteLater()
+
     def _on_scan_finished(self, results, all_ports):
-        self._scanner = None
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("Refresh Ports")
         self._set_status("Ready")
+
+        # A rescan is the documented remedy after reflashing, so it clears the
+        # refusal and lets the device be tried again. Only the refusal: clearing
+        # every card's frame also erased the orange JAM border and the red
+        # disconnected border, neither of which a port scan resolves.
+        for device in self.devices:
+            if device.refused:
+                device.refused = False
+                device.box.setStyleSheet("")
+                device.box.setToolTip("")
 
         active = []
         for port, status, device_id, firmware in results:
@@ -950,13 +1179,6 @@ class FEDTabWidget(QWidget):
         self.log.append_log(f"[Scan] Active FED3 ports: {active or 'none'}")
         self._populate_port_combos(all_ports)
         self._assign_discovered_ports(active)
-
-        # Leave one empty slot so the panel is never blank and a port can be
-        # assigned by hand when auto-discovery finds nothing.
-        if not self.devices:
-            self.add_device_slot(refresh=False)
-            self._populate_port_combos(all_ports)
-
         self._connect_assigned_ports()
 
     def _populate_port_combos(self, all_ports):
@@ -1033,11 +1255,8 @@ class FEDTabWidget(QWidget):
 
         device.saved_port = port
         info = info or self._port_info.get(port, {})
-        device.device_id = info.get("id")
-        device.firmware = info.get("firmware")
-        if device.device_id and not device.name_edit.text().strip():
-            device.name_edit.setText(f"FED {device.device_id}")
-            self._on_device_renamed(device)     # setText alone skips editingFinished
+        self._adopt_identity(device, info.get("id"), info.get("firmware"),
+                             replace=True)
 
     def _on_port_selected(self, device):
         """User picked a port by hand."""
@@ -1061,14 +1280,17 @@ class FEDTabWidget(QWidget):
         onboard = info.get("id")
         if onboard and str(onboard) != str(device.slot_num) and not self._confirm(
                 f"The device on {port} reports on-board ID {onboard}, but this is "
-                f"the Device {device.slot_num} slot.\n\nAssign it anyway?"):
+                f"slot {device.slot_num}.\n\nSlots normally match the number on "
+                f"the device, so FED {onboard} would usually belong in slot "
+                f"{onboard}.\n\nAssign it here anyway?"):
             device.port_combo.setCurrentIndex(-1)
             return
 
         self.removed_ports.discard(port)
+        device.refused = False
+        device.box.setStyleSheet("")
         device.saved_port = port
-        device.device_id = onboard
-        device.firmware = info.get("firmware")
+        self._adopt_identity(device, onboard, info.get("firmware"), replace=True)
         self._connect_device(device)
 
     def _connect_assigned_ports(self):
@@ -1101,6 +1323,9 @@ class FEDTabWidget(QWidget):
     def _on_link_connected(self, device):
         device.has_connected = True
         device.connect_attempts = 0
+        device.reconnect_gave_up = False
+        device.awaiting_pong_since = None
+        device.handshake_done = False
         device.is_tracking = True
         device.svg_view.is_tracking = True
         device.svg_view.is_stale = False
@@ -1110,13 +1335,17 @@ class FEDTabWidget(QWidget):
             device.tracking_start_time = datetime.now()
         device.status_label.setText(f"Connected on {device.port}")
         device.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
+        # The card stops being a form and becomes a readout.
+        device.setup_btn.setChecked(False)
 
         self._log_action("Connected", device=device.name,
                          detail=device.port, source="system")
-        self._sync_device(device)
-        device.link.send(proto.CMD_STATUS)
+        # PING first, and nothing else until it is answered: the reply is what
+        # confirms the device is running firmware FNT can actually drive.
+        device.link.send(proto.CMD_PING)
         if self.session is not None:
             self._attach_session_to_device(device)
+        self._refresh_recording_indicators()
         self._mark_plot_dirty()
 
     def _on_link_disconnected(self, device, reason):
@@ -1128,6 +1357,12 @@ class FEDTabWidget(QWidget):
         if device.transfer is not None:
             device.transfer.cancel("connection lost")
         device.link = None
+        self._refresh_recording_indicators()
+
+        if device.refused:
+            # The panel already explains why, in terms the user can act on.
+            return
+
         device.status_label.setText(f"Disconnected — {reason}")
         device.status_label.setStyleSheet("color: #e57373; font-size: 11px;")
 
@@ -1142,11 +1377,16 @@ class FEDTabWidget(QWidget):
 
     def _disconnect_device(self, device):
         if device.mirror is not None:
-            device.mirror.stop()
-            device.mirror = None
+            mirror, device.mirror = device.mirror, None
+            mirror.stop()
+            mirror.deleteLater()
         if device.transfer is not None:
-            device.transfer.cancel("disconnecting")
-            device.transfer = None
+            transfer, device.transfer = device.transfer, None
+            transfer.cancel("disconnecting")
+            # Parented to the tab, so it outlives the device slot unless it is
+            # explicitly dropped: 20 reconnect attempts would otherwise leave 20
+            # live Fed3Transfer objects and their timers behind.
+            transfer.deleteLater()
         if device.link is not None:
             link, device.link = device.link, None
             link.stop()
@@ -1166,7 +1406,23 @@ class FEDTabWidget(QWidget):
         for device in self.devices:
             if device.is_connected or not device.has_connected:
                 continue
+            # Reconnecting a refused device would loop: connect, PING, refuse,
+            # repeat every few seconds. Refresh Ports is the way back.
+            if device.refused:
+                continue
             if device.connect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                if not device.reconnect_gave_up:
+                    # Silently giving up looked identical to still trying, which
+                    # is how a device could sit disconnected for a whole run
+                    # without anyone noticing.
+                    device.reconnect_gave_up = True
+                    self.log.append_log(
+                        f"[{device.name}] gave up after {MAX_RECONNECT_ATTEMPTS} "
+                        f"reconnect attempts — reselect its port to retry", False)
+                    self._log_action(
+                        "Reconnect abandoned", device=device.name,
+                        detail=f"{MAX_RECONNECT_ATTEMPTS} consecutive failures",
+                        source="system", result="failed")
                 continue
             port = device.port
             if port and port in available:
@@ -1197,6 +1453,10 @@ class FEDTabWidget(QWidget):
                              detail=stripped, source="device", result="error")
             return
 
+        if stripped.startswith("PONG_FED3"):
+            self._apply_handshake(device, stripped)
+            return
+
         status = proto.parse_status(stripped)
         if status is not None:
             self._apply_status(device, status)
@@ -1206,13 +1466,94 @@ class FEDTabWidget(QWidget):
             self._record_clock_sync(device, stripped.split(",", 1)[1])
             return
 
+        feeding = proto.parse_feeding(stripped)
+        if feeding is not None:
+            turn, total = feeding
+            device.status_label.setText(
+                f"Dispensing — attempt {turn + 1} of {total}"
+                if turn else "Dispensing...")
+            device.status_label.setStyleSheet("color: #f1c40f; font-size: 11px;")
+            return
+
+        if stripped.startswith(proto.REPLY_NEW_TRIAL):
+            self._adopt_current_file(
+                device, stripped[len(proto.REPLY_NEW_TRIAL):])
+            self._log_action("New trial started", device=device.name,
+                             detail=device.current_file or "", source="device")
+            return
+
         event = proto.parse_event(stripped)
         if event is not None:
             self._on_device_event(device, event)
 
+    def _apply_handshake(self, device, line):
+        """Accept or refuse a device based on the firmware its PING reports.
+
+        A board older than the supported firmware is dropped rather than driven
+        in a reduced mode. It parses ``GET_FILE:<name>,<offset>`` as a request
+        for a file literally named ``"<name>,0"``, so every download and every
+        mirror pull would fail — and it would fail quietly, halfway through an
+        experiment, which is exactly when nobody is watching the log.
+        """
+        # Every heartbeat PING is answered with a PONG identical to the one that
+        # opened the connection. Liveness is tracked from the receive time in
+        # _check_heartbeats, so a repeat PONG needs nothing done to it; treating
+        # one as a handshake re-set the RTC and re-logged acceptance every 30s.
+        if device.handshake_done:
+            return
+
+        device_id, firmware = proto.parse_pong(line)
+        device.firmware = firmware
+        self._adopt_identity(device, device_id)
+
+        if not proto.is_supported(firmware):
+            self._refuse_device(device, firmware)
+            return
+
+        device.handshake_done = True
+        device.box.setToolTip("")
+        device.status_label.setText(f"Connected on {device.port}")
+        device.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
+        self._log_action("Firmware accepted", device=device.name,
+                         detail=f"FW {firmware}", source="device")
+
+        # Deferred until the handshake so nothing is sent to a device that turns
+        # out to be unusable. The link may already be gone: lines from the serial
+        # thread are queued, so a PONG can arrive after the link was torn down.
+        if device.link is not None:
+            self._sync_device(device)
+
+    def _refuse_device(self, device, firmware):
+        """Disconnect a device running firmware FNT cannot drive, and say so."""
+        required = proto.firmware_requirement()
+        reported = firmware or "none reported"
+        detail = (f"firmware {reported}; {required} or newer required")
+
+        # Set before tearing the link down: the disconnected signal is queued and
+        # arrives after this returns, and _on_link_disconnected must not overwrite
+        # the explanation below with a generic "Disconnected" line.
+        device.refused = True
+        self._disconnect_device(device)
+        device.status_label.setText(f"Refused — firmware {reported}, needs {required}")
+        device.status_label.setStyleSheet("color: #e57373; font-size: 11px;")
+        device.box.setStyleSheet("QGroupBox { border: 2px solid #e67e22; }")
+        device.box.setToolTip(
+            f"This device reports firmware {reported}, but FNT requires "
+            f"{required} or newer.\n\n"
+            "Older firmware cannot do ranged SD transfers, so mirroring and "
+            "exports fail, and it reports pokes without a device timestamp.\n\n"
+            "Reflash it from fnt-fed3/ClassicFed3withTimeSync, then press "
+            "Refresh Ports.")
+        self.log.append_log(
+            f"[{device.name}] refused: {detail}. Reflash from fnt-fed3 and "
+            f"press Refresh Ports.", False)
+        self._log_action("Device refused", device=device.name, detail=detail,
+                         source="device", result="failed")
+        self._set_status(f"{device.name} needs reflashing to firmware {required}")
+
     def _apply_status(self, device, status):
         device.firmware = status.get("fw") or device.firmware
-        device.device_id = status.get("id") or device.device_id
+        self._adopt_identity(device, status.get("id"))
         counts = {}
         for key, field in (("l", "left"), ("r", "right"), ("p", "pellet")):
             if key in status:
@@ -1223,14 +1564,42 @@ class FEDTabWidget(QWidget):
         if counts:
             device.apply_counts(counts)
             device.svg_view.set_counts(device.stats)
+        self._note_clock_drift(device, status.get("time"))
+        self._adopt_current_file(device, status.get("file"))
         if status.get("session"):
+            # The port belongs to setup and is a click away; the protocol and
+            # the file being written are what a running experiment is checked
+            # against, and the whole string has to fit a half-width card.
             device.status_label.setText(
-                f"Connected on {device.port} — {status['session']} "
-                f"· {status.get('file', 'no file')}")
+                f"{status['session']} \u00b7 {status.get('file', 'no file')}")
+            device.status_label.setToolTip(f"Connected on {device.port}")
+
+    def _adopt_current_file(self, device, filename):
+        """Note which SD log the device is writing to, and tell its mirror.
+
+        This is what scopes a session's mirror. Without it the mirror would have
+        to guess which of the files on the card belongs to the running
+        experiment, and the only honest guess — all of them — is what used to
+        make the live data arrive last.
+        """
+        filename = (filename or "").strip()
+        if not filename:
+            return
+        device.current_file = filename
+        # Forwarded unconditionally, not only when the name changes. NEW_TRIAL
+        # can hand back the *same* name — FED3 recycles the filename of any log
+        # with fewer than three lines — and an early return on "unchanged" left
+        # the mirror having never been told which file the session owns at all.
+        if device.mirror is not None:
+            device.mirror.adopt_current_file(filename)
 
     def _on_device_event(self, device, event):
         host_ts = session_mod.host_now()
         device.apply_counts(event.counts)
+
+        if event.kind == proto.EVENT_JAM:
+            self._on_device_jam(device, event, host_ts)
+            return
 
         key = {proto.EVENT_LEFT: "left", proto.EVENT_RIGHT: "right",
                proto.EVENT_PELLET: "pellet"}[event.kind]
@@ -1246,18 +1615,59 @@ class FEDTabWidget(QWidget):
         if device.mirror is not None:
             device.mirror.note_event()
 
+    def _on_device_jam(self, device, event, host_ts):
+        """The device gave up trying to dispense.
+
+        Reported loudly because it is the one thing an unattended cage cannot
+        recover from on its own: the hopper is empty or the disk is jammed, and
+        until someone attends to it the animal is on extinction. Older firmware
+        could not report this at all — it spun in the dispense loop forever and
+        simply stopped answering, which read as a dead device.
+        """
+        device.status_label.setText(f"{device.name}: JAMMED — check the hopper")
+        device.status_label.setStyleSheet(
+            "color: #e67e22; font-size: 11px; font-weight: bold;")
+        device.box.setStyleSheet("QGroupBox { border: 2px solid #e67e22; }")
+        device.box.setToolTip(
+            "The device tried to dispense and could not. Refill the hopper or "
+            "clear the pellet disk; it keeps running and logging in the "
+            "meantime.")
+        if device.event_log is not None:
+            device.event_log.append(event, host_ts)
+        self.log.append_log(f"[{device.name}] JAM — could not dispense", False)
+        self._log_action("Dispense failed", device=device.name,
+                         detail="hopper empty or disk jammed",
+                         source="device", result="failed")
+        self._set_status(f"{device.name} could not dispense — check the hopper")
+
+    def _note_clock_drift(self, device, iso_text):
+        """Log how far the device RTC has wandered, from an unadjusted reading.
+
+        Both sides are truncated to the second before comparing. The device
+        reports whole seconds and SYNC can only set whole seconds, so a device
+        that is exactly right reads 0 here. Comparing a whole-second device time
+        against a sub-second host clock is what made every healthy device report
+        "-1s off" forever, and a permanent false alarm teaches people to skip
+        the line that would have shown them a real one.
+        """
+        device_time = proto._parse_iso(iso_text or "")
+        if device_time is None:
+            return
+        device.last_device_time = device_time
+        offset = (device_time
+                  - datetime.now().replace(microsecond=0)).total_seconds()
+        self._log_action("Clock checked", device=device.name,
+                         detail=f"{iso_text} (device {offset:+.0f}s vs host)",
+                         source="system")
+
     def _record_clock_sync(self, device, iso_text):
         device_time = proto._parse_iso(iso_text)
         device.last_sync_time = datetime.now()
         device.last_device_time = device_time
         if self.session is not None:
             self.session.log_clock_sync(device.name, device_time)
-        drift = ""
-        if device_time is not None:
-            offset = (device_time - device.last_sync_time).total_seconds()
-            drift = f" (device was {offset:+.0f}s off)"
         self._log_action("Clock synced", device=device.name,
-                         detail=f"{iso_text}{drift}", source="system")
+                         detail=iso_text, source="system")
 
     def _on_command_sent(self, device, command, ok, detail):
         if not ok:
@@ -1277,7 +1687,12 @@ class FEDTabWidget(QWidget):
             self._log_action(description, device=device.name, detail=command,
                              source=source, result="not connected")
             return False
-        device.link.send(command)
+        if not device.link.send(command):
+            # The link stopped between the is_connected check and the write.
+            self.log.append_log(f"[{device.name}] {command}: link closed", False)
+            self._log_action(description, device=device.name, detail=command,
+                             source=source, result="link closed")
+            return False
         self._log_action(description, device=device.name, detail=command,
                          source=source)
         return True
@@ -1337,9 +1752,32 @@ class FEDTabWidget(QWidget):
             self._execute_action(device, sched.ACTION_SET_MODE, params)
 
     def _dispense_all(self):
-        for device in self.devices:
-            if device.is_connected:
-                self._execute_action(device, sched.ACTION_DISPENSE, {})
+        """Deliver a pellet to every connected device, after asking.
+
+        Under a fixed-ratio protocol a pellet is meant to have been earned by a
+        poke. One delivered from here is written to the log as an ordinary
+        pellet row and is indistinguishable from an earned one afterwards, so
+        an accidental click silently contaminates every cage at once rather
+        than doing something visibly wrong.
+        """
+        targets = [d for d in self.devices if d.is_connected]
+        if not targets:
+            self._set_status("No connected devices to dispense to")
+            return
+        names = ", ".join(d.name for d in targets)
+        confirm = QMessageBox.question(
+            self, "Dispense to every device?",
+            f"Deliver one pellet to {len(targets)} device"
+            f"{'s' if len(targets) != 1 else ''}?\n\n{names}\n\n"
+            "These pellets are not earned by a poke, and the log will not "
+            "distinguish them from ones that were.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if confirm != QMessageBox.Yes:
+            self._log_action("Dispense to all devices", detail="cancelled",
+                             result="cancelled")
+            return
+        for device in targets:
+            self._execute_action(device, sched.ACTION_DISPENSE, {})
 
     def _toggle_global_lights(self):
         on = self.global_lights_btn.isChecked()
@@ -1358,15 +1796,16 @@ class FEDTabWidget(QWidget):
         for device in connected:
             self._send(device, command, "Raw command")
 
-    def _new_trial(self, device):
-        if not self._confirm(
-                f"Start a new trial on {device.name}?\n\n"
-                "This zeroes the device counters and starts a new CSV on its SD "
-                "card. Data already mirrored to the session folder is kept."):
-            return
-        self._start_new_trial(device)
-
     def _start_new_trial(self, device, source="user"):
+        """Roll the device onto a fresh SD log and zero its counters.
+
+        No longer a button. Starting a recording does this, so a session owns a
+        file boundary on the card without anyone having to remember a second
+        step; the scheduler can still do it mid-run for a daily boundary. It used
+        to be a red button in three places, competing with Start Recording to
+        mean "this is where my experiment begins" and agreeing with it only if
+        the user pressed both.
+        """
         ok = self._send(device, proto.CMD_NEW_TRIAL, "Start new trial", source)
         if ok:
             device.reset_counters()
@@ -1374,18 +1813,17 @@ class FEDTabWidget(QWidget):
             self._mark_plot_dirty()
         return ok
 
-    def _new_trial_all(self):
-        connected = [d for d in self.devices if d.is_connected]
-        if not connected:
-            QMessageBox.warning(self, "New trial", "No connected devices.")
-            return
-        if self._confirm(f"Start a new trial on all {len(connected)} device(s)?"):
-            for device in connected:
-                self._start_new_trial(device)
-
     # --- clock sync --------------------------------------------------------
 
     def _sync_device(self, device):
+        """Read the device clock, then set it.
+
+        STATUS goes first because it reports the RTC as it stands. The SYNCED
+        reply echoes the time the device was just adjusted to, so it can never
+        show drift; this reading is the only evidence over a multi-week run that
+        the clock is holding.
+        """
+        self._send(device, proto.CMD_STATUS, "Read clock", source="system")
         return self._send(device, proto.cmd_sync(), "Sync clock", source="system")
 
     def _sync_all(self):
@@ -1443,13 +1881,26 @@ class FEDTabWidget(QWidget):
             "devices": [d.to_state() for d in self.devices],
         })
 
+        # A resumed session is continuing an experiment that is already running:
+        # rolling its file and zeroing its counters mid-run is exactly the wrong
+        # thing. Only a genuinely new recording claims a fresh trial.
+        rolling = resume_root is None
         for device in self.devices:
-            self._attach_session_to_device(device)
+            self._attach_session_to_device(device, adopt_current=not rolling)
 
-        if self.webcam is not None:
-            self._arm_camera_recording()
+        if rolling:
+            for device in self.devices:
+                if device.is_connected:
+                    self._start_new_trial(device, source="system")
+                    # The reply names the new log; STATUS is the fallback for a
+                    # device that was mid-stream when NEW_TRIAL arrived.
+                    device.link.send(proto.CMD_STATUS)
+            # Give those replies time to land before the first pull, so it is
+            # scoped to the session's own file rather than the one it replaced.
+            QTimer.singleShot(NEW_TRIAL_SETTLE_MS, self._force_mirror_sync)
 
         self.record_btn.setText("Stop Recording")
+        self._refresh_recording_indicators()
         self.session_label.setText(f"Recording to {self.session.name}")
         self.session_label.setStyleSheet("color: #4caf50;")
         self.open_folder_btn.setEnabled(True)
@@ -1458,25 +1909,49 @@ class FEDTabWidget(QWidget):
         self._save_state()
         return True
 
-    def _attach_session_to_device(self, device):
-        """Give a device its event log and SD mirror for the active session."""
+    def _refresh_recording_indicators(self):
+        """Show on each card whether its data is actually being written."""
+        for device in self.devices:
+            recording = (self.session is not None
+                         and device.is_connected
+                         and device.event_log is not None)
+            device.rec_label.setText("\u25cf RECORDING" if recording else "")
+
+    def _attach_session_to_device(self, device, adopt_current=True):
+        """Give a device its event log and SD mirror for the active session.
+
+        ``adopt_current`` is False when the caller is about to roll the device
+        onto a new log. The file it is writing *now* belongs to whatever ran
+        before this session, and claiming it here would both put pre-session data
+        in the session folder and spend the first pull on it.
+        """
         if self.session is None:
             return
         device.event_log = session_mod.DeviceEventLog(
             self.session.device_events_path(device.name), device.name)
         if device.transfer is not None and device.mirror is None:
             device.mirror = DeviceMirror(
-                device.transfer, self.session.device_mirror_dir(device.name),
+                device.transfer,
+                self.session.device_mirror_dir(device.name),
+                session_mod.device_archive_dir(self.sessions_dir, device.name),
                 parent=self)
+            if adopt_current:
+                device.mirror.adopt_current_file(device.current_file)
             device.mirror.progress.connect(self.mirror_status.setText)
             device.mirror.failed.connect(
                 lambda message, d=device: self._on_mirror_failed(d, message))
             device.mirror.updated.connect(
-                lambda name, added, total, d=device:
-                self._log_action("Mirrored SD data", device=d.name,
-                                 detail=f"{name}: +{added} bytes ({total} total)",
-                                 source="system"))
-            device.mirror.sync_now(force=True)
+                lambda name, added, total, d=device: self._on_mirror_updated(
+                    d, name, added, total))
+            if adopt_current:
+                device.mirror.sync_now(force=True)
+
+    def _on_mirror_updated(self, device, name, added, total):
+        """Record that this device's data reached disk, and when."""
+        device.last_mirror_update = datetime.now()
+        self._log_action("Mirrored SD data", device=device.name,
+                         detail=f"{name}: +{added} bytes ({total} total)",
+                         source="system")
 
     def _on_mirror_failed(self, device, message):
         self.mirror_status.setText(message)
@@ -1487,27 +1962,68 @@ class FEDTabWidget(QWidget):
     def _stop_session(self):
         if self.session is None:
             return
-        frames = 0
-        if self.webcam is not None:
-            frames = self.webcam.stop_recording()
+
+        # Wait for the final pull instead of firing and forgetting it. The
+        # previous version requested a sync and immediately dropped the mirror,
+        # so the last few kilobytes written to the SD card between the previous
+        # pull and the stop button were never copied to the session folder.
+        self._drain_mirrors()
 
         for device in self.devices:
             if device.mirror is not None:
-                device.mirror.sync_now(force=True)   # last pull before closing
-                device.mirror.stop()
-                device.mirror = None
+                mirror, device.mirror = device.mirror, None
+                mirror.stop()
+                mirror.deleteLater()
             device.event_log = None
+        self._refresh_recording_indicators()
 
-        self._log_action("Recording stopped",
-                         detail=f"{frames} video frames" if frames else "",
-                         source="system")
+        self._log_action("Recording stopped", source="system")
         self.session.mark_closed()
         self.logger.detach()
 
         self.record_btn.setText("Start Recording")
         self.session_label.setText(f"Last session: {self.session.name}")
         self.session_label.setStyleSheet("color: #999999;")
+        # Kept so the button the label points at still opens something: it stayed
+        # enabled after a stop while _open_session_folder returned silently.
+        self.last_session_root = self.session.root
         self.session = None
+
+    def _drain_mirrors(self, timeout_ms=FINAL_PULL_TIMEOUT_MS):
+        """Run one last SD pull on every mirror and wait for it to land.
+
+        Bounded: a device that has gone unresponsive must not be able to block
+        the stop button. Anything not pulled stays on the SD card and is picked
+        up by the next session's mirror, which resumes from the recorded offset.
+        """
+        mirrors = [d.mirror for d in self.devices if d.mirror is not None]
+        if not mirrors:
+            return
+
+        self.mirror_status.setText("Finishing final SD pull...")
+        for mirror in mirrors:
+            mirror.sync_now(force=True)
+
+        loop = QEventLoop()
+        deadline = QTimer(self)
+        deadline.setSingleShot(True)
+        deadline.timeout.connect(loop.quit)
+        poll = QTimer(self)
+        poll.timeout.connect(
+            lambda: loop.quit() if not any(m.busy for m in mirrors) else None)
+        deadline.start(timeout_ms)
+        poll.start(200)
+        try:
+            loop.exec_()
+        finally:
+            poll.stop()
+            deadline.stop()
+
+        if any(m.busy for m in mirrors):
+            self._log_action(
+                "Final SD pull timed out", source="system", result="warn",
+                detail=f"still running after {timeout_ms // 1000}s; "
+                       f"remaining data stays on the SD card")
 
     def _save_state(self):
         """Persist everything needed to resume after a crash."""
@@ -1517,8 +2033,6 @@ class FEDTabWidget(QWidget):
             "status": session_mod.STATUS_RUNNING,
             "devices": [d.to_state() for d in self.devices],
             "scheduled_events": self.scheduler.to_list(),
-            "camera_index": self.camera_combo.currentData(),
-            "camera_recording": self.webcam is not None and self.webcam.is_recording(),
             "auto_sync": self.auto_sync_btn.isChecked(),
         })
 
@@ -1547,12 +2061,15 @@ class FEDTabWidget(QWidget):
 
         for entry in state.get("devices") or []:
             device = self.add_device_slot(slot_num=entry.get("slot_num"), refresh=False)
-            device.name_edit.setText(entry.get("name", ""))
-            device.last_known_name = device.name
-            device.view_title.setText(device.name)
-            device.saved_port = entry.get("port", "")
             device.device_id = entry.get("device_id")
             device.firmware = entry.get("firmware")
+            # The label, not the resolved name: restoring "FED 4" into the
+            # override field would freeze the default in place as a user label.
+            device.name_edit.setText(entry.get("label", ""))
+            device.last_known_name = device.name
+            device.box.setTitle(device.name)
+            device.name_edit.setPlaceholderText(device.default_name)
+            device.saved_port = entry.get("port", "")
             device.mode_combo.setCurrentText(entry.get("mode", proto.MODE_LABELS[0]))
             device.params.set_values(entry.get("ratio", 1), entry.get("timeout", 30))
             device.stats = dict(entry.get("stats") or device.stats)
@@ -1601,9 +2118,9 @@ class FEDTabWidget(QWidget):
             self._log_action("Session location changed", detail=chosen)
 
     def _open_session_folder(self):
-        if self.session is None:
+        path = self.session.root if self.session else self.last_session_root
+        if not path:
             return
-        path = self.session.root
         if sys.platform == "darwin":
             subprocess.Popen(["open", path])
         elif os.name == "nt":
@@ -1611,80 +2128,6 @@ class FEDTabWidget(QWidget):
         else:
             subprocess.Popen(["xdg-open", path])
 
-    # ==================================================================
-    # Camera
-    # ==================================================================
-
-    def _populate_cameras(self):
-        try:
-            cameras = list_cameras()
-        except Exception as exc:  # noqa: BLE001
-            self.log.append_log(f"Camera scan failed: {exc}", False)
-            cameras = []
-        self.camera_combo.clear()
-        for index in cameras:
-            self.camera_combo.addItem(f"Camera {index}", index)
-        if not cameras:
-            self.camera_combo.addItem("No camera detected", None)
-
-    def _toggle_camera(self):
-        if self.webcam is not None:
-            self._stop_camera()
-            return
-        index = self.camera_combo.currentData()
-        if index is None:
-            QMessageBox.warning(self, "Camera", "No camera was detected.")
-            return
-
-        self.webcam = WebcamRecorder(camera_index=index,
-                                     label=self.camera_combo.currentText())
-        self.webcam.frame_ready.connect(self._on_camera_frame)
-        self.webcam.opened.connect(self._on_camera_opened)
-        self.webcam.error.connect(self._on_camera_error)
-        self.webcam.start()
-
-        self.camera_btn.setText("Stop Camera")
-        self.camera_combo.setEnabled(False)
-        self.camera_view.setVisible(True)
-        self._log_action("Camera started", detail=self.camera_combo.currentText())
-
-        if self.session is not None:
-            self._arm_camera_recording()
-
-    def _arm_camera_recording(self):
-        label = self.webcam.label
-        self.webcam.start_recording(self.session.video_path(label),
-                                    self.session.video_frames_path(label))
-        self._log_action("Camera recording armed", detail=label, source="system")
-
-    def _stop_camera(self):
-        if self.webcam is None:
-            return
-        frames = self.webcam.stop_recording()
-        self.webcam.stop()
-        if not self.webcam.wait(3000):      # a blocked camera read needs forcing
-            self.webcam.terminate()
-            self.webcam.wait(1000)
-        self.webcam = None
-
-        self.camera_btn.setText("Start Camera")
-        self.camera_combo.setEnabled(True)
-        self.camera_view.setPixmap(QPixmap())
-        self.camera_view.setText("Camera off")
-        self.camera_view.setVisible(False)
-        self.camera_status.setText("Camera off")
-        self._log_action("Camera stopped", detail=f"{frames} frames recorded")
-
-    def _on_camera_frame(self, image):
-        self.camera_view.setPixmap(QPixmap.fromImage(image).scaled(
-            self.camera_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def _on_camera_opened(self, width, height, fps):
-        self.camera_status.setText(f"Camera on: {width}x{height} @ {fps:.0f} fps")
-
-    def _on_camera_error(self, message):
-        self._stop_camera()
-        QMessageBox.critical(self, "Camera error", message)
 
     # ==================================================================
     # Export
@@ -1734,7 +2177,10 @@ class FEDTabWidget(QWidget):
         def cancel():
             state["cancelled"] = True
             for device in available:
-                device.transfer.cancel("export cancelled")
+                # A device that dropped since the export started has had its
+                # transfer torn down by _disconnect_device.
+                if device.transfer is not None:
+                    device.transfer.cancel("export cancelled")
 
         progress.canceled.connect(cancel)
 
@@ -1746,6 +2192,11 @@ class FEDTabWidget(QWidget):
                 self._choose_and_download(listings)
                 return
             device = available[index]
+            if device.transfer is None:
+                self.log.append_log(
+                    f"[{device.name}] disconnected; skipped in export", False)
+                query(index + 1)
+                return
             progress.setLabelText(f"Listing files on {device.name}...")
             progress.setValue(index)
 
@@ -1792,7 +2243,8 @@ class FEDTabWidget(QWidget):
         def cancel():
             state["cancelled"] = True
             for device, _ in selected:
-                device.transfer.cancel("download cancelled")
+                if device.transfer is not None:
+                    device.transfer.cancel("download cancelled")
 
         progress.canceled.connect(cancel)
 
@@ -1809,6 +2261,11 @@ class FEDTabWidget(QWidget):
                 return
 
             device, filename = selected[index]
+            if device.transfer is None:
+                self.log.append_log(
+                    f"[{device.name}] disconnected; {filename} not exported", False)
+                download(index + 1)
+                return
             progress.setLabelText(
                 f"{filename} from {device.name} ({index + 1}/{len(selected)})")
             progress.setValue(index)
@@ -1862,14 +2319,157 @@ class FEDTabWidget(QWidget):
         self.sync_timer.timeout.connect(self._sync_all)
         self.sync_timer.start(self._sync_interval_ms())
 
+        # The plot is expensive and slow-moving; it gets its own, slower timer
+        # rather than riding the 1 Hz countdown tick.
+        self.plot_timer = QTimer(self)
+        self.plot_timer.timeout.connect(self._on_plot_tick)
+        self.plot_timer.start(PLOT_TICK_MS)
+
+        self.heartbeat_timer = QTimer(self)
+        self.heartbeat_timer.timeout.connect(self._check_heartbeats)
+        self.heartbeat_timer.start(HEARTBEAT_TICK_MS)
+
     def _on_ui_tick(self):
         self._run_due_events()
         self._tick_scheduler_display()
+        self._refresh_readouts()
+        # Cheap, and genuinely clock-dependent: a delay-based trigger resolves
+        # relative to now, so a frozen preview would misstate when it fires.
         self._update_sched_preview()
-        # Redraw on a timer rather than per event: a pellet burst would otherwise
-        # queue a full matplotlib redraw per pellet.
+
+    # ------------------------------------------------------------ readouts
+
+    @staticmethod
+    def _age(moment, now):
+        """"4s", "12m", "3h 20m" — how long ago, at a glance."""
+        if moment is None:
+            return None
+        seconds = int((now - moment).total_seconds())
+        if seconds < 0:
+            return "0s"
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        hours, minutes = divmod(seconds // 60, 60)
+        if hours < 24:
+            return f"{hours}h {minutes:02d}m"
+        return f"{hours // 24}d {hours % 24}h"
+
+    def _device_summary(self, device, now):
+        """One line answering "is this cage still working?".
+
+        Counters alone cannot: a device that stopped feeding an hour ago shows
+        exactly the same numbers as one that fed a minute ago. The time since
+        the last pellet is what separates them.
+        """
+        if not device.is_connected:
+            return "\u2014"
+
+        today = now.date()
+        parts = [f"{sum(1 for e in device.events if e.date() == today)} today",
+                 f"{device.stats['pellet']} total"]
+
+        last = self._age(device.events[-1] if device.events else None, now)
+        parts.append(f"last pellet {last} ago" if last else "no pellets yet")
+
+        if device.mirror is not None:
+            mirrored = self._age(device.last_mirror_update, now)
+            parts.append(f"mirrored {mirrored} ago" if mirrored
+                         else "mirror pending")
+        return "  \u00b7  ".join(parts)
+
+    def _refresh_readouts(self):
+        """Keep the card summaries, the fleet line and the section headers current."""
+        now = datetime.now()
+        for device in self.devices:
+            summary = self._device_summary(device, now)
+            if device.stats_label.text() != summary:
+                device.stats_label.setText(summary)
+
+        connected = [d for d in self.devices if d.is_connected]
+        recording = [d for d in connected if d.mirror is not None]
+        if not self.devices:
+            fleet = "No devices connected"
+        else:
+            fleet = (f"{len(connected)} of {len(self.devices)} connected")
+            if recording:
+                fleet += f"  \u00b7  {len(recording)} recording"
+            silent = [d for d in connected if d.refused or d.reconnect_gave_up]
+            if silent:
+                fleet += f"  \u00b7  {len(silent)} needs attention"
+        self.fleet_status.setText(fleet)
+        self.fleet_status.setStyleSheet(
+            "color: %s; font-size: 11px;"
+            % ("#4caf50" if connected and len(connected) == len(self.devices)
+               else "#999999"))
+
+        pending = [e for e in self.scheduler.events
+                   if e.enabled and e.status == sched.STATUS_PENDING
+                   and e.target_time is not None]
+        if not self.scheduler.events:
+            summary = "no events scheduled"
+        elif pending:
+            soonest = min(pending, key=lambda e: e.target_time)
+            summary = (f"next: {soonest.describe_action()} on "
+                       f"{soonest.target} {soonest.describe_trigger(now)}")
+            if len(pending) > 1:
+                summary += f"  \u00b7  {len(pending) - 1} more pending"
+        else:
+            summary = f"{len(self.scheduler.events)} events, none pending"
+        self.scheduler_section.set_summary(summary)
+
+    def _on_plot_tick(self):
+        """Redraw only when something changed, or when a live trace must advance.
+
+        The previous version redrew whenever *any* device was tracking, which
+        meant a full matplotlib re-render every second for the whole length of a
+        multi-day session — the single biggest reason the tab felt sluggish.
+        A live trace only needs redrawing to extend its "time since last pellet"
+        line, which is legible at this cadence.
+        """
         if self._plot_dirty or any(d.is_tracking for d in self.devices):
             self._redraw_plot()
+
+    # ------------------------------------------------------------ liveness
+
+    def _check_heartbeats(self):
+        """Detect a device that has stopped talking without dropping the port.
+
+        A wedged SAMD21 USB stack leaves the port open and readable, so nothing
+        in the serial layer errors: FNT goes on showing "Connected" while the
+        device answers nothing. PING is answered by every firmware, so an
+        unanswered one is unambiguous.
+        """
+        for device in self.devices:
+            if not device.is_connected:
+                device.awaiting_pong_since = None
+                continue
+            # Activity of any kind, including an SD transfer, proves liveness.
+            if device.transfer is not None and device.transfer.busy:
+                device.awaiting_pong_since = None
+                continue
+
+            idle = device.link.seconds_since_rx()
+            if device.awaiting_pong_since is not None:
+                if idle < HEARTBEAT_IDLE_S:
+                    device.awaiting_pong_since = None       # it answered
+                elif (session_mod.host_now() - device.awaiting_pong_since
+                        > HEARTBEAT_GRACE_S):
+                    device.awaiting_pong_since = None
+                    self.log.append_log(
+                        f"[{device.name}] no response to PING after "
+                        f"{HEARTBEAT_GRACE_S}s — recycling the connection", False)
+                    self._log_action(
+                        "Device unresponsive", device=device.name,
+                        detail=f"silent for {idle:.0f}s, PING unanswered",
+                        source="system", result="failed")
+                    # Reconnecting reopens the port, which resets the device's
+                    # USB session and is what actually clears the wedge.
+                    self._connect_device(device)
+            elif idle > HEARTBEAT_IDLE_S:
+                device.awaiting_pong_since = session_mod.host_now()
+                device.link.send(proto.CMD_PING)
 
     def _mark_plot_dirty(self):
         self._plot_dirty = True
@@ -1894,56 +2494,15 @@ class FEDTabWidget(QWidget):
             self.dark_cycle_check.isChecked())
         self._mark_plot_dirty()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._apply_responsive_layout()
-
-    def _apply_responsive_layout(self):
-        """Two columns when wide, a single stack when narrow."""
-        is_narrow = self.width() < NARROW_WIDTH
-        if is_narrow == self._layout_is_narrow:
-            return
-        self._layout_is_narrow = is_narrow
-
-        for widget in (self.control_group, self.scheduler_group, self.devices_group,
-                       self.left_column, self.right_column):
-            self.columns_layout.removeWidget(widget)
-        for layout, widget in ((self.left_column_layout, self.control_group),
-                               (self.left_column_layout, self.scheduler_group),
-                               (self.right_column_layout, self.devices_group)):
-            layout.removeWidget(widget)
-
-        if is_narrow:
-            self.left_column.hide()
-            self.right_column.hide()
-            for row, widget in enumerate(
-                    (self.control_group, self.scheduler_group, self.devices_group)):
-                self.columns_layout.addWidget(widget, row, 0)
-                widget.show()
-            self.columns_layout.setColumnStretch(0, 1)
-            self.columns_layout.setColumnStretch(1, 0)
-        else:
-            self.left_column_layout.addWidget(self.control_group)
-            self.left_column_layout.addWidget(self.scheduler_group)
-            self.right_column_layout.addWidget(self.devices_group)
-            self.columns_layout.addWidget(self.left_column, 0, 0)
-            self.columns_layout.addWidget(self.right_column, 0, 1)
-            for widget in (self.left_column, self.right_column, self.control_group,
-                           self.scheduler_group, self.devices_group):
-                widget.show()
-            self.columns_layout.setColumnStretch(0, 1)
-            self.columns_layout.setColumnStretch(1, 1)
-
-    def cleanup(self):
+    def cleanup(self):  # noqa: D401
         """Close every connection, timer and file before the window goes away."""
         self.log.append_log("Shutting down FED3 tab...")
-        for name in ("ui_timer", "reconnect_timer", "state_timer", "sync_timer"):
+        for name in ("ui_timer", "reconnect_timer", "state_timer", "sync_timer",
+                     "plot_timer", "heartbeat_timer"):
             timer = getattr(self, name, None)
             if timer is not None:
                 timer.stop()
 
-        if self.webcam is not None:
-            self._stop_camera()
         if self.session is not None:
             self._stop_session()
 
@@ -2035,17 +2594,24 @@ def _sync_mode_params(mode_combo, params):
     params.show_fields(proto.mode_fields(mode_combo.currentText()))
 
 
-def _status_item(event):
-    item = QTableWidgetItem(event.status if event.enabled else sched.STATUS_DISABLED)
-    colors = {
-        sched.STATUS_DONE: "#2ecc71",
-        sched.STATUS_FAILED: "#e74c3c",
-        sched.STATUS_MISSED: "#e67e22",
-        sched.STATUS_PENDING: "#bbbbbb",
-    }
+STATUS_COLORS = {
+    sched.STATUS_DONE: "#2ecc71",
+    sched.STATUS_FAILED: "#e74c3c",
+    sched.STATUS_MISSED: "#e67e22",
+    sched.STATUS_PENDING: "#bbbbbb",
+}
+
+
+def _style_status_item(item, event):
+    """Set a status cell's text and colour from an event."""
+    item.setText(event.status if event.enabled else sched.STATUS_DISABLED)
     item.setForeground(QBrush(QColor(
-        colors.get(event.status, "#888888") if event.enabled else "#666666")))
+        STATUS_COLORS.get(event.status, "#888888") if event.enabled else "#666666")))
     return item
+
+
+def _status_item(event):
+    return _style_status_item(QTableWidgetItem(), event)
 
 
 def _section_label(text):
@@ -2057,13 +2623,18 @@ def _section_label(text):
 
 
 def _row(*widgets):
+    """A horizontal strip. ``None`` places a stretch; one is appended if absent."""
     container = QWidget()
     layout = QHBoxLayout(container)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
     for widget in widgets:
-        layout.addWidget(widget)
-    layout.addStretch()
+        if widget is None:
+            layout.addStretch()
+        else:
+            layout.addWidget(widget)
+    if None not in widgets:
+        layout.addStretch()
     return container
 
 
