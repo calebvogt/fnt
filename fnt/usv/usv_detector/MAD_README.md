@@ -239,10 +239,21 @@ of the project's `source_folders`. A candidate is accepted only if the size — 
 the fingerprint, when known — matches, so a same-named different recording is
 never silently swapped in.
 
-When automatic resolution fails, **File ▸ Locate Missing Recordings…** asks for
-one file and infers the prefix change from it (`D:/exp/mic2/a.wav` →
-`E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`), then repoints every sibling
-that moved the same way. Fix one, fix two hundred. Prefix matching compares whole
+When automatic resolution fails, **File ▸ Locate Missing Recordings…** (or
+double-clicking a flagged row) offers two strategies:
+
+- **Pick the file…** — infers the prefix change from one file
+  (`D:/exp/mic2/a.wav` → `E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`) and
+  repoints every sibling that moved the same way. Fix one, fix two hundred.
+- **Search a folder…** — walks a folder and its subfolders, matching by name and
+  then verifying size and fingerprint. Use this when the tree was *reorganized*
+  rather than moved as a unit, which no single prefix change can describe.
+
+When a recording legitimately exists in more than one place with identical audio
+(a working copy and an archive), content cannot tell them apart — so the search
+prefers the candidate whose folder structure most resembles where the entry used
+to live. This matters because labels are *sibling* files: picking the wrong copy
+would silently swap in a different label set. Prefix matching compares whole
 path components, so a neighbouring `exp_backup/` tree is never dragged along, and
 only files that are *currently missing* and whose rewritten path *exists* are
 changed — a wrong guess is a no-op.

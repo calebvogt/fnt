@@ -25,7 +25,7 @@ import hashlib
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 
 # Bytes read from each end of the file for the content fingerprint. Wav headers
@@ -152,18 +152,7 @@ def resolve_entries(
         still: List[RegisteredFile] = []
         for e in unresolved:
             cand = os.path.join(d, e.basename)
-            if not os.path.isfile(cand):
-                still.append(e)
-                continue
-            try:
-                if e.size and os.path.getsize(cand) != e.size:
-                    still.append(e)
-                    continue
-            except OSError:
-                still.append(e)
-                continue
-            if (verify_fingerprint and e.fingerprint
-                    and file_fingerprint(cand) != e.fingerprint):
+            if not _accepts(e, cand, verify_fingerprint):
                 still.append(e)
                 continue
             out[e.path] = os.path.abspath(cand)
@@ -185,6 +174,97 @@ def _is_under(path: str, prefix: str) -> bool:
     if p == q:
         return True
     return p.startswith(q + os.sep) or p.startswith(q + '/')
+
+
+def _accepts(entry: 'RegisteredFile', candidate: str,
+             verify_fingerprint: bool = True) -> bool:
+    """Is ``candidate`` the same recording as ``entry``?
+
+    Size first (cheap), then the content fingerprint when both are known. A
+    same-named different recording is never accepted silently — that would
+    repoint a project at the wrong audio, which is far worse than leaving the
+    row flagged.
+    """
+    if not os.path.isfile(candidate):
+        return False
+    try:
+        if entry.size and os.path.getsize(candidate) != entry.size:
+            return False
+    except OSError:
+        return False
+    if verify_fingerprint and entry.fingerprint:
+        return file_fingerprint(candidate) == entry.fingerprint
+    return True
+
+
+def _shared_tail(a: str, b: str) -> int:
+    """How many trailing path components two paths have in common."""
+    pa = Path(os.path.abspath(a)).parts
+    pb = Path(os.path.abspath(b)).parts
+    n = 0
+    while (n < min(len(pa), len(pb))
+           and os.path.normcase(pa[-1 - n]) == os.path.normcase(pb[-1 - n])):
+        n += 1
+    return n
+
+
+def index_tree_by_basename(
+    root: str, suffixes: Sequence[str] = ('.wav',),
+    progress: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, List[str]]:
+    """``{lowercased basename: [paths]}`` for every matching file under ``root``.
+
+    One walk, reused for every missing entry — the alternative is re-walking a
+    large tree per file, which on a network share is the difference between
+    seconds and minutes.
+    """
+    idx: Dict[str, List[str]] = {}
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
+        for fn in filenames:
+            if fn.lower().endswith(tuple(suffixes)) and not fn.startswith('.'):
+                idx.setdefault(os.path.normcase(fn), []).append(
+                    os.path.join(dirpath, fn))
+                n += 1
+        if progress is not None:
+            progress(n, dirpath)
+    return idx
+
+
+def resolve_in_tree(
+    entries: Sequence['RegisteredFile'], root: str,
+    verify_fingerprint: bool = True,
+    progress: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, str]:
+    """Find missing entries anywhere under ``root``, by name then content.
+
+    Complements :func:`remap_prefix`, which needs the tree to have moved as a
+    unit. This handles the case where recordings were reorganized, split across
+    subfolders, or renamed around — the user points at a folder and says "it is
+    somewhere in here".
+
+    Returns ``{old_path: found_path}`` for entries that were resolved; entries
+    already present, or with no acceptable match, are simply absent.
+    """
+    missing = [e for e in entries if not e.exists()]
+    if not missing or not root or not os.path.isdir(root):
+        return {}
+    idx = index_tree_by_basename(root, progress=progress)
+    out: Dict[str, str] = {}
+    for e in missing:
+        cands = idx.get(os.path.normcase(e.basename), ())
+        # A recording can legitimately exist in more than one place (a working
+        # copy and an archive, say) with byte-identical audio, so the content
+        # check cannot separate them. Prefer the candidate sitting in the most
+        # similar location to where this entry used to live: MAD's labels are
+        # sibling files, so picking the wrong copy silently swaps in a different
+        # label set. Walk order is not a defensible tiebreak.
+        for cand in sorted(cands, key=lambda c: -_shared_tail(e.path, c)):
+            if _accepts(e, cand, verify_fingerprint):
+                out[e.path] = os.path.abspath(cand)
+                break
+    return out
 
 
 def remap_prefix(entries: Sequence[RegisteredFile],

@@ -3854,6 +3854,7 @@ class MADMainWindow(QMainWindow):
             "Click a row to preview and label it. The count is "
             "(accepted, pending, rejected) calls for that recording.")
         self.file_list.currentRowChanged.connect(self._on_file_selected)
+        self.file_list.itemDoubleClicked.connect(self._on_file_double_clicked)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
         vbox.addWidget(self.file_list)
 
@@ -8409,17 +8410,35 @@ class MADMainWindow(QMainWindow):
         return (os.path.normcase(os.path.abspath(path))
                 in getattr(self, '_missing_audio', set()))
 
-    def _locate_missing_recordings(self):
-        """Point the project at one relocated recording, then repoint every
-        sibling that moved with it.
+    def _on_file_double_clicked(self, item):
+        """Double-click a row. On a ⚠ row that means "help me find this file",
+        which is the obvious gesture and saves hunting through the File menu."""
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        if path and self._is_missing(path):
+            self._locate_missing_recordings(focus_path=path)
 
-        Recordings move as whole trees, so deducing the prefix change from a
-        single file and applying it in bulk is what keeps referencing cheap —
-        fix one, fix all of them."""
+    def _locate_missing_recordings(self, focus_path: Optional[str] = None):
+        """Repoint recordings whose audio has moved.
+
+        Two strategies, because moves come in two shapes:
+
+        * **Pick the file** — recordings usually move as a whole tree, so the
+          prefix change deduced from one file repoints every sibling that moved
+          with it. Fix one, fix hundreds.
+        * **Search a folder** — when the tree was reorganized rather than moved,
+          walk a folder recursively and match by name, then verify by size and
+          content fingerprint so a same-named different recording is never
+          silently swapped in.
+
+        ``focus_path`` names the row the user double-clicked, so the prompt talks
+        about the file they actually pointed at.
+        """
         if self._project is None:
             return
         from fnt.usv.usv_detector.mad_registry import (
-            infer_prefix_change, remap_prefix, resolve_entries)
+            infer_prefix_change, remap_prefix, resolve_entries, resolve_in_tree)
         entries = self._project.audio_entries()
         missing = [e for e in entries if not e.exists()]
         if not missing:
@@ -8427,34 +8446,92 @@ class MADMainWindow(QMainWindow):
                 self, "Locate Recordings",
                 "Every recording in this project was found.")
             return
+        # Lead with the row the user clicked, when there is one.
         first = missing[0]
-        QMessageBox.information(
-            self, "Locate Recordings",
-            f"{len(missing)} recording(s) are missing.\n\n"
-            f"Pick the new location of:\n    {first.basename}\n\n"
-            "Every other missing file that moved the same way will be "
-            "repointed automatically.")
-        new_path, _ = QFileDialog.getOpenFileName(
-            self, f"Locate {first.basename}",
-            self._default_browse_dir(), "WAV files (*.wav)")
-        if not new_path:
+        if focus_path:
+            key = os.path.normcase(os.path.abspath(focus_path))
+            for e in missing:
+                if os.path.normcase(os.path.abspath(e.path)) == key:
+                    first = e
+                    break
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Locate Recordings")
+        box.setText(f"{len(missing)} recording(s) can't be found.")
+        box.setInformativeText(
+            f"<b>{first.basename}</b><br><br>"
+            "<b>Pick the file…</b> — best when the recordings moved together; "
+            "every sibling that moved the same way is repointed too.<br><br>"
+            "<b>Search a folder…</b> — best when things were reorganized; MAD "
+            "walks the folder and its subfolders and matches by name, then "
+            "verifies the contents before accepting a match.")
+        b_file = box.addButton("Pick the file…", QMessageBox.AcceptRole)
+        b_dir = box.addButton("Search a folder…", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_dir if len(missing) > 1 else b_file)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
             return
-        old_path = first.path
-        first.path = os.path.abspath(new_path)
-        first.basename = os.path.basename(new_path)
-        fixed = 1
-        change = infer_prefix_change(old_path, new_path)
-        if change:
-            fixed += remap_prefix(entries, change[0], change[1])
-        # Second pass: anything still missing may live beside a file we just
-        # fixed, so re-run the normal resolver over the updated set.
+
+        fixed = 0
+        if clicked is b_file:
+            new_path, _ = QFileDialog.getOpenFileName(
+                self, f"Locate {first.basename}",
+                self._default_browse_dir(), "WAV files (*.wav)")
+            if not new_path:
+                return
+            old_path = first.path
+            first.path = os.path.abspath(new_path)
+            first.basename = os.path.basename(new_path)
+            fixed = 1
+            change = infer_prefix_change(old_path, new_path)
+            if change:
+                fixed += remap_prefix(entries, change[0], change[1])
+        else:
+            root = QFileDialog.getExistingDirectory(
+                self, "Search this folder (and subfolders) for the recordings",
+                self._default_browse_dir())
+            if not root:
+                return
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+
+            def _scan(n, where):
+                self.status_bar.showMessage(
+                    f"Searching {root} — {n:,} wav(s) seen…")
+                QApplication.processEvents()
+
+            try:
+                found = resolve_in_tree(entries, root, progress=_scan)
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.status_bar.clearMessage()
+            by_path = {os.path.normcase(os.path.abspath(e.path)): e
+                       for e in entries}
+            for old, new in found.items():
+                e = by_path.get(os.path.normcase(os.path.abspath(old)))
+                if e is not None:
+                    e.path = new
+                    e.basename = os.path.basename(new)
+                    fixed += 1
+            if not fixed:
+                QMessageBox.information(
+                    self, "Locate Recordings",
+                    f"No matching recordings were found under:\n{root}\n\n"
+                    "Names are matched first, then the file's size and content "
+                    "are checked — a same-named file with different audio is "
+                    "not accepted.")
+                return
+
+        # Anything still missing may now live beside a file we just fixed.
         resolved = resolve_entries(
             entries, extra_roots=list(self._project.source_folders or []))
         for e in entries:
-            found = resolved.get(e.path)
-            if found and os.path.normcase(found) != os.path.normcase(e.path):
-                e.path = found
-                e.basename = os.path.basename(found)
+            found_p = resolved.get(e.path)
+            if found_p and os.path.normcase(found_p) != os.path.normcase(e.path):
+                e.path = found_p
+                e.basename = os.path.basename(found_p)
                 fixed += 1
         self._project.set_audio_entries(entries)
         self._project.save()
@@ -8464,8 +8541,8 @@ class MADMainWindow(QMainWindow):
         QMessageBox.information(
             self, "Locate Recordings",
             f"Relocated {fixed} recording(s)."
-            + (f"\n\n{still} still missing — run this again to fix another "
-               "group that moved somewhere else." if still else ""))
+            + (f"\n\n{still} still missing — run this again and point at "
+               "another location." if still else ""))
 
     def _pack_project(self):
         """Copy every referenced recording into the project (recordings/).
