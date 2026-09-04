@@ -36,7 +36,16 @@ except Exception:
 
 
 LABEL_SUFFIX = "_FNT_MAD_labels.png"
-PRED_SUFFIX = "_FNT_MAD_predictions.csv"
+
+#: The per-wav call table. Named "annotations" because that is what it holds:
+#: hand-drawn labels and reviewed decisions sit in it alongside model output,
+#: and a file called "predictions" misdescribes most of its rows.
+ANNOT_SUFFIX = "_FNT_MAD_annotations.csv"
+#: What the same file was called before. Still read, never written for a new
+#: recording — see :func:`annotations_csv_sibling_path`.
+LEGACY_PRED_SUFFIX = "_FNT_MAD_predictions.csv"
+#: Back-compat alias for callers that imported the old constant.
+PRED_SUFFIX = LEGACY_PRED_SUFFIX
 PRED_MASK_SUFFIX = "_FNT_MAD_predictions.png"
 
 
@@ -66,12 +75,31 @@ def clear_all_pred_csv_overrides() -> None:
     _PRED_CSV_OVERRIDES.clear()
 
 
-def pred_csv_sibling_path(wav_path: str) -> str:
+def annotations_csv_sibling_path(wav_path: str) -> str:
+    """The per-wav annotations CSV for ``wav_path``.
+
+    New recordings get ``_FNT_MAD_annotations.csv``. A recording that already
+    has the old ``_FNT_MAD_predictions.csv`` beside it keeps using that file:
+    projects made before the rename hold thousands of them, and silently
+    starting a second table next to an existing one would split a recording's
+    calls across two files with neither being complete. Renaming on disk is a
+    separate, explicit step — not something a path lookup should do.
+    """
     ov = _PRED_CSV_OVERRIDES.get(_os.path.normpath(wav_path))
     if ov is not None:
         return ov
     stem = Path(wav_path).stem
-    return str(Path(wav_path).with_name(stem + PRED_SUFFIX))
+    current = Path(wav_path).with_name(stem + ANNOT_SUFFIX)
+    if current.exists():
+        return str(current)
+    legacy = Path(wav_path).with_name(stem + LEGACY_PRED_SUFFIX)
+    if legacy.exists():
+        return str(legacy)
+    return str(current)
+
+
+#: Back-compat alias — the name most call sites still use.
+pred_csv_sibling_path = annotations_csv_sibling_path
 
 
 def pred_mask_sibling_path(wav_path: str) -> str:

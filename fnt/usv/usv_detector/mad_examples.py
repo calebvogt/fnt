@@ -282,13 +282,23 @@ def migrate_legacy_to_h5(dataset_dir: str) -> int:
 # ----------------------------------------------------------------------
 # Per-file annotations (one object per saved example)
 # ----------------------------------------------------------------------
-def _examples_to_annotations(examples, wav_name, grid_shape):
-    """Shared: convert example dicts into annotation dicts clipped to *grid_shape*."""
+def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
+    """Shared: convert example dicts into annotation dicts clipped to *grid_shape*.
+
+    ``kinds`` selects which example kinds to emit. It matters because a demoted
+    ``'rejected'`` example still carries a real mask -- that is the whole point
+    of demoting rather than deleting -- so unlike a ``'negative'`` it would not
+    be filtered out by the empty-mask check below, and would otherwise come back
+    as a confirmed call.
+    """
+    from . import fnt_mask_store as _ms
     n_freq, n_time = grid_shape
     target = Path(str(wav_name)).name
     for ex in examples:
         meta = ex["meta"]
         if Path(str(meta.get("source_wav", ""))).name != target:
+            continue
+        if kinds is not None and _ms.example_kind(meta) not in kinds:
             continue
         m = ex["mask"] > 0
         if not m.any():
@@ -330,7 +340,8 @@ def iter_file_annotations(
     """
     from . import fnt_mask_store as _ms
     h5_path = _store_path(dataset_dir)
-    fast = list(_ms.td_iter_file_examples(h5_path, Path(str(wav_name)).name))
+    fast = list(_ms.td_iter_file_examples(
+        h5_path, Path(str(wav_name)).name, with_spec=False))
     legacy = [ex for ex in _iter_legacy_examples(dataset_dir)
               if Path(str(ex["meta"].get("source_wav", ""))).name
               == Path(str(wav_name)).name]
@@ -338,6 +349,24 @@ def iter_file_annotations(
     combined = fast + [ex for ex in legacy
                        if ex["meta"].get("id") not in seen]
     yield from _examples_to_annotations(combined, wav_name, grid_shape)
+
+
+def iter_file_rejected_annotations(
+    dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
+):
+    """Yield annotation dicts for this file's *demoted* (rejected) examples.
+
+    These keep their traced mask, so a rejected call renders as a real red
+    outline instead of a bounding box, and re-accepting it restores the shape
+    the user actually drew rather than a filled rectangle.
+    """
+    from . import fnt_mask_store as _ms
+    h5_path = _store_path(dataset_dir)
+    fast = list(_ms.td_iter_file_examples(
+        h5_path, Path(str(wav_name)).name, with_spec=False,
+        kinds=("rejected",)))
+    yield from _examples_to_annotations(fast, wav_name, grid_shape,
+                                        kinds=("rejected",))
 
 
 # ----------------------------------------------------------------------
@@ -352,12 +381,20 @@ def reconstruct_file_mask(
     its saved time offset. ``grid_shape`` is ``(n_freq_bins, n_time_frames)``.
     Returns a uint8 {0, 1} array.
     """
+    from . import fnt_mask_store as _ms
     n_freq, n_time = grid_shape
     out = np.zeros((n_freq, n_time), dtype=np.uint8)
     target = Path(str(wav_name)).name
     for ex in iter_examples(dataset_dir):
         meta = ex["meta"]
         if Path(str(meta.get("source_wav", ""))).name != target:
+            continue
+        # Only real labels. A demoted ('rejected') example keeps its mask, so
+        # without this it would paint in here — showing as a confirmed call in
+        # the overlay, and worse, shielding its time column from re-detection
+        # via inference's preserve_labels. A rejected region is exactly a region
+        # the model should be allowed to look at again.
+        if _ms.example_kind(meta) != "label":
             continue
         t_off = int(meta.get("patch_t_off") or 0)
         f_off = int(meta.get("patch_f_off") or 0)
@@ -474,6 +511,7 @@ def collect_training_examples(
     a noise-floor background is what makes a model trained here usable outside
     the tile it was trained on.
     """
+    from . import fnt_mask_store as _ms
     examples = list(iter_examples(dataset_dir))
     specs: List[np.ndarray] = []
     targets: List[np.ndarray] = []
@@ -488,6 +526,18 @@ def collect_training_examples(
             progress(i, n, meta.get("id", ""))
         spec = ex["spec"]
         mask = ex["mask"]
+        # A rejected call trains as a HARD NEGATIVE: its patch is supervised
+        # with an all-zero target, so every bright pixel a human refused is
+        # explicitly taught as "not a call".
+        #
+        # This is the only thing in the training set that can teach *shape*.
+        # With positives alone, "bright ⇒ call" fits the data perfectly and the
+        # model has no reason to learn that a blob of noise is the wrong shape
+        # for a call -- the surrounding quiet only ever teaches "quiet ⇒ not a
+        # call". Rejections are bright things that are not calls, which is
+        # exactly the counterexample that forces shape to matter.
+        if _ms.example_kind(meta) in ("negative", "rejected"):
+            mask = np.zeros_like(mask)
         # Provenance for the split. Fall back to the positional index for
         # examples with no id, so distinct calls never collapse into one group.
         src = Path(str(meta.get("source_wav", ""))).name or "<unknown>"

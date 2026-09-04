@@ -66,7 +66,7 @@ The **CSV is canonical** for tabular output. Pixel data lives in HDF5 siblings.
 
 Per recording `<wav>`:
 
-- `<wav>_FNT_MAD_predictions.csv` — the **unified table of every call** on the
+- `<wav>_FNT_MAD_annotations.csv` — the **unified table of every call** on the
   file: hand-labels **and** model predictions, one row each. The first 16 columns
   mirror CAD's `_FNT_CAD_detections.csv` (so the two tools are cross-readable);
   the rest are MAD's richer per-call quantification. CAD's harmonic columns and

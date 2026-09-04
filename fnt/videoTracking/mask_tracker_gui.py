@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -3053,7 +3054,18 @@ class MaskTrackerWindow(QMainWindow):
         self._project_dir: Optional[str] = None
         self._project_config: Dict = {}
 
+        # Two different things that used to share one list.
+        #
+        # video_paths is the Mask tab's *working set*: what you are browsing
+        # to extract frames from. It is user-curated and per-tab.
+        #
+        # _source_videos is the project's *registry*: every video that ever
+        # contributed an extracted frame or a behavior clip. It is never
+        # curated by hand, only appended to, and it is what provenance and
+        # relinking resolve against. Keeping them separate is what stops
+        # Remove Selected from silently orphaning the frames cut from a video.
         self.video_paths: List[str] = []
+        self._source_videos: List[str] = []
         self.current_video_idx: int = -1
         self._video_cap: Optional[cv2.VideoCapture] = None
         self._video_frame_count: int = 0
@@ -3244,8 +3256,22 @@ class MaskTrackerWindow(QMainWindow):
         file_menu.addSeparator()
 
         act_locate = QAction("Locate Missing Videos...", self)
+        act_locate.setToolTip(
+            "Repair references to videos that moved. Fixes the video list, "
+            "the project's source registry and each behavior clip's recorded "
+            "source in one pass."
+        )
         act_locate.triggered.connect(self._locate_missing_videos)
         file_menu.addAction(act_locate)
+
+        act_rebuild = QAction("Rebuild Source Video Links...", self)
+        act_rebuild.setToolTip(
+            "For frames whose source video this project never recorded.\n"
+            "Searches a folder and matches on the video name embedded in each\n"
+            "extracted frame's filename."
+        )
+        act_rebuild.triggered.connect(self._rebuild_source_links)
+        file_menu.addAction(act_rebuild)
 
         edit_menu = menu_bar.addMenu("Edit")
         self.act_undo = QAction("Undo", self)
@@ -5451,7 +5477,7 @@ class MaskTrackerWindow(QMainWindow):
     # Annotator tab sections
     # ------------------------------------------------------------------
     def _create_videos_section(self, layout):
-        group = QGroupBox("Add Videos")
+        group = QGroupBox("Source Videos")
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -5760,9 +5786,12 @@ class MaskTrackerWindow(QMainWindow):
         self._output_dir = os.path.join(d, "training_frames")
         self.lbl_output_dir.setText(self._output_dir)
         self.lbl_output_dir.setStyleSheet("color: #cccccc; font-size: 10px;")
+        self.video_paths = []
+        self._source_videos = []
         self._project_config = {
             "project_dir": d,
             "video_paths": [],
+            "source_videos": [],
             "categories": [],
             "sam2_model_path": None,
         }
@@ -5842,12 +5871,28 @@ class MaskTrackerWindow(QMainWindow):
             self._locate_missing_videos()
 
     def _locate_missing_videos(self):
+        """Repair every reference to a video that moved.
+
+        Covers the Mask tab's list, the project registry and each behavior
+        clip's recorded source in one pass, because they are all describing
+        the same files and repairing only one of them leaves the project
+        half-linked.
+        """
         missing_idx = [
             i for i, p in enumerate(self.video_paths) if not os.path.exists(p)
         ]
-        if not missing_idx:
+        missing_reg = [
+            i for i, p in enumerate(self._source_videos) if not os.path.exists(p)
+        ]
+        clips = self._scan_clips_from_disk()
+        missing_clips = [
+            (d, m) for d, m in clips
+            if m.get("source_video") and not os.path.exists(m["source_video"])
+        ]
+        if not missing_idx and not missing_reg and not missing_clips:
             QMessageBox.information(
-                self, "No Missing Videos", "All project videos were found on disk."
+                self, "No Missing Videos",
+                "Every video this project references was found on disk."
             )
             return
         folder = QFileDialog.getExistingDirectory(
@@ -5860,21 +5905,63 @@ class MaskTrackerWindow(QMainWindow):
             for f in files:
                 if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
                     by_name.setdefault(f, os.path.join(root, f))
+
         relinked = 0
         for i in missing_idx:
-            base = os.path.basename(self.video_paths[i])
-            if base in by_name:
-                self.video_paths[i] = by_name[base]
+            hit = by_name.get(os.path.basename(self.video_paths[i]))
+            if hit:
+                self.video_paths[i] = hit
                 relinked += 1
+
+        reg_fixed = 0
+        for i in missing_reg:
+            hit = by_name.get(os.path.basename(self._source_videos[i]))
+            if hit:
+                self._source_videos[i] = hit
+                reg_fixed += 1
+        seen = set()
+        self._source_videos = [
+            p for p in self._source_videos if not (p in seen or seen.add(p))
+        ]
+
+        clips_fixed = 0
+        for clip_dir, meta in missing_clips:
+            hit = by_name.get(os.path.basename(meta["source_video"]))
+            if not hit:
+                continue
+            meta["source_video"] = hit
+            try:
+                with open(os.path.join(clip_dir, "meta.json"), "w") as f:
+                    json.dump(meta, f, indent=2)
+                clips_fixed += 1
+            except OSError:
+                pass
+
+        self._register_source_videos(
+            [self.video_paths[i] for i in missing_idx if os.path.exists(self.video_paths[i])]
+        )
+        self._refresh_video_list()
+        self._relink_frame_provenance()
+        self._autosave_project_config()
+        self._refresh_frame_list()
+        self._sync_scrubber()
+        if clips_fixed:
+            self._cls_data_loaded = False
+
+        parts = []
         if relinked:
-            self._refresh_video_list()
-            self._relink_frame_provenance()
-            self._autosave_project_config()
-        still = len(missing_idx) - relinked
-        msg = f"Relinked {relinked} video(s)."
+            parts.append(f"{relinked} in the video list")
+        if reg_fixed:
+            parts.append(f"{reg_fixed} in the project registry")
+        if clips_fixed:
+            parts.append(f"{clips_fixed} behavior clip source(s)")
+        msg = ("Relinked " + ", ".join(parts) + ".") if parts else "Nothing matched."
+        still = (len(missing_idx) - relinked) + (len(missing_clips) - clips_fixed)
         if still:
-            msg += f" {still} still missing."
-        self.status_bar.showMessage(msg, 5000)
+            msg += (f" {still} reference(s) still unresolved — try "
+                    f"File > Rebuild Source Video Links for frames whose video "
+                    f"the project never recorded.")
+        self.status_bar.showMessage(msg, 8000)
 
     def _migrate_classifier_dir(self):
         old = os.path.join(self._project_dir, "behavior_classifier")
@@ -5960,6 +6047,11 @@ class MaskTrackerWindow(QMainWindow):
         # dropping them — the user can relink after moving data or drives.
         saved_paths = cfg.get("video_paths", [])
         self.video_paths = list(saved_paths)
+        _seen: set = set()
+        self._source_videos = [
+            p for p in cfg.get("source_videos", [])
+            if p and not (p in _seen or _seen.add(p))
+        ]
         missing = [p for p in saved_paths if not os.path.exists(p)]
         self._refresh_video_list(
             auto_select=any(os.path.exists(p) for p in self.video_paths)
@@ -5978,6 +6070,18 @@ class MaskTrackerWindow(QMainWindow):
             self._scan_frames_dir(self._output_dir)
             if self._extracted_frames:
                 self._select_frame_row(0)
+
+        # Projects built before the registry existed recover what they can
+        # from frame names and clip metadata, so provenance starts working on
+        # the next open rather than only for newly extracted material.
+        n_backfilled = self._backfill_source_registry()
+        if n_backfilled:
+            self._scan_frames_dir(self._output_dir) if os.path.isdir(
+                self._output_dir) else None
+            self.status_bar.showMessage(
+                f"Recovered {n_backfilled} source video link(s) for this project.",
+                5000,
+            )
 
         ann_path = os.path.join(self._project_dir, "annotations", "annotations.json")
         if os.path.exists(ann_path):
@@ -6015,6 +6119,7 @@ class MaskTrackerWindow(QMainWindow):
             if self._project_dir is None:
                 return
         self._project_config["video_paths"] = list(self.video_paths)
+        self._project_config["source_videos"] = list(self._source_videos)
         self._project_config["categories"] = list(self._categories)
         self._save_project_config()
         ann_dir = os.path.join(self._project_dir, "annotations")
@@ -6040,8 +6145,178 @@ class MaskTrackerWindow(QMainWindow):
         if self._project_dir is None:
             return
         self._project_config["video_paths"] = list(self.video_paths)
+        self._project_config["source_videos"] = list(self._source_videos)
         self._project_config["categories"] = list(self._categories)
         self._save_project_config()
+
+    # ------------------------------------------------------------------
+    # Source video registry
+    # ------------------------------------------------------------------
+    def _register_source_videos(self, paths) -> int:
+        """Record videos as sources this project was built from.
+
+        Called wherever a frame or a clip is created, never by the user.
+        Registering a path costs nothing; reconstructing provenance after the
+        fact is impossible, which is how projects end up with hundreds of
+        frames whose origin nobody can name.
+        """
+        # Dedupe within the incoming batch as well as against what is already
+        # registered. Backfill passes the same path once per frame it explains,
+        # so checking only against the existing list would add a video as many
+        # times as it has frames, on every open.
+        seen = set(self._source_videos)
+        added = []
+        for p in paths:
+            if p and p not in seen:
+                seen.add(p)
+                added.append(p)
+        if not added:
+            return 0
+        self._source_videos.extend(added)
+        self._autosave_project_config()
+        return len(added)
+
+    def _known_videos(self) -> Dict[str, str]:
+        """Stem to path for every video this project can resolve right now.
+
+        The registry is the authority and the working set is folded in, so a
+        video added but not yet extracted from still links its frames.
+        """
+        out: Dict[str, str] = {}
+        for p in list(self._source_videos) + list(self.video_paths):
+            if p and os.path.exists(p):
+                out.setdefault(Path(p).stem, p)
+        return out
+
+    def _clip_source_videos(self) -> List[str]:
+        """Source video of every behavior clip saved in this project."""
+        out = []
+        for clip_dir, meta in self._scan_clips_from_disk():
+            src = meta.get("source_video")
+            if src:
+                out.append(src)
+        return out
+
+    def _backfill_source_registry(self):
+        """Reconstruct the registry for projects that predate it.
+
+        Extracted frames are named ``{stem}_frame_{idx:06d}``, and every clip
+        records its source in meta.json, so a project built before the
+        registry existed can recover most of what it should have been storing
+        all along. Paths that no longer resolve are still registered: knowing
+        a frame came from a video that has since been deleted is strictly
+        better than not knowing where it came from.
+        """
+        if self._project_dir is None:
+            return 0
+        candidates = list(self.video_paths)
+        candidates.extend(self._clip_source_videos())
+
+        # Frames only carry a stem, so they can only be backfilled against
+        # videos some other part of the project still names.
+        by_stem = {}
+        for p in candidates + list(self._source_videos):
+            if p:
+                by_stem.setdefault(Path(p).stem, p)
+        pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
+        for _vpath, _fidx, png in self._extracted_frames:
+            m = pat.match(Path(png).stem)
+            if m and m.group("stem") in by_stem:
+                candidates.append(by_stem[m.group("stem")])
+
+        return self._register_source_videos(candidates)
+
+    def _unresolved_frame_stems(self) -> Dict[str, int]:
+        """Frame-name stems with no video behind them, and how many frames each."""
+        known = set(self._known_videos())
+        pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
+        out: Dict[str, int] = {}
+        for vpath, _fidx, png in self._extracted_frames:
+            if vpath and os.path.exists(vpath):
+                continue
+            m = pat.match(Path(png).stem)
+            if m and m.group("stem") not in known:
+                stem = m.group("stem")
+                out[stem] = out.get(stem, 0) + 1
+        return out
+
+    def _rebuild_source_links(self):
+        """Search a folder for the videos this project's frames and clips came from.
+
+        Locate Missing Videos repairs entries the project already names. This
+        is for the harder case: a project whose registry is empty or partial,
+        where the only surviving evidence of a frame's origin is its filename.
+        """
+        if self._project_dir is None:
+            QMessageBox.information(self, "No Project", "Open a project first.")
+            return
+
+        unresolved = self._unresolved_frame_stems()
+        missing_clips = [p for p in self._clip_source_videos() if not os.path.exists(p)]
+        missing_reg = [p for p in self._source_videos if not os.path.exists(p)]
+        if not unresolved and not missing_clips and not missing_reg:
+            QMessageBox.information(
+                self, "Nothing to Rebuild",
+                "Every extracted frame and behavior clip already resolves to a "
+                "video on disk.",
+            )
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder to Search for the Source Videos"
+        )
+        if not folder:
+            return
+
+        by_stem: Dict[str, str] = {}
+        by_name: Dict[str, str] = {}
+        for root, _dirs, files in os.walk(folder):
+            for f in files:
+                if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                    full = os.path.join(root, f)
+                    by_stem.setdefault(Path(f).stem, full)
+                    by_name.setdefault(f, full)
+
+        found = [by_stem[s] for s in unresolved if s in by_stem]
+        n_frames = sum(n for s, n in unresolved.items() if s in by_stem)
+        for p in missing_clips + missing_reg:
+            hit = by_name.get(os.path.basename(p))
+            if hit:
+                found.append(hit)
+        self._register_source_videos(found)
+
+        # Repair the registry in place too, so entries that merely moved stop
+        # reporting as missing.
+        for i, p in enumerate(self._source_videos):
+            if not os.path.exists(p):
+                hit = by_name.get(os.path.basename(p))
+                if hit:
+                    self._source_videos[i] = hit
+        seen = set()
+        self._source_videos = [
+            p for p in self._source_videos if not (p in seen or seen.add(p))
+        ]
+
+        self._relink_frame_provenance()
+        self._autosave_project_config()
+        self._refresh_frame_list()
+        self._sync_scrubber()
+
+        still = {s: n for s, n in unresolved.items() if s not in by_stem}
+        msg = (f"Linked {n_frames} frame(s) to {len(set(found))} video(s) "
+               f"found in that folder.")
+        if still:
+            msg += (f"\n\n{sum(still.values())} frame(s) from "
+                    f"{len(still)} video(s) are still unresolved:\n"
+                    + "\n".join(f"  • {s}" for s in sorted(still)[:10]))
+            if len(still) > 10:
+                msg += f"\n  … and {len(still) - 10} more"
+            msg += ("\n\nThose files are not under the folder you chose. "
+                    "The frames remain fully usable for training either way.")
+        QMessageBox.information(self, "Rebuild Source Links", msg)
+        self.status_bar.showMessage(
+            f"Rebuilt source links for {n_frames} frame(s).", 6000
+        )
 
     def _relink_frame_provenance(self):
         """Re-match queue frames to source videos after the video list changes.
@@ -6050,8 +6325,7 @@ class MaskTrackerWindow(QMainWindow):
         Source Video" starts working as soon as the videos are (re)added —
         no project reload needed.
         """
-        import re
-        stem_map = {Path(vp).stem: vp for vp in self.video_paths}
+        stem_map = self._known_videos()
         pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
         changed = 0
         for i, (vpath, fidx, png) in enumerate(self._extracted_frames):
@@ -6142,8 +6416,9 @@ class MaskTrackerWindow(QMainWindow):
         self._close_video()
         self.current_video_idx = -1
         self._refresh_video_list()
-        # Frames extracted from it stay in the queue (still trainable), but
-        # they lose their source link — repaint so the marker appears.
+        # Frames extracted from it keep their source link: the video stays in
+        # the project's registry even though it has left this list. Repaint
+        # anyway, since the row's selection state changed.
         for frame_row in range(len(self._extracted_frames)):
             self._update_frame_list_item(frame_row)
         self._autosave_project_config()
@@ -6255,8 +6530,14 @@ class MaskTrackerWindow(QMainWindow):
         stepping out of a queue frame. Selects the video in the list without
         firing its handler, which would reload from frame 0.
         """
-        if vpath not in self.video_paths or not self._ensure_source_video_open(vpath):
+        if not os.path.exists(vpath) or not self._ensure_source_video_open(vpath):
             return False
+        if vpath not in self.video_paths:
+            # A registry video the working set has dropped. Asking to see it
+            # is a good enough reason to put it back in the list.
+            self.video_paths.append(vpath)
+            self._refresh_video_list(auto_select=False)
+            self._autosave_project_config()
         vrow = self.video_paths.index(vpath)
         self._annot_in_video_mode = True
         self.frame_list.blockSignals(True)
@@ -6441,6 +6722,7 @@ class MaskTrackerWindow(QMainWindow):
                 return
             cv2.imwrite(out_path, frame)
 
+        self._register_source_videos([vpath])
         existing_paths = {fp for _, _, fp in self._extracted_frames}
         if out_path not in existing_paths:
             self._extracted_frames.append((vpath, fidx, out_path))
@@ -6526,6 +6808,11 @@ class MaskTrackerWindow(QMainWindow):
     def _on_extract_finished(self, results: list):
         self.extract_progress.setVisible(False)
         self.btn_generate.setEnabled(True)
+
+        # Every video that contributed a frame becomes a project source, so
+        # the queue can still name each frame's origin long after the Mask
+        # tab's list has moved on.
+        self._register_source_videos([item[0] for item in results if item[0]])
 
         # Merge new frames with existing ones (append, don't replace)
         existing_paths = {fp for _, _, fp in self._extracted_frames}
@@ -6726,8 +7013,7 @@ class MaskTrackerWindow(QMainWindow):
         that back (against the project's video list) restores provenance after
         a reload, so "Show in Source Video" keeps working across sessions.
         """
-        import re
-        stem_map = {Path(vp).stem: vp for vp in self.video_paths}
+        stem_map = self._known_videos()
         pat = re.compile(r"^(?P<stem>.+)_frame_(?P<idx>\d+)$")
         frames = []
         for f in sorted(os.listdir(folder)):
@@ -6782,11 +7068,14 @@ class MaskTrackerWindow(QMainWindow):
     def _frame_source_available(self, vpath: str) -> bool:
         """Can this queue frame be traced back to a playable source video?
 
-        Requires project membership as well as an existing file, so the italic
-        "no source" marker and the Show in Source Video menu item can never
-        disagree about the same row.
+        Membership is tested against the registry rather than the Mask tab's
+        working set, so dropping a video from the list you are browsing does
+        not orphan the frames already cut from it. Show in Source Video puts
+        it back in the list on demand.
         """
-        return bool(vpath) and vpath in self.video_paths and os.path.exists(vpath)
+        if not vpath or not os.path.exists(vpath):
+            return False
+        return vpath in self._source_videos or vpath in self.video_paths
 
     def _on_frame_list_context_menu(self, pos):
         item = self.frame_list.itemAt(pos)
@@ -9503,6 +9792,10 @@ class MaskTrackerWindow(QMainWindow):
         with open(os.path.join(clip_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
+        # Behavior clips are provenance-bearing too. Registering here is what
+        # lets Locate Missing Videos repair a clip's source, which it could
+        # not do while clip sources lived only inside each clip's meta.json.
+        self._register_source_videos([video_path])
         return clip_dir
 
     def _load_clip_frames(self, clip_dir):
@@ -9974,6 +10267,10 @@ class MaskTrackerWindow(QMainWindow):
             "objects": meta.get("objects", {}),
             "clip_length": meta.get("clip_length", 15),
         })
+        # Batch extraction writes clips from a worker thread, so registration
+        # happens here rather than in _save_clip_to_disk.
+        if meta.get("source_video"):
+            self._register_source_videos([meta["source_video"]])
 
         item = self._clip_queue_item_by_idx(real_idx)
         if item:

@@ -26,7 +26,7 @@ Because recordings are referenced rather than copied, a recording that moves is 
 
 ## Detection output
 
-Every recording gets its own standalone `<wav>_FNT_MAD_predictions.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. There is no aggregate run-level table and no interchange export: MAD is deliberately self-contained for both analysis and review, and third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
+Every recording gets its own standalone `<wav>_FNT_MAD_annotations.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. There is no aggregate run-level table and no interchange export: MAD is deliberately self-contained for both analysis and review, and third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
 
 ## Consecutive-detection merging
 

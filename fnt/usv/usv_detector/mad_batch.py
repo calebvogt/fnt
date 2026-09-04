@@ -169,23 +169,42 @@ class RunSettings:
 
 
 def file_already_done(wav_path: str, settings: RunSettings) -> bool:
-    """True when ``wav_path``'s sibling CSV already holds predictions from this
-    model at these settings.
+    """True when ``wav_path``'s store already holds predictions from this model
+    at these settings.
 
-    A file with *no* prediction rows is treated as done when the CSV exists and
-    was written by this model — a recording containing zero calls is a legitimate
-    result, and re-running it every time would defeat resuming on exactly the
-    quiet files that dominate 24/7 recordings. Presence of the provenance is
-    established from any prediction row; the empty case falls back to the run
-    manifest, which records zero-detection files explicitly.
+    Reads the .mad store, not a CSV: a run no longer writes a CSV, and the
+    prediction crops carry the model name, threshold and min-blob-pixels that
+    produced them. Only the crop attributes are touched — no pixel array is
+    decompressed — so answering this for a few thousand previously-analysed
+    recordings stays a metadata scan.
+
+    A file with *no* prediction crops is treated as done when the store exists
+    and its grid was written by a run: a recording containing zero calls is a
+    legitimate result, and re-running it every time would defeat resuming on
+    exactly the quiet files that dominate 24/7 recordings. That empty case
+    falls back to the run manifest, which records zero-detection files
+    explicitly.
+
+    A legacy CSV is still honoured for recordings analysed before the store
+    carried provenance, so resuming an old run does not redo everything.
     """
+    from .fnt_mask_store import masks_sibling_path, read_pred_attrs
+
+    h5_path = masks_sibling_path(wav_path)
+    if os.path.isfile(h5_path):
+        attrs = read_pred_attrs(h5_path)
+        if attrs:
+            for a in attrs:
+                if not settings.matches_row(a):
+                    return False
+            return True
+        # No crops at all: nothing to attest, leave it to the manifest.
+        return False
+
+    # --- legacy: recordings whose predictions predate provenance in the store
     csv_path = pred_csv_sibling_path(wav_path)
     if not os.path.isfile(csv_path):
         return False
-    # Streamed, and only the four provenance fields are touched. read_blob_csv
-    # would parse and float-convert ~40 columns of every detection on the file;
-    # at 3,000 previously-analyzed recordings that is minutes of work to answer
-    # a yes/no question. Bails at the first mismatching row.
     import csv as _csv
     n_pred = 0
     try:
@@ -194,10 +213,10 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
                 raw = row.get('call_id', row.get('blob_id'))
                 if raw is None:
                     continue
-                try:                       # int call_id == model prediction
+                try:
                     int(str(raw).strip())
                 except (TypeError, ValueError):
-                    continue               # string id == hand-label, not ours
+                    continue
                 n_pred += 1
                 if not settings.matches_row(row):
                     return False

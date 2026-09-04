@@ -290,11 +290,21 @@ def evaluate_wavs(
         if progress is not None:
             progress(i, len(wav_paths), name)
 
-        csv_path = pred_csv_sibling_path(wav)
+        # Ground truth comes from the store, which is where a review decision
+        # is actually recorded; the CSV is an export and may not exist at all.
+        # A legacy CSV is still read for recordings labelled before the store
+        # was authoritative.
         try:
-            rows = read_blob_csv(csv_path) if Path(csv_path).is_file() else []
+            from .mad_csv_rebuild import rows_for_wav
+            rows = rows_for_wav(wav)
         except Exception:
             rows = []
+        if not rows:
+            csv_path = pred_csv_sibling_path(wav)
+            try:
+                rows = read_blob_csv(csv_path) if Path(csv_path).is_file() else []
+            except Exception:
+                rows = []
         labels = rows_to_boxes(rows, source='truth')
         if not labels:
             files_out.append({'name': name, 'skipped': 'no confirmed calls'})

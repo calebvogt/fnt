@@ -57,7 +57,9 @@ class MADInferenceConfig:
     # Time-column budget for the per-chunk float32 accumulator; bounds peak RAM
     # independently of recording length. See infer_probability_mask.
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
-    save_blob_csv: bool = True
+    #: Write a CSV alongside the run. Off by default: the store holds every
+    #: detection, and a CSV that is only ever regenerated cannot drift from it.
+    save_blob_csv: bool = False
     # If True (default), the probability mask is zeroed out in any time
     # column that already contains a confirmed call for this file (rebuilt
     # from the example store via
@@ -701,6 +703,12 @@ _EXTRA_COLS = [
     'model_name', 'threshold', 'min_blob_pixels',
 ]
 
+# Harmonic grouping (see mad_harmonics). Written by the review GUI, not by
+# inference: which elements form one call is decided after detection, so these
+# stay blank until the grouping has been run. Element count is the row count;
+# call count is the number of distinct harmonic_call_id.
+_HARMONIC_COLS = ['harmonic_call_id', 'harmonic_n', 'f0_hz']
+
 # CAD-shared core (first 16, matching _FNT_CAD_detections.csv naming/order) +
 # MAD-specific quantification columns appended.
 CSV_FIELDNAMES = [
@@ -708,7 +716,7 @@ CSV_FIELDNAMES = [
     'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
     'max_power_db', 'mean_power_db', 'class', 'score', 'area_pixels',
     'status', 'source',
-] + _EXTRA_COLS
+] + _EXTRA_COLS + _HARMONIC_COLS
 
 # Local-window half-width (seconds) for the call_rate_hz density estimate.
 _CALL_RATE_WINDOW_S = 0.5
@@ -778,7 +786,7 @@ def write_blob_csv(path: str, rows: List[Dict]) -> None:
                 'status': r.get('status', 'pending') or 'pending',
                 'source': r.get('source', '') or '',
             }
-            for col in _EXTRA_COLS:
+            for col in _EXTRA_COLS + _HARMONIC_COLS:
                 out[col] = r.get(col, '')
             out['inter_call_interval_ms'] = ici
             out['call_rate_hz'] = rate
@@ -817,7 +825,7 @@ def read_blob_csv(path: str) -> List[Dict]:
             # verbatim, so a read-modify-write (e.g. status change) preserves
             # them. inter_call_interval_ms / call_rate_hz are recomputed on
             # write, so they needn't round-trip.
-            for col in _EXTRA_COLS:
+            for col in _EXTRA_COLS + _HARMONIC_COLS:
                 row[col] = g(col, default='')
             rows.append(row)
     return rows
@@ -1167,7 +1175,11 @@ def run_inference_on_file(
         # The CSV is unified: hand-labels (string blob_ids) and reviewed
         # predictions (Accepted/Rejected) are carried over verbatim; only
         # pending predictions are regenerated.
-        write_blob_csv(csv_path, handlabel_rows + reviewed_rows + rows)
+        # Inference records its detections in the .mad store (the crops
+        # above, carrying score and provenance). The CSV is an export the user
+        # asks for, so a run no longer writes one — see mad_csv_rebuild.
+        if cfg.save_blob_csv:
+            write_blob_csv(csv_path, handlabel_rows + reviewed_rows + rows)
     # Persist each blob's small cropped mask (NOT the multi-GB /prob grid):
     # blob_id matches the CSV row's blob_id. On file switch these few-MB crops
     # are read directly, so predictions redraw without decompressing the full
@@ -1182,15 +1194,27 @@ def run_inference_on_file(
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
                        n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
+        # Carry score and provenance onto the crop itself. These used to exist
+        # only in the CSV, which is what forced the CSV to be a second source of
+        # truth: without them the h5 cannot answer "how confident was this?" or
+        # "which model produced it?", so the review UI's score filter and the
+        # run record both depended on a file that has to be kept in sync.
+        def _prov(r):
+            return {k: r.get(k) for k in
+                    ('score', 'class', 'model_name', 'threshold',
+                     'min_blob_pixels') if r.get(k) not in (None, '')}
+
         crops = []
         for r in reviewed_rows:
             c = old_crops.get(str(r['blob_id']))
             if c is not None:
                 crops.append({'blob_id': r['blob_id'], 'mask': c['mask'],
-                              'f_off': c['f_off'], 't_off': c['t_off']})
+                              'f_off': c['f_off'], 't_off': c['t_off'],
+                              **_prov(r)})
         for i, b in enumerate(blobs):
             crops.append({'blob_id': id_offset + i, 'mask': b['mask'],
-                          'f_off': b['f_low'], 't_off': b['t_start']})
+                          'f_off': b['f_low'], 't_off': b['t_start'],
+                          **_prov(rows[i] if i < len(rows) else {})})
         write_pred_masks(h5_path, crops)
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)

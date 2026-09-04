@@ -1346,8 +1346,11 @@ class WaveformOverviewWidget(QWidget):
         """Set status-colored tick marks along the overview strip.
 
         Args:
-            marks: list of ``(center_seconds, QColor)`` — one tick per detection,
-                colored by labeling status (pending/accepted/rejected).
+            marks: list of ``(center_seconds, QColor)`` or
+                ``(center_seconds, QColor, priority)`` — one entry per
+                detection, colored by labeling status. ``priority`` breaks the
+                tie when several detections land on the same pixel column
+                (higher wins); it defaults to 0.
         """
         self.status_marks = marks or []
         self.update()
@@ -1384,14 +1387,31 @@ class WaveformOverviewWidget(QWidget):
                 cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
                 painter.drawLine(cx, 0, cx, h)
 
-        # Draw status-colored tick marks (pending/accepted/rejected). One per
-        # detection at its center time, so the user can see where calls cluster
-        # along the whole file without zooming out.
+        # Status ticks (pending/accepted/rejected), showing where calls sit
+        # across the whole file without zooming out.
+        #
+        # Drawing one full-height line per detection does not survive real
+        # files: a thousand calls over a strip a thousand pixels wide puts a
+        # line in every column, and they overdraw into a solid block that
+        # carries no information. So collapse to at most one mark per pixel
+        # column (highest priority wins) and confine them to a short lane at
+        # the top, which keeps the waveform readable underneath and turns the
+        # cost from O(detections) into O(width).
         if self.status_marks and self.total_duration > 0:
-            for cs, color in self.status_marks:
+            lane = max(4, int(h * 0.22))
+            best = {}
+            for mark in self.status_marks:
+                cs, color = mark[0], mark[1]
+                rank = mark[2] if len(mark) > 2 else 0
                 cx = int(cs / self.total_duration * w)
+                if not 0 <= cx < w:
+                    continue
+                prev = best.get(cx)
+                if prev is None or rank > prev[0]:
+                    best[cx] = (rank, color)
+            for cx, (_rank, color) in best.items():
                 painter.setPen(QPen(color, 1))
-                painter.drawLine(cx, 0, cx, h)
+                painter.drawLine(cx, 0, cx, lane)
 
         # Draw viewport highlight
         x1 = int(self.view_start / self.total_duration * w)

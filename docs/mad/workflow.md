@@ -118,7 +118,8 @@ capacity, is what limits a first model.
 
 ## 4. Train a first model
 
-In *Model Training & Inference*, tick **Train a new model**. The defaults are
+In *Run Training*, open **Training settings** if you want to change them —
+you usually don't for a first model. The defaults are
 sensible:
 
 - **U-Net + resnet18** for a first model. Move to resnet34/50 or **HRNet** (crisp
@@ -127,9 +128,12 @@ sensible:
 - **Augmentation on.** It is the biggest lever against overfitting a small set.
 - **Device auto** picks the GPU.
 
-Click **Run Training**. The live graph opens in its own window; the Run
-Inference targets, if ticked, run automatically on the new model when it
-finishes. The model lands in the *Model* dropdown, selected.
+Click **Run Training**. The live graph opens in its own window. If **Then
+run inference on** is set to anything but *Nothing*, those recordings are
+analyzed automatically on the new weights when training finishes — using the
+detection settings (probability threshold, minimum blob size) from *Run
+Inference*, so set those first if you want something other than the defaults.
+The model lands in the *Model* dropdown, selected.
 
 **Read the split line in the log.** Training holds out *whole recordings* for
 validation when it can (`split_level: file`), so the reported score means
@@ -142,7 +146,9 @@ hold out most of your data; check `n_val_tiles` rather than trusting the score.
 
 ## 5. Run on your labeled files and review
 
-Tick **Audio ▸ All** as the inference target and click **Run Inference**.
+In *Run Inference*, tick **Audio list** with **All**, then click
+**Run Inference**. (To predict as soon as training finishes instead, set
+*Run Training*'s **Then run inference on** dropdown before you train.)
 Predictions appear as pending (colored per the legend under *Labeling Tools*;
 colors follow the color map so they stay visible).
 
@@ -239,9 +245,16 @@ to failures, double-click a row to open it for review.
 
 ## 9. What you get
 
-One standalone `<recording>_FNT_MAD_predictions.csv` beside each wav — the same
-per-file profile SLEAP and DLC use. There is deliberately no aggregate table;
-concatenate what you need in your analysis code.
+A run records itself in `<recording>_FNT.mad` beside the wav — masks,
+detections, review status and harmonic assignments in one HDF5 file. That store
+is the record; nothing else is written during a run.
+
+**File ▸ Export Annotations to CSV…** turns it into one standalone
+`<recording>_FNT_MAD_annotations.csv` per wav — the same per-file profile SLEAP
+and DLC use. Export when you are done reviewing, not before: the CSV is a
+snapshot, and re-exporting after more review simply overwrites it. There is
+deliberately no aggregate table; concatenate what you need in your analysis
+code.
 
 Every row is one call: onset/offset, frequency box and contour metrics (peak,
 bandwidth, slope, excursion, sinuosity), spectral shape (centroid, entropy,
@@ -249,7 +262,6 @@ tonality), power and SNR, sequence metrics (inter-call interval, local call
 rate), the model score, and `status` (`pending` / `accepted` / `rejected`).
 Columns are documented in the technical reference.
 
-The pixel masks live in `<recording>_FNT_masks.h5` next to it.
 
 ---
 
