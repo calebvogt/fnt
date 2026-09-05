@@ -243,6 +243,41 @@ to failures, double-click a row to open it for review.
 
 ---
 
+## 8b. Getting a picture out
+
+**Copy View**, at the right of the controls bar under the spectrogram, puts the
+current view on the clipboard as an image — window, frequency range, colour map,
+boxes, masks and labels exactly as they stand — ready to paste into a slide, a
+document or a message. The **dpi** box beside it chooses the resolution: 150,
+300 (the default, and the usual journal minimum) or 600. **File > Save View as
+PNG…** (`Ctrl+Shift+S`) writes the same image to a file.
+
+The picture keeps the panel's own geometry and physical size, so raising the dpi
+makes it finer rather than bigger, and it is tagged with that dpi so Word and
+PowerPoint place it at the intended size instead of guessing. A very large
+window is capped at 40 megapixels — 600 dpi on a full-screen panel lands nearer
+450 — and the status bar says so rather than quietly under-delivering.
+
+**What the resolution is and is not.** The view is re-rendered, not
+screengrabbed, so axes, tick labels, detection boxes, mask outlines and contours
+are drawn at the output resolution. That part is real at every zoom and it is
+most of the benefit. The spectrogram raster behind them is bounded by the
+analysis:
+
+| View width | What the extra pixels buy |
+|---|---|
+| 0.3 s | nothing — 590 STFT columns against a ~1300 px panel, already interpolated |
+| 1 s | 1.4x |
+| 2 s | 1.8x |
+| 5 s | 2.3x |
+
+The crossover is around a 0.7 s window: below it the view holds fewer columns
+than the panel has pixels, so there is nothing to recover; above it there is,
+and the copy recovers it. Vertically there is never anything to recover — 513
+frequency bins against a 700–1300 px pane is always upsampling.
+
+---
+
 ## 9. What you get
 
 A run records itself in `<recording>_FNT.mad` beside the wav — masks,

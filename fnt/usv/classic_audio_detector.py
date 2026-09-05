@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QPointF, QTimer, QSettings, QUrl
-from PyQt5.QtGui import QFont, QColor, QPainter, QImage, QPen, QBrush, QPolygonF, QKeySequence, QDesktopServices
+from PyQt5.QtGui import QFont, QColor, QPainter, QImage, QPen, QBrush, QPolygonF, QKeySequence, QDesktopServices, QCursor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QProgressBar, QGroupBox,
@@ -32,7 +32,8 @@ from PyQt5.QtWidgets import (
 )
 from scipy import signal
 
-from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
+from fnt.usv.audio_widgets import (
+    MAX_EXPORT_MP, SpectrogramWidget, WaveformOverviewWidget)
 
 # Optional imports
 try:
@@ -251,6 +252,11 @@ class PipelineInspectorDialog(QDialog):
 
 class ClassicAudioDetectorWindow(QMainWindow):
     """Main window for Classic Audio Detector."""
+
+    _COPY_VIEW_LABEL = "Copy View"
+    #: Offered copy-out resolutions. 300 is the usual journal minimum; 600 is
+    #: safe for a figure panel that will be printed.
+    COPY_VIEW_DPIS = (150, 300, 600)
 
     # Species-specific DSP detection presets.
     # 'Manual' means user controls all parameters directly.
@@ -584,6 +590,45 @@ class ClassicAudioDetectorWindow(QMainWindow):
             controls_layout.addWidget(lbl_warn)
 
         controls_layout.addStretch()
+
+        # Copy the view out for a slide or a figure panel. Far right of the
+        # bar, away from the controls you use to find a view, because it is
+        # something you do to a view you have already found.
+        self.combo_copy_dpi = QComboBox()
+        for _dpi in self.COPY_VIEW_DPIS:
+            self.combo_copy_dpi.addItem(f"{_dpi} dpi", int(_dpi))
+        self.combo_copy_dpi.setCurrentIndex(1)               # 300 dpi
+        self.combo_copy_dpi.setFixedWidth(84)
+        self.combo_copy_dpi.setFocusPolicy(Qt.NoFocus)
+        self.combo_copy_dpi.setToolTip(
+            "Resolution of the copied image.\n"
+            "\n"
+            "The view is re-rendered rather than screengrabbed, so the axes, "
+            "tick labels and detection boxes are drawn at the chosen "
+            "resolution instead of being magnified. The spectrogram picture "
+            "behind them is bounded by the analysis: above roughly a 0.7 s "
+            "window the view holds more columns than the panel can show and "
+            "the extra resolution recovers them; below that it is already as "
+            "detailed as the data goes.\n"
+            "\n"
+            "300 is the usual journal minimum; 600 is safe for a figure panel "
+            "that will be printed. A very large window is capped to keep the "
+            "copy a sane size - the status bar says when that happens.")
+        controls_layout.addWidget(self.combo_copy_dpi)
+
+        self.btn_copy_view = QPushButton(self._COPY_VIEW_LABEL)
+        self.btn_copy_view.setFixedWidth(92)
+        self.btn_copy_view.setFocusPolicy(Qt.NoFocus)
+        self.btn_copy_view.setToolTip(
+            "Copy the spectrogram exactly as it stands - current window, "
+            "frequency range, colour map and detection boxes - to the "
+            "clipboard as an image, ready to paste into a slide, a document "
+            "or a message.\n"
+            "\n"
+            "Re-rendered rather than screengrabbed, so the axes, text and "
+            "boxes are drawn at full resolution instead of being magnified.")
+        self.btn_copy_view.clicked.connect(self.copy_spectrogram_view)
+        controls_layout.addWidget(self.btn_copy_view)
 
         right_layout.addWidget(controls_bar)
 
@@ -5238,6 +5283,64 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.spectrogram.update()
         # Re-enable controls
         self._set_playback_controls_enabled(True)
+
+    def copy_spectrogram_view(self):
+        """Put the current spectrogram view on the clipboard as an image.
+
+        Playback is held for the duration — a timer tick landing mid-render
+        would paint the export geometry into the real window — and the brush
+        cursor is cleared, since it follows the mouse and is not part of the
+        picture.
+        """
+        dpi = self.combo_copy_dpi.currentData() or 300
+        if self.is_playing:
+            self.stop_playback()
+        cursor_was = self.spectrogram._cursor_pos
+        self.spectrogram._cursor_pos = None
+        self.btn_copy_view.setEnabled(False)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            img, eff = self.spectrogram.render_view_image(dpi=dpi)
+        except Exception as e:
+            self.status_bar.showMessage(f"Could not copy the view: {e}")
+            QMessageBox.warning(self, "Copy View",
+                                f"Could not render the view:\n\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.spectrogram._cursor_pos = cursor_was
+            self.btn_copy_view.setEnabled(True)
+
+        if img is None:
+            self.status_bar.showMessage(
+                "Nothing to copy yet - load a recording first.")
+            return
+
+        # A bare setImage is deliberate: Qt publishes the clipboard formats
+        # lazily, so this costs milliseconds, while encoding a PNG here to add
+        # a second flavour would freeze the GUI for seconds on a large view and
+        # buy nothing — the DIB Qt writes already carries the dpi, and that is
+        # what Word and PowerPoint size from.
+        QApplication.clipboard().setImage(img)
+        if eff < dpi - 0.5:
+            note = (f"{eff:.0f} dpi - {dpi} was capped to keep the image "
+                    f"under {int(MAX_EXPORT_MP)} megapixels")
+        else:
+            note = f"{eff:.0f} dpi"
+        self.status_bar.showMessage(
+            f"Copied view to clipboard: {img.width()}x{img.height()} px at "
+            f"{note} ({img.width() / eff:.1f} x {img.height() / eff:.1f} in)")
+
+        # One owned timer, restarted per click: an anonymous singleShot would
+        # let a second click inside the window capture "Copied" as the label to
+        # restore, and the button would keep that text for good.
+        self.btn_copy_view.setText("Copied")
+        if getattr(self, '_copy_view_timer', None) is None:
+            self._copy_view_timer = QTimer(self)
+            self._copy_view_timer.setSingleShot(True)
+            self._copy_view_timer.timeout.connect(
+                lambda: self.btn_copy_view.setText(self._COPY_VIEW_LABEL))
+        self._copy_view_timer.start(1200)
 
     def _update_playback_position(self):
         """Timer callback to update the playback position line."""

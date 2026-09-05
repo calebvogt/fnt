@@ -16,6 +16,12 @@ from PyQt5.QtWidgets import QWidget, QSizePolicy
 # ~0.5s import before any spectrogram is actually computed.
 
 
+#: Ceiling on an exported view, in megapixels. Not a Qt or clipboard limit —
+#: both cope well past it — but PNG encoding scales superlinearly with pixel
+#: count and entropy, and a spectrogram is high-entropy: 28 Mpx takes ~2-4 s.
+MAX_EXPORT_MP = 40.0
+
+
 # =============================================================================
 # Spectrogram Widget
 # =============================================================================
@@ -32,6 +38,14 @@ class SpectrogramWidget(QWidget):
     sample_freq_adjusted = pyqtSignal(int, int, float)
     # A sample-dot drag finished (det_idx) — persist + refresh.
     sample_drag_complete = pyqtSignal(int)
+
+    #: Set only while render_view_image() is rendering. paintEvent reads it to
+    #: resample the spectrogram straight to the export resolution instead of to
+    #: the widget's logical size. Deliberately NOT derived from the painter's
+    #: transform: on a 125%/150% Windows display that would silently change
+    #: every interactive repaint, and this widget is repainted on every brush
+    #: stroke and box drag.
+    export_scale = 1.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -550,11 +564,34 @@ class SpectrogramWidget(QWidget):
                          if self._filter_overlay_active
                          and self._filter_overlay_image
                          else self.spec_image)
-        scaled_image = display_image.scaled(
-            int(spec_rect.width()), int(spec_rect.height()),
-            Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-        )
-        painter.drawImage(spec_rect.topLeft(), scaled_image)
+        # Resample once, to the resolution actually being painted.
+        #
+        # On screen (export_scale 1.0) this is exactly the old code. During a
+        # high-resolution export the painter carries a scale transform, and
+        # scaling to the LOGICAL rect first would resample twice — spec_image
+        # to ~1300 px, then that intermediate up to ~4000 by the transform,
+        # which Qt does with nearest-neighbour unless asked otherwise. The
+        # result is a blocky magnification of the screen image carrying no
+        # more information than the screen image. Scaling straight to the
+        # device size keeps whatever real detail spec_image has, which above
+        # roughly a 0.7 s window is substantial: at 2 s the view holds ~3900
+        # STFT columns and the screen throws three quarters of them away.
+        s = self.export_scale
+        if s == 1.0:
+            scaled_image = display_image.scaled(
+                int(spec_rect.width()), int(spec_rect.height()),
+                Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            painter.drawImage(spec_rect.topLeft(), scaled_image)
+        else:
+            scaled_image = display_image.scaled(
+                max(1, int(round(spec_rect.width() * s))),
+                max(1, int(round(spec_rect.height() * s))),
+                Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            # Rect overload: the source is already at the target's device size,
+            # so this lands 1:1 rather than resampling again.
+            painter.drawImage(spec_rect, scaled_image)
 
         # Draw per-call masks (under the boxes).
         if self.call_masks and self.spec_grid is not None:
@@ -647,6 +684,70 @@ class SpectrogramWidget(QWidget):
             self.width() - margin_left - margin_right,
             self.height() - margin_top - margin_bottom
         )
+
+    def render_view_image(self, dpi=96.0, max_megapixels=None):
+        """Render the current view to a QImage at ``dpi``, ready to copy out.
+
+        The picture keeps the panel's own geometry and physical size — a
+        1400 px panel is 14.6 in wide at any dpi — so raising dpi multiplies
+        pixels rather than changing the layout. What those extra pixels buy:
+
+        * Axes, tick labels, detection boxes, mask outlines and contours are
+          redrawn at the output resolution. Real, at every zoom.
+        * The spectrogram raster is bounded by the analysis. Above roughly a
+          0.7 s window the view holds more STFT columns than the panel has
+          pixels, and the extra resolution recovers them — measured about
+          1.8x at a 2 s window and 2.3x at 5 s, on a 1378 px panel. Below
+          that there is nothing to recover and it is an honest
+          interpolation. Vertically it is always interpolation: 513 frequency
+          bins against a 700-1300 px pane.
+
+        Returns ``(QImage, effective_dpi)``, or ``(None, 0.0)`` when there is
+        no spectrogram to render. ``effective_dpi`` is below ``dpi`` when the
+        megapixel cap bit — say so rather than quietly under-delivering.
+        """
+        if self.spec_image is None:
+            return None, 0.0
+
+        logical_w = max(1, self.width())
+        logical_h = max(1, self.height())
+        scale = max(1.0, float(dpi) / 96.0)
+
+        # Cap total pixels rather than the scale factor: the preview grows with
+        # the window, so a maximised 4K pane at a fixed multiplier runs to tens
+        # of megapixels, and it is the PNG encode downstream — not the render —
+        # that then freezes the GUI for seconds.
+        # Resolved here, not as a default argument: a default is bound at
+        # import, so the module constant would be frozen at that moment and
+        # neither a caller nor a test could move it.
+        cap = MAX_EXPORT_MP if max_megapixels is None else max_megapixels
+        mp = (logical_w * scale) * (logical_h * scale) / 1e6
+        if cap and mp > cap:
+            scale *= (cap / mp) ** 0.5
+
+        img = QImage(max(1, int(round(logical_w * scale))),
+                     max(1, int(round(logical_h * scale))),
+                     QImage.Format_RGB32)   # no alpha: keeps the dpi in CF_DIBV5
+        img.setDevicePixelRatio(scale)
+        img.fill(QColor(30, 30, 30))
+
+        # The widget is never resized for this: render() draws it at its own
+        # geometry through a scaled painter, so nothing about the live layout
+        # is touched and there is no window in which a repaint could catch the
+        # panel at the wrong size. export_scale is the only mutated state, and
+        # it is reset in the finally.
+        try:
+            self.export_scale = scale
+            self.render(img)
+        finally:
+            self.export_scale = 1.0
+
+        eff_dpi = 96.0 * scale
+        img.setDevicePixelRatio(1.0)
+        dpm = int(round(eff_dpi / 0.0254))
+        img.setDotsPerMeterX(dpm)
+        img.setDotsPerMeterY(dpm)
+        return img, eff_dpi
 
     def _time_to_x(self, time_s, spec_rect):
         """Convert time to x coordinate."""

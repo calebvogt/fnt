@@ -29,7 +29,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QIcon, QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
-    QPalette,
+    QPalette, QCursor,
 )
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -44,7 +44,8 @@ from PyQt5.QtWidgets import (
 # scipy.signal is imported lazily where used (spectrogram compute / resample)
 # so opening MAD doesn't pay scipy's ~0.5s import before any file is loaded.
 
-from fnt.usv.audio_widgets import SpectrogramWidget, WaveformOverviewWidget
+from fnt.usv.audio_widgets import (
+    MAX_EXPORT_MP, SpectrogramWidget, WaveformOverviewWidget)
 from fnt.usv.usv_detector.mad_labels import pred_csv_sibling_path
 from fnt.usv.usv_detector.mad_project import (
     MADProjectConfig, PROJECT_INFO_FILENAME, create_mad_project,
@@ -3402,37 +3403,20 @@ class MADDeviceProbeWorker(QThread):
 class MADMainWindow(QMainWindow):
     BASE_TITLE = "FNT Mask Audio Detector"
 
+    _COPY_VIEW_LABEL = "Copy View"
+    #: Offered copy-out resolutions. 300 is the usual journal minimum; 600 is
+    #: safe for a figure panel that will be printed.
+    COPY_VIEW_DPIS = (150, 300, 600)
+
     @staticmethod
     def _apply_dark_theme():
-        """Force a consistent dark look on every OS/platform. Without this MAD
-        inherits the native theme — dark on macOS, light on Windows — so we pin
-        the Fusion style + a dark palette, which themes all standard widgets
-        (inputs, lists, menus, scrollbars) uniformly."""
-        app = QApplication.instance()
-        if app is None:
-            return
-        try:
-            app.setStyle("Fusion")
-        except Exception:
-            pass
-        from PyQt5.QtGui import QPalette
-        p = QPalette()
-        p.setColor(QPalette.Window, QColor(43, 43, 43))
-        p.setColor(QPalette.WindowText, QColor(220, 220, 220))
-        p.setColor(QPalette.Base, QColor(30, 30, 30))
-        p.setColor(QPalette.AlternateBase, QColor(43, 43, 43))
-        p.setColor(QPalette.ToolTipBase, QColor(30, 30, 30))
-        p.setColor(QPalette.ToolTipText, QColor(220, 220, 220))
-        p.setColor(QPalette.Text, QColor(220, 220, 220))
-        p.setColor(QPalette.Button, QColor(53, 53, 53))
-        p.setColor(QPalette.ButtonText, QColor(220, 220, 220))
-        p.setColor(QPalette.BrightText, QColor(255, 80, 80))
-        p.setColor(QPalette.Link, QColor(0, 120, 212))
-        p.setColor(QPalette.Highlight, QColor(0, 120, 212))
-        p.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-        for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
-            p.setColor(QPalette.Disabled, role, QColor(120, 120, 120))
-        app.setPalette(p)
+        """Force a consistent dark look on every OS/platform.
+
+        Delegates to fnt.theme so every FNT tool shares one definition; without
+        it MAD inherits the native theme (dark on macOS, light on Windows).
+        """
+        from fnt.theme import apply_dark_theme
+        apply_dark_theme()
 
     def __init__(self):
         super().__init__()
@@ -3810,6 +3794,60 @@ class MADMainWindow(QMainWindow):
             controls_layout.addWidget(lbl_warn)
 
         controls_layout.addStretch()
+
+        # Copy the view out for a slide or a figure panel. Far right of the
+        # bar, away from the zoom/frequency/playback controls, because it is
+        # something you do to a view you have already found rather than part
+        # of finding it.
+        self.combo_copy_dpi = QComboBox()
+        for _dpi in self.COPY_VIEW_DPIS:
+            self.combo_copy_dpi.addItem(f"{_dpi} dpi", int(_dpi))
+        self.combo_copy_dpi.setCurrentIndex(1)               # 300 dpi
+        self.combo_copy_dpi.setFixedWidth(84)
+        self.combo_copy_dpi.setFocusPolicy(Qt.NoFocus)
+        self.combo_copy_dpi.setToolTip(
+            "Resolution of the copied image.\n"
+            "\n"
+            "The view is re-rendered rather than screengrabbed, so the axes, "
+            "tick labels, detection boxes and mask outlines are drawn at the "
+            "chosen resolution instead of being magnified — those are sharper "
+            "at every zoom. The spectrogram picture behind them is bounded by "
+            "the analysis: above roughly a 0.7 s window the view holds more "
+            "columns than the panel can show and the extra resolution "
+            "recovers them (measured about 1.8x at a 2 s window, 2.3x at "
+            "5 s); below that it is already as detailed as the data goes.\n"
+            "\n"
+            "300 is the usual journal minimum; 600 is safe for a figure panel "
+            "that will be printed. The pixel count also scales with how big "
+            "you have made this panel, so a very large window is capped to "
+            "keep the copy a sane size — the status bar says when that "
+            "happens.")
+        controls_layout.addWidget(self.combo_copy_dpi)
+
+        self.btn_copy_view = QPushButton(self._COPY_VIEW_LABEL)
+        self.btn_copy_view.setFixedWidth(92)
+        self.btn_copy_view.setFocusPolicy(Qt.NoFocus)
+        self.btn_copy_view.setToolTip(
+            "Copy the spectrogram exactly as it stands — current window, "
+            "frequency range, colour map, boxes, masks and labels — to the "
+            "clipboard as an image, ready to paste into a slide, a document "
+            "or a message.\n"
+            "\n"
+            "Re-rendered rather than screengrabbed, so the axes, text, boxes "
+            "and mask outlines are drawn at full resolution instead of being "
+            "magnified. The spectrogram picture itself is limited by the "
+            "analysis: past about a 0.7 s window there is real detail on the "
+            "time axis for it to recover, and below that the copy is as sharp "
+            "as the data goes.\n"
+            "\n"
+            "It pastes at the same physical size as the panel on screen, so "
+            "raising the dpi makes it finer rather than bigger.\n"
+            "\n"
+            "File > Save View as PNG (Ctrl+Shift+S) writes the same image to "
+            "a file.")
+        self.btn_copy_view.clicked.connect(self.copy_spectrogram_view)
+        controls_layout.addWidget(self.btn_copy_view)
+
         right_layout.addWidget(controls_bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -8132,6 +8170,16 @@ class MADMainWindow(QMainWindow):
         self.act_export_csv.triggered.connect(self._export_annotations_csv)
         file_menu.addAction(self.act_export_csv)
 
+        self.act_save_view = QAction("Save &View as PNG…", self)
+        self.act_save_view.setShortcut("Ctrl+Shift+S")
+        self.act_save_view.setToolTip(
+            "Save the spectrogram exactly as it stands to a PNG file, at the "
+            "destination size chosen next to the Copy View button.\n\n"
+            "Same picture the Copy View button puts on the clipboard — this "
+            "one keeps a file you can point a figure at.")
+        self.act_save_view.triggered.connect(self.save_spectrogram_view)
+        file_menu.addAction(self.act_save_view)
+
         self.act_pack_project = QAction("&Pack Project (embed audio)…", self)
         self.act_pack_project.setToolTip(
             "Copy every referenced recording into the project so it is fully "
@@ -11393,6 +11441,113 @@ class MADMainWindow(QMainWindow):
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
+
+    # ------------------------------------------------------------------ #
+    # Copying the view out
+    # ------------------------------------------------------------------ #
+    def _render_spectrogram_view(self):
+        """Render the current view at the chosen destination size.
+
+        Returns ``(QImage, effective_dpi)``; ``(None, 0.0)`` when there is
+        nothing on screen to copy. Holds playback for the duration — a timer
+        tick landing mid-render would paint the export geometry into the real
+        window — and hands it back afterwards.
+        """
+        dpi = self.combo_copy_dpi.currentData() or 300
+        was_playing = bool(getattr(self, 'is_playing', False))
+        if was_playing:
+            self._stop_playback()
+        # The brush circle follows the mouse and is not part of the picture.
+        cursor_was = self.spectrogram._cursor_pos
+        self.spectrogram._cursor_pos = None
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            return self.spectrogram.render_view_image(dpi=dpi)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.spectrogram._cursor_pos = cursor_was
+            if was_playing:
+                self._toggle_playback()
+
+    def copy_spectrogram_view(self):
+        """Put the current spectrogram view on the clipboard as an image."""
+        self.btn_copy_view.setEnabled(False)
+        try:
+            img, dpi = self._render_spectrogram_view()
+        except Exception as e:
+            self.status_bar.showMessage(f"Could not copy the view: {e}")
+            QMessageBox.warning(self, "Copy View",
+                                f"Could not render the view:\n\n{e}")
+            return
+        finally:
+            self.btn_copy_view.setEnabled(True)
+
+        if img is None:
+            self.status_bar.showMessage(
+                "Nothing to copy yet — load a recording first.")
+            return
+
+        # A bare setImage is deliberate. Qt publishes the clipboard formats
+        # lazily, so this costs milliseconds; encoding a PNG here to add an
+        # extra flavour would freeze the GUI for seconds on a large view and
+        # buys nothing, because the DIB Qt writes already carries the dpi and
+        # that is what Word and PowerPoint size from.
+        QApplication.clipboard().setImage(img)
+
+        asked = self.combo_copy_dpi.currentData() or 300
+        if dpi < asked - 0.5:
+            # The panel is big enough that the asked-for dpi would have blown
+            # past the cap; say so rather than quietly under-delivering.
+            note = (f"{dpi:.0f} dpi — {asked} was capped to keep the image "
+                    f"under {int(MAX_EXPORT_MP)} megapixels")
+        else:
+            note = f"{dpi:.0f} dpi"
+        self.status_bar.showMessage(
+            f"Copied view to clipboard: {img.width()}x{img.height()} px at "
+            f"{note} ({img.width() / dpi:.1f} x {img.height() / dpi:.1f} in)")
+
+        # One owned timer, restarted per click: an anonymous singleShot would
+        # let a second click inside the window capture "Copied" as the label to
+        # restore, and the button would keep that text for good.
+        self.btn_copy_view.setText("Copied ✓")
+        if getattr(self, '_copy_view_timer', None) is None:
+            self._copy_view_timer = QTimer(self)
+            self._copy_view_timer.setSingleShot(True)
+            self._copy_view_timer.timeout.connect(
+                lambda: self.btn_copy_view.setText(self._COPY_VIEW_LABEL))
+        self._copy_view_timer.start(1200)
+
+    def save_spectrogram_view(self):
+        """Save the current spectrogram view as a PNG file."""
+        wav = self._active_wav_path()
+        if wav:
+            stem = Path(wav).stem
+            v0, v1 = self.spectrogram.view_start, self.spectrogram.view_end
+            suggested = str(Path(wav).with_name(
+                f"{stem}_{v0:.3f}-{v1:.3f}s_view.png"))
+        else:
+            suggested = "spectrogram_view.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save View as PNG", suggested, "PNG image (*.png)")
+        if not path:
+            return
+        try:
+            img, dpi = self._render_spectrogram_view()
+        except Exception as e:
+            QMessageBox.warning(self, "Save View",
+                                f"Could not render the view:\n\n{e}")
+            return
+        if img is None:
+            self.status_bar.showMessage(
+                "Nothing to save yet — load a recording first.")
+            return
+        if not img.save(path, "PNG"):
+            QMessageBox.warning(self, "Save View",
+                                f"Could not write:\n\n{path}")
+            return
+        self.status_bar.showMessage(
+            f"Saved view: {os.path.basename(path)} — {img.width()}x"
+            f"{img.height()} px at {dpi:.0f} dpi")
 
     def _update_playback_position(self):
         import time as _time

@@ -450,6 +450,7 @@ class FNTMainWindow(QMainWindow):
             ("Video PreProcessing", "Comprehensive preprocessing: downsampling, re-encoding, format conversion", self.run_video_processing),
             ("Video Trim and Crop", "Interactively trim video files with preview", self.run_video_trim),
             ("Video Concatenation", "Join multiple video files together", self.run_video_concatenate),
+            ("Camera Grid", "Combine synchronized multi-camera feeds into one grid video for scoring", self.run_camera_grid),
         ]
 
         self.create_button_grid(group_layout, buttons)
@@ -973,6 +974,10 @@ class FNTMainWindow(QMainWindow):
     def run_video_processing(self):
         """Launch combined video processing tool with PyQt interface"""
         self.tools.launch("video_processing")
+
+    def run_camera_grid(self):
+        """Launch the Camera Grid tool"""
+        self.tools.launch("camera_grid")
 
     def run_behavior_scoring_studio(self):
         """Launch Behavior Scoring Studio"""

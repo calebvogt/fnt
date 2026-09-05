@@ -41,14 +41,15 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QSlider, QProgressDialog, QGridLayout,
                              QListWidget, QListWidgetItem,
                              QColorDialog, QInputDialog, QMenu)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QDateTime,
+                          QByteArray, QMimeData)
 from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
                          QCursor)
 
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
-    label_halo)
+    label_halo, MAX_RENDER_MP)
 from fnt.uwb import animation as uwb_animation
 from fnt.uwb import uwb_roi
 
@@ -4262,6 +4263,10 @@ class UWBQuickVisualizationWindow(QWidget):
     VIEW_XML = "XML (site map)"
     VIEW_2D = "2D Idealized"
     VIEW_3D = "3D Idealized"
+    # Resting label of the Copy View button. Held as a constant because the
+    # button briefly shows a confirmation instead, and reading the label back
+    # to restore it would latch the confirmation on a fast second click.
+    _COPY_VIEW_LABEL = "Copy View"
 
     def __init__(self):
         super().__init__()
@@ -5920,6 +5925,51 @@ class UWBQuickVisualizationWindow(QWidget):
             "though the elapsed time is still right.")
         transport.addWidget(self.lbl_preview_fps)
         transport.addStretch(1)
+
+        # Copy the view out for a slide or a figure panel. Sits at the right
+        # of the transport row, away from the playback controls, because it is
+        # something you do to a frame you have already found rather than part
+        # of finding it.
+        self.combo_copy_dpi = QComboBox()
+        for _dpi in (150, 300, 600):
+            self.combo_copy_dpi.addItem(f"{_dpi} dpi", int(_dpi))
+        self.combo_copy_dpi.setCurrentIndex(1)               # 300 dpi
+        self.combo_copy_dpi.setFixedWidth(84)
+        self.combo_copy_dpi.setToolTip(
+            "Resolution of the copied image.\n"
+            "\n"
+            "The view is re-rendered from the scene rather than screengrabbed, "
+            "so this is real detail and not an upscale: text, markers and line "
+            "widths are set in POINTS and keep their physical size, so the "
+            "picture gets finer as the number goes up rather than just bigger. "
+            "300 is the usual journal minimum; 600 is safe for a figure panel "
+            "that will be printed. The pixel count also scales with how wide "
+            "you have made this pane, so a very wide window is capped to keep "
+            "the copy a sane size — the log says when that happens.\n"
+            "\n"
+            "A loaded background image is the exception — it has whatever "
+            "resolution it was saved at, and rendering above that enlarges its "
+            "pixels. The tracks, markers, labels and regions drawn over it stay "
+            "sharp regardless.")
+        transport.addWidget(self.combo_copy_dpi)
+
+        self.btn_copy_view = QPushButton(self._COPY_VIEW_LABEL)
+        self.btn_copy_view.setFixedWidth(96)
+        self.btn_copy_view.setToolTip(
+            "Copy the preview exactly as it stands — current frame, zoom, "
+            "trails, labels and behaviour overlays — to the clipboard as a "
+            "PNG, ready to paste into a slide, a document or a message.\n"
+            "\n"
+            "Rendered fresh at the chosen dpi, not captured from the screen, "
+            "so the copy is much sharper than the pane you are looking at. "
+            "Surrounding whitespace is trimmed.\n"
+            "\n"
+            "In the 3D view this can only copy what the GPU already drew, so "
+            "it comes out at screen resolution; switch to the 2D view for a "
+            "high-resolution copy.")
+        self.btn_copy_view.clicked.connect(self.copy_preview_view)
+        transport.addWidget(self.btn_copy_view)
+
         layout.addLayout(transport)
 
         self.lbl_preview_time = QLabel("--")
@@ -10111,6 +10161,80 @@ class UWBQuickVisualizationWindow(QWidget):
                              readouts=readouts, behavior=behavior)
         self._update_time_label()
 
+    def copy_preview_view(self):
+        """Put a high-resolution PNG of the current view on the clipboard."""
+        backend = self._preview_backend()
+        if not hasattr(backend, "render_png"):
+            self.log_message("This view cannot be copied.")
+            return
+        dpi = self.combo_copy_dpi.currentData() or 300
+
+        # Playback and a render fight over the same figure: the render swaps
+        # the canvas to the export dpi and rebuilds the blit cache underneath,
+        # which a timer tick landing mid-way would draw against. Hold the
+        # playhead for the duration and hand it back afterwards.
+        was_playing = bool(getattr(self, "_playing", False))
+        if was_playing:
+            self.stop_preview_playback()
+
+        self.btn_copy_view.setEnabled(False)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            png = backend.render_png(dpi=dpi)
+        except Exception as e:
+            self.log_message(f"Could not copy the view: {type(e).__name__}: {e}")
+            QMessageBox.warning(self, "Copy View",
+                                f"Could not render the view:\n\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_copy_view.setEnabled(True)
+            if was_playing:
+                self.start_preview_playback()
+
+        if png is None:
+            # The pane is showing the "load a database" hint, or a 3D view that
+            # has never painted. Copying would mean inventing a picture.
+            self.log_message("Nothing to copy yet — the preview has no frame on screen.")
+            return
+        img = QImage.fromData(png, "PNG")
+        if img.isNull():
+            self.log_message("Could not copy the view: the render did not decode.")
+            return
+
+        # Two flavours on the clipboard, because pasting targets disagree:
+        # Office and most native apps take the generic image (a DIB), while
+        # browsers, Slack and image editors prefer the PNG itself and keep its
+        # exact pixels. Setting both lets each take what it understands.
+        md = QMimeData()
+        md.setImageData(img)
+        md.setData("image/png", QByteArray(png))
+        QApplication.clipboard().setMimeData(md)
+
+        used = getattr(backend, "rendered_dpi", None)
+        if used is None:
+            note = " at screen resolution (3D — use the 2D view to render higher)"
+        elif used < dpi - 0.5:
+            # The pane is wide enough that the asked-for dpi would have blown
+            # past the render cap; say so rather than quietly under-delivering.
+            note = (f" at {used:.0f} dpi — {dpi} was capped to keep the image "
+                    f"under {int(MAX_RENDER_MP)} megapixels")
+        else:
+            note = f" at {dpi} dpi"
+        self.log_message(
+            f"Copied preview to clipboard: {img.width()}x{img.height()} px{note}")
+
+        # One owned timer, restarted per click. An anonymous singleShot per
+        # click meant a second click inside the window captured "Copied" as the
+        # label to restore, and the button kept that text for good.
+        self.btn_copy_view.setText("Copied ✓")
+        if getattr(self, "_copy_view_timer", None) is None:
+            self._copy_view_timer = QTimer(self)
+            self._copy_view_timer.setSingleShot(True)
+            self._copy_view_timer.timeout.connect(
+                lambda: self.btn_copy_view.setText(self._COPY_VIEW_LABEL))
+        self._copy_view_timer.start(1200)
+
     # -- transport --------------------------------------------------------- #
     # ── playback ──────────────────────────────────────────────────────────
     # Redraws per second to AIM for. Drawing faster than this buys nothing on
@@ -13277,6 +13401,9 @@ class UWBQuickVisualizationWindow(QWidget):
         'displace_winner_speed': ('spin_displace_winner_speed', 'value'),
         'displace_leave_distance': ('spin_displace_leave', 'value'),
         'displace_window_s': ('spin_displace_window', 'value'),
+        # Resolution the Copy View button renders at. Nothing downstream reads
+        # it — it persists purely so the setting survives reopening a trial.
+        'copy_view_dpi': ('combo_copy_dpi', 'text'),
         # NOTE: the preview tag marker size persists separately as the
         # top-level 'preview_tag_size' key (kept for config compatibility).
     }
@@ -15823,7 +15950,16 @@ class UWBQuickVisualizationWindow(QWidget):
                 # Free text (timestamps): re-rendering can differ legitimately,
                 # so require only that it still parses as the time it was.
                 if pd.api.types.is_datetime64_any_dtype(df[col]):
-                    bad = pd.to_datetime(back[col], errors='coerce').isna()
+                    # format='ISO8601', not inference. str(Timestamp) drops
+                    # trailing zero microseconds, so to_csv emits a column of
+                    # MIXED precision - '...:56.123000-06:00' for most rows and
+                    # '...:56-06:00' for the few that land on a whole second.
+                    # Since pandas 2.0 to_datetime guesses one format from the
+                    # FIRST element and coerces everything else to NaT, so the
+                    # whole-second rows were being reported as corruption and
+                    # the export aborted on a file that was perfectly good.
+                    bad = pd.to_datetime(back[col], format='ISO8601',
+                                         errors='coerce').isna()
                     if bad.any():
                         first = back[col][bad].iloc[0]
                         problems.append(

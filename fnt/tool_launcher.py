@@ -59,6 +59,8 @@ TOOL_REGISTRY = {
                  "VideoProcessingGUI", "Video PreProcessing"),
         ToolSpec("behavior_scoring", "fnt.videoProcessing.behavior_scoring_studio_pyqt",
                  "BehaviorScoringStudioWindow", "Behavior Scoring Studio"),
+        ToolSpec("camera_grid", "fnt.videoProcessing.camera_grid_pyqt",
+                 "CameraGridWindow", "Camera Grid"),
 
         # --- SLEAP / pose ---
         ToolSpec("sleap_inference", "fnt.sleapProcessing.sleap_inference_tool_pyqt",

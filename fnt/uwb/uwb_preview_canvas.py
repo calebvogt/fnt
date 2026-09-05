@@ -52,6 +52,11 @@ import matplotlib.patheffects as pe
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle, Polygon, Rectangle
 
+# Ceiling on a "Copy View" render, in megapixels. 40 MP is ~6300 x 6300 —
+# beyond any figure panel or slide — and decodes to a ~160 MB image, which is
+# the real constraint: the clipboard holds it for as long as it is there.
+MAX_RENDER_MP = 40.0
+
 # Palettes deliberately mirror the ABMA arena views so the two tools read as
 # one system, without coupling this module to fnt.abma.
 _THEMES = {
@@ -376,6 +381,27 @@ class UWBPreview3D(gl.GLViewWidget if HAVE_GL else object):
             it.setVisible(False)
         self._trail.setData(pos=np.zeros((0, 3)))
 
+    def render_png(self, dpi=300, pad_inches=0.0):
+        """PNG bytes of the current 3D view, at SCREEN resolution.
+
+        Signature matches ``UWBPreview2D.render_png`` so the window can copy
+        whichever backend is showing, but ``dpi`` cannot be honoured here:
+        this is a GPU framebuffer, not a vector scene, so the only pixels that
+        exist are the ones already drawn. Callers that care should say so —
+        the 2D canvas is the one that renders at arbitrary resolution.
+        """
+        from PyQt5.QtCore import QBuffer, QByteArray
+        self.rendered_dpi = None            # "screen", not a number
+        img = self.grabFramebuffer()
+        if img.isNull() or img.width() == 0:
+            return None                     # never painted / no GL context
+        ba = QByteArray()
+        bf = QBuffer(ba)
+        bf.open(QBuffer.WriteOnly)
+        img.save(bf, "PNG")
+        bf.close()
+        return bytes(ba)
+
     # -- view -------------------------------------------------------------- #
     def set_theme(self, name):
         self._theme = name if name in _THEMES else "dark"
@@ -464,6 +490,11 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = True
         self._blit_bg = None
         self._last_frame = None     # (x, y, colors, tracks, raw_pts) for re-render
+        # True while the pane is showing the "load something" hint rather than
+        # a scene. Only render_png reads it, to refuse a copy instead of
+        # drawing a default arena over the hint and calling that the view.
+        self._placeholder = False
+        self.rendered_dpi = None    # dpi the last render_png actually used
         # User-drawn regions of interest, in the same shape as XML zones:
         # dicts of name / color / linewidth / points (N,2) in metres. Finished
         # ROIs belong to the static scene; only the one being drawn moves.
@@ -953,6 +984,7 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = True
         self._blit_bg = None
         self._last_frame = None
+        self._placeholder = True
         self.draw_idle()
 
     def _apply_theme(self):
@@ -1000,6 +1032,7 @@ class UWBPreview2D(FigureCanvas):
         pal = _THEMES[self._theme]
         a = self.arena
         self.ax.clear()
+        self._placeholder = False     # the hint, if there was one, is gone now
         self._apply_theme()
 
         # Site map from the XML takes precedence; otherwise any separately
@@ -1084,7 +1117,8 @@ class UWBPreview2D(FigureCanvas):
         self._static_dirty = False
 
     def update_frame(self, x, y, colors, tracks=None, raw_pts=None,
-                     labels=None, batteries=None, readouts=None, behavior=None):
+                     labels=None, batteries=None, readouts=None, behavior=None,
+                     keep_artists=False):
         """Draw one frame by blitting the moving tags over the cached scene.
 
         ``tracks``: list of (xy Nx2 array, rgb tuple) — one fading polyline per
@@ -1096,6 +1130,12 @@ class UWBPreview2D(FigureCanvas):
         under the voltage, or None for a tag with nothing to report.
         Only these dynamic artists are drawn per frame; the arena/zones/anchors
         come from the cached static background.
+
+        ``keep_artists``: build the per-frame artists, then return them still
+        attached instead of blitting and tearing them down. Only ``render_png``
+        uses this — a full-figure render has to find the tags IN the figure,
+        and the blit path deliberately leaves nothing behind. The caller owns
+        the returned artists and must remove them.
         """
         self._last_frame = (x, y, colors, tracks, raw_pts, labels, batteries,
                             readouts, behavior)
@@ -1287,6 +1327,20 @@ class UWBPreview2D(FigureCanvas):
 
         dynamic.extend(self._roi_artists())
 
+        # draw_artist paints IMMEDIATELY, in call order - unlike a full draw it
+        # does not sort the axes by zorder. So the order this list was built in
+        # is the stacking order on screen, and a zorder set on a per-frame
+        # artist means nothing unless it is sorted in by hand. Sort here (a
+        # stable sort, so artists sharing a zorder keep their build order) and
+        # the blit matches what savefig would produce for the same artists.
+        dynamic.sort(key=lambda a: a.get_zorder())
+
+        if keep_artists:
+            # Hand the frame over intact for a full-figure render. No
+            # draw_artist/blit pass: savefig draws the whole figure itself, so
+            # doing it here would be wasted work at the wrong resolution.
+            return dynamic
+
         for art in dynamic:
             self.ax.draw_artist(art)
         self.blit(self.ax.bbox)
@@ -1294,6 +1348,86 @@ class UWBPreview2D(FigureCanvas):
         # static cache (and do not accumulate).
         for art in dynamic:
             art.remove()
+        return None
+
+    def render_png(self, dpi=300, pad_inches=0.05):
+        """PNG bytes of exactly what is on screen, rendered at ``dpi``.
+
+        Not a screengrab: the figure is re-rendered from the vector scene, so
+        the resolution is whatever is asked for rather than whatever the
+        widget happens to be. Text, markers and line widths are specified in
+        POINTS, so they keep their physical size and the picture gains detail
+        rather than just pixels.
+
+        The catch this works around: the live view is a blit, and
+        ``update_frame`` removes every per-frame artist once it has drawn it.
+        At rest the figure holds the arena and nothing else, so a bare savefig
+        would produce an empty enclosure. Replaying the last frame with
+        ``keep_artists=True`` puts the tags, trails, labels and behaviour
+        overlays back in for the duration of the render.
+
+        A region being drawn or dragged does NOT appear: those artists are
+        ``animated``, which a full draw skips by definition. Finished regions
+        are part of the static scene and come out fine.
+
+        Returns None if there is nothing to copy (the empty-state placeholder),
+        rather than manufacturing a picture of a default arena nobody asked for.
+
+        ``dpi`` is clamped so the result cannot exceed ``MAX_RENDER_MP``
+        megapixels — see that constant for why the requested number alone is
+        not a safe bound. ``rendered_dpi`` on the way out reports what was
+        actually used.
+        """
+        import io
+
+        if self._placeholder:
+            return None
+        if self._static_dirty or self._blit_bg is None:
+            self._draw_static()
+
+        # The figure's size in INCHES is not a design choice - it is the pane's
+        # pixel width over the default 100 dpi, so a maximised window is a
+        # ~19 x 12 inch figure. dpi therefore multiplies against an accidental
+        # number, and 1200 dpi on a big pane is a 300-megapixel render: several
+        # GB peak on the GUI thread (bbox_inches="tight" renders the figure
+        # twice), and the clipboard then holds the decoded image for as long as
+        # it stays there. Clamp on the quantity that actually costs - pixels.
+        w_in, h_in = self.fig.get_size_inches()
+        dpi = float(dpi)
+        cap = (MAX_RENDER_MP * 1e6 / max(w_in * h_in, 1e-6)) ** 0.5
+        self.rendered_dpi = min(dpi, cap)
+
+        held = None
+        buf = io.BytesIO()
+        try:
+            if self._last_frame is not None:
+                held = self.update_frame(*self._last_frame, keep_artists=True)
+                # On screen the static scene is a flat BITMAP, so every
+                # per-frame artist covers it whatever its zorder — a tag can
+                # sit over a zone name (zorder 6) or an anchor (6). A full draw
+                # has no such bitmap and would sort those static artists back
+                # on top, so the copy would not be the view. Lift the frame
+                # above the whole static scene, keeping the artists' order
+                # among themselves, to reproduce what the blit actually shows.
+                lift = max((a.get_zorder() for a in self.ax.get_children()),
+                           default=0) + 1
+                for art in held:
+                    art.set_zorder(art.get_zorder() + lift)
+            self.fig.savefig(buf, format="png", dpi=self.rendered_dpi,
+                             facecolor=self.fig.get_facecolor(),
+                             edgecolor="none", bbox_inches="tight",
+                             pad_inches=float(pad_inches))
+        finally:
+            for art in (held or ()):
+                art.remove()
+            # savefig re-renders at the export dpi, which resizes the Agg
+            # buffer out from under the cached blit background. Restoring that
+            # stale region against the next frame is a crash, so drop the
+            # cache and rebuild at screen resolution before returning.
+            self._static_dirty = True
+            self._blit_bg = None
+            self._rerender()
+        return buf.getvalue()
 
     def clear(self):
         self.show_placeholder()
