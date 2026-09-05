@@ -282,6 +282,38 @@ def migrate_legacy_to_h5(dataset_dir: str) -> int:
 # ----------------------------------------------------------------------
 # Per-file annotations (one object per saved example)
 # ----------------------------------------------------------------------
+def _bbox_from_meta(meta):
+    """Patch-local (f0, f1, t0, t1) for an example whose mask is blank.
+
+    Rebuilt from the absolute time/frequency span every example records, so a
+    rejection can be drawn even though its mask carries no pixels. Returns
+    None when the metadata cannot place it, which is what distinguishes a
+    rejected detection from a painted hard negative.
+    """
+    try:
+        sr = float(meta["sample_rate"])
+        nperseg = float(meta["nperseg"])
+        noverlap = float(meta["noverlap"])
+        nfft = float(meta["nfft"])
+        hop = nperseg - noverlap
+        dt = hop / sr
+        df = (sr / 2.0) / (nfft // 2)
+        t0_s, t1_s = float(meta["t_start_s"]), float(meta["t_stop_s"])
+        lo_hz, hi_hz = float(meta["f_low_hz"]), float(meta["f_high_hz"])
+        patch_t0 = float(meta.get("patch_t0_s", 0.0))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if dt <= 0 or df <= 0 or t1_s <= t0_s or hi_hz <= lo_hz:
+        return None
+    t0 = int(round((t0_s - patch_t0) / dt))
+    t1 = max(t0 + 1, int(round((t1_s - patch_t0) / dt)))
+    f0 = int(round(lo_hz / df))
+    f1 = max(f0 + 1, int(round(hi_hz / df)))
+    if t0 < 0 or f0 < 0:
+        return None
+    return f0, f1, t0, t1
+
+
 def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
     """Shared: convert example dicts into annotation dicts clipped to *grid_shape*.
 
@@ -302,7 +334,16 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
             continue
         m = ex["mask"] > 0
         if not m.any():
-            continue
+            # A rejected *prediction* is stored as a hard negative with its
+            # component deliberately zeroed — nothing in that patch is a call.
+            # It is still a decision the reviewer made and wants to see, so
+            # rebuild the box from the metadata every example carries. A true
+            # hand-painted negative has no such box and is still skipped.
+            box = _bbox_from_meta(meta)
+            if box is None:
+                continue
+            m = np.zeros_like(m)
+            m[box[0]:box[1], box[2]:box[3]] = True
         t_off = int(meta.get("patch_t_off") or 0)
         f_off = int(meta.get("patch_f_off") or 0)
         fs = np.where(m.any(axis=1))[0]
@@ -364,9 +405,9 @@ def iter_file_rejected_annotations(
     h5_path = _store_path(dataset_dir)
     fast = list(_ms.td_iter_file_examples(
         h5_path, Path(str(wav_name)).name, with_spec=False,
-        kinds=("rejected",)))
+        kinds=_ms.REJECTED_KINDS))
     yield from _examples_to_annotations(fast, wav_name, grid_shape,
-                                        kinds=("rejected",))
+                                        kinds=_ms.REJECTED_KINDS)
 
 
 # ----------------------------------------------------------------------

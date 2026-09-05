@@ -952,6 +952,15 @@ def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
         return None
 
 
+#: Kinds that mean "the reviewer said no". Two of them, for two paths: a
+#: rejected *prediction* is stored as a hard negative ('negative'), while a
+#: previously-confirmed call that is later rejected is demoted ('rejected')
+#: and keeps its traced mask. Both must read back as rejections — filtering on
+#: only one is what made 35 rejections vanish from the Detections list while
+#: the Audio list still counted them.
+REJECTED_KINDS = ("rejected", "negative")
+
+
 def example_kind(meta: Dict) -> str:
     """An example's role in training: ``'label'`` (painted call, the default for
     anything written before negatives existed) or ``'negative'`` (a rejected

@@ -7178,13 +7178,14 @@ class MADMainWindow(QMainWindow):
 
         Metadata only — never touches a pixel array.
         """
-        from fnt.usv.usv_detector.fnt_mask_store import example_kind, td_iter_meta
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            example_kind, td_iter_meta, REJECTED_KINDS)
         base = os.path.basename(wav or '')
         for store in self._example_store_paths(wav):
             try:
                 for meta in td_iter_meta(store):
                     if (os.path.basename(str(meta.get('source_wav', ''))) == base
-                            and example_kind(meta) == 'rejected'):
+                            and example_kind(meta) in REJECTED_KINDS):
                         return True
             except Exception:
                 continue
@@ -7996,7 +7997,7 @@ class MADMainWindow(QMainWindow):
                 from fnt.usv.usv_detector.mad_examples import (
                     _examples_to_annotations)
                 from fnt.usv.usv_detector.fnt_mask_store import (
-                    td_iter_file_examples)
+                    td_iter_file_examples, REJECTED_KINDS)
                 # Filter on kind and skip the spectrogram patch *before* any
                 # array is touched: this is looking for a handful of rejected
                 # calls, and reading the whole store to find them cost about as
@@ -8004,10 +8005,10 @@ class MADMainWindow(QMainWindow):
                 for a in _examples_to_annotations(
                         td_iter_file_examples(store, os.path.basename(wav),
                                               with_spec=False,
-                                              kinds=("rejected",)),
+                                              kinds=REJECTED_KINDS),
                         os.path.basename(wav),
                         (sg.n_freq_bins, sg.n_time_frames),
-                        kinds=("rejected",)):
+                        kinds=REJECTED_KINDS):
                     demoted.setdefault(str(a.get('id')), a)
             except Exception:
                 pass
