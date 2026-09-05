@@ -24,15 +24,24 @@ class MADProjectConfig:
     Layout on disk::
 
         <project_dir>/
-            mad_project_info.json
-            datasets/           # exported tiles + mask tiles (regenerated each train)
-            models/             # per-run segmentation model checkpoints
+            mad_project_info.json     # this config: audio registry + params
+            models/
+                training_data.h5      # consolidated examples the model trains on
+                <run>/weights.pt      # per-run checkpoint + its provenance
+            batch_runs/<run>/         # inference run logs
+            recordings/               # ONLY when Pack Project embeds audio
 
-    Sibling label format (lives next to each .wav, NOT inside the project):
-      * ``<base>_FNT_MAD_labels.png`` — 8-bit PNG, spectrogram-pixel grid.
-        Values: 0 = unlabeled, 1 = painted positive, 2 = certified negative.
-      * ``<base>_FNT_MAD_labels.json`` — sidecar with committed-column ranges,
-        spectrogram params hash, and paint-tool metadata.
+    Labels live next to each recording, not inside the project, in a
+    ``<base>_FNT.mad`` HDF5 sidecar (see ``fnt_mask_store``):
+
+      * ``/examples/<id>`` — confirmed calls and hard negatives, each a
+        self-contained spec patch + mask with its own metadata.
+      * ``/pred_calls/<id>`` — prediction crops awaiting review.
+      * root attrs — the spectrogram grid every mask was computed on, plus
+        provenance (FNT version, created/updated, last inference run).
+
+    That is what makes a recording portable: hand someone the .wav and its
+    .mad and they have the labels, with no project at all.
     """
     project_dir: str = ""
     project_name: str = ""
@@ -188,8 +197,13 @@ def create_mad_project(
     os.makedirs(project_dir, exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models', 'training_data'), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, 'datasets'), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, 'recordings'), exist_ok=True)
+    # No 'datasets/' — it held exported tile/mask files for a training path
+    # that no longer exists (training reads models/training_data/*.h5), so it
+    # was created empty in every project and never written to.
+    #
+    # No 'recordings/' either: only Pack Project puts anything there, and it
+    # creates the folder itself. An empty one in every project just invites
+    # "what is this for?".
 
     if config is None:
         config = MADProjectConfig()
