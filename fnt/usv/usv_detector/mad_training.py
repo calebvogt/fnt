@@ -42,6 +42,23 @@ class UNetTrainingConfig:
     # Seed for the train/val split. Recorded in the run summary so a reported
     # number can be reproduced exactly.
     split_seed: int = 42
+    # How train/val is grouped:
+    #   'call' — DEFAULT. Hold out whole calls (masks), regardless of which
+    #            recording they came from. Every labelled file trains. This is
+    #            the correct default for MAD's actual workflow: label a file,
+    #            train, run inference on new audio, correct the junk and the
+    #            low-confidence guesses, retrain. Each round the label set grows
+    #            across files, and a split that reserves whole recordings keeps
+    #            pulling the newest corrections out of training — the exact data
+    #            the next round exists to learn from. Validation shares
+    #            recordings with training, so val_dice runs optimistic; every
+    #            consumer prints the caveat next to the number.
+    #   'auto' — 'file' once >= 2 recordings carry calls, else 'call'.
+    #   'file' — always hold out whole recordings. The strictest generalization
+    #            measure ("does this work on a recording it has never seen") and
+    #            the right choice for a final, honest number once labelling has
+    #            settled. Needs calls on >= 2 recordings.
+    split_mode: str = "call"    # 'call' | 'auto' | 'file'
     # How many times each labeled call is placed, at a random position, into a
     # training tile. See mad_examples.collect_training_examples for why this
     # is what makes the model usable on full recordings.
@@ -107,6 +124,7 @@ class UNetTrainingConfig:
 # ----------------------------------------------------------------------
 def grouped_split(
     group_keys: List[str], val_fraction: float, seed: int = 42,
+    positives: Optional[np.ndarray] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
     """Hold out whole groups. Returns ``(train_idx, val_idx, val_groups)``, or
     None when there are fewer than two groups to split.
@@ -153,8 +171,33 @@ def grouped_split(
     # is never empty *and* never trivial: reserving an arbitrary group (say,
     # the last one drawn) satisfies "non-empty" while still allowing the bulk
     # of the labels into validation.
-    largest = max(order, key=lambda k: len(members[k]))
+    # Positive tiles per group. "Largest group trains" keeps the train side
+    # non-empty but says nothing about it being *learnable*: on a label set
+    # where one recording holds every call and another contributes only hard
+    # negatives, the negative-only recording is the larger one, so it anchored
+    # training and every call went to validation. That trains a segmentation
+    # model on zero positive pixels — it can only ever predict background.
+    # Anchor on the largest group that actually contains calls instead.
+    pos_count: Dict[str, int] = {k: 0 for k in order}
+    if positives is not None:
+        for i, key in enumerate(group_keys):
+            if positives[i]:
+                pos_count[key] += 1
+    total_pos = sum(pos_count.values())
+
+    if total_pos:
+        largest = max((k for k in order if pos_count[k]),
+                      key=lambda k: len(members[k]))
+    else:
+        largest = max(order, key=lambda k: len(members[k]))
     candidates = [k for k in shuffled if k != largest]
+
+    def _drains_positives(chosen: List[str]) -> bool:
+        """True if handing ``chosen`` to validation leaves training with no calls."""
+        if not total_pos:
+            return False
+        return (total_pos - sum(pos_count[k] for k in chosen)) <= 0
+
     val_groups: List[str] = []
     n_val = 0
     for key in candidates:
@@ -163,12 +206,18 @@ def grouped_split(
         size = len(members[key])
         if n_val + size > cap:
             continue        # would overshoot; try a smaller one
+        if _drains_positives(val_groups + [key]):
+            continue        # would leave training with nothing to learn from
         val_groups.append(key)
         n_val += size
     if not val_groups:
-        # Every candidate exceeds the cap on its own. Take the smallest, so
-        # validation is still a held-out recording rather than nothing.
-        smallest = min(candidates, key=lambda k: len(members[k]))
+        # Every candidate exceeds the cap on its own. Take the smallest that
+        # still leaves calls in training, so validation is a held-out recording
+        # rather than nothing — but never at the cost of a trainable split.
+        usable = [k for k in candidates if not _drains_positives([k])]
+        if not usable:
+            return None     # no viable split at this grouping level
+        smallest = min(usable, key=lambda k: len(members[k]))
         val_groups = [smallest]
         n_val = len(members[smallest])
 
@@ -182,7 +231,8 @@ def grouped_split(
 
 def _split_tiles(
     groups: List[Tuple[str, str]], n_total: int, val_fraction: float,
-    seed: int = 42,
+    seed: int = 42, positives: Optional[np.ndarray] = None,
+    mode: str = "call",
 ) -> Dict:
     """Pick the strongest split the label set supports, and say which one.
 
@@ -198,14 +248,50 @@ def _split_tiles(
     * ``tile`` — last resort for a single labeled call. Train and val overlap;
       validation is not a held-out measurement at all.
     """
+    def _usable(train_idx, val_idx) -> bool:
+        """A split is only usable when BOTH sides contain calls.
+
+        Zero positives in train means the model cannot learn a call at all;
+        zero positives in val means the score is measured on background only.
+        Either way the run is wasted, so a degenerate split at one grouping
+        level falls through to the next weaker level rather than being used.
+        """
+        if positives is None:
+            return True
+        return bool(positives[train_idx].any()) and bool(positives[val_idx].any())
+
+    degraded: List[str] = []
+    levels = [('file', [g[0] for g in groups] if groups else []),
+              ('call', [g[1] for g in groups] if groups else [])]
+    if mode == 'file':
+        levels = levels[:1]
+    elif mode == 'call':
+        levels = levels[1:]
+
     if groups and len(groups) == n_total:
-        for level, keys in (('file', [g[0] for g in groups]),
-                            ('call', [g[1] for g in groups])):
-            split = grouped_split(keys, val_fraction, seed=seed)
+        for level, keys in levels:
+            # Holding out a recording only measures "works on an unseen
+            # recording" when at least two recordings actually carry calls.
+            # With calls on one file the held-out side has either all of them
+            # or none — the first starves training, the second makes the score
+            # meaningless. That is the normal state early in the label-one-file
+            # -then-expand workflow, so auto drops to a call-level split rather
+            # than forcing a split the label set cannot support.
+            if level == 'file' and mode == 'auto' and positives is not None:
+                files_with_calls = {k for k, p in zip(keys, positives) if p}
+                if len(files_with_calls) < 2:
+                    degraded.append('file')
+                    continue
+            split = grouped_split(keys, val_fraction, seed=seed,
+                                  positives=positives)
             if split is not None:
                 train_idx, val_idx, val_groups = split
+                if not _usable(train_idx, val_idx):
+                    degraded.append(level)
+                    continue
                 n_groups = len(set(keys))
                 return {
+                    'degraded_from': degraded,
                     'train_idx': train_idx, 'val_idx': val_idx,
                     'split_level': level, 'val_groups': sorted(val_groups),
                     'n_groups': n_groups,
@@ -216,15 +302,30 @@ def _split_tiles(
                     # with training, so it reads False and every consumer warns.
                     'val_held_out': level == 'file',
                 }
-    # One call (or no provenance): nothing can be held out.
+    # One call (or no provenance): nothing can be held out. Stratify on
+    # positives so the last-resort split still puts calls on both sides —
+    # an unstratified shuffle can hand every call to one side by chance.
     rng = np.random.default_rng(seed)
-    indices = rng.permutation(n_total)
-    n_val = max(1, int(n_total * val_fraction))
+    if positives is not None and positives.any() and not positives.all():
+        pos_idx = rng.permutation(np.flatnonzero(positives))
+        neg_idx = rng.permutation(np.flatnonzero(~positives))
+        n_pos_val = max(1, int(len(pos_idx) * val_fraction))
+        n_neg_val = max(1, int(len(neg_idx) * val_fraction))
+        # Never take the last positive away from training.
+        n_pos_val = min(n_pos_val, max(0, len(pos_idx) - 1))
+        val_idx = np.concatenate([pos_idx[:n_pos_val], neg_idx[:n_neg_val]])
+        train_idx = np.concatenate([pos_idx[n_pos_val:], neg_idx[n_neg_val:]])
+    else:
+        indices = rng.permutation(n_total)
+        n_val = max(1, int(n_total * val_fraction))
+        val_idx = indices[:n_val]
+        train_idx = indices[n_val:] if n_total > n_val else indices
     return {
-        'train_idx': indices[n_val:] if n_total > n_val else indices,
-        'val_idx': indices[:n_val],
+        'train_idx': train_idx,
+        'val_idx': val_idx,
         'split_level': 'tile', 'val_groups': [], 'n_groups': 1,
         'n_val_groups': 0, 'val_held_out': False,
+        'degraded_from': degraded,
     }
 
 
@@ -574,12 +675,57 @@ def train_unet(
         )
 
     # ---- train/val split (grouped — see _split_tiles) ----
-    split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed)
+    # Which tiles actually contain a labelled call. The split needs this: a
+    # split that is balanced by tile count can still be empty of calls on one
+    # side, which silently produces a model that only ever predicts background.
+    tile_positive = (targets.reshape(n_total, -1) > 0.5).any(axis=1)
+    split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed,
+                         positives=tile_positive,
+                         mode=getattr(cfg, 'split_mode', 'call'))
     train_idx, val_idx = split['train_idx'], split['val_idx']
+
+    # Refuse to burn a GPU run on an unlearnable split. Reaching here means no
+    # grouping level could put calls on both sides — the label set itself is
+    # the problem, and only the user can fix it.
+    if tile_positive.any() and not tile_positive[train_idx].any():
+        raise RuntimeError(
+            "The train/validation split left ZERO labelled calls in the "
+            "training set, so the model would have nothing to learn from.\n\n"
+            "This happens when the calls are concentrated on recordings that "
+            "all end up held out — typically when one recording contributes "
+            "only rejected/hard-negative examples and another holds every "
+            "confirmed call.\n\n"
+            "Label confirmed calls on at least two recordings, then retrain."
+        )
     n_val = int(len(val_idx))
+
+    # Positive-pixel balance, measured over the supervised region only (the
+    # weight mask) because that is exactly what the loss sees. When this is
+    # tiny, an all-background prediction is a cheap minimum for a symmetric
+    # loss and the run silently collapses; reporting it makes that predictable
+    # instead of something you infer from three zeroed metrics.
+    def _balance(idx):
+        if len(idx) == 0:
+            return {'pos_frac': 0.0, 'n_call_tiles': 0, 'n_tiles': 0}
+        t = targets[idx] > 0.5
+        w = weights[idx] > 0.5
+        sup = float(w.sum())
+        pos = float(np.logical_and(t, w).sum())
+        per_tile = t.reshape(len(idx), -1).sum(axis=1)
+        return {
+            'pos_frac': (pos / sup) if sup > 0 else 0.0,
+            'n_call_tiles': int((per_tile > 0).sum()),
+            'n_tiles': int(len(idx)),
+        }
+
+    train_balance = _balance(train_idx)
+    val_balance = _balance(val_idx)
+
     if progress:
         progress(0, cfg.n_epochs, {
             'status': 'split',
+            'train_balance': train_balance,
+            'val_balance': val_balance,
             'split_level': split['split_level'],
             'val_held_out': split['val_held_out'],
             'n_groups': split['n_groups'],
@@ -713,6 +859,7 @@ def train_unet(
         model.eval()
         val_loss_sum, val_n = 0.0, 0
         dice_sum = 0.0
+        dice_n = 0
         # Pixel confusion (TP/FP/FN) over the supervised region at several
         # thresholds — cheap, nothing stored — for precision/recall and a
         # Dice-vs-threshold sweep. These separate "masks too tight / missing
@@ -737,8 +884,16 @@ def train_unet(
                 pred = (probs > 0.5).float() * wb
                 inter = (pred * tgt).sum()
                 union = pred.sum() + tgt.sum()
-                dice = (2 * inter / (union + 1e-6)).item() if union.item() > 0 else float('nan')
-                dice_sum += dice * xb.size(0)
+                # A batch with neither a predicted nor a labelled pixel has no
+                # meaningful Dice. It used to contribute nan, and one nan in
+                # the running sum makes val_dice nan for the whole run — which
+                # is what happens the moment background-only tiles enter
+                # validation and the model correctly predicts nothing on them.
+                # Skip those batches instead of poisoning the average.
+                if union.item() > 0:
+                    dice = (2 * inter / (union + 1e-6)).item()
+                    dice_sum += dice * xb.size(0)
+                    dice_n += xb.size(0)
                 pos_px += float(tgt.sum())
                 sup_px += float(wb.sum())
                 for t in _THRS:
@@ -747,7 +902,9 @@ def train_unet(
                     _fp[t] += float((pbt * (1 - yb) * wb).sum())
                     _fn[t] += float(((wb - pbt) * tgt).sum())
         val_loss = val_loss_sum / max(1, val_n)
-        val_dice = dice_sum / max(1, val_n)
+        # Averaged over the batches that HAD something to score, not all
+        # of them — otherwise background-only batches drag it toward 0.
+        val_dice = (dice_sum / dice_n) if dice_n else 0.0
 
         def _prd(t):
             prec = _tp[t] / (_tp[t] + _fp[t] + 1e-6)
@@ -835,6 +992,12 @@ def train_unet(
                     'n_train_tiles': int(len(train_idx)),
                     'n_val_tiles': n_val,
                     'trained': datetime.now().isoformat(timespec='seconds'),
+                    # The threshold this checkpoint actually scores best at.
+                    # 0.5 is only a convention, and on sparse masks the best
+                    # operating point is routinely elsewhere — carrying it with
+                    # the weights means inference does not have to guess.
+                    'best_threshold': best_thr,
+                    'val_dice_sweep': dice_sweep,
                 },
                 best_path,
             )
@@ -883,6 +1046,10 @@ def train_unet(
         'n_val_groups': split['n_val_groups'],
         'val_groups': split['val_groups'],
         'split_seed': cfg.split_seed,
+        # Positive-pixel balance — the number that explains an all-background
+        # collapse after the fact (see the _balance note above).
+        'train_balance': train_balance,
+        'val_balance': val_balance,
         'history': history,
         'config': asdict(cfg),
     }

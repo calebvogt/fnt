@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -68,6 +69,15 @@ MASKS_SUFFIX = LEGACY_MASKS_SUFFIX
 #: future layout change can be migrated deliberately instead of guessed at.
 FORMAT_NAME = "FNT-MAD"
 FORMAT_VERSION = 1
+
+
+def _fnt_version() -> str:
+    """Installed FNT version, or 'unknown' outside an installed package."""
+    try:
+        from importlib.metadata import version
+        return version("fnt")
+    except Exception:
+        return "unknown"
 TRAINING_STORE_NAME = "training_data.h5"
 _GRID_KEYS = ("sample_rate", "nperseg", "noverlap", "nfft",
               "n_freq_bins", "n_time_frames")
@@ -331,6 +341,87 @@ def set_grid_attrs(h5_path: str, **params) -> None:
         f.attrs["schema_version"] = SCHEMA_VERSION
         f.attrs["format"] = FORMAT_NAME
         f.attrs["format_version"] = FORMAT_VERSION
+        # Provenance, written once and never overwritten: which FNT wrote this
+        # file, when, and which recording it belongs to. A .mad separated from
+        # its wav (copied to another machine, or found years later) otherwise
+        # says nothing about where it came from — and "which version produced
+        # this?" is unanswerable after the fact.
+        if "created" not in f.attrs:
+            f.attrs["created"] = datetime.now().isoformat(timespec="seconds")
+        f.attrs["fnt_version"] = _fnt_version()
+        wav = params.get("source_wav")
+        if wav and "source_wav" not in f.attrs:
+            f.attrs["source_wav"] = str(wav)
+        f.attrs["updated"] = datetime.now().isoformat(timespec="seconds")
+
+
+#: Root attrs describing the last inference run over this recording. Written
+#: even when the run found nothing — "inference ran and found 0 calls" and
+#: "inference never ran" look identical without it, and the first is a real
+#: result the user should not have to re-derive by re-running.
+_RUN_KEYS = ("last_infer_at", "last_infer_model", "last_infer_threshold",
+             "last_infer_min_blob", "last_infer_merge", "last_infer_n")
+
+
+def set_infer_run_attrs(h5_path: str, **params) -> None:
+    """Record who/what/when produced the predictions now in this file."""
+    _require_h5()
+    with h5py.File(h5_path, "a") as f:
+        for k in _RUN_KEYS:
+            v = params.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str):
+                f.attrs[k] = v
+            elif k in ("last_infer_min_blob", "last_infer_n"):
+                f.attrs[k] = int(v)          # counts are counts, not 3286.0
+            elif k == "last_infer_merge":
+                f.attrs[k] = int(bool(v))
+            else:
+                # Thresholds come from a spin box; 0.15000000000000002 is
+                # binary-float noise, not precision anyone chose.
+                f.attrs[k] = round(float(v), 6)
+
+
+def get_infer_run_attrs(h5_path: str) -> Dict:
+    """The last run's settings, or {} when inference has never been run."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return {}
+    out: Dict = {}
+    try:
+        with h5py.File(h5_path, "r") as f:
+            for k in _RUN_KEYS:
+                if k in f.attrs:
+                    v = f.attrs[k]
+                    out[k] = (v.decode() if isinstance(v, bytes)
+                              else v.item() if hasattr(v, "item") else v)
+    except Exception:
+        return {}
+    return out
+
+
+def was_inferred(h5_path: str) -> bool:
+    """True if inference has ever been run over this recording.
+
+    Prefers the explicit run stamp, but falls back to the evidence a run
+    leaves regardless of version — the cached blob count, or the pred_calls
+    group itself, both of which only exist because a run wrote them. Without
+    the fallback every file analyzed before the stamp existed would read as
+    never analyzed.
+    """
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return False
+    try:
+        with h5py.File(h5_path, "r") as f:
+            if any(k in f.attrs for k in _RUN_KEYS):
+                return True
+            if "n_pred_blobs" in f.attrs:
+                return True
+            return PRED_GROUP in f
+    except Exception:
+        return False
 
 
 def get_grid_attrs(h5_path: str) -> Dict:

@@ -26,6 +26,92 @@ MAX_EXPORT_MP = 40.0
 # Spectrogram Widget
 # =============================================================================
 
+def compute_view_spec_arrays(audio_data, sample_rate, view_start, view_end,
+                             min_freq, max_freq, total_duration):
+    """Everything needed to draw a view's spectrogram, as plain numpy.
+
+    Split out of :meth:`SpectrogramWidget._compute_view_spectrogram` so it can
+    run on a worker thread: it touches no widget state and returns arrays, not
+    a QImage. On a 600 s recording this was ~1.2 s on the UI thread every time
+    a file was opened, which is most of what made switching files feel frozen.
+
+    Returns a dict with the uint8 colormap ``indices`` (already flipped so row
+    0 is the top of the image), the raw dB slice and its frequencies for the
+    filter overlay, and the view it was computed for — the caller checks that
+    before installing it, since the user may have moved on. Returns None when
+    there is nothing to draw.
+    """
+    if audio_data is None or sample_rate is None:
+        return None
+
+    # Extract segment with padding
+    pad_time = 0.1
+    start_time = max(0, view_start - pad_time)
+    end_time = min(total_duration, view_end + pad_time)
+    start_sample = int(start_time * sample_rate)
+    end_sample = int(end_time * sample_rate)
+    segment = audio_data[start_sample:end_sample]
+    if len(segment) < 512:
+        return None
+
+    # Downsample if needed, but ensure Nyquist stays above max display freq
+    effective_sr = sample_rate
+    if len(segment) > 2_000_000:
+        downsample_factor = int(np.ceil(len(segment) / 2_000_000))
+        if max_freq > 0:
+            max_allowed = max(1, int(sample_rate / (2 * max_freq)))
+            downsample_factor = min(downsample_factor, max_allowed)
+        if downsample_factor > 1:
+            segment = segment[::downsample_factor]
+            effective_sr = sample_rate / downsample_factor
+
+    # For very large segments, reduce time resolution instead of frequency.
+    target_time_cols = 2000
+    nperseg = min(512, len(segment) // 10)
+    nperseg = max(128, nperseg)
+    min_hop = max(1, len(segment) // target_time_cols)
+    noverlap = max(0, nperseg - min_hop)
+    noverlap = min(noverlap, int(nperseg * 0.75))    # cap at 75% overlap
+    nfft = max(nperseg, 512)
+
+    from scipy import signal
+    frequencies, times, Sxx = signal.spectrogram(
+        segment, fs=effective_sr,
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann')
+
+    times = times + start_time
+    spec_db = 10 * np.log10(Sxx + 1e-10)
+
+    time_mask = (times >= view_start) & (times <= view_end)
+    if not np.any(time_mask):
+        return None
+    view_spec = spec_db[:, time_mask]
+
+    freq_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+    if not np.any(freq_mask):
+        return None
+    view_spec = view_spec[freq_mask, :]
+
+    # Raw dB kept for the filter overlay, before normalization.
+    raw_db = view_spec.copy()
+    raw_freqs = frequencies[freq_mask].copy()
+
+    vmin = np.percentile(view_spec, 5)
+    vmax = np.percentile(view_spec, 99)
+    normalized = np.clip((view_spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
+    indices = np.flipud((normalized * 255).astype(np.uint8))
+
+    return {
+        'indices': indices,
+        'raw_db': raw_db,
+        'raw_freqs': raw_freqs,
+        'view_start': view_start,
+        'view_end': view_end,
+        'min_freq': min_freq,
+        'max_freq': max_freq,
+    }
+
+
 class SpectrogramWidget(QWidget):
     """Custom widget for displaying spectrogram with detection boxes."""
 
@@ -354,7 +440,8 @@ class SpectrogramWidget(QWidget):
 
         return lut
 
-    def set_audio_data(self, audio_data, sample_rate, preserve_view=False):
+    def set_audio_data(self, audio_data, sample_rate, preserve_view=False,
+                       precomputed=None):
         """Set audio data for spectrogram computation.
 
         Args:
@@ -391,7 +478,17 @@ class SpectrogramWidget(QWidget):
         self.spec_image = None
 
         if self.total_duration > 0:
-            self._compute_view_spectrogram()
+            # A worker may already have done the expensive part for the view
+            # we are about to show. Use it only if it matches, so a stale
+            # result can never be painted as if it were this view.
+            if (precomputed is not None
+                    and abs(precomputed['view_start'] - self.view_start) < 1e-9
+                    and abs(precomputed['view_end'] - self.view_end) < 1e-9
+                    and precomputed['min_freq'] == self.min_freq
+                    and precomputed['max_freq'] == self.max_freq):
+                self._install_spec_arrays(precomputed)
+            else:
+                self._compute_view_spectrogram()
         self.update()
 
     def set_detections(self, detections, current_idx=-1):
@@ -438,6 +535,28 @@ class SpectrogramWidget(QWidget):
         """Get total audio duration."""
         return self.total_duration
 
+    def _install_spec_arrays(self, res):
+        """Turn arrays from :func:`compute_view_spec_arrays` into the QImage.
+
+        Only the LUT lookup and the QImage build happen here — both cheap —
+        so this is safe and quick on the UI thread whether the arrays came
+        from a worker or from a synchronous recompute.
+        """
+        indices = res['indices']
+        self._raw_spec_db = res['raw_db']
+        self._raw_spec_freqs = res['raw_freqs']
+        rgb_data = np.ascontiguousarray(self.colormap_lut[indices])
+        height, width = indices.shape
+        self.spec_image = QImage(
+            rgb_data.data, width, height, width * 3,
+            QImage.Format_RGB888).copy()
+        self.cached_view_start = res['view_start']
+        self.cached_view_end = res['view_end']
+        self.cached_min_freq = res['min_freq']
+        self.cached_max_freq = res['max_freq']
+        if self._filter_overlay_active:
+            self._compute_filter_overlay()
+
     def _compute_view_spectrogram(self):
         """Compute spectrogram for current view window."""
         if self.audio_data is None or self.sample_rate is None:
@@ -459,93 +578,13 @@ class SpectrogramWidget(QWidget):
             if zoom_similar and same_position and same_freq:
                 return
 
-        # Extract segment with padding
-        pad_time = 0.1
-        start_time = max(0, self.view_start - pad_time)
-        end_time = min(self.total_duration, self.view_end + pad_time)
-
-        start_sample = int(start_time * self.sample_rate)
-        end_sample = int(end_time * self.sample_rate)
-        segment = self.audio_data[start_sample:end_sample]
-
-        if len(segment) < 512:
+        res = compute_view_spec_arrays(
+            self.audio_data, self.sample_rate, self.view_start, self.view_end,
+            self.min_freq, self.max_freq, self.total_duration)
+        if res is None:
             self.spec_image = None
             return
-
-        # Downsample if needed, but ensure Nyquist stays above max display freq
-        effective_sr = self.sample_rate
-        if len(segment) > 2_000_000:
-            downsample_factor = int(np.ceil(len(segment) / 2_000_000))
-            # Limit downsample so Nyquist (effective_sr/2) >= max_freq
-            if self.max_freq > 0:
-                max_allowed = max(1, int(self.sample_rate / (2 * self.max_freq)))
-                downsample_factor = min(downsample_factor, max_allowed)
-            if downsample_factor > 1:
-                segment = segment[::downsample_factor]
-                effective_sr = self.sample_rate / downsample_factor
-
-        # For very large segments, reduce time resolution instead of frequency
-        # Target ~2000 time columns max for the spectrogram image
-        target_time_cols = 2000
-        nperseg = min(512, len(segment) // 10)
-        nperseg = max(128, nperseg)
-        # Adjust overlap to limit output columns for wide windows
-        min_hop = max(1, len(segment) // target_time_cols)
-        noverlap = max(0, nperseg - min_hop)
-        noverlap = min(noverlap, int(nperseg * 0.75))  # Cap at 75% overlap
-        nfft = max(nperseg, 512)
-
-        from scipy import signal
-        frequencies, times, Sxx = signal.spectrogram(
-            segment, fs=effective_sr,
-            nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann'
-        )
-
-        times = times + start_time
-        spec_db = 10 * np.log10(Sxx + 1e-10)
-
-        # Filter to view range (time)
-        time_mask = (times >= self.view_start) & (times <= self.view_end)
-        if not np.any(time_mask):
-            self.spec_image = None
-            return
-
-        view_spec = spec_db[:, time_mask]
-
-        # Filter to frequency display range
-        freq_mask = (frequencies >= self.min_freq) & (frequencies <= self.max_freq)
-        if not np.any(freq_mask):
-            self.spec_image = None
-            return
-        view_spec = view_spec[freq_mask, :]
-
-        # Cache raw dB data for filter overlay (before normalization)
-        self._raw_spec_db = view_spec.copy()
-        self._raw_spec_freqs = frequencies[freq_mask].copy()
-
-        # Normalize and apply colormap
-        vmin = np.percentile(view_spec, 5)
-        vmax = np.percentile(view_spec, 99)
-        normalized = np.clip((view_spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
-        indices = (normalized * 255).astype(np.uint8)
-        indices = np.flipud(indices)
-
-        rgb_data = np.ascontiguousarray(self.colormap_lut[indices])
-
-        height, width = indices.shape
-        self.spec_image = QImage(
-            rgb_data.data, width, height, width * 3,
-            QImage.Format_RGB888
-        ).copy()
-
-        self.cached_view_start = self.view_start
-        self.cached_view_end = self.view_end
-        self.cached_min_freq = self.min_freq
-        self.cached_max_freq = self.max_freq
-
-        # Recompute filter overlay if active
-        if self._filter_overlay_active:
-            self._compute_filter_overlay()
+        self._install_spec_arrays(res)
 
     def paintEvent(self, event):
         """Paint spectrogram and detection boxes."""

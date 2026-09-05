@@ -1,191 +1,104 @@
+"""Dyadic co-presence: how long each pair of animals actually spent together.
+
+Written fresh rather than ported. The R script for this (``3b``) never ran to
+completion - it loops over one variable while reading another, and its method
+for stitching adjacent intervals back together (dropping timestamps that appear
+more than once) breaks whenever three intervals share an endpoint. No output
+file was ever produced, so there is nothing to reproduce.
+
+The definition here: for a pair, walk the GBI intervals of one zone in time
+order and merge every run of CONTIGUOUS intervals in which both animals are
+present. Contiguity is required - one interval's stop being the next one's
+start - so a pair that leaves and returns records two encounters rather than
+one long one. Other animals coming and going do not split the encounter, which
+is the point: this measures the pair's association, not the group's.
 """
-Edgelist Generator - Stage 3c of pipeline.
 
-Creates dyadic interaction records from GBI matrices.
+from __future__ import annotations
 
-Equivalent to R script: 3b_create_ALLTRIAL_MOVEBOUT_GBI_edgelist.R
-"""
+import itertools
 
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from typing import Optional, Callable, Dict
+import pandas as pd
 
-from ..config import RFIDConfig
+from .gbi_generator import GBI_META
+
+BOUT_COLUMNS = ["trial", "day", "zone", "id1", "id2",
+                "field_time_start", "field_time_stop", "duration_s"]
+EDGE_COLUMNS = ["trial", "day", "id1", "id2", "n_bouts", "total_duration_s",
+                "mean_duration_s", "n_zones"]
+
+
+def co_presence_bouts(gbi: pd.DataFrame, animals: list[str] | None = None,
+                      progress=None) -> pd.DataFrame:
+    """One row per continuous encounter between a pair of animals."""
+    if gbi.empty:
+        return pd.DataFrame(columns=BOUT_COLUMNS)
+    say = progress or (lambda _m: None)
+
+    animals = animals or [c for c in gbi.columns if c not in GBI_META]
+    trial = gbi["trial"].iloc[0] if "trial" in gbi.columns else ""
+    gbi = gbi.sort_values(["zone", "field_time_start"], kind="stable")
+
+    zone = gbi["zone"].to_numpy()
+    day = gbi["day"].to_numpy()
+    start = gbi["field_time_start"].to_numpy()
+    stop = gbi["field_time_stop"].to_numpy()
+    present = {a: gbi[a].to_numpy().astype(bool) for a in animals}
+
+    rows = []
+    pairs = list(itertools.combinations(animals, 2))
+    for n, (a, b) in enumerate(pairs):
+        if n % 100 == 0:
+            say(f"Co-presence... pair {n:,}/{len(pairs):,}")
+        together = present[a] & present[b]
+        if not together.any():
+            continue
+        idx = np.flatnonzero(together)
+        # split the run wherever the zone changes or the intervals are not
+        # butted up against each other
+        breaks = np.ones(len(idx), bool)
+        if len(idx) > 1:
+            prev, cur = idx[:-1], idx[1:]
+            breaks[1:] = (zone[cur] != zone[prev]) | (start[cur] != stop[prev])
+        group = np.cumsum(breaks)
+        frame = pd.DataFrame({"g": group, "i": idx})
+        for g, part in frame.groupby("g", sort=True):
+            lo, hi = part["i"].iloc[0], part["i"].iloc[-1]
+            rows.append((trial, int(day[lo]), int(zone[lo]), a, b,
+                         start[lo], stop[hi],
+                         (stop[hi] - start[lo]) / np.timedelta64(1, "s")))
+
+    out = pd.DataFrame(rows, columns=BOUT_COLUMNS)
+    say(f"{len(out):,} co-presence bouts")
+    return out.sort_values(["id1", "id2", "field_time_start"],
+                           kind="stable").reset_index(drop=True)
+
+
+def edgelist(bouts: pd.DataFrame, by_day: bool = True) -> pd.DataFrame:
+    """Aggregate co-presence bouts into a weighted edge list."""
+    if bouts.empty:
+        return pd.DataFrame(columns=EDGE_COLUMNS)
+    keys = ["trial", "id1", "id2"] + (["day"] if by_day else [])
+    out = (bouts.groupby(keys, observed=True)
+                .agg(n_bouts=("duration_s", "size"),
+                     total_duration_s=("duration_s", "sum"),
+                     mean_duration_s=("duration_s", "mean"),
+                     n_zones=("zone", "nunique"))
+                .reset_index())
+    if not by_day:
+        out["day"] = np.nan
+    return out[EDGE_COLUMNS].sort_values(
+        ["day", "id1", "id2"], kind="stable").reset_index(drop=True)
 
 
 class EdgelistGenerator:
-    """
-    Generator for dyadic edgelists from GBI matrices.
-    """
+    """Config-driven wrapper producing bouts and their aggregation."""
 
-    def __init__(self, config: RFIDConfig):
-        """
-        Initialize edgelist generator with configuration.
-
-        Args:
-            config: RFID configuration object
-        """
+    def __init__(self, config=None):
         self.config = config
 
-    def create_edgelist(
-        self,
-        gbi_dict: Dict[str, pd.DataFrame],
-        movebout_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> pd.DataFrame:
-        """
-        Create edgelist from GBI matrices.
-
-        Args:
-            gbi_dict: Dictionary mapping trial_id to GBI DataFrame
-            movebout_df: Movement bout DataFrame
-            progress_callback: Optional callback function(message: str)
-
-        Returns:
-            Edgelist DataFrame with dyadic interactions
-        """
-        if progress_callback:
-            progress_callback("Creating edgelist...")
-
-        all_edges = []
-
-        for trial_id, gbi_df in gbi_dict.items():
-            if progress_callback:
-                progress_callback(f"Processing edgelist for trial: {trial_id}")
-
-            if len(gbi_df) == 0:
-                continue
-
-            # Get animal columns
-            metadata_cols = ['zone_id', 'start_time', 'end_time', 'center_time',
-                            'duration', 'group_size', 'm_sum', 'f_sum', 'mf_sum']
-            animal_cols = [col for col in gbi_df.columns if col not in metadata_cols]
-
-            # Process each grouping event
-            for idx, row in gbi_df.iterrows():
-                # Find animals present in this event
-                animals_present = [col for col in animal_cols if row[col] == 1]
-
-                # Create edges for all pairs
-                for i in range(len(animals_present)):
-                    for j in range(i+1, len(animals_present)):
-                        edge = {
-                            'trial': trial_id,
-                            'animal1': animals_present[i],
-                            'animal2': animals_present[j],
-                            'zone_id': row['zone_id'],
-                            'start_time': row['start_time'],
-                            'end_time': row['end_time'],
-                            'duration': row['duration']
-                        }
-                        all_edges.append(edge)
-
-        # Convert to DataFrame
-        if all_edges:
-            edgelist_df = pd.DataFrame(all_edges)
-
-            # Concatenate continuous interactions (same dyad, same zone)
-            edgelist_df = self._concatenate_continuous_interactions(edgelist_df)
-
-            # Save output
-            output_path = self._save_output(edgelist_df, progress_callback)
-
-            if progress_callback:
-                progress_callback(f"Created {len(edgelist_df)} dyadic interactions")
-
-            return edgelist_df
-        else:
-            return pd.DataFrame()
-
-    def _concatenate_continuous_interactions(self, edgelist_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Concatenate continuous co-occurrence events.
-
-        Args:
-            edgelist_df: Raw edgelist DataFrame
-
-        Returns:
-            Edgelist with continuous interactions merged
-        """
-        if len(edgelist_df) == 0:
-            return edgelist_df
-
-        # Sort by dyad, zone, and time
-        edgelist_df = edgelist_df.sort_values(['trial', 'animal1', 'animal2', 'zone_id', 'start_time'])
-
-        # Group by dyad and zone
-        grouped = edgelist_df.groupby(['trial', 'animal1', 'animal2', 'zone_id'])
-
-        concatenated = []
-
-        for (trial, animal1, animal2, zone), group in grouped:
-            group = group.sort_values('start_time').reset_index(drop=True)
-
-            if len(group) == 1:
-                concatenated.append(group.iloc[0])
-                continue
-
-            # Merge continuous interactions
-            current_start = group.iloc[0]['start_time']
-            current_end = group.iloc[0]['end_time']
-
-            for i in range(1, len(group)):
-                next_start = group.iloc[i]['start_time']
-                next_end = group.iloc[i]['end_time']
-
-                # If next interaction starts before current ends, extend
-                if next_start <= current_end:
-                    current_end = max(current_end, next_end)
-                else:
-                    # Save current interaction
-                    concatenated.append({
-                        'trial': trial,
-                        'animal1': animal1,
-                        'animal2': animal2,
-                        'zone_id': zone,
-                        'start_time': current_start,
-                        'end_time': current_end,
-                        'duration': current_end - current_start
-                    })
-
-                    # Start new interaction
-                    current_start = next_start
-                    current_end = next_end
-
-            # Save last interaction
-            concatenated.append({
-                'trial': trial,
-                'animal1': animal1,
-                'animal2': animal2,
-                'zone_id': zone,
-                'start_time': current_start,
-                'end_time': current_end,
-                'duration': current_end - current_start
-            })
-
-        return pd.DataFrame(concatenated)
-
-    def _save_output(
-        self,
-        edgelist_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> str:
-        """
-        Save edgelist to file.
-
-        Args:
-            edgelist_df: Edgelist DataFrame
-            progress_callback: Optional callback function
-
-        Returns:
-            Path to output file
-        """
-        output_dir = Path(self.config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = output_dir / "ALLTRIAL_MOVEBOUT_GBI_edgelist.csv"
-
-        edgelist_df.to_csv(output_path, index=False)
-
-        return str(output_path)
+    def run(self, gbi: pd.DataFrame, animals=None,
+            progress=None) -> dict[str, pd.DataFrame]:
+        bouts = co_presence_bouts(gbi, animals, progress)
+        return {"co_presence_bouts": bouts, "edgelist": edgelist(bouts)}

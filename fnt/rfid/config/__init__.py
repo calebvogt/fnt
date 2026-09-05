@@ -1,11 +1,12 @@
-"""Configuration management for RFID preprocessing."""
+"""Trial configuration for RFID preprocessing."""
 
-from .defaults import RFIDConfig, get_default_config, get_available_templates
+from .defaults import (TrialConfig, RFIDConfig, Arena, Zone, Antenna,
+                       DEFAULT_EXPORTS, get_default_config,
+                       get_available_templates, get_fnt_version)
 from .config_manager import ConfigManager
 
 __all__ = [
-    'RFIDConfig',
-    'get_default_config',
-    'get_available_templates',
-    'ConfigManager'
+    "TrialConfig", "RFIDConfig", "Arena", "Zone", "Antenna", "DEFAULT_EXPORTS",
+    "get_default_config", "get_available_templates", "get_fnt_version",
+    "ConfigManager",
 ]

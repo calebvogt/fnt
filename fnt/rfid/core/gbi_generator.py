@@ -1,351 +1,153 @@
+"""Stage 3: bouts -> a group-by-individual (GBI) matrix.
+
+Within a zone, take every bout start and stop as an endpoint and sort them.
+Consecutive endpoints bound an interval over which the set of animals present
+cannot change, because the only thing that changes it is an endpoint. Each
+interval becomes a row, with a 1 for every animal in the zone during it.
+
+The R original tested every interval against every bout with lubridate's
+``%within%``, which is O(intervals x bouts) per zone and took hours. The sweep
+here adds a bout when its start is reached and removes it when its stop is
+passed, so the active set IS the answer - same result, seconds instead.
+
+One inherited subtlety, kept deliberately: when two endpoints coincide (one
+animal leaves exactly as another arrives) the interval has zero length, and the
+probe point sits exactly on the boundary. Because intervals are closed at both
+ends, BOTH the departing and the arriving animal count as present. Those rows
+are the clearest hand-off events in the data, so they are worth keeping; the
+duration is reported as ``min_duration_s`` rather than zero.
 """
-Group-By-Individual (GBI) Matrix Generator - Stage 3a of pipeline.
 
-Creates binary presence matrices showing which animals were present
-in each grouping event (co-occurrence in zones).
+from __future__ import annotations
 
-Equivalent to R script: 3_create_ALLTRIAL_MOVEBOUT_GBI.R
-"""
-
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from typing import Optional, Callable, Dict, List, Tuple
-from itertools import combinations
+import pandas as pd
 
-from ..config import RFIDConfig
+from ..config.defaults import TrialConfig
+
+EPOCH = pd.Timestamp("1970-01-01")
+GBI_META = ["trial", "day", "zone", "field_time_start", "field_time_stop",
+            "duration_s", "m_sum", "f_sum", "mf_sum"]
+
+
+def _seconds(series: pd.Series) -> np.ndarray:
+    return (series - EPOCH).dt.total_seconds().to_numpy()
+
+
+def _zone_intervals(starts, stops, days, who, min_duration_s):
+    """Sweep one zone's bouts into (start, stop, duration, day, present)."""
+    endpoints = np.sort(np.concatenate([starts, stops]))
+    left, right = endpoints[:-1], endpoints[1:]
+    raw = right - left
+    duration = np.where(raw == 0, min_duration_s, raw)
+    # probe from the RAW span, so a zero-length interval is probed on the
+    # boundary itself and catches both sides of a hand-off
+    probe = left + raw / 2.0
+
+    entering = np.argsort(starts, kind="stable")
+    leaving = np.argsort(stops, kind="stable")
+    i = j = 0
+    active: set[int] = set()
+    rows = []
+    for k, point in enumerate(probe):
+        while i < len(entering) and starts[entering[i]] <= point:
+            active.add(int(entering[i]))
+            i += 1
+        while j < len(leaving) and stops[leaving[j]] < point:
+            active.discard(int(leaving[j]))
+            j += 1
+        if not active:
+            continue
+        rows.append((left[k], right[k], duration[k],
+                     int(days[max(active)]), [who[m] for m in active]))
+    return rows
+
+
+def create_gbi(bouts: pd.DataFrame, animals: list[str] | None = None,
+               sex_by_name: dict[str, str] | None = None,
+               min_duration_s: float = 1.0, progress=None) -> pd.DataFrame:
+    """Build the GBI matrix for one trial's bouts."""
+    if bouts.empty:
+        return pd.DataFrame(columns=GBI_META)
+    say = progress or (lambda _m: None)
+
+    bouts = bouts.copy()
+    bouts["field_time_stop"] = pd.to_datetime(bouts["field_time_stop"])
+    animals = animals or sorted(bouts["name"].unique())
+    if sex_by_name is None:
+        sex_by_name = (bouts.drop_duplicates("name")
+                            .set_index("name")["sex"].to_dict())
+    trial = bouts["trial"].iloc[0] if "trial" in bouts.columns else ""
+
+    records = []
+    zones = sorted(bouts["zone"].dropna().unique())
+    for zone in zones:
+        say(f"Building GBI for zone {zone}...")
+        z = bouts[bouts["zone"] == zone].sort_values("field_time", kind="stable")
+        if z.empty:
+            continue
+        for start, stop, duration, day, present in _zone_intervals(
+                _seconds(z["field_time"]), _seconds(z["field_time_stop"]),
+                z["noon_day"].to_numpy(), z["name"].to_numpy(), min_duration_s):
+            row = {"trial": trial, "day": day, "zone": int(zone),
+                   "field_time_start": start, "field_time_stop": stop,
+                   "duration_s": duration}
+            row.update(dict.fromkeys(animals, 0))
+            for animal in present:
+                row[animal] = 1
+            records.append(row)
+
+    if not records:
+        return pd.DataFrame(columns=GBI_META + animals)
+
+    gbi = pd.DataFrame.from_records(records)
+    for col in ("field_time_start", "field_time_stop"):
+        gbi[col] = pd.to_datetime(gbi[col], unit="s").dt.round("ms")
+
+    males = [a for a in animals if sex_by_name.get(a) == "M"]
+    females = [a for a in animals if sex_by_name.get(a) == "F"]
+    gbi["m_sum"] = gbi[males].sum(axis=1) if males else 0
+    gbi["f_sum"] = gbi[females].sum(axis=1) if females else 0
+    gbi["mf_sum"] = gbi["m_sum"] + gbi["f_sum"]
+
+    gbi = gbi.sort_values(["zone", "field_time_start"], kind="stable")
+    say(f"{len(gbi):,} GBI intervals across {len(zones)} zones")
+    return gbi[GBI_META + animals].reset_index(drop=True)
+
+
+def melt_gbi(gbi: pd.DataFrame, meta: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Long form: one row per animal per interval it was present for.
+
+    This is the per-animal occupancy table. It is derived from the GBI rather
+    than from the bouts, so an animal's row carries who else was in the zone at
+    the time - which is the whole point of having it.
+    """
+    animals = [c for c in gbi.columns if c not in GBI_META]
+    pieces = []
+    for animal in animals:
+        part = gbi.loc[gbi[animal] == 1, GBI_META].copy()
+        if part.empty:
+            continue
+        part.insert(3, "name", animal)
+        pieces.append(part)
+    if not pieces:
+        return pd.DataFrame(columns=GBI_META[:3] + ["name"] + GBI_META[3:])
+    out = pd.concat(pieces, ignore_index=True)
+    if meta is not None and not meta.empty:
+        cols = [c for c in ("name", "code", "sex", "phase", "group", "strain")
+                if c in meta.columns]
+        out = out.merge(meta[cols].drop_duplicates("name"), on="name", how="left")
+    return out.sort_values(["name", "field_time_start"],
+                           kind="stable").reset_index(drop=True)
 
 
 class GBIGenerator:
-    """
-    Generator for Group-By-Individual matrices.
+    """Config-driven wrapper around :func:`create_gbi`."""
 
-    Creates binary matrices showing co-occurrence patterns in zones.
-    """
-
-    def __init__(self, config: RFIDConfig):
-        """
-        Initialize GBI generator with configuration.
-
-        Args:
-            config: RFID configuration object
-        """
+    def __init__(self, config: TrialConfig):
         self.config = config
 
-    def create_gbi_matrices(
-        self,
-        movebout_df: pd.DataFrame,
-        metadata_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> Dict[str, pd.DataFrame]:
-        """
-        Create GBI matrices for all trials.
-
-        Args:
-            movebout_df: Movement bout DataFrame
-            metadata_df: Metadata DataFrame with animal information
-            progress_callback: Optional callback function(message: str)
-
-        Returns:
-            Dictionary mapping trial_id to GBI DataFrame
-
-        Raises:
-            ValueError: If required columns are missing
-        """
-        # Validate input
-        required_cols = ['trial', 'name', 'zone_id', 'bout_type', 'bout_id',
-                        'bout_start_time', 'bout_end_time']
-        missing_cols = [col for col in required_cols if col not in movebout_df.columns]
-
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-
-        if progress_callback:
-            progress_callback("Creating GBI matrices...")
-
-        # Process each trial separately
-        gbi_dict = {}
-
-        for trial_id in self.config.trial_ids:
-            if progress_callback:
-                progress_callback(f"Processing trial: {trial_id}")
-
-            trial_df = movebout_df[movebout_df['trial'] == trial_id]
-            trial_metadata = metadata_df[metadata_df['trial'] == trial_id]
-
-            if len(trial_df) == 0:
-                if progress_callback:
-                    progress_callback(f"Warning: No data for trial {trial_id}")
-                continue
-
-            # Create GBI for this trial
-            gbi_df = self._create_trial_gbi(trial_df, trial_metadata, progress_callback)
-
-            gbi_dict[trial_id] = gbi_df
-
-            # Save trial-specific GBI
-            output_path = self._save_trial_gbi(trial_id, gbi_df, progress_callback)
-
-            if progress_callback:
-                progress_callback(f"Saved {len(gbi_df)} grouping events for {trial_id}")
-
-        return gbi_dict
-
-    def _create_trial_gbi(
-        self,
-        trial_df: pd.DataFrame,
-        metadata_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> pd.DataFrame:
-        """
-        Create GBI matrix for a single trial.
-
-        Args:
-            trial_df: Movement bout data for one trial
-            metadata_df: Metadata for one trial
-            progress_callback: Optional callback function
-
-        Returns:
-            GBI DataFrame with grouping events
-        """
-        # Get list of all animals in this trial
-        animals = sorted(metadata_df['name'].unique())
-
-        # Get sex information for summary columns
-        animal_sex = metadata_df.set_index('name')['sex'].to_dict()
-
-        # Extract bout information (START and STOP reads)
-        bout_reads = trial_df[trial_df['bout_type'].isin(['START', 'STOP'])].copy()
-
-        # Get bout-level information
-        bouts = self._extract_bouts(bout_reads)
-
-        if len(bouts) == 0:
-            # No bouts found, return empty GBI
-            return pd.DataFrame()
-
-        # Find overlapping bouts by zone
-        grouping_events = []
-
-        # Process each zone separately
-        zones = bouts['zone_id'].unique()
-
-        for zone_id in zones:
-            zone_bouts = bouts[bouts['zone_id'] == zone_id]
-
-            # Find overlapping time windows
-            overlaps = self._find_overlapping_bouts(zone_bouts)
-
-            for overlap_group in overlaps:
-                # Create grouping event
-                animals_present = overlap_group['animals']
-                start_time = overlap_group['start_time']
-                end_time = overlap_group['end_time']
-                center_time = (start_time + end_time) / 2
-
-                # Create binary presence vector
-                presence = {animal: (1 if animal in animals_present else 0) for animal in animals}
-
-                # Add event metadata
-                event = {
-                    'zone_id': zone_id,
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'center_time': center_time,
-                    'duration': end_time - start_time,
-                    'group_size': len(animals_present)
-                }
-
-                # Add presence columns
-                event.update(presence)
-
-                # Add sex-based counts
-                males = [a for a in animals_present if animal_sex.get(a) == 'M']
-                females = [a for a in animals_present if animal_sex.get(a) == 'F']
-
-                event['m_sum'] = len(males)
-                event['f_sum'] = len(females)
-                event['mf_sum'] = len(males) + len(females)
-
-                grouping_events.append(event)
-
-        # Convert to DataFrame
-        if grouping_events:
-            gbi_df = pd.DataFrame(grouping_events)
-
-            # Reorder columns: metadata first, then animal presence
-            metadata_cols = ['zone_id', 'start_time', 'end_time', 'center_time',
-                            'duration', 'group_size', 'm_sum', 'f_sum', 'mf_sum']
-            animal_cols = sorted(animals)
-
-            # Ensure all columns exist
-            for col in metadata_cols + animal_cols:
-                if col not in gbi_df.columns:
-                    if col in metadata_cols:
-                        gbi_df[col] = np.nan
-                    else:
-                        gbi_df[col] = 0
-
-            gbi_df = gbi_df[metadata_cols + animal_cols]
-
-            return gbi_df
-        else:
-            return pd.DataFrame()
-
-    def _extract_bouts(self, bout_reads: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract bout-level information from START/STOP reads.
-
-        Args:
-            bout_reads: DataFrame with START and STOP reads
-
-        Returns:
-            DataFrame with one row per bout
-        """
-        bouts = []
-
-        # Group by bout_id to get bout information
-        for bout_id, group in bout_reads.groupby('bout_id'):
-            start_reads = group[group['bout_type'] == 'START']
-
-            if len(start_reads) == 0:
-                continue
-
-            # Use first START read for bout info (should only be one)
-            start_read = start_reads.iloc[0]
-
-            bout_info = {
-                'bout_id': bout_id,
-                'animal': start_read['name'],
-                'zone_id': start_read['zone_id'],
-                'start_time': start_read['bout_start_time'],
-                'end_time': start_read['bout_end_time'],
-                'duration': start_read['bout_duration']
-            }
-
-            bouts.append(bout_info)
-
-        return pd.DataFrame(bouts)
-
-    def _find_overlapping_bouts(self, zone_bouts: pd.DataFrame) -> List[Dict]:
-        """
-        Find overlapping bouts in a zone (co-occurrence events).
-
-        Uses the "center time" method: bouts overlap if their centers
-        fall within each other's duration.
-
-        Args:
-            zone_bouts: Bouts in a single zone
-
-        Returns:
-            List of overlapping bout groups
-        """
-        if len(zone_bouts) == 0:
-            return []
-
-        zone_bouts = zone_bouts.copy()
-        zone_bouts['center_time'] = (zone_bouts['start_time'] + zone_bouts['end_time']) / 2
-
-        # Sort by center time
-        zone_bouts = zone_bouts.sort_values('center_time')
-
-        # Find overlapping groups
-        overlap_groups = []
-
-        for idx, bout in zone_bouts.iterrows():
-            # Check if this bout's center falls within any existing bout
-            overlapping_bouts = zone_bouts[
-                (zone_bouts['start_time'] <= bout['center_time']) &
-                (zone_bouts['end_time'] >= bout['center_time'])
-            ]
-
-            if len(overlapping_bouts) > 0:
-                # Create grouping event from overlapping bouts
-                animals_present = set(overlapping_bouts['animal'].unique())
-
-                # Use the overlap period
-                overlap_start = overlapping_bouts['start_time'].max()
-                overlap_end = overlapping_bouts['end_time'].min()
-
-                # Only create event if there's actual overlap
-                if overlap_end > overlap_start:
-                    overlap_group = {
-                        'animals': animals_present,
-                        'start_time': overlap_start,
-                        'end_time': overlap_end
-                    }
-
-                    # Check if this is a new unique group (avoid duplicates)
-                    is_duplicate = False
-                    for existing_group in overlap_groups:
-                        if (existing_group['animals'] == animals_present and
-                            abs(existing_group['start_time'] - overlap_start) < 0.1 and
-                            abs(existing_group['end_time'] - overlap_end) < 0.1):
-                            is_duplicate = True
-                            break
-
-                    if not is_duplicate:
-                        overlap_groups.append(overlap_group)
-
-        return overlap_groups
-
-    def _save_trial_gbi(
-        self,
-        trial_id: str,
-        gbi_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> str:
-        """
-        Save GBI matrix for a trial.
-
-        Args:
-            trial_id: Trial identifier
-            gbi_df: GBI DataFrame
-            progress_callback: Optional callback function
-
-        Returns:
-            Path to output file
-        """
-        output_dir = Path(self.config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = output_dir / f"{trial_id}_MOVEBOUT_GBI.csv"
-
-        gbi_df.to_csv(output_path, index=False)
-
-        return str(output_path)
-
-    def get_gbi_statistics(self, gbi_dict: Dict[str, pd.DataFrame]) -> dict:
-        """
-        Calculate summary statistics for GBI matrices.
-
-        Args:
-            gbi_dict: Dictionary of GBI DataFrames by trial
-
-        Returns:
-            Dictionary of summary statistics
-        """
-        stats = {
-            'num_trials': len(gbi_dict),
-            'trial_stats': {}
-        }
-
-        for trial_id, gbi_df in gbi_dict.items():
-            trial_stats = {
-                'num_events': len(gbi_df),
-                'group_size_stats': {
-                    'mean': gbi_df['group_size'].mean() if len(gbi_df) > 0 else 0,
-                    'median': gbi_df['group_size'].median() if len(gbi_df) > 0 else 0,
-                    'min': gbi_df['group_size'].min() if len(gbi_df) > 0 else 0,
-                    'max': gbi_df['group_size'].max() if len(gbi_df) > 0 else 0
-                },
-                'duration_stats': {
-                    'mean': gbi_df['duration'].mean() if len(gbi_df) > 0 else 0,
-                    'median': gbi_df['duration'].median() if len(gbi_df) > 0 else 0,
-                    'total': gbi_df['duration'].sum() if len(gbi_df) > 0 else 0
-                }
-            }
-
-            stats['trial_stats'][trial_id] = trial_stats
-
-        return stats
+    def run(self, bouts: pd.DataFrame, animals=None, sex_by_name=None,
+            progress=None) -> pd.DataFrame:
+        return create_gbi(bouts, animals, sex_by_name,
+                          self.config.min_duration_s, progress)

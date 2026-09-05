@@ -1,274 +1,145 @@
-# RFID Preprocessing Module
+# RFID Processing Module
 
-Universal RFID preprocessing tool for the FNT (FieldNeuroToolbox) package.
+Preprocessing and analysis for **passive RFID** tracking of animals moving
+between antenna-instrumented resource zones. Built for field enclosure studies
+where each zone carries one or more antennas and animals wear PIT tags.
 
-## Overview
+## Design
 
-This module provides a comprehensive pipeline for processing raw RFID data into analysis-ready datasets for social network analysis, behavioral analysis, and movement tracking. It replaces the existing 8-script R pipeline with a unified, configurable Python interface.
+**One trial, one config, one output folder** — the same shape as the UWB module.
+A trial's analysis folder sits beside its raw exports and is self-describing:
 
-## Features
-
-### Complete Pipeline (7 Stages)
-
-1. **Raw RFID Processing**: Consolidates raw RFID files, maps tags to animals, assigns zones and coordinates
-2. **Movement Bout Detection**: Identifies continuous bouts of presence in zones using configurable time thresholds
-3. **GBI Matrix Generation**: Creates Group-By-Individual matrices showing co-occurrence patterns
-4. **Social Network Analysis**: Calculates node and network-level metrics using Simple Ratio Index (SRI)
-5. **Edgelist Creation**: Generates dyadic interaction records
-6. **Displacement Detection**: Identifies male displacement events
-7. **Hinde Index Calculation**: Computes broad/narrow contact indices and summary statistics
-
-### Key Capabilities
-
-- **Multi-format Support**: Auto-detects and reads Excel (.xlsx), CSV (.csv), and plain text (.txt) files
-- **Configurable Parameters**: GUI-based configuration with save/load profiles
-- **Memory Optimization**: Chunked processing for large datasets (191M+ records)
-- **Progress Tracking**: Real-time progress updates and detailed logging
-- **Preset Templates**: Ships with "8-zone paddock" configuration matching existing R pipeline
-
-## Installation
-
-The RFID module is part of the FNT toolbox. Install required dependencies:
-
-```bash
-pip install networkx openpyxl
+```
+T001_Alpha/
+    LID_2021_ALPHA_RFID_DL_1.txt        raw exports, never modified
+    LID_2021_ALPHA_RFID_DL_1.xlsx
+    ...
+    T001_FNT/
+        fnt_config.json                 settings, provenance, run stats, warnings
+        _messageLog.txt
+        csvs/                           every table the run produced
+        plots/
+        animations/
 ```
 
-Or install the full FNT package:
+This replaces an earlier workflow that concatenated every trial into single
+`ALLTRIAL_*.csv` files. Per-trial folders make a run reproducible (the config
+that produced a folder lives in it) and make re-running one trial cheap.
 
-```bash
-cd /path/to/fnt
-pip install -e .
+## Pipeline
+
 ```
+raw exports → reads → bouts → GBI → { ownership, contacts, networks }
+```
+
+| Stage | Output | What it is |
+|---|---|---|
+| Reads | `<trial>_reads.csv` | One row per tag detection, with animal identity, zone, coordinates, day, and elapsed time |
+| Bouts | `<trial>_bouts.csv` | One row per continuous stay in a zone |
+| GBI | `<trial>_gbi.csv` | Group-by-individual matrix: one row per interval in which the set of animals present cannot change |
+| Bout summary | `<trial>_bout_summary.csv` | The GBI in long form — one row per animal per interval, carrying who else was there |
+| Zone ownership | `<trial>_zone_ownership.csv` | Each male's share of a zone's reads per day, and his rank |
+| Co-presence | `<trial>_co_presence_bouts.csv`, `<trial>_edgelist.csv` | Continuous encounters per pair, and their aggregation |
+| Displacement | `<trial>_displacement.csv` | Male 1→n→1 turnovers in a zone, typed by who owned it |
+| Hinde index | `<trial>_hinde_{broad,narrow}.csv` | Who closes distance and who breaks it |
+| Social networks | `<trial>_sna_{node,net}_stats.csv` | SRI association networks with igraph metrics, per day |
+
+Reads, bouts and the GBI are the preprocessing itself and are always produced.
+Everything below them is an analysis layer selected in `TrialConfig.exports`.
+
+## Input
+
+**Reader exports.** Biomark Device Manager `.txt` (fixed-width), `.xlsx`, and
+CSV are all read. Every file in the trial folder is ingested and the union
+deduplicated — downloads overlap by design, and in real data a `.txt` export can
+be silently truncated while its `.xlsx` sibling is complete. Taking the union
+makes that harmless instead of lossy.
+
+**Metadata.** A CSV or Excel table with at minimum `name`, `sex`, and the tag
+columns (`tag_1`, `tag_2` by default). `code`, `phase`, `group`, `strain` (or
+`genotype`), and `trial` are used when present.
+
+> Tag IDs are 15-significant-digit decimals. Anything that stores them as a
+> number drops the trailing digit — `985.113004548310` becomes
+> `985.11300454831`, which matches no animal. They are read as text throughout
+> and re-padded on load.
+
+## Arena
+
+Zones and antennas are configured together, because assigning several antennas
+to one zone is the normal case (a wall and a floor antenna per zone):
+
+```python
+from fnt.rfid import Arena, get_default_config
+
+cfg = get_default_config("8_zone_paddock")   # 2x4 zones, 16 antennas
+cfg.arena.antenna_zone_map()                 # {1: 1, ..., 9: 1, ..., 16: 8}
+```
+
+`Arena.grid()` lays out a regular grid; individual antennas can then be moved or
+reassigned. Validation refuses a config with a zone that has no antenna (it
+could never record an animal) or an antenna assigned to a zone that does not
+exist, and a run reports antennas that produced no reads — a dead antenna
+otherwise looks exactly like an unvisited zone.
 
 ## Usage
 
-### From FNT GUI
-
-1. Launch FNT toolbox: `python -m fnt.gui_pyqt`
-2. Navigate to the **RFID** tab
-3. Click **RFID Preprocessing Tool**
-4. Configure parameters and select files
-5. Click **Process RFID Data**
-
-### Standalone
-
-```bash
-python -m fnt.rfid.rfid_preprocessing_pyqt
-```
-
-### Programmatic Usage
-
 ```python
-from fnt.rfid import RFIDConfig, get_default_config, ConfigManager
-from fnt.rfid import RFIDPreprocessor, BoutDetector, GBIGenerator
+from fnt.rfid import get_default_config
+from fnt.rfid.pipeline import run_trial
 
-# Load preset configuration
-config = get_default_config("8_zone_paddock")
+cfg = get_default_config("8_zone_paddock")
+cfg.trial_id = "T001"
+cfg.raw_dir = r"...\Data\RFID\T001_Alpha"
+cfg.metadata_path = r"...\Data\metadata.csv"
+cfg.reader_ids = [1]                 # readers installed in THIS enclosure
+cfg.exports.update({"displacement": True, "sna": True})
 
-# Customize for your experiment
-config.input_dir = "/path/to/rfid/data"
-config.metadata_file_path = "/path/to/metadata.xlsx"
-config.output_dir = "/path/to/output"
-config.trial_ids = ["T001", "T002"]
-config.trial_reader_map = {"T001": 1, "T002": 2}
-
-# Run pipeline
-preprocessor = RFIDPreprocessor(config)
-rfid_df = preprocessor.process_raw_rfid()
-
-bout_detector = BoutDetector(config)
-movebout_df = bout_detector.detect_bouts(rfid_df)
-
-gbi_generator = GBIGenerator(config)
-gbi_dict = gbi_generator.create_gbi_matrices(movebout_df, preprocessor.metadata_df)
+result = run_trial(cfg, progress=print)
+result.tables["gbi"]                 # tables are returned as well as written
 ```
 
-## Configuration
+## Choices worth knowing about
 
-### Templates
+**Bout detection** defaults to `segment`: a new bout begins whenever the gap
+reaches the threshold or the zone changes, so no bout can contain a gap or a
+zone change. An `r_compat` algorithm reproduces the original R pipeline's
+control flow exactly, for regenerating published numbers — it pairs bout starts
+to stops by position rather than adjacency, which mis-pairs about 2.3% of bouts.
 
-- **8_zone_paddock**: Default configuration matching 2021_LID_TER project
-  - 8 zones (2 columns × 4 rows)
-  - 16 antennas (paired: wall + floor per zone)
-  - 50-second bout threshold
-  - Noon day boundaries (12:00:00)
+**Timestamp resolution** defaults to `ms`. The R pipeline lost sub-second
+precision by writing reads to CSV and reading them back, so its 50 s threshold
+was applied to whole-second times; `time_resolution="s"` reproduces that.
 
-- **custom**: Empty template for custom experimental setups
+**Foreign reader reads** — detections of this trial's animals on another
+enclosure's reader — are dropped by default and counted in the run's warnings.
+They are real events but not valid observations of this arena.
 
-### Parameters
+**Zero-length GBI intervals** occur when one animal's bout ends exactly as
+another's begins. Both animals count as present: these are the clearest
+hand-off events in the data, and an implementation that probes slightly later
+loses all of them.
 
-#### Temporal
-- `bout_threshold_sec`: Time threshold for bout detection (default: 50s)
-- `min_duration_sec`: Minimum bout duration (default: 1s)
-- `day_origin_time`: Time for day boundaries (default: "12:00:00")
-- `analysis_days`: Day range to analyze (default: 1-12)
+**Two network metrics were renamed** from the R pipeline, which mislabelled
+them. `net_spectral_radius` (was `net_eigen_centrality`) is the leading
+eigenvalue of the unweighted adjacency, not a centralisation score.
+`net_mean_dist_weighted` (was `net_mean_dist`) is a weighted shortest-path
+length, not a count of edges — with SRI weights it lands near 0.02.
 
-#### Spatial
-- `num_zones`: Number of zones in enclosure
-- `num_antennas`: Number of RFID antennas
-- `antenna_zone_map`: Dictionary mapping antenna IDs to zone IDs
-- `zone_coordinates`: List of zone coordinates (x, y, location)
+## Dependencies
 
-#### Trial
-- `trial_ids`: List of trial identifiers
-- `trial_reader_map`: Dictionary mapping trial IDs to reader IDs
+`pandas`, `numpy`, `openpyxl` (Excel input), and `python-igraph` for the social
+network layer.
 
-#### Metadata
-- `tag_columns`: Tag ID column names (default: ["tag_1", "tag_2"])
-- `strain_prefixes`: Prefixes to remove from animal names
-- `phases`: Experimental phases (default: ["early", "late"])
+> On Windows the `python-igraph` wheel needs `VCOMP140.DLL`, the MSVC OpenMP
+> runtime, which is absent unless the Visual C++ Redistributable is installed.
+> The module falls back to a copy shipped inside scikit-learn if one is present;
+> otherwise it raises with an explanation rather than a bare "DLL load failed".
 
-## Input Files
+## Validation
 
-### RFID Data
-Expected structure:
-```
-input_dir/
-  T001/
-    file1.xlsx
-    file2.csv
-  T002/
-    file1.txt
-```
-
-Required columns (auto-detected with flexible naming):
-- `scan_date`: Date of RFID read
-- `scan_time`: Time of RFID read
-- `reader_id`: Reader/paddock identifier
-- `antenna_id`: Antenna identifier
-- `tag_id`: RFID tag ID
-
-### Metadata File
-Excel or CSV file with:
-- `trial`: Trial identifier
-- `name`: Animal name
-- `sex`: M/F
-- `tag_1`, `tag_2`: RFID tag IDs (dual-tag system)
-- `phase`: Experimental phase (optional)
-
-## Output Files
-
-1. **ALLTRIAL_RFID_DATA.csv**: Raw RFID reads with metadata (may be chunked if >100MB)
-2. **ALLTRIAL_MOVEBOUT.csv**: Movement bouts with START/STOP classifications
-3. **{trial}_MOVEBOUT_GBI.csv**: Trial-specific GBI matrices
-4. **ALLTRIAL_SNA_node_stats.csv**: Node-level network metrics
-5. **ALLTRIAL_SNA_net_stats.csv**: Network-level metrics
-6. **ALLTRIAL_MOVEBOUT_GBI_edgelist.csv**: Dyadic interactions
-7. **ALLTRIAL_MOVEBOUT_GBI_displace.csv**: Displacement events
-8. **ALLTRIAL_MOVEBOUT_GBI_hinde_broad.csv**: All contact events
-9. **ALLTRIAL_MOVEBOUT_GBI_hinde_narrow.csv**: 2-individual contacts only
-10. **ALLTRIAL_MOVEBOUT_GBI_summary.csv**: Individual movement statistics
-
-## Module Structure
-
-```
-fnt/rfid/
-├── __init__.py                          # Package exports
-├── config/
-│   ├── __init__.py
-│   ├── config_manager.py                # Configuration I/O
-│   ├── defaults.py                      # Preset templates
-│   └── validators.py                    # Configuration validation
-├── core/
-│   ├── __init__.py
-│   ├── file_readers.py                  # Multi-format RFID file reading
-│   ├── preprocessor.py                  # Stage 1: Raw RFID processing
-│   ├── bout_detector.py                 # Stage 2: Movement bouts
-│   ├── gbi_generator.py                 # Stage 3a: GBI matrices
-│   ├── social_network.py                # Stage 3b: Network analysis
-│   ├── edgelist.py                      # Stage 3c: Edgelist
-│   ├── displacement.py                  # Stage 3d: Displacement events
-│   ├── hinde_index.py                   # Stage 3e-f: Hinde indices
-│   └── utils.py                         # Shared utilities
-├── rfid_preprocessing_pyqt.py           # Main GUI window
-└── rfid_worker.py                       # Background processing thread
-```
-
-## Algorithm Details
-
-### Bout Detection
-Uses time-gap thresholding:
-- New bout starts when: `time_gap > threshold` OR `zone_changed`
-- Reads classified as: `START`, `STOP`, or `SINGLE_READ`
-- Minimum duration applied to prevent zero-duration bouts
-
-### GBI Generation
-Uses center-time method for co-occurrence:
-- Bouts overlap if their centers fall within each other's duration
-- Creates binary presence matrix (1 = present, 0 = absent)
-- Includes sex-based summaries (m_sum, f_sum, mf_sum)
-
-### Social Network Metrics
-**Node-level** (using NetworkX):
-- Edge strength (sum of SRI weights)
-- Degree, eigenvector, betweenness, closeness centrality
-- PageRank, authority scores
-- Opposite-sex edge strength
-
-**Network-level**:
-- Density, transitivity, centralization
-- Mean distance, modularity
-- Number of communities (greedy modularity)
-
-## Comparison with R Pipeline
-
-This Python implementation replicates the 8-script R pipeline:
-
-| R Script | Python Module | Function |
-|----------|---------------|----------|
-| `1_create_ALLTRIAL_RFID.R` | `preprocessor.py` | Raw RFID processing |
-| `2_create_ALLTRIAL_MOVEBOUT.R` | `bout_detector.py` | Movement bouts |
-| `3_create_ALLTRIAL_MOVEBOUT_GBI.R` | `gbi_generator.py` | GBI matrices |
-| `3a_create_MOVEBOUT_GBI_sn_node_net.R` | `social_network.py` | Network analysis |
-| `3b_create_ALLTRIAL_MOVEBOUT_GBI_edgelist.R` | `edgelist.py` | Edgelist |
-| `3c_create_ALLTRIAL_MOVEBOUT_GBI_displace.R` | `displacement.py` | Displacements |
-| `3d, 3e, 3f` | `hinde_index.py` | Hinde indices + summary |
-
-**Advantages over R pipeline:**
-- Single unified interface (no script juggling)
-- GUI-based configuration (no hardcoded paths)
-- Multi-format file support (not just Excel)
-- Real-time progress tracking
-- Memory-efficient chunked processing
-- Configuration profiles (reuse setups)
-
-## Testing
-
-Test with your existing 2021_LID_TER data:
-
-```python
-config = get_default_config("8_zone_paddock")
-config.input_dir = "/Users/caleb/Box/1_projects/2021_LID_TER/data/rfid"
-config.metadata_file_path = "/Users/caleb/Box/1_projects/2021_LID_TER/data/metadata.xlsx"
-config.output_dir = "/Users/caleb/Box/1_projects/2021_LID_TER/data/output_python"
-
-# Run full pipeline
-# Compare outputs with existing R outputs for validation
-```
-
-## Troubleshooting
-
-### "Missing required columns" error
-- Check that your RFID files have columns matching: scan_date, scan_time, reader_id, antenna_id, tag_id
-- The tool supports flexible column naming (e.g., "Scan Date", "scan date", "scandate" all work)
-
-### "Metadata file missing required columns"
-- Ensure metadata has: trial, name, sex, tag_1, tag_2 columns
-
-### Memory issues with large datasets
-- The tool automatically chunks files >100MB
-- Reduce `analysis_days` range to process fewer days at once
-- Process trials separately by adjusting `trial_ids`
-
-### No displacement events detected
-- Displacement detection requires male-only data
-- Check that metadata `sex` column is correctly labeled ("M", "F")
-
-## License
-
-Part of the FieldNeuroToolbox (FNT) package.
-
-## Author
-
-Caleb Sankaran (with Claude Sonnet 4.5)
+Every stage was validated row-for-row against the outputs of the R pipeline it
+replaces, on the 2021_LID two-trial dataset: 1,402,867 reads, 70,796 bouts,
+43,837 + 45,810 GBI intervals, 510 ownership rows, 1,355 displacement events,
+17,589 broad contact events, and 508 node × 24 network statistics rows all
+reproduce exactly. See `tests/rfid/` for the properties that are pinned.

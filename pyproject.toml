@@ -38,6 +38,7 @@ dependencies = [
     "PyQt5",
     # I/O
     "h5py",
+    "openpyxl",       # Excel input: RFID reader exports and animal metadata
     "Pillow",
     "soundfile",
     "opencv-python",
@@ -76,7 +77,9 @@ imaging = [
     "scikit-image",
 ]
 rfid = [
-    "networkx>=3.0",
+    # The social-network layer uses python-igraph (a core dependency) so its
+    # metrics match the R/igraph pipeline this module replaces. networkx was
+    # listed here for an earlier implementation and is no longer used.
 ]
 tracking = [
     "torchvision>=0.20.1",

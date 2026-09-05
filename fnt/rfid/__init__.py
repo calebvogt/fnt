@@ -1,36 +1,34 @@
-"""
-RFID Preprocessing Module for FNT Toolbox.
+"""RFID preprocessing for the FNT toolbox.
 
-Provides tools for processing raw RFID data into analysis-ready datasets
-for social network analysis, behavioral analysis, and movement tracking.
+Turns raw RFID reader exports into a trial's analysis-ready tables: reads,
+movement bouts, a group-by-individual matrix, and the zone-ownership, contact
+and social-network layers derived from it.
+
+One trial, one config, one output folder - see :class:`TrialConfig`.
 """
 
-from .config import RFIDConfig, get_default_config, get_available_templates, ConfigManager
+from .config import (TrialConfig, RFIDConfig, Arena, Zone, Antenna,
+                     get_default_config, get_available_templates, ConfigManager)
 from .core import (
-    RFIDPreprocessor,
-    BoutDetector,
-    GBIGenerator,
-    SocialNetworkAnalyzer,
-    EdgelistGenerator,
-    DisplacementDetector,
-    HindeIndexCalculator
+    RFIDPreprocessor, ReadsResult,
+    BoutDetector, detect_bouts,
+    GBIGenerator, create_gbi, melt_gbi,
+    zone_ownership, daily_owners, zones_owned_per_day,
+    EdgelistGenerator, co_presence_bouts, edgelist,
+    DisplacementDetector, detect_displacements, annotate_ownership,
+    HindeIndexCalculator, hinde_index, hinde_summary,
+    SocialNetworkAnalyzer, social_networks,
 )
 
-__version__ = '1.0.0'
-
 __all__ = [
-    # Configuration
-    'RFIDConfig',
-    'get_default_config',
-    'get_available_templates',
-    'ConfigManager',
-
-    # Pipeline components
-    'RFIDPreprocessor',
-    'BoutDetector',
-    'GBIGenerator',
-    'SocialNetworkAnalyzer',
-    'EdgelistGenerator',
-    'DisplacementDetector',
-    'HindeIndexCalculator',
+    "TrialConfig", "RFIDConfig", "Arena", "Zone", "Antenna",
+    "get_default_config", "get_available_templates", "ConfigManager",
+    "RFIDPreprocessor", "ReadsResult",
+    "BoutDetector", "detect_bouts",
+    "GBIGenerator", "create_gbi", "melt_gbi",
+    "zone_ownership", "daily_owners", "zones_owned_per_day",
+    "EdgelistGenerator", "co_presence_bouts", "edgelist",
+    "DisplacementDetector", "detect_displacements", "annotate_ownership",
+    "HindeIndexCalculator", "hinde_index", "hinde_summary",
+    "SocialNetworkAnalyzer", "social_networks",
 ]

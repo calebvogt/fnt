@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -69,10 +70,13 @@ class MADInferenceConfig:
     # Example store used to look up confirmed labels for preserve_labels.
     training_data_dir: str = ""
     # Merge consecutive detections that belong to one call but surfaced as
-    # separate blobs (tile seams, brief sub-threshold dips). Off by default.
-    # ``merge_max_gap_s`` is the largest time gap bridged; freq-overlap gating
-    # keeps time-adjacent but frequency-separated calls (harmonics) distinct.
-    merge_consecutive: bool = False
+    # separate blobs (brief sub-threshold dips mid-call). ON by default: a
+    # connected component needs a contiguous above-threshold path, so a long
+    # whistle that dips for a few frames splits into fragments, and reporting
+    # one call as six is worse than the rare over-merge. ``merge_max_gap_s``
+    # is the largest time gap bridged; freq-overlap gating keeps time-adjacent
+    # but frequency-separated calls (harmonics) distinct.
+    merge_consecutive: bool = True
     merge_max_gap_s: float = 0.01
     merge_require_freq_overlap: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
@@ -265,7 +269,13 @@ def infer_probability_mask(
                 dtype=np.float32)
             for k, t0 in enumerate(bstarts):
                 t1 = min(W, t0 + tile_time_frames)
-                tiles[k, 0, :f_crop, :t1 - t0] = spec_image[:f_crop, t0:t1]
+                src = spec_image[:f_crop, t0:t1]
+                if src.dtype == np.uint8:
+                    # Stored quantised; the model wants [0,1]. Same round trip
+                    # training examples make (uint8 in the store, /255 on read).
+                    tiles[k, 0, :f_crop, :t1 - t0] = src / np.float32(255.0)
+                else:
+                    tiles[k, 0, :f_crop, :t1 - t0] = src
             xb = torch.from_numpy(tiles).to(device)
             with torch.no_grad():
                 if amp_on:
@@ -1021,10 +1031,16 @@ def run_inference_on_file(
     db_min, db_max = db_range_for(
         db_norm, db_min, db_max, audio=audio, sample_rate=sr,
         nperseg=nperseg, noverlap=noverlap, nfft=nfft)
+    # uint8: a quarter of the memory (2.4 GB -> 0.6 GB on a 600 s recording),
+    # and the precision the model was actually trained at — examples are
+    # stored as (clip*255).round().astype(uint8) and read back /255, so a
+    # float32 grid here was finer-grained than anything the weights ever saw.
+    # Measured on a 474-detection file: identical count, 473/474 matched at
+    # IoU>=0.5, median box shift 0 frames.
     spec = compute_full_spec_image(
         audio.astype(np.float32), sr,
         nperseg=nperseg, noverlap=noverlap, nfft=nfft,
-        db_min=db_min, db_max=db_max,
+        db_min=db_min, db_max=db_max, as_uint8=True,
     )
     t_spec = _time.perf_counter() - _t_spec0
     if progress:
@@ -1193,7 +1209,8 @@ def run_inference_on_file(
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
-                       n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
+                       n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1],
+                       source_wav=Path(wav_path).name)
         # Carry score and provenance onto the crop itself. These used to exist
         # only in the CSV, which is what forced the CSV to be a second source of
         # truth: without them the h5 cannot answer "how confident was this?" or
@@ -1216,6 +1233,19 @@ def run_inference_on_file(
                           'f_off': b['f_low'], 't_off': b['t_start'],
                           **_prov(rows[i] if i < len(rows) else {})})
         write_pred_masks(h5_path, crops)
+        # Stamp the run itself, so a file that came back empty is recorded as
+        # "analyzed, found nothing at these settings" rather than being
+        # indistinguishable from one that was never analyzed.
+        from .fnt_mask_store import set_infer_run_attrs
+        set_infer_run_attrs(
+            h5_path,
+            last_infer_at=datetime.now().isoformat(timespec='seconds'),
+            last_infer_model=str(Path(cfg.model_path).parent.name),
+            last_infer_threshold=float(cfg.threshold),
+            last_infer_min_blob=int(cfg.min_blob_pixels),
+            last_infer_merge=1.0 if cfg.merge_consecutive else 0.0,
+            last_infer_n=float(len(blobs)),
+        )
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)
     except Exception:

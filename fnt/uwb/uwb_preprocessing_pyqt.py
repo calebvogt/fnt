@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
                              QDateTimeEdit, QTreeWidget, QTreeWidgetItem,
                              QSplitter, QSlider, QProgressDialog, QGridLayout,
-                             QListWidget, QListWidgetItem,
+                             QListWidget, QListWidgetItem, QAbstractItemView,
                              QColorDialog, QInputDialog, QMenu)
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QDateTime,
                           QByteArray, QMimeData)
@@ -451,8 +451,8 @@ ROI_BOUTS_TOOLTIP = (
     "\n"
     "Regions are the ones DRAWN in the preview. Site-XML zones are measured "
     "only once imported with 'Import XML' beside the region list. Where two "
-    "regions overlap the fix goes to whichever takes precedence, never to "
-    "both, so an animal is in at most one region at a time.")
+    "regions overlap the fix goes to whichever is HIGHER in the region list, "
+    "never to both, so an animal is in at most one region at a time.")
 
 ROI_DAILY_TOOLTIP = (
     "FILE: {db}_ROI_DailySummary.csv\n"
@@ -500,9 +500,11 @@ ROI_IMPORT_XML_TOOLTIP = (
     "smoothed track before trusting the numbers, and drag the corners where "
     "they do not fit.\n"
     "\n"
-    "Imported regions can overlap each other or the ones you drew; you will "
-    "be asked which takes precedence, since a fix inside two regions is "
-    "credited to exactly one.")
+    "Imported regions can overlap each other or the ones you drew. A fix "
+    "inside two regions is credited to exactly one: whichever sits HIGHER in "
+    "the region list. Zones arrive smallest-first, so a zone contained in an "
+    "arena boundary is counted before the boundary; drag a row to change "
+    "that.")
 
 DATA_VIEW_TOOLTIP = (
     "Add a panel beside the arena showing time in each region accumulating "
@@ -6258,12 +6260,35 @@ class UWBQuickVisualizationWindow(QWidget):
             "area. Select one to recolour it, change its line width, rename "
             "it or delete it.\n"
             "\n"
+            "DRAG A ROW to set precedence. Where regions overlap, a fix is "
+            "credited to whichever sits HIGHER in this list, and to that one "
+            "only. Drag a big containing region (an arena boundary, say) to "
+            "the bottom so the smaller regions inside it are counted first.\n"
+            "\n"
             "Right-clicking a region in the preview itself offers the same "
             "options plus Move, Modify points and Copy.")
         self.roi_list.setMaximumHeight(96)
+        # Precedence IS list order, so the list is the control that sets it:
+        # drag a row and the region list is reordered to match. This replaced
+        # a pairwise "which of these two wins?" modal, which asked once per
+        # overlapping PAIR — unanswerable as a stream of yes/no questions once
+        # a containing region overlaps every other one.
+        self.roi_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.roi_list.setDefaultDropAction(Qt.MoveAction)
+        self.roi_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.roi_list.model().rowsMoved.connect(self._on_roi_rows_moved)
         self.roi_list.currentRowChanged.connect(self._on_roi_selected)
         self.roi_list.itemDoubleClicked.connect(lambda _i: self.rename_roi())
         v.addWidget(self.roi_list)
+
+        # Says what the order MEANS, but only while it means something. With
+        # nothing overlapping, precedence changes no number and a standing
+        # instruction to drag rows would be noise.
+        self.lbl_roi_overlap = QLabel("")
+        self.lbl_roi_overlap.setStyleSheet("color: #9fb3c8; font-size: 9px;")
+        self.lbl_roi_overlap.setWordWrap(True)
+        self.lbl_roi_overlap.setVisible(False)
+        v.addWidget(self.lbl_roi_overlap)
 
         roi_btns = QHBoxLayout()
         self.btn_roi_draw = QPushButton("Draw new")
@@ -8845,6 +8870,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # noise, so the prefix appears exactly when it starts to matter.
         overlaps = ROI.overlapping_pairs(self.rois)
         entangled = {i for pair in overlaps for i in pair}
+        # A full clear()/addItem() rebuild moves rows too, so far as the model
+        # is concerned. Suppress the reorder handler for the duration or the
+        # rebuild would reorder the very list it is rendering.
+        self._roi_reordering = True
         self.roi_list.blockSignals(True)
         self.roi_list.clear()
         for i, r in enumerate(self.rois):
@@ -8855,18 +8884,71 @@ class UWBQuickVisualizationWindow(QWidget):
                     text += "  ⬚ overlaps"
             item = QListWidgetItem(text)
             item.setForeground(QColor(r.get("color", ROI.DEFAULT_ROI_COLOR)))
+            # The region's position at render time. A drop reorders the ROWS;
+            # reading these back gives the new order without having to reason
+            # about Qt's source/destination index conventions.
+            item.setData(Qt.UserRole, i)
+            # Rows reorder; they are not editable text and cannot accept a drop
+            # INTO them (which would delete the row being dropped on).
+            item.setFlags((item.flags() | Qt.ItemIsDragEnabled)
+                          & ~Qt.ItemIsDropEnabled)
             if i in entangled:
                 item.setToolTip(
                     "This region overlaps another. A fix inside both is "
                     "credited to whichever appears FIRST in this list, and to "
-                    "that one only — it is never counted twice.")
+                    "that one only — it is never counted twice.\n"
+                    "\n"
+                    "Drag this row up or down to change that.")
             self.roi_list.addItem(item)
         if 0 <= row < len(self.rois):
             self.roi_list.setCurrentRow(row)
         self.roi_list.blockSignals(False)
+        self._roi_reordering = False
+        if hasattr(self, 'lbl_roi_overlap'):
+            n = len(overlaps)
+            self.lbl_roi_overlap.setText(
+                f"{n} region pair{'s' if n != 1 else ''} overlap. A fix inside "
+                f"both goes to the one higher in the list — drag a row to "
+                f"change which." if n else "")
+            self.lbl_roi_overlap.setVisible(bool(n))
         self._sync_roi_style_controls()
         self.btn_roi_rename.setEnabled(bool(self.rois))
         self.btn_roi_delete.setEnabled(bool(self.rois))
+
+    def _on_roi_rows_moved(self, *_args):
+        """Reorder self.rois to match rows the user dragged, and persist it.
+
+        Precedence is list position, so this drag IS the setting: whatever ends
+        up higher is tested first. The new order is read back from each row's
+        stored original index rather than computed from the signal's arguments,
+        because Qt reports a destination row measured BEFORE the moved row is
+        taken out, and an off-by-one there would silently mis-order regions.
+        """
+        if getattr(self, '_roi_reordering', False):
+            return
+        # A canvas move/edit holds its region by INDEX, which this is about to
+        # invalidate. End it first, keeping the shape as it stands, rather than
+        # letting the next mouse move drag a different region's corner.
+        canvas = getattr(self, 'preview_canvas_2d', None)
+        if canvas is not None and getattr(canvas, '_roi_action', None):
+            canvas.end_roi_edit()
+        order = []
+        for row in range(self.roi_list.count()):
+            src = self.roi_list.item(row).data(Qt.UserRole)
+            if isinstance(src, int) and 0 <= src < len(self.rois):
+                order.append(src)
+        if sorted(order) != list(range(len(self.rois))):
+            # The rows no longer describe the list (a rebuild raced the drop).
+            # Re-render from the model rather than reordering from bad indices.
+            self._refresh_roi_list()
+            return
+        moved = self.roi_list.currentRow()
+        self.rois = [self.rois[i] for i in order]
+        self._refresh_roi_list(keep=moved)
+        self.on_rois_changed()
+        self.write_live_config()
+        names = ", ".join(str(r.get('name', '')) for r in self.rois)
+        self.log_message(f"Region precedence is now: {names}")
 
     def _sync_roi_style_controls(self):
         """Point the colour swatch and width box at the current selection.
@@ -8966,34 +9048,10 @@ class UWBQuickVisualizationWindow(QWidget):
             f"{ROI.polygon_area(points):.2f} m\u00b2")
         self.on_rois_changed()
         self.write_live_config()
-        self._resolve_roi_overlaps(len(self.rois) - 1)
-
-    def ask_roi_precedence(self, name_a, name_b):
-        """Which of two overlapping regions wins: 'a', 'b', or None to leave it.
-
-        The decision is a method of its own so the resolution logic can be
-        driven without a modal in the way. A QMessageBox INSTANCE cannot be
-        stubbed the way the static helpers can, and one appearing inside an
-        automated pass blocks it rather than failing it.
-        """
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Regions overlap")
-        box.setText(
-            f"'{name_a}' and '{name_b}' share area.\n\n"
-            f"An animal inside both is credited to ONE of them — never to "
-            f"both. Which takes precedence?")
-        btn_a = box.addButton(f"'{name_a}' wins", QMessageBox.AcceptRole)
-        btn_b = box.addButton(f"'{name_b}' wins", QMessageBox.AcceptRole)
-        box.addButton("Leave as is", QMessageBox.RejectRole)
-        box.setDefaultButton(btn_a)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked is btn_a:
-            return 'a'
-        if clicked is btn_b:
-            return 'b'
-        return None
+        # A new region lands at the BOTTOM, so it cannot silently take
+        # precedence over anything already drawn. Where it overlaps, the list
+        # says so and the row can be dragged up.
+        self._announce_roi_overlaps(self.rois[-1])
 
     def _data_view_signature(self):
         """What the cached Data View series depend on.
@@ -9237,78 +9295,38 @@ class UWBQuickVisualizationWindow(QWidget):
             log_callback=None)
         return DV.series_from_bouts(DV.overlap_bouts_from_frame(bouts, tz))
 
-    def _resolve_roi_overlaps(self, index):
-        """Ask which region wins where ``index`` overlaps another, and reorder.
+    def _announce_roi_overlaps(self, roi):
+        """Log which regions ``roi`` overlaps and who currently wins.
 
-        Overlap is resolved by PRECEDENCE, never by double counting: a fix
-        inside two regions is credited to whichever is tested first, so the
-        answer is a position in the list. Asking at the moment the overlap is
-        created is the point — discovering it later, from an occupancy total
-        that quietly went to the wrong region, is exactly what this prevents.
-
-        Returns True if the order changed.
+        This replaced a modal that asked, per overlapping PAIR, which region
+        took precedence. With a containing region — an arena boundary — every
+        other region overlaps it, so that modal asked once per pair and then
+        again from the other side, which is unanswerable as a stream of yes/no
+        questions. Precedence is one ordering over the whole list, so it is set
+        by dragging the list into that order; this only reports the state.
         """
         from fnt.uwb import uwb_roi as ROI
 
-        if getattr(self, '_batch_active', False):
-            return False
-        changed = False
-        # Pairs are re-derived each pass, because resolving one reorders the
-        # list and invalidates every index. They are also remembered, by
-        # IDENTITY rather than position: choosing a winner does not separate
-        # the regions, so an already-answered pair keeps reappearing and would
-        # be asked forever. Marking each pair decided is what terminates this.
-        seen = set()
-        while True:
-            nxt = None
-            for i, j in ROI.overlapping_pairs(self.rois):
-                if index not in (i, j):
-                    continue
-                key = frozenset((id(self.rois[i]), id(self.rois[j])))
-                if key not in seen:
-                    nxt = (i, j, key)
-                    break
-            if nxt is None:
-                break
-            i, j, key = nxt
-            seen.add(key)
-            a, b = self.rois[i], self.rois[j]
-            name_a = a.get('name', f'#{i + 1}')
-            name_b = b.get('name', f'#{j + 1}')
-            answer = self.ask_roi_precedence(name_a, name_b)
-            if answer == 'a':
-                winner, loser = i, j
-            elif answer == 'b':
-                winner, loser = j, i
-            else:
-                # Left alone deliberately: say what that means and move on to
-                # any other overlap, so a shrug is still an informed one.
-                self.log_message(
-                    f"  '{name_a}' and '{name_b}' overlap; the shared area "
-                    f"goes to '{self.rois[min(i, j)].get('name', '')}' "
-                    f"(first in the list).")
-                continue
-            # Read the winner's name BEFORE reordering: set_precedence moves
-            # list positions, so i and j stop pointing at these two regions
-            # the moment it returns.
-            winner_name = name_a if winner == i else name_b
-            if winner != min(i, j):
-                keep = self.rois[index]
-                self.rois = ROI.set_precedence(self.rois, winner, loser)
-                index = self.rois.index(keep)
-                changed = True
-                self.log_message(
-                    f"  '{winner_name}' now takes precedence: shared area is "
-                    f"credited to it.")
-            else:
-                self.log_message(
-                    f"  '{winner_name}' already takes precedence; order "
-                    f"unchanged.")
-        if changed:
-            self._refresh_roi_list(keep=index)
-            self.on_rois_changed()
-            self.write_live_config()
-        return changed
+        if getattr(self, '_batch_active', False) or roi is None:
+            return
+        try:
+            index = next(i for i, r in enumerate(self.rois) if r is roi)
+        except StopIteration:
+            return
+        others = [self.rois[j if i == index else i].get('name', '')
+                  for i, j in ROI.overlapping_pairs(self.rois, only=index)]
+        if not others:
+            return
+        name = roi.get('name', '')
+        winners = [n for n in others
+                   if next(i for i, r in enumerate(self.rois)
+                           if r.get('name', '') == n) < index]
+        note = (f"  '{name}' overlaps {', '.join(others)}. "
+                + (f"Shared area goes to {', '.join(winners)} "
+                   f"(higher in the list)."
+                   if winners else
+                   f"'{name}' takes the shared area (higher in the list)."))
+        self.log_message(note + " Drag a row to change that.")
 
     def _on_roi_cancelled(self):
         self._end_roi_draw_ui()
@@ -9429,6 +9447,14 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message("No XML zones were usable as regions.")
             return
 
+        # Smallest first, so a region CONTAINED in another is tested before the
+        # one containing it. Authored sites routinely carry an arena boundary
+        # drawn around every other zone; appended in XML order it would swallow
+        # all of them, and every fix would be credited to the arena. Area order
+        # makes the common case right on arrival, and any row can still be
+        # dragged. Only the imported block is sorted — regions already in the
+        # list keep the precedence the user gave them.
+        added.sort(key=lambda r: ROI.polygon_area(r['points']))
         self.rois.extend(added)
         for roi in added:
             self.log_message(
@@ -9443,15 +9469,17 @@ class UWBQuickVisualizationWindow(QWidget):
         self.roi_list.setCurrentRow(len(self.rois) - 1)
         self.on_rois_changed()
         self.write_live_config()
-        # Authored zones routinely abut or overlap, and may overlap regions
-        # already drawn. Each one is resolved as if it had just been drawn,
-        # re-finding its position every time because the previous answer may
-        # have moved it.
-        for roi in added:
-            try:
-                self._resolve_roi_overlaps(self.rois.index(roi))
-            except ValueError:      # removed mid-loop; nothing to resolve
-                continue
+        # One line, not one per zone: authored sites overlap heavily (every
+        # zone against the arena boundary), and ten restatements of the same
+        # rule is the noise version of the modal this replaced.
+        pairs = ROI.overlapping_pairs(self.rois)
+        if pairs:
+            first = self.rois[0].get('name', '')
+            self.log_message(
+                f"  {len(pairs)} region pair(s) overlap. Regions were ordered "
+                f"smallest first, so the shared area goes to the smaller one "
+                f"(here '{first}' outranks everything below it). Drag a row in "
+                f"the region list to change the precedence.")
 
     def on_rois_changed(self):
         """Push the current regions to the preview and refresh the list text."""
@@ -9599,10 +9627,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self._refresh_roi_list()
         self.write_live_config()
         # Only once the drag has FINISHED. A copy is deliberately dropped on
-        # top of its source and then dragged clear, so asking mid-move would
-        # prompt about an overlap the user is in the middle of removing.
+        # top of its source and then dragged clear, so reporting mid-move would
+        # name an overlap the user is in the middle of removing.
         if roi is not None:
-            self._resolve_roi_overlaps(self.roi_list.currentRow())
+            self._announce_roi_overlaps(roi)
 
     def _roi_busy(self):
         """Is the preview mid-region - placing corners, moving, or editing?"""
