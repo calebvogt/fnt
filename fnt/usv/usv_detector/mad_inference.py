@@ -688,8 +688,16 @@ def blobs_to_rows(
             'source': 'prediction',
         }
         if (spec is not None and b.get('mask') is not None and span is not None):
-            # Full-frequency dB columns for this call's time span.
-            cols_db = spec[:, b['t_start']:b['t_end_exclusive']] * span + db_min
+            # Full-frequency dB columns for this call's time span. The grid
+            # is uint8 (0-255) since the memory change; de-normalizing it as
+            # if it were [0,1] made every dB value ~255x too large, and
+            # compute_call_metrics' 10**(dB/10) then overflowed to inf — so
+            # tonality, entropy, centroid, max_power_db, snr_db and AM came
+            # back inf/NaN for every detection.
+            cols = spec[:, b['t_start']:b['t_end_exclusive']]
+            if cols.dtype == np.uint8:
+                cols = cols / np.float32(255.0)
+            cols_db = cols * span + db_min
             row.update(compute_call_metrics(
                 cols_db, b['mask'], b['f_low'], df, dt, db_min, db_max))
         rows.append(row)

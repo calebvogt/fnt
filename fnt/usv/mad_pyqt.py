@@ -1235,13 +1235,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if getattr(self, '_temp_erase', False) and                 event.button() == Qt.RightButton:
+        if (getattr(self, '_temp_erase', False)
+                and event.button() == Qt.RightButton):
             self.paint_mode = 'brush'      # right-drag erase was momentary
             self._temp_erase = False
         if self._rubber_start is not None and event.button() == Qt.LeftButton:
             self._finish_rubber_band(event.pos())
             return
-        if self._painting and event.button() == Qt.LeftButton:
+        # Right-drag paints too, so it must end the stroke as well. Clearing
+        # _painting only on LeftButton left it True after a right-drag erase,
+        # and every later mouse move kept painting with no button held.
+        if self._painting and event.button() in (Qt.LeftButton,
+                                                 Qt.RightButton):
             self._painting = False
             self._last_paint_idx = None
             # Push the stroke's newly-painted pixels onto the undo stack.
@@ -4688,6 +4693,17 @@ class MADMainWindow(QMainWindow):
         self.btn_remove_files.clicked.connect(self._remove_selected_files)
         self.btn_remove_files.setEnabled(False)
         btn_row.addWidget(self.btn_remove_files)
+
+        self.btn_clear_files = QPushButton("Clear All")
+        self.btn_clear_files.setToolTip(
+            "Empty the Audio list. Like Remove File(s), this only "
+            "unregisters the recordings — every .wav and its .mad sidecar "
+            "stay exactly where they are on disk, so nothing labelled is "
+            "lost and re-adding the folder brings it all back."
+        )
+        self.btn_clear_files.clicked.connect(self._clear_all_files)
+        self.btn_clear_files.setEnabled(False)
+        btn_row.addWidget(self.btn_clear_files)
         vbox.addLayout(btn_row)
 
         self.btn_inspect_mad = QPushButton("Inspect .mad")
@@ -6880,6 +6896,8 @@ class MADMainWindow(QMainWindow):
         if hasattr(self, 'btn_remove_files'):
             self.btn_remove_files.setEnabled(
                 bool(self.file_list.selectedItems()))
+        if hasattr(self, 'btn_clear_files'):
+            self.btn_clear_files.setEnabled(bool(self.audio_files))
         if hasattr(self, 'btn_inspect_mad'):
             # Only offer it for a recording that actually has a sidecar —
             # a file with no labels and no run has nothing to inspect.
@@ -7587,9 +7605,13 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"Skipped {n} detection(s) — nothing changed")
             self._refresh_annotation_list()
+            self._count_skips(n)      # a box of 20 is 20 skips, not one
         if not self._pred_indices():
             return
-        self._log("Skip prediction")
+        # Not logged per click: skipping records no decision and changes
+        # nothing on disk, so a line per press is pure volume in a log whose
+        # job is explaining what a run did. Counted for the per-file summary.
+        self._count_skips(1)
         sid = (sg.annotations[sel].get('id')
                if sel is not None and 0 <= sel < len(sg.annotations)
                else None)
@@ -8599,6 +8621,10 @@ class MADMainWindow(QMainWindow):
         except TypeError:
             pass
         self._close_infer_progress_dialog()
+        # The queue is consumed. Leaving it set made every later manual
+        # inference run look like the tail of a chained run, so it skipped
+        # its own completion dialog and never reset the progress bars.
+        self._post_train_infer_wavs = []
         self._scan_all_file_counts()
         QTimer.singleShot(300, self._finish_run_and_summarize)
 
@@ -8800,6 +8826,7 @@ class MADMainWindow(QMainWindow):
             self._load_current_file()
         self._update_project_state()
         self.btn_remove_files.setEnabled(bool(self.audio_files))
+        self.btn_clear_files.setEnabled(bool(self.audio_files))
         self._update_scope_labels()
         self._update_run_button()
         n = len(paths_to_remove)
@@ -10930,6 +10957,48 @@ class MADMainWindow(QMainWindow):
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         dlg.show()
 
+    def _clear_all_files(self):
+        """Empty the Audio list. Nothing on disk is touched."""
+        n = len(self.audio_files)
+        if not n:
+            return
+        # Confirm on count alone: the labels are safe either way, but
+        # rebuilding a 15-file list by hand is a real annoyance.
+        if QMessageBox.question(
+            self, "Clear the Audio list",
+            f"Remove all {n} recording(s) from the list?\n\n"
+            "Nothing is deleted — the .wav files and their .mad sidecars "
+            "(labels, detections) stay on disk.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No) != QMessageBox.Yes:
+            return
+        # Project-owned copies (legacy recordings/, or made by Pack Project)
+        # must be deleted, not just unregistered: _rescan_project_wavs
+        # re-adopts everything under recordings/ on the next project open, so
+        # unregistering alone would let the cleared list come back. Same rule
+        # _remove_selected_files applies — and the same reason the prompt has
+        # to say so before anything leaves the disk.
+        owned = []
+        if self._project is not None:
+            try:
+                owned = [e.path for e in self._project.audio_entries()
+                         if getattr(e, 'embedded', False)]
+            except Exception:
+                owned = []
+        if owned and QMessageBox.question(
+            self, "Clear the Audio list",
+            f"{len(owned)} of these {n} recording(s) are stored inside the "
+            "project and WILL be deleted from disk (wav + sidecars).\n\n"
+            "The rest are only unregistered — their files stay where they "
+            "are. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No) != QMessageBox.Yes:
+            return
+        # _remove_files_by_path already logs what it removed; a second line
+        # here would be the duplicate volume this diff set out to cut.
+        self._remove_files_by_path(list(self.audio_files),
+                                   delete_embedded=bool(owned))
+
     def _remove_selected_files(self):
         """Drop the selected recordings from the Audio list (and the project).
 
@@ -10970,6 +11039,24 @@ class MADMainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self._remove_files_by_path(victims, delete_embedded=True)
+
+    def _count_skips(self, n: int = 1):
+        """Tally skips for the current file's summary line."""
+        self._skips_this_file = getattr(self, '_skips_this_file', 0) + int(n)
+
+    def _flush_skip_count(self):
+        """Emit and reset the pending skip tally.
+
+        Called from every path that leaves a file — a successful switch, a
+        switch to a recording that cannot be opened, and session close.
+        Emitting it only on a successful load lost the skips on the last file
+        reviewed, and an early return on a missing file rolled them into the
+        next file's summary under the wrong name.
+        """
+        n = getattr(self, '_skips_this_file', 0)
+        self._skips_this_file = 0
+        if n:
+            self._log(f"  ({n} skipped on the previous file)")
 
     def _clear_review_canvas(self):
         """Blank the preview and every piece of per-file review state.
@@ -11027,6 +11114,7 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"{name} not found — File ▸ Locate Missing Recordings… to "
                 "repoint it")
+            self._flush_skip_count()      # belongs to the file being left
             self._log(f"Cannot open {name} — recording not found")
             return
         self._stop_playback()
@@ -11145,6 +11233,7 @@ class MADMainWindow(QMainWindow):
                     f"{os.path.basename(filepath)}  |  "
                     f"{len(self.audio_data) / self.sample_rate:.2f}s @ "
                     f"{self.sample_rate} Hz")
+                self._flush_skip_count()
                 self._log(f"Open file {self.current_file_idx + 1}/"
                           f"{len(self.audio_files)}: "
                           f"{os.path.basename(filepath)}")
@@ -11393,11 +11482,9 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 "Brush mode — left-click + drag over target pixels"
             )
-            self._log("Tool: Brush ON")
         else:
             self.spectrogram.set_paint_mode(None)
             self.status_bar.showMessage("Paint mode off")
-            self._log("Tool: brush OFF")
 
     def _on_eraser_clicked(self, checked: bool):
         if checked:
@@ -11407,11 +11494,9 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 "Eraser mode — left-click + drag to clear painted pixels"
             )
-            self._log("Tool: Eraser ON")
         else:
             self.spectrogram.set_paint_mode(None)
             self.status_bar.showMessage("Paint mode off")
-            self._log("Tool: Eraser OFF")
 
     # ==================================================================
     # SAM2-assisted labeling
@@ -11484,7 +11569,6 @@ class MADMainWindow(QMainWindow):
         if not checked:
             self.spectrogram.set_paint_mode(None)
             self.status_bar.showMessage("SAM mode off")
-            self._log("Tool: SAM OFF")
             return
         if not self._ensure_sam_model():
             self.btn_sam.setChecked(False)
@@ -11493,7 +11577,6 @@ class MADMainWindow(QMainWindow):
         self.btn_paint.setChecked(False)
         self.btn_erase.setChecked(False)
         self.spectrogram.set_paint_mode('sam')
-        self._log("Tool: SAM ON")
         self.status_bar.showMessage(
             "SAM mode — click each call (yellow), then Enter to assign a class; "
             "Esc clears, U undoes"
@@ -14423,6 +14506,7 @@ class MADMainWindow(QMainWindow):
                 SPLITTER_STATE_KEY, self.splitter.saveState())
         except Exception:
             pass
+        self._flush_skip_count()      # the last file reviewed still counts
         self._auto_save_mask_if_dirty()
         self._stop_playback()
         # A background read still touching the file would outlive the window.
