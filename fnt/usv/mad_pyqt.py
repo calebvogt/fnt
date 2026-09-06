@@ -1260,7 +1260,15 @@ class MADSpectrogramWidget(SpectrogramWidget):
         super().mouseReleaseEvent(event)
 
     def _finish_rubber_band(self, end_pos):
-        """Select every annotation whose bbox intersects the drag rectangle."""
+        """Select every annotation whose bbox lies FULLY inside the drag box.
+
+        Containment, not intersection: the box is mostly used to sweep up a
+        cluster of small false positives and delete them, and with
+        intersection a rectangle that merely clipped the edge of a neighbouring
+        call took that call too. Requiring containment makes the boundary mean
+        something — anything you half-cover is left alone, so a miss costs a
+        redrag rather than an unnoticed deletion.
+        """
         start = self._rubber_start
         self._rubber_start = None
         self._rubber_cur = None
@@ -1279,8 +1287,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         f_lo, f_hi = sorted((a[1], b[1]))
         hits = []
         for i, ann in enumerate(self.annotations):
-            if (ann['t1'] > t_lo and ann['t0'] < t_hi and
-                    ann['f1'] > f_lo and ann['f0'] < f_hi):
+            # t1/f1 are exclusive bounds, so a call touching the far edge of
+            # the drag is still fully inside it.
+            if (ann['t0'] >= t_lo and ann['t1'] <= t_hi and
+                    ann['f0'] >= f_lo and ann['f1'] <= f_hi):
                 hits.append(i)
         self._selected_set = set(hits)
         self.update()
@@ -2405,7 +2415,10 @@ class MADRunProgressDialog(QDialog):
         self._line_batch.set_data(self._batches_x, self._batch_losses)
         self._redraw_plot()
 
-    def plot_epoch(self, global_batch: int, train_loss: float, val_loss: float):
+    def plot_epoch(self, global_batch: int, train_loss: float,
+                   val_loss: float, dice: float = None):
+        # Accepts `dice` for signature parity with MADRunPanel; this dialog
+        # has no second axis to draw it on.
         if not self._plot:
             return
         self._train_epoch_x.append(int(global_batch))
@@ -2456,6 +2469,37 @@ class MADRunProgressDialog(QDialog):
 # ======================================================================
 # Embeddable run panel (inline training/inference progress + live plot)
 # ======================================================================
+#: What the training graph is showing. Hung on the canvas itself, because
+#: that is what a first-time user hovers when the curves make no sense.
+_GRAPH_TOOLTIP = (
+    "<b>Reading this graph</b><br><br>"
+    "The x-axis is <b>batches</b> — one step of learning on 8 tiles. An "
+    "<i>epoch</i> is one pass over every training tile, so it spans many "
+    "batches; the marked points are epoch boundaries.<br><br>"
+    "<b>batch</b> (faint blue) — loss on each individual batch. Spiky by "
+    "nature: some batches are harder than others. Watch its trend, not its "
+    "jitter.<br>"
+    "<b>train</b> (blue) — average loss over the whole epoch, on the tiles "
+    "the model is fitting. It should fall.<br>"
+    "<b>val</b> (orange) — the same measure on held-out tiles the model "
+    "never trains on. This is the honest one.<br>"
+    "<b>Dice</b> (green, right axis) — how much the predicted mask actually "
+    "overlaps yours, 0 to 1. Loss says the optimiser is working; Dice says "
+    "the masks are right.<br><br>"
+    "<b>What the shapes mean</b><br>"
+    "Both falling together: learning.<br>"
+    "Train falling, val flat or rising: <b>overfitting</b> — memorising "
+    "these calls instead of learning what a call looks like. Training stops "
+    "itself when val stops improving.<br>"
+    "Loss falling but Dice stuck near 0: the model is predicting empty masks "
+    "— cheap when calls are under 1% of pixels. That is the failure Dice "
+    "catches and loss hides.<br><br>"
+    "Y-axis is log-scaled, so a straight fall is exponential improvement. "
+    "USV calls are thin, so <b>Dice 0.4-0.6 is already a working model</b>; "
+    "what matters is that it climbs across retrains."
+)
+
+
 class MADRunPanel(QWidget):
     """Inline progress reporter embedded in the Mask / Inference tabs.
 
@@ -2552,6 +2596,7 @@ class MADRunPanel(QWidget):
         self._figure.patch.set_facecolor("#1e1e1e")
         self._canvas = FigureCanvas(self._figure)
         self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._canvas.setToolTip(_GRAPH_TOOLTIP)
         parent_layout.addWidget(self._canvas, 1)
         self._ax = self._figure.add_subplot(1, 1, 1)
         self._style_axes()
@@ -2563,6 +2608,21 @@ class MADRunPanel(QWidget):
         (self._line_val,) = self._ax.plot(
             [], [], color='#ff9800', marker='s', markersize=3,
             linewidth=1.8, label='val')
+        # Dice needs its own axis: the losses are on a log scale and unbounded,
+        # Dice is linear 0-1. Plotting the POOLED figure, not the per-tile mean
+        # shown in the epoch line — the mean swings wildly when a background
+        # tile picks up a stray pixel, and a curve that jumps 0.9 to 0.55 and
+        # back teaches the reader nothing.
+        self._ax2 = self._ax.twinx()
+        self._ax2.set_ylim(0.0, 1.0)
+        self._ax2.set_ylabel("Dice (pooled)", color="#4caf50", fontsize=9)
+        self._ax2.tick_params(axis='y', colors="#4caf50", labelsize=8)
+        for sp in self._ax2.spines.values():
+            sp.set_color("#3f3f3f")
+        (self._line_dice,) = self._ax2.plot(
+            [], [], color='#4caf50', marker='^', markersize=3,
+            linewidth=1.6, label='dice')
+        self._dice_x, self._dice_vals = [], []
         self._style_legend()
         self._plot = True
         self._canvas.draw_idle()
@@ -2605,11 +2665,14 @@ class MADRunPanel(QWidget):
         self.pb_main.setValue(0)
         self.pb_sub.setValue(0)
         for lst in (self._batches_x, self._batch_losses, self._val_epoch_x,
-                    self._val_losses, self._train_epoch_x, self._train_losses):
+                    self._val_losses, self._train_epoch_x, self._train_losses,
+                    getattr(self, '_dice_x', []), getattr(self, '_dice_vals', [])):
             lst.clear()
         if self._plot:
             self._line_batch.set_data([], [])
             self._line_train.set_data([], [])
+            if getattr(self, '_line_dice', None) is not None:
+                self._line_dice.set_data([], [])
             self._line_val.set_data([], [])
             self._redraw_plot()
 
@@ -2638,9 +2701,14 @@ class MADRunPanel(QWidget):
         self._line_batch.set_data(self._batches_x, self._batch_losses)
         self._redraw_plot()
 
-    def plot_epoch(self, global_batch: int, train_loss: float, val_loss: float):
+    def plot_epoch(self, global_batch: int, train_loss: float,
+                   val_loss: float, dice: float = None):
         if not self._plot:
             return
+        if dice is not None and getattr(self, '_line_dice', None) is not None:
+            self._dice_x.append(int(global_batch))
+            self._dice_vals.append(float(dice))
+            self._line_dice.set_data(self._dice_x, self._dice_vals)
         self._train_epoch_x.append(int(global_batch))
         self._train_losses.append(float(train_loss))
         self._val_epoch_x.append(int(global_batch))
@@ -2787,8 +2855,10 @@ class MADTrainGraphDialog(QDialog):
     stays usable during a run. Closing it while training is active defers to the
     main window (keep running in the background vs stop)."""
 
-    def __init__(self, main):
-        super().__init__(main)
+    def __init__(self, main, parented: bool = True):
+        # ``parented=False`` detaches the native window so it can be sent
+        # behind the main window; `main` is still kept for callbacks.
+        super().__init__(main if parented else None)
         self._main = main
         self.setModal(False)
         self.setWindowTitle("Segmentation Training")
@@ -3615,8 +3685,10 @@ class MADClipDialog(QDialog):
     the platform does not do. Save is the cross-platform answer.
     """
 
-    def __init__(self, parent, clip_path: str, meta: str = "", preview=None):
-        super().__init__(parent)
+    def __init__(self, parent, clip_path: str, meta: str = "",
+                 preview=None, parented: bool = True):
+        super().__init__(parent if parented else None)
+        self._parent = parent          # kept for the status bar; see _save
         self._clip_path = clip_path
         self.setWindowTitle("Rendered Clip")
         self.setModal(False)
@@ -3695,7 +3767,7 @@ class MADClipDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Save Clip", f"Could not save:\n\n{e}")
             return
-        p = self.parent()
+        p = getattr(self, '_parent', None) or self.parent()
         if hasattr(p, 'status_bar'):
             p.status_bar.showMessage(f"Clip saved: {dest}")
 
@@ -3704,7 +3776,7 @@ class MADClipDialog(QDialog):
         md.setUrls([QUrl.fromLocalFile(self._clip_path)])
         md.setText(self._clip_path)
         QApplication.clipboard().setMimeData(md)
-        p = self.parent()
+        p = getattr(self, '_parent', None) or self.parent()
         if hasattr(p, 'status_bar'):
             p.status_bar.showMessage("Clip copied to clipboard")
 
@@ -3901,9 +3973,12 @@ class MADPreviewPanel(QWidget):
             "what the model predicted, at a 0.5 probability cut. Green neatly "
             "filled with red is correct; red outside green is a false "
             "positive; green with no red is a miss.<br><br>"
-            "Tiles titled <b>background (no call)</b> have no label in them "
-            "and are shown so false positives on empty spectrogram are "
-            "visible.<br><br>"
+            "Tiles titled <b>no labelled call</b> are hard negatives — the "
+            "patch around a detection you rejected. The split is on whether "
+            "the ground-truth mask is empty, NOT on whether the audio holds a "
+            "call, so a real but unlabelled call in one of these still counts "
+            "against precision. Red fill here is the model firing where you "
+            "said there was nothing.<br><br>"
             "<b>dice=</b> in each title is that single tile's overlap score — "
             "see the epoch line above for what Dice means.<br><br>"
             "The six tiles are drawn again at random every epoch, so do not "
@@ -4016,7 +4091,14 @@ class MADPreviewPanel(QWidget):
                 title = (f"call · dice={t['dice']:.2f}"
                          if t.get('dice') is not None else "call")
             else:
-                title = "background (no call)"
+                # "no labelled call", not "no call". These tiles are the hard
+                # negatives — patches around detections you rejected — and the
+                # split is on whether the ground-truth mask is empty, not on
+                # whether the audio contains a call. An unlabelled call here
+                # still scores as a false positive.
+                pm_area = int(((t['pred'].astype(np.float32) / 255.0) > 0.5).sum())
+                title = ("no labelled call"
+                         + (f" · {pm_area}px predicted" if pm_area else " · clean"))
             ax.set_title(title, color="#cccccc", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
@@ -6196,11 +6278,18 @@ class MADMainWindow(QMainWindow):
         s['skip'].setStyleSheet(self._review_btn_qss("#5a5a5a", "#6a6a6a"))
         s['skip'].clicked.connect(self._skip_current_pred)
         row2.addWidget(s['skip'])
-        s['accept_all'] = QPushButton("Accept All")
+        s['accept_all'] = QPushButton("Accept All Pending")
         s['accept_all'].setToolTip(
-            "Accept every pending prediction for this file at once "
-            "(train mode → saved as training examples; deploy mode → marked "
-            "'accepted' in the output CSV).")
+            "<b>Accept every pending prediction on this recording.</b><br><br>"
+            "Only pending (yellow) calls are touched — anything you already "
+            "accepted or rejected keeps the decision you made.<br><br>"
+            "Each one is confirmed and saved into the recording's .mad as a "
+            "training example, so the next run trains on it.<br><br>"
+            "<b>The Min score filter applies.</b> With it set, this accepts "
+            "only the predictions currently visible, not the ones it is "
+            "hiding — so raise it first to bulk-accept just the confident "
+            "ones.<br><br>"
+            "Undo (U) reverses the whole batch.")
         s['accept_all'].clicked.connect(self._accept_all_preds)
         row2.addWidget(s['accept_all'])
         s['clear_all'] = QPushButton("Clear All")
@@ -8387,7 +8476,13 @@ class MADMainWindow(QMainWindow):
         """Show (or re-show) the floating training-graph window. The spectrogram
         in the main window stays fully visible/usable while a run is active."""
         if self._train_dialog is None:
-            self._train_dialog = MADTrainGraphDialog(self)
+            # No parent: Qt.Window alone does not free a window from its
+            # parent. A parented widget becomes an *owned* native window, and
+            # Windows always draws an owned window above its owner — which is
+            # why the graph stayed pinned over the main window whatever flags
+            # it carried. The main window is kept as `_main` for callbacks and
+            # in `_train_dialog` for lifetime, so nothing needs the parent.
+            self._train_dialog = MADTrainGraphDialog(self, parented=False)
             self._train_dialog.setWindowTitle(
                 "Segmentation Training — loss & live predictions")
             lay = QVBoxLayout(self._train_dialog)
@@ -8573,7 +8668,7 @@ class MADMainWindow(QMainWindow):
         worker as its reporter.
         """
         if getattr(self, '_infer_dialog', None) is None:
-            dlg = QDialog(self)
+            dlg = QDialog(None)          # independent — see MADTrainGraphDialog
             dlg.setModal(False)
             dlg.setWindowTitle("Running Inference")
             dlg.setWindowFlags(Qt.Window
@@ -10954,31 +11049,28 @@ class MADMainWindow(QMainWindow):
                 f"{os.path.basename(wav)} has no .mad sidecar yet — label a "
                 "call or run inference on it first.")
             return
-        dlg = MADInspectorDialog(self, path)
+        dlg = MADInspectorDialog(self, path, parented=False)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._keep_window(dlg)
         dlg.show()
 
     def _clear_all_files(self):
-        """Empty the Audio list. Nothing on disk is touched."""
+        """Empty the Audio list, after one prompt that tells the truth.
+
+        Work out what would actually leave the disk BEFORE asking, so the
+        prompt can say so. Asking a generic "nothing is deleted" question
+        first and only then admitting some files will be deleted makes the
+        first answer meaningless — the user has already agreed to something
+        that was not what happens.
+        """
         n = len(self.audio_files)
         if not n:
             return
-        # Confirm on count alone: the labels are safe either way, but
-        # rebuilding a 15-file list by hand is a real annoyance.
-        if QMessageBox.question(
-            self, "Clear the Audio list",
-            f"Remove all {n} recording(s) from the list?\n\n"
-            "Nothing is deleted — the .wav files and their .mad sidecars "
-            "(labels, detections) stay on disk.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No) != QMessageBox.Yes:
-            return
-        # Project-owned copies (legacy recordings/, or made by Pack Project)
-        # must be deleted, not just unregistered: _rescan_project_wavs
-        # re-adopts everything under recordings/ on the next project open, so
-        # unregistering alone would let the cleared list come back. Same rule
-        # _remove_selected_files applies — and the same reason the prompt has
-        # to say so before anything leaves the disk.
+        # Project-owned copies (a legacy recordings/ file, or one made by
+        # Pack Project) have to be deleted, not merely unregistered:
+        # _rescan_project_wavs re-adopts everything under recordings/ on the
+        # next project open, so unregistering alone lets the cleared list
+        # come straight back.
         owned = []
         if self._project is not None:
             try:
@@ -10986,17 +11078,27 @@ class MADMainWindow(QMainWindow):
                          if getattr(e, 'embedded', False)]
             except Exception:
                 owned = []
-        if owned and QMessageBox.question(
-            self, "Clear the Audio list",
-            f"{len(owned)} of these {n} recording(s) are stored inside the "
-            "project and WILL be deleted from disk (wav + sidecars).\n\n"
-            "The rest are only unregistered — their files stay where they "
-            "are. Continue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No) != QMessageBox.Yes:
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear the Audio list")
+        box.setIcon(QMessageBox.Warning if owned else QMessageBox.Question)
+        box.setText(f"Remove all {n} recording(s) from the Audio list?")
+        if owned:
+            box.setInformativeText(
+                f"{len(owned)} of them are stored INSIDE the project and will be "
+                f"deleted from disk (wav + .mad sidecar). This cannot be undone.\n\n"
+                f"The other {n - len(owned)} are only unregistered — those files "
+                "stay where they are.")
+        else:
+            box.setInformativeText(
+                "Nothing is deleted — every .wav and its .mad sidecar "
+                "(labels, detections, review decisions) stays on disk, and "
+                "re-adding the folder brings the list back.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec_() != QMessageBox.Yes:
             return
-        # _remove_files_by_path already logs what it removed; a second line
-        # here would be the duplicate volume this diff set out to cut.
+        # _remove_files_by_path already logs what it removed.
         self._remove_files_by_path(list(self.audio_files),
                                    delete_embedded=bool(owned))
 
@@ -11058,6 +11160,50 @@ class MADMainWindow(QMainWindow):
         self._skips_this_file = 0
         if n:
             self._log(f"  ({n} skipped on the previous file)")
+
+    def _keep_window(self, dlg):
+        """Hold a reference to an un-parented top-level window.
+
+        These are created without a parent so they can be sent behind the main
+        window, which also means nothing on the C++ side owns them: the moment
+        the local variable goes out of scope Python collects the wrapper and
+        the window vanishes. (The clip dialog did exactly that — it flashed up
+        and disappeared while its audio, which sounddevice owns process-wide,
+        carried on playing.) The reference is dropped when Qt destroys it.
+        """
+        if not hasattr(self, '_open_windows'):
+            self._open_windows = []
+
+        # Prune on every add rather than trusting `destroyed`: with
+        # WA_DeleteOnClose that signal does not reliably reach a Python slot
+        # once the wrapper is the last thing holding the object, and a
+        # registry that only ever grows would keep dead wrappers around for
+        # the life of the session.
+        def _alive(d):
+            try:
+                import sip
+                if sip.isdeleted(d):
+                    return False
+            except Exception:
+                pass
+            try:
+                return d.isVisible()
+            except RuntimeError:        # C++ side already gone
+                return False
+
+        self._open_windows = [d for d in self._open_windows if _alive(d)]
+        self._open_windows.append(dlg)
+
+        def _forget(*_):
+            try:
+                self._open_windows.remove(dlg)
+            except (ValueError, AttributeError):
+                pass
+        try:
+            dlg.destroyed.connect(_forget)
+        except Exception:
+            pass
+        return dlg
 
     def _clear_review_canvas(self):
         """Blank the preview and every piece of per-file review state.
@@ -13326,13 +13472,14 @@ class MADMainWindow(QMainWindow):
             self._log(f"Rendered clip: {meta}")
             # The preview plays from the frame + WAV rather than decoding the
             # mp4, so it works regardless of the machine's codecs.
-            dlg = MADClipDialog(self, path, meta, preview={
+            dlg = MADClipDialog(self, path, meta, parented=False, preview={
                 'png': png, 'wav': wav, 'duration': clip_dur,
                 'x0': x0, 'x1': x1,
             })
             dlg.destroyed.connect(
                 lambda *_: shutil.rmtree(tmpdir, ignore_errors=True))
             dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+            self._keep_window(dlg)
             dlg.show()
 
         def _fail(msg: str):
@@ -13569,10 +13716,15 @@ class MADMainWindow(QMainWindow):
                     f"prec={metrics.get('val_precision', 0):.3f} "
                     f"rec={metrics.get('val_recall', 0):.3f}"
                 )
+                # Pooled Dice at the 0.5 cut, not the per-tile mean the
+                # epoch line prints — see _init_loss_plot.
+                _sweep = metrics.get('val_dice_sweep') or {}
+                _pooled = _sweep.get(0.5, _sweep.get('0.5'))
                 progress.plot_epoch(
                     metrics.get('global_batch', 0),
                     metrics.get('train_loss', float('nan')),
                     metrics.get('val_loss', float('nan')),
+                    dice=_pooled,
                 )
             elif status == 'epoch_preview':
                 if self._preview_dialog is not None:
@@ -14521,11 +14673,25 @@ class MADMainWindow(QMainWindow):
         # visible — leaving the process alive after MAD looks shut, which the
         # FNT launcher then reports as a tool still running. Close them here.
         self._closing_train_windows = True   # no "stop the run?" prompt now
-        for dlg in list(self.findChildren(QDialog)):
+        owned = [getattr(self, n, None)
+                 for n in ('_train_dialog', '_infer_dialog')]
+        owned += list(getattr(self, '_open_windows', []))
+        for dlg in list(self.findChildren(QDialog)) + [d for d in owned if d]:
             try:
                 dlg.close()
+                # These have no parent (so they can be sent behind the main
+                # window), which means nothing on the C++ side owns them and
+                # their destruction order at interpreter teardown is not
+                # defined — destroyed after QApplication, Qt segfaults on the
+                # way out. Delete them here, while the app is still alive.
+                dlg.setParent(None)
+                dlg.deleteLater()
             except Exception:
                 pass
+        self._train_dialog = None
+        self._infer_dialog = None
+        self._preview_dialog = None
+        QApplication.processEvents()      # let deleteLater actually run
 
         # Worker threads outlive the window the same way. Ask each to stop,
         # then give it a bounded wait — a hung thread must not turn closing

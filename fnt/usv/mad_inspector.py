@@ -135,8 +135,10 @@ def _fmt_attr(v):
 class MADInspectorDialog(QDialog):
     """Tree view of a .mad file's structure, attributes and arrays."""
 
-    def __init__(self, parent, path: str):
-        super().__init__(parent)
+    def __init__(self, parent, path: str, parented: bool = True):
+        # Un-parented by default from MAD: a parented widget is an owned
+        # native window and Windows keeps an owned window above its owner.
+        super().__init__(parent if parented else None)
         self._path = path
         self.setWindowTitle(f"Inspect .mad — {os.path.basename(path)}")
         self.setModal(False)
