@@ -530,8 +530,8 @@ def _shrink_for_preview(a: np.ndarray, max_h: int = 160, max_w: int = 192):
     return a[::sh, ::sw]
 
 
-def _build_epoch_previews(model, device, specs, targets, gt_pool, nogt_pool,
-                          rng, k):
+def _build_epoch_previews(model, device, specs, targets, weights,
+                          gt_pool, nogt_pool, rng, k):
     """Run the current model on a fresh random handful of val tiles and return
     lightweight preview payloads. ``gt_pool``/``nogt_pool`` are index lists into
     ``specs``/``targets`` for tiles that do / don't contain a labelled call.
@@ -540,8 +540,19 @@ def _build_epoch_previews(model, device, specs, targets, gt_pool, nogt_pool,
 
     Each payload is a dict of small uint8 arrays: ``spec`` (grayscale 0-255),
     ``pred`` (predicted probability 0-255), ``gt`` (0/1 mask, or None for
-    background tiles), ``dice`` (float over the supervised tile, or None), and
-    ``has_gt``. Must be called under ``model.eval()`` / ``torch.no_grad()``.
+    background tiles), ``unsup`` (0/1 mask of pixels NOT scored), ``dice``
+    (float over the supervised tile, or None), and ``has_gt``. Must be called
+    under ``model.eval()`` / ``torch.no_grad()``.
+
+    Supervision is column-wise (see ``supervision_weight``): a time column
+    holding any labelled pixel is supervised across all frequencies, and a
+    column with no label is not scored at all. The preview used to ignore that
+    weight entirely, which made it disagree with the run in two visible ways —
+    a call the model found in an unlabelled column showed as a bare red blob
+    with no green outline, looking like a missed label, and the tile's dice
+    counted it as a false positive even though ``val_dice`` had excluded it.
+    Reporting the same masked number, and marking the unscored region, is what
+    makes the preview agree with the metric beside it.
     """
     import torch
 
@@ -572,6 +583,7 @@ def _build_epoch_previews(model, device, specs, targets, gt_pool, nogt_pool,
         spec = specs[idx]
         payload = {
             'has_gt': bool(has_gt),
+            'unsup': None,
             'spec': (np.clip(_shrink_for_preview(spec), 0.0, 1.0) * 255
                      ).astype(np.uint8),
             'pred': (np.clip(_shrink_for_preview(prob), 0.0, 1.0) * 255
@@ -579,10 +591,18 @@ def _build_epoch_previews(model, device, specs, targets, gt_pool, nogt_pool,
             'gt': None,
             'dice': None,
         }
+        w = (weights[idx] > 0.5) if weights is not None else None
+        if w is not None:
+            payload['unsup'] = _shrink_for_preview((~w).astype(np.uint8))
         if has_gt:
             gt = targets[idx] > 0.5
             payload['gt'] = _shrink_for_preview(gt.astype(np.uint8))
+            # Masked exactly as the validation loop masks it, so a tile's
+            # number is comparable with the val_dice shown next to it.
             pred_bin = prob > 0.5
+            if w is not None:
+                gt = gt & w
+                pred_bin = pred_bin & w
             inter = float(np.logical_and(pred_bin, gt).sum())
             denom = float(pred_bin.sum() + gt.sum())
             payload['dice'] = (2.0 * inter / denom) if denom > 0 else 1.0
@@ -809,6 +829,7 @@ def train_unet(
     # tiles (empty mask → "no ground truth", surfaces false positives).
     prev_specs = specs[val_idx]
     prev_targets = targets[val_idx]
+    prev_weights = weights[val_idx]
     prev_gt_pool = [i for i in range(len(prev_targets))
                     if prev_targets[i].sum() > 0]
     prev_nogt_pool = [i for i in range(len(prev_targets))
@@ -952,7 +973,7 @@ def train_unet(
             try:
                 with torch.no_grad():
                     tiles = _build_epoch_previews(
-                        model, device, prev_specs, prev_targets,
+                        model, device, prev_specs, prev_targets, prev_weights,
                         prev_gt_pool, prev_nogt_pool, prev_rng,
                         cfg.preview_count)
                 if tiles:

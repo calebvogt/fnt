@@ -5071,7 +5071,9 @@ class MADPreviewPanel(QWidget):
         legend = QLabel(
             "<span style='color:#39ff88'>▢ outline = ground truth</span>"
             "&nbsp;&nbsp;&nbsp;"
-            "<span style='color:#ff6666'>■ fill = predicted mask</span>")
+            "<span style='color:#ff6666'>■ fill = predicted mask</span>"
+            "  ·  "
+            "<span style='color:#5a8cf0'>▨ shaded = not scored (no label in these columns)</span>")
         legend.setStyleSheet("font-size:10px;")
         legend.setToolTip(
             "<b>Reading a preview tile</b><br><br>"
@@ -5193,6 +5195,17 @@ class MADPreviewPanel(QWidget):
             overlay = np.zeros((pm.shape[0], pm.shape[1], 4), dtype=np.float32)
             overlay[pm] = (1.0, 0.4, 0.4, 0.45)
             ax.imshow(overlay, origin='lower', aspect='auto')
+            # Columns nobody labelled are not scored at all — supervision is
+            # column-wise (see supervision_weight). Drawn as a dim blue wash so
+            # a red blob sitting in one reads as "not judged" rather than "a
+            # call you forgot to label": that ambiguity is what made these
+            # tiles look broken, when the run had already excluded them.
+            unsup = t.get('unsup')
+            if unsup is not None and unsup.any():
+                shade = np.zeros((unsup.shape[0], unsup.shape[1], 4),
+                                 dtype=np.float32)
+                shade[unsup > 0] = (0.35, 0.55, 0.95, 0.16)
+                ax.imshow(shade, origin='lower', aspect='auto')
             if t.get('gt') is not None:
                 ax.contour(t['gt'].astype(np.float32), levels=[0.5],
                            colors='#39ff88', linewidths=1.1)
@@ -5204,7 +5217,10 @@ class MADPreviewPanel(QWidget):
                 # split is on whether the ground-truth mask is empty, not on
                 # whether the audio contains a call. An unlabelled call here
                 # still scores as a false positive.
-                pm_area = int(((t['pred'].astype(np.float32) / 255.0) > 0.5).sum())
+                # Only pixels that are actually scored count as a false
+                # positive; the rest sit in unlabelled columns.
+                scored = pm if unsup is None else (pm & (unsup == 0))
+                pm_area = int(scored.sum())
                 title = ("no labelled call"
                          + (f" · {pm_area}px predicted" if pm_area else " · clean"))
             ax.set_title(title, color="#cccccc", fontsize=8)
