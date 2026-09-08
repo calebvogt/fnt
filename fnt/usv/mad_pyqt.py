@@ -4375,15 +4375,13 @@ class MADConfirmedGalleryDialog(QDialog):
         # window used to abort this method before the tiles were rebuilt, which
         # made a completed deletion look like nothing had happened.
         try:
-            cur = None
-            if (self._main.audio_files
-                    and 0 <= self._main.current_file_idx
-                    < len(self._main.audio_files)):
-                cur = os.path.normcase(os.path.abspath(
-                    self._main.audio_files[self._main.current_file_idx]))
-            if cur and cur in {os.path.normcase(os.path.abspath(r['wav']))
-                               for r in rows}:
-                self._main._load_current_file()
+            # Correct the Detections list in place. Reloading the recording
+            # would also work and used to be what happened, but it is an
+            # asynchronous multi-second read, so the list went on showing the
+            # deleted call as confirmed until it finished — which read as the
+            # delete having done nothing at all.
+            self._main.drop_annotations_by_example_id(
+                [r['id'] for r in rows])
             self._main._scan_all_file_counts()
         except Exception as e:
             self._main._log(f"Deleted, but refreshing the main window failed: {e}")
@@ -11330,6 +11328,11 @@ class MADMainWindow(QMainWindow):
         make("]", self._shortcut_brush_bigger)
         make("V", self._shortcut_cycle_view)
         make("D", self._delete_selected_annotation)
+        # Delete/Backspace mean the same thing and are what a Windows
+        # user reaches for. Safe alongside D because the slot ignores
+        # them whenever a field has focus — see _focus_is_edit.
+        make(Qt.Key_Delete, self._delete_selected_annotation)
+        make(Qt.Key_Backspace, self._delete_selected_annotation)
         make("H", self._shortcut_detect_harmonics)   # group into calls
         make("A", lambda: self._shortcut_review('accepted'))
         make("R", lambda: self._shortcut_review('rejected'))
@@ -11347,8 +11350,23 @@ class MADMainWindow(QMainWindow):
             self._pred_next()
 
     def _focus_is_edit(self):
+        """Is the user typing into a field right now?
+
+        Every single-letter shortcut is an ApplicationShortcut, so it fires
+        wherever focus is; this is what stops "D" deleting a call while someone
+        edits a number.
+
+        The set covers QLineEdit and QTextEdit as well as the spin boxes, which
+        matters more now that Delete and Backspace also delete a detection:
+        those two keys mean something in any text field, and quietly removing a
+        mask instead would be a nasty surprise. QAbstractSpinBox rather than
+        the concrete classes so a custom spin box is covered too. Mirrors the
+        widget set the arrow-key filter already uses.
+        """
+        from PyQt5.QtWidgets import QAbstractSpinBox, QLineEdit
         focus = QApplication.focusWidget()
-        return isinstance(focus, (QSpinBox, QDoubleSpinBox, QComboBox))
+        return isinstance(focus, (QAbstractSpinBox, QLineEdit, QComboBox,
+                                  QTextEdit))
 
     def eventFilter(self, obj, event):
         # Route arrow keys to spectrogram pan/zoom regardless of which control
@@ -14577,6 +14595,40 @@ class MADMainWindow(QMainWindow):
         self._log(f"{action.capitalize()} {n_done} box-selected detection(s)")
         self.status_bar.showMessage(f"{action.capitalize()}ed {n_done} detection(s)")
         return True
+
+    def drop_annotations_by_example_id(self, example_ids) -> int:
+        """Remove on-screen detections whose stored example was just deleted.
+
+        A confirmed call carries its example's id (see
+        ``_examples_to_annotations``), so the Detections list can be corrected
+        directly rather than by re-reading the recording. That matters: the
+        gallery's delete used to call ``_load_current_file()``, a multi-second
+        asynchronous reload of the audio and its spectrogram, and until it
+        landed the list still showed the deleted call as confirmed. Deleting
+        one mask should not reload a ten-minute recording, and the list should
+        not be briefly wrong while it does.
+
+        Returns how many rows were removed.
+        """
+        want = {str(e) for e in example_ids if e is not None}
+        if not want:
+            return 0
+        sg = getattr(self, 'spectrogram', None)
+        if sg is None:
+            return 0
+        doomed = [i for i, a in enumerate(sg.annotations)
+                  if str(a.get('id')) in want]
+        if not doomed:
+            return 0
+        # Back to front: remove_annotation pops by index.
+        for i in reversed(doomed):
+            sg.remove_annotation(i)
+        sg._selected_ann_idx = None
+        sg._rebuild_confirmed_mask()
+        sg.update()
+        self._bump_review_token()
+        self._refresh_annotation_list()
+        return len(doomed)
 
     def _delete_selected_annotation(self):
         """Delete the selected detection (Delete button / D key).
