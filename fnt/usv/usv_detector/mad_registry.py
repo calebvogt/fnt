@@ -6,7 +6,7 @@ That made projects self-contained but duplicated hundreds of MB per file (a
 the copy never reached the original and vice versa.
 
 The copies were never needed for *training*. MAD bakes each confirmed call into
-``models/training_data/training_data.h5`` as a self-contained spectrogram patch
+``training_data/training_data.h5`` as a self-contained spectrogram patch
 plus mask, and ``mad_training`` reads only that store — it never opens a wav. So
 the audio is needed for exactly one thing: re-opening a file to look at it. That
 is a much weaker dependency than SLEAP has on its videos (SLEAP stores only frame

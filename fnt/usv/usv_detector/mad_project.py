@@ -2,9 +2,11 @@
 
 A MAD project is a directory that *references* recordings where they already
 live (SLEAP's model: the project points at videos, it does not ingest them).
-Pixel-level labels and training examples live in per-wav ``_FNT_masks.h5``
-siblings and a consolidated ``training_data.h5`` store under the project's
-``models/training_data/``.
+Pixel-level labels live in a ``_FNT.mad`` sidecar beside each recording --
+that is the master copy. ``training_data/`` holds a consolidated
+``training_data.h5`` rebuilt from those sidecars at the start of every run;
+it is a cache, and it sits beside ``models/`` rather than inside it because
+it is an input to models rather than one of them.
 """
 from __future__ import annotations
 
@@ -25,8 +27,9 @@ class MADProjectConfig:
 
         <project_dir>/
             mad_project_info.json     # this config: audio registry + params
+            training_data/
+                training_data.h5      # cache rebuilt from the .mad sidecars
             models/
-                training_data.h5      # consolidated examples the model trains on
                 <run>/weights.pt      # per-run checkpoint + its provenance
             batch_runs/<run>/         # inference run logs
             recordings/               # ONLY when Pack Project embeds audio
@@ -113,10 +116,53 @@ class MADProjectConfig:
     schema_version: int = 1
 
     # ------------------------------------------------------------------
+    #: Where the training cache lived before 2026-09-08. Read forever so an
+    #: existing project keeps working; migrated on open by
+    #: :func:`migrate_training_data_dir`.
+    LEGACY_TRAINING_DATA_DIR = ('models', 'training_data')
+
     @property
     def training_data_dir(self) -> str:
-        """Self-contained per-call example store, shared across model runs."""
-        return os.path.join(self.project_dir, 'models', 'training_data')
+        """Per-call example cache, rebuilt from the ``.mad`` sidecars each run.
+
+        Sits beside ``models/`` rather than inside it because it is an *input*
+        to models, not one of them: each ``models/<run>/`` is one frozen
+        training run, while this corpus accumulates across all of them. Filing
+        it under ``models/`` read as "a model called training_data".
+
+        A project created before the move keeps its old location — see
+        :func:`migrate_training_data_dir`.
+        """
+        new = os.path.join(self.project_dir, 'training_data')
+        if os.path.isdir(new):
+            return new
+        old = os.path.join(self.project_dir, *self.LEGACY_TRAINING_DATA_DIR)
+        return old if os.path.isdir(old) else new
+
+    def migrate_training_data_dir(self) -> Optional[str]:
+        """Move ``models/training_data/`` up to ``training_data/``.
+
+        Safe to call on every open: it does nothing when the new location
+        already exists, and nothing when the old one does not. Returns the new
+        path if it moved, else None.
+
+        The contents are a cache rebuilt from the ``.mad`` sidecars at the
+        start of every run, so even a failed move costs nothing but a rebuild —
+        which is why this can just log and carry on rather than block opening a
+        project.
+        """
+        import shutil
+        if not self.project_dir:
+            return None
+        new = os.path.join(self.project_dir, 'training_data')
+        old = os.path.join(self.project_dir, *self.LEGACY_TRAINING_DATA_DIR)
+        if os.path.isdir(new) or not os.path.isdir(old):
+            return None
+        try:
+            shutil.move(old, new)
+        except Exception:
+            return None
+        return new
 
     @property
     def recordings_dir(self) -> str:
@@ -206,9 +252,9 @@ def create_mad_project(
     """Create a new MAD project directory and write its config."""
     os.makedirs(project_dir, exist_ok=True)
     os.makedirs(os.path.join(project_dir, 'models'), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, 'models', 'training_data'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'training_data'), exist_ok=True)
     # No 'datasets/' — it held exported tile/mask files for a training path
-    # that no longer exists (training reads models/training_data/*.h5), so it
+    # that no longer exists (training reads training_data/*.h5), so it
     # was created empty in every project and never written to.
     #
     # No 'recordings/' either: only Pack Project puts anything there, and it

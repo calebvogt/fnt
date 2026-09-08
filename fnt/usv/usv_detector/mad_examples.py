@@ -1,7 +1,7 @@
 """MAD per-call training-example store.
 
 Each confirmed call is saved as a small, self-contained example under the
-project's ``models/training_data/`` directory — a normalized spectrogram
+project's ``training_data/`` directory — a normalized spectrogram
 **patch** (full frequency height x a time window around the call), its binary
 mask, and a metadata sidecar. Training reads these patches directly, so the
 project no longer needs the original WAVs (inference still runs on whatever
@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -52,17 +52,22 @@ def save_example(
     mask_patch: np.ndarray,
     meta: Dict,
     example_id: Optional[str] = None,
+    neighbors_patch: Optional[np.ndarray] = None,
 ) -> str:
     """Persist one confirmed-call example.
 
     Args:
-        dataset_dir: ``<project>/models/training_data``.
+        dataset_dir: ``<project>/training_data``.
         spec_patch:  normalized spectrogram patch, float in [0, 1] OR uint8.
-        mask_patch:  binary mask, same shape as ``spec_patch`` (any nonzero =
-                     positive).
+        mask_patch:  binary mask of THIS call only, same shape as
+                     ``spec_patch`` (any nonzero = positive).
         meta:        metadata dict (class, source_wav, time/freq, params, ...).
         example_id:  optional explicit id; a uuid-based one is generated
                      otherwise.
+        neighbors_patch: other confirmed calls falling inside this patch
+                     window. Kept out of ``mask_patch`` so per-call readers
+                     (overlay, gallery, CSV) see one call; recombined by
+                     :func:`collect_training_examples`.
 
     Returns the example id.
 
@@ -73,7 +78,8 @@ def save_example(
     d = Path(dataset_dir)
     d.mkdir(parents=True, exist_ok=True)
     return _ms.td_save_example(_store_path(dataset_dir), spec_patch, mask_patch,
-                               meta, example_id)
+                               meta, example_id,
+                               neighbors_patch=neighbors_patch)
 
 
 def _store_path(dataset_dir: str) -> str:
@@ -510,25 +516,55 @@ def iter_file_rejected_annotations(
 # ----------------------------------------------------------------------
 def reconstruct_file_mask(
     dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
+    extra_stores: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     """Rebuild the confirmed-positive mask for one source file.
 
     Pastes every matching example's mask back onto the full-file spec grid at
     its saved time offset. ``grid_shape`` is ``(n_freq_bins, n_time_frames)``.
     Returns a uint8 {0, 1} array.
+
+    ``extra_stores`` are additional example stores to union in — in practice
+    the recording's own ``.mad``, which is the MASTER label set: labels always
+    save there, project or not, and ``rebuild_training_store`` regenerates
+    ``dataset_dir`` from the sidecars at the start of every run. So the project
+    store is a cache and is stale between runs — measured on one v5 recording,
+    39 labels in the ``.mad`` against 28 in the cache.
+
+    Pass ``dataset_dir=""`` to read the given stores ONLY. Callers that must
+    reflect the labels as they are right now (inference's ``preserve_labels``)
+    should do that when the sidecar exists, because a label deleted from the
+    sidecar lingers in the cache until the next rebuild, and unioning the two
+    would honour a label the user has already removed.
     """
     from . import fnt_mask_store as _ms
     n_freq, n_time = grid_shape
     out = np.zeros((n_freq, n_time), dtype=np.uint8)
     target = Path(str(wav_name)).name
-    for ex in iter_examples(dataset_dir):
+
+    def _sources():
+        if dataset_dir:
+            yield from iter_examples(dataset_dir)
+        for store in (extra_stores or ()):
+            if store and Path(store).is_file():
+                yield from _ms.td_iter_file_examples(store, target,
+                                                     with_spec=False)
+
+    seen_ids = set()
+    for ex in _sources():
         meta = ex["meta"]
+        # The same example is routinely in both stores; paint it once.
+        ex_id = meta.get("id")
+        if ex_id is not None:
+            if ex_id in seen_ids:
+                continue
+            seen_ids.add(ex_id)
         if Path(str(meta.get("source_wav", ""))).name != target:
             continue
         # Only real labels. A demoted ('rejected') example keeps its mask, so
         # without this it would paint in here — showing as a confirmed call in
-        # the overlay, and worse, shielding its time column from re-detection
-        # via inference's preserve_labels. A rejected region is exactly a region
+        # the overlay, and worse, shielding its pixels from re-detection via
+        # inference's preserve_labels. A rejected region is exactly a region
         # the model should be allowed to look at again.
         if _ms.example_kind(meta) != "label":
             continue
@@ -589,12 +625,17 @@ def _background_fill(spec: np.ndarray, mask: np.ndarray, width: int,
 
 
 def _place_in_tile(spec: np.ndarray, mask: np.ndarray, tile_h: int,
-                   tile_w: int, t_off: int, rng: np.random.Generator):
+                   tile_w: int, t_off: int, rng: np.random.Generator,
+                   ignore: Optional[np.ndarray] = None):
     """Put a (narrower-than-tile) patch at column ``t_off`` of a fresh tile.
 
     Everything outside the patch is noise-floor fill supervised as background
     (weight 1, target 0). Rows are cropped to ``tile_h`` from the bottom, the
     same convention inference uses.
+
+    ``ignore`` marks patch pixels to drop from the loss (weight 0) — a
+    confirmed call sitting inside a rejection's window, which must be taught
+    as neither foreground nor background.
     """
     H, W = spec.shape
     # Clamp rather than trust the caller: an offset that overruns the tile
@@ -606,6 +647,8 @@ def _place_in_tile(spec: np.ndarray, mask: np.ndarray, tile_h: int,
     s[:, t_off:t_off + W] = spec[:, :W]
     t[:, t_off:t_off + W] = (np.asarray(mask)[:, :W] > 0)
     w = np.ones((H, tile_w), dtype=np.float32)
+    if ignore is not None and np.any(ignore):
+        w[:, t_off:t_off + W] = (np.asarray(ignore)[:, :W] <= 0)
     return (_crop_or_pad(s, tile_h, tile_w, 0, 0),
             _crop_or_pad(t, tile_h, tile_w, 0, 0),
             _crop_or_pad(w, tile_h, tile_w, 0, 0))
@@ -662,6 +705,12 @@ def collect_training_examples(
             progress(i, n, meta.get("id", ""))
         spec = ex["spec"]
         mask = ex["mask"]
+        # Other confirmed calls sharing this patch window. Stored apart from
+        # ``mask`` so the overlay sees one call per example, and folded back in
+        # here because training is the one consumer that wants the whole window.
+        nb = ex.get("neighbors")
+        nb = None if nb is None else (np.asarray(nb) > 0)
+        ignore = None
         # A rejected call trains as a HARD NEGATIVE: its patch is supervised
         # with an all-zero target, so every bright pixel a human refused is
         # explicitly taught as "not a call".
@@ -674,6 +723,18 @@ def collect_training_examples(
         # exactly the counterexample that forces shape to matter.
         if _ms.example_kind(meta) in ("negative", "rejected"):
             mask = np.zeros_like(mask)
+            # ...but a rejection's window can contain a CONFIRMED call, and
+            # zeroing the whole patch taught the model that a call a human had
+            # just accepted was background. Those pixels are excluded from the
+            # loss instead: the rejection still teaches its own shape, and the
+            # confirmed call in the corner is simply not asked about.
+            ignore = nb
+        elif nb is not None:
+            # A neighbour's traced pixels are confirmed foreground, so they are
+            # supervised positive rather than ignored. Leaving them at 0 was
+            # the original problem: the weight mask is 1 across the patch, so
+            # an unpainted neighbour trained as background.
+            mask = np.maximum(mask, nb.astype(mask.dtype))
         # Provenance for the split. Fall back to the positional index for
         # examples with no id, so distinct calls never collapse into one group.
         src = Path(str(meta.get("source_wav", ""))).name or "<unknown>"
@@ -683,7 +744,8 @@ def collect_training_examples(
             if W <= tile_time_frames:
                 off = int(rng.integers(0, tile_time_frames - W + 1))
                 s_t, t_t, w_t = _place_in_tile(
-                    spec, mask, tile_freq_bins, tile_time_frames, off, rng)
+                    spec, mask, tile_freq_bins, tile_time_frames, off, rng,
+                    ignore=ignore)
             else:
                 # Wider than a tile (a long call): a random window into it,
                 # fully supervised — inference cuts long calls this way too.
@@ -691,6 +753,10 @@ def collect_training_examples(
                 s_t = _crop_or_pad(spec, tile_freq_bins, tile_time_frames, 0, start)
                 t_t = _crop_or_pad(mask, tile_freq_bins, tile_time_frames, 0, start)
                 w_t = np.ones((tile_freq_bins, tile_time_frames), dtype=np.float32)
+                if ignore is not None and ignore.any():
+                    ig = _crop_or_pad(ignore.astype(np.float32),
+                                      tile_freq_bins, tile_time_frames, 0, start)
+                    w_t = w_t * (ig <= 0)
             specs.append(s_t)
             targets.append(t_t)
             weights.append(w_t)

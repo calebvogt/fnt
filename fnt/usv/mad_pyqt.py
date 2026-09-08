@@ -3944,7 +3944,7 @@ class MADConfirmedGalleryDialog(QDialog):
         super().__init__(main)
         self._main = main
         self.setModal(False)
-        self.setWindowTitle("Confirmed Masks")
+        self.setWindowTitle("Training Masks Gallery")
         self.resize(1080, 760)
         self._index: List[dict] = []
         self._page = 0
@@ -3956,7 +3956,7 @@ class MADConfirmedGalleryDialog(QDialog):
 
         v = QVBoxLayout(self)
         head = QLabel(
-            "Every confirmed call and rejection in the project — this is "
+            "Every accepted call and rejection in the project — this is "
             "what training sees. <b>Double-click</b> a tile to open that "
             "call in its recording, or <b>click</b> to tick it for "
             "deletion (Shift-click for a run).")
@@ -3967,8 +3967,8 @@ class MADConfirmedGalleryDialog(QDialog):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Show:"))
         self.cmb_kind = QComboBox()
-        self.cmb_kind.addItems(["Confirmed calls + rejections",
-                                "Confirmed calls only",
+        self.cmb_kind.addItems(["Accepted calls + rejections",
+                                "Accepted calls only",
                                 "Rejections only"])
         bar.addWidget(self.cmb_kind)
         bar.addWidget(QLabel("Sort:"))
@@ -4200,7 +4200,7 @@ class MADConfirmedGalleryDialog(QDialog):
         rgba[..., 1] = g
         rgba[..., 2] = g
         rgba[..., 3] = 255
-        # Green for a confirmed call, red for a rejection — the same colours the
+        # Green for an accepted call, red for a rejection — the same colours the
         # spectrogram uses, so the two views read the same way.
         tint = (80, 220, 120) if r['kind'] == 'label' else (225, 90, 90)
         if m.any():
@@ -4249,17 +4249,20 @@ class MADConfirmedGalleryDialog(QDialog):
             btn.setText(f"{stem[-13:]}\n{r['t0']:.1f}s · {dur_ms:.0f}ms")
             colour = "#3fbf5f" if r['kind'] == 'label' else "#d64545"
             btn.setStyleSheet(
-                f"QToolButton {{ border: 1px solid {colour}; border-radius: 4px;"
+                # 2px, not 1: accepted-vs-rejected is the thing you scan a
+                # page of tiles FOR, and a hairline in a 158 px tile reads as
+                # decoration rather than status.
+                f"QToolButton {{ border: 2px solid {colour}; border-radius: 4px;"
                 f" background: #232323; color: #cccccc; font-size: 8px;"
                 f" padding: 2px; }}"
-                f"QToolButton:hover {{ border-width: 2px; }}"
+                f"QToolButton:hover {{ border-width: 3px; }}"
                 # Ticked-for-deletion has to be unmistakable at a glance across
                 # a screenful, so it changes the fill, not just the border.
-                f"QToolButton:checked {{ border: 3px solid #ff8c1a;"
+                f"QToolButton:checked {{ border: 4px solid #ff8c1a;"
                 f" background: #4a2a10; }}")
             btn.setToolTip(
                 f"{os.path.basename(r['wav'])}\n"
-                f"{'confirmed call' if r['kind'] == 'label' else 'rejection'}"
+                f"{'accepted call' if r['kind'] == 'label' else 'rejection'}"
                 f"{(' · ' + r['cls']) if r['cls'] else ''}\n"
                 f"{r['t0']:.3f}-{r['t1']:.3f} s  ({dur_ms:.0f} ms)"
                 + chr(10) + chr(10) +
@@ -4282,7 +4285,7 @@ class MADConfirmedGalleryDialog(QDialog):
         self.lbl_page.setText(
             (f"{len(self._index)} shown · page {self._page + 1}/{self._pages()}"
              if paged else f"{len(self._index)} shown")
-            if self._index else "Nothing confirmed in this project yet")
+            if self._index else "Nothing accepted in this project yet")
         for b in (self.btn_prev, self.btn_next):
             b.setVisible(paged)
         self.btn_prev.setEnabled(self._page > 0)
@@ -4293,7 +4296,7 @@ class MADConfirmedGalleryDialog(QDialog):
     def _set_status(self, loading=None):
         n_lab = sum(1 for r in self._index if r['kind'] == 'label')
         n_rej = len(self._index) - n_lab
-        base = (f"{n_lab} confirmed call(s) · {n_rej} rejection(s) across "
+        base = (f"{n_lab} accepted call(s) · {n_rej} rejection(s) across "
                 f"{len({r['wav'] for r in self._index})} recording(s)")
         if self._selected:
             base += f"   ·   {len(self._selected)} selected"
@@ -6330,9 +6333,9 @@ class MADMainWindow(QMainWindow):
             "color: #9fb8c8; font-size: 10px; padding: 2px 2px 4px 2px;")
         tvbox.addWidget(self.lbl_split_preview)
 
-        self.btn_inspect_confirmed = QPushButton("Inspect Confirmed Masks")
+        self.btn_inspect_confirmed = QPushButton("Training Masks Gallery")
         self.btn_inspect_confirmed.setToolTip(
-            "See every confirmed call and rejection in the project as a grid "
+            "See every accepted call and rejection in the project as a grid "
             "of spectrogram crops with their masks drawn on — the training set "
             "itself, rather than one recording at a time.\n\n"
             "Double-click a tile to open that call in its recording. Sorting "
@@ -7736,7 +7739,9 @@ class MADMainWindow(QMainWindow):
             if ex_id in now_ids:
                 continue
             try:
-                td_save_example(h5, ex['spec'], ex['mask'], ex['meta'], ex_id)
+                td_save_example(h5, ex['spec'], ex['mask'], ex['meta'],
+                                ex_id,
+                                neighbors_patch=ex.get('neighbors'))
                 n_add += 1
             except Exception:
                 continue
@@ -8571,12 +8576,12 @@ class MADMainWindow(QMainWindow):
             return
         if not self.audio_files:
             QMessageBox.information(
-                self, "Confirmed Masks",
+                self, "Training Masks Gallery",
                 "No recordings in the Audio list yet.")
             return
         self._confirmed_gallery = MADConfirmedGalleryDialog(self)
         self._confirmed_gallery.show()
-        self._log("Opened Confirmed Masks gallery")
+        self._log("Opened Training Masks Gallery")
 
     def _focus_confirmed_call(self, wav_path: str, example_id, t_center: float):
         """Show one confirmed call in its own recording, centred and selected.
@@ -12037,6 +12042,13 @@ class MADMainWindow(QMainWindow):
 
     def _activate_project(self, cfg: MADProjectConfig):
         self._project = cfg
+        # training_data/ moved out of models/ on 2026-09-08 — it is an input to
+        # models, not one of them. Contents are a cache rebuilt from the .mad
+        # sidecars each run, so a failed move costs a rebuild and nothing more.
+        moved = cfg.migrate_training_data_dir()
+        if moved:
+            self._log("Moved models/training_data -> training_data "
+                      "(it is an input to models, not a model)")
         self.setWindowTitle(f"{self.BASE_TITLE} — {cfg.project_name}")
         self.lbl_project_status.setText(f"Project: {cfg.project_name}")
         self.lbl_project_status.setStyleSheet(
@@ -14015,25 +14027,36 @@ class MADMainWindow(QMainWindow):
         # The patch is a time-crop with generous context, so it routinely
         # contains calls other than the one being saved — stacked or
         # overlapping USVs are labelled as separate calls but share pixels in
-        # this window. Storing only this call's component made every other
-        # confirmed call in the crop supervised as BACKGROUND (the weight mask
-        # is 1 everywhere), so the model was punished for correctly finding a
-        # real call it had also been shown. Composite every confirmed pixel in
-        # the window instead.
+        # this window. Those neighbours matter to training: storing only this
+        # call left every other confirmed call in the crop supervised as
+        # BACKGROUND (the weight mask is 1 everywhere), so the model was
+        # punished for correctly finding a real call it had also been shown.
+        #
+        # They are recorded SEPARATELY rather than composited into the mask.
+        # Compositing was the fix's first form and it broke per-call identity:
+        # every reader outside training rebuilds a call's shape from `mask`
+        # (the overlay, the confirmed-mask gallery, mask editing, the CSV
+        # geometry), so a composited mask made adjacent calls read as one
+        # detection, and re-confirming a call minted a bigger composite whose
+        # bounding box painted over its neighbour. mad_examples recombines the
+        # two at training time.
         mask_patch = np.zeros((n_freq, W), dtype=np.uint8)
         lt0 = t0 - pt0
         tw = min(t1 - t0, W - lt0)
         if tw > 0:
             mask_patch[f0:f1, lt0:lt0 + tw] = local[:, :tw].astype(np.uint8)
+        neighbors_patch = None
         confirmed = getattr(sg, 'mask', None)
         if confirmed is not None and getattr(confirmed, 'size', 0):
             win = confirmed[:, pt0:pt0 + W]
             hh = min(mask_patch.shape[0], win.shape[0])
             ww = min(mask_patch.shape[1], win.shape[1])
             if hh > 0 and ww > 0:
-                np.maximum(mask_patch[:hh, :ww],
-                           (win[:hh, :ww] > 0).astype(np.uint8),
-                           out=mask_patch[:hh, :ww])
+                nb = np.zeros_like(mask_patch)
+                nb[:hh, :ww] = (win[:hh, :ww] > 0).astype(np.uint8)
+                nb[mask_patch > 0] = 0        # disjoint from this call
+                if nb.any():
+                    neighbors_patch = nb
 
         df = (sr / 2.0) / (nfft // 2)
         dt = hop / float(sr)
@@ -14148,7 +14171,8 @@ class MADMainWindow(QMainWindow):
             grid=dict(sample_rate=sr, nperseg=nperseg, noverlap=noverlap_val,
                       nfft=nfft, n_freq_bins=n_freq, n_time_frames=n_time,
                       source_wav=os.path.basename(wav_path)),
-            replace_blob_id=replace_blob)
+            replace_blob_id=replace_blob,
+            neighbors_patch=neighbors_patch)
         # Hand the pre-write id list to the undo snapshot that is waiting for
         # it. Only the first commit of an operation sets it: a snapshot covers
         # one user action, and its baseline is the state before that action.

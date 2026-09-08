@@ -732,6 +732,35 @@ def merge_consecutive_blobs(
 # ----------------------------------------------------------------------
 # Blob index → time / freq conversion
 # ----------------------------------------------------------------------
+#: Halo, in grid cells, around a confirmed label when shielding it from
+#: re-detection. Without one a prediction can hug the label's edge and come
+#: back as a near-duplicate of a call you already reviewed; much larger and it
+#: starts hiding the genuinely separate call stacked next to it.
+LABEL_SHIELD_PAD = 3
+
+
+def _dilate_mask(mask: np.ndarray, pad: int) -> np.ndarray:
+    """Grow ``mask`` by ``pad`` cells in each direction.
+
+    A full-grid recording is ~513 x 1.2M cells, so this uses scipy's separable
+    box dilation and falls back to shifted ORs if scipy is unavailable.
+    """
+    if pad <= 0 or not mask.any():
+        return mask
+    try:
+        from scipy import ndimage
+        return ndimage.binary_dilation(
+            mask, structure=np.ones((2 * pad + 1, 2 * pad + 1), dtype=bool))
+    except Exception:
+        out = mask.copy()
+        for df in range(-pad, pad + 1):
+            for dt in range(-pad, pad + 1):
+                if df == 0 and dt == 0:
+                    continue
+                out |= np.roll(np.roll(mask, df, axis=0), dt, axis=1)
+        return out
+
+
 def _time_per_frame(nperseg: int, noverlap: int, sr: int) -> float:
     return (nperseg - noverlap) / float(sr)
 
@@ -1426,19 +1455,38 @@ def run_inference_on_file(
             if f1 > f0 and t1 > t0:
                 prob[f0:f1, t0:t1] = 0.0
 
-    # Preserve confirmed labels: zero out the probability mask in any time
-    # column that already contains a human-confirmed call for this file, so
-    # predictions never overwrite confirmed annotations. Skipped when the user
-    # asked to re-detect from scratch (preserve_labels False).
+    # Preserve confirmed labels: zero the probability under each confirmed
+    # call (plus a small halo, so a prediction cannot hug its edge and come
+    # back as a near-duplicate), leaving the rest of the frequency axis alone.
+    #
+    # This used to blank whole TIME COLUMNS -- prob[:, cols] = 0 across all
+    # 0-125 kHz -- which made a confirmed call at 25 kHz suppress detection of
+    # everything stacked above it for the call's whole duration. Rodent USVs
+    # overlap in time constantly, so that is not a corner case: measured on one
+    # 600 s recording, shielding 19,695 labelled pixels blanked 763,344 grid
+    # cells, a 39x over-reach that silently cost real detections.
+    #
+    # Labels come from the recording's own .mad, which is the MASTER set --
+    # labels always save there, and the project's training store is a cache
+    # rebuilt from the sidecars at the start of each run. Reading the cache
+    # here was the second half of the bug: it was stale, so 11 confirmed calls
+    # on one recording went unshielded and were drawn over. Unioning the two
+    # would be wrong in the other direction -- a label deleted from the sidecar
+    # lingers in the cache until the next rebuild, and shielding it would
+    # protect a call the user has already removed. The cache is the fallback
+    # only when a recording has no sidecar at all.
     if cfg.preserve_labels and cfg.training_data_dir:
         try:
             from .mad_examples import reconstruct_file_mask
+            from .fnt_mask_store import store_paths_for
+            sidecars = [p for p in store_paths_for(wav_path)
+                        if Path(p).is_file()]
             user_mask = reconstruct_file_mask(
-                cfg.training_data_dir, Path(wav_path).name, prob.shape
+                "" if sidecars else cfg.training_data_dir,
+                Path(wav_path).name, prob.shape, extra_stores=sidecars,
             )
-            cols = (user_mask > 0).any(axis=0)
-            if cols.any():
-                prob[:, cols] = 0.0
+            if user_mask.any():
+                prob[_dilate_mask(user_mask > 0, LABEL_SHIELD_PAD)] = 0.0
         except Exception:
             # Don't let a label-store hiccup block inference.
             pass

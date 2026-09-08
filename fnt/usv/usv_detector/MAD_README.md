@@ -185,6 +185,23 @@ Project-wide:
 
 - `models/training_data/training_data.h5` — every confirmed labeling example
   (spec patch + mask + metadata) used for training.
+
+  Each example carries **`mask`** (this call and nothing else) and an optional
+  **`neighbors`** (other confirmed calls that fall inside the same patch
+  window, disjoint from `mask`). Keep them apart: everything outside training
+  — the spectrogram overlay, the confirmed-mask gallery, mask editing, the CSV
+  geometry — reads `mask` as *this call's shape*. Merging the two is what made
+  adjacent calls read as a single detection and let a later label paint over
+  an earlier one. `collect_training_examples` recombines them: a label's
+  neighbours are supervised **positive**, a rejection's are **excluded from
+  the loss** (weight 0), because a rejection's target is all-zero and would
+  otherwise teach a confirmed call as background.
+
+  Stores written between 2026-09-05 and 2026-09-08 have the two composited
+  into `mask`. Split them with
+  `python -m fnt.usv.usv_detector.mad_migrate_composites <project>
+  --audio-root <audio tree> --apply` (omit `--apply` for a dry run; it backs
+  up each store and reports anything it cannot separate).
 - `.scratch/` — temporary masks/predictions for files you're **browsing in
   place** but haven't accepted a call on yet. Wiped on close (see below).
 

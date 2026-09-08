@@ -19,13 +19,24 @@ Two kinds of store:
    ``call_id`` is the stable id stored in the CSV, so a CSV row and its mask
    are linked without relying on row order.
 
-2. **Consolidated training store** ``models/training_data.h5`` (MAD) — every
+2. **Consolidated training store** ``training_data/training_data.h5`` (MAD) — every
    confirmed per-call example in one file (replaces thousands of PNG/JSON
    triplets)::
 
        /examples/<example_id>/spec   uint8 [H, W] normalized spec patch (gzip)
        /examples/<example_id>/mask   uint8 [H, W] binary mask (gzip)
+       /examples/<example_id>/neighbors
+                                     uint8 [H, W] OTHER confirmed calls that
+                                     fall in this patch window (optional,
+                                     disjoint from ``mask``)
        /examples/<example_id>        attrs: meta_json (JSON string)
+
+   ``mask`` is strictly THIS call and nothing else. The patch is a time crop
+   with generous context, so a neighbouring call routinely lands inside it;
+   those pixels belong in ``neighbors``, never in ``mask``. Merging the two
+   was a real bug — the overlay rebuilds a call's shape from ``mask``, so a
+   composited mask made two calls read as one and let a later label paint over
+   an earlier one.
 
 Heavy import (``h5py``) is module-level; it's already a project dependency.
 """
@@ -905,7 +916,7 @@ def set_prob_blob_count(h5_path: str, n: int) -> None:
 
 
 # ======================================================================
-# Consolidated MAD training-example store  (models/training_data.h5)
+# Consolidated MAD training-example store  (training_data/training_data.h5)
 # ======================================================================
 def training_store_path(models_dir: str) -> str:
     return os.path.join(models_dir, TRAINING_STORE_NAME)
@@ -914,9 +925,18 @@ def training_store_path(models_dir: str) -> str:
 @_reporting_write
 def td_save_example(h5_path: str, spec_patch: np.ndarray,
                     mask_patch: np.ndarray, meta: Dict,
-                    example_id: Optional[str] = None) -> str:
+                    example_id: Optional[str] = None,
+                    neighbors_patch: Optional[np.ndarray] = None) -> str:
     """Persist one confirmed-call example; returns its id (mirrors
-    :func:`fnt.usv.usv_detector.mad_examples.save_example`)."""
+    :func:`fnt.usv.usv_detector.mad_examples.save_example`).
+
+    ``mask`` is THIS call's own traced pixels and nothing else — it is the
+    per-call truth every reader outside training depends on (the overlay, the
+    gallery, mask editing, the CSV geometry). ``neighbors_patch`` carries the
+    OTHER confirmed calls that happen to fall inside the same patch window;
+    see :func:`fnt.usv.usv_detector.mad_examples.collect_training_examples`
+    for how the two are recombined into a training target.
+    """
     _require_h5()
     import uuid
     if example_id is None:
@@ -936,8 +956,29 @@ def td_save_example(h5_path: str, spec_patch: np.ndarray,
         g = ex.create_group(example_id)
         g.create_dataset("spec", data=spec, compression="gzip", compression_opts=4)
         g.create_dataset("mask", data=mask, compression="gzip", compression_opts=4)
+        _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
     return example_id
+
+
+def _write_neighbors(g, neighbors_patch, mask) -> None:
+    """Write the ``neighbors`` dataset, if there is anything to write.
+
+    Stored exclusive of ``mask`` so the two never double-count, and omitted
+    entirely when empty — the overwhelmingly common case is a call with no
+    other confirmed call within its patch window, and an all-zero array per
+    example is pure overhead.
+    """
+    if neighbors_patch is None:
+        return
+    nb = (np.asarray(neighbors_patch) > 0)
+    if nb.shape != mask.shape or not nb.any():
+        return
+    nb = np.logical_and(nb, mask == 0).astype(np.uint8)
+    if not nb.any():
+        return
+    g.create_dataset("neighbors", data=nb, compression="gzip",
+                     compression_opts=4)
 
 
 @_reporting_write
@@ -945,7 +986,8 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
                       mask_patch: np.ndarray, meta: Dict,
                       example_id: Optional[str] = None,
                       grid: Optional[Dict] = None,
-                      replace_blob_id=None) -> Dict:
+                      replace_blob_id=None,
+                      neighbors_patch: Optional[np.ndarray] = None) -> Dict:
     """Everything one accept has to write, in a single file open.
 
     Confirming a call used to cost four separate opens — list the ids for the
@@ -1013,6 +1055,7 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
                          compression_opts=4)
         g.create_dataset("mask", data=mask, compression="gzip",
                          compression_opts=4)
+        _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
     return {"id": example_id, "ids_before": ids_before, "dropped": dropped}
 
@@ -1054,9 +1097,10 @@ def td_iter_examples(h5_path: str) -> Iterator[Dict]:
                 meta = json.loads(g.attrs.get("meta_json", "{}"))
                 spec = g["spec"][()].astype(np.float32) / 255.0
                 mask = (g["mask"][()] > 0).astype(np.float32)
+                nb = (g["neighbors"][()] > 0).astype(np.float32)                     if "neighbors" in g else None
             except Exception:
                 continue
-            yield {"meta": meta, "spec": spec, "mask": mask}
+            yield {"meta": meta, "spec": spec, "mask": mask, "neighbors": nb}
 
 
 def td_iter_file_examples(h5_path: str, wav_name: str,
@@ -1102,6 +1146,9 @@ def td_iter_file_examples(h5_path: str, wav_name: str,
                     mask = mask.astype(np.float32)
             except Exception:
                 continue
+            # `neighbors` is deliberately NOT read here: every caller of this
+            # function wants per-call geometry for the overlay, and the whole
+            # point of the split is that those readers see only this call.
             yield {"meta": meta, "spec": spec, "mask": mask}
 
 
@@ -1126,6 +1173,10 @@ def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
                 "meta": json.loads(g.attrs.get("meta_json", "{}")),
                 "spec": g["spec"][()].astype(np.float32) / 255.0,
                 "mask": (g["mask"][()] > 0).astype(np.float32),
+                # Carried so undo can put the example back whole; dropping it
+                # would silently strip the neighbour supervision on restore.
+                "neighbors": ((g["neighbors"][()] > 0).astype(np.float32)
+                              if "neighbors" in g else None),
             }
     except Exception:
         return None
