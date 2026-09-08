@@ -49,7 +49,7 @@ from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
-    label_halo, MAX_RENDER_MP)
+    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI)
 from fnt.uwb import animation as uwb_animation
 from fnt.uwb import uwb_roi
 
@@ -5932,39 +5932,28 @@ class UWBQuickVisualizationWindow(QWidget):
         # of the transport row, away from the playback controls, because it is
         # something you do to a frame you have already found rather than part
         # of finding it.
-        self.combo_copy_dpi = QComboBox()
-        for _dpi in (150, 300, 600):
-            self.combo_copy_dpi.addItem(f"{_dpi} dpi", int(_dpi))
-        self.combo_copy_dpi.setCurrentIndex(1)               # 300 dpi
-        self.combo_copy_dpi.setFixedWidth(84)
-        self.combo_copy_dpi.setToolTip(
-            "Resolution of the copied image.\n"
-            "\n"
-            "The view is re-rendered from the scene rather than screengrabbed, "
-            "so this is real detail and not an upscale: text, markers and line "
-            "widths are set in POINTS and keep their physical size, so the "
-            "picture gets finer as the number goes up rather than just bigger. "
-            "300 is the usual journal minimum; 600 is safe for a figure panel "
-            "that will be printed. The pixel count also scales with how wide "
-            "you have made this pane, so a very wide window is capped to keep "
-            "the copy a sane size — the log says when that happens.\n"
-            "\n"
-            "A loaded background image is the exception — it has whatever "
-            "resolution it was saved at, and rendering above that enlarges its "
-            "pixels. The tracks, markers, labels and regions drawn over it stay "
-            "sharp regardless.")
-        transport.addWidget(self.combo_copy_dpi)
-
         self.btn_copy_view = QPushButton(self._COPY_VIEW_LABEL)
         self.btn_copy_view.setFixedWidth(96)
         self.btn_copy_view.setToolTip(
             "Copy the preview exactly as it stands — current frame, zoom, "
             "trails, labels and behaviour overlays — to the clipboard as a "
-            "PNG, ready to paste into a slide, a document or a message.\n"
+            f"PNG at {COPY_VIEW_DPI} dpi, ready to paste into a slide, a "
+            "document or a message.\n"
             "\n"
-            "Rendered fresh at the chosen dpi, not captured from the screen, "
-            "so the copy is much sharper than the pane you are looking at. "
-            "Surrounding whitespace is trimmed.\n"
+            "Rendered fresh from the scene, not captured from the screen, so "
+            "the copy is much sharper than the pane you are looking at: text, "
+            "markers and line widths are set in POINTS and keep their physical "
+            f"size, so {COPY_VIEW_DPI} dpi buys real detail rather than just "
+            "pixels. Surrounding whitespace is trimmed.\n"
+            "\n"
+            "The pixel count also scales with how wide you have made this "
+            "pane, so a very wide window is capped to keep the copy a sane "
+            "size — the log says when that happens.\n"
+            "\n"
+            "A loaded background image is the exception — it has whatever "
+            "resolution it was saved at, and rendering above that enlarges its "
+            "pixels. The tracks, markers, labels and regions drawn over it "
+            "stay sharp regardless.\n"
             "\n"
             "In the 3D view this can only copy what the GPU already drew, so "
             "it comes out at screen resolution; switch to the 2D view for a "
@@ -10195,7 +10184,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not hasattr(backend, "render_png"):
             self.log_message("This view cannot be copied.")
             return
-        dpi = self.combo_copy_dpi.currentData() or 300
+        dpi = COPY_VIEW_DPI
 
         # Playback and a render fight over the same figure: the render swaps
         # the canvas to the export dpi and rebuilds the blit cache underneath,
@@ -13429,9 +13418,10 @@ class UWBQuickVisualizationWindow(QWidget):
         'displace_winner_speed': ('spin_displace_winner_speed', 'value'),
         'displace_leave_distance': ('spin_displace_leave', 'value'),
         'displace_window_s': ('spin_displace_window', 'value'),
-        # Resolution the Copy View button renders at. Nothing downstream reads
-        # it — it persists purely so the setting survives reopening a trial.
-        'copy_view_dpi': ('combo_copy_dpi', 'text'),
+        # NOTE: Copy View renders at the fixed COPY_VIEW_DPI and so has nothing
+        # to persist. Configs written while it was a dropdown carry a
+        # 'copy_view_dpi' key; the apply loop ignores keys it has no widget
+        # for, so those load without complaint.
         # NOTE: the preview tag marker size persists separately as the
         # top-level 'preview_tag_size' key (kept for config compatibility).
     }

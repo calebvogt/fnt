@@ -52,6 +52,12 @@ import matplotlib.patheffects as pe
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle, Polygon, Rectangle
 
+# Resolution "Copy View" renders at. Fixed rather than offered as a choice:
+# 600 dpi is the safe number for a printed figure panel, everything in the
+# scene is specified in POINTS so it costs nothing but pixels, and the cap
+# below already keeps a wide window from running away with it.
+COPY_VIEW_DPI = 600
+
 # Ceiling on a "Copy View" render, in megapixels. 40 MP is ~6300 x 6300 —
 # beyond any figure panel or slide — and decodes to a ~160 MB image, which is
 # the real constraint: the clipboard holds it for as long as it is there.
