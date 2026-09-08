@@ -34,6 +34,10 @@ def main():
     # The suites print em dashes and arrows; a redirected Windows console is
     # cp1252 by default and would turn a passing check into an encoding error.
     env.setdefault("PYTHONUTF8", "1")
+    # Unbuffered, so a suite that hangs still shows how far it got. Buffered
+    # output is thrown away when CI kills the process, which left a deadlock
+    # looking like a suite that had printed nothing at all.
+    env.setdefault("PYTHONUNBUFFERED", "1")
 
     results = []
     for name in suites():
