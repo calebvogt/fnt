@@ -15,6 +15,10 @@ jobs:
     # A macOS failure is reported but does not hold anything back: the lab runs
     # Windows, and macOS is built only as a convenience.
     continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    # The suites take about a minute. A hung Qt thread would otherwise sit
+    # there until the job is cancelled hours later, which is how this job
+    # reported itself the first time it deadlocked.
+    timeout-minutes: 15
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]

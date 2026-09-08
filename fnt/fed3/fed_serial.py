@@ -109,9 +109,13 @@ class Fed3Link(QThread):
         self._running = False
         self._commands.put(None)        # wake the loop immediately
         if not self.wait(wait_ms):
-            self.terminate()
-            self.wait(1000)
-        # terminate() skips the finally block, so release defensively.
+            # A read is sitting in the serial driver past its own timeout.
+            # Waiting it out is the only safe answer: terminate() kills the
+            # thread wherever it stands, and this loop is mostly Python, so a
+            # thread killed holding the GIL takes the whole application with
+            # it rather than just this link.
+            self.wait(wait_ms)
+        # The loop may still be unwinding, so release defensively.
         if self._claimed:
             PORT_REGISTRY.release(self.port)
             self._claimed = False
@@ -261,6 +265,18 @@ class PortScannerWorker(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._cancelled = False
+
+    def cancel(self):
+        """Ask the scan to stop at the next port boundary.
+
+        A probe already in flight is left to finish, which it will: each is
+        bounded by its own open and read timeouts. The one thing a caller must
+        never do instead is terminate() this thread. Enumerating ports is
+        almost entirely Python, so killing the thread there strands the GIL and
+        the process deadlocks the moment any other thread needs it.
+        """
+        self._cancelled = True
 
     def run(self):
         try:
@@ -278,9 +294,13 @@ class PortScannerWorker(QThread):
         probe = [p for p in ports
                  if is_candidate_port(p) and p.device not in claimed]
 
-        if probe:
+        if probe and not self._cancelled:
             with ThreadPoolExecutor(max_workers=min(10, len(probe))) as pool:
                 results.extend(r for r in pool.map(_probe_port, probe) if r)
+
+        if self._cancelled:
+            # The tab that asked for this scan is gone; nothing is listening.
+            return
 
         self.finished_scan.emit(results, [p.device for p in ports])
 

@@ -138,6 +138,15 @@ FINAL_PULL_TIMEOUT_MS = 30000
 # Grace period between telling devices to start a new trial and the session's
 # first mirror pull, so the pull is scoped to the log they just rolled onto.
 NEW_TRIAL_SETTLE_MS = 2500
+# Long enough for a cancelled scan to unwind a probe that has run its open and
+# read timeouts out in full, so the orphan path below is reserved for a driver
+# that has genuinely wedged.
+SCANNER_STOP_MS = 8000
+
+# Scanners that outlived the tab that started them. Held only so Python cannot
+# collect a QThread mid-run, which Qt answers with abort(); each drops itself
+# when run() returns.
+_ORPHANED_SCANNERS = set()
 
 
 class FEDTabWidget(QWidget):
@@ -2509,14 +2518,28 @@ class FEDTabWidget(QWidget):
         for device in self.devices:
             self._disconnect_device(device)
 
-        if self._scanner is not None and self._scanner.isRunning():
-            try:
-                self._scanner.finished_scan.disconnect()
-            except TypeError:
-                pass
-            self._scanner.terminate()
-            self._scanner.wait(2000)
-        self._scanner = None
+        if self._scanner is not None:
+            scanner, self._scanner = self._scanner, None
+            # Both slots point back into a tab that is being taken apart.
+            for signal in (scanner.finished_scan, scanner.finished):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
+            scanner.cancel()
+            if not scanner.wait(SCANNER_STOP_MS):
+                # A probe is wedged in the serial driver, well past its own
+                # timeouts. It is left to unwind on its own: terminate() used
+                # to be called here, and killing a thread that is running
+                # Python strands the GIL and hangs the whole process.
+                scanner.setParent(None)
+                scanner.finished.connect(scanner.deleteLater)
+                scanner.finished.connect(
+                    lambda s=scanner: _ORPHANED_SCANNERS.discard(s))
+                _ORPHANED_SCANNERS.add(scanner)
+                self.log.append_log(
+                    "A port scan is still finishing; it will release its port "
+                    "when the driver lets go.", False)
         self.logger.detach()
 
     # --- small helpers ----------------------------------------------------
