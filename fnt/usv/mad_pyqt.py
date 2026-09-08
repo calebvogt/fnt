@@ -8784,6 +8784,50 @@ class MADMainWindow(QMainWindow):
             return f"@ {ann.get('t0', 0) * dt:.2f}s"
         return "?"
 
+    def _successor_id(self, eid):
+        """The id of the row sitting just after ``eid`` in the list right now.
+
+        Captured *before* a decision is applied, because applying it can move
+        the row. Sorted by Status, rejecting a call re-sorts it down into the
+        rejected block, and "the next pending after this id" then resolves
+        against its new position — so the cursor followed the call it had just
+        dismissed to the bottom of the list instead of carrying on down the
+        pending ones. Remembering the neighbour makes the advance mean "the row
+        after the one I was on", which is the same thing under every sort order
+        and does not care where the decided row lands.
+        """
+        order = self._review_order()
+        anns = self.spectrogram.annotations
+        for p, ai in enumerate(order):
+            if anns[ai].get('id') == eid:
+                if p + 1 < len(order):
+                    return anns[order[p + 1]].get('id')
+                return None
+        return None
+
+    def _select_next_pending_from_id(self, eid) -> bool:
+        """Select the first pending detection at or after ``eid``'s row.
+
+        "At or after", not "after": ``eid`` here is the row that *followed* the
+        decided one, so it is itself the first candidate.
+        """
+        if eid is None:
+            return False
+        order = self._review_order()
+        anns = self.spectrogram.annotations
+        start = None
+        for p, ai in enumerate(order):
+            if anns[ai].get('id') == eid:
+                start = p
+                break
+        if start is None:
+            return False
+        for p in range(start, len(order)):
+            if anns[order[p]].get('status') == 'prediction':
+                self._select_review_pos(p)
+                return True
+        return False
+
     def _after_review_decision(self, decided_id, was_pending: bool):
         """Tail for accept/reject. Auto-advance fast-forwards to the next pending
         detection ONLY when a pending item was just decided (forward review).
@@ -8792,12 +8836,16 @@ class MADMainWindow(QMainWindow):
         decided transition counts toward the 'all reviewed' tally/prompt."""
         if was_pending:
             self._reviewed_count += 1
+        # Whoever comes next, noted before the list can reorder underneath us.
+        successor = (self._successor_id(decided_id)
+                     if self._auto_advance and was_pending else None)
         # One row changed status; only fall back to rebuilding all of them when
         # the change could alter what the list contains.
         if not self._touch_annotation_rows([decided_id]):
             self._refresh_annotation_list()
         if self._auto_advance and was_pending:
-            if not self._select_next_pending_after_id(decided_id):
+            if not (self._select_next_pending_from_id(successor)
+                    or self._select_next_pending_after_id(decided_id)):
                 self._reselect_by_id(decided_id)  # nothing left after — stay
         else:
             self._reselect_by_id(decided_id)  # re-decision / manual: stay put
