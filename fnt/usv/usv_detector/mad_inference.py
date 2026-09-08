@@ -368,6 +368,12 @@ def extract_blobs(
     # 8-connectivity via 3x3 structuring element.
     structure = np.ones((3, 3), dtype=np.uint8)
     labels, n_labels = ndi.label(binary, structure=structure)
+    # ndi.label returns int32, so `labels` alone is 2.4 GB for a 10-minute
+    # recording — the largest single block this pipeline asks for. Nothing
+    # below reads `binary` again (the per-blob masks come from `labels`), so
+    # holding both at once costs another 600 MB for no reason. Peak footprint
+    # is what makes a long batch run fail on a fragmented heap, not total use.
+    del binary
     if n_labels == 0:
         return []
 
@@ -399,6 +405,194 @@ def extract_blobs(
             blob['mask'] = np.ascontiguousarray(sub_mask)
         blobs.append(blob)
     # Sort by time.
+    blobs.sort(key=lambda b: (b['t_start'], b['f_low']))
+    return blobs
+
+
+#: Time frames per labelling chunk. 100k frames is ~205 MB of int32 labels at
+#: 513 bins — an ordinary allocation, and a 10-minute recording is a dozen of
+#: them.
+DEFAULT_LABEL_CHUNK_FRAMES = 100_000
+
+
+class _UnionFind:
+    """Plain union-find over hashable ids, with path compression.
+
+    Deliberately the textbook version. A hand-rolled merge scheme written
+    inline got the seam cases subtly wrong — it reported 82 blobs where the
+    whole-grid labeller found 78 — and the failure mode is a detector that
+    invents split calls at chunk boundaries on long recordings only. Not worth
+    being clever about.
+    """
+
+    def __init__(self):
+        self._parent: Dict = {}
+
+    def find(self, x):
+        p = self._parent.setdefault(x, x)
+        while p != x:
+            x, p = p, self._parent.setdefault(p, p)
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb
+
+
+def _seam_pairs(last_col: np.ndarray, first_col: np.ndarray):
+    """Label pairs joined across a chunk boundary, under 8-connectivity.
+
+    A set pixel at row r in the left chunk's final column touches rows r-1, r
+    and r+1 of the right chunk's first column.
+    """
+    pairs = set()
+    rows = np.nonzero(last_col)[0]
+    n = len(first_col)
+    for r in rows:
+        left = int(last_col[r])
+        for rr in (r - 1, r, r + 1):
+            if 0 <= rr < n:
+                right = int(first_col[rr])
+                if right:
+                    pairs.add((left, right))
+    return pairs
+
+
+def extract_blobs_chunked(
+    prob_mask: np.ndarray, threshold: float,
+    min_blob_pixels: int = 8,
+    include_mask: bool = False,
+    spec: Optional[np.ndarray] = None,
+    chunk_frames: int = DEFAULT_LABEL_CHUNK_FRAMES,
+) -> List[Dict]:
+    """:func:`extract_blobs`, labelling in time chunks instead of all at once.
+
+    Identical output, bounded memory. ``ndi.label`` returns int32, so labelling
+    a whole recording asks for a contiguous block four times the size of the
+    grid: 2.4 GB for ten minutes, 14.4 GB for an hour, 29 GB for two. That is a
+    ceiling, not a slowdown — a 217-file batch failed on 29 of them with
+    "Unable to allocate 572 MiB" while 25 GB was free, because hours of
+    multi-gigabyte allocations had left no block that size contiguous, and at
+    an hour per recording it would not run at all on a 16 GB machine.
+
+    Chunking the time axis alone suffices: the grid is 513 bins against
+    millions of frames, so a 100k-frame chunk is ~205 MB however long the
+    recording.
+
+    The work is at the seams. A call crossing a boundary is labelled separately
+    on each side, and the halves must come back as one blob — otherwise the
+    detector silently invents a split call at every boundary, on long files
+    only. Two passes keep that honest: the first labels each chunk and records
+    per-component statistics plus the boundary columns, then unions components
+    that touch across a seam; the second re-labels only to paint the surviving
+    components' masks. Labelling twice costs a little time (blob extraction is
+    a small share of a file's runtime) and buys a merge rule that is simply
+    union-find rather than a carry protocol that has to be reasoned about.
+    """
+    from scipy import ndimage as ndi
+    u8 = prob_mask.dtype == np.uint8
+    cut = prob_threshold_u8(threshold) if u8 else threshold
+    score_scale = (1.0 / 255.0) if u8 else 1.0
+    want_mask = bool(include_mask or spec is not None)
+    H, W = prob_mask.shape
+    structure = np.ones((3, 3), dtype=np.uint8)
+    chunk = max(1, int(chunk_frames))
+    starts = list(range(0, W, chunk)) or [0]
+
+    uf = _UnionFind()
+    stats: Dict = {}          # (chunk, local label) -> bbox/area/prob_sum
+    prev_last = None          # previous chunk's final column of labels
+
+    # --- pass 1: per-chunk labels, statistics, and seam unions -----------
+    for ci, c0 in enumerate(starts):
+        c1 = min(W, c0 + chunk)
+        sub_prob = prob_mask[:, c0:c1]
+        binary = (sub_prob >= cut).astype(np.uint8)
+        if not binary.any():
+            prev_last = None          # an empty chunk breaks every run
+            continue
+        labels, n = ndi.label(binary, structure=structure)
+        del binary
+        for i, sl in enumerate(ndi.find_objects(labels), start=1):
+            if sl is None:
+                continue
+            fs, ts = sl
+            sub_labels = labels[fs, ts]
+            m = sub_labels == i
+            probs = sub_prob[fs, ts]
+            key = (ci, i)
+            uf.find(key)                       # register even if never unioned
+            stats[key] = {
+                'f_low': int(fs.start), 'f_high': int(fs.stop),
+                't_start': int(ts.start) + c0, 't_end': int(ts.stop) + c0,
+                'area': int(m.sum()),
+                'prob_sum': float(probs[m].sum()) * score_scale,
+            }
+        if prev_last is not None:
+            for left, right in _seam_pairs(prev_last, labels[:, 0]):
+                uf.union((ci - 1, left), (ci, right))
+        prev_last = labels[:, -1].copy()       # copy: `labels` is about to go
+        del labels
+
+    if not stats:
+        return []
+
+    # --- merge components, then drop the ones too small to keep ---------
+    groups: Dict = {}
+    for key, st in stats.items():
+        groups.setdefault(uf.find(key), []).append(key)
+
+    keep: Dict = {}
+    for root, keys in groups.items():
+        area = sum(stats[k]['area'] for k in keys)
+        if area < min_blob_pixels:
+            continue
+        keep[root] = {
+            't_start': min(stats[k]['t_start'] for k in keys),
+            't_end_exclusive': max(stats[k]['t_end'] for k in keys),
+            'f_low': min(stats[k]['f_low'] for k in keys),
+            'f_high_exclusive': max(stats[k]['f_high'] for k in keys),
+            'area_pixels': area,
+            'score': sum(stats[k]['prob_sum'] for k in keys) / float(area),
+        }
+    if not keep:
+        return []
+
+    # --- pass 2: paint the surviving masks ------------------------------
+    if want_mask:
+        for b in keep.values():
+            b['mask'] = np.zeros(
+                (b['f_high_exclusive'] - b['f_low'],
+                 b['t_end_exclusive'] - b['t_start']), dtype=bool)
+        # Which roots have a piece in each chunk, so a chunk with nothing
+        # surviving is skipped without relabelling it.
+        by_chunk: Dict = {}
+        for root, keys in groups.items():
+            if root not in keep:
+                continue
+            for ci, lab in keys:
+                by_chunk.setdefault(ci, []).append((lab, root))
+        for ci, wanted in sorted(by_chunk.items()):
+            c0 = starts[ci]
+            c1 = min(W, c0 + chunk)
+            binary = (prob_mask[:, c0:c1] >= cut).astype(np.uint8)
+            labels, _n = ndi.label(binary, structure=structure)
+            del binary
+            for lab, root in wanted:
+                b = keep[root]
+                fs = slice(b['f_low'], b['f_high_exclusive'])
+                piece = labels[fs, :] == lab
+                to = c0 - b['t_start']
+                # The piece spans this chunk's columns; place it in the blob's
+                # own bounding box.
+                lo = max(0, to)
+                hi = min(b['mask'].shape[1], to + (c1 - c0))
+                if hi > lo:
+                    b['mask'][:, lo:hi] |= piece[:, lo - to:hi - to]
+            del labels
+
+    blobs = list(keep.values())
     blobs.sort(key=lambda b: (b['t_start'], b['f_low']))
     return blobs
 
@@ -1112,11 +1306,25 @@ def run_inference_on_file(
     # float32 grid here was finer-grained than anything the weights ever saw.
     # Measured on a 474-detection file: identical count, 473/474 matched at
     # IoU>=0.5, median box shift 0 frames.
+    # asarray, not astype: load_audio already returns float32, and astype
+    # copies regardless of dtype — a second 600 MB block for a 10-minute
+    # recording, alive at the same moment as the original.
     spec = compute_full_spec_image(
-        audio.astype(np.float32), sr,
+        np.asarray(audio, dtype=np.float32), sr,
         nperseg=nperseg, noverlap=noverlap, nfft=nfft,
         db_min=db_min, db_max=db_max, as_uint8=True,
     )
+    # The audio is finished with — everything downstream works off the
+    # spectrogram. Holding it through the scan and blob phases pinned 600 MB
+    # for ~75 s of every file and, worse, kept a large block busy exactly when
+    # the NEXT file asked for one the same size.
+    #
+    # That mattered: a 217-file run failed on 29 of them with "Unable to
+    # allocate 572 MiB" while 25 GB was free. Nothing leaked (RSS across six
+    # consecutive files drifted +-3 MB); the heap had simply been churned by
+    # hours of interleaved 600 MB and 1800 MB allocations until no contiguous
+    # block that size remained. Releasing early is what reduces that pressure.
+    del audio
     t_spec = _time.perf_counter() - _t_spec0
     if progress:
         progress('spec', 1, 1)
@@ -1238,9 +1446,12 @@ def run_inference_on_file(
     if progress:
         progress('blobs', 0, 1)
     _t_blob0 = _time.perf_counter()
-    blobs = extract_blobs(prob, threshold=cfg.threshold,
-                          min_blob_pixels=cfg.min_blob_pixels, include_mask=True,
-                          spec=spec)
+    # Chunked: labelling a whole recording at once needs a contiguous
+    # int32 block four times the grid's size, which is a ceiling rather
+    # than a cost — 14.4 GB for an hour of audio, 29 GB for two.
+    blobs = extract_blobs_chunked(
+        prob, threshold=cfg.threshold,
+        min_blob_pixels=cfg.min_blob_pixels, include_mask=True, spec=spec)
     if cfg.merge_consecutive:
         # dt (seconds/frame) → gap in frames; both derived above.
         max_gap_frames = int(round(cfg.merge_max_gap_s / dt)) if dt else 0

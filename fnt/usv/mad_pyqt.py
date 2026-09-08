@@ -110,6 +110,11 @@ def _new_ann_id(prefix: str) -> str:
 
 _ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
 _ROLE_FILE_COUNTS = Qt.UserRole + 21  # (accepted, pending, rejected) or None
+#: Error text when the last inference run FAILED on this recording.
+#: A failed file writes no sidecar, so without this it is indistinguishable
+#: from one that was never analyzed — which is how 29 files silently
+#: dropped out of a 22-hour run and looked like ordinary blank rows.
+_ROLE_FILE_ERROR = Qt.UserRole + 22
 
 
 class FileCountDelegate(QStyledItemDelegate):
@@ -148,6 +153,7 @@ class FileCountDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
 
         counts = index.data(_ROLE_FILE_COUNTS)
+        err = index.data(_ROLE_FILE_ERROR)
         painter.save()
         painter.setClipRect(opt.rect)
         fm = opt.fontMetrics
@@ -167,11 +173,15 @@ class FileCountDelegate(QStyledItemDelegate):
         # No tick: it was drawn under exactly the condition that also shows
         # the counts, so it carried no information the numbers did not.
         draw(str(label), base_col)
-        if not has_counts and counts is not None:
+        if err:
+            # Loud, and ahead of the count states: "inference tried and failed"
+            # is the one status a reviewer must not mistake for "nothing here".
+            draw("  ✖ failed", QColor(214, 69, 69))
+        elif not has_counts and counts is not None:
             # Analyzed and genuinely empty — distinct from never analyzed,
             # which has no counts tuple at all.
             draw("  (0 detections)", QColor(150, 150, 150))
-        if has_counts:
+        if has_counts and not err:
             a, p, r = counts
             c_acc, c_pend, c_rej = self._colors()
             draw("  (", base_col)
@@ -3678,6 +3688,144 @@ class _ClipPlayer(QWidget):
         pnt.drawLine(QPointF(px, oy), QPointF(px, oy + h))
 
 
+class MADRunSummaryTable(QDialog):
+    """Completion summary for a run, with every file listed and scrollable.
+
+    The previous version put the per-file breakdown in a QMessageBox's
+    informative text, which meant a plain string that elided after ten entries
+    and could not be scrolled. On a 217-file run that hid 207 of them — and,
+    worse, hid the 29 that FAILED behind a "see Session Logs" line, so a run
+    that silently dropped 13% of its files looked like a success.
+
+    Failures sort to the top and carry their error, because the whole point of
+    reading this dialog is to find out what did not work.
+    """
+
+    def __init__(self, main, title: str, headline: str, summary_lines,
+                 results, copy_text_fn=None):
+        super().__init__(main)
+        self._main = main
+        self._results = list(results or [])
+        self._copy_text_fn = copy_text_fn
+        self.setWindowTitle(title)
+        self.resize(760, 560)
+
+        v = QVBoxLayout(self)
+        head = QLabel(headline)
+        head.setStyleSheet("font-size: 13px; font-weight: 600;")
+        v.addWidget(head)
+
+        if summary_lines:
+            box = QLabel("\n".join(summary_lines))
+            box.setWordWrap(True)
+            box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            box.setStyleSheet("color: #cccccc; font-size: 10px;")
+            v.addWidget(box)
+
+        n_err = sum(1 for r in self._results if r.get('error'))
+        n_ok = len(self._results) - n_err
+        tally = QLabel()
+        tally.setStyleSheet("font-size: 11px;")
+        tally.setText(
+            f"<span style='color:#8fbf8f;'>{n_ok} analyzed</span>"
+            + (f" &nbsp;·&nbsp; <span style='color:#ff6b6b; font-weight:600;'>"
+               f"{n_err} FAILED</span>" if n_err else ""))
+        v.addWidget(tally)
+
+        self.chk_errors_only = QCheckBox("Show only failures")
+        self.chk_errors_only.setChecked(bool(n_err))
+        self.chk_errors_only.setEnabled(bool(n_err))
+        self.chk_errors_only.toggled.connect(lambda _c: self._fill())
+        v.addWidget(self.chk_errors_only)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(["Recording", "Detections", "Status"])
+        self.table.setRootIsDecorated(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
+        self.table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        v.addWidget(self.table, 1)
+
+        row = QHBoxLayout()
+        self.lbl_hint = QLabel(
+            "Double-click a recording to open it." if n_ok else "")
+        self.lbl_hint.setStyleSheet("color: #999999; font-size: 10px;")
+        row.addWidget(self.lbl_hint, 1)
+        btn_copy = QPushButton("Copy to Clipboard")
+        btn_copy.setToolTip("Copy the full summary, every file included.")
+        btn_copy.clicked.connect(self._copy)
+        row.addWidget(btn_copy)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.accepted.connect(self.accept)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+        self.table.itemDoubleClicked.connect(self._open_row)
+        self._fill()
+
+    def _fill(self):
+        only_errs = (self.chk_errors_only.isChecked()
+                     and self.chk_errors_only.isEnabled())
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        items = []
+        # Name order within each status group, so the Status sort below is
+        # deterministic rather than relying on Qt's sort being stable.
+        rows = sorted(self._results,
+                      key=lambda r: os.path.basename(
+                          str(r.get('wav_path') or '')).lower())
+        for pos, r in enumerate(rows):
+            err = r.get('error')
+            if only_errs and not err:
+                continue
+            name = os.path.basename(str(r.get('wav_path') or ''))
+            n = r.get('n_blobs')
+            it = SortableTreeWidgetItem([
+                name,
+                "—" if err else f"{int(n or 0):,}",
+                f"FAILED — {err}" if err else "analyzed",
+            ])
+            # Column 0 sorts by name (the item's text fallback handles it).
+            # Column 2 puts every failure first and then holds name order —
+            # one number, because the comparator coerces the key with float()
+            # and anything it cannot coerce silently degrades to comparing the
+            # displayed text.
+            it.setData(1, _SORT_ROLE, -1 if err else int(n or 0))
+            it.setData(2, _SORT_ROLE, (0 if err else 1) * 1e9 + pos)
+            it.setData(0, Qt.UserRole, r.get('wav_path'))
+            colour = QColor(214, 69, 69) if err else QColor(200, 200, 200)
+            for c in range(3):
+                it.setForeground(c, colour)
+            if err:
+                it.setToolTip(2, str(err))
+            items.append(it)
+        self.table.addTopLevelItems(items)
+        self.table.setSortingEnabled(True)
+        # Failures first — that is what this dialog is opened to find.
+        self.table.sortByColumn(2, Qt.AscendingOrder)
+
+    def _open_row(self, item, _col=0):
+        wav = item.data(0, Qt.UserRole)
+        if not wav:
+            return
+        try:
+            self._main._open_wav_for_review(str(wav))
+        except Exception:
+            pass
+
+    def _copy(self):
+        if self._copy_text_fn is not None:
+            text = self._copy_text_fn()
+        else:
+            text = "\n".join(
+                f"{os.path.basename(str(r.get('wav_path') or ''))}: "
+                + (f"FAILED — {r['error']}" if r.get('error')
+                   else f"{int(r.get('n_blobs') or 0)} detection(s)")
+                for r in self._results)
+        QApplication.clipboard().setText(text)
+        self.lbl_hint.setText("Copied.")
+
+
 class MADConfirmedGalleryDialog(QDialog):
     """Contact sheet of every confirmed call in the project — the training set.
 
@@ -6679,36 +6827,29 @@ class MADMainWindow(QMainWindow):
                          "pending review.")
         else:
             lines.append(f"No detections in {len(ok)} file(s).")
-        for r in ok[:12]:
-            lines.append(f"   • {os.path.basename(str(r.get('wav_path')))}: "
-                         f"{int(r.get('n_blobs') or 0)}")
-        if len(ok) > 12:
-            lines.append(f"   … +{len(ok) - 12} more")
         if errs:
-            lines.append(f"\n{len(errs)} file(s) failed — see Session Logs.")
-            for r in errs[:5]:
-                lines.append(f"   ✖ {os.path.basename(str(r.get('wav_path')))}")
-
+            lines.append(
+                f"{len(errs)} file(s) FAILED and hold no detections — they "
+                "are listed below and marked ✖ in the Audio list. Re-run "
+                "inference; files that succeeded are skipped.")
         if cfg is not None:
             lines.append(
-                f"\nSettings: threshold {getattr(cfg, 'threshold', 0):.2f}, "
+                f"Settings: threshold {getattr(cfg, 'threshold', 0):.2f}, "
                 f"min blob {getattr(cfg, 'min_blob_pixels', 0)} px, merge "
                 f"{'on' if getattr(cfg, 'merge_consecutive', False) else 'off'}.")
             if not total:
                 lines.append(
-                    "Nothing cleared both of those. Lower the threshold or the "
-                    "minimum blob size and run again — the probability grid is "
-                    "not kept, so this cannot be re-filtered after the fact.")
+                    "Nothing cleared both of those. Lower the threshold or "
+                    "the minimum blob size and run again — the probability "
+                    "grid is not kept, so this cannot be re-filtered after "
+                    "the fact.")
 
-        box = QMessageBox(self)
-        box.setWindowTitle("Inference complete")
-        box.setIcon(QMessageBox.Information if not errs
-                    else QMessageBox.Warning)
-        box.setText("Inference complete." if total else
-                    "Inference complete — nothing detected.")
-        box.setInformativeText("\n".join(lines))
-        box.setStandardButtons(QMessageBox.Ok)
-        box.exec_()
+        dlg = MADRunSummaryTable(
+            self, "Inference complete",
+            "Inference complete." if total else
+            "Inference complete — nothing detected.",
+            lines, results)
+        dlg.exec_()
 
     def _show_settings_dialog(self):
         """File > Settings."""
@@ -10073,55 +10214,28 @@ class MADMainWindow(QMainWindow):
                 f"\nInference ran on {len(ok)} file(s) — "
                 f"{total} pending mask(s) added for review.")
             if errs:
-                lines.append(f"{len(errs)} file(s) failed — see Session Logs.")
-            for r in ok[:10]:
                 lines.append(
-                    f"   • {os.path.basename(str(r.get('wav_path')))}: "
-                    f"{int(r.get('n_blobs') or 0)} pending")
-            # The dialog elides the per-file list; the clipboard copy keeps
-            # all of it, since that is the version worth pasting into notes.
-            full_lines = list(lines)
-            for r in ok[10:]:
-                full_lines.append(
-                    f"   • {os.path.basename(str(r.get('wav_path')))}: "
-                    f"{int(r.get('n_blobs') or 0)} pending")
-            if len(ok) > 10:
-                lines.append(f"   … +{len(ok) - 10} more")
+                    f"{len(errs)} file(s) FAILED and hold no detections — "
+                    "listed below and marked ✖ in the Audio list.")
 
         headline = ("Training complete!" if not results
                     else "Training and Inference complete!")
-        # With no inference there is no elided list; the two are the same.
-        try:
-            full_lines
-        except NameError:
-            full_lines = list(lines)
         if not lines:
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("Run complete")
-        box.setIcon(QMessageBox.Information)
-        box.setText("Training complete!" if not results
-                    else "Training and Inference complete!")
-        box.setInformativeText("\n".join(lines))
-        box.setStandardButtons(QMessageBox.Ok)
-        btn_copy = box.addButton("Copy to Clipboard", QMessageBox.ActionRole)
-        btn_copy.setToolTip(
-            "Copy this summary to the clipboard, with every file listed "
-            "rather than the shortened list shown here.")
 
-        def _copy():
-            QApplication.clipboard().setText(
-                headline + chr(10) + chr(10) + chr(10).join(full_lines))
-            btn_copy.setText("Copied")
+        def _full_text():
+            out = [headline, ""] + list(lines) + [""]
+            for r in results:
+                nm = os.path.basename(str(r.get('wav_path') or ''))
+                out.append(
+                    f"   ✖ {nm}: FAILED — {r['error']}" if r.get('error')
+                    else f"   • {nm}: {int(r.get('n_blobs') or 0)} pending")
+            return chr(10).join(out)
 
-        # ActionRole would close the dialog on click; keep it open so the
-        # summary is still readable after copying.
-        try:
-            btn_copy.clicked.disconnect()
-        except TypeError:
-            pass
-        btn_copy.clicked.connect(_copy)
-        box.exec_()
+        # Every file listed and scrollable, rather than ten of them in a
+        # string that elides the rest — including the failures.
+        MADRunSummaryTable(self, "Run complete", headline, lines,
+                           results, copy_text_fn=_full_text).exec_()
         # One run's numbers must never be reported against the next.
         self._last_infer_results = []
 
@@ -10538,6 +10652,19 @@ class MADMainWindow(QMainWindow):
         item.setData(_ROLE_FILE_LABEL, base)
         item.setData(_ROLE_FILE_COUNTS, counts)
         item.setData(Qt.ForegroundRole, None)  # delegate owns the colors
+        # A recording the last run could not analyze. Kept per-run rather than
+        # inferred from disk, because a failed file leaves nothing behind to
+        # infer it from — that absence is exactly the problem.
+        err = (getattr(self, '_file_errors', None) or {}).get(base)
+        item.setData(_ROLE_FILE_ERROR, err)
+        if err:
+            item.setToolTip(
+                f"Inference FAILED on this recording:\n{err}\n\n"
+                "Nothing was written for it, so it holds no detections — "
+                "this is not the same as 'analyzed and found nothing'. "
+                "Re-run inference; completed files are skipped "
+                "automatically.")
+            return
         run = getattr(self, '_file_run_info', {}).get(base)
         if counts is not None and not any(counts) and run:
             item.setToolTip(
@@ -16150,6 +16277,22 @@ class MADMainWindow(QMainWindow):
         def on_finished(results):
             self._infer_worker = None
             self._last_infer_results = list(results or [])
+            # Remember which recordings failed, so the Audio list can say so.
+            # Only the files THIS run touched are updated: a re-run of the
+            # failures must clear their marks without disturbing files it did
+            # not look at.
+            errs_by_name = getattr(self, '_file_errors', None)
+            if errs_by_name is None:
+                errs_by_name = self._file_errors = {}
+            for r in results or []:
+                wp = r.get('wav_path')
+                if not wp:
+                    continue
+                base = os.path.basename(str(wp))
+                if r.get('error'):
+                    errs_by_name[base] = str(r['error'])
+                else:
+                    errs_by_name.pop(base, None)
             self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")
