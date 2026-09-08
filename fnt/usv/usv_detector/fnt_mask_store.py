@@ -332,7 +332,11 @@ def migrate_to_mad_suffix(wav_path: str) -> Optional[str]:
 
 @_reporting_write
 def set_grid_attrs(h5_path: str, **params) -> None:
-    """Record spectrogram-grid params at the file root (idempotent)."""
+    """Record spectrogram-grid params at the file root (idempotent).
+
+    Callers already holding the file open should use :func:`_apply_grid_attrs`
+    instead — on a network share a redundant open costs more than the write.
+    """
     _require_h5()
     with h5py.File(h5_path, "a") as f:
         for k in _GRID_KEYS:
@@ -595,6 +599,82 @@ def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
                               else v.item() if hasattr(v, "item") else v)
             out[key] = rec
     return out
+
+
+def read_pred_masks(h5_path: str, blob_ids) -> Dict[str, Dict]:
+    """Read just the named prediction crops, in one file open.
+
+    The scoped counterpart to :func:`read_all_pred_masks`. Reviewing changes
+    one detection at a time, and reading every crop to capture one of them
+    costs the whole file: 1,239 crops measured 1.55 s on a network share, per
+    keystroke, for a snapshot that only ever needed a single entry back.
+
+    Missing ids are skipped rather than raising — a crop can legitimately be
+    gone already (a prediction deleted earlier in the same operation).
+    """
+    _require_h5()
+    out: Dict[str, Dict] = {}
+    want = [str(b) for b in blob_ids]
+    if not want or not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        grp = f.get(PRED_GROUP)
+        if grp is None:
+            return out
+        for key in want:
+            ds = grp.get(key)
+            if ds is None:
+                continue
+            rec = {
+                "mask": ds[()].astype(bool),
+                "f_off": int(ds.attrs.get("f_off", 0)),
+                "t_off": int(ds.attrs.get("t_off", 0)),
+            }
+            for k in PRED_ATTRS:
+                if k in ds.attrs:
+                    v = ds.attrs[k]
+                    rec[k] = (v.decode() if isinstance(v, bytes)
+                              else v.item() if hasattr(v, "item") else v)
+            out[key] = rec
+    return out
+
+
+@_reporting_write
+def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
+    """Add or replace the given prediction crops, leaving the rest alone.
+
+    :func:`write_pred_masks` deletes the whole group and rewrites it, so
+    changing one detection rewrites every one in the file — 0.96 s over a
+    network share for 1,239 crops, and 0.55 s on a local SSD, which is why the
+    cost is the *scope* of the write rather than the medium it lands on. This
+    touches only the datasets named, so one edit costs one edit.
+
+    Use :func:`write_pred_masks` when genuinely replacing the whole set (a
+    fresh inference pass over the file); use this for everything incremental.
+    """
+    _require_h5()
+    if not crops:
+        return
+    os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
+    with h5py.File(h5_path, "a") as f:
+        grp = f.require_group(PRED_GROUP)
+        for c in crops:
+            key = str(c["blob_id"])
+            if key in grp:
+                del grp[key]
+            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
+            ds = grp.create_dataset(key, data=m, compression="gzip",
+                                    compression_opts=4)
+            ds.attrs["f_off"] = int(c.get("f_off", 0))
+            ds.attrs["t_off"] = int(c.get("t_off", 0))
+            for k in PRED_ATTRS:
+                v = c.get(k)
+                if v is None or v == "":
+                    continue
+                ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+        # Kept in step so file lists can still show the count without reading
+        # a single crop.
+        f.attrs["n_pred_blobs"] = int(len(grp))
 
 
 def list_pred_ids(h5_path: str) -> List[str]:
@@ -860,6 +940,105 @@ def td_save_example(h5_path: str, spec_patch: np.ndarray,
     return example_id
 
 
+@_reporting_write
+def td_commit_example(h5_path: str, spec_patch: np.ndarray,
+                      mask_patch: np.ndarray, meta: Dict,
+                      example_id: Optional[str] = None,
+                      grid: Optional[Dict] = None,
+                      replace_blob_id=None) -> Dict:
+    """Everything one accept has to write, in a single file open.
+
+    Confirming a call used to cost four separate opens — list the ids for the
+    undo snapshot, scan the metadata for stale copies of the same detection,
+    stamp the grid attributes, then save the example. Each open of an HDF5 file
+    on a network share measured ~9 ms, so 36 ms of a 60 ms accept was spent
+    opening and closing the same file four times. Reviewing is a
+    keystroke-per-call activity; that is exactly where fixed overhead is felt.
+
+    Doing the work under one handle also makes the write atomic in the way that
+    matters: a stale duplicate cannot survive because the process died between
+    the scan that found it and the save that replaced it.
+
+    ``grid`` carries the same params :func:`set_grid_attrs` takes, applied only
+    when the file does not already agree with them — an accept on a file
+    already stamped skips the attribute writes entirely.
+
+    ``replace_blob_id`` drops any other *label* example recorded for that
+    detection, which is what keeps re-accepting from stacking copies.
+
+    Returns ``{'id', 'ids_before', 'dropped'}``: the id written, the example ids
+    that existed beforehand (what the undo snapshot needs) and the stale ids
+    removed.
+    """
+    _require_h5()
+    import uuid
+    if example_id is None:
+        stem = Path(str(meta.get("source_wav", "ex"))).stem
+        example_id = f"{stem}_{uuid.uuid4().hex[:10]}"
+
+    spec = np.asarray(spec_patch)
+    if spec.dtype != np.uint8:
+        spec = (np.clip(spec, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    mask = (np.asarray(mask_patch) > 0).astype(np.uint8)
+    meta = dict(meta)
+    meta["id"] = example_id
+
+    os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
+    dropped: List[str] = []
+    with h5py.File(h5_path, "a") as f:
+        if grid:
+            _apply_grid_attrs(f, grid)
+        ex = f.require_group("examples")
+        ids_before = list(ex.keys())
+
+        if replace_blob_id is not None:
+            want = str(replace_blob_id)
+            for key in ids_before:
+                if key == example_id:
+                    continue
+                try:
+                    m = json.loads(ex[key].attrs.get("meta_json", "{}"))
+                except Exception:
+                    continue
+                if (m.get("blob_id") is not None
+                        and str(m["blob_id"]) == want
+                        and example_kind(m) == "label"):
+                    del ex[key]
+                    dropped.append(key)
+
+        if example_id in ex:
+            del ex[example_id]
+        g = ex.create_group(example_id)
+        g.create_dataset("spec", data=spec, compression="gzip",
+                         compression_opts=4)
+        g.create_dataset("mask", data=mask, compression="gzip",
+                         compression_opts=4)
+        g.attrs["meta_json"] = json.dumps(meta)
+    return {"id": example_id, "ids_before": ids_before, "dropped": dropped}
+
+
+def _apply_grid_attrs(f, params: Dict) -> None:
+    """Grid + provenance attrs on an already-open file.
+
+    Split out of :func:`set_grid_attrs` so callers that already hold the file
+    open do not have to reopen it purely to stamp attributes. The values that
+    are written once (``created``, ``source_wav``) stay write-once here too.
+    """
+    for k in _GRID_KEYS:
+        if k in params and params[k] is not None:
+            f.attrs[k] = int(params[k])
+    f.attrs["schema_version"] = SCHEMA_VERSION
+    f.attrs["format"] = FORMAT_NAME
+    f.attrs["format_version"] = FORMAT_VERSION
+    if "created" not in f.attrs:
+        f.attrs["created"] = datetime.now().isoformat(timespec="seconds")
+    f.attrs["fnt_version"] = _fnt_version()
+    wav = params.get("source_wav")
+    if wav and "source_wav" not in f.attrs:
+        f.attrs["source_wav"] = str(wav)
+    f.attrs["updated"] = datetime.now().isoformat(timespec="seconds")
+
+
 def td_iter_examples(h5_path: str) -> Iterator[Dict]:
     """Yield ``{meta, spec(float[0,1]), mask(float{0,1})}`` per example."""
     _require_h5()
@@ -1051,14 +1230,25 @@ def td_list_ids(h5_path: str) -> List[str]:
 
 
 @_reporting_write
-def td_delete(h5_path: str, example_id: str) -> None:
+def td_delete(h5_path: str, example_id: str) -> bool:
+    """Remove one example. Returns whether it was actually there.
+
+    Absent ids are not an error — an example can legitimately be gone already
+    (deleted earlier in the same operation, or by another pass). But "gone
+    already" is not "deleted now", and a caller counting its own calls rather
+    than this result reports work it did not do: the confirmed-mask gallery
+    logged three deletions for three clicks on one tile, when only the first
+    removed anything.
+    """
     _require_h5()
     if not os.path.isfile(h5_path):
-        return
+        return False
     with h5py.File(h5_path, "a") as f:
         ex = f.get("examples")
         if ex is not None and example_id in ex:
             del ex[example_id]
+            return True
+    return False
 
 
 @_reporting_write

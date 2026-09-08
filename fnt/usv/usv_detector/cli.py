@@ -64,6 +64,79 @@ def _expand_inputs(inputs: List[str], recursive: bool = True) -> List[str]:
     return out
 
 
+def _add_sampling_args(p: argparse.ArgumentParser) -> None:
+    """Sampling flags, identical in meaning to the GUI's import dialog.
+
+    Analyzing a whole 24/7 multi-microphone set is not a thing anyone can
+    afford: 33,996 ten-minute recordings at roughly 3x realtime is weeks of
+    GPU. A subset that tiles every trial, microphone and time of day is an
+    overnight run, and it is what the GUI offers on import — so the CLI has to
+    offer it too, or a headless run silently analyzes something different from
+    what the user set up interactively.
+    """
+    g = p.add_argument_group('sampling')
+    g.add_argument('--sample-per-folder', type=int, default=0, metavar='N',
+                   help="Analyze only N recordings from each folder, chosen to "
+                        "span the whole series. With --sample-channel-mode "
+                        "spread (the default) N is the folder's total budget, "
+                        "split across its microphones — not N per microphone.")
+    g.add_argument('--sample-total', type=int, default=0, metavar='N',
+                   help="Analyze N recordings across the whole input, "
+                        "apportioned by folder size.")
+    g.add_argument('--sample-spacing', default='stride',
+                   choices=['stride', 'random'],
+                   help="'stride' spreads picks evenly over each group "
+                        "(default, reproducible without a seed); 'random' "
+                        "draws uniformly.")
+    g.add_argument('--sample-seed', type=int, default=12345,
+                   help="Seed for --sample-spacing random (default 12345).")
+    g.add_argument('--sample-channel-mode', default='spread',
+                   choices=['spread', 'only', 'pool'],
+                   help="'spread' splits each folder's budget across its "
+                        "microphones; 'only' keeps just --sample-channels; "
+                        "'pool' ignores channels (right for single-mic sets, "
+                        "wrong for multi-mic ones).")
+    g.add_argument('--sample-channels', nargs='+', default=(), metavar='CH',
+                   help="Channels to keep with --sample-channel-mode only, "
+                        "e.g. ch1 ch3.")
+
+
+def _apply_sampling(wavs, args) -> list:
+    """Narrow ``wavs`` per the --sample-* flags, reporting what was drawn.
+
+    Printed rather than silent because the count is the whole point: a run that
+    was meant to sample 20 per folder and actually took 33,996 files is a
+    three-week mistake that should be visible in the first line of the log.
+    """
+    per_folder = getattr(args, 'sample_per_folder', 0) or 0
+    total = getattr(args, 'sample_total', 0) or 0
+    if per_folder and total:
+        raise SystemExit(
+            "Use --sample-per-folder or --sample-total, not both.")
+    if not per_folder and not total:
+        return wavs
+
+    from .mad_sampling import SampleSpec, sample_paths
+    spec = SampleSpec(
+        per='folder' if per_folder else 'total',
+        n=per_folder or total,
+        spacing=args.sample_spacing,
+        seed=(args.sample_seed if args.sample_spacing == 'random' else None),
+        channel_mode=args.sample_channel_mode,
+        channels=tuple(args.sample_channels or ()))
+    res = sample_paths(wavs, spec)
+    print(f"Sampling {len(res)} of {len(wavs)} file(s) — {spec.describe()}",
+          flush=True)
+    for row in res.rows:
+        if row['picked']:
+            label = os.path.basename(row['folder']) or row['folder']
+            if row['channel']:
+                label += f" {row['channel']}"
+            print(f"    {label}: {row['picked']} of {row['available']}",
+                  flush=True)
+    return list(res.paths)
+
+
 # ----------------------------------------------------------------------
 # analyze
 # ----------------------------------------------------------------------
@@ -72,9 +145,10 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     wavs = _expand_inputs(args.input)
     if not wavs:
-        print("No .wav files found in the given input(s).", file=sys.stderr)
+        print("No .wav files found in the given input(s).", file=sys.stderr, flush=True)
         return 2
-    print(f"Analyzing {len(wavs)} file(s) with {os.path.basename(args.model)}")
+    wavs = _apply_sampling(wavs, args)
+    print(f"Analyzing {len(wavs)} file(s) with {os.path.basename(args.model)}", flush=True)
 
     cfg = MADInferenceConfig(
         model_path=args.model,
@@ -117,10 +191,10 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         todo, done = partition_done(wavs, settings, manifest_done)
         if done:
             print(f"  Resuming — {len(done)} file(s) already analyzed with "
-                  f"these settings, {len(todo)} to go.")
+                  f"these settings, {len(todo)} to go.", flush=True)
         wavs = todo
         if not wavs:
-            print("Nothing to do — every file is already analyzed.")
+            print("Nothing to do — every file is already analyzed.", flush=True)
             return 0
 
     run_dir = args.run_dir or new_run_dir(log_root)
@@ -135,7 +209,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         'preserve_labels': cfg.preserve_labels,
     })
     manifest.write_info(info)
-    print(f"  Run log: {run_dir}")
+    print(f"  Run log: {run_dir}", flush=True)
 
     def _on_done(summary: dict):
         # Flushed per file, so a killed run resumes from exactly here.
@@ -145,7 +219,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             pass
         wav = os.path.basename(summary.get('wav_path', '?'))
         if 'error' in summary:
-            print(f"  [FAIL] {wav}: {summary['error']}", file=sys.stderr)
+            print(f"  [FAIL] {wav}: {summary['error']}", file=sys.stderr, flush=True)
             return
         t = summary.get('timing', {})
         print(f"  [ok]   {wav}: {summary.get('n_blobs', 0)} detection(s) "
@@ -160,7 +234,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     n_fail = sum(1 for r in results if 'error' in r)
     total = sum(r.get('n_blobs', 0) for r in results if 'error' not in r)
     print(f"Done — {total} detection(s) across {len(results) - n_fail} file(s)"
-          + (f", {n_fail} failed" if n_fail else ""))
+          + (f", {n_fail} failed" if n_fail else ""), flush=True)
     return 1 if n_fail else 0
 
 
@@ -172,9 +246,26 @@ def _cmd_train(args: argparse.Namespace) -> int:
     from .mad_training import UNetTrainingConfig, train_unet
 
     if not os.path.isdir(args.project):
-        print(f"Project directory not found: {args.project}", file=sys.stderr)
+        print(f"Project directory not found: {args.project}", file=sys.stderr, flush=True)
         return 2
     proj = MADProjectConfig.load(args.project)
+
+    # Rebuild the consolidated store from the per-recording .mad sidecars
+    # first. Without this the run trains on whatever the last GUI session left
+    # behind — a headless run could silently fit a stale label set and still
+    # report success, which is exactly what an unattended workflow cannot
+    # tolerate.
+    from .mad_examples import rebuild_training_store
+    wavs = [e.path for e in proj.audio_entries()]
+    try:
+        n_lab = rebuild_training_store(proj.training_data_dir, wavs)
+    except Exception as e:
+        print(f"Could not rebuild the training store: {e}", file=sys.stderr, flush=True)
+        print("Training was NOT started — the model must never be fitted on a "
+              "partial label set.", file=sys.stderr, flush=True)
+        return 1
+    print(f"Training store rebuilt from {len(wavs)} recording(s): "
+          f"{n_lab} example(s)", flush=True)
 
     cfg = UNetTrainingConfig(
         project_dir=proj.project_dir,
@@ -185,7 +276,11 @@ def _cmd_train(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         learning_rate=args.lr,
         device=args.device,
-        val_fraction=proj.val_fraction,
+        val_fraction=(args.val_fraction if args.val_fraction is not None
+                      else proj.val_fraction),
+        loss=args.loss,
+        split_mode=args.split_mode,
+        early_stop_patience=args.patience,
         nperseg=proj.nperseg, noverlap=proj.noverlap, nfft=proj.nfft,
         db_min=proj.db_min, db_max=proj.db_max,
         training_data_dir=proj.training_data_dir,
@@ -197,21 +292,21 @@ def _cmd_train(args: argparse.Namespace) -> int:
             fn = info.get('file_name')
             if fn:
                 print(f"  collecting tiles: {info.get('file_i', '?')}/"
-                      f"{info.get('file_n', '?')} {fn}      ", end='\r')
+                      f"{info.get('file_n', '?')} {fn}      ", end='\r', flush=True)
             return
         if status == 'device':
-            print(f"  device: {info.get('device', '?')}")
+            print(f"  device: {info.get('device', '?')}", flush=True)
         elif status == 'split':
             level = info.get('split_level', '?')
             print(f"  split: {level}-level — "
                   f"{info.get('n_val_groups', 0)}/{info.get('n_groups', 0)} "
                   f"group(s) held out, "
                   f"{info.get('n_train_tiles', 0)} train / "
-                  f"{info.get('n_val_tiles', 0)} val tiles")
+                  f"{info.get('n_val_tiles', 0)} val tiles", flush=True)
             if not info.get('val_held_out', True):
                 print("  WARNING: validation is not held out at the recording "
                       "level — val scores will flatter the model.",
-                      file=sys.stderr)
+                      file=sys.stderr, flush=True)
         elif status == 'training':
             tl, vl = info.get('train_loss'), info.get('val_loss')
             msg = f"  epoch {epoch}/{n_epochs}"
@@ -219,21 +314,21 @@ def _cmd_train(args: argparse.Namespace) -> int:
                 msg += f"  train_loss={tl:.4f}"
             if vl is not None:
                 msg += f"  val_loss={vl:.4f}"
-            print(msg)
+            print(msg, flush=True)
         elif status == 'early_stop':
-            print(f"  early stop at epoch {epoch}")
+            print(f"  early stop at epoch {epoch}", flush=True)
         # 'batch' / 'epoch_preview' / 'done' are intentionally not printed.
 
     print(f"Training {cfg.model_arch} on project '{proj.project_name}' "
-          f"({cfg.n_epochs} epochs, encoder={cfg.encoder_name})")
+          f"({cfg.n_epochs} epochs, encoder={cfg.encoder_name})", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:
-        print(f"Training failed: {e}", file=sys.stderr)
+        print(f"Training failed: {e}", file=sys.stderr, flush=True)
         return 1
     dice = summary.get('best_val_dice')
     dice_str = f"{dice:.3f}" if isinstance(dice, (int, float)) else "?"
-    print(f"Done — model saved to {summary.get('model_path', '?')}")
+    print(f"Done — model saved to {summary.get('model_path', '?')}", flush=True)
     print(f"  val_dice={dice_str} "
           f"({summary.get('split_level', '?')}-level split"
           f"{'' if summary.get('val_held_out') else ', NOT held out'})")
@@ -249,25 +344,25 @@ def _cmd_embeddings(args: argparse.Namespace) -> int:
 
     wavs = _expand_inputs(args.input)
     if not wavs:
-        print("No .wav files found in the given input(s).", file=sys.stderr)
+        print("No .wav files found in the given input(s).", file=sys.stderr, flush=True)
         return 2
     cfg = MADInferenceConfig(model_path=args.model, device=args.device)
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
-    print(f"Embedding detections from {len(wavs)} file(s) on {device}")
+    print(f"Embedding detections from {len(wavs)} file(s) on {device}", flush=True)
 
     results = []
     for wav in wavs:
         try:
             res = embed_file(wav, cfg, model=model, ckpt=ckpt, device=device)
         except RuntimeError as e:
-            print(f"  [skip] {os.path.basename(wav)}: {e}", file=sys.stderr)
+            print(f"  [skip] {os.path.basename(wav)}: {e}", file=sys.stderr, flush=True)
             continue
         n = res['embeddings'].shape[0]
-        print(f"  [ok]   {os.path.basename(wav)}: {n} detection(s)")
+        print(f"  [ok]   {os.path.basename(wav)}: {n} detection(s)", flush=True)
         results.append(res)
 
     n = write_embeddings_npz(args.out, results)
-    print(f"Wrote {n} embedding(s) → {args.out}")
+    print(f"Wrote {n} embedding(s) → {args.out}", flush=True)
     return 0
 
 
@@ -292,7 +387,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Drop blobs smaller than this (default 8).")
     pa.add_argument('--device', default='auto',
                     choices=['auto', 'cuda', 'mps', 'cpu'])
-    pa.add_argument('--merge-consecutive', action='store_true',
+    pa.add_argument('--no-merge-consecutive', dest='merge_consecutive',
+                    action='store_false',
+                    help="Do NOT merge fragments of one call. Merging is on "
+                         "by default, matching the GUI.")
+    pa.add_argument('--merge-consecutive', dest='merge_consecutive',
+                    action='store_true', default=True,
                     help="Merge consecutive blobs of one call into a single "
                          "detection.")
     pa.add_argument('--merge-gap-s', type=float, default=0.01,
@@ -320,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Example store, to preserve confirmed labels.")
     pa.add_argument('--no-preserve-labels', action='store_true',
                     help="Re-detect from scratch (ignore prior decisions).")
+    _add_sampling_args(pa)
     pa.set_defaults(func=_cmd_analyze)
 
     # train
@@ -333,6 +434,16 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument('--lr', type=float, default=1e-3)
     pt.add_argument('--device', default='auto',
                     choices=['auto', 'cuda', 'mps', 'cpu'])
+    pt.add_argument('--loss', default='bce_dice',
+                    choices=['bce_dice', 'focal_tversky'],
+                    help="Segmentation loss (default: bce_dice).")
+    pt.add_argument('--split-mode', default='call',
+                    choices=['call', 'auto', 'file'],
+                    help="How validation is held out (default: call).")
+    pt.add_argument('--val-fraction', type=float, default=None,
+                    help="Override the project's validation fraction.")
+    pt.add_argument('--patience', type=int, default=10,
+                    help="Early-stop patience in epochs (0 disables).")
     pt.add_argument('--run-name', default='',
                     help="Name for the model run dir (default: timestamped).")
     pt.set_defaults(func=_cmd_train)

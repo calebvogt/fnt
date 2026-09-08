@@ -79,6 +79,15 @@ class MADInferenceConfig:
     merge_consecutive: bool = True
     merge_max_gap_s: float = 0.01
     merge_require_freq_overlap: bool = True
+    # How far apart in frequency two SEQUENTIAL fragments may sit and still be
+    # one call. 8 bins is ~2 kHz at the usual grid — wide enough for a steep
+    # sweep's pieces (a real one missed by 4), far narrower than the tens of
+    # kHz separating a fundamental from its harmonic.
+    merge_max_freq_gap_bins: int = 8
+    # Above this fractional time overlap two blobs are treated as sounding
+    # together, so they must genuinely share a band to merge. A harmonic
+    # overlaps its fundamental almost completely; sweep fragments barely.
+    merge_concurrent_fraction: float = 0.5
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -399,9 +408,62 @@ def _freq_overlap(a: Dict, b: Dict) -> bool:
             and b['f_low'] < a['f_high_exclusive'])
 
 
+def _freq_gap_bins(a: Dict, b: Dict) -> int:
+    """Frequency bins separating two blobs; 0 when their bands overlap."""
+    if _freq_overlap(a, b):
+        return 0
+    return max(a['f_low'] - b['f_high_exclusive'],
+               b['f_low'] - a['f_high_exclusive'])
+
+
+def _time_overlap_fraction(a: Dict, b: Dict) -> float:
+    """Shared duration as a fraction of the shorter blob's duration.
+
+    ~1.0 means the two sound at the same moment; ~0 means one follows the
+    other. This is what actually separates a harmonic from a fragment.
+    """
+    lo = max(a['t_start'], b['t_start'])
+    hi = min(a['t_end_exclusive'], b['t_end_exclusive'])
+    shared = max(0, hi - lo)
+    shorter = min(a['t_end_exclusive'] - a['t_start'],
+                  b['t_end_exclusive'] - b['t_start'])
+    return (shared / shorter) if shorter > 0 else 0.0
+
+
+def _bands_joinable(a: Dict, b: Dict, max_freq_gap_bins: int,
+                    concurrent_fraction: float) -> bool:
+    """May these two blobs be parts of one call, judged on frequency?
+
+    Overlapping bands always qualify. The interesting case is bands that do
+    not overlap, where the old rule refused outright — and that refusal broke
+    on the shape it most needed to handle.
+
+    A steep FM sweep fragments into pieces that are *sequential in time and
+    adjacent in frequency*: a real 81.5 → 63.5 kHz downsweep came back as
+    73.2–81.5 kHz followed by 63.5–72.3 kHz, missing overlap by 0.98 kHz —
+    four bins — and so was reported as two calls with half the duration and
+    half the bandwidth each. Requiring overlap assumes fragments of one call
+    share a frequency band, which is true of flat calls and false of sweeps.
+
+    The guard is still needed: it exists so a fundamental is not merged with
+    its harmonic. But that case is distinguished by *time*, not frequency — a
+    harmonic sounds simultaneously with its fundamental, while sweep fragments
+    follow one another. So concurrency decides which rule applies: blobs that
+    overlap in time by more than ``concurrent_fraction`` must genuinely share a
+    band, and sequential ones may join across a small frequency gap.
+    """
+    if _freq_overlap(a, b):
+        return True
+    if _time_overlap_fraction(a, b) >= concurrent_fraction:
+        return False            # sounding together — a harmonic, not a fragment
+    return _freq_gap_bins(a, b) <= max_freq_gap_bins
+
+
 def merge_consecutive_blobs(
     blobs: List[Dict], max_gap_frames: int,
     require_freq_overlap: bool = True,
+    max_freq_gap_bins: int = 8,
+    concurrent_fraction: float = 0.5,
 ) -> List[Dict]:
     """Merge runs of consecutive blobs into single detections.
 
@@ -410,8 +472,12 @@ def merge_consecutive_blobs(
     Two blobs join when the time gap between the running cluster's offset and
     the next blob's onset is ``<= max_gap_frames`` (a negative gap means they
     already overlap in time) and — when ``require_freq_overlap`` — their
-    frequency bands overlap, so calls stacked in time but separated in
-    frequency (e.g. a harmonic vs. its fundamental) are left distinct.
+    frequency bands are compatible per :func:`_bands_joinable`: overlapping,
+    or merely adjacent (within ``max_freq_gap_bins``) when the two are
+    sequential rather than concurrent. That keeps a harmonic distinct from its
+    fundamental, which is what the gating is for, while still stitching the
+    fragments of a steep frequency sweep, whose pieces land in adjacent bands
+    and never overlap at all.
 
     Inspired by BirdNET's ``--merge_consecutive``. Blobs must carry the
     ``'mask'`` bbox crop (as :func:`extract_blobs` produces with
@@ -455,7 +521,8 @@ def merge_consecutive_blobs(
         gap = b['t_start'] - cur_end
         joins = gap <= max_gap_frames and (
             not require_freq_overlap
-            or any(_freq_overlap(b, g) for g in group))
+            or any(_bands_joinable(b, g, max_freq_gap_bins,
+                                   concurrent_fraction) for g in group))
         if joins:
             group.append(b)
             cur_end = max(cur_end, b['t_end_exclusive'])
@@ -1179,7 +1246,9 @@ def run_inference_on_file(
         max_gap_frames = int(round(cfg.merge_max_gap_s / dt)) if dt else 0
         blobs = merge_consecutive_blobs(
             blobs, max_gap_frames=max_gap_frames,
-            require_freq_overlap=cfg.merge_require_freq_overlap)
+            require_freq_overlap=cfg.merge_require_freq_overlap,
+            max_freq_gap_bins=cfg.merge_max_freq_gap_bins,
+            concurrent_fraction=cfg.merge_concurrent_fraction)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
     # Re-key the fresh predictions so their int blob_ids never collide with the

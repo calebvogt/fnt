@@ -1578,6 +1578,16 @@ def main():
     except Exception as _e:
         print(f"[FNT] faulthandler not installed: {_e}")
 
+    # And the far more common failure: a Python exception inside a Qt slot,
+    # which PyQt turns into qFatal() -> abort(). faulthandler cannot see that
+    # one (see install_slot_excepthook), so the launcher would otherwise die
+    # with exit 0xC0000409 and no traceback anywhere.
+    try:
+        from fnt.tool_host import install_slot_excepthook
+        install_slot_excepthook()
+    except Exception as _e:
+        print(f"[FNT] slot excepthook not installed: {_e}")
+
     # Windows taskbar icon fix - must be set before creating QApplication
     try:
         import ctypes

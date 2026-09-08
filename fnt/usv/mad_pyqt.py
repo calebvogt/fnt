@@ -41,8 +41,9 @@ from PyQt5.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate,
-    QStyleOptionViewItem, QTextEdit, QTreeWidget,
+    QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate, QToolButton,
+    QStyleOptionViewItem, QTextEdit, QTreeWidget, QButtonGroup,
+    QProgressDialog, QAbstractItemView, QListView, QTreeView,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 # scipy.signal is imported lazily where used (spectrogram compute / resample)
@@ -50,10 +51,16 @@ from PyQt5.QtWidgets import (
 
 from fnt.usv.audio_widgets import (
     MAX_EXPORT_MP, SpectrogramWidget, WaveformOverviewWidget)
+from scipy.ndimage import binary_erosion as ndi_binary_erosion
+from fnt.usv.usv_detector.fnt_mask_store import REJECTED_KINDS
 from fnt.usv.usv_detector.mad_labels import pred_csv_sibling_path
 from fnt.usv.usv_detector.mad_project import (
     MADProjectConfig, PROJECT_INFO_FILENAME, create_mad_project,
 )
+from fnt.usv.usv_detector.mad_sampling import (
+    SampleSpec, parse_channel, sample_paths)
+from fnt.usv.usv_detector.mad_sampling import draw as _sampling_draw
+from fnt.usv.usv_detector.mad_sampling import prepare as _sampling_prepare
 from fnt.usv.usv_detector.spectrogram import load_audio
 
 try:
@@ -3671,6 +3678,599 @@ class _ClipPlayer(QWidget):
         pnt.drawLine(QPointF(px, oy), QPointF(px, oy + h))
 
 
+class MADConfirmedGalleryDialog(QDialog):
+    """Contact sheet of every confirmed call in the project — the training set.
+
+    Checking what a model is actually being taught used to mean opening each
+    recording, sorting the detections list by status, and stepping through the
+    confirmed calls one at a time. On a project spanning fourteen trials that is
+    the slowest possible way to notice that six masks are clipped and one is a
+    noise transient somebody accepted by mistake.
+
+    This is cheap for the same reason the Detection Gallery is: a confirmed call
+    is stored as its own spec patch + mask in the recording's ``.mad``, so a
+    page is a few hundred KB of reads and no audio is decoded. Measured on a
+    159-recording project: 0.6 s to index every example from metadata alone,
+    0.5 s to load a 48-tile page of crops.
+
+    Two things it does that the Detection Gallery does not:
+
+    * **Shows the spectrogram under the mask.** Marks alone tell you a call was
+      found; the point here is judging whether the outline is *right*, which
+      needs the signal it was drawn on.
+    * **Double-click opens the call in its recording**, so a mask that needs
+      work is two clicks from being fixed rather than a hunt.
+
+    Reads run on the UI thread, in chunks. HDF5 must not be touched from two
+    threads while the main window has its own store open, and the work is small
+    enough that yielding between chunks keeps the window live without one.
+    """
+
+    TILE = 158
+    #: Height of the image inside a tile; the rest is the caption.
+    IMG_H = 104
+    #: Big enough that a normal project is one scroll rather than four
+    #: pages. Not unlimited: these are real widgets, and a grid of several
+    #: thousand is slow to lay out no matter how cheap each one is.
+    PER_PAGE = 600
+    #: Examples indexed per event-loop turn while building. Metadata-only reads,
+    #: so this is generous; the ceiling is one recording's store per turn.
+    INDEX_CHUNK = 12
+
+    def __init__(self, main):
+        super().__init__(main)
+        self._main = main
+        self.setModal(False)
+        self.setWindowTitle("Confirmed Masks")
+        self.resize(1080, 760)
+        self._index: List[dict] = []
+        self._page = 0
+        self._pending_files: List[str] = []
+        self._building = False
+        self._selected: set = set()      # example ids ticked for deletion
+        self._last_click = None          # anchor for shift-range selection
+        self._buttons: List[tuple] = []
+
+        v = QVBoxLayout(self)
+        head = QLabel(
+            "Every confirmed call and rejection in the project — this is "
+            "what training sees. <b>Double-click</b> a tile to open that "
+            "call in its recording, or <b>click</b> to tick it for "
+            "deletion (Shift-click for a run).")
+        head.setWordWrap(True)
+        head.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        v.addWidget(head)
+
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Show:"))
+        self.cmb_kind = QComboBox()
+        self.cmb_kind.addItems(["Confirmed calls + rejections",
+                                "Confirmed calls only",
+                                "Rejections only"])
+        bar.addWidget(self.cmb_kind)
+        bar.addWidget(QLabel("Sort:"))
+        self.cmb_sort = QComboBox()
+        self.cmb_sort.addItems(["Recording, then time",
+                                "Smallest mask first",
+                                "Largest mask first",
+                                "Most recently edited"])
+        self.cmb_sort.setToolTip(
+            "Smallest mask first surfaces clipped and half-drawn outlines, "
+            "which are the ones most worth a second look.")
+        bar.addWidget(self.cmb_sort)
+        bar.addStretch(1)
+        self.btn_rects = QPushButton("Select solid rectangles")
+        self.btn_rects.setToolTip(
+            "Tick every mask that is a perfect filled box. A drawn or "
+            "predicted outline is never rectangular, so these are masks MAD "
+            "fabricated when it could not recover a detection's real pixels — "
+            "they teach the model to paint blocks.")
+        self.btn_rects.clicked.connect(self._select_rectangles)
+        bar.addWidget(self.btn_rects)
+        self.btn_clear_sel = QPushButton("Clear selection")
+        self.btn_clear_sel.clicked.connect(self._clear_selection)
+        bar.addWidget(self.btn_clear_sel)
+        self.btn_reload = QPushButton("Reload")
+        bar.addWidget(self.btn_reload)
+        v.addLayout(bar)
+
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev page")
+        self.btn_prev.clicked.connect(lambda: self._go(-1))
+        nav.addWidget(self.btn_prev)
+        self.lbl_page = QLabel("")
+        self.lbl_page.setAlignment(Qt.AlignCenter)
+        nav.addWidget(self.lbl_page, 1)
+        self.btn_next = QPushButton("Next page ▶")
+        self.btn_next.clicked.connect(lambda: self._go(1))
+        nav.addWidget(self.btn_next)
+        v.addLayout(nav)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self._grid_host = QWidget()
+        self.scroll.setWidget(self._grid_host)
+        v.addWidget(self.scroll, 1)
+
+        row = QHBoxLayout()
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("font-size: 10px; color: #bbbbbb;")
+        row.addWidget(self.lbl_status, 1)
+        self.btn_delete = QPushButton("Delete selected…")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.setToolTip(
+            "Remove the ticked masks from their recordings' .mad sidecars, so "
+            "they stop training the model. The .wav files are untouched.")
+        self.btn_delete.setStyleSheet(
+            MADMainWindow._review_btn_qss("#a03535", "#c04545"))
+        self.btn_delete.clicked.connect(self._delete_selected)
+        row.addWidget(self.btn_delete)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+        self.btn_reload.clicked.connect(self.reload)
+        self.cmb_kind.currentIndexChanged.connect(lambda _i: self._resort())
+        self.cmb_sort.currentIndexChanged.connect(lambda _i: self._resort())
+        self.reload()
+
+    # -- indexing ------------------------------------------------------
+    def reload(self):
+        """Rebuild the index from every registered recording's store.
+
+        Metadata only — no pixels — so this stays cheap enough to redo whenever
+        the user wants the view refreshed after editing a mask.
+        """
+        self._all: List[dict] = []
+        self._page = 0
+        self._pending_files = list(self._main.audio_files)
+        self._building = True
+        self.btn_reload.setEnabled(False)
+        self._index_chunk()
+
+    def _index_chunk(self):
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            example_kind, masks_sibling_path, td_iter_meta)
+        batch = self._pending_files[:self.INDEX_CHUNK]
+        self._pending_files = self._pending_files[self.INDEX_CHUNK:]
+        for wav in batch:
+            h5 = masks_sibling_path(wav)
+            if not os.path.isfile(h5):
+                continue
+            try:
+                metas = list(td_iter_meta(h5))
+            except Exception:
+                continue
+            for meta in metas:
+                kind = example_kind(meta)
+                if kind not in ('label',) + REJECTED_KINDS:
+                    continue
+                self._all.append({
+                    'h5': h5, 'wav': wav, 'id': meta.get('id'),
+                    'kind': 'label' if kind == 'label' else 'rejected',
+                    'cls': meta.get('class') or '',
+                    't0': float(meta.get('t_start_s') or 0.0),
+                    't1': float(meta.get('t_stop_s') or 0.0),
+                    'created': str(meta.get('created') or ''),
+                    'meta': meta,
+                })
+        self.lbl_status.setText(
+            f"Indexing… {len(self._all)} example(s) so far")
+        if self._pending_files:
+            QTimer.singleShot(0, self._index_chunk)
+            return
+        self._building = False
+        self.btn_reload.setEnabled(True)
+        self._resort()
+
+    def _resort(self):
+        if self._building:
+            return
+        want = self.cmb_kind.currentIndex()
+        rows = [r for r in self._all
+                if want == 0
+                or (want == 1 and r['kind'] == 'label')
+                or (want == 2 and r['kind'] == 'rejected')]
+        mode = self.cmb_sort.currentIndex()
+        if mode == 0:
+            rows.sort(key=lambda r: (os.path.basename(r['wav']).lower(), r['t0']))
+        elif mode in (1, 2):
+            # Duration stands in for mask size before the pixels are loaded —
+            # a clipped outline is short, and this keeps sorting free.
+            rows.sort(key=lambda r: (r['t1'] - r['t0']), reverse=(mode == 2))
+        else:
+            rows.sort(key=lambda r: r['created'], reverse=True)
+        self._index = rows
+        self._page = 0
+        self._render()
+
+    # -- rendering -----------------------------------------------------
+    def _pages(self) -> int:
+        return max(1, (len(self._index) + self.PER_PAGE - 1) // self.PER_PAGE)
+
+    def _go(self, delta: int):
+        self._page = max(0, min(self._pages() - 1, self._page + delta))
+        self._render()
+
+    def _page_rows(self):
+        start = self._page * self.PER_PAGE
+        return self._index[start:start + self.PER_PAGE]
+
+    def _bbox(self, r, spec, mask):
+        """Display window for one example, in patch pixel coordinates.
+
+        The mask's own extent when it has one. Rejections are stored with a
+        blank mask — that is the point of a hard negative — so theirs comes from
+        the metadata box instead, which is the only record of what the user
+        actually pointed at.
+        """
+        h, w = spec.shape
+        ys, xs = np.nonzero(mask > 0)
+        if len(xs):
+            x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        else:
+            meta = r['meta']
+            t0p = float(meta.get('patch_t0_s') or 0.0)
+            t1p = float(meta.get('patch_t1_s') or 0.0)
+            span = max(1e-9, t1p - t0p)
+            x0 = int((r['t0'] - t0p) / span * w)
+            x1 = int((r['t1'] - t0p) / span * w)
+            sr = float(meta.get('sample_rate') or 0) or 1.0
+            bins = float(meta.get('f_bins') or h) or float(h)
+            f_off = int(meta.get('patch_f_off') or 0)
+            y0 = int(float(meta.get('f_low_hz') or 0) / (sr / 2) * bins) - f_off
+            y1 = int(float(meta.get('f_high_hz') or 0) / (sr / 2) * bins) - f_off
+        # A little air around the call, so a clipped outline is visible AS
+        # clipped rather than filling the tile edge to edge.
+        padx = max(4, int(0.25 * (x1 - x0 + 1)))
+        pady = max(4, int(0.35 * (y1 - y0 + 1)))
+        return (max(0, int(x0) - padx), min(w, int(x1) + padx + 1),
+                max(0, int(y0) - pady), min(h, int(y1) + pady + 1))
+
+    def _tile_pixmap(self, r) -> 'QPixmap':
+        """The call's spectrogram patch with its mask drawn over it.
+
+        Mask-only thumbnails answer "was something found here". This view has to
+        answer "is this outline correct", and that is not a question you can
+        answer without seeing the signal underneath it.
+
+        The stored patch is read here and dropped as soon as this returns. A
+        patch is ~1.4 MB and the rendered tile is ~70 KB, so keeping pixmaps
+        rather than arrays is what makes showing a whole project at once
+        affordable: a thousand confirmed calls is 70 MB of tiles against 1.4 GB
+        of patches.
+        """
+        from PyQt5.QtGui import QPixmap
+        from fnt.usv.usv_detector.fnt_mask_store import td_read_example
+        try:
+            ex = td_read_example(r['h5'], r['id'])
+        except Exception:
+            ex = None
+        if ex is None:
+            pm = QPixmap(self.TILE - 8, self.IMG_H)
+            pm.fill(QColor(35, 35, 35))
+            return pm
+        spec, mask = ex['spec'], ex['mask']
+        x0, x1, y0, y1 = self._bbox(r, spec, mask)
+        s = np.clip(spec[y0:y1, x0:x1], 0.0, 1.0)
+        m = mask[y0:y1, x0:x1] > 0
+        if s.size == 0:
+            s = np.zeros((1, 1), dtype=np.float32)
+            m = np.zeros((1, 1), dtype=bool)
+        h, w = s.shape
+        g = (s * 255).astype(np.uint8)
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., 0] = g
+        rgba[..., 1] = g
+        rgba[..., 2] = g
+        rgba[..., 3] = 255
+        # Green for a confirmed call, red for a rejection — the same colours the
+        # spectrogram uses, so the two views read the same way.
+        tint = (80, 220, 120) if r['kind'] == 'label' else (225, 90, 90)
+        if m.any():
+            edge = m & ~ndi_binary_erosion(m)
+            rgba[edge, 0], rgba[edge, 1], rgba[edge, 2] = tint
+            inner = m & ~edge
+            for c in range(3):
+                rgba[inner, c] = np.minimum(
+                    255, rgba[inner, c].astype(np.int32) // 2 + tint[c] // 2)
+        rgba = np.ascontiguousarray(np.flipud(rgba))   # frequency up the screen
+        img = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        return QPixmap.fromImage(img).scaled(
+            self.TILE - 8, self.IMG_H, Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation)
+
+    def _render(self):
+        """Lay the tiles out, then fill their images in over successive
+        event-loop turns.
+
+        Every tile costs an HDF5 read, and HDF5 has to stay on this thread while
+        the main window holds its own store open, so showing a whole project at
+        once has to be staged or the window locks up for as long as the reads
+        take. The buttons are created up front so the grid has its final shape
+        immediately — column count, scrollbar, counts — and only the images
+        arrive progressively.
+        """
+        self._render_token = getattr(self, '_render_token', 0) + 1
+        token = self._render_token
+        self._grid_host = QWidget()
+        from PyQt5.QtWidgets import QGridLayout
+        grid = QGridLayout(self._grid_host)
+        grid.setSpacing(6)
+        rows = self._page_rows()
+        start = self._page * self.PER_PAGE      # index offset for shift-range
+        cols = max(1, (self.scroll.viewport().width() - 24) // (self.TILE + 8))
+        buttons = []
+        for n, r in enumerate(rows):
+            btn = _DoubleClickTile()
+            btn.setFixedSize(self.TILE, self.TILE)
+            btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            btn.setIconSize(QSize(self.TILE - 8, self.IMG_H))
+            dur_ms = (r['t1'] - r['t0']) * 1000.0
+            # Trimmed to the part that differs: every recording in a trial
+            # shares a long prefix, and the tail identifies which one it is.
+            stem = os.path.splitext(os.path.basename(r['wav']))[0]
+            btn.setText(f"{stem[-13:]}\n{r['t0']:.1f}s · {dur_ms:.0f}ms")
+            colour = "#3fbf5f" if r['kind'] == 'label' else "#d64545"
+            btn.setStyleSheet(
+                f"QToolButton {{ border: 1px solid {colour}; border-radius: 4px;"
+                f" background: #232323; color: #cccccc; font-size: 8px;"
+                f" padding: 2px; }}"
+                f"QToolButton:hover {{ border-width: 2px; }}"
+                # Ticked-for-deletion has to be unmistakable at a glance across
+                # a screenful, so it changes the fill, not just the border.
+                f"QToolButton:checked {{ border: 3px solid #ff8c1a;"
+                f" background: #4a2a10; }}")
+            btn.setToolTip(
+                f"{os.path.basename(r['wav'])}\n"
+                f"{'confirmed call' if r['kind'] == 'label' else 'rejection'}"
+                f"{(' · ' + r['cls']) if r['cls'] else ''}\n"
+                f"{r['t0']:.3f}-{r['t1']:.3f} s  ({dur_ms:.0f} ms)"
+                + chr(10) + chr(10) +
+                "Double-click to open this call in its recording.")
+            btn.setCheckable(True)
+            btn.setChecked(r['id'] in self._selected)
+            btn.clicked.connect(
+                lambda _c=False, row=r, pos=start + n: self._tile_clicked(row, pos))
+            btn.doubleClicked.connect(
+                lambda _c=False, row=r: self._open_in_context(row))
+            grid.addWidget(btn, n // cols, n % cols)
+            buttons.append((btn, r))
+        grid.setRowStretch(grid.rowCount(), 1)
+        # setWidget takes ownership and destroys the previous widget, so the old
+        # host must NOT also be deleteLater()'d — that double-frees it.
+        self.scroll.setWidget(self._grid_host)
+        self._buttons = buttons
+
+        paged = len(self._index) > self.PER_PAGE
+        self.lbl_page.setText(
+            (f"{len(self._index)} shown · page {self._page + 1}/{self._pages()}"
+             if paged else f"{len(self._index)} shown")
+            if self._index else "Nothing confirmed in this project yet")
+        for b in (self.btn_prev, self.btn_next):
+            b.setVisible(paged)
+        self.btn_prev.setEnabled(self._page > 0)
+        self.btn_next.setEnabled(self._page < self._pages() - 1)
+        self._set_status()
+        self._fill_tiles(token, buttons, 0)
+
+    def _set_status(self, loading=None):
+        n_lab = sum(1 for r in self._index if r['kind'] == 'label')
+        n_rej = len(self._index) - n_lab
+        base = (f"{n_lab} confirmed call(s) · {n_rej} rejection(s) across "
+                f"{len({r['wav'] for r in self._index})} recording(s)")
+        if self._selected:
+            base += f"   ·   {len(self._selected)} selected"
+        self.lbl_status.setText(
+            f"{base}   ·   loading masks… {loading}" if loading else base)
+
+    def _fill_tiles(self, token, buttons, i, chunk: int = 8):
+        if token != getattr(self, '_render_token', 0):
+            return                      # a newer render replaced this one
+        try:
+            for btn, r in buttons[i:i + chunk]:
+                btn.setIcon(QIcon(self._tile_pixmap(r)))
+        except RuntimeError:
+            return                      # host widget was destroyed under us
+        i += chunk
+        if i < len(buttons):
+            self._set_status(f"{min(i, len(buttons))} of {len(buttons)}")
+            QTimer.singleShot(0, lambda: self._fill_tiles(token, buttons, i))
+        else:
+            self._set_status()
+
+    # -- selection -----------------------------------------------------
+    def _tile_clicked(self, row, pos: int):
+        """Toggle one tile, or extend from the last one with Shift.
+
+        Shift-range because the failures this view exists to catch arrive in
+        runs — a bad inference pass writes a dozen consecutive rectangles, and
+        clicking each of twelve is exactly the tedium the gallery replaced.
+        """
+        mods = QApplication.keyboardModifiers()
+        if mods & Qt.ShiftModifier and self._last_click is not None:
+            lo, hi = sorted((self._last_click, pos))
+            for r in self._index[lo:hi + 1]:
+                self._selected.add(r['id'])
+        else:
+            if row['id'] in self._selected:
+                self._selected.discard(row['id'])
+            else:
+                self._selected.add(row['id'])
+        self._last_click = pos
+        self._sync_selection()
+
+    def _sync_selection(self):
+        for btn, r in getattr(self, '_buttons', []):
+            try:
+                btn.setChecked(r['id'] in self._selected)
+            except RuntimeError:
+                return                  # widgets replaced by a newer render
+        n = len(self._selected)
+        self.btn_delete.setEnabled(bool(n))
+        self.btn_delete.setText(
+            f"Delete {n} selected mask(s)…" if n else "Delete selected…")
+        self._set_status()
+
+    def _clear_selection(self):
+        self._selected.clear()
+        self._last_click = None
+        self._sync_selection()
+
+    def _select_rectangles(self):
+        """Select every mask that is a solid filled rectangle.
+
+        A hand-drawn or model-predicted mask is never a perfect rectangle; a
+        fabricated one always is. MAD's view-inference path falls back to
+        ``np.ones(...)`` — a filled box — whenever it cannot recover a blob's
+        per-pixel probabilities, and nothing downstream marks that mask as
+        fabricated, so it trains the model to paint solid blocks. Finding them
+        by shape is the only reliable way to spot them after the fact.
+        """
+        from fnt.usv.usv_detector.fnt_mask_store import td_read_example
+        found = 0
+        for n, r in enumerate(self._index):
+            fill = r.get('fill')
+            if fill is None:
+                try:
+                    ex = td_read_example(r['h5'], r['id'])
+                except Exception:
+                    ex = None
+                fill = self._fill_ratio(ex['mask']) if ex is not None else 0.0
+                r['fill'] = fill
+            if fill >= 0.995:
+                self._selected.add(r['id'])
+                found += 1
+            if n % 25 == 0:
+                self._set_status(f"scanning shapes… {n} of {len(self._index)}")
+                QApplication.processEvents()
+        self._sync_selection()
+        if not found:
+            QMessageBox.information(
+                self, "Solid rectangles",
+                "No solid rectangular masks found — every mask in the project "
+                "has a real outline.")
+
+    @staticmethod
+    def _fill_ratio(mask) -> float:
+        """How much of a mask's bounding box the mask actually fills.
+
+        1.0 means a perfect filled rectangle. A blank mask (a hard negative)
+        returns 0.0 rather than dividing by zero — those are stored empty on
+        purpose and must never be flagged as fabricated.
+        """
+        m = mask > 0
+        if not m.any():
+            return 0.0
+        ys, xs = np.nonzero(m)
+        area = float((ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1))
+        return float(m.sum()) / area if area else 0.0
+
+    # -- deletion ------------------------------------------------------
+    def _delete_selected(self):
+        """Remove the selected examples from the recordings' stores.
+
+        This deletes the training example — the spec patch, the mask and its
+        metadata — from the ``.mad`` beside the recording. That is the source of
+        truth: the consolidated training store is rebuilt from the sidecars on
+        every run, so a deleted mask cannot come back and train the model.
+
+        The recording's audio is untouched, and so is every other mask on it.
+        """
+        rows = [r for r in self._index if r['id'] in self._selected]
+        if not rows:
+            return
+        n_lab = sum(1 for r in rows if r['kind'] == 'label')
+        n_rej = len(rows) - n_lab
+        wavs = {os.path.basename(r['wav']) for r in rows}
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete masks")
+        box.setText(f"Permanently delete {len(rows)} mask(s)?")
+        box.setInformativeText(
+            f"{n_lab} confirmed call(s) and {n_rej} rejection(s) across "
+            f"{len(wavs)} recording(s).\n\n"
+            "The mask, its spectrogram patch and its metadata are removed from "
+            "each recording's .mad sidecar. This cannot be undone.\n\n"
+            "The .wav files are untouched, and the detections themselves stay "
+            "in the file as unreviewed — deleting a mask un-decides the call "
+            "rather than hiding it.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec_() != QMessageBox.Yes:
+            return
+
+        from fnt.usv.usv_detector.fnt_mask_store import td_delete
+        deleted, absent, failed = 0, 0, []
+        for r in rows:
+            try:
+                # Count what the store actually removed, not how many times we
+                # asked. An id already gone is not a deletion, and reporting it
+                # as one is how three clicks on one tile read as three masks.
+                if td_delete(r['h5'], r['id']):
+                    deleted += 1
+                else:
+                    absent += 1
+            except Exception as e:
+                failed.append(f"{os.path.basename(r['wav'])}: {e}")
+        self._main._log(
+            f"Deleted {deleted} confirmed mask(s) from {len(wavs)} recording(s)"
+            + (f" ({absent} already gone)" if absent else ""))
+
+        # The open recording holds its own copy of these annotations in memory,
+        # so it has to be re-read or the deleted masks stay on screen and can be
+        # written back out by the next save.
+        #
+        # Wrapped because this gallery must reflect the deletion either way: the
+        # masks are already off disk by now, and a failure refreshing the main
+        # window used to abort this method before the tiles were rebuilt, which
+        # made a completed deletion look like nothing had happened.
+        try:
+            cur = None
+            if (self._main.audio_files
+                    and 0 <= self._main.current_file_idx
+                    < len(self._main.audio_files)):
+                cur = os.path.normcase(os.path.abspath(
+                    self._main.audio_files[self._main.current_file_idx]))
+            if cur and cur in {os.path.normcase(os.path.abspath(r['wav']))
+                               for r in rows}:
+                self._main._load_current_file()
+            self._main._scan_all_file_counts()
+        except Exception as e:
+            self._main._log(f"Deleted, but refreshing the main window failed: {e}")
+
+        if failed:
+            QMessageBox.warning(
+                self, "Some masks could not be deleted",
+                f"{deleted} deleted, {len(failed)} failed.\n\n" + failed[0])
+        self._clear_selection()
+        self.reload()
+
+    # -- navigation ----------------------------------------------------
+    def _open_in_context(self, row):
+        """Show this call in its recording, centred and selected."""
+        self._main._focus_confirmed_call(row['wav'], row['id'],
+                                         (row['t0'] + row['t1']) / 2.0)
+
+
+class _DoubleClickTile(QToolButton):
+    """A tile that reports double-clicks and puts its caption under the image.
+
+    QToolButton rather than QPushButton for the caption: ToolButtonTextUnderIcon
+    is the only stock way to get the label below the icon instead of beside it,
+    where a filename is clipped down to nothing. The double-click signal is ours
+    because neither class has one, and plain ``clicked`` fires twice on a
+    double-click — which would open the recording, then open it again.
+    """
+
+    doubleClicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        event.accept()
+
+
 class MADClipDialog(QDialog):
     """Previews a rendered clip and offers to keep it. Closing discards it.
 
@@ -3870,6 +4470,368 @@ class MADSettingsDialog(QDialog):
     def _ok(self):
         self._apply()
         self.accept()
+
+
+class _SidecarScanWorker(QThread):
+    """Find which recordings have a label/detection sidecar beside them.
+
+    Directory listings only — no HDF5, deliberately. An earlier version of this
+    also read the stores here, which meant h5py running on this thread while
+    the main thread opened its own sidecars for the previewed recording. That
+    is a native-level crash waiting to happen (HDF5 over SMB, two threads), and
+    the speed never depended on it: of the 27 s a 6,252-file project spent on
+    project open, 14 s was directory probing and under 5 s was reading the
+    handful of stores that exist. Probing moves here; reading stays on the UI
+    thread, where the rest of MAD's HDF5 access already lives.
+
+    The probing is worth moving on its own account. ``masks_sibling_path`` and
+    ``pred_csv_sibling_path`` look like string manipulation but stat the
+    current name and then every legacy name, so a recording with no sidecar
+    costs five round trips just to confirm absence. One ``scandir`` per
+    directory answers the same question for every file in it.
+    """
+
+    done = pyqtSignal(list)
+
+    def __init__(self, paths, parent=None):
+        super().__init__(parent)
+        self._paths = list(paths)
+
+    def run(self):
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            LEGACY_MAD_SUFFIXES, MAD_SUFFIX)
+        from fnt.usv.usv_detector.mad_labels import (
+            ANNOT_SUFFIX, LEGACY_PRED_SUFFIX)
+
+        store_suffixes = tuple(s.lower() for s in
+                               (MAD_SUFFIX,) + tuple(LEGACY_MAD_SUFFIXES))
+        csv_suffixes = (ANNOT_SUFFIX.lower(), LEGACY_PRED_SUFFIX.lower())
+        listings: Dict[str, set] = {}
+        out = []
+        for fp in self._paths:
+            d = os.path.dirname(fp)
+            names = listings.get(d)
+            if names is None:
+                try:
+                    names = {e.name.lower() for e in os.scandir(d)}
+                except Exception:
+                    names = set()
+                listings[d] = names
+            stem = os.path.splitext(os.path.basename(fp))[0].lower()
+            has_store = any((stem + s) in names for s in store_suffixes)
+            if has_store or any((stem + s) in names for s in csv_suffixes):
+                # (path, has_store) — the flag saves the UI thread a second
+                # look when deciding whether a run stamp could exist.
+                out.append((fp, has_store))
+        self.done.emit(out)
+
+
+class _FolderScanWorker(QThread):
+    """Walk folder trees for .wav files off the UI thread.
+
+    A flat scan is instant and this would be pointless — but these trees are
+    not flat. Walking the 2021_8x8 USV set (33,996 files on a network share)
+    measured 11 s cold, which on the UI thread is 11 s of "(Not Responding)"
+    before the user sees a single thing.
+    """
+
+    done = pyqtSignal(list)
+    progress = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, folders, recursive: bool, parent=None):
+        super().__init__(parent)
+        self._folders = list(folders)
+        self._recursive = recursive
+
+    def run(self):
+        try:
+            out, seen = [], set()
+            for i, folder in enumerate(self._folders, 1):
+                self.progress.emit(
+                    f"Scanning {os.path.basename(folder) or folder}"
+                    f"{f'  ({i} of {len(self._folders)})' if len(self._folders) > 1 else ''}…")
+                for p in _list_wavs_in_folder(folder, self._recursive):
+                    # Selected folders can nest — picking a parent and one of
+                    # its children would otherwise offer the child's files
+                    # twice, and the import dialog would count them twice.
+                    key = os.path.normcase(os.path.abspath(p))
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(p)
+            self.done.emit(out)
+        except Exception as e:                       # unreachable share, ACLs
+            self.failed.emit(str(e))
+
+
+class MADImportSamplingDialog(QDialog):
+    """Choose how much of a folder tree to import: all of it, or a sample.
+
+    Importing everything is the wrong default for a 24/7 multi-microphone set.
+    Thirty-four thousand ten-minute recordings is more audio than anyone will
+    label and more than this hardware can run a detector over in a month, and
+    loading it into the Audio list makes the project itself slow to open —
+    every row costs a sidecar stat, and several minutes of them once the files
+    have been analyzed. What actually advances the work is a few files from
+    every trial, every microphone, and every part of every recording day.
+
+    The sampling itself lives in ``mad_sampling`` rather than here, so
+    ``mad analyze --sample-*`` draws exactly what this dialog would.
+    """
+
+    def __init__(self, folder: str, wavs, exclude=(), parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Recordings")
+        self.setMinimumWidth(620)
+        self._wavs = list(wavs)
+        self._exclude = list(exclude)
+        self._result = None
+
+        v = QVBoxLayout(self)
+        self._summary = QLabel()
+        self._summary.setWordWrap(True)
+        v.addWidget(self._summary)
+
+        # ---- how many ----------------------------------------------------
+        gb_n = QGroupBox("How many")
+        f_n = QVBoxLayout(gb_n)
+        self._grp_per = QButtonGroup(self)
+        self._rb_all = QRadioButton("Import all")
+        self._rb_folder = QRadioButton("Sample per folder:")
+        self._rb_total = QRadioButton("Sample across the whole tree:")
+        self._rb_folder.setChecked(True)
+        for i, rb in enumerate((self._rb_all, self._rb_folder, self._rb_total)):
+            self._grp_per.addButton(rb, i)
+        self._spin_folder = QSpinBox()
+        self._spin_folder.setRange(1, 100000)
+        self._spin_folder.setValue(20)
+        self._spin_folder.setSuffix(" per folder")
+        self._spin_total = QSpinBox()
+        self._spin_total.setRange(1, 1000000)
+        self._spin_total.setValue(200)
+        self._spin_total.setSuffix(" total")
+        f_n.addWidget(self._rb_all)
+        for rb, spin in ((self._rb_folder, self._spin_folder),
+                         (self._rb_total, self._spin_total)):
+            row = QHBoxLayout()
+            row.addWidget(rb)
+            row.addWidget(spin)
+            row.addStretch(1)
+            f_n.addLayout(row)
+        v.addWidget(gb_n)
+
+        # ---- how spaced --------------------------------------------------
+        gb_s = QGroupBox("How to choose them")
+        f_s = QVBoxLayout(gb_s)
+        self._rb_stride = QRadioButton(
+            "Evenly spaced — tiles the whole recording series")
+        self._rb_random = QRadioButton("Random")
+        self._rb_stride.setChecked(True)
+        self._spin_seed = QSpinBox()
+        self._spin_seed.setRange(0, 2 ** 31 - 1)
+        self._spin_seed.setValue(12345)
+        self._spin_seed.setPrefix("seed ")
+        self._spin_seed.setEnabled(False)
+        f_s.addWidget(self._rb_stride)
+        row = QHBoxLayout()
+        row.addWidget(self._rb_random)
+        row.addWidget(self._spin_seed)
+        row.addStretch(1)
+        f_s.addLayout(row)
+        v.addWidget(gb_s)
+
+        # ---- channels ----------------------------------------------------
+        self._channels = sorted(
+            {c for c in (parse_channel(p) for p in self._wavs) if c},
+            key=lambda c: int(c[2:]))
+        self._gb_ch = QGroupBox("Microphones")
+        f_c = QVBoxLayout(self._gb_ch)
+        self._rb_spread = QRadioButton("Spread the budget across all channels")
+        self._rb_one = QRadioButton("One channel only:")
+        self._rb_pool = QRadioButton("Ignore channels (treat as one pool)")
+        self._rb_spread.setChecked(True)
+        self._cmb_ch = QComboBox()
+        self._cmb_ch.addItems(self._channels)
+        self._cmb_ch.setEnabled(False)
+        f_c.addWidget(self._rb_spread)
+        row = QHBoxLayout()
+        row.addWidget(self._rb_one)
+        row.addWidget(self._cmb_ch)
+        row.addStretch(1)
+        f_c.addLayout(row)
+        f_c.addWidget(self._rb_pool)
+        self._rb_spread.setToolTip(
+            "Channels recorded at the same moment are the same event heard by "
+            "different microphones, so they are near-duplicates for training. "
+            "Spreading a per-folder budget across them keeps the signal-to-"
+            "noise variation without paying four times the labelling effort.")
+        v.addWidget(self._gb_ch)
+        self._gb_ch.setVisible(bool(self._channels))
+
+        self._chk_skip = QCheckBox("Skip recordings already in this project")
+        self._chk_skip.setChecked(True)
+        self._chk_skip.setToolTip(
+            "Applied before the draw, so asking again gives you that many NEW "
+            "recordings, evenly spread over what is left — rather than "
+            "re-offering the ones you have already reviewed.")
+        self._chk_skip.setEnabled(bool(self._exclude))
+        v.addWidget(self._chk_skip)
+
+        # ---- preview -----------------------------------------------------
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Folder", "Channel", "Available", "Import"])
+        self._tree.setRootIsDecorated(False)
+        self._tree.setAlternatingRowColors(True)
+        self._tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._tree.setMinimumHeight(200)
+        v.addWidget(self._tree, 1)
+
+        self._total_lbl = QLabel()
+        self._total_lbl.setStyleSheet("font-weight:600;")
+        v.addWidget(self._total_lbl)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Import")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+        self._ok = btns.button(QDialogButtonBox.Ok)
+
+        # Every one of these signals carries a payload (the new value, the new
+        # checked state), and connecting the slot directly would bind that
+        # payload to _refresh's `immediate` argument — so a spinbox change
+        # would pass immediate=20 and recompute synchronously, defeating the
+        # debounce on the exact control that needs it most. Swallow the
+        # argument explicitly.
+        for w in (self._rb_all, self._rb_folder, self._rb_total,
+                  self._rb_stride, self._rb_random,
+                  self._rb_spread, self._rb_one, self._rb_pool,
+                  self._chk_skip):
+            w.toggled.connect(lambda _checked: self._refresh())
+        for w in (self._spin_folder, self._spin_total, self._spin_seed):
+            w.valueChanged.connect(lambda _value: self._refresh())
+        self._cmb_ch.currentIndexChanged.connect(lambda _i: self._refresh())
+
+        n_ch = len(self._channels)
+        chan_note = (f" · {n_ch} channel(s) detected "
+                     f"({', '.join(self._channels)})" if n_ch else "")
+        n_folders = len({os.path.dirname(os.path.abspath(p))
+                         for p in self._wavs})
+        self._summary.setText(
+            f"<b>{os.path.basename(folder) or folder}</b> — "
+            f"{len(self._wavs):,} .wav file(s) in {n_folders} folder(s)"
+            f"{chan_note}.")
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.timeout.connect(self._recompute)
+        self._refresh(immediate=True)
+
+    # ------------------------------------------------------------------
+    def spec(self) -> "SampleSpec":
+        per = ("all" if self._rb_all.isChecked()
+               else "folder" if self._rb_folder.isChecked() else "total")
+        n = (self._spin_folder.value() if per == "folder"
+             else self._spin_total.value())
+        mode = ("spread" if self._rb_spread.isChecked()
+                else "only" if self._rb_one.isChecked() else "pool")
+        if not self._channels:
+            mode = "pool"
+        return SampleSpec(
+            per=per, n=n,
+            spacing="stride" if self._rb_stride.isChecked() else "random",
+            seed=(None if self._rb_stride.isChecked()
+                  else self._spin_seed.value()),
+            channel_mode=mode,
+            channels=((self._cmb_ch.currentText(),) if mode == "only" else ()))
+
+    def result_paths(self):
+        return list(self._result.paths) if self._result else []
+
+    def result_spec(self):
+        return self._result.spec if self._result else None
+
+    def _refresh(self, immediate: bool = False):
+        """Recompute the preview, coalescing bursts of input.
+
+        Typing "20" into the count box fires valueChanged twice, and holding an
+        arrow key fires it continuously. Each redraw re-samples the whole input
+        — a second per pass on a 34,000-file tree — so reacting to every one of
+        them made the box feel stuck. A short timer collapses a burst into the
+        single draw the user actually meant.
+        """
+        self._sync_enabled()
+        if immediate:
+            self._recompute()
+            return
+        self._debounce.start(180)
+
+    def _sync_enabled(self):
+        self._spin_folder.setEnabled(self._rb_folder.isChecked())
+        self._spin_total.setEnabled(self._rb_total.isChecked())
+        self._spin_seed.setEnabled(self._rb_random.isChecked())
+        self._cmb_ch.setEnabled(self._rb_one.isChecked())
+
+    def _prepared(self, spec):
+        """Grouped candidates for this channel policy, reused across draws.
+
+        Grouping is ~85% of the cost of a draw and depends only on the channel
+        policy and the exclusion set — never on how many files are wanted — so
+        it is computed once per policy and kept.
+        """
+        skip = tuple(self._exclude) if (self._chk_skip.isChecked()
+                                        and self._chk_skip.isEnabled()) else ()
+        key = (spec.channel_mode, spec.channels, bool(skip))
+        if key != getattr(self, '_prep_key', None):
+            self._prep_key = key
+            self._prep = _sampling_prepare(
+                self._wavs, spec.channel_mode, spec.channels, skip)
+        return self._prep
+
+    def _recompute(self):
+        spec = self.spec()
+        self._result = _sampling_draw(self._prepared(spec), spec)
+
+        self._tree.setUpdatesEnabled(False)
+        self._tree.clear()
+        by_folder = {}
+        for r in self._result.rows:
+            by_folder.setdefault(r["folder"], []).append(r)
+        for folder in sorted(by_folder):
+            rows = by_folder[folder]
+            avail = sum(r["available"] for r in rows)
+            take = sum(r["picked"] for r in rows)
+            top = QTreeWidgetItem(
+                [os.path.basename(folder) or folder, "",
+                 f"{avail:,}", f"{take:,}"])
+            # Channels only earn their own rows when there is more than one;
+            # a single-mic folder would otherwise show a redundant child.
+            chans = [r for r in rows if r["channel"]]
+            if len(chans) > 1:
+                for r in sorted(chans, key=lambda r: r["channel"]):
+                    top.addChild(QTreeWidgetItem(
+                        ["", r["channel"], f"{r['available']:,}",
+                         f"{r['picked']:,}"]))
+            self._tree.addTopLevelItem(top)
+        self._tree.setRootIsDecorated(True)
+        self._tree.setUpdatesEnabled(True)
+
+        n = len(self._result)
+        skipped = self._result.n_excluded
+        note = (f"  ({skipped:,} already in the project, skipped)"
+                if skipped else "")
+        hours = n * 10.0 / 60.0          # these sets are 10-minute recordings
+        self._total_lbl.setText(
+            f"Importing {n:,} of {len(self._wavs):,} recordings{note}"
+            f"   ·   roughly {hours:,.0f} h of audio")
+        self._ok.setEnabled(n > 0)
+
+    def accept(self):
+        # A pending debounce must land before the draw is taken, or Import uses
+        # the previous number.
+        if self._debounce.isActive():
+            self._debounce.stop()
+            self._recompute()
+        super().accept()
 
 
 class MADClipWorker(QThread):
@@ -4471,7 +5433,7 @@ class MADMainWindow(QMainWindow):
         self.spin_view_window.setRange(0.1, 300.0)
         self.spin_view_window.setValue(2.0)
         self.spin_view_window.setSuffix(" s")
-        self.spin_view_window.setFixedWidth(80)
+        self.spin_view_window.setFixedWidth(70)
         self.spin_view_window.setToolTip(
             "Time window duration (seconds). Zoom with ↑/↓ or by scrolling the "
             "mouse wheel over the spectrogram (centered on the cursor).")
@@ -4498,7 +5460,7 @@ class MADMainWindow(QMainWindow):
         self.spin_display_min_freq.setSingleStep(5000)
         self.spin_display_min_freq.setValue(0)
         self.spin_display_min_freq.setSuffix(" Hz")
-        self.spin_display_min_freq.setFixedWidth(90)
+        self.spin_display_min_freq.setFixedWidth(74)
         self.spin_display_min_freq.setToolTip(
             "Lowest frequency shown on the spectrogram (display only — does not "
             "change the audio, labels, or model).")
@@ -4512,7 +5474,7 @@ class MADMainWindow(QMainWindow):
         self.spin_display_max_freq.setSingleStep(5000)
         self.spin_display_max_freq.setValue(125000)
         self.spin_display_max_freq.setSuffix(" Hz")
-        self.spin_display_max_freq.setFixedWidth(90)
+        self.spin_display_max_freq.setFixedWidth(74)
         self.spin_display_max_freq.setToolTip(
             "Highest frequency shown on the spectrogram (display only). Set near "
             "the Nyquist limit (½ the sample rate) to see the full band.")
@@ -4524,7 +5486,11 @@ class MADMainWindow(QMainWindow):
         sep2.setStyleSheet("color: #3f3f3f;")
         controls_layout.addWidget(sep2)
 
-        controls_layout.addWidget(QLabel("Color Map:"))
+        # Short labels, with the shortcuts moved into the tooltips.
+        # "Color Map:", "Speed (+/-):" and "Play (Space)" spent 190 px of
+        # the bar restating what the tooltips already say, beside widgets
+        # whose own values ("Viridis", "1.0x") name what they are.
+        controls_layout.addWidget(QLabel("Colors:"))
         self.combo_colormap = QComboBox()
         # Display label -> internal colormap key (kept as userData so the LUT
         # lookups and saved values keep using the short keys).
@@ -4536,7 +5502,7 @@ class MADMainWindow(QMainWindow):
             ("Inferno", 'inferno'),
         ):
             self.combo_colormap.addItem(label, key)
-        self.combo_colormap.setFixedWidth(140)
+        self.combo_colormap.setFixedWidth(108)
         self.combo_colormap.setToolTip(
             "Spectrogram color palette (display only). 'Viridis/Magma/Inferno' "
             "are perceptually uniform; 'Grayscale Inverted' shows loud = dark.")
@@ -4551,25 +5517,28 @@ class MADMainWindow(QMainWindow):
         controls_layout.addWidget(sep3)
 
         # Playback — Play toggles to Stop while audio is playing.
-        self.btn_play = QPushButton("Play (Space)")
+        self.btn_play = QPushButton("Play")
+        # Fixed so the button does not resize when it says "Stop".
+        self.btn_play.setFixedWidth(52)
         self.btn_play.setToolTip("Play / stop the visible window (Space)")
         self.btn_play.clicked.connect(self._toggle_playback)
         controls_layout.addWidget(self.btn_play)
 
-        controls_layout.addWidget(QLabel("Speed (+/-):"))
+        controls_layout.addWidget(QLabel("Speed:"))
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
         self.slider_speed.setValue(len(self._speed_values) - 1)
         self.slider_speed.setFixedWidth(100)
         self.slider_speed.setToolTip(
-            "Playback speed multiplier. Lower values slow audio down so\n"
-            "ultrasonic frequencies shift into the audible range."
+            "Playback speed multiplier — + and - adjust it.\n"
+            "Lower values slow audio down so ultrasonic frequencies "
+            "shift into the audible range."
         )
         self.slider_speed.valueChanged.connect(self._on_speed_changed)
         controls_layout.addWidget(self.slider_speed)
 
         self.lbl_speed = QLabel("1.0x")
-        self.lbl_speed.setFixedWidth(40)
+        self.lbl_speed.setFixedWidth(36)
         controls_layout.addWidget(self.lbl_speed)
 
         if not HAS_SOUNDDEVICE:
@@ -4778,10 +5747,14 @@ class MADMainWindow(QMainWindow):
 
         self.btn_clear_files = QPushButton("Clear All")
         self.btn_clear_files.setToolTip(
-            "Empty the Audio list. Like Remove File(s), this only "
-            "unregisters the recordings — every .wav and its .mad sidecar "
-            "stay exactly where they are on disk, so nothing labelled is "
-            "lost and re-adding the folder brings it all back."
+            "Empty the Audio list — or just the recordings holding no calls "
+            "at all (never analyzed, or analyzed and nothing found). "
+            "Anything you confirmed or rejected is kept. The dialog "
+            "offers both.\n\n"
+            "Like Remove File(s), this only unregisters the recordings — "
+            "every .wav and its .mad sidecar stay exactly where they are on "
+            "disk, so nothing labelled is lost and re-adding the folder "
+            "brings it all back."
         )
         self.btn_clear_files.clicked.connect(self._clear_all_files)
         self.btn_clear_files.setEnabled(False)
@@ -5107,6 +6080,16 @@ class MADMainWindow(QMainWindow):
         self.lbl_split_preview.setStyleSheet(
             "color: #9fb8c8; font-size: 10px; padding: 2px 2px 4px 2px;")
         tvbox.addWidget(self.lbl_split_preview)
+
+        self.btn_inspect_confirmed = QPushButton("Inspect Confirmed Masks")
+        self.btn_inspect_confirmed.setToolTip(
+            "See every confirmed call and rejection in the project as a grid "
+            "of spectrogram crops with their masks drawn on — the training set "
+            "itself, rather than one recording at a time.\n\n"
+            "Double-click a tile to open that call in its recording. Sorting "
+            "by smallest mask first surfaces clipped outlines.")
+        self.btn_inspect_confirmed.clicked.connect(self._open_confirmed_gallery)
+        tvbox.addWidget(self.btn_inspect_confirmed)
 
         self._train_body = QWidget()
         tbody = QVBoxLayout(self._train_body)
@@ -6090,11 +7073,14 @@ class MADMainWindow(QMainWindow):
             "Detections for the current file. Green = confirmed, "
             "Yellow = prediction (pending review). Click to jump."
         )
-        cols = ["", "Time", "Class", "Dur", "kHz", "Px", "Score"]
+        cols = ["Status", "Time", "Class", "Dur", "kHz", "Px", "Score"]
         self.annotation_list.setHeaderLabels(cols)
         # Score is the model's per-detection confidence, which people reliably
         # confuse with the Dice reported during training. Say what each is.
         _hdr_tips = {
+            0: ("<b>Status</b> — your decision on this detection: ✓ confirmed, "
+                "✕ rejected, ○ still pending. Sort by it to group the "
+                "undecided ones together."),
             5: ("<b>Px</b> — pixels in this detection's mask. A useful sort "
                 "for finding slivers: a handful of pixels is usually noise "
                 "that squeaked past the minimum blob size."),
@@ -6118,6 +7104,12 @@ class MADMainWindow(QMainWindow):
         self.annotation_list.setRootIsDecorated(False)
         self.annotation_list.setAllColumnsShowFocus(True)
         self.annotation_list.setSortingEnabled(True)
+        # Time, not Status. Enabling sorting without saying which column means
+        # column 0, so the list opened grouped by decision — which scrambles
+        # the one ordering that matches what is on screen and what Next/Back
+        # step through. Reviewing runs along the recording, so the list should
+        # too.
+        self.annotation_list.sortByColumn(1, Qt.AscendingOrder)
         hdr = self.annotation_list.header()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         for c in range(1, len(cols)):
@@ -6348,7 +7340,7 @@ class MADMainWindow(QMainWindow):
                 'reviewed': self._reviewed_count,
                 'csv': None, 'crops': None,
                 'examples_h5': None, 'example_ids': set(),
-                'removed_examples': {}}
+                'removed_examples': {}, 'removed_crops': {}}
         if wav:
             from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
             h5 = masks_sibling_path(wav)
@@ -6359,22 +7351,52 @@ class MADMainWindow(QMainWindow):
                     snap['csv'] = (cp, read_blob_csv(cp))
             except Exception:
                 pass
-            try:
-                from fnt.usv.usv_detector.fnt_mask_store import td_list_ids
-                snap['examples_h5'] = h5
-                snap['example_ids'] = set(td_list_ids(h5))
-            except Exception:
-                pass
-            if crops:
-                try:
-                    from fnt.usv.usv_detector.fnt_mask_store import (
-                        read_all_pred_masks)
-                    snap['crops'] = (h5, read_all_pred_masks(h5))
-                except Exception:
-                    pass
+            # The id list is NOT read here. td_commit_example returns the
+            # ids that existed immediately before it wrote, captured inside
+            # the same file open — the same information without a second
+            # round trip, and with no window between reading and writing.
+            # None means "no example was committed", which is also the only
+            # case where nothing could have been minted.
+            snap['examples_h5'] = h5
+            snap['example_ids'] = None
+            # NOT read here. The crops an operation destroys are stashed by
+            # _remember_undo_crops as it destroys them, so a Delete reads one
+            # crop instead of every crop in the file. `crops` survives as the
+            # flag saying this operation can touch them at all.
+            snap['crops_h5'] = h5 if crops else None
         self._undo_stack.append(snap)
         if len(self._undo_stack) > 15:  # bound the history
             self._undo_stack.pop(0)
+
+    def _remember_undo_crops(self, blob_ids) -> None:
+        """Stash the named prediction crops into the active undo snapshot,
+        immediately before the caller deletes them.
+
+        The crop counterpart to :meth:`_remember_undo_example`, and lazy for
+        the same reason. Capturing up front meant reading every crop in the
+        file on each Delete — 1,239 of them measured 1.55 s on a network share,
+        for a snapshot that only ever needed the one being removed. Undo has to
+        restore exactly what an operation destroyed, and nothing more, so the
+        scope of the capture is the scope of the operation.
+        """
+        if getattr(self, '_in_undo', False) or not self._undo_stack:
+            return                      # never re-enter while undoing
+        snap = self._undo_stack[-1]
+        h5 = snap.get('examples_h5')
+        if not h5:
+            return
+        store = snap.get('removed_crops')
+        if store is None:
+            store = snap['removed_crops'] = {}
+        want = [str(b) for b in blob_ids
+                if b is not None and str(b) not in store]
+        if not want:
+            return
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import read_pred_masks
+            store.update(read_pred_masks(h5, want))
+        except Exception:
+            pass
 
     def _remember_undo_example(self, example_id) -> None:
         """Stash one training example's content into the active undo snapshot,
@@ -6448,7 +7470,13 @@ class MADMainWindow(QMainWindow):
             aid = a.get('id')
             if aid is not None and aid != prev.get('id'):
                 minted.add(str(aid))
-        added_since = now_ids - set(snap.get('example_ids') or ())
+        # A None baseline means no example was committed during the
+        # operation, so nothing was minted and the store diff has nothing to
+        # confirm. Treating it as an empty set would drop the second guard;
+        # treating it as "no minting" is what actually happened.
+        baseline = snap.get('example_ids')
+        added_since = (set() if baseline is None
+                       else now_ids - set(baseline))
         for ex_id in (minted & added_since):
             try:
                 td_delete(h5, ex_id)
@@ -6497,15 +7525,21 @@ class MADMainWindow(QMainWindow):
                 write_blob_csv(cp, rows)
             except Exception:
                 pass
-        # Restore the per-blob crops.
-        if snap.get('crops'):
-            h5, crops = snap['crops']
+        # Restore the per-blob crops this operation destroyed — only those.
+        # Rewriting the whole group to put one crop back cost as much as the
+        # original inference write; a scoped write costs one crop.
+        removed_crops = snap.get('removed_crops') or {}
+        h5_crops = snap.get('crops_h5')
+        if h5_crops and removed_crops:
             try:
-                from fnt.usv.usv_detector.fnt_mask_store import write_pred_masks
+                from fnt.usv.usv_detector.fnt_mask_store import (
+                    write_pred_mask_subset)
                 items = [{'blob_id': bid, 'mask': c['mask'],
-                          'f_off': c['f_off'], 't_off': c['t_off']}
-                         for bid, c in crops.items()]
-                write_pred_masks(h5, items)
+                          'f_off': c['f_off'], 't_off': c['t_off'],
+                          **{k: v for k, v in c.items()
+                             if k not in ('mask', 'f_off', 't_off')}}
+                         for bid, c in removed_crops.items()]
+                write_pred_mask_subset(h5_crops, items)
             except Exception:
                 pass
         # Reverse the training-example store: drop what this operation minted,
@@ -6635,6 +7669,120 @@ class MADMainWindow(QMainWindow):
         self._log(f"Cleared {removed} detection(s) [{', '.join(cats)}]")
         self.status_bar.showMessage(f"Cleared {removed} detection(s)")
 
+    def _touch_annotation_rows(self, ann_ids) -> bool:
+        """Restyle just the rows whose status changed. False = rebuild needed.
+
+        Accepting or rejecting alters one row — its icon, its class text and its
+        colour — but the list was rebuilt whole every time, constructing every
+        QTreeWidgetItem from scratch. That is 0.2 ms on an eight-detection file
+        and 72 ms on a 2,508-detection one, paid per keystroke, on exactly the
+        files where a reviewer holds the key down.
+
+        Only membership-preserving cases qualify. Under a Pending/Confirmed/
+        Rejected filter a decided row has to leave the list, and with the score
+        slider engaged the hidden tally shifts, so those still rebuild — the
+        fast path must never leave a row showing something that is no longer
+        true.
+        """
+        tree = getattr(self, 'annotation_list', None)
+        index = getattr(self, '_ann_row_index', None)
+        if tree is None or not index:
+            return False
+        combo = getattr(self, 'combo_det_filter', None)
+        if (combo.currentText() if combo else "All") != "All":
+            return False
+        if self._min_score() > 0.0:
+            return False
+
+        by_id = {}
+        for ann in self.spectrogram.annotations:
+            aid = ann.get('id')
+            if aid is not None:
+                by_id[str(aid)] = ann
+        _lpal = self._overlay_palette()
+        ncols = tree.columnCount()
+        try:
+            for raw in ann_ids:
+                if raw is None:
+                    continue
+                item = index.get(str(raw))
+                ann = by_id.get(str(raw))
+                if item is None or ann is None:
+                    return False        # row or call is gone — rebuild
+                st = ann.get('status')
+                is_pred = st == 'prediction'
+                is_rej = st == 'rejected'
+                item.setText(0, "○" if is_pred else ("✕" if is_rej else "●"))
+                item.setText(2, "Reject" if is_rej
+                             else ann.get('category', ''))
+                score = ann.get('score', 0)
+                item.setText(6, f"{score:.2f}" if is_pred and score else "")
+                item.setData(6, _SORT_ROLE, score if is_pred else -1.0)
+                kind = ('prediction' if is_pred
+                        else 'rejected' if is_rej else 'confirmed')
+                prev = item.data(0, Qt.UserRole) or ('', 0.0, '', '')
+                item.setData(0, Qt.UserRole,
+                             (prev[0], prev[1], ann.get('id', ''), kind))
+                color = QColor(*(_lpal['pending'] if is_pred
+                                 else _lpal['rejected'] if is_rej
+                                 else _lpal['confirmed']))
+                for c in range(ncols):
+                    item.setForeground(c, color)
+        except RuntimeError:
+            # The tree was rebuilt under us and the index points at deleted
+            # C++ objects. Falling back is always safe; guessing is not.
+            self._ann_row_index = {}
+            return False
+
+        self._refresh_annotation_counts()
+        # The same tail a full refresh runs — these are cheap (sub-millisecond
+        # at project scale) and skipping them would leave the review widgets,
+        # the Audio list badges and the overview ticks stale.
+        self._update_pred_review_widgets()
+        self._update_train_button_count()
+        self._update_file_list_counts()
+        self._update_overview_marks()
+        self._refresh_open_gallery()
+        return True
+
+    def _refresh_annotation_counts(self):
+        """Rewrite the 'N detection(s)' line from the annotations alone.
+
+        Counted rather than carried over from the last rebuild, so the fast
+        path and the full path can never disagree about what is in the list.
+        """
+        lbl = getattr(self, 'lbl_annotation_count', None)
+        if lbl is None:
+            return
+        n_pred = n_rej = n_conf = 0
+        for ann in self.spectrogram.annotations:
+            st = ann.get('status')
+            if st == 'prediction':
+                n_pred += 1
+            elif st == 'rejected':
+                n_rej += 1
+            else:
+                n_conf += 1
+        n_draw = 0
+        try:
+            n_draw = len(self.spectrogram.pending_components())
+        except Exception:
+            pass
+        parts = []
+        if n_conf:
+            parts.append(f"{n_conf} confirmed")
+        if n_pred:
+            parts.append(f"{n_pred} prediction(s)")
+        if n_rej:
+            parts.append(f"{n_rej} rejected")
+        if n_draw:
+            parts.append(f"{n_draw} drawing")
+        text = (f"{n_conf + n_pred + n_rej + n_draw} detection(s)"
+                + (f" ({', '.join(parts)})" if len(parts) > 1 else ""))
+        if getattr(self, '_n_score_hidden', 0):
+            text += f"  ·  {self._n_score_hidden} below min score"
+        lbl.setText(text)
+
     def _refresh_annotation_list(self):
         if not hasattr(self, 'annotation_list'):
             return
@@ -6685,6 +7833,10 @@ class MADMainWindow(QMainWindow):
                 entries.append(ann)
         self._n_score_hidden = n_score_hidden
         entries.sort(key=lambda a: a['t0'])
+        # id -> row, so a status change can restyle one row instead of
+        # rebuilding every one. Rebuilt here because these are the items that
+        # exist; a stale entry points at a deleted C++ object.
+        row_index: Dict[str, object] = {}
         n_confirmed, n_pred, n_rej = 0, 0, 0
         ncols = tree.columnCount()
         new_items = []
@@ -6724,6 +7876,7 @@ class MADMainWindow(QMainWindow):
             for c in range(ncols):
                 item.setForeground(c, color)
             new_items.append(item)
+            row_index[str(ann.get('id'))] = item
             if is_pred:
                 n_pred += 1
             elif is_rej:
@@ -6765,6 +7918,7 @@ class MADMainWindow(QMainWindow):
                     item.setForeground(c, color)
                 new_items.append(item)
                 n_draw += 1
+        self._ann_row_index = row_index
         if new_items:  # one batched insert is far faster than N addTopLevelItem
             tree.addTopLevelItems(new_items)
         tree.setSortingEnabled(True)
@@ -7165,6 +8319,88 @@ class MADMainWindow(QMainWindow):
         self._select_list_row_for_id(ann.get('id'))
         self._update_pred_review_widgets()
 
+    def _open_confirmed_gallery(self):
+        """Open (or raise) the project-wide confirmed-mask gallery."""
+        dlg = getattr(self, '_confirmed_gallery', None)
+        if dlg is not None and dlg.isVisible():
+            dlg.reload()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        if not self.audio_files:
+            QMessageBox.information(
+                self, "Confirmed Masks",
+                "No recordings in the Audio list yet.")
+            return
+        self._confirmed_gallery = MADConfirmedGalleryDialog(self)
+        self._confirmed_gallery.show()
+        self._log("Opened Confirmed Masks gallery")
+
+    def _focus_confirmed_call(self, wav_path: str, example_id, t_center: float):
+        """Show one confirmed call in its own recording, centred and selected.
+
+        Switching recordings is asynchronous now (the read and the STFT are on
+        workers), so the two halves have to be sequenced: the view can only be
+        centred once the recording it belongs to is actually on screen, or the
+        selection lands on whatever was there before.
+        """
+        if not wav_path or not os.path.isfile(wav_path):
+            QMessageBox.warning(
+                self, "Recording not found",
+                f"{os.path.basename(wav_path)} is not on disk.\n\n"
+                "The mask is safe in its sidecar — only the audio is missing.")
+            return
+        ap = os.path.abspath(wav_path)
+        idx = next((i for i, p in enumerate(self.audio_files)
+                    if os.path.normcase(os.path.abspath(p))
+                    == os.path.normcase(ap)), None)
+        if idx is None:
+            return
+        already = (self.current_file_idx == idx and self.audio_data is not None)
+        # setCurrentRow must be what triggers the load; assigning
+        # current_file_idx first makes _on_file_selected's "already on this
+        # row" guard fire and the recording never opens.
+        self.file_list.setCurrentRow(idx)
+        if already:
+            self._center_on_confirmed(example_id, t_center)
+            return
+        self.current_file_idx = idx
+        self._load_current_file(
+            then=lambda: self._center_on_confirmed(example_id, t_center))
+
+    def _center_on_confirmed(self, example_id, t_center: float):
+        """Centre the view on a time and select the call sitting there.
+
+        Matched by example id where the on-screen annotation carries one, and
+        by time otherwise: a confirmed call's id is the store's, and not every
+        annotation in view is guaranteed to have been minted from it.
+        """
+        sg = getattr(self, 'spectrogram', None)
+        if sg is None:
+            return
+        if sg.total_duration > 0:
+            window = max(1e-3, sg.view_end - sg.view_start)
+            sg.view_start = max(0.0, t_center - window / 2)
+            sg.view_end = min(sg.total_duration, sg.view_start + window)
+            self._invalidate_spec_cache()
+            self._sync_scrollbar_from_view()
+        dt = (sg.hop / float(self.sample_rate)) if self.sample_rate else 1.0
+        best, best_gap = None, None
+        for i, ann in enumerate(sg.annotations):
+            if example_id is not None and ann.get('id') == example_id:
+                best = i
+                break
+            mid = (ann.get('t0', 0) + ann.get('t1', 0)) / 2.0 * dt
+            gap = abs(mid - t_center)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = i, gap
+        if best is not None:
+            sg._selected_ann_idx = best
+            self._select_list_row_for_id(sg.annotations[best].get('id'))
+        sg.update()
+        self.raise_()
+        self.activateWindow()
+
     def _select_list_row_for_id(self, eid):
         """Highlight the detections-list row whose example/prediction id matches,
         so list selection follows Prev/Next prediction navigation."""
@@ -7417,7 +8653,10 @@ class MADMainWindow(QMainWindow):
         decided transition counts toward the 'all reviewed' tally/prompt."""
         if was_pending:
             self._reviewed_count += 1
-        self._refresh_annotation_list()
+        # One row changed status; only fall back to rebuilding all of them when
+        # the change could alter what the list contains.
+        if not self._touch_annotation_rows([decided_id]):
+            self._refresh_annotation_list()
         if self._auto_advance and was_pending:
             if not self._select_next_pending_after_id(decided_id):
                 self._reselect_by_id(decided_id)  # nothing left after — stay
@@ -7472,11 +8711,21 @@ class MADMainWindow(QMainWindow):
                             else "\n\nThis is the last file."))
         b_show = box.addButton(f"Show the {hidden} hidden",
                                QMessageBox.AcceptRole) if hidden else None
+        # Offered first and made the default because it is what a reviewer
+        # working through a batch run almost always wants: after inference most
+        # recordings hold nothing, and walking to the next one that does via
+        # plain "Next file" means pressing through the empties one at a time.
+        nxt_pending = self._next_file_with_pending()
+        b_pending = (box.addButton("Next file with pending detections",
+                                   QMessageBox.AcceptRole)
+                     if nxt_pending is not None else None)
         b_next = (box.addButton("Next file", QMessageBox.AcceptRole)
                   if has_next else None)
         b_stay = box.addButton("Stay", QMessageBox.RejectRole)
-        # Only default to advancing when there is genuinely nothing left here.
-        box.setDefaultButton(b_show if hidden else (b_next or b_stay))
+        # Hidden detections still win the default: they are on THIS file and
+        # skipping past them is a decision the user has not knowingly made.
+        box.setDefaultButton(
+            b_show if hidden else (b_pending or b_next or b_stay))
         box.exec_()
         clicked = box.clickedButton()
         if b_show is not None and clicked is b_show:
@@ -7485,8 +8734,53 @@ class MADMainWindow(QMainWindow):
                 f"Min score filter cleared — {hidden} pending detection(s) "
                 "back in the list")
             return
-        if b_next is not None and clicked is b_next:
+        if b_pending is not None and clicked is b_pending:
+            self._advance_to_next_pending_file()
+        elif b_next is not None and clicked is b_next:
             self._advance_to_next_review_file()
+
+    def _next_file_with_pending(self, after: Optional[int] = None):
+        """Index of the next recording that still has something to review.
+
+        Uses the per-file counts the Audio list already maintains, so finding
+        the next one costs nothing even across a few hundred recordings. A file
+        with no cache entry has never been analyzed and holds no predictions, so
+        it is skipped rather than opened to find out.
+
+        Searches forward only. Wrapping around would silently send a reviewer
+        back over files they had already passed, which is the opposite of what
+        "next" promises.
+        """
+        start = (self.current_file_idx if after is None else after) + 1
+        cache = getattr(self, '_file_count_cache', {})
+        for i in range(start, len(self.audio_files)):
+            counts = cache.get(os.path.basename(self.audio_files[i]))
+            if counts and counts[1] > 0:        # (accepted, pending, rejected)
+                return i
+        return None
+
+    def _advance_to_next_pending_file(self):
+        """Open the next recording that has pending detections, on its first.
+
+        The point of the button: after a batch run most recordings are silent,
+        and stepping through them one "Next file" at a time to find the few with
+        anything in them is the slowest part of reviewing a night's inference.
+        """
+        idx = self._next_file_with_pending()
+        if idx is None:
+            self.status_bar.showMessage(
+                "No further recordings with pending detections")
+            return
+        # The load is asynchronous, so the request to land on the first
+        # detection has to survive until the annotations actually exist —
+        # selecting here would act on the outgoing file's list.
+        self._select_first_pending_on_load = True
+        n_skipped = idx - self.current_file_idx - 1
+        self.file_list.setCurrentRow(idx)
+        name = os.path.basename(self.audio_files[idx])
+        self.status_bar.showMessage(
+            f"{name} — next with pending detections"
+            + (f" ({n_skipped} with none skipped)" if n_skipped > 0 else ""))
 
     def _advance_to_next_review_file(self):
         """Select the next file in the Audio list (loads it for review)."""
@@ -8171,6 +9465,9 @@ class MADMainWindow(QMainWindow):
         wav_name = os.path.basename(wav)
         n_added = 0
         n_pending = 0
+        # Detections whose real per-pixel mask could not be recovered.
+        # Counted, never squared off into a fabricated box.
+        n_unmasked = 0
         for r in rows:
             st = r.get('status')
             if st == 'deleted':
@@ -8202,15 +9499,14 @@ class MADMainWindow(QMainWindow):
                 f1 = f0 + blob_region.shape[0]
                 t1 = t0 + blob_region.shape[1]
             else:
-                # No crop (e.g. CSV-only legacy) — fall back to the box rect.
-                t_org = self._frame_time_origin_s()
-                t0 = int(round((r['start_s'] - t_org) / dt))
-                t1 = int(round((r['stop_s'] - t_org) / dt))
-                f0 = int(round(r['min_freq_hz'] / df))
-                f1 = int(round(r['max_freq_hz'] / df))
-                if t1 <= t0 or f1 <= f0:
-                    continue
-                blob_region = np.ones((f1 - f0, t1 - t0), dtype=bool)
+                # No crop and no overlapping mask to borrow (e.g. a CSV-only
+                # legacy file). There is no outline to draw, and inventing a
+                # filled box from the row's bounding box would put a mask on
+                # screen that no model or person ever produced — which is
+                # exactly how solid rectangles got into a real training set.
+                # Skip it and say so.
+                n_unmasked += 1
+                continue
             if not blob_region.any():
                 continue
             sg.annotations.append({
@@ -8237,12 +9533,26 @@ class MADMainWindow(QMainWindow):
             set_prob_blob_count(h5_path, n_pending)
         except Exception:
             pass
+        if n_unmasked:
+            # Said out loud, because the alternative used to be a silent
+            # fabricated rectangle. Re-running inference over the view
+            # regenerates the crops these detections were missing.
+            msg = (f"{n_unmasked} detection(s) had no recoverable mask "
+                   "and were skipped — re-run inference to regenerate them")
+            self.status_bar.showMessage(msg)
+            self._log(msg)
         sg._rebuild_confirmed_mask()
         sg.update()
         self._bump_review_token()
         self._pred_review_idx = 0 if n_pending > 0 else None
         self._refresh_annotation_list()
         self._update_pred_review_widgets()
+        # Arrived here from "Next file with pending detections": land on the
+        # first one rather than at the start of a ten-minute recording.
+        if getattr(self, '_select_first_pending_on_load', False):
+            self._select_first_pending_on_load = False
+            if n_pending > 0:
+                self._jump_to_pred(0)
         if n_pending:
             self._jump_to_pred(0)
         if n_added:
@@ -8335,6 +9645,10 @@ class MADMainWindow(QMainWindow):
             _set_combo_data(self.combo_train_device, cfg.get('device'))
             # Keep the encoder picker's enabled state in sync with HRNet.
             self._on_arch_changed()
+            # Named, because "why does it say 5000 epochs?" is otherwise
+            # unanswerable without going and reading the run directories.
+            self._log("Training settings prefilled from "
+                      f"{os.path.basename(os.path.dirname(path))}")
         except Exception as e:
             self._log(f"Could not apply latest training config: {e}")
 
@@ -8411,62 +9725,20 @@ class MADMainWindow(QMainWindow):
         """
         if self._project is None:
             return True
-        from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, td_iter_examples, td_count, td_save_example,
-        )
-        from fnt.usv.usv_detector.mad_examples import _store_path
-        td_dir = self._project.training_data_dir
-        os.makedirs(td_dir, exist_ok=True)
-        store = _store_path(td_dir)
-        tmp = store + ".rebuild.tmp"
-
-        def _drop_tmp():
-            try:
-                if os.path.isfile(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-
-        _drop_tmp()
-        n, failed = 0, []
+        from fnt.usv.usv_detector.mad_examples import rebuild_training_store
         try:
-            for fp in self._training_source_paths():
-                h5 = masks_sibling_path(fp)
-                try:
-                    if td_count(h5) == 0:
-                        continue
-                    examples = list(td_iter_examples(h5))
-                except Exception as e:
-                    failed.append(f"{os.path.basename(fp)}: {e}")
-                    continue
-                for ex in examples:
-                    meta = ex['meta']
-                    try:
-                        td_save_example(tmp, ex['spec'], ex['mask'], meta,
-                                        meta.get('id') or None)
-                        n += 1
-                    except Exception as e:
-                        failed.append(f"{os.path.basename(fp)}: {e}")
-            if failed:
-                raise RuntimeError(
-                    f"{len(failed)} label(s) could not be copied. "
-                    f"First error — {failed[0]}")
-            if n:
-                os.replace(tmp, store)      # atomic swap; old store until now
-            else:
-                _drop_tmp()                 # there really are no labels
-                if os.path.isfile(store):
-                    os.remove(store)
+            n = rebuild_training_store(self._project.training_data_dir,
+                                       self._training_source_paths())
         except Exception as e:
-            _drop_tmp()                     # keep the previous store as-is
             self._log(f"Training store rebuild FAILED — {e}")
             QMessageBox.critical(
                 self, "Could not rebuild training store",
-                f"The training store could not be rebuilt from the labels in "
-                f"the Audio list:\n\n{e}\n\nThe previous store was left "
-                f"untouched and training was NOT started, so the model is never "
-                f"fitted on a partial label set.\n\nIf the audio lives on a "
-                f"network drive, check it is still connected."
+                "The training store could not be rebuilt from the labels "
+                f"in the Audio list:\n\n{e}\n\n"
+                "The previous store was left untouched and training was "
+                "NOT started, so the model is never fitted on a partial "
+                "label set.\n\nIf the audio lives on a network drive, "
+                "check it is still connected."
             )
             return False
         self._log(f"Built training store from {n} label(s)")
@@ -10272,45 +11544,149 @@ class MADMainWindow(QMainWindow):
                     return d
         return os.path.expanduser("~")
 
+    def _pick_folders(self):
+        """Ask for one or more folders of .wav files.
+
+        Qt's ``getExistingDirectory`` — and the native Windows picker behind it —
+        can only ever return one directory, which means adding fourteen trial
+        folders is fourteen trips through the dialog. Building the dialog by hand
+        lets its inner views take an extended selection, so shift- and ctrl-click
+        work the way they do everywhere else.
+
+        The cost is the non-native dialog, which looks slightly different from the
+        Explorer picker. That is worth it here: pointing at the parent folder is
+        the only alternative, and it forces "all subfolders or nothing".
+        """
+        dlg = QFileDialog(self, "Add folder(s) of .wav files",
+                          self._default_browse_dir())
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        # The multi-select capability is not exposed on QFileDialog itself; it
+        # lives on the item views inside it, which is why this reaches in.
+        for name, cls in (('listView', QListView), ('treeView', QTreeView)):
+            view = dlg.findChild(cls, name)
+            if view is not None:
+                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if dlg.exec_() != QDialog.Accepted:
+            return []
+        # selectedFiles() includes the directory currently shown when nothing is
+        # highlighted, which is the behaviour we want for a plain single pick.
+        return [f for f in dlg.selectedFiles() if os.path.isdir(f)]
+
     def _menu_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Add folder of .wav files",
-            self._default_browse_dir()
-        )
-        if not folder:
+        folders = self._pick_folders()
+        if not folders:
             return
-        # Recording sets are nested (experiment / mic / day), so offer the whole
-        # tree — but only when there's actually something deeper to find, so the
-        # common flat-folder case stays a single click.
-        flat = _list_wavs_in_folder(folder)
-        deep = _list_wavs_in_folder(folder, recursive=True)
-        wavs = flat
-        if len(deep) > len(flat):
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Question)
-            box.setWindowTitle("Include subfolders?")
-            box.setText(
-                f"{os.path.basename(folder) or folder} contains "
-                f"{len(flat)} .wav file(s) directly, and {len(deep)} including "
-                "subfolders.")
-            box.setInformativeText("Which do you want to load?")
-            b_deep = box.addButton(f"All {len(deep)} (recursive)",
-                                   QMessageBox.AcceptRole)
-            box.addButton(f"Just these {len(flat)}", QMessageBox.AcceptRole)
-            box.addButton("Cancel", QMessageBox.RejectRole)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
-                return
-            wavs = deep if clicked is b_deep else flat
+        # Recording sets are nested (experiment / mic / day), so always walk
+        # the whole tree — the import dialog is where the user decides how much
+        # of it to actually take.
+        label = (os.path.basename(folders[0]) or folders[0] if len(folders) == 1
+                 else f"{len(folders)} folders")
+        self._scan_dlg = QProgressDialog(f"Scanning {label}…", "Cancel", 0, 0, self)
+        self._scan_dlg.setWindowTitle("Add Folder")
+        self._scan_dlg.setWindowModality(Qt.WindowModal)
+        self._scan_dlg.setMinimumDuration(400)   # stay out of the way when fast
+        self._scan_worker = _FolderScanWorker(folders, True, self)
+        self._scan_worker.done.connect(
+            lambda wavs, f=folders: self._on_folder_scanned(f, wavs))
+        self._scan_worker.progress.connect(self._on_folder_scan_progress)
+        self._scan_worker.failed.connect(self._on_folder_scan_failed)
+        # Let Qt reap the thread object once it has actually finished, rather
+        # than leaving one per Add Folder parented to the window for the life
+        # of the session — and never by dropping the reference while it runs,
+        # which is how a worker becomes a crash at exit.
+        self._scan_worker.finished.connect(self._scan_worker.deleteLater)
+        self._scan_dlg.canceled.connect(self._cancel_folder_scan)
+        self._scan_worker.start()
+
+    def _on_folder_scan_progress(self, msg: str):
+        dlg = getattr(self, '_scan_dlg', None)
+        if dlg is not None:
+            dlg.setLabelText(msg)
+
+    def _cancel_folder_scan(self):
+        """Abandon a scan's result. The walk itself is left to finish.
+
+        os.walk has no interruption point that doesn't risk leaving a half-read
+        directory handle on a network share, and it is bounded work — dropping
+        the signal connection costs a few seconds of background I/O and is
+        indistinguishable from a cancel to the user.
+        """
+        w = self._live_worker('_scan_worker')
+        if w is not None:
+            try:
+                w.done.disconnect()
+                w.failed.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        self._close_scan_dialog()
+
+    def _close_scan_dialog(self):
+        dlg = getattr(self, '_scan_dlg', None)
+        if dlg is not None:
+            dlg.close()
+        self._scan_dlg = None
+
+    def _on_folder_scan_failed(self, msg: str):
+        self._close_scan_dialog()
+        QMessageBox.critical(self, "Could not read folder", msg)
+
+    def _on_folder_scanned(self, folders, wavs):
+        self._close_scan_dialog()
+        folders = [folders] if isinstance(folders, str) else list(folders)
+        label = (os.path.basename(folders[0]) or folders[0]
+                 if len(folders) == 1 else f"{len(folders)} folders")
         if not wavs:
-            self.status_bar.showMessage(f"No .wav files found in {folder}")
+            self.status_bar.showMessage(f"No .wav files found in {label}")
+            return
+        dlg = MADImportSamplingDialog(label, wavs,
+                                      exclude=self.audio_files, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        chosen = dlg.result_paths()
+        if not chosen:
             return
         # Browsed in place for this session — files are never copied, and their
         # labels/predictions save next to the source audio.
-        added = self._append_audio_paths(wavs)
+        added = self._append_audio_paths(chosen)
+        spec = dlg.result_spec()
+        if spec is not None and spec.per != "all":
+            # Recorded so the draw can be reproduced or reported, and so a later
+            # pass can tell what the first one took.
+            self._record_sample_spec(folders, spec, added)
         self.status_bar.showMessage(
-            f"Loaded {added} wav(s) from {folder} — referenced in place")
+            f"Loaded {added} of {len(wavs)} wav(s) from {label} — "
+            f"{spec.describe() if spec else 'all'}")
+        self._log(
+            f"Imported {added} recording(s) from {label} "
+            f"({spec.describe() if spec else 'all'})")
+
+    def _record_sample_spec(self, folders, spec, n_added: int):
+        """Append the draw to the project so it is reproducible.
+
+        A sampled training set is a methods-section fact — "20 per trial, evenly
+        spaced, spread across four microphones" is the difference between a
+        result someone can repeat and one they cannot. Kept as a list because
+        the label / correct / retrain loop draws repeatedly, and each pass
+        excludes the last.
+        """
+        if self._project is None:
+            return
+        try:
+            import datetime
+            hist = list(getattr(self._project, 'sample_history', None) or [])
+            entry = dict(spec.to_dict())
+            entry.update({'roots': [os.path.abspath(f) for f in folders],
+                          'n_added': n_added,
+                          'at': datetime.datetime.now().isoformat(timespec='seconds')})
+            hist.append(entry)
+            self._project.sample_history = hist
+            self._project.save()
+        except Exception as e:
+            # Provenance is worth recording but never worth losing an import
+            # over — the files are already in the list by this point.
+            self._log(f"Could not record sampling spec: {e}")
 
     def _append_audio_paths(self, paths, persist_files: bool = True) -> int:
         """Add wav paths to the Audio list (in place — never copied into the
@@ -10319,9 +11695,32 @@ class MADMainWindow(QMainWindow):
         time it's opened; ``persist_files=False`` skips that, for paths opened
         transiently (e.g. jumping to a batch-run result). Returns the count
         added."""
-        existing = set(self.audio_files)
-        to_add = [p for p in paths
-                  if p and p not in existing and os.path.isfile(p)]
+        # Compare the way the project registry does — normcase(abspath) — not
+        # by raw string. The same recording reaches this method spelled two
+        # ways: Add Folder walks with pathlib and yields backslashes, while
+        # QFileDialog hands back forward slashes, and a reopened project
+        # supplies whatever abspath stored. A raw-string set treats those as
+        # different files and puts a duplicate row in the Audio list, even
+        # though the registry (which does normalize) correctly refuses to
+        # register it — so the duplicate appears now and silently vanishes on
+        # the next reopen. Storing abspath keeps the list and the registry
+        # spelling the same file the same way.
+        #
+        # Note this still cannot see through a mapped drive: Z:\... and
+        # \\server\share paths are the same file to os.path.samefile, not to
+        # normcase, and stat-ing every candidate to find out costs a network
+        # round trip per file on the 30k-file sets this has to stay usable on.
+        seen = {os.path.normcase(os.path.abspath(p)) for p in self.audio_files}
+        to_add = []
+        for p in paths:
+            if not p or not os.path.isfile(p):
+                continue
+            ap = os.path.abspath(p)
+            key = os.path.normcase(ap)
+            if key in seen:
+                continue
+            seen.add(key)
+            to_add.append(ap)
         if not to_add:
             return 0
         self.audio_files.extend(to_add)
@@ -10521,9 +11920,7 @@ class MADMainWindow(QMainWindow):
 
         self.audio_files = [e.path for e in entries]
         self.current_file_idx = 0
-        self._missing_audio = {
-            os.path.normcase(os.path.abspath(e.path))
-            for e in entries if not e.exists()}
+        self._missing_audio = self._missing_paths(entries)
         self._refresh_file_list()
         self.file_list.blockSignals(True)
         self.file_list.setCurrentRow(0 if self.audio_files else -1)
@@ -10748,6 +12145,20 @@ class MADMainWindow(QMainWindow):
             self, "Pack Project",
             f"Copied {packed} recording(s) into:\n{rdir}")
 
+    def _missing_paths(self, entries) -> set:
+        """Which registered recordings are not on disk, in as few round trips
+        as possible.
+
+        ``RegisteredFile.exists`` stats one file at a time, which is fine for a
+        dozen entries and 5 s of frozen window for six thousand on a network
+        share. _DirIndex answers the same question from one listing per
+        directory — three round trips for a project spanning three folders.
+        """
+        from fnt.usv.usv_detector.mad_registry import _DirIndex
+        index = _DirIndex()
+        return {os.path.normcase(os.path.abspath(e.path))
+                for e in entries if not index.exists(e.path)}
+
     def _sync_list_from_entries(self, entries):
         """Re-point the Audio list at ``entries`` after their paths changed
         (Locate Missing Recordings, Pack Project), keeping the previewed file
@@ -10756,9 +12167,7 @@ class MADMainWindow(QMainWindow):
                    if 0 <= self.current_file_idx < len(self.audio_files)
                    else None)
         self.audio_files = [e.path for e in entries]
-        self._missing_audio = {
-            os.path.normcase(os.path.abspath(e.path))
-            for e in entries if not e.exists()}
+        self._missing_audio = self._missing_paths(entries)
         if current in self.audio_files:
             self.current_file_idx = self.audio_files.index(current)
         else:
@@ -10799,27 +12208,113 @@ class MADMainWindow(QMainWindow):
         self._n_missing_audio = n_missing
         self._scan_all_file_counts()
 
+    def _live_worker(self, attr: str):
+        """The worker stored at ``attr``, or None if it is finished or reaped.
+
+        ``finished.connect(deleteLater)`` keeps worker objects from piling up,
+        but it destroys the C++ object while the Python attribute still refers
+        to it. Touching that wrapper — even to ask ``isRunning()`` — raises
+        RuntimeError, and since PyQt turns an unhandled exception in a slot
+        into an abort, one stale reference is enough to take down whatever
+        called it. It killed the confirmed-mask delete: the masks were removed
+        from disk and the exception fired before the gallery could refresh, so
+        the tiles stayed on screen and the deletion looked like a no-op.
+
+        Clears the attribute on the way out so the next call is cheap.
+        """
+        w = getattr(self, attr, None)
+        if w is None:
+            return None
+        try:
+            if w.isRunning():
+                return w
+        except RuntimeError:
+            pass                        # C++ side already gone
+        setattr(self, attr, None)
+        return None
+
     def _scan_all_file_counts(self):
-        """Populate ``_file_count_cache`` with the (accepted, pending, rejected)
-        breakdown per file, via the shared :meth:`_csv_status_counts`. One cheap
-        sibling read per file; the multi-GB probability grid is never touched.
+        """Fill ``_file_count_cache`` with the (accepted, pending, rejected)
+        breakdown per recording.
+
+        Two stages, split by what is safe to move off the UI thread.
+
+        *Probing* — which recordings even have a sidecar — is the expensive
+        part and is pure filesystem work, so it runs on a worker. It used to
+        cost 14 s of a 6,252-file project open because the sibling-path helpers
+        stat every legacy name before giving up; one listing per directory
+        replaces all of it.
+
+        *Reading* those sidecars stays here on the UI thread. HDF5 is not
+        something to touch from two threads at once — the main thread opens the
+        previewed recording's store constantly — and it is cheap anyway,
+        because only a handful of recordings in a sampled project have one.
+
         Call on project open / file-list rebuild, NOT on file switch.
         """
+        paths = list(self.audio_files)
+        self._counts_generation = getattr(self, '_counts_generation', 0) + 1
+        gen = self._counts_generation
+        w = self._live_worker('_counts_worker')
+        if w is not None:
+            # A superseded probe cannot be interrupted mid-listing, but its
+            # result is discarded on arrival by the generation check below.
+            try:
+                w.done.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if not paths:
+            self._file_count_cache = {}
+            self._file_run_info = {}
+            self._update_file_list_counts(sync_current=False)
+            return
+        self._counts_worker = _SidecarScanWorker(paths, self)
+        self._counts_worker.done.connect(
+            lambda found, g=gen: self._on_sidecars_found(g, found))
+        self._counts_worker.finished.connect(self._counts_worker.deleteLater)
+        self._counts_worker.start()
+
+    def _on_sidecars_found(self, generation: int, found):
+        """Read the stores the probe turned up, a few per event-loop turn.
+
+        Staged rather than done in one pass because HDF5 has to stay on this
+        thread (the main thread opens the previewed recording's store
+        constantly, and two threads in HDF5 over SMB is a native crash), and a
+        cold read of twenty stores on a network share measured 3.2 s. Twenty is
+        a small project; a curated one runs to hundreds. Yielding between
+        chunks keeps the window painting and the list clickable while the
+        badges fill in behind it.
+        """
+        if generation != getattr(self, '_counts_generation', 0):
+            return          # a newer scan is authoritative
+        self._counts_pending = list(found)
+        self._counts_partial = ({}, {})
+        self._read_sidecar_chunk(generation)
+
+    def _read_sidecar_chunk(self, generation: int, chunk: int = 2):
+        if generation != getattr(self, '_counts_generation', 0):
+            return          # the list changed while we were reading
         from fnt.usv.usv_detector.fnt_mask_store import (
             masks_sibling_path, get_infer_run_attrs, was_inferred)
-        cache: Dict[str, tuple] = {}
-        runs: Dict[str, dict] = {}
-        for fp in self.audio_files:
-            counts = self._csv_status_counts(fp)
+        cache, runs = self._counts_partial
+        batch, self._counts_pending = (self._counts_pending[:chunk],
+                                       self._counts_pending[chunk:])
+        for fp, has_store in batch:
+            try:
+                counts = self._csv_status_counts(fp)
+            except Exception:
+                continue
             base = os.path.basename(fp)
             if any(counts):
                 cache[base] = counts
                 continue
+            if not has_store:
+                continue        # no store, so no run stamp to find
             # No calls — but "analyzed and empty" is a result worth showing,
             # and is only distinguishable from "never analyzed" by the run
             # stamp inference leaves behind. An all-zero tuple carries that.
-            h5 = masks_sibling_path(fp)
             try:
+                h5 = masks_sibling_path(fp)
                 ran = was_inferred(h5)
                 run = get_infer_run_attrs(h5) if ran else {}
             except Exception:
@@ -10828,9 +12323,14 @@ class MADMainWindow(QMainWindow):
                 cache[base] = (0, 0, 0)
                 if run:
                     runs[base] = run
+        # Publish what we have so far, so badges appear progressively rather
+        # than all at the end.
         self._file_count_cache = cache
         self._file_run_info = runs
         self._update_file_list_counts(sync_current=False)
+        if self._counts_pending:
+            QTimer.singleShot(
+                0, lambda g=generation: self._read_sidecar_chunk(g))
 
     def _update_file_list_counts(self, sync_current: bool = True):
         """Refresh the file-list labels from the cached (accepted, pending,
@@ -11054,8 +12554,39 @@ class MADMainWindow(QMainWindow):
         self._keep_window(dlg)
         dlg.show()
 
+    def _files_without_detections(self):
+        """Recordings holding nothing a human curated — safe to drop from the
+        list.
+
+        The point is pruning: after a sampled run over a 24/7 set most files are
+        genuinely silent, and a list of six thousand rows where forty have
+        content is unusable. The counts come from the cache the file list
+        already maintains, so this costs no disk reads.
+
+        A rejection counts as content. It is tempting to treat a file with only
+        rejected calls as empty — the reviewer looked and said no — but that
+        gets the training set exactly backwards: rejections are stored as hard
+        negatives and are some of the most valuable supervision in the project,
+        because they are the mistakes the model actually made. Clearing them
+        silently cost one real project 40 of its 61 negatives, including a
+        recording carrying 35, and the loss was invisible until the training
+        report disagreed with the gallery.
+
+        So: clearable means never analyzed, or analyzed and found nothing at
+        all. Anything a person accepted OR rejected stays.
+        """
+        out = []
+        for fp in self.audio_files:
+            counts = self._file_count_cache.get(os.path.basename(fp))
+            if counts is None:              # never analyzed
+                out.append(fp)
+                continue
+            if not any(counts):             # analyzed, found nothing
+                out.append(fp)
+        return out
+
     def _clear_all_files(self):
-        """Empty the Audio list, after one prompt that tells the truth.
+        """Empty the Audio list — or just the part of it with nothing in it.
 
         Work out what would actually leave the disk BEFORE asking, so the
         prompt can say so. Asking a generic "nothing is deleted" question
@@ -11066,41 +12597,65 @@ class MADMainWindow(QMainWindow):
         n = len(self.audio_files)
         if not n:
             return
+        empty = self._files_without_detections()
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear the Audio list")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"The Audio list holds {n} recording(s).")
+        box.setInformativeText(
+            f"{len(empty)} of them hold no calls at all — never analyzed, "
+            f"or analyzed and nothing found. Recordings with confirmed "
+            f"calls OR rejections are kept: rejections train the model as "
+            f"hard negatives.\n\n"
+            "Nothing is deleted — every .wav and its .mad sidecar stays on "
+            "disk, and re-adding the folder brings the list back.")
+        b_empty = box.addButton(f"Clear {len(empty)} with no detections",
+                                QMessageBox.AcceptRole)
+        b_all = box.addButton(f"Clear all {n}", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        b_empty.setEnabled(bool(empty))
+        box.setDefaultButton(b_empty if empty else b_all)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+            return
+        targets = empty if clicked is b_empty else list(self.audio_files)
+        if not targets:
+            return
+
         # Project-owned copies (a legacy recordings/ file, or one made by
         # Pack Project) have to be deleted, not merely unregistered:
         # _rescan_project_wavs re-adopts everything under recordings/ on the
         # next project open, so unregistering alone lets the cleared list
-        # come straight back.
+        # come straight back. Asked separately, and only about the files this
+        # clear actually touches.
         owned = []
         if self._project is not None:
             try:
+                keys = {os.path.normcase(os.path.abspath(p)) for p in targets}
                 owned = [e.path for e in self._project.audio_entries()
-                         if getattr(e, 'embedded', False)]
+                         if getattr(e, 'embedded', False)
+                         and os.path.normcase(os.path.abspath(e.path)) in keys]
             except Exception:
                 owned = []
-
-        box = QMessageBox(self)
-        box.setWindowTitle("Clear the Audio list")
-        box.setIcon(QMessageBox.Warning if owned else QMessageBox.Question)
-        box.setText(f"Remove all {n} recording(s) from the Audio list?")
         if owned:
-            box.setInformativeText(
-                f"{len(owned)} of them are stored INSIDE the project and will be "
-                f"deleted from disk (wav + .mad sidecar). This cannot be undone.\n\n"
-                f"The other {n - len(owned)} are only unregistered — those files "
-                "stay where they are.")
-        else:
-            box.setInformativeText(
-                "Nothing is deleted — every .wav and its .mad sidecar "
-                "(labels, detections, review decisions) stays on disk, and "
-                "re-adding the folder brings the list back.")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.No)
-        if box.exec_() != QMessageBox.Yes:
-            return
+            warn = QMessageBox(self)
+            warn.setWindowTitle("Delete project-owned recordings?")
+            warn.setIcon(QMessageBox.Warning)
+            warn.setText(
+                f"{len(owned)} of the {len(targets)} recording(s) being "
+                "cleared are stored INSIDE the project.")
+            warn.setInformativeText(
+                "Those will be deleted from disk (wav + .mad sidecar). This "
+                f"cannot be undone. The other {len(targets) - len(owned)} are "
+                "only unregistered.")
+            warn.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            warn.setDefaultButton(QMessageBox.No)
+            if warn.exec_() != QMessageBox.Yes:
+                return
         # _remove_files_by_path already logs what it removed.
-        self._remove_files_by_path(list(self.audio_files),
-                                   delete_embedded=bool(owned))
+        self._remove_files_by_path(targets, delete_embedded=bool(owned))
 
     def _remove_selected_files(self):
         """Drop the selected recordings from the Audio list (and the project).
@@ -11980,6 +13535,54 @@ class MADMainWindow(QMainWindow):
         )
 
     @staticmethod
+    def _drop_other_examples_for_blob(wav_path: str, blob_id, keep_id: str):
+        """Delete any other stored example for this detection.
+
+        One detection is one example. Before label ids were deterministic, each
+        accept minted a new uuid, so re-accepting stacked copies; this removes
+        the strays so the count in the store matches the calls on screen.
+        """
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            example_kind, masks_sibling_path, td_delete, td_iter_meta)
+        h5 = masks_sibling_path(wav_path)
+        if not os.path.isfile(h5):
+            return
+        try:
+            stale = [m.get('id') for m in td_iter_meta(h5)
+                     if m.get('id') and m.get('id') != keep_id
+                     and m.get('blob_id') is not None
+                     and str(m.get('blob_id')) == str(blob_id)
+                     and example_kind(m) == 'label']
+        except Exception:
+            return
+        for eid in stale:
+            try:
+                td_delete(h5, eid)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _label_example_id(wav_path: str, blob_id) -> str:
+        """Deterministic id for the label confirmed from one detection.
+
+        Accepting the same detection twice must UPDATE its example, not add a
+        second one. With a uuid it added: one real project accumulated three
+        byte-identical copies of four calls — twelve stored examples for four
+        detections — because the same view was re-inferred and re-accepted
+        three times a minute apart. Nothing showed it; the duplicates sat
+        exactly on top of each other on screen, and only turned up as a count
+        mismatch in the confirmed-mask gallery.
+
+        Weighting one call three times in training is not harmless, and the
+        rejection path already had this right — see
+        :meth:`_negative_example_id`, which is deterministic for the same
+        reason. Hand-drawn masks have no blob_id and keep a uuid, because each
+        one genuinely is a new example.
+        """
+        stem = os.path.splitext(os.path.basename(wav_path))[0]
+        return f"{stem}_lbl_{blob_id}"
+
+    @staticmethod
     def _negative_example_id(wav_path: str, blob_id) -> str:
         """Deterministic id for the hard negative harvested from one rejection.
 
@@ -12222,22 +13825,42 @@ class MADMainWindow(QMainWindow):
         # training_data.h5 is rebuilt from the Audio list at train time.
         import uuid
         from fnt.usv.usv_detector.fnt_mask_store import (
-            masks_sibling_path, set_grid_attrs, td_save_example,
+            masks_sibling_path, td_commit_example,
         )
+        replace_blob = None
         if kind == 'negative' and blob_id is not None:
             ex_id = self._negative_example_id(wav_path, blob_id)
+        elif kind == 'label' and blob_id is not None:
+            ex_id = self._label_example_id(wav_path, blob_id)
+            # Older accepts of this same detection carry random ids, so the
+            # deterministic one alone would sit alongside them rather than
+            # replace them. Cleared as part of the same write — see
+            # td_commit_example.
+            replace_blob = blob_id
         else:
             ex_id = f"{os.path.splitext(wav_name)[0]}_{uuid.uuid4().hex[:10]}"
         h5_path = masks_sibling_path(wav_path)
-        set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
-                       noverlap=noverlap_val, nfft=nfft,
-                       n_freq_bins=n_freq, n_time_frames=n_time,
-                       source_wav=os.path.basename(wav_path))
         if kind == 'label':
             # This detection is a call after all — retract any hard negative
             # stored when it was rejected.
             self._drop_rejection_negative(blob_id)
-        td_save_example(h5_path, spec_patch, mask_patch, meta, ex_id)
+        # One open for the grid attrs, the stale-copy sweep and the save. Four
+        # separate opens here cost 36 ms of a 60 ms accept on a network share,
+        # which is what made review feel sticky.
+        res = td_commit_example(
+            h5_path, spec_patch, mask_patch, meta, ex_id,
+            grid=dict(sample_rate=sr, nperseg=nperseg, noverlap=noverlap_val,
+                      nfft=nfft, n_freq_bins=n_freq, n_time_frames=n_time,
+                      source_wav=os.path.basename(wav_path)),
+            replace_blob_id=replace_blob)
+        # Hand the pre-write id list to the undo snapshot that is waiting for
+        # it. Only the first commit of an operation sets it: a snapshot covers
+        # one user action, and its baseline is the state before that action.
+        if not getattr(self, '_in_undo', False) and self._undo_stack:
+            snap = self._undo_stack[-1]
+            if (snap.get('example_ids') is None
+                    and snap.get('examples_h5') == h5_path):
+                snap['example_ids'] = set(res['ids_before'])
         return ex_id
 
     def _clear_tool_buttons(self):
@@ -12739,6 +14362,8 @@ class MADMainWindow(QMainWindow):
         try:
             from fnt.usv.usv_detector.fnt_mask_store import (
                 masks_sibling_path, delete_pred_masks)
+            # Stash before destroying — undo restores exactly these.
+            self._remember_undo_crops(ids)
             delete_pred_masks(masks_sibling_path(wav), ids)
         except Exception:
             pass
@@ -12895,6 +14520,8 @@ class MADMainWindow(QMainWindow):
             from fnt.usv.usv_detector.fnt_mask_store import (
                 masks_sibling_path, delete_pred_mask,
             )
+            # Stash before destroying — undo restores exactly this one.
+            self._remember_undo_crops([bid])
             delete_pred_mask(masks_sibling_path(wav), bid)
         except Exception:
             pass
@@ -13224,7 +14851,7 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
             self.is_playing = True
-            self.btn_play.setText("Stop (Space)")
+            self.btn_play.setText("Stop")
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
@@ -13238,7 +14865,7 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         self.is_playing = False
-        self.btn_play.setText("Play (Space)")
+        self.btn_play.setText("Play")
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
@@ -13912,18 +15539,35 @@ class MADMainWindow(QMainWindow):
                               skip_resume_prompt=True)
 
     def _latest_model_path(self) -> Optional[str]:
-        """Return the path to the most recent trained model in the project."""
+        """Path to the most recently trained model in the project.
+
+        Ordered by when the weights were actually written, not by name. Run
+        directories are usually timestamped, which made sorting by name look
+        equivalent — until a run carries a ``--run-name``. Then the sort is
+        lexicographic and letters land after digits, so ``agent_headless_test``
+        outranks ``20260906_235419_unet_n=115`` and the newest model is the one
+        the project never offers. It fed the wrong settings into the training
+        prefill and would have picked the wrong model for inference too.
+        """
         if self._project is None:
             return None
         models_root = os.path.join(self._project.project_dir, 'models')
         if not os.path.isdir(models_root):
             return None
         candidates = []
-        for name in sorted(os.listdir(models_root)):
+        for name in os.listdir(models_root):
             w = os.path.join(models_root, name, 'weights.pt')
             if os.path.isfile(w):
-                candidates.append(w)
-        return candidates[-1] if candidates else None
+                try:
+                    candidates.append((os.path.getmtime(w), w))
+                except OSError:
+                    continue
+        if not candidates:
+            return None
+        # Name breaks a tie, so the choice stays deterministic when two runs
+        # land in the same filesystem timestamp granularity.
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return candidates[-1][1]
 
     def _log_model_info_for_q(self, model_path: str,
                               threshold: float, min_blob: int):
@@ -14118,6 +15762,9 @@ class MADMainWindow(QMainWindow):
 
         n_added = 0
         new_crops = []  # small per-blob masks to persist (NOT the full grid)
+        # Detections whose real per-pixel mask could not be recovered.
+        # Counted, never squared off into a fabricated box.
+        n_unmasked = 0
         for r in rows:
             t0 = int(round((r['start_s'] - t_org) / dt))
             t1 = int(round((r['stop_s'] - t_org) / dt))
@@ -14126,19 +15773,24 @@ class MADMainWindow(QMainWindow):
             if t1 <= t0 or f1 <= f0:
                 continue
             # Extract actual pixel mask from the in-memory (view-sized) prob map.
+            # A detection with no recoverable per-pixel mask is DROPPED, not
+            # squared off. This used to fall back to np.ones(...) — a solid
+            # filled box presented as if it were a real outline, with nothing
+            # downstream marking it as fabricated. Accepting one wrote a solid
+            # block into the training set and taught the model to paint blocks;
+            # a real project ended up with 12 of them before anyone noticed,
+            # and they were only findable afterwards by their perfect
+            # rectangularity. A dropped detection costs one re-run of
+            # inference; a fabricated mask costs a corrupted model.
+            blob_region = None
             if prob_mask is not None:
-                lt0 = t0 - frame_offset
-                lt1 = t1 - frame_offset
-                lt0 = max(0, lt0)
-                lt1 = min(prob_mask.shape[1], lt1)
+                lt0 = max(0, t0 - frame_offset)
+                lt1 = min(prob_mask.shape[1], t1 - frame_offset)
                 lf1 = min(prob_mask.shape[0], f1)
                 if lt1 > lt0 and lf1 > f0:
                     blob_region = prob_mask[f0:lf1, lt0:lt1] >= threshold
-                else:
-                    blob_region = np.ones((f1 - f0, t1 - t0), dtype=bool)
-            else:
-                blob_region = np.ones((f1 - f0, t1 - t0), dtype=bool)
-            if not blob_region.any():
+            if blob_region is None or not blob_region.any():
+                n_unmasked += 1
                 continue
             blob_region = np.ascontiguousarray(blob_region)
             f1 = f0 + blob_region.shape[0]
@@ -14187,6 +15839,14 @@ class MADMainWindow(QMainWindow):
             delete_prob(h5)
         except Exception:
             pass
+        if n_unmasked:
+            # Said out loud, because the alternative used to be a silent
+            # fabricated rectangle. Re-running inference over the view
+            # regenerates the crops these detections were missing.
+            msg = (f"{n_unmasked} detection(s) had no recoverable mask "
+                   "and were skipped — re-run inference to regenerate them")
+            self.status_bar.showMessage(msg)
+            self._log(msg)
         sg._rebuild_confirmed_mask()
         sg.update()
         self._bump_review_token()
@@ -14382,6 +16042,13 @@ class MADMainWindow(QMainWindow):
             self._update_infer_run_enabled()
             return
         owns_modal = reporter is None
+        # Whether this run is the tail of a chained Training + Inference, read
+        # now rather than at the end. The queue it used to be read from is
+        # cleared by _post_training_cleanup_after_infer, which hangs off the
+        # panel's run_finished signal — and that fires before this run's own
+        # completion slot, so by then a chained run looked unchained and put up
+        # its own "Inference complete" box beside the "Run complete" one.
+        is_chained_tail = bool(getattr(self, '_post_train_infer_wavs', None))
         progress = reporter or MADRunProgressDialog(self, "MAD Inference")
         progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
         progress.append(f"Model: {cfg.model_path}")
@@ -14546,7 +16213,7 @@ class MADMainWindow(QMainWindow):
                     self.file_list.setCurrentRow(self.audio_files.index(first))
             # A chained training run reports both halves in its own summary;
             # a second dialog here would be the same news twice.
-            if not getattr(self, '_post_train_infer_wavs', None):
+            if not is_chained_tail:
                 self._show_inference_summary_dialog(results, cfg)
                 self.infer_panel.reset_idle()
 

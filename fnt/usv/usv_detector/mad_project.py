@@ -61,6 +61,16 @@ class MADProjectConfig:
     # runs through the Run Inference "Folder" target, which never touches this.
     audio_files: List[Dict] = field(default_factory=list)
 
+    # Every sampling draw that fed this project, appended in order.
+    #
+    # A subset drawn from a 34,000-file tree is a methods-section fact: "20 per
+    # trial, evenly spaced, spread across four microphones" is the difference
+    # between a training set someone can reproduce and one they cannot. It is
+    # also what lets a later pass ask for twenty MORE — each draw excludes the
+    # files already imported, so the history is the record of what was taken.
+    # Entries are SampleSpec dicts plus root/n_added/at; see mad_sampling.
+    sample_history: List[Dict] = field(default_factory=list)
+
     # Spectrogram parameters — must match between label, train, and inference.
     nperseg: int = 512
     noverlap: int = 384

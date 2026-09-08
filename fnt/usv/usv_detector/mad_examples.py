@@ -314,6 +314,78 @@ def _bbox_from_meta(meta):
     return f0, f1, t0, t1
 
 
+def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
+    """Rebuild the consolidated training store from the per-recording sidecars.
+
+    The ``.mad`` next to each recording is the source of truth; this store is
+    only a training cache, rebuilt fresh every run so a removed or re-drawn
+    label can never linger in it.
+
+    Lives here rather than in the GUI because the CLI needs it just as much:
+    ``mad train`` used to feed ``train_unet`` whatever the last GUI session
+    happened to leave behind, so a headless run could train on a stale label
+    set and report success. A caller that skips this is not training on the
+    labels the user can see.
+
+    Writes to a temp file and swaps it in with ``os.replace`` only after a
+    complete, error-free pass, so an interruption (full disk, dropped network
+    share, unreadable sidecar) leaves the previous store untouched rather than
+    truncated. Raises on any failure — a partial label set must never be
+    trained on silently.
+
+    Returns the number of examples written.
+    """
+    import os
+    from .fnt_mask_store import (
+        masks_sibling_path, td_iter_examples, td_count, td_save_example)
+
+    os.makedirs(training_data_dir, exist_ok=True)
+    store = _store_path(training_data_dir)
+    tmp = store + ".rebuild.tmp"
+
+    def _drop_tmp():
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+    _drop_tmp()
+    n, failed = 0, []
+    try:
+        for fp in wav_paths:
+            h5 = masks_sibling_path(fp)
+            try:
+                if td_count(h5) == 0:
+                    continue
+                examples = list(td_iter_examples(h5))
+            except Exception as e:
+                failed.append(f"{os.path.basename(fp)}: {e}")
+                continue
+            for ex in examples:
+                meta = ex["meta"]
+                try:
+                    td_save_example(tmp, ex["spec"], ex["mask"], meta,
+                                    meta.get("id") or None)
+                    n += 1
+                except Exception as e:
+                    failed.append(f"{os.path.basename(fp)}: {e}")
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} label(s) could not be copied. "
+                f"First error — {failed[0]}")
+        if n:
+            os.replace(tmp, store)      # atomic swap; old store until now
+        else:
+            _drop_tmp()
+            if os.path.isfile(store):
+                os.remove(store)
+    except Exception:
+        _drop_tmp()                     # keep the previous store as-is
+        raise
+    return n
+
+
 def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
     """Shared: convert example dicts into annotation dicts clipped to *grid_shape*.
 
