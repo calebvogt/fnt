@@ -540,6 +540,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._selected_ann_idx: Optional[int] = None
         # Rubber-band multi-select (drag a box over masks with no tool active).
         self._selected_set: set = set()
+        #: (rect, annotation index) for every class label drawn in the
+        #: last paint, so the labels are clickable targets too.
+        self._label_hits: list = []
         self._rubber_start = None
         self._rubber_cur = None
         # Harmonic links as (lower_id, upper_id, n), drawn as dotted lines so a
@@ -1160,6 +1163,53 @@ class MADSpectrogramWidget(SpectrogramWidget):
             self._stamp(ti, fi)
 
     # --- mouse events --------------------------------------------------
+    def label_at(self, pos):
+        """Annotation index whose class label was drawn under ``pos``.
+
+        Labels are hit-tested before masks and in reverse draw order, so the
+        one painted on top — the one the user can actually see there — wins
+        when two overlap.
+        """
+        for rect, ai in reversed(getattr(self, '_label_hits', [])):
+            if rect.contains(pos) and 0 <= ai < len(self.annotations):
+                return ai
+        return None
+
+    def harmonic_group_of(self, ann_idx):
+        """Indices of every annotation harmonically linked to ``ann_idx``.
+
+        A call and its harmonics are one vocalisation; selecting the fundamental
+        alone would leave the rest of the same call unhighlighted. Walks
+        ``harmonic_links`` transitively, so a stack of three comes back whole
+        whichever member was clicked. Returns ``{ann_idx}`` when harmonics were
+        never detected or this call is not in a stack.
+        """
+        if not (0 <= ann_idx < len(self.annotations)):
+            return set()
+        links = getattr(self, 'harmonic_links', None) or []
+        if not links:
+            return {ann_idx}
+        by_id = {}
+        for i, a in enumerate(self.annotations):
+            aid = a.get('id')
+            if aid is not None:
+                by_id.setdefault(str(aid), i)
+        adj = {}
+        for lo, up, _n in links:
+            a, b = str(lo), str(up)
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+        start = str(self.annotations[ann_idx].get('id'))
+        seen, stack = {start}, [start]
+        while stack:
+            cur = stack.pop()
+            for nxt in adj.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        out = {by_id[k] for k in seen if k in by_id}
+        return out or {ann_idx}
+
     def mousePressEvent(self, event):
         self._selected_ann_idx = None
         self._selected_set = set()
@@ -1175,12 +1225,14 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
         # --- right-click → context menu on an accepted annotation ---
         if event.button() == Qt.RightButton and self._editing_ann_idx is None:
-            idx = self._screen_to_spec_idx(
-                event.pos().x(), event.pos().y(), spec_rect)
-            if idx is not None:
-                ai = self.annotation_at(idx[0], idx[1])
-                if ai is not None:
-                    self.request_context_menu.emit(ai, event.globalPos())
+            ai = self.label_at(event.pos())
+            if ai is None:
+                idx = self._screen_to_spec_idx(
+                    event.pos().x(), event.pos().y(), spec_rect)
+                if idx is not None:
+                    ai = self.annotation_at(idx[0], idx[1])
+            if ai is not None:
+                self.request_context_menu.emit(ai, event.globalPos())
             return
 
         if self.paint_mode == 'sam':
@@ -1214,6 +1266,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # No tool engaged: left-click an existing mask to select it (white
         # outline); drag over empty space to rubber-band multiple masks.
         if event.button() == Qt.LeftButton and self.paint_mode is None:
+            # The class label counts as part of its call. It is often the
+            # easier target — a faint few-pixel sliver is hard to hit, and its
+            # name sits just above it in clear space — and clicking it selects
+            # the whole harmonic stack, which is one vocalisation.
+            ai = self.label_at(event.pos())
+            if ai is not None:
+                group = self.harmonic_group_of(ai)
+                self._selected_ann_idx = ai
+                self._selected_set = set(group) if len(group) > 1 else set()
+                self.update()
+                self.annotation_clicked.emit(ai)
+                return
             idx = self._screen_to_spec_idx(
                 event.pos().x(), event.pos().y(), spec_rect)
             if idx is not None:
@@ -1432,6 +1496,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
             return
 
         spec_rect = self._get_spec_rect()
+        # Rebuilt every paint: label positions move with pan, zoom and the
+        # frequency range, so a stale rect would select the wrong call.
+        self._label_hits = []
 
         # Visible time-frame slice
         t_start = int(self.view_start * self.sample_rate / self.hop)
@@ -1688,11 +1755,19 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 if h_n > 1:
                     label = f"{label}\u00b7H{h_n}"
                 cx = _t_to_x((max(ann['t0'], t_start) + min(ann['t1'], t_end)) / 2.0)
-                tw = painter.fontMetrics().horizontalAdvance(label)
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(label)
                 lx = cx - tw / 2.0
                 ly = _f_to_y(min(ann['f1'], f_end)) - 3
                 self._draw_haloed_text(painter, QPointF(lx, ly), label,
                                        label_color, pal['halo'])
+                # Remember where it landed so it can be clicked. The label is
+                # often far easier to hit than the call itself — a faint 4-px
+                # sliver is a hard target, and its name sits right above it in
+                # clear space.
+                self._label_hits.append((
+                    QRectF(lx - 2, ly - fm.ascent() - 2,
+                           tw + 4, fm.height() + 4), ai))
 
         # Dotted links from each fundamental to its harmonics. Drawn under
         # the selection highlight so selecting a member never hides its links.
@@ -4100,6 +4175,18 @@ class MADConfirmedGalleryDialog(QDialog):
             pm.fill(QColor(35, 35, 35))
             return pm
         spec, mask = ex['spec'], ex['mask']
+        # Same trim the loader applies: a stored patch holds every confirmed
+        # pixel in its window so neighbours are not supervised as background,
+        # but a tile is about ONE call. Without this the gallery drew a call
+        # merged with whatever shared its crop.
+        from fnt.usv.usv_detector.mad_examples import _bbox_from_meta
+        box = _bbox_from_meta(r['meta'])
+        if box is not None:
+            own = np.zeros_like(mask, dtype=bool)
+            own[box[0]:box[1], box[2]:box[3]] = True
+            trimmed = (mask > 0) & own
+            if trimmed.any():
+                mask = trimmed
         x0, x1, y0, y1 = self._bbox(r, spec, mask)
         s = np.clip(spec[y0:y1, x0:x1], 0.0, 1.0)
         m = mask[y0:y1, x0:x1] > 0

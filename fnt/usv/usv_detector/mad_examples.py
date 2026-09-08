@@ -416,6 +416,29 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
                 continue
             m = np.zeros_like(m)
             m[box[0]:box[1], box[2]:box[3]] = True
+        else:
+            # Trim the stored mask back to the call this example is about.
+            #
+            # A saved patch deliberately carries EVERY confirmed pixel in its
+            # window, not just this call's: the patch is a time-crop with
+            # context, so it routinely contains neighbouring USVs, and storing
+            # only one component made the others supervised as background.
+            # That union is the right training target — but it is not this
+            # call's identity, and the box below is derived from the mask. Left
+            # alone, one label's box grew to span every call sharing its
+            # window: separate USVs came back as one connected detection, with
+            # a frequency range and pixel count to match.
+            #
+            # The metadata still records what was actually drawn, so intersect
+            # with it. Examples saved before compositing existed have a mask
+            # that already equals the call, and for them this is a no-op.
+            box = _bbox_from_meta(meta)
+            if box is not None:
+                own = np.zeros_like(m)
+                own[box[0]:box[1], box[2]:box[3]] = True
+                trimmed = m & own
+                if trimmed.any():
+                    m = trimmed
         t_off = int(meta.get("patch_t_off") or 0)
         f_off = int(meta.get("patch_f_off") or 0)
         fs = np.where(m.any(axis=1))[0]
