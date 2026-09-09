@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .rng import CH_HEADING
+from .rng import CH_HEADING, CH_CHEW
 
 
 class Policy:
@@ -240,6 +240,26 @@ class RuleBasedPolicy(Policy):
         for v in drives.values():
             desired += v
 
+        # --- trail maintenance: stop and clip the sward ------------------- #
+        # Clipping yields no food, so the only reason to do it is the route it
+        # leaves behind. The conditions say exactly that: the grass here is
+        # worth cutting, this is ground the animal already uses (its own scent
+        # is on it), and nothing more urgent is pressing. An animal that is
+        # hungry walks on instead — which is why trails belong to settled
+        # animals and never appear in a cohort that is still scrambling.
+        want_chew = np.zeros(n, bool)
+        sw = getattr(sim, "sward", None)
+        if sw is not None:
+            sp = sim.cfg.sward
+            ready = ((sim.grass_cm > sp.chew_threshold_cm)
+                     & (np.maximum(need_food, need_water) < sp.chew_max_need)
+                     & sim.alive)
+            if scented and own_lvl is not None:
+                ready = ready & (own_lvl >= sp.chew_min_own_scent)
+            p_chew = 1.0 - np.exp(-(sp.chew_rate_h / 3600.0) * dt)
+            want_chew = ready & (
+                sim.arand.uniform(sim.uid, sim._step_k, CH_CHEW) < p_chew)
+
         return desired, {
             "dist": dist, "dist_home": dist_home, "within": within,
             "rec_j": rec_j, "need_food": need_food, "need_water": need_water,
@@ -249,4 +269,5 @@ class RuleBasedPolicy(Policy):
             # the named parts whose sum is `desired` — recorded per frame so a
             # trajectory can be read back with the motivation behind it
             "drives": drives, "recognition": recog,
+            "want_chew": want_chew,
         }

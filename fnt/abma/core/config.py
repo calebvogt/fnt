@@ -207,6 +207,77 @@ class ScentParams:
 
 
 @dataclass
+class SwardParams:
+    """The living grass layer (see :mod:`fnt.abma.core.sward`).
+
+    Distinct from ``ArenaConfig.grass``, which is only how the ground is
+    *drawn*. This is grass the animals actually push through, wear down, clip,
+    and share: the first part of an ABMA world that one animal's behaviour
+    changes for every other animal.
+
+    Off by default so configs written before it existed reproduce exactly.
+    Every rate is a **free** parameter — sward heights and the fact that voles
+    clip runways are field-realistic, but how many centimetres one pass removes
+    is chosen so trails take days rather than minutes to appear.
+    """
+    enabled: bool = False
+    cell_size: float = 0.25          # m; trail width is roughly one cell
+    initial_min_cm: float = 6.0      # a field sward at the start of a trial
+    initial_max_cm: float = 10.0
+    patchiness: float = 0.5          # 0 = white noise, 1 = broad patches
+    max_cm: float = 12.0             # ceiling regrowth approaches
+
+    # ---- how the sward changes ------------------------------------------ #
+    regrowth_cm_per_day: float = 0.8   # what makes a trail need *maintaining*
+    trample_cm_per_m: float = 0.05     # wear from simply walking over it
+    chew_rate_multiplier: float = 4.0  # clipping is 3-5x faster than walking
+    chew_cm_per_s: float = 0.02        # base clip rate before the multiplier
+    chew_floor_cm: float = 1.0         # a runway is worn, not scoured to soil
+    chew_seconds_per_cm: float = 12.0  # bout length scales with sward height
+
+    # ---- what height does to movement ------------------------------------ #
+    speed_ref_cm: float = 8.0          # neutral height (factor 1.0)
+    speed_min_factor: float = 0.45     # slowest, in a full-height sward
+    speed_max_factor: float = 1.35     # fastest, on a worn trail
+    push_kj_per_kg_m_per_cm: float = 0.0022   # extra locomotion cost
+
+    # ---- when an animal decides to clip ---------------------------------- #
+    chew_threshold_cm: float = 6.0     # not worth stopping for below this
+    chew_min_own_scent: float = 0.02   # only on ground it already uses
+    chew_max_need: float = 0.35        # a hungry animal forages instead
+    chew_rate_h: float = 6.0           # attempts per hour when conditions hold
+
+
+@dataclass
+class SkyParams:
+    """Where and when the enclosure is, so the sun and moon are real.
+
+    A fixed ``day_start_hour`` makes every day the same length, which is fine
+    in a light-cycle room and wrong outdoors: the question "does this animal
+    behave differently in December than in June" cannot even be posed. With a
+    latitude, a longitude and a date, sunrise, sunset, solar elevation and moon
+    phase all follow (see :mod:`fnt.abma.core.sky`), and season becomes a thing
+    you choose rather than a thing you approximate.
+
+    Defaults are VoleTerra's site: Boulder, Colorado.
+    """
+    enabled: bool = False
+    latitude: float = 40.0150        # deg N
+    longitude: float = -105.2705     # deg E (negative = W)
+    timezone_hours: float = -7.0     # MST; the run's clock is local time
+    #: Sun elevation (deg) below which it counts as night. 0 is geometric
+    #: sunset; -6 is civil twilight, which is closer to when a small mammal
+    #: treats the field as dark.
+    night_elevation_deg: float = -6.0
+    #: How much a full moon suppresses activity in a nocturnal animal, 0-1.
+    #: Lunar-phobic foraging is well described in small mammals; the magnitude
+    #: here is a free parameter.
+    moonlight_suppression: float = 0.25
+    #: Scales sward regrowth with the season (winter ~0, midsummer ~1).
+    seasonal_growth: bool = True
+
+
+@dataclass
 class OlfactionParams:
     """The mechanistic nose (see :mod:`fnt.abma.core.olfaction`).
 
@@ -589,6 +660,20 @@ class ExperimentConfig:
     day_activity: float = 0.7          # activity multiplier during day
     night_activity: float = 1.3        # activity multiplier during night
 
+    # ---- release ---------------------------------------------------------- #
+    #: How founders are placed at t=0.
+    #:   'auto'    point release in a small arena, dispersed in a large one
+    #:   'point'   all founders within `release_scatter_m` of the centre
+    #:   'scatter' uniformly across the arena
+    #:   'nests'   distributed over the nest objects / resource zones
+    #: A fixed 15 cm scatter was fine in a 2.2 m cage and disastrous in a
+    #: 22.9 m enclosure: twelve animals released inside one body-length of
+    #: each other fuse into a single clump that social attraction then holds
+    #: together, and no territory ever forms. 'auto' scales the release with
+    #: the arena so that is not the default outcome.
+    release_mode: str = "auto"
+    release_scatter_m: float = 0.0     # 0 = derive from release_mode
+
     # Biology options
     individual_variation: float = 0.0  # per-agent trait jitter SD (0 = clones)
     enable_mortality: bool = False     # allow starvation death
@@ -600,6 +685,8 @@ class ExperimentConfig:
     scent: ScentParams = field(default_factory=ScentParams)
     physiology: PhysiologyParams = field(default_factory=PhysiologyParams)
     olfaction: OlfactionParams = field(default_factory=OlfactionParams)
+    sward: SwardParams = field(default_factory=SwardParams)
+    sky: SkyParams = field(default_factory=SkyParams)
 
     #: 1 = condition bars were 0..1; 2 = bars are 0-100 (current). Configs
     #: written before the change carry no version and are migrated on load.
@@ -671,6 +758,7 @@ class ExperimentConfig:
             "start_datetime", "parallel", "n_workers",
             "individual_variation", "enable_mortality",
             "energy_speed_coupling", "rest_speed_factor",
+            "release_mode", "release_scatter_m",
         }
         scalars = {k: d[k] for k in known if k in d}
         interventions = [Intervention(**iv) for iv in d.get("interventions", [])]
@@ -691,6 +779,8 @@ class ExperimentConfig:
                                     **d.get("physiology", {})),
                                 olfaction=OlfactionParams(
                                     **d.get("olfaction", {})),
+                                sward=SwardParams(**d.get("sward", {})),
+                                sky=SkyParams(**d.get("sky", {})),
                                 schema_version=2,
                                 **scalars)
 

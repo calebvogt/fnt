@@ -177,6 +177,40 @@ PHYSIOLOGY_PRESETS: dict[str, dict] = {
         "water_loss_ml_h": 0.34, "drink_rate_ml_min": 0.28,
         "urine_fraction": 0.30,
     },
+    # Every other preset here was calibrated in a 2.2 m cage, where a station
+    # is always a few seconds away. Across a 75 ft enclosure an animal spends
+    # most of its day walking between widely-spaced stations, and the cage
+    # rates leave it in permanent deficit: measured on the VoleTerra preset,
+    # a cohort on "Standard" took in ~2 g and ~1.5 mL per animal per day
+    # against a requirement of roughly 4-8 g and 5-8 mL, and fell from full
+    # energy to near death over five days.
+    #
+    # The knock-on mattered more than the starvation. Scent marks are paid for
+    # out of the bladder, which is filled by drinking, so chronically
+    # dehydrated animals stopped marking — and territory, the thing the whole
+    # enclosure model exists to produce, silently stopped forming. Nothing
+    # errored; the mechanism just switched itself off.
+    #
+    # These rates restore the balance: an animal that reaches a station gets a
+    # useful meal from it, and locomotion is cheaper per metre because a field
+    # animal travelling a kilometre a day is not sprinting.
+    # The measured failure was not only energy. Raising the feed rate alone
+    # changed nothing, because intake is capped by the room left in the energy
+    # store rather than by how fast an animal can chew — the binding
+    # constraint is how often it reaches a station, not what it gets when it
+    # arrives. So locomotion is what comes down here.
+    #
+    # `mark_volume_ul` is the other half, and it is a straight correction: 22
+    # µL is a full void, not a scent mark. A rodent marks with a droplet, so a
+    # bladder bought only 25 marks and marking was hard-limited by hydration —
+    # which in a large enclosure meant no territory formed at all. At 4 µL a
+    # full bladder buys ~135 marks, which is the order a scent-marking rodent
+    # actually deposits.
+    "Field enclosure": {
+        "feed_rate_g_min": 0.25, "drink_rate_ml_min": 0.50,
+        "locomotion_kj_per_kg_m": 0.010, "water_loss_ml_h": 0.09,
+        "mark_volume_ul": 4.0,
+    },
 }
 
 

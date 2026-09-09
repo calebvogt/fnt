@@ -46,7 +46,7 @@ _PANEL = "#1a1a1a"
 _LINE = "#3f3f3f"
 
 _ACTIVITY = {0: "resting", 1: "foraging", 2: "roaming", 3: "fleeing",
-             4: "mating", 5: "dead"}
+             4: "mating", 5: "dead", 6: "clipping"}
 
 #: The named drives, in the order they are shown. Labels are written for
 #: someone reading the panel, not for someone who has read policy.py.
@@ -68,6 +68,16 @@ CONDITION: list[tuple[str, str, str]] = [
     ("thirst", "thirst", "#3ab0c4"),
     ("stress", "stress", "#d9534f"),
     ("bladder", "bladder", "#c9b458"),
+]
+
+#: The world under and over the animal — the part it shares with the others.
+ENVIRONMENT: list[tuple[str, str, str]] = [
+    ("grass_cm", "sward here (cm)", "#5ec26a"),
+    ("grass_speed_factor", "speed x sward", "#9ad06b"),
+    ("chewing", "clipping", "#c9b458"),
+    ("grass_cut_cm", "cm clipped (total)", "#8a6d3b"),
+    ("daylight", "daylight", "#ffd23f"),
+    ("night_light", "moonlight", "#aab6c8"),
 ]
 
 #: What the animal is sensing — the input side of the same decision.
@@ -595,7 +605,8 @@ class SciencePanel(QWidget):
 
         self.picker = QComboBox()
         self.picker.addItems(["Drives over time", "Condition over time",
-                              "What it senses", "Condition dynamics"])
+                              "What it senses", "Sward & sky",
+                              "Condition dynamics"])
         self.picker.currentIndexChanged.connect(self._show_page)
         lay.addWidget(self.picker)
 
@@ -603,6 +614,7 @@ class SciencePanel(QWidget):
             TraceGroup("drive strength", DRIVES),
             TraceGroup("condition", CONDITION, y_range=(0.0, 100.0)),
             TraceGroup("sensed", SENSED),
+            TraceGroup("environment", ENVIRONMENT),
         ]
         self.coupling = CouplingDiagram()
         for page in self.pages:

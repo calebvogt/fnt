@@ -233,7 +233,14 @@ class Arena3DView(gl.GLViewWidget):
         self.arena = None
         self._selected = None
         self._last_pos = None
-        self._history = deque(maxlen=10)
+        # Per-animal position history, one deque each. Drawn as a fading
+        # polyline rather than a cloud of dots: a scatter of the last few
+        # frames merged across the whole cohort reads as noise around each
+        # animal, with no way to tell which mark is *now* or which way it came
+        # from. A line has direction and an obvious leading end.
+        self._tracks: list[deque] = []
+        self._trail_len = 1000
+        self._trails_visible = True
         self._press_xy = None
         self._press_btn = Qt.LeftButton
         self._pan_last = None
@@ -262,9 +269,13 @@ class Arena3DView(gl.GLViewWidget):
         self._head_md = gl.MeshData.sphere(rows=8, cols=8, radius=_HEAD_R)
 
         self._resources = gl.GLScatterPlotItem()
-        self._trail = gl.GLScatterPlotItem()
+        #: one line strip per animal; built lazily as the roster is known
+        self._trail_lines: list = []
+        #: a bright dot on every animal's current position, so the head of the
+        #: track is unambiguous even when the body mesh is small on screen
+        self._now = gl.GLScatterPlotItem()
         self._sel = gl.GLScatterPlotItem()
-        for it in (self._resources, self._trail, self._sel):
+        for it in (self._resources, self._now, self._sel):
             it.setGLOptions("translucent")
             self.addItem(it)
 
@@ -885,15 +896,32 @@ class Arena3DView(gl.GLViewWidget):
         self._agents_visible = bool(on)
         for it in self._bodies + self._heads:
             it.setVisible(self._agents_visible)
-        for it in (self._trail, self._sel):
+        for it in (self._now, self._sel):
             it.setVisible(self._agents_visible)
+        for it in self._trail_lines:
+            it.setVisible(self._agents_visible and self._trails_visible)
+        self.update()
+
+    def set_trail_length(self, n_steps: int) -> None:
+        """How many recorded steps of track to keep behind each animal."""
+        self._trail_len = max(2, int(n_steps))
+        self._tracks = [deque(t, maxlen=self._trail_len) for t in self._tracks]
+
+    def set_trails_visible(self, on: bool) -> None:
+        """Hide the tracks without forgetting them, so toggling is free."""
+        self._trails_visible = bool(on)
+        for it in self._trail_lines:
+            it.setVisible(self._agents_visible and self._trails_visible)
         self.update()
 
     def clear_playback(self):
-        self._history.clear()
+        self._tracks = []
         self._last_pos = None
         self._selected = None
-        self._trail.setData(pos=np.zeros((0, 3)))
+        for it in self._trail_lines:
+            self.removeItem(it)
+        self._trail_lines = []
+        self._now.setData(pos=np.zeros((0, 3)))
         self._sel.setData(pos=np.zeros((0, 3)))
         for it in self._bodies + self._heads:
             self.removeItem(it)
@@ -955,24 +983,7 @@ class Arena3DView(gl.GLViewWidget):
             hd.scale(sc, sc, sc, local=True)
             hd.setColor(col)
 
-        # fading trails, tinted to each agent's colour so they read on the ground
-        self._history.append(self._last_pos.copy())
-        if len(self._history) > 1:
-            tp, tc = [], []
-            hist = list(self._history)[:-1]
-            for k, hp in enumerate(hist):
-                a = 0.20 + 0.60 * (k / len(hist))       # brighter, fades in
-                tp.append(hp)
-                c = self._agent_colors.copy()
-                if len(c) == len(hp):
-                    c[:, 3] = a
-                    tc.append(c)
-                else:                                    # agent count changed
-                    tc.append(np.tile((0.7, 0.7, 0.7, a), (len(hp), 1)))
-            pos = np.vstack(tp)
-            pos[:, 2] = 0.022                            # sit just above the floor
-            self._trail.setData(pos=pos, color=np.vstack(tc),
-                                size=7, pxMode=True)
+        self._update_tracks(x, y, alive)
 
         if self._selected is not None and self._selected < n:
             sp = self._last_pos[self._selected].copy()
@@ -985,6 +996,56 @@ class Arena3DView(gl.GLViewWidget):
         if is_day is not None:
             bg = self._pal["day_bg"] if is_day else self._pal["night_bg"]
             self.setBackgroundColor(pg.mkColor(*[int(c * 255) for c in bg]))
+
+    #: height above the floor the tracks are drawn at, so they never z-fight
+    #: with the ground plane or disappear into it
+    _TRACK_Z = 0.022
+
+    def _update_tracks(self, x, y, alive) -> None:
+        """Extend each animal's track and redraw it as a fading polyline.
+
+        One line strip per animal, oldest vertex nearly transparent and the
+        newest fully opaque, plus a bright dot on the current position. The
+        previous version merged every animal's last ten positions into a single
+        scatter, which around each animal looked like a smear of identical dots
+        — no direction, no history worth the name, and no way to tell at a
+        glance where the animal actually *is*.
+        """
+        n = len(x)
+        while len(self._tracks) < n:
+            self._tracks.append(deque(maxlen=self._trail_len))
+        for i in range(n):
+            self._tracks[i].append((float(x[i]), float(y[i])))
+
+        while len(self._trail_lines) < n:
+            line = gl.GLLinePlotItem(pos=np.zeros((0, 3)), width=2.0,
+                                     antialias=True, mode="line_strip")
+            line.setGLOptions("translucent")
+            line.setVisible(self._agents_visible and self._trails_visible)
+            self.addItem(line)
+            self._trail_lines.append(line)
+
+        for i, line in enumerate(self._trail_lines):
+            if i >= n or len(self._tracks[i]) < 2:
+                line.setData(pos=np.zeros((0, 3)))
+                continue
+            pts = np.asarray(self._tracks[i], float)
+            pos = np.column_stack(
+                [pts[:, 0], pts[:, 1], np.full(len(pts), self._TRACK_Z)])
+            base = self._agent_colors[i]
+            col = np.tile(base, (len(pts), 1))
+            # linear ramp: the tail dissolves, the head is the animal's colour
+            col[:, 3] = base[3] * np.linspace(0.04, 0.95, len(pts))
+            line.setData(pos=pos, color=col)
+
+        # the head of every track, so "where is it now" needs no inspection
+        if n:
+            head = np.column_stack(
+                [x, y, np.full(n, self._TRACK_Z + 0.004)])
+            self._now.setData(pos=head, color=self._agent_colors,
+                              size=9, pxMode=True)
+        else:
+            self._now.setData(pos=np.zeros((0, 3)))
 
     # ------------------------------------------------------------------ #
     def _is_pan(self, ev):

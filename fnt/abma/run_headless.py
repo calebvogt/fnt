@@ -81,6 +81,12 @@ def main(argv=None) -> int:
                    help="Replace the cohort with this many males.")
     d.add_argument("--females", type=int, default=0,
                    help="Replace the cohort with this many females.")
+    d.add_argument("--season", choices=["winter", "spring", "summer", "fall",
+                                        "autumn"],
+                   help="Release date, which at a real site sets day length, "
+                        "solar angle and grass growth together.")
+    d.add_argument("--year", type=int, default=2026,
+                   help="Year for --season (default 2026).")
     d.add_argument("--name", help="Name the experiment (sets the run folder).")
     d.add_argument("--save-config", metavar="PATH",
                    help="Write the composed config to PATH as well.")
@@ -140,7 +146,7 @@ def main(argv=None) -> int:
                   else None),
             males=args.males, females=args.females, species=args.species,
             days=args.days, trials=args.trials, seed=args.seed,
-            name=args.name)
+            name=args.name, season=args.season, year=args.year)
     except ValueError as e:
         p.error(str(e))
     if args.parallel:

@@ -100,11 +100,18 @@ class ArenaCanvas(FigureCanvas):
         # emergent territory map, painted under the arena when switched on
         self._scent_artist = None
         self._scent_visible = False
+        # the living sward: trails the animals wear into it show up here
+        self._grass_artist = None
+        self._grass_visible = False
+        self._sky_artists = []
         self._selected = None
         self._last_xy = None
         self._chambers = [(0.0, 0.0)]
         self._trail_artists = []
-        self._history = deque(maxlen=8)
+        # per-animal position history, drawn as a fading polyline
+        self._tracks = []
+        self._trail_len = 1000
+        self._trails_visible = True
         self._daynight_text = None
         self._edit_layout = False
         self._snap = 0.0
@@ -408,10 +415,12 @@ class ArenaCanvas(FigureCanvas):
         self._agent_scatters = []
         self._sel_artist = None
         self._heading_artist = None
-        # the axes were cleared, so the old image artist is gone with them
+        # the axes were cleared, so the old image artists are gone with them
         self._scent_artist = None
+        self._grass_artist = None
+        self._sky_artists = []
         self._trail_artists = []
-        self._history.clear()
+        self._tracks = []
         self._daynight_text = None
         self.fig.tight_layout()
         self.draw_idle()
@@ -420,12 +429,132 @@ class ArenaCanvas(FigureCanvas):
         """Reset agent markers and trails (call before a new run)."""
         self.draw_arena()
 
+    def set_trail_length(self, n_steps: int) -> None:
+        """How many recorded steps of track to keep behind each animal."""
+        from collections import deque as _deque
+
+        self._trail_len = max(2, int(n_steps))
+        self._tracks = [_deque(t, maxlen=self._trail_len)
+                        for t in getattr(self, "_tracks", [])]
+
+    def set_trails_visible(self, on: bool) -> None:
+        """Hide the tracks without forgetting them, so toggling is free."""
+        self._trails_visible = bool(on)
+
+    def _draw_tracks(self, x, y, colors, sex_m, alive) -> None:
+        """One fading polyline per animal, behind its current position.
+
+        Replaces a scatter of the last eight frames pooled across the cohort,
+        which drew each animal as a smudge of identical grey dots: no
+        direction, no usable history, and nothing marking where the animal
+        actually is right now.
+        """
+        import numpy as np
+        from collections import deque as _deque
+        from matplotlib.collections import LineCollection
+
+        n = len(x)
+        if not hasattr(self, "_tracks"):
+            self._tracks, self._trail_len = [], 1000
+        while len(self._tracks) < n:
+            self._tracks.append(_deque(maxlen=self._trail_len))
+        for i in range(n):
+            self._tracks[i].append((float(x[i]), float(y[i])))
+
+        for artist in self._trail_artists:
+            artist.remove()
+        self._trail_artists = []
+        if not getattr(self, "_trails_visible", True):
+            return
+        if colors is not None:
+            rgb = np.asarray(colors, float)[:, :3]
+        else:
+            rgb = np.array([_MALE_RGBA[:3] if m else _FEMALE_RGBA[:3]
+                            for m in sex_m])
+
+        for i in range(n):
+            pts = np.asarray(self._tracks[i], float)
+            if len(pts) < 2:
+                continue
+            # a LineCollection of per-segment colours: one artist per animal
+            # rather than one per frame, and the alpha ramp gives the track a
+            # readable direction
+            segs = np.stack([pts[:-1], pts[1:]], axis=1)
+            rgba = np.tile(np.append(rgb[i], 1.0), (len(segs), 1))
+            rgba[:, 3] = np.linspace(0.05, 0.85, len(segs))
+            if not alive[i]:
+                rgba[:, :3] = 0.45
+            lc = LineCollection(segs, colors=rgba, linewidths=1.4, zorder=4)
+            self.ax.add_collection(lc)
+            self._trail_artists.append(lc)
+
     def set_scent_visible(self, on: bool) -> None:
         """Show or hide the emergent territory map under the arena."""
         self._scent_visible = bool(on)
         if not on and getattr(self, "_scent_artist", None) is not None:
             self._scent_artist.set_visible(False)
             self.draw_idle()
+
+    def set_grass_visible(self, on: bool) -> None:
+        """Show or hide the sward, which is where trails become visible."""
+        self._grass_visible = bool(on)
+        if not on and getattr(self, "_grass_artist", None) is not None:
+            self._grass_artist.set_visible(False)
+            self.draw_idle()
+
+    def _draw_grass(self, rgba, extent) -> None:
+        """Paint the sward beneath everything, trails and all.
+
+        Below the scent map (zorder 0.5 vs 1) because the two answer different
+        questions — who owns this ground, versus how hard it is to cross — and
+        a trail worn through a territory should be visible inside it.
+        """
+        if rgba is None or not getattr(self, "_grass_visible", False):
+            if getattr(self, "_grass_artist", None) is not None:
+                self._grass_artist.set_visible(False)
+            return
+        if getattr(self, "_grass_artist", None) is None:
+            self._grass_artist = self.ax.imshow(
+                rgba, extent=extent, origin="lower", interpolation="nearest",
+                zorder=0.5)
+        else:
+            self._grass_artist.set_data(rgba)
+            self._grass_artist.set_extent(extent)
+            self._grass_artist.set_visible(True)
+
+    def _draw_sky(self, fr) -> None:
+        """Mark where the sun and moon are, outside the arena walls.
+
+        A top-down view cannot show an elevation angle, so azimuth places the
+        marker around the arena and elevation sets its size and brightness —
+        enough to read "low sun in the northwest, moon just risen" at a glance
+        while a run plays.
+        """
+        import numpy as np
+        for art in self._sky_artists:
+            art.remove()
+        self._sky_artists = []
+        if fr is None or "sun_elevation" not in fr:
+            return
+        w, h = self.arena.width, self.arena.height
+        cx, cy = w / 2, h / 2
+        r = 0.62 * max(w, h)
+        for key_el, key_az, base, name in (
+                ("sun_elevation", "sun_azimuth", "#ffd23f", "sun"),
+                ("moon_elevation", "moon_azimuth", "#dfe6ef", "moon")):
+            elev = float(fr.get(key_el, -90.0))
+            if elev <= 0:                     # below the horizon: not drawn
+                continue
+            # azimuth is degrees clockwise from north; +y is north here
+            az = np.radians(float(fr.get(key_az, 0.0)))
+            x, y = cx + r * np.sin(az), cy + r * np.cos(az)
+            high = np.clip(elev / 60.0, 0.0, 1.0)
+            size = 120 + 380 * high
+            if name == "moon":
+                size *= 0.35 + 0.65 * float(fr.get("moon_illumination", 1.0))
+            self._sky_artists.append(self.ax.scatter(
+                [x], [y], s=size, c=base, alpha=0.35 + 0.6 * high,
+                edgecolors="none", zorder=3, clip_on=False))
 
     def _draw_scent(self, rgba, extent) -> None:
         """Paint the scent field as a translucent layer beneath the animals.
@@ -449,10 +578,13 @@ class ArenaCanvas(FigureCanvas):
 
     def update_agents(self, x, y, sex_m, heading=None, day=None, hour=None,
                       is_day=None, alive=None, colors=None, sizes=None,
-                      shapes=None, scent_rgba=None, scent_extent=None):
+                      shapes=None, scent_rgba=None, scent_extent=None,
+                      grass_rgba=None, grass_extent=None, sky=None):
         """Redraw agent positions (with fading trails) over the static arena."""
         import numpy as np
+        self._draw_grass(grass_rgba, grass_extent)
         self._draw_scent(scent_rgba, scent_extent)
+        self._draw_sky(sky)
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         sex_m = np.asarray(sex_m)
@@ -466,17 +598,7 @@ class ArenaCanvas(FigureCanvas):
         if is_day is not None:
             self.ax.set_facecolor("#20242b" if is_day else "#0c0d11")
 
-        # fading trails from recent history
-        for artist in self._trail_artists:
-            artist.remove()
-        self._trail_artists = []
-        self._history.append((x.copy(), y.copy()))
-        n_hist = len(self._history)
-        for k, (hx, hy) in enumerate(list(self._history)[:-1]):
-            alpha = 0.06 + 0.18 * (k / max(1, n_hist))
-            art = self.ax.scatter(hx, hy, c="#888888", s=10, alpha=alpha,
-                                  linewidths=0, zorder=4)
-            self._trail_artists.append(art)
+        self._draw_tracks(x, y, colors, sex_m, alive)
 
         # current positions — per-agent colour/size, marker by shape
         if colors is not None:

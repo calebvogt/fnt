@@ -58,6 +58,12 @@ VALUE_FIELDS: list[str] = [
     "health", "energy", "hunger", "thirst", "stress", "mass", "bladder",
     # what it has accumulated
     "dist_today", "territory_m2",
+    # the sward it is standing in, and the trail work it has done
+    "grass_cm", "grass_speed_factor", "chewing", "grass_cut_cm",
+    # the sky overhead (constant across the cohort, stored per agent so the
+    # record stays one rectangular table rather than two)
+    "sun_elevation", "moon_elevation", "moon_illumination", "daylight",
+    "night_light",
 ]
 
 #: Small integer per-agent, per-frame quantities (stored int16/int32).
@@ -162,13 +168,22 @@ class RunRecord:
             if value is None:
                 return
             arr = np.asarray(value, np.float32).ravel()
-            vals[:len(arr), _VALUE_INDEX[name]] = arr
+            if arr.size == 1:
+                # a cohort-wide scalar (the sun's elevation, say) is stored on
+                # every row, so the archive stays one rectangular table and a
+                # reader never has to know which fields are per-animal
+                vals[:, _VALUE_INDEX[name]] = arr[0]
+            else:
+                vals[:len(arr), _VALUE_INDEX[name]] = arr
 
         def put_state(name, value):
             if value is None:
                 return
             arr = np.asarray(value).astype(np.int32).ravel()
-            states[:len(arr), _STATE_INDEX[name]] = arr
+            if arr.size == 1:
+                states[:, _STATE_INDEX[name]] = arr[0]
+            else:
+                states[:len(arr), _STATE_INDEX[name]] = arr
 
         for name in VALUE_FIELDS:
             if name in frame:

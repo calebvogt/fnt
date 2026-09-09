@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import numpy as np
 
@@ -33,6 +34,8 @@ from copy import deepcopy
 
 from .config import ExperimentConfig, AgentGroup
 from .scent import ScentField
+from .sward import SwardField
+from .sky import sky_state, growth_factor
 from .physiology import get_food, DEFAULT_FOOD
 from .biology import (
     resolve_traits, apply_drug, TRAIT_TO_ARRAY, _TRAIT_RANGES,
@@ -181,6 +184,24 @@ class Simulation:
         self._physio_on = bool(getattr(getattr(cfg, "physiology", None),
                                        "enabled", False))
 
+        # ---- living grass layer (trails emerge from movement) ----
+        sw = getattr(cfg, "sward", None)
+        self.sward = (SwardField(cfg.arena.width, cfg.arena.height, sw,
+                                 rng=self.rng)
+                      if sw is not None and sw.enabled else None)
+        #: grass height (cm) under each animal, refreshed every step
+        self.grass_cm = np.zeros(n)
+        #: seconds left in the current clipping bout; >0 means "chewing"
+        self.chew_left = np.zeros(n)
+        self.chew_seconds = np.zeros(n)     # cumulative, per animal
+        self.grass_cut_cm = np.zeros(n)     # cumulative cm clipped
+
+        # ---- sky: a real sun and moon for a real place ----
+        sk = getattr(cfg, "sky", None)
+        self.sky_p = sk if sk is not None and sk.enabled else None
+        self._sky = None
+        self._sky_t = -1e18
+
         # ---- olfactory system (receptors + odour signatures) ----
         # Off by default, in which case recognition stays the scalar product
         # `smell_ability x identity_signal` and old configs reproduce exactly.
@@ -281,7 +302,6 @@ class Simulation:
         """Construct founders for group ``g``, released near the arena centre."""
         cfg = self.cfg
         sd = cfg.individual_variation
-        release = np.array([cfg.arena.width / 2, cfg.arena.height / 2])
         delayed = (g.treatment.drug not in ("none", None)
                    and g.treatment.day_offset > 0.0)
         specs = {k: parse_spec(v) for k, v in (g.dists or {}).items()}
@@ -303,7 +323,7 @@ class Simulation:
             self._next_index += 1
             self._next_uid += 1
             self._next_shortid += 1
-            start = release + self.rng.normal(0, 0.15, 2)
+            start = self._release_point()
             metas.append(AgentMeta(
                 index=idx, uid=uid, sexid=f"{g.sex}{shortid}", shortid=shortid,
                 species=g.species, sex=g.sex, group=g.label,
@@ -320,6 +340,45 @@ class Simulation:
                         self._schedule.append(
                             (onset_s, idx, arr, getattr(post, tname)))
         return metas
+
+    #: Arenas narrower than this keep the historical point release under
+    #: 'auto'. A cage is small enough that where you put an animal down does
+    #: not decide the experiment; an enclosure is not.
+    _POINT_RELEASE_MAX_M = 3.0
+
+    def _release_point(self) -> np.ndarray:
+        """Where one founder is put down at t=0.
+
+        A release is part of the design, not an implementation detail. Twelve
+        animals set down inside one body-length of each other in a 523 m²
+        enclosure do not disperse — social attraction holds the clump together
+        and the run measures a scrum rather than a population. See
+        ``ExperimentConfig.release_mode``.
+        """
+        cfg = self.cfg
+        w, h = cfg.arena.width, cfg.arena.height
+        mode = (cfg.release_mode or "auto").lower()
+        margin = 0.05 * min(w, h)
+        if mode == "auto":
+            mode = ("point" if min(w, h) <= self._POINT_RELEASE_MAX_M
+                    else "scatter")
+
+        if mode == "nests":
+            sites = [(o.x, o.y) for o in cfg.arena.objects if o.kind == "nest"]
+            sites += [(z.x, z.y)
+                      for z in getattr(cfg.arena, "resource_zones", [])]
+            if sites:
+                x, y = sites[self._next_uid % len(sites)]
+                spread = cfg.release_scatter_m or 0.25
+                return np.array([x, y]) + self.rng.normal(0, spread, 2)
+            mode = "scatter"          # nowhere to nest; fall back
+
+        if mode == "scatter":
+            lo, hi = margin, np.array([w, h]) - margin
+            return self.rng.uniform(lo, hi, 2)
+
+        centre = np.array([w / 2, h / 2])
+        return centre + self.rng.normal(0, cfg.release_scatter_m or 0.15, 2)
 
     def _init_state_for(self, metas: list[AgentMeta]) -> dict:
         """Fresh per-agent state arrays for ``metas`` (attr name -> array)."""
@@ -460,13 +519,50 @@ class Simulation:
     def _hour(self, elapsed_s: float) -> float:
         return (self.start_dt.hour + elapsed_s / 3600.0) % 24.0
 
+    def when(self, elapsed_s: float):
+        """Wall-clock timestamp at ``elapsed_s`` into the run."""
+        return self.start_dt + timedelta(seconds=float(elapsed_s))
+
+    #: The sun moves ~0.25°/min, so recomputing it more often than this buys
+    #: nothing at any timestep an experiment runs at.
+    _SKY_REFRESH_S = 60.0
+
+    def sky_at(self, elapsed_s: float):
+        """Cached sky for this instant, or ``None`` when the sky is off."""
+        if self.sky_p is None:
+            return None
+        if (self._sky is None
+                or abs(elapsed_s - self._sky_t) >= self._SKY_REFRESH_S):
+            self._sky = sky_state(self.when(elapsed_s), self.sky_p)
+            self._sky_t = elapsed_s
+        return self._sky
+
     def _is_day(self, elapsed_s: float) -> bool:
+        """Daytime — from the real sun outdoors, from the clock indoors."""
+        sky = self.sky_at(elapsed_s)
+        if sky is not None:
+            return sky.is_day
         # day window is [day_start, day_start + 12); night otherwise
         return (self._hour(elapsed_s) - self.cfg.day_start_hour) % 24 < 12
 
     def _activity(self, elapsed_s: float) -> float:
-        return self.cfg.day_activity if self._is_day(elapsed_s) \
-            else self.cfg.night_activity
+        """How hard the cohort is working right now.
+
+        With a sky, day and night are interpolated through twilight rather
+        than switched, so a crepuscular animal gets a dawn and a dusk instead
+        of a step change — and a bright moon suppresses activity, which is one
+        of the better-described behaviours in nocturnal small mammals.
+        """
+        cfg = self.cfg
+        sky = self.sky_at(elapsed_s)
+        if sky is None:
+            return cfg.day_activity if self._is_day(elapsed_s) \
+                else cfg.night_activity
+        lit = sky.daylight
+        base = cfg.night_activity + (cfg.day_activity - cfg.night_activity) * lit
+        if sky.night_light > 0.0:
+            base *= (1.0 - self.sky_p.moonlight_suppression * sky.night_light)
+        return float(base)
 
     def _match_target(self, agent, target: str) -> bool:
         t = (target or "all").strip()
@@ -559,6 +655,18 @@ class Simulation:
         # energy -> speed coupling (low energy is sluggish); config-driven
         f = cfg.energy_speed_coupling
         spd = self.speed * activity * (1.0 - f + f * self.energy / 100.0)
+
+        # --- the sward underfoot: how fast, and how expensive, this is ---
+        if self.sward is not None:
+            self.grass_cm = self.sward.sample(P)
+            # deep grass drags; a worn trail is faster than open ground ever
+            # was, which is the payoff that makes clipping one worth the time
+            spd = spd * self.sward.speed_factor(self.grass_cm)
+
+        # --- clipping bouts: an animal that is cutting a trail stands still --
+        chewing = self._update_chewing(perc.get("want_chew"), dt)
+        if chewing.any():
+            spd = np.where(chewing, 0.0, spd)
         # "settled" = fed, watered, and standing on familiar ground. With scent
         # marking that means inside its own marked patch (emergent); without
         # it, inside the prescribed home-range radius (legacy).
@@ -587,6 +695,20 @@ class Simulation:
         self.home[self.alive] += ((self.P[self.alive] - self.home[self.alive])
                                   * (dt / self._settle_tau_s))
 
+        # --- the sward changes because they were here -------------------- #
+        # Walking wears it down a little, clipping a lot; both leave a route
+        # that is cheaper for EVERY animal, not just the one that made it.
+        if self.sward is not None:
+            self.sward.trample(self.P, np.where(self.alive, step_dist, 0.0))
+            cut = self.sward.chew(self.P, dt, chewing & self.alive)
+            self.grass_cut_cm += cut
+            self.chew_seconds += np.where(chewing, dt, 0.0)
+            season = (growth_factor(self.when(elapsed_s))
+                      if self.sky_p is not None and self.sky_p.seasonal_growth
+                      else 1.0)
+            self.sward.grow(dt, season)
+            self.grass_cm = self.sward.sample(self.P)
+
         # --- scent marking (marks fade, then animals lay new ones) ---
         if self.scent is not None:
             self._update_scent(dt, perc.get("scent_foreign"))
@@ -614,6 +736,8 @@ class Simulation:
         # --- baseline activity label (events may override to flee/mate) ---
         self.activity = np.where(
             satiated, 0, np.where((need_food > 0) | (need_water > 0), 1, 2))
+        if chewing.any():
+            self.activity = np.where(chewing, 6, self.activity)
         self.activity[~self.alive] = 5
 
         # --- mortality (starvation or fatal injury drive health to 0) ---
@@ -631,6 +755,35 @@ class Simulation:
             self._resolve_events(elapsed_s, dt, dist, rec_j, events)
 
     # ------------------------------------------------------------------ #
+    def _update_chewing(self, want_chew, dt: float) -> np.ndarray:
+        """Advance the clipping state machine; returns who is chewing now.
+
+        A bout is committed once it starts: the animal stops, and stays stopped
+        for a time proportional to how tall the grass is
+        (``chew_seconds_per_cm``). That commitment is what makes clipping a
+        real decision rather than a free action taken every step — the cost is
+        the foraging time it displaces, and a tall sward costs more of it.
+        """
+        n = self.n
+        if self.sward is None:
+            return np.zeros(n, bool)
+        if len(self.chew_left) != n:            # the roster grew mid-run
+            pad = n - len(self.chew_left)
+            self.chew_left = np.concatenate([self.chew_left, np.zeros(pad)])
+            self.chew_seconds = np.concatenate([self.chew_seconds,
+                                                np.zeros(pad)])
+            self.grass_cut_cm = np.concatenate([self.grass_cut_cm,
+                                                np.zeros(pad)])
+        self.chew_left = np.maximum(0.0, self.chew_left - dt)
+        if want_chew is not None and np.any(want_chew):
+            starting = np.asarray(want_chew, bool) & (self.chew_left <= 0.0)
+            if starting.any():
+                bout = self.sward.chew_bout_s(self.grass_cm)
+                self.chew_left = np.where(starting, bout, self.chew_left)
+        # dead animals do not clip
+        self.chew_left = np.where(self.alive, self.chew_left, 0.0)
+        return self.chew_left > 0.0
+
     def _seek(self, P, targets, need):
         d = np.linalg.norm(P[:, None, :] - targets[None, :, :], axis=2)
         nearest = np.argmin(d, axis=1)
@@ -814,6 +967,12 @@ class Simulation:
         # ---- energy out ------------------------------------------------- #
         kj_out = p.basal_kj(mass, self.metabolism, dt)
         kj_out = kj_out + p.locomotion_kj(mass, step_dist)
+        if self.sward is not None:
+            # Forcing a body through standing grass costs on top of the
+            # flat-ground price, per metre and per centimetre of sward. This is
+            # what makes a worn trail *cheaper* as well as quicker, and so what
+            # makes maintaining one pay for itself.
+            kj_out = kj_out + self.sward.push_kj(mass, step_dist, self.grass_cm)
         kj_out[~alive] = 0.0
 
         self.energy = np.clip(
@@ -1216,10 +1375,19 @@ class Simulation:
                             self.energy[[i, j]] - 1.0, 0, 100)
             else:
                 # --- same-sex contest -> winner/loser, damage, dominance ---
-                # Contests happen during active patrol — not while nesting/huddling
-                # (rest) or feeding. At least one animal must be roaming, so
-                # affiliative huddles and shared foraging don't register as fights.
-                if self.activity[i] != 2 and self.activity[j] != 2:
+                # A contest is about ground, not about walking. The thing that
+                # must NOT register as a fight is an affiliative huddle — and a
+                # huddle is *both* animals settled together, so that is what
+                # this excludes.
+                #
+                # The rule used to require at least one animal to be ROAMING.
+                # That was wrong in exactly the case the enclosure model is
+                # for: once animals successfully settle they rest ~84% of the
+                # time, only ~2% of same-sex contacts had anyone roaming, and a
+                # resident was structurally incapable of defending its patch
+                # against an intruder walking through it. Dominance could not
+                # form, so `dominance_<trial>.csv` was empty of content.
+                if self.activity[i] == 0 and self.activity[j] == 0:
                     continue
                 # one contest per dyad per cooldown; provocation scales with the
                 # aggression of BOTH animals, so affiliative (low-aggression)
@@ -1389,6 +1557,19 @@ class Simulation:
                             else np.zeros(n))
         return out
 
+    def _environment_summary(self, elapsed: float) -> dict:
+        """Per-agent environment state: the sward underfoot, and clipping."""
+        n = self.n
+        if self.sward is None:
+            return {"grass_cm": np.zeros(n), "grass_speed_factor": np.ones(n),
+                    "chewing": np.zeros(n), "grass_cut_cm": np.zeros(n)}
+        return {
+            "grass_cm": self.grass_cm.copy(),
+            "grass_speed_factor": self.sward.speed_factor(self.grass_cm),
+            "chewing": (self.chew_left > 0).astype(float),
+            "grass_cut_cm": self.grass_cut_cm.copy(),
+        }
+
     def _perception_summary(self) -> dict:
         """Per-agent summary of what each animal was sensing last step."""
         n = self.n
@@ -1427,6 +1608,22 @@ class Simulation:
         what it was sensing when it decided.
         """
         extra = {}
+        sky = self.sky_at(elapsed)
+        if sky is not None:
+            # the sun and moon are part of the world, so the views can draw
+            # them and an analysis can ask what the light was doing
+            extra.update(
+                sun_elevation=sky.sun_elevation, sun_azimuth=sky.sun_azimuth,
+                moon_elevation=sky.moon_elevation,
+                moon_azimuth=sky.moon_azimuth,
+                moon_phase=sky.moon_phase,
+                moon_illumination=sky.moon_illumination,
+                daylight=sky.daylight, night_light=sky.night_light)
+        if self.sward is not None and self.emit_scent_map:
+            got = self.sward.image()
+            extra["grass_rgba"], extra["grass_extent"] = got
+            extra["grass_mean_cm"] = self.sward.mean_height()
+            extra["trail_fraction"] = self.sward.trail_fraction()
         if self.emit_scent_map:
             got = self.territory_image()
             if got is not None:
@@ -1434,6 +1631,7 @@ class Simulation:
         return {
             **self._drive_magnitudes(),
             **self._perception_summary(),
+            **self._environment_summary(elapsed),
             **extra,
             "marks_made": self.marks_made.copy(),
             "trial": self.trial_id, "elapsed": elapsed,

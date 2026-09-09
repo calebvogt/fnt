@@ -153,7 +153,7 @@ def test_pages_switch_without_error(panel, running_sim):
         pages = panel.pages + [panel.coupling]
         shown.append([k for k, w in enumerate(pages) if not w.isHidden()])
     # exactly one page visible at a time, and each selection shows its own
-    assert shown == [[0], [1], [2], [3]]
+    assert shown == [[i] for i in range(panel.picker.count())]
 
 
 def test_every_named_drive_exists_in_the_record_schema():

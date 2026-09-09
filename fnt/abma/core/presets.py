@@ -14,10 +14,14 @@ from typing import Callable
 from .config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, Zone, Pole, AntennaBox, AntennaLayout, WaterTower,
-    ResourceZone, Hut, GrassSpec, ScentParams, blank_experiment,
-    default_vole_experiment,
+    ResourceZone, Hut, GrassSpec, ScentParams, SwardParams, SkyParams,
+    blank_experiment, default_vole_experiment,
 )
 from .physiology import preset_params
+from .sky import season_start
+
+#: VoleTerra's actual site, so sunrise, sunset and day length are its own.
+BOULDER_LAT, BOULDER_LON, BOULDER_TZ = 40.0150, -105.2705, -7.0
 
 
 def _live_world(cfg: ExperimentConfig,
@@ -179,10 +183,59 @@ def voleterra() -> ExperimentConfig:
                                        exploration=0.5, base_speed=0.11),
                    dists={"mass": "N(38,4)"}),
     ]
-    return _live_world(ExperimentConfig(
+    cfg = _live_world(ExperimentConfig(
         name="voleterra", arena=arena, groups=voles,
         days=10.0, dt=2.0, record_interval=10.0, n_trials=1,
-        start_datetime="2025-11-07T18:00:00"))
+        start_datetime=season_start("summer")))
+    # VoleTerra is a real outdoor site, so it gets a real sky and a real
+    # sward. Boulder's latitude decides day length and the sun's angle; the
+    # grass is something the animals push through, wear down and clip into
+    # runways. Both are specific to this preset on purpose — the enclosure we
+    # can describe exactly is where the building blocks get proven before
+    # they are offered for arbitrary arenas.
+    cfg.sky = SkyParams(enabled=True, latitude=BOULDER_LAT,
+                        longitude=BOULDER_LON, timezone_hours=BOULDER_TZ)
+    cfg.sward = SwardParams(enabled=True)
+    # The scent grid has to scale with the enclosure. A 10 cm cell is right in
+    # a 2.2 m cage (484 cells); across 75 ft it is 52,000 cells, and a cohort's
+    # whole daily marking budget covers about 1% of them — so no territory can
+    # form however well the animals behave. Half-metre cells put the field back
+    # at a resolution a marking budget can actually cover, and an outdoor
+    # animal reads marks from further away than a caged one.
+    cfg.scent = ScentParams(enabled=True, half_life_h=24.0,
+                            cell_size=0.5, perception_r=1.5)
+    # How far an animal notices another animal. 0.6 m is a quarter of a 2.2 m
+    # cage and effectively blind across 523 m²: measured, opposite-sex pairs
+    # never came into contact at all and the cohort produced *zero* matings in
+    # three days, because the attraction that brings them together only acts
+    # inside this radius.
+    #
+    # Swept over 3-day runs (6M/6F, one trial per cell, so the counts bounce —
+    # this is chosen on the joint picture, not a precise optimum):
+    #
+    #   perception_r   fights  matings  territory
+    #        0.6 m        48        0      66 m²
+    #        1.2 m        31       49      55 m²
+    #        2.0 m        63       55      57 m²
+    #        3.0 m        86       79      48 m²
+    #
+    # 2.0 m buys both kinds of interaction for ~13% of the territory the
+    # isolated cohort held; 3.0 m keeps buying interaction but starts eating
+    # the spatial structure the enclosure exists to produce. Detecting a moving
+    # conspecific at 2 m by sound and scent is unremarkable for a field vole —
+    # and note it exceeds the mark-reading radius above, which is right: a
+    # moving animal advertises itself, a deposited mark does not.
+    #
+    # k_social is deliberately left at its default. The same sweep on the gain
+    # (at 0.6 m) reached only 16-17 matings even at 2.5-4.0, while costing
+    # territory and condition — it scales a force that almost never activates,
+    # so widening the radius it acts within is the honest lever.
+    cfg.policy.perception_r = 2.0
+    # a field cohort has to cross the enclosure to eat and drink, which the
+    # cage-calibrated rates do not pay for (see physiology.PHYSIOLOGY_PRESETS)
+    cfg.physiology = preset_params("Field enclosure")
+    cfg.release_mode = "auto"
+    return cfg
 
 
 def voleterra_2026_t001() -> ExperimentConfig:

@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
 )
 
 _ACTIVITY = {0: "resting", 1: "foraging", 2: "roaming", 3: "fleeing",
-             4: "mating", 5: "dead"}
+             4: "mating", 5: "dead", 6: "clipping"}
 _MALE = "#4a90d9"
 _FEMALE = "#e0559a"
 

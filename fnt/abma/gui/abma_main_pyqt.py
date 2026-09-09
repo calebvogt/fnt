@@ -30,7 +30,7 @@ from ..core.config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
     default_dynamics, GrassSpec, blank_experiment, default_vole_experiment,
-    ScentParams, OlfactionParams,
+    ScentParams, OlfactionParams, SwardParams, SkyParams,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -246,8 +246,7 @@ class ABMAWindow(QMainWindow):
         pcfg.n_trials = 1
         pcfg.enable_mortality = False
         self._preview_sim = Simulation(pcfg, trial_index=0)
-        self._preview_sim.emit_scent_map = (
-            hasattr(self, "btn_scent") and self.btn_scent.isChecked())
+        self._preview_sim.emit_scent_map = self._sync_map_rasterising()
         self._preview_elapsed = 0.0
         for v in self._views():
             v.set_arena(cfg.arena)          # single chamber for the preview
@@ -501,6 +500,22 @@ class ABMAWindow(QMainWindow):
             "(colour = whose marks dominate each patch, opacity = how fresh)")
         self.btn_scent.toggled.connect(self._on_toggle_scent)
         tl.addWidget(self.btn_scent)
+        self._trail_state = 2           # index into _TRAIL_LENGTHS
+        self.btn_trail = QToolButton()
+        self.btn_trail.setText("〰")
+        self.btn_trail.setToolTip(
+            "Track length: how many recorded steps of path trail each "
+            "animal. The head of the track is its current position.")
+        self.btn_trail.clicked.connect(self._cycle_trail)
+        tl.addWidget(self.btn_trail)
+        self.btn_grass_map = QToolButton()
+        self.btn_grass_map.setText("🌱")
+        self.btn_grass_map.setCheckable(True)
+        self.btn_grass_map.setToolTip(
+            "Sward: show the living grass layer. Dark = worn to a runway, "
+            "green = full height. Trails appear here as the animals make them.")
+        self.btn_grass_map.toggled.connect(self._on_toggle_grass_map)
+        tl.addWidget(self.btn_grass_map)
         self._resource_state = -1       # -1 off, 0 lids-on, 1 lids-off
         self.btn_resources = QToolButton()
         self.btn_resources.setText("💧🌿")
@@ -532,10 +547,102 @@ class ABMAWindow(QMainWindow):
         for v in self._views():
             if hasattr(v, "set_scent_visible"):
                 v.set_scent_visible(on)
-        if self._preview_sim is not None:
-            self._preview_sim.emit_scent_map = on
+        self._sync_map_rasterising()
         if self._last_frame is not None:
             self._push_frame(self._active_view(), self._last_frame)
+
+    def _on_season_changed(self, index: int):
+        """Picking a season moves the release date to that solstice/equinox."""
+        from ..core.sky import season_start
+
+        if index <= 0 or getattr(self, "_loading", False):
+            return
+        season = self.in_season.currentText()
+        try:
+            when = season_start(season, self._start_dt_year())
+        except ValueError:
+            return
+        self.in_start.setText(when)
+        self._refresh_daylength()
+        self._on_arena_edit()
+
+    def _start_dt_year(self) -> int:
+        """Year currently in the start-date box; today's if it is unparseable."""
+        import datetime as _dt
+        try:
+            return _dt.datetime.fromisoformat(self.in_start.text().strip()).year
+        except (ValueError, AttributeError):
+            return _dt.date.today().year
+
+    def _refresh_daylength(self):
+        """Show what the chosen site and date actually mean for the animals."""
+        from datetime import datetime
+        from ..core.sky import day_length_hours, season_of
+        from ..core.config import SkyParams
+
+        # the Site box is built before the release-date field, so this can be
+        # reached during construction with nothing to read yet
+        if not hasattr(self, "lbl_daylen") or not hasattr(self, "in_start"):
+            return
+        try:
+            when = datetime.fromisoformat(self.in_start.text().strip())
+        except (ValueError, AttributeError):
+            self.lbl_daylen.setText("")
+            return
+        p = SkyParams(latitude=self.in_lat.value(),
+                      longitude=self.in_lon.value(),
+                      timezone_hours=self.in_tz.value())
+        self.lbl_daylen.setText(
+            f"{when:%d %b %Y}  ·  {season_of(when)}  ·  "
+            f"day length {day_length_hours(when, p):.1f} h")
+
+    #: selectable track lengths, in recorded steps. "Off" is there because a
+    #: dense cohort in a small arena is easier to read with no tracks at all.
+    _TRAIL_LENGTHS = [(0, "off"), (100, "100"), (1000, "1000"), (5000, "5000")]
+
+    def _cycle_trail(self, *_):
+        """Cycle how much of each animal's recent path is drawn."""
+        self._trail_state = (self._trail_state + 1) % len(self._TRAIL_LENGTHS)
+        self._apply_trail_length()
+
+    def _apply_trail_length(self):
+        n, label = self._TRAIL_LENGTHS[self._trail_state]
+        self.btn_trail.setText("〰" if n else "⌁")
+        self.btn_trail.setToolTip(
+            f"Track length: {label} steps. The head of the track is the "
+            f"animal's current position. Click to cycle.")
+        for v in self._views():
+            if hasattr(v, "set_trail_length"):
+                # 0 means "no track"; two points is the minimum a line needs,
+                # and at two the ramp is invisible, which reads as off
+                v.set_trail_length(max(2, n))
+                if hasattr(v, "set_trails_visible"):
+                    v.set_trails_visible(n > 0)
+        if self._last_frame is not None:
+            self._push_frame(self._active_view(), self._last_frame)
+
+    def _on_toggle_grass_map(self, on):
+        """Show the sward the animals are wearing trails into.
+
+        Shares the map-rasterising switch with the territory view, since both
+        are painted from the same per-frame image budget and neither should be
+        computed while nobody is looking at it.
+        """
+        for v in self._views():
+            if hasattr(v, "set_grass_visible"):
+                v.set_grass_visible(on)
+        self._sync_map_rasterising()
+        if self._last_frame is not None:
+            self._push_frame(self._active_view(), self._last_frame)
+
+    def _sync_map_rasterising(self):
+        """Ask the live sim for map images only while a map is on screen."""
+        want = ((hasattr(self, "btn_scent") and self.btn_scent.isChecked())
+                or (hasattr(self, "btn_grass_map")
+                    and self.btn_grass_map.isChecked()))
+        if self._preview_sim is not None:
+            self._preview_sim.emit_scent_map = want
+        return want
 
     def _on_toggle_grass(self, on):
         for v in self._views():
@@ -1471,6 +1578,104 @@ class ABMAWindow(QMainWindow):
         self.in_olf_on.toggled.connect(self._on_arena_edit)
         lay.addWidget(olf_box)
 
+        # ---- site & season: a real sun and moon over a real place --------- #
+        sky_box = QGroupBox("Site & season")
+        kl = QVBoxLayout(sky_box)
+        self.in_sky_on = QCheckBox("Real sun and moon for this latitude")
+        self.in_sky_on.setToolTip(
+            "Off: day is a fixed window on the clock, the same all year.\n"
+            "On: sunrise, sunset, twilight and day length come from the "
+            "site's latitude and the date, and moonlight suppresses activity "
+            "at night the way it does in nocturnal small mammals.")
+        kl.addWidget(self.in_sky_on)
+        k_hint = QLabel(
+            "Choosing a season sets the release date — which outdoors means "
+            "day length, solar angle and grass growth all change together.")
+        k_hint.setWordWrap(True)
+        k_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        kl.addWidget(k_hint)
+        kf = QFormLayout()
+        self.in_season = QComboBox()
+        self.in_season.addItems(["(keep date)", "spring", "summer", "fall",
+                                 "winter"])
+        self.in_season.setToolTip("Sets the release date to that solstice or "
+                                  "equinox")
+        self.in_season.currentIndexChanged.connect(self._on_season_changed)
+        self.in_lat = _dspin(-89.0, 89.0, 40.015, 0.001, "°N")
+        self.in_lat.setDecimals(4)
+        self.in_lon = _dspin(-180.0, 180.0, -105.2705, 0.001, "°E")
+        self.in_lon.setDecimals(4)
+        self.in_tz = _dspin(-12.0, 14.0, -7.0, 0.5, " h")
+        self.in_tz.setToolTip("UTC offset the run's clock is in")
+        self.in_moon = _dspin(0.0, 1.0, 0.25, 0.05)
+        self.in_moon.setToolTip(
+            "How much a full moon suppresses activity (free parameter)")
+        for lab, wdg in [("Season", self.in_season),
+                         ("Latitude", self.in_lat),
+                         ("Longitude", self.in_lon),
+                         ("UTC offset", self.in_tz),
+                         ("Moonlight suppression", self.in_moon)]:
+            kf.addRow(lab, wdg)
+        kl.addLayout(kf)
+        self.lbl_daylen = QLabel("")
+        self.lbl_daylen.setStyleSheet("color:#8a9099; font-size:10px;")
+        kl.addWidget(self.lbl_daylen)
+        self._sky_fields = (self.in_season, self.in_lat, self.in_lon,
+                            self.in_tz, self.in_moon)
+        for fld in self._sky_fields:
+            fld.setEnabled(False)
+        self.in_sky_on.toggled.connect(
+            lambda on: [f.setEnabled(on) for f in self._sky_fields])
+        self.in_sky_on.toggled.connect(self._on_arena_edit)
+        lay.addWidget(sky_box)
+
+        # ---- the living sward: trails the animals make and share ---------- #
+        sw_box = QGroupBox("Sward (living grass)")
+        wl = QVBoxLayout(sw_box)
+        self.in_sward_on = QCheckBox(
+            "Grass the animals push through, wear down and clip")
+        self.in_sward_on.setToolTip(
+            "Deep sward slows movement and costs energy; a worn trail is "
+            "faster and cheaper than open ground ever was.\n"
+            "Walking wears it slowly, clipping several times faster — but the "
+            "animal has to stop to clip, and gets no food from it.\n"
+            "A trail benefits EVERY animal, so this is the first part of an "
+            "ABMA world that is genuinely shared.")
+        wl.addWidget(self.in_sward_on)
+        w_hint = QLabel(
+            "Regrowth is what makes a trail need maintaining: without it the "
+            "enclosure is flattened once and there is no ongoing decision.")
+        w_hint.setWordWrap(True)
+        w_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        wl.addWidget(w_hint)
+        wf = QFormLayout()
+        self.in_sw_min = _dspin(0.0, 60.0, 6.0, 0.5, " cm")
+        self.in_sw_max = _dspin(0.0, 60.0, 10.0, 0.5, " cm")
+        self.in_sw_regrow = _dspin(0.0, 20.0, 0.8, 0.1, " cm/day")
+        self.in_sw_trample = _dspin(0.0, 2.0, 0.05, 0.01, " cm/m")
+        self.in_sw_chewmult = _dspin(1.0, 20.0, 4.0, 0.5, "x")
+        self.in_sw_chewmult.setToolTip("How much faster clipping is than walking")
+        self.in_sw_slow = _dspin(0.05, 1.0, 0.45, 0.05, "x")
+        self.in_sw_fast = _dspin(1.0, 3.0, 1.35, 0.05, "x")
+        for lab, wdg in [("Height at release (min)", self.in_sw_min),
+                         ("Height at release (max)", self.in_sw_max),
+                         ("Regrowth", self.in_sw_regrow),
+                         ("Wear from walking", self.in_sw_trample),
+                         ("Clipping speed-up", self.in_sw_chewmult),
+                         ("Speed in full sward", self.in_sw_slow),
+                         ("Speed on a bare trail", self.in_sw_fast)]:
+            wf.addRow(lab, wdg)
+        wl.addLayout(wf)
+        self._sward_fields = (self.in_sw_min, self.in_sw_max, self.in_sw_regrow,
+                              self.in_sw_trample, self.in_sw_chewmult,
+                              self.in_sw_slow, self.in_sw_fast)
+        for fld in self._sward_fields:
+            fld.setEnabled(False)
+        self.in_sward_on.toggled.connect(
+            lambda on: [f.setEnabled(on) for f in self._sward_fields])
+        self.in_sward_on.toggled.connect(self._on_arena_edit)
+        lay.addWidget(sw_box)
+
         # ---- physiology: energy in / energy out, water in / urine out ----
         phys_box = QGroupBox("Physiology")
         yl = QVBoxLayout(phys_box)
@@ -1862,6 +2067,11 @@ class ABMAWindow(QMainWindow):
         if hasattr(view, "set_scent_visible") and "scent_rgba" in fr:
             kw["scent_rgba"] = fr["scent_rgba"]
             kw["scent_extent"] = fr.get("scent_extent")
+        if hasattr(view, "set_grass_visible"):
+            if "grass_rgba" in fr:
+                kw["grass_rgba"] = fr["grass_rgba"]
+                kw["grass_extent"] = fr.get("grass_extent")
+            kw["sky"] = fr
         view.update_agents(
             fr["x"], fr["y"], fr["sex_m"], heading=fr.get("heading"),
             day=fr.get("day"), hour=fr.get("hour"), is_day=fr.get("is_day"),
@@ -1929,6 +2139,37 @@ class ABMAWindow(QMainWindow):
                 anonymous_weight=self.in_scent_anon.value(),
             ),
             physiology=self._physiology_from_ui(),
+            sky=SkyParams(
+                enabled=self.in_sky_on.isChecked(),
+                latitude=self.in_lat.value(),
+                longitude=self.in_lon.value(),
+                timezone_hours=self.in_tz.value(),
+                night_elevation_deg=self._sky.night_elevation_deg,
+                moonlight_suppression=self.in_moon.value(),
+                seasonal_growth=self._sky.seasonal_growth,
+            ),
+            sward=SwardParams(
+                enabled=self.in_sward_on.isChecked(),
+                cell_size=self._sward.cell_size,
+                initial_min_cm=self.in_sw_min.value(),
+                initial_max_cm=self.in_sw_max.value(),
+                patchiness=self._sward.patchiness,
+                max_cm=max(self._sward.max_cm, self.in_sw_max.value()),
+                regrowth_cm_per_day=self.in_sw_regrow.value(),
+                trample_cm_per_m=self.in_sw_trample.value(),
+                chew_rate_multiplier=self.in_sw_chewmult.value(),
+                chew_cm_per_s=self._sward.chew_cm_per_s,
+                chew_floor_cm=self._sward.chew_floor_cm,
+                chew_seconds_per_cm=self._sward.chew_seconds_per_cm,
+                speed_ref_cm=self._sward.speed_ref_cm,
+                speed_min_factor=self.in_sw_slow.value(),
+                speed_max_factor=self.in_sw_fast.value(),
+                push_kj_per_kg_m_per_cm=self._sward.push_kj_per_kg_m_per_cm,
+                chew_threshold_cm=self._sward.chew_threshold_cm,
+                chew_min_own_scent=self._sward.chew_min_own_scent,
+                chew_max_need=self._sward.chew_max_need,
+                chew_rate_h=self._sward.chew_rate_h,
+            ),
             olfaction=OlfactionParams(
                 enabled=self.in_olf_on.isChecked(),
                 n_channels=self.in_olf_ch.value(),
@@ -1960,6 +2201,43 @@ class ABMAWindow(QMainWindow):
             self.in_phys_on.blockSignals(True)
             self.in_phys_on.setChecked(cfg.physiology.enabled)
             self.in_phys_on.blockSignals(False)
+        # sky/sward fields with no widget of their own ride along on the
+        # window, so a tuned config survives the GUI round-trip untouched
+        self._sky = copy.deepcopy(cfg.sky)
+        self._sward = copy.deepcopy(cfg.sward)
+        if hasattr(self, "in_sky_on"):
+            for fld, v in ((self.in_lat, cfg.sky.latitude),
+                           (self.in_lon, cfg.sky.longitude),
+                           (self.in_tz, cfg.sky.timezone_hours),
+                           (self.in_moon, cfg.sky.moonlight_suppression)):
+                fld.blockSignals(True)
+                fld.setValue(v)
+                fld.blockSignals(False)
+                fld.setEnabled(cfg.sky.enabled)
+            self.in_season.blockSignals(True)
+            self.in_season.setCurrentIndex(0)     # the date is already set
+            self.in_season.setEnabled(cfg.sky.enabled)
+            self.in_season.blockSignals(False)
+            self.in_sky_on.blockSignals(True)
+            self.in_sky_on.setChecked(cfg.sky.enabled)
+            self.in_sky_on.blockSignals(False)
+            self._refresh_daylength()
+        if hasattr(self, "in_sward_on"):
+            for fld, v in ((self.in_sw_min, cfg.sward.initial_min_cm),
+                           (self.in_sw_max, cfg.sward.initial_max_cm),
+                           (self.in_sw_regrow, cfg.sward.regrowth_cm_per_day),
+                           (self.in_sw_trample, cfg.sward.trample_cm_per_m),
+                           (self.in_sw_chewmult,
+                            cfg.sward.chew_rate_multiplier),
+                           (self.in_sw_slow, cfg.sward.speed_min_factor),
+                           (self.in_sw_fast, cfg.sward.speed_max_factor)):
+                fld.blockSignals(True)
+                fld.setValue(v)
+                fld.blockSignals(False)
+                fld.setEnabled(cfg.sward.enabled)
+            self.in_sward_on.blockSignals(True)
+            self.in_sward_on.setChecked(cfg.sward.enabled)
+            self.in_sward_on.blockSignals(False)
         if hasattr(self, "in_olf_on"):
             for fld, v in ((self.in_olf_ch, cfg.olfaction.n_channels),
                            (self.in_olf_disc, cfg.olfaction.discrimination),
@@ -2032,6 +2310,9 @@ class ABMAWindow(QMainWindow):
         self.in_dayact.setValue(cfg.day_activity)
         self.in_nightact.setValue(cfg.night_activity)
         self.in_start.setText(cfg.start_datetime)
+        # the Site box was populated before this field existed, so the day
+        # length it showed was for whatever date the box happened to hold
+        self._refresh_daylength()
         self.in_variation.setValue(cfg.individual_variation)
         self.in_mortality.setChecked(cfg.enable_mortality)
         self.in_espeed.setValue(cfg.energy_speed_coupling)
@@ -2279,7 +2560,7 @@ class ABMAWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
         self.worker = ABMARunWorker(cfg, project_dir,
                                     analyze=self.in_analyze.isChecked(),
-                                    scent_map=self.btn_scent.isChecked())
+                                    scent_map=self._sync_map_rasterising())
         self.worker.progress.connect(self._on_progress)
         self.worker.frame.connect(self._on_frame)
         self.worker.agents.connect(self.inspector.set_population)

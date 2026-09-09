@@ -43,9 +43,12 @@ def build_window(cfg: ExperimentConfig, out_dir: str | None = None,
         os.makedirs(out_dir, exist_ok=True)
         win.in_outdir.setText(out_dir)
     if territory_map:
-        # the emergent territory mosaic is the thing worth watching in a
-        # scent-marking run, and it is off by default
+        # The two things worth watching in a field run are both off by
+        # default: the territory mosaic the marks build, and the trails the
+        # animals wear into the sward. Switch on whichever the config can
+        # actually produce.
         win.btn_scent.setChecked(bool(cfg.scent.enabled))
+        win.btn_grass_map.setChecked(bool(cfg.sward.enabled))
     win._rebuild_preview()
     if select is not None and win.science.roster.cards:
         win._select_agent(select, from_roster=True)

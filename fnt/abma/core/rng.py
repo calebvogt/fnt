@@ -55,6 +55,7 @@ CH_FIGHT_OUTCOME = 3  # who wins a contest
 CH_MATE = 4           # mating hazard
 CH_OLFACTION = 5      # receptor / perceptual noise in the olfactory model
 CH_SPARE = 6          # reserved
+CH_CHEW = 7           # whether to stop and clip the sward this step
 
 
 def _splitmix64(x: np.ndarray) -> np.ndarray:

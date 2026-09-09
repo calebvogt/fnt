@@ -43,6 +43,8 @@ fnt/fnt/abma/
     policy.py               decision policies + the drive decomposition
     simulation.py           Simulation: physics, physiology, combat, events
     scent.py                decaying grid of identity-carrying marks
+    sward.py                living grass: trails they wear and share
+    sky.py                  sun, moon and season for a real site
     physiology.py           energy/water budget in real units
     compose.py              describe a run in one line -> ExperimentConfig
     analysis.py             built-in socio-spatial + dominance analysis
@@ -474,6 +476,164 @@ study as its base.
 
 A 5-day, 12-animal VoleTerra run is ~216,000 steps and takes about **3 minutes**
 — fast enough to watch end to end.
+
+## The sward: an environment they wear down and share
+
+`core/sward.py`, on by default in the VoleTerra preset.
+
+Everything else an ABMA animal changes, it changes for itself — its energy, its
+marks, its memory of home. Grass is the first part of the world that is
+genuinely **common**. An animal that walks a route flattens it, and the
+flattened route is then cheaper and faster for *every* animal, including ones
+that never contributed. Runway networks are one of the most conspicuous things
+voles actually do in the field, and they are not explicable from an individual
+optimum.
+
+Three couplings:
+
+* **Height slows movement.** The speed multiplier is anchored at
+  `speed_ref_cm` (factor 1) and runs from 1.35× on a worn trail down to 0.45×
+  in a full-height sward.
+* **Height costs energy.** Pushing through grass is charged per metre *and* per
+  centimetre, on top of flat-ground locomotion. A trail is cheaper as well as
+  quicker, which is what makes maintaining one rational.
+* **Movement and clipping lower it.** Walking wears it slowly; clipping is 4×
+  faster — but the animal must **stop**, for a bout proportional to the sward
+  height. Clipping yields **no energy**: the cost of trail maintenance is the
+  foraging time it displaces and nothing else. (Real voles do eat what they
+  clip; separating the two is a deliberate choice so trail-building and feeding
+  can be told apart in a result.)
+
+Regrowth is what makes it a *maintenance* problem rather than a one-off
+demolition — without it the first week flattens the enclosure permanently and
+there is no ongoing decision to study. Growth scales with the season.
+
+The clipping decision reads the scent field: an animal clips where the grass is
+worth cutting, nothing more urgent is pressing, **and its own marks are already
+on the ground**. So trails form along routes an animal already uses, and belong
+to settled animals — a cohort still scrambling for food never builds any.
+
+Measured on VoleTerra, 12 animals, 5 days, summer: **11.6% of the enclosure
+worn into runway**, whole-enclosure mean sward steady at 7.9 cm (regrowth
+balancing wear while local trails deepen), and clipping effort ranging from 1.5
+to 28 minutes per animal per day — some animals invest in trails and some free-ride.
+
+Watch it with the 🌱 toolbar toggle; dark ground is worn runway.
+
+## Sun, moon and season
+
+`core/sky.py`. The original day/night was a switch on the clock — right for a
+light-cycle room, wrong for a field enclosure, where "does this cohort space
+itself differently in December than in June" needs day length and twilight to
+be produced rather than typed in.
+
+Given a latitude, longitude and date it computes solar elevation and azimuth
+(standard NOAA algorithm), moon position and phase (a truncated lunar series),
+day length, and a smooth twilight ramp so a crepuscular animal gets a dawn and
+a dusk instead of a step change. Moonlight suppresses night activity, which is
+one of the better-described behaviours in nocturnal small mammals.
+
+VoleTerra ships with its actual site — Boulder, Colorado (40.015 N, 105.271 W).
+Verified against known geometry: solar noon elevation 73.4° at the summer
+solstice and 26.5° at the winter one, due south at noon, day length 14.9 h vs
+9.2 h.
+
+Season is how you say all of that at once:
+
+```bash
+python -m fnt.abma --preset voleterra --males 6 --females 6 --days 5 \
+    --season winter --watch
+```
+
+Choosing a season sets the release date, and at a real latitude day length,
+solar angle and grass growth then all change together — which is the point of
+asking for a season rather than a date.
+
+## Release: where animals are put down
+
+`ExperimentConfig.release_mode` — `auto` (default), `point`, `scatter`, `nests`.
+
+A fixed 15 cm scatter was fine in a 2.2 m cage and disastrous in a 22.9 m
+enclosure: twelve animals set down inside one body-length of each other fuse
+into a clump that social attraction then holds together, and no territory ever
+forms. `auto` keeps the point release for arenas under 3 m and disperses above
+it. Measured: mean release spacing 0.18 m in the cage (unchanged), 10.8 m in
+VoleTerra.
+
+## Scale, and the two bugs it exposed
+
+Running the cage-tuned model in a 523 m² enclosure broke it in ways that were
+silent rather than loud. Both fixes are in the **Field enclosure** physiology
+preset and the VoleTerra scent settings:
+
+* **A scent mark is a droplet, not a void.** `mark_volume_ul` was 22 µL — a
+  full urination. A 0.54 mL bladder therefore bought 25 marks, and marking was
+  hard-limited by hydration. At 4 µL a full bladder buys ~135, which is the
+  order a scent-marking rodent actually deposits.
+* **The scent grid has to scale with the enclosure.** A 10 cm cell is right for
+  a cage (484 cells); across 75 ft it is 52,000 cells, and a cohort's entire
+  daily marking budget covered about 1% of them — so no territory could form
+  however well the animals behaved. Half-metre cells put it back within reach.
+
+Together these took emergent territory from **0.2 m² to 89 m²** over five days
+and moved the cohort from "dead by day six" to a stable energy plateau at full
+health. Note what the failure looked like: nothing errored, and the mechanism
+the enclosure model rests on had simply switched itself off.
+
+## Making them interact — two more silent failures
+
+Once the cohort stopped starving and started holding territory, it stopped
+*interacting*: 3 fights and stress 0.2 over five days, and the social network
+went sparse. Two independent causes, both silent, both found by instrumenting
+the funnel rather than by turning knobs.
+
+**Contests were structurally impossible for settled animals.** A fight required
+at least one animal to be ROAMING. Once animals settle successfully they rest
+~84% of the time, and only **2.1% of 4,345 same-sex contacts** had anyone
+roaming — so a resident could never defend its patch against an intruder
+walking through it, and `dominance_<trial>.csv` had nothing in it. The rule was
+trying to stop affiliative huddling from registering as aggression, which is
+right, but a huddle is *both* animals settled together — so that is now what it
+excludes. Fights went **0 → 48 per three days**.
+
+**`perception_r` was the lever, not `k_social`.** Social attraction only acts
+within the perception radius; at 0.6 m — a quarter of a 2.2 m cage — it is
+effectively blind across 523 m², and opposite-sex pairs never touched at all.
+Swept over 3-day runs (one trial per cell, so counts bounce):
+
+| `perception_r` | fights | matings | territory |
+|---|---|---|---|
+| 0.6 m (cage default) | 48 | **0** | 66 m² |
+| 1.2 m | 31 | 49 | 55 m² |
+| **2.0 m (VoleTerra)** | **63** | **55** | **57 m²** |
+| 3.0 m | 86 | 79 | 48 m² |
+
+Raising `k_social` instead reached only 16–17 matings even at 2.5–4.0× while
+costing territory and condition: it scales a force that almost never activates.
+Widening the radius that force acts within is the honest lever, so VoleTerra
+sets `perception_r = 2.0` and leaves the gain alone. The cage default is
+unchanged.
+
+`tests/abma/test_interaction.py` now pins floors — contests happen, matings
+happen, a hierarchy can form, and territory survives all of it. Nothing had
+asserted that any of those were *reachable*, which is exactly how both bugs
+reached a finished run without going red.
+
+## Reading the animals: tracks, not dot clouds
+
+Both views used to draw recent history as a **scatter** — the last 10 frames
+(3D) or 8 (2D), pooled across the whole cohort into one item. Around each animal
+that reads as a smear of identical dots: no direction, no usable history, and
+nothing telling you which mark is *now*.
+
+Each animal now gets its own **fading polyline**: a line strip whose tail
+dissolves toward transparent and whose head is the animal's own colour at full
+opacity, plus a bright dot on the current position so the head of the track is
+unambiguous even when the body mesh is small on screen. A line has direction; a
+cloud of dots does not.
+
+The 〰 toolbar button cycles track length — off / 100 / **1000** / 5000 recorded
+steps. Hiding tracks does not forget them, so toggling is free.
 
 ## Provenance
 

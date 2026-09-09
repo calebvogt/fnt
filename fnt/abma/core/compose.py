@@ -26,8 +26,10 @@ founders vary the way a real cohort does rather than being identical clones.
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 
 from .config import AgentGroup, ExperimentConfig, Genotype, Treatment
+from .sky import day_length_hours, season_of, season_start
 from .species import Species, by_name, build_group, species_names
 
 
@@ -90,7 +92,8 @@ def design(preset: str | None = None, base: ExperimentConfig | None = None,
            seed: int | None = None, name: str | None = None,
            groups: list[AgentGroup] | None = None,
            record_interval: float | None = None,
-           dt: float | None = None) -> ExperimentConfig:
+           dt: float | None = None, season: str | None = None,
+           year: int = 2026) -> ExperimentConfig:
     """Build a runnable config from a plain description of the experiment.
 
     ``preset`` names the world (matched loosely — "voleterra" finds the
@@ -98,6 +101,11 @@ def design(preset: str | None = None, base: ExperimentConfig | None = None,
     ``females`` replace the preset's suggested cohort with your own, keeping
     that preset's arena, mechanisms and protocol intact. Pass ``groups`` to
     specify the population fully (mixed species, treated arms, knockouts).
+
+    ``season`` sets the release date — "winter", "spring", "summer", "fall" —
+    which at a site with a real latitude means day length, solar angle and
+    grass growth all change together. That is the point of asking for a season
+    rather than a date: outdoors those things are not independent.
 
     Anything left as ``None`` keeps the preset's value, so
     ``design(preset="voleterra")`` is just the preset.
@@ -128,6 +136,10 @@ def design(preset: str | None = None, base: ExperimentConfig | None = None,
         cfg.dt = float(dt)
     if record_interval is not None:
         cfg.record_interval = float(record_interval)
+    if season:
+        cfg.start_datetime = season_start(season, year)
+        if not name:
+            cfg.name = f"{cfg.name}_{season.strip().lower()}"
     if name:
         cfg.name = name
     elif males or females or groups:
@@ -176,10 +188,27 @@ def summary(cfg: ExperimentConfig) -> str:
         ("scent marking", cfg.scent.enabled),
         ("energy/water budget", cfg.physiology.enabled),
         ("mechanistic olfaction", cfg.olfaction.enabled),
+        ("living sward", cfg.sward.enabled),
+        ("sun & moon", cfg.sky.enabled),
         ("mortality", cfg.enable_mortality)) if on]
-    return (
+    lines = [
         f"{cfg.name}: {cfg.arena.width:.2f} x {cfg.arena.height:.2f} m "
         f"({cfg.arena.ground}) · {per_group} · {cfg.days:g} days · "
         f"{cfg.n_trials} replicate(s) · dt {cfg.dt:g}s "
-        f"({steps:,} steps/trial) · sample every {cfg.record_interval:g}s\n"
-        f"mechanisms: {', '.join(mech) if mech else 'none'}")
+        f"({steps:,} steps/trial) · sample every {cfg.record_interval:g}s",
+        f"mechanisms: {', '.join(mech) if mech else 'none'}",
+        f"release: {cfg.release_mode}",
+    ]
+    if cfg.sky.enabled:
+        when = datetime.fromisoformat(cfg.start_datetime)
+        lines.append(
+            f"site: {cfg.sky.latitude:.3f}N {cfg.sky.longitude:.3f}E · "
+            f"{when:%d %b %Y %H:%M} ({season_of(when)}) · "
+            f"day length {day_length_hours(when, cfg.sky):.1f} h")
+    if cfg.sward.enabled:
+        lines.append(
+            f"sward: {cfg.sward.initial_min_cm:g}-"
+            f"{cfg.sward.initial_max_cm:g} cm at release, regrowing "
+            f"{cfg.sward.regrowth_cm_per_day:g} cm/day; clipping is "
+            f"{cfg.sward.chew_rate_multiplier:g}x walking")
+    return "\n".join(lines)
