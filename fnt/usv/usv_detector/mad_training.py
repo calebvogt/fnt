@@ -522,6 +522,115 @@ class _AugmentedTileDataset:
 # ----------------------------------------------------------------------
 # Live per-epoch prediction previews
 # ----------------------------------------------------------------------
+#: Filename of the preview grid saved beside the weights.
+PREVIEW_GRID_NAME = "preview_grid.png"
+
+
+def save_preview_grid(tiles, path, *, cols: int = 3, pad: int = 8,
+                      threshold: float = 0.5) -> Optional[str]:
+    """Write the epoch-preview payloads to a PNG, laid out like the live panel.
+
+    The panels are the fastest way to see WHY a score is what it is — a tile
+    whose ground truth holds one call while the picture plainly contains four
+    says "the targets are wrong" at a glance, where the loss curve only says
+    "worse". They were rendered live and discarded, so diagnosing a finished
+    run meant asking the user for screenshots. This keeps the last set.
+
+    Colours match the live legend: green outline = ground truth, red fill =
+    predicted mask, blue tint = not scored (no label in those columns).
+
+    Best-effort — returns the path, or None if anything went wrong. A training
+    run must not fail because a picture could not be written.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    tiles = [t for t in (tiles or []) if t is not None and t.get('spec') is not None]
+    if not tiles:
+        return None
+    try:
+        h = max(t['spec'].shape[0] for t in tiles)
+        w = max(t['spec'].shape[1] for t in tiles)
+        rows = int(np.ceil(len(tiles) / cols))
+        # 12 px of caption strip under each tile.
+        cap = 12
+        canvas = np.zeros((rows * (h + cap + pad) + pad,
+                           cols * (w + pad) + pad, 3), dtype=np.uint8)
+        canvas[:] = 24
+        for n, t in enumerate(tiles):
+            r, c = divmod(n, cols)
+            y0 = pad + r * (h + cap + pad)
+            x0 = pad + c * (w + pad)
+            spec = t['spec']
+            th, tw = spec.shape
+            rgb = np.repeat(spec[:, :, None], 3, axis=2).astype(np.float32)
+            unsup = t.get('unsup')
+            if unsup is not None and unsup.shape == spec.shape:
+                m = unsup > 0
+                rgb[m, 2] = np.minimum(255, rgb[m, 2] + 46)   # blue tint
+            pred = t.get('pred')
+            if pred is not None and pred.shape == spec.shape:
+                m = pred > int(threshold * 255)
+                rgb[m, 0] = np.minimum(255, rgb[m, 0] * 0.45 + 210)
+                rgb[m, 1] *= 0.45
+                rgb[m, 2] *= 0.45
+            gt = t.get('gt')
+            if gt is not None and gt.shape == spec.shape:
+                g = gt > 0
+                edge = g & ~_erode(g)
+                rgb[edge] = (60, 235, 110)
+            canvas[y0:y0 + th, x0:x0 + tw] = rgb.astype(np.uint8)
+            # Caption strip: a dice bar, because text needs a font we may not
+            # have. Full width = 1.0; grey when the tile has no ground truth.
+            d = t.get('dice')
+            by = y0 + th + 3
+            if d is None:
+                canvas[by:by + 4, x0:x0 + tw] = (70, 70, 70)
+            else:
+                n_px = int(max(0.0, min(1.0, float(d))) * tw)
+                canvas[by:by + 4, x0:x0 + tw] = (55, 55, 55)
+                canvas[by:by + 4, x0:x0 + n_px] = (60, 235, 110)
+        Image.fromarray(canvas).save(str(path))
+        return str(path)
+    except Exception:
+        return None
+
+
+def _write_preview_grid(best_tiles, run_dir, model, device, specs, targets,
+                        weights, gt_pool, nogt_pool, cfg) -> Optional[str]:
+    """Save the preview grid beside the weights; never raise.
+
+    Prefers the BEST epoch's tiles, which describe the checkpoint that was
+    actually saved. Falls back to rendering a fresh set — that path is what
+    gives a headless ``mad train`` a picture too, since previews are otherwise
+    only computed when a GUI is listening.
+    """
+    try:
+        import torch
+        tiles = best_tiles
+        if not tiles and len(specs):
+            model.eval()
+            with torch.no_grad():
+                tiles = _build_epoch_previews(
+                    model, device, specs, targets, weights, gt_pool,
+                    nogt_pool, np.random.default_rng(cfg.split_seed),
+                    max(6, int(cfg.preview_count)))
+        return save_preview_grid(tiles, Path(run_dir) / PREVIEW_GRID_NAME)
+    except Exception:
+        return None
+
+
+def _erode(m: np.ndarray) -> np.ndarray:
+    """One-pixel binary erosion, so a mask can be drawn as an outline."""
+    out = m.copy()
+    out[1:, :] &= m[:-1, :]
+    out[:-1, :] &= m[1:, :]
+    out[:, 1:] &= m[:, :-1]
+    out[:, :-1] &= m[:, 1:]
+    return out
+
+
 def _shrink_for_preview(a: np.ndarray, max_h: int = 160, max_w: int = 192):
     """Nearest-neighbour decimate a tile so preview payloads stay small."""
     h, w = a.shape
@@ -659,6 +768,12 @@ def train_unet(
         seed=cfg.split_seed,
     )
 
+    # How many recordings actually carry labels. Reported because the split
+    # line used to assert "All labels are on ONE recording" whenever the level
+    # was 'call' — true while call-level was only a fallback from file-level,
+    # and wrong now that it is the default mode.
+    n_label_recordings = len({g[0] for g in groups if g and g[0]})
+
     # Refuse to train on a mix of normalization rules. A patch is normalized
     # and quantized when it is saved, so examples from different rules are on
     # two incompatible intensity scales and the result would look like a merely
@@ -752,6 +867,7 @@ def train_unet(
             'n_val_groups': split['n_val_groups'],
             'val_groups': split['val_groups'],
             'n_train_tiles': int(len(train_idx)), 'n_val_tiles': n_val,
+            'n_label_recordings': n_label_recordings,
         })
 
     def to_tensor(arr):
@@ -841,6 +957,11 @@ def train_unet(
     best_val = float('inf')
     best_epoch = 0
     best_metrics: Dict = {}
+    # Previews from the BEST epoch, kept for the PNG written beside the
+    # weights. The model in memory at the end is the LAST epoch's, which
+    # is not the one saved, so capturing at `improved` keeps the picture
+    # and the checkpoint describing the same model.
+    best_preview_tiles: List = []
     best_path = run_dir / 'weights.pt'
     epochs_without_improvement = 0
     early_stopped = False
@@ -977,6 +1098,8 @@ def train_unet(
                         prev_gt_pool, prev_nogt_pool, prev_rng,
                         cfg.preview_count)
                 if tiles:
+                    if improved:
+                        best_preview_tiles = tiles
                     progress(epoch, cfg.n_epochs, {
                         'status': 'epoch_preview', 'epoch': epoch,
                         'total_epochs': cfg.n_epochs, 'val_dice': val_dice,
@@ -1066,12 +1189,17 @@ def train_unet(
         'n_groups': split['n_groups'],
         'n_val_groups': split['n_val_groups'],
         'val_groups': split['val_groups'],
+        'n_label_recordings': n_label_recordings,
         'split_seed': cfg.split_seed,
         # Positive-pixel balance — the number that explains an all-background
         # collapse after the fact (see the _balance note above).
         'train_balance': train_balance,
         'val_balance': val_balance,
         'history': history,
+        'preview_grid': _write_preview_grid(
+            best_preview_tiles, run_dir, model, device,
+            prev_specs, prev_targets, prev_weights,
+            prev_gt_pool, prev_nogt_pool, cfg),
         'config': asdict(cfg),
     }
     with open(run_dir / 'training_summary.json', 'w') as f:

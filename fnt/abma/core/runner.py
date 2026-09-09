@@ -21,6 +21,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from .config import ExperimentConfig
+from .provenance import write_manifest
 from .simulation import Simulation, run_trial
 
 
@@ -36,6 +37,10 @@ def make_project(config: ExperimentConfig, project_dir: str) -> str:
     data_dir = os.path.join(project_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
     config.to_json(os.path.join(project_dir, "config.json"))
+    # A fingerprint of the exact config plus where its numbers came from, so a
+    # run folder can prove what produced it and say which of its inputs are
+    # free parameters. See core/provenance.py.
+    write_manifest(project_dir, config)
     with open(os.path.join(project_dir, "README.txt"), "w") as fh:
         fh.write(
             "ABMA simulated experiment\n"
@@ -113,6 +118,7 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
     """
     from .recorder import (TrajectoryRecorder, EventRecorder, ConditionRecorder,
                            write_agents_table)
+    from .record import RunRecord
     n = config.n_trials
     sims = [Simulation(config, trial_index=i) for i in range(n)]
     offsets = grid_offsets(n, config.arena.width, config.arena.height)
@@ -127,10 +133,20 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
         cr = ConditionRecorder(base["condition"], sim.trial_id, sim.start_dt,
                                sim.agents)
         write_agents_table(base["agents"], sim.agents)
-        recs.append({"traj": rec, "evt": ev, "cond": cr, "paths": {
-            "trajectory": traj, "events": base["events"],
-            "condition": base["condition"], "agents": base["agents"],
-            "trial_id": sim.trial_id}})
+        # Each replicate keeps its OWN replayable archive, even though the
+        # live view shows them side by side in one grid — a record is a
+        # property of a trial, not of how it happened to be watched.
+        archive = RunRecord(trial_id=sim.trial_id, n_agents=sim.n,
+                            frame_interval_s=frame_interval_s,
+                            agents=sim.agent_static())
+        recs.append({"traj": rec, "evt": ev, "cond": cr, "archive": archive,
+                     "record_path": os.path.join(
+                         data_dir, f"record_{sim.trial_id}.npz"),
+                     "paths": {
+                         "trajectory": traj, "events": base["events"],
+                         "condition": base["condition"],
+                         "agents": base["agents"],
+                         "trial_id": sim.trial_id}})
 
     def _emit_meta():
         """Combined static meta, keyed by GLOBAL index (frame array order)."""
@@ -181,8 +197,12 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
                     r["cond"].record(elapsed, sim.health, sim.energy, sim.hunger,
                                      sim.thirst, sim.stress, sim.mass,
                                      sim.smell < 0.5, sim.bladder)
-            if frame_cb is not None and k % frame_every == 0:
-                frame_cb(_combined_frame(sims, offsets, elapsed))
+            if k % frame_every == 0:
+                per_sim = [sim._frame(elapsed) for sim in sims]
+                for sim_frame, r in zip(per_sim, recs):
+                    r["archive"].append(sim_frame)
+                if frame_cb is not None:
+                    frame_cb(_combined_frame(per_sim, sims, offsets, elapsed))
             if progress_cb is not None and k % report_every == 0:
                 progress_cb(k / n_steps)
     finally:
@@ -190,6 +210,11 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
             r["traj"].close()
             r["evt"].close()
             r["cond"].close()
+        for sim, r in zip(sims, recs):
+            if len(r["archive"]):
+                r["archive"].agents = sim.agent_static()
+                r["archive"].save(r["record_path"])
+                r["paths"]["record"] = r["record_path"]
     if progress_cb is not None:
         progress_cb(1.0)
     return [r["paths"] for r in recs], cancelled
@@ -198,12 +223,25 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
 _FRAME_KEYS = ("heading", "sex_m", "alive", "color", "size", "shape",
                "health", "energy", "hunger", "thirst", "stress", "bladder",
                "mass", "anosmic", "estrus", "activity", "fights_won",
-               "fights_lost", "matings", "dist_today")
+               "fights_lost", "matings", "dist_today", "marks_made",
+               # the decomposition behind the movement, so the inspector can
+               # show *why* a selected animal is heading where it is
+               "drive_scent_home", "drive_memory", "drive_home",
+               "drive_resource", "drive_social", "drive_territory",
+               "drive_wander", "desired_x", "desired_y",
+               # and what it is sensing while it decides
+               "scent_own", "scent_foreign", "recognition_mean",
+               "detection_mean", "need_food", "need_water", "neighbours",
+               "territory_m2")
 
 
-def _combined_frame(sims, offsets, elapsed):
-    """Concatenate all replicates' agents into one frame, offset into the grid."""
-    frames = [s._frame(elapsed) for s in sims]
+def _combined_frame(frames, sims, offsets, elapsed):
+    """Concatenate all replicates' agents into one frame, offset into the grid.
+
+    ``frames`` are the per-replicate snapshots, passed in rather than recomputed
+    so the live view and each replicate's archive are guaranteed to be looking
+    at the same instant.
+    """
     out = {
         "trial": "grid", "elapsed": elapsed,
         "day": int(elapsed // 86400) + 1,

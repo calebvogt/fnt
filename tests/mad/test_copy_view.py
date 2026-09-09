@@ -1,8 +1,11 @@
 """Copying the spectrogram view out at a chosen resolution.
 
-Mirrors the UWB preprocessing tool's Copy View: a dpi dropdown and a button,
-rendering the panel at its own geometry so raising dpi multiplies pixels rather
-than changing the layout.
+Mirrors the UWB preprocessing tool's Copy View, rendering the panel at its own
+geometry so raising dpi multiplies pixels rather than changing the layout. The
+dpi started as a dropdown beside the button and is now a preference
+(``mad/export/copy_dpi``, surfaced as ``MADMainWindow.COPY_VIEW_DPI``) — set
+once for how you work rather than chosen per copy, and the controls bar is
+short on room.
 
 The trap this suite exists to guard is that the extra pixels can be empty.
 paintEvent scaled spec_image to the LOGICAL widget rect and then let the
@@ -17,6 +20,7 @@ columns than the panel has pixels), and measured 1.4x at 1 s, 1.8x at 2 s and
 
 Runs under pytest, or directly.
 """
+import inspect
 import os
 import tempfile
 
@@ -280,63 +284,69 @@ def test_the_megapixel_cap_reduces_dpi_rather_than_failing():
 # ----------------------------------------------------------------------
 # The controls, in MAD
 # ----------------------------------------------------------------------
-def test_the_button_and_dpi_box_live_in_the_spectrogram_controls_bar():
+def test_the_button_lives_in_the_spectrogram_controls_bar():
     w, _ = gui()
     assert w._controls_bar.isAncestorOf(w.btn_copy_view)
-    assert w._controls_bar.isAncestorOf(w.combo_copy_dpi)
 
 
-def test_neither_control_can_steal_the_arrow_keys():
+def test_the_button_cannot_steal_the_arrow_keys():
     """The blanket no-focus loop walks only self.left_column, so anything
     added to this bar has to opt out by hand or it eats pan/zoom."""
     from PyQt5.QtCore import Qt
     w, _ = gui()
     assert w.btn_copy_view.focusPolicy() == Qt.NoFocus
-    assert w.combo_copy_dpi.focusPolicy() == Qt.NoFocus
 
 
-def test_the_dpi_choices_match_the_uwb_tool():
+def test_the_dpi_is_a_preference_not_a_per_copy_choice():
     w, _ = gui()
-    items = [w.combo_copy_dpi.itemText(i)
-             for i in range(w.combo_copy_dpi.count())]
-    assert items == ["150 dpi", "300 dpi", "600 dpi"], items
-    assert w.combo_copy_dpi.currentData() == 300, "300 should be the default"
+    assert isinstance(w.COPY_VIEW_DPI, int)
+    assert 72 <= w.COPY_VIEW_DPI <= 1200, w.COPY_VIEW_DPI
+    src = inspect.getsource(M.MADMainWindow._render_spectrogram_view)
+    assert "dpi = self.COPY_VIEW_DPI" in src
 
 
-def test_copying_puts_an_image_on_the_clipboard_at_the_chosen_dpi():
+def test_copying_puts_an_image_on_the_clipboard_at_the_preference_dpi():
     w, _ = gui()
     QApplication.clipboard().clear()
-    w.combo_copy_dpi.setCurrentIndex(2)                 # 600 dpi
-    w.copy_spectrogram_view()
-    got = QApplication.clipboard().image()
-    assert not got.isNull()
-    assert got.width() == round(w.spectrogram.width() * 600 / 96), got.width()
-    assert "600 dpi" in w.status_bar.currentMessage(), \
-        w.status_bar.currentMessage()
-    w.combo_copy_dpi.setCurrentIndex(1)
+    keep = w.COPY_VIEW_DPI
+    try:
+        w.COPY_VIEW_DPI = 300
+        w.copy_spectrogram_view()
+        got = QApplication.clipboard().image()
+        assert not got.isNull()
+        assert got.width() == round(w.spectrogram.width() * 300 / 96), \
+            got.width()
+        assert "300 dpi" in w.status_bar.currentMessage(), \
+            w.status_bar.currentMessage()
+    finally:
+        w.COPY_VIEW_DPI = keep
 
 
 def test_a_capped_copy_says_so_instead_of_under_delivering_quietly():
     w, _ = gui()
-    real = AW.MAX_EXPORT_MP
+    real, keep = AW.MAX_EXPORT_MP, w.COPY_VIEW_DPI
     try:
         AW.MAX_EXPORT_MP = 1.0
         M.MAX_EXPORT_MP = 1.0
-        w.combo_copy_dpi.setCurrentIndex(2)             # 600 dpi
+        w.COPY_VIEW_DPI = 600
         w.copy_spectrogram_view()
         msg = w.status_bar.currentMessage()
         assert "capped" in msg and "600" in msg, msg
     finally:
         AW.MAX_EXPORT_MP = real
         M.MAX_EXPORT_MP = real
-        w.combo_copy_dpi.setCurrentIndex(1)
+        w.COPY_VIEW_DPI = keep
 
 
 def test_saving_writes_a_png_carrying_its_dpi():
     w, wav = gui()
     out = os.path.join(os.path.dirname(wav), "view.png")
-    w.combo_copy_dpi.setCurrentIndex(1)                 # 300 dpi
-    img, dpi = w._render_spectrogram_view()
+    keep = w.COPY_VIEW_DPI
+    w.COPY_VIEW_DPI = 300
+    try:
+        img, dpi = w._render_spectrogram_view()
+    finally:
+        w.COPY_VIEW_DPI = keep
     assert img.save(out, "PNG")
     back = QImage(out)
     assert not back.isNull()
@@ -364,7 +374,6 @@ def test_the_classic_detector_got_the_same_controls():
     wiring the second host is a button and a combo."""
     from PyQt5.QtCore import Qt
     import fnt.usv.classic_audio_detector as C
-    assert C.ClassicAudioDetectorWindow.COPY_VIEW_DPIS == (150, 300, 600)
     assert hasattr(C.ClassicAudioDetectorWindow, 'copy_spectrogram_view')
     app = QApplication.instance() or QApplication([])
     cad = C.ClassicAudioDetectorWindow()
@@ -372,7 +381,6 @@ def test_the_classic_detector_got_the_same_controls():
     cad.show()
     app.processEvents()
     assert cad.btn_copy_view.focusPolicy() == Qt.NoFocus
-    assert cad.combo_copy_dpi.focusPolicy() == Qt.NoFocus
     cad.copy_spectrogram_view()                  # nothing loaded: must not crash
     assert "Nothing to copy" in cad.status_bar.currentMessage()
     cad.close()

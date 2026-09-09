@@ -123,24 +123,32 @@ def test_the_inference_button_states_one_action():
 
 
 def test_the_training_button_names_its_follow_on():
+    """The follow-on is the one thing the button alone can tell you: the
+    scope lives in a dropdown that may be scrolled out of sight."""
     w, _ = gui()
     _set_after(w, 0)
     w._update_run_button()
     plain = w.btn_train_run.text()
-    assert plain.startswith("Run Training (") and "Inference" not in plain, plain
+    assert plain == "Run Training", plain
 
     _set_after(w, 2)                       # all files
     w._update_run_button()
     assert "+ Inference on 3" in w.btn_train_run.text(), w.btn_train_run.text()
 
 
-def test_the_label_count_stays_on_the_training_button():
-    """It is how you know when retraining is worth it, and it reaches you
-    while your eyes are on the spectrogram."""
+def test_the_label_count_moved_to_the_split_preview():
+    """It used to sit on the button. The split-preview line states the same
+    count AND how it divides into train/val, which is the thing that decides
+    whether retraining is worth it — so the button was left naming an action
+    and the number reads once, in the place that explains it."""
     w, _ = gui()
     _set_after(w, 0)
     w._update_run_button()
-    assert "label" in w.btn_train_run.text()
+    assert "label" not in w.btn_train_run.text()
+    text = w.lbl_split_preview.text()
+    assert text, "the split preview must say something"
+    # No confirmed calls in this fixture, so it says so rather than a count.
+    assert "confirmed call" in text, text
 
 
 # ----------------------------------------------------------------------
@@ -151,7 +159,7 @@ def test_the_post_training_choices_match_the_sleap_shape():
     items = [w.combo_train_after.itemText(i)
              for i in range(w.combo_train_after.count())]
     assert len(items) == 4, items
-    assert items[0] == "Nothing"
+    assert items[0] == "None"
     assert "Current file" in items[1]
     assert "All files" in items[2]
     assert "Select" in items[3]

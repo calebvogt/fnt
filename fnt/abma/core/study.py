@@ -369,6 +369,58 @@ def lesion_study(name: str, base: ExperimentConfig, trait_path: str,
                  reference=reference or next(iter(levels), ""))
 
 
+def anosmia_study(name: str = "methimazole_dose_response",
+                  base: ExperimentConfig | None = None,
+                  doses: tuple[float, ...] = (0.0, 0.5, 0.75, 1.0),
+                  replicates: int = 4, days: float | None = None,
+                  mechanistic_nose: bool = True) -> Study:
+    """The design ABMA was built to run: saline vs methimazole, in silico.
+
+    Each arm delivers a different methimazole dose to the whole cohort at
+    release, and everything else is held identical. The readout is emergent:
+    nothing in the config says how far apart animals should sit, so mean
+    male-male spacing is a *result* of animals marking, smelling each other's
+    marks, and avoiding ground that smells of a rival. Take the nose away and
+    that structure has nothing to stand on.
+
+    The arms are paired by default, so replicate *r* starts from the same
+    release positions and the same founder traits in every arm — and, because
+    per-agent random streams are keyed by identity rather than by draw order
+    (see :mod:`fnt.abma.core.rng`), they stay matched even though the anosmic
+    animals immediately start behaving differently.
+
+    ``mechanistic_nose`` switches on the receptor/signature olfactory model
+    (:mod:`fnt.abma.core.olfaction`), under which a dose ablates whole receptor
+    channels rather than turning a global gain down — so animals at the same
+    intermediate dose end up confused about *different* cage-mates.
+    """
+    from .presets import vole_anosmia
+
+    cfg = copy.deepcopy(base) if base is not None else vole_anosmia()
+    if days is not None:
+        cfg.days = float(days)
+    cfg.olfaction.enabled = bool(mechanistic_nose)
+    conditions = []
+    for dose in doses:
+        label = "saline" if dose <= 0 else f"methimazole_{dose:g}"
+        conditions.append(Condition(
+            name=label,
+            overrides={"groups[*].treatment.drug":
+                       "saline" if dose <= 0 else "methimazole",
+                       "groups[*].treatment.dose": float(dose),
+                       # delivered before release, as in the wet-lab protocol
+                       "groups[*].treatment.day_offset": -5.0},
+            description=(f"methimazole {dose:g} mg/kg-equivalent"
+                         if dose > 0 else "vehicle control")))
+    return Study(name=name, base=cfg, conditions=conditions,
+                 replicates=replicates, seed_policy="paired",
+                 reference=conditions[0].name,
+                 description=(
+                     "Olfactory ablation dose-response. Primary readout: "
+                     "mean_dist_MM (emergent male-male spacing). Secondary: "
+                     "mean_home_range_m2, network_density, n_fight."))
+
+
 def environment_study(name: str, base: ExperimentConfig,
                       variants: dict[str, dict[str, Any]],
                       replicates: int = 4, reference: str = "") -> Study:

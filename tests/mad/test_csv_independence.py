@@ -33,6 +33,8 @@ from fnt.usv.usv_detector.mad_project import MADProjectConfig, create_mad_projec
 
 SR = 250_000
 _APP = None
+#: Every window built by _session, kept alive for the run (see _session).
+_WINDOWS = []
 
 
 def _session(n_labels=3, reject_index=1, with_predictions=False):
@@ -43,8 +45,11 @@ def _session(n_labels=3, reject_index=1, with_predictions=False):
                             * 32767).astype(np.int16))
     proj = os.path.join(root, "p")
     create_mad_project(proj)
-    # Keep the reference: a collected QApplication takes the process with it,
-    # with no traceback to say why.
+    # Keep the references. A collected QApplication takes the process with it,
+    # with no traceback to say why — and so does a collected MADMainWindow: it
+    # still owns running timers and a spectrogram, and each test here builds a
+    # fresh one, so without _WINDOWS the previous window is freed underneath
+    # the next test and the run dies partway with no failure reported.
     global _APP
     _APP = QApplication.instance() or QApplication([])
     M.MADMainWindow._apply_dark_theme()
@@ -72,6 +77,7 @@ def _session(n_labels=3, reject_index=1, with_predictions=False):
             crops.append({'blob_id': b, 'mask': m, 'f_off': 300,
                           't_off': 1500 + b, 'score': 0.8, 'class': 'USV'})
         MS.write_pred_masks(h5, crops)
+    _WINDOWS.append(w)
     return w, wav, root
 
 

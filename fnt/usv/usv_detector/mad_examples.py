@@ -371,8 +371,17 @@ def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
             for ex in examples:
                 meta = ex["meta"]
                 try:
+                    # neighbors MUST come across. It holds the other confirmed
+                    # calls sharing this patch window, and collect_training_
+                    # examples folds it back into the target. Dropping it here
+                    # rebuilt a store where each tile's ground truth was one
+                    # call while the tile plainly contained several — so the
+                    # model was penalised for correctly finding calls the user
+                    # had already labelled, and val_dice sat near zero on
+                    # exactly the tiles it got right.
                     td_save_example(tmp, ex["spec"], ex["mask"], meta,
-                                    meta.get("id") or None)
+                                    meta.get("id") or None,
+                                    neighbors_patch=ex.get("neighbors"))
                     n += 1
                 except Exception as e:
                     failed.append(f"{os.path.basename(fp)}: {e}")

@@ -1970,7 +1970,37 @@ def _train_config_report(cfg, n_examples: int) -> List[str]:
         f"  dB scale      : {g('db_min')}..{g('db_max')} dB  "
         f"norm={g('db_norm')}",
         f"  device        : requested={g('device')}",
-    ]
+    ] + _label_breakdown_lines(g('training_data_dir', ''))
+
+
+def _label_breakdown_lines(training_data_dir: str) -> List[str]:
+    """Labels and rejections per recording.
+
+    The single most useful thing to have in a shared log: it says at a glance
+    whether the label set is broad or concentrated, and it is what settles a
+    question like "the split says one recording but my Audio list shows five".
+    """
+    if not training_data_dir:
+        return []
+    try:
+        from fnt.usv.usv_detector.mad_examples import count_by_source_wav
+        by_wav = count_by_source_wav(training_data_dir, kind='label')
+        neg_by_wav = count_by_source_wav(training_data_dir, kind='negative')
+    except Exception:
+        return []
+    if not by_wav and not neg_by_wav:
+        return []
+    lines = [f"  labels by recording ({sum(by_wav.values())} label(s) across "
+             f"{len(by_wav)} recording(s)):"]
+    for wav, n in sorted(by_wav.items(), key=lambda kv: (-kv[1], kv[0])):
+        neg = neg_by_wav.get(wav, 0)
+        lines.append(f"      {n:5} label(s)"
+                     + (f"  + {neg} rejection(s)" if neg else "")
+                     + f"   {wav}")
+    only_neg = {w: n for w, n in neg_by_wav.items() if w not in by_wav}
+    for wav, n in sorted(only_neg.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"      {'':5}            {n} rejection(s)   {wav}")
+    return lines
 
 
 def _balance_report(info: dict) -> List[str]:
@@ -2041,12 +2071,26 @@ def _split_report(info: dict) -> List[str]:
         return [f"Split: {n_vg}/{n_g} recording(s) held out for validation "
                 f"({n_tr} train / {n_va} val tiles) — {shown}"]
     if level == 'call':
-        return [
-            f"Split: {n_vg}/{n_g} call(s) held out ({n_tr} train / {n_va} val "
-            f"tiles). All labels are on ONE recording.",
-            "  ⚠ Validation shares a recording with training, so val scores "
-            "flatter the model. Label a second recording for an honest number.",
-        ]
+        # How many recordings actually carry labels. This used to read "All
+        # labels are on ONE recording" unconditionally, which was true only
+        # while call-level was a FALLBACK from file-level. It is now the
+        # default split mode, so the line was telling users with labels on
+        # five recordings that they had one.
+        n_rec = int(info.get('n_label_recordings') or 0)
+        if n_rec > 1:
+            head = (f"Split: {n_vg}/{n_g} call(s) held out ({n_tr} train / "
+                    f"{n_va} val tiles), from {n_rec} labelled recording(s).")
+            why = ("  ⚠ split mode is 'call': whole calls are held out, but "
+                   "train and val share recordings, so val scores flatter the "
+                   "model. Set split to 'file' (or 'auto') for a number that "
+                   "answers \"does this work on a recording it never saw\".")
+        else:
+            head = (f"Split: {n_vg}/{n_g} call(s) held out ({n_tr} train / "
+                    f"{n_va} val tiles). All labels are on ONE recording.")
+            why = ("  ⚠ Validation shares a recording with training, so val "
+                   "scores flatter the model. Label a second recording for an "
+                   "honest number.")
+        return [head, why]
     return [
         f"Split: tile-level ({n_tr} train / {n_va} val tiles) — only one "
         f"labeled call available.",
@@ -8951,6 +8995,12 @@ class MADMainWindow(QMainWindow):
         # the change could alter what the list contains.
         if not self._touch_annotation_rows([decided_id]):
             self._refresh_annotation_list()
+        else:
+            # The fast path deliberately skips the full list rebuild, and with
+            # it _update_file_list_counts -- so the Audio-list badge kept the
+            # numbers inference wrote and never moved while you reviewed. One
+            # row is all that can have changed.
+            self._touch_current_file_badge()
         if self._auto_advance and was_pending:
             if not (self._select_next_pending_from_id(successor)
                     or self._select_next_pending_after_id(decided_id)):
@@ -11025,9 +11075,16 @@ class MADMainWindow(QMainWindow):
                 "Deleted calls stay deleted — but their region re-opens for "
                 "fresh detection.\n\n"
                 "Continue?")
+        # Default depends on what is at stake. A normal re-run only regenerates
+        # pending predictions — nothing you decided is lost — and it is the
+        # routine thing you do after retraining, so Enter should just start it.
+        # "Re-detect from scratch" throws away every Accept and Reject on those
+        # files, so it keeps No: a destructive default one keystroke away is
+        # how a morning of review disappears.
         reply = QMessageBox.warning(
             self, title, body,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No if redetect else QMessageBox.Yes,
         )
         return reply == QMessageBox.Yes
 
@@ -12639,6 +12696,54 @@ class MADMainWindow(QMainWindow):
         if self._counts_pending:
             QTimer.singleShot(
                 0, lambda g=generation: self._read_sidecar_chunk(g))
+
+    def _touch_current_file_badge(self):
+        """Re-badge JUST the on-screen recording's Audio-list row from memory.
+
+        The row's (accepted, pending, rejected) badge is written when inference
+        finishes a file and then never moved, so a morning of review left it
+        reading whatever the run produced. This reconciles it after each
+        decision instead.
+
+        One row, not the whole list: :meth:`_update_file_list_counts` walks
+        every row, which is nothing on eighteen files and a full loop per
+        keystroke on a six-thousand-file project.
+        """
+        if not hasattr(self, 'file_list') or not self.audio_files:
+            return
+        if not (0 <= self.current_file_idx < len(self.audio_files)):
+            return
+        cur = self.audio_files[self.current_file_idx]
+        # Only once the annotations in memory actually belong to this file: a
+        # background load leaves current_file_idx pointing at the new recording
+        # while the annotations are still the old one's, and badging from that
+        # writes the wrong counts onto the wrong row.
+        loaded = getattr(self, '_loaded_wav_path', None)
+        if (getattr(self, '_loading_path', None) is not None or loaded is None
+                or os.path.normcase(os.path.abspath(loaded))
+                != os.path.normcase(os.path.abspath(cur))):
+            return
+        item = self.file_list.item(self.current_file_idx)
+        if item is None or self._is_missing(cur):
+            return
+        base = os.path.basename(cur)
+        counts = self._mem_status_counts()
+        if any(counts):
+            self._file_count_cache[base] = counts
+        else:
+            # All-zero means "analyzed, found nothing" for a file that HAS been
+            # run; for one that hasn't, no badge at all. Dropping the entry in
+            # the first case would relabel it as never analyzed.
+            if base in getattr(self, '_file_run_info', {}):
+                self._file_count_cache[base] = (0, 0, 0)
+            else:
+                self._file_count_cache.pop(base, None)
+        self.file_list.blockSignals(True)
+        self._apply_file_row(item, base, self._file_count_cache.get(base))
+        self.file_list.blockSignals(False)
+        # The split preview reads the same cache, so it would otherwise
+        # disagree with the row directly above it.
+        self._update_split_preview()
 
     def _update_file_list_counts(self, sync_current: bool = True):
         """Refresh the file-list labels from the cached (accepted, pending,
@@ -14604,13 +14709,43 @@ class MADMainWindow(QMainWindow):
         self._store_write_errors = []
 
     def _wait_for_audio_load(self, timeout_ms: int = 15000) -> bool:
-        """Block until the in-flight read finishes (tests, and shutdown)."""
+        """Block until the loaded file is USABLE (tests, and shutdown).
+
+        The worker only delivers samples. Opening then continues on the UI
+        thread in three stages chained by ``QTimer.singleShot`` — spectrogram,
+        waveform, masks — and it is the last of those that calls ``init_mask``
+        and sets ``_loaded_wav_path``. Returning when the worker was gone left
+        the window holding audio with no grid: ``hop`` and ``n_time_frames``
+        still None, so anything that saves an example died on a None
+        comparison, several tests deep and nowhere near the cause.
+        """
         deadline = time.time() + timeout_ms / 1000.0
         while self._audio_workers and time.time() < deadline:
             QApplication.processEvents()
             for w in list(self._audio_workers.values()):
                 w.wait(20)
         QApplication.processEvents()
+        want = (self.audio_files[self.current_file_idx]
+                if self.audio_files
+                and 0 <= self.current_file_idx < len(self.audio_files)
+                else None)
+        if want is not None:
+            sg = getattr(self, 'spectrogram', None)
+            key = os.path.normcase(os.path.abspath(want))
+            while time.time() < deadline:
+                # Match the PATH, not merely "something loaded". The previous
+                # file's _loaded_wav_path is still standing while the new one
+                # is in flight, so a non-None test is satisfied by the file we
+                # just navigated away from — and switching recordings then
+                # returned with the old one still on screen.
+                loaded = self._loaded_wav_path
+                landed = (self._loading_path is None
+                          and loaded is not None
+                          and os.path.normcase(os.path.abspath(loaded)) == key
+                          and (sg is None or sg.n_time_frames is not None))
+                if landed:
+                    break
+                QApplication.processEvents()
         return not self._audio_workers
 
     def _on_annotation_clicked(self, ai):
@@ -14765,7 +14900,7 @@ class MADMainWindow(QMainWindow):
             sg._rebuild_confirmed_mask()
         self._clear_box_selection()
         self._pred_review_idx = None
-        self._refresh_annotation_list()
+        self._refresh_annotation_list()   # re-badges the row via _update_file_list_counts
         self._update_pred_review_widgets()
         self._log(f"{action.capitalize()} {n_done} box-selected detection(s)")
         self.status_bar.showMessage(f"{action.capitalize()}ed {n_done} detection(s)")

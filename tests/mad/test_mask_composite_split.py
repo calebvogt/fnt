@@ -369,6 +369,60 @@ def test_the_two_passes_run_together_and_stay_idempotent():
 
 
 # ----------------------------------------------------------------------
+# The rebuild is the only route from sidecar to training
+# ----------------------------------------------------------------------
+def test_the_rebuild_carries_neighbours_across():
+    """``rebuild_training_store`` regenerates the project store from the
+    ``.mad`` sidecars before every run, so anything it drops never reaches
+    training. It dropped ``neighbors``.
+
+    The symptom was visible in the live preview panels: a tile plainly
+    containing several calls, all of them labelled, scored dice≈0 because its
+    ground truth held only one — so the model was penalised for correctly
+    finding calls the user had already confirmed. Measured on a real project,
+    113 of 250 sidecar examples carried neighbours and the rebuilt store had
+    zero.
+    """
+    from scipy.io import wavfile
+    from fnt.usv.usv_detector.mad_examples import rebuild_training_store
+    from fnt.usv.usv_detector import fnt_mask_store as _ms
+    own, nb = two_blobs()
+    with tempfile.TemporaryDirectory() as d:
+        wav = os.path.join(d, "rec.wav")
+        wavfile.write(wav, SR, np.zeros(SR // 10, np.int16))
+        sidecar = _ms.masks_sibling_path(wav)
+        ms.td_save_example(sidecar, np.zeros((H, W), np.uint8), own,
+                           meta_for(5, 12, 20, 30), "ex1",
+                           neighbors_patch=nb)
+        out = os.path.join(d, "training_data")
+        assert rebuild_training_store(out, [wav]) == 1
+        got = list(ms.td_iter_examples(os.path.join(out, "training_data.h5")))[0]
+    assert got["neighbors"] is not None, "the rebuild dropped neighbours"
+    assert np.array_equal(got["neighbors"] > 0, nb)
+    assert np.array_equal(got["mask"] > 0, own), "and it must not merge them"
+
+
+def test_a_rebuilt_store_still_supervises_the_neighbour():
+    """End to end: sidecar -> rebuild -> training target."""
+    from scipy.io import wavfile
+    from fnt.usv.usv_detector.mad_examples import rebuild_training_store
+    from fnt.usv.usv_detector import fnt_mask_store as _ms
+    own, nb = two_blobs()
+    with tempfile.TemporaryDirectory() as d:
+        wav = os.path.join(d, "rec.wav")
+        wavfile.write(wav, SR, np.zeros(SR // 10, np.int16))
+        ms.td_save_example(_ms.masks_sibling_path(wav),
+                           np.zeros((H, W), np.uint8), own,
+                           meta_for(5, 12, 20, 30), "ex1", neighbors_patch=nb)
+        out = os.path.join(d, "training_data")
+        rebuild_training_store(out, [wav])
+        _s, t, _w = mx.collect_training_examples(
+            out, tile_time_frames=W, tile_freq_bins=H, placements=1, seed=0)
+    assert t[0][40:50, 25:33].min() > 0.5, \
+        "the neighbour is background again after a rebuild"
+
+
+# ----------------------------------------------------------------------
 # What the user actually saw
 # ----------------------------------------------------------------------
 def test_the_reconstructed_annotation_covers_one_call_only():

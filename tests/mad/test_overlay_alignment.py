@@ -108,18 +108,42 @@ def test_the_offset_would_have_been_visible_at_labelling_zoom():
 # ----------------------------------------------------------------------
 # What actually gets drawn
 # ----------------------------------------------------------------------
+#: Render multiplier used when measuring the outline.
+#:
+#: Sampling a 1x grab at integer coordinates with an exact colour match is
+#: biased: an antialiased stroke centred at x.4 saturates the pixel below it
+#: and not the one above, so the measured span sits ~0.6-0.75 DEVICE pixels
+#: low. That bias is a constant in device pixels, which means it grows when
+#: expressed in grid units as the grid gets finer — measured on the same
+#: render, -0.29 columns on the time axis (px_col 2.13) but -0.59 bins on the
+#: frequency axis (px_bin 1.27). The frequency test failed on that alone.
+#:
+#: Rendering larger shrinks the bias in proportion: measured -0.590, -0.195,
+#: -0.097, -0.064 bins at 1x, 2x, 4x, 6x. It converges to zero, which is the
+#: evidence that the overlay is aligned and the measurement was not.
+MEASURE_SCALE = 4
+
+
 def _outline_span(sg, axis='x'):
-    """Screen extent of the drawn outline along one axis, from the render."""
+    """Extent of the drawn outline along one axis.
+
+    Returns ``(found, (lo, hi), pitch)`` — the coordinates that matched, the
+    expected span, and the size of one grid unit — all in the coordinates of
+    the measured image, so the caller divides by ``pitch`` and gets grid units
+    whatever :data:`MEASURE_SCALE` is.
+    """
     from PyQt5.QtGui import QColor
     rect, bounds, px_col, px_bin = geometry()
     t_start, _t_end, f_start, _f_end = bounds
-    img = sg.grab().toImage()
+    img, _dpi = sg.render_view_image(dpi=96 * MEASURE_SCALE)
+    s = img.width() / max(1, sg.width())
     want = M._SEMANTIC_PALETTE['confirmed']
     ann = sg.annotations[0]
-    x_lo = rect.left() + (ann['t0'] - t_start) * px_col
-    x_hi = rect.left() + (ann['t1'] - t_start) * px_col
-    y_hi = rect.bottom() - (ann['f0'] - f_start) * px_bin
-    y_lo = rect.bottom() - (ann['f1'] - f_start) * px_bin
+    x_lo = (rect.left() + (ann['t0'] - t_start) * px_col) * s
+    x_hi = (rect.left() + (ann['t1'] - t_start) * px_col) * s
+    y_hi = (rect.bottom() - (ann['f0'] - f_start) * px_bin) * s
+    y_lo = (rect.bottom() - (ann['f1'] - f_start) * px_bin) * s
+    margin = int(30 * s)
 
     def hit(x, y):
         # EXACT match only. The stroke is drawn at full alpha, so it is the one
@@ -127,16 +151,20 @@ def _outline_span(sg, axis='x'):
         # semi-transparent and blends with the viridis underneath into shades
         # that a tolerant match happily accepts, which measures the fill rather
         # than the outline.
+        if not (0 <= x < img.width() and 0 <= y < img.height()):
+            return False
         c = QColor(img.pixel(int(x), int(y)))
         return (c.red(), c.green(), c.blue()) == tuple(want)
 
     if axis == 'x':
         y = (y_lo + y_hi) / 2
-        found = [x for x in range(int(x_lo) - 30, int(x_hi) + 30) if hit(x, y)]
-        return found, (x_lo, x_hi)
+        found = [x for x in range(int(x_lo) - margin, int(x_hi) + margin)
+                 if hit(x, y)]
+        return found, (x_lo, x_hi), px_col * s
     x = (x_lo + x_hi) / 2
-    found = [y for y in range(int(y_lo) - 30, int(y_hi) + 30) if hit(x, y)]
-    return found, (y_lo, y_hi)
+    found = [y for y in range(int(y_lo) - margin, int(y_hi) + margin)
+             if hit(x, y)]
+    return found, (y_lo, y_hi), px_bin * s
 
 
 def _place_block():
@@ -158,23 +186,17 @@ def test_the_outline_is_centred_on_the_region_it_traces():
     insensitive to how thick the pen is, and it is exactly what a systematic
     half-pixel shift would move."""
     sg = _place_block()
-    found, (lo, hi) = _outline_span(sg, 'x')
+    found, (lo, hi), pitch = _outline_span(sg, 'x')
     assert found, "no outline rendered"
-    drawn_centre = (min(found) + max(found)) / 2
-    expected_centre = (lo + hi) / 2
-    _r, _b, px_col, _pb = geometry()
-    off = (drawn_centre - expected_centre) / px_col
+    off = ((min(found) + max(found)) / 2 - (lo + hi) / 2) / pitch
     assert abs(off) < 0.35, f"outline centre is {off:+.2f} columns off"
 
 
 def test_the_same_holds_on_the_frequency_axis():
     sg = _place_block()
-    found, (lo, hi) = _outline_span(sg, 'y')
+    found, (lo, hi), pitch = _outline_span(sg, 'y')
     assert found, "no outline rendered"
-    drawn_centre = (min(found) + max(found)) / 2
-    expected_centre = (lo + hi) / 2
-    _r, _b, _pc, px_bin = geometry()
-    off = (drawn_centre - expected_centre) / px_bin
+    off = ((min(found) + max(found)) / 2 - (lo + hi) / 2) / pitch
     assert abs(off) < 0.35, f"outline centre is {off:+.2f} bins off"
 
 

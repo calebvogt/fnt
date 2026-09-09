@@ -46,6 +46,7 @@ from ..core.physiology import (
 from ..core.species import get_species, apply_species, by_name as by_species_name
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
+from .science_panel import SciencePanel
 from .protocol_timeline import ProtocolTimeline, describe as describe_event
 from .species_picker import SpeciesPicker
 
@@ -172,14 +173,25 @@ class ABMAWindow(QMainWindow):
         left = self._build_left_column()
         right = self._build_preview()
 
+        # Third column: pick an animal and see what it is doing and why. The
+        # arena answers "where"; this answers "which one, and what for".
+        self.science = SciencePanel()
+        # a roster click selects without popping the hover card over the
+        # roster itself — the panel already shows everything the card does
+        self.science.selected.connect(
+            lambda i: self._select_agent(i, from_roster=True))
+
         split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
         split.setHandleWidth(5)
         split.addWidget(left)
         split.addWidget(right)
+        split.addWidget(self.science)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([500, 820])
+        split.setStretchFactor(2, 0)
+        split.setSizes([460, 700, 300])
+        self._split = split
         self.setCentralWidget(split)
 
         self._load_config(blank_experiment())
@@ -191,7 +203,10 @@ class ABMAWindow(QMainWindow):
     # This is purely visual; nothing is written to disk (only a real Run does).
     # ------------------------------------------------------------------ #
     def _rebuild_preview(self):
-        if self._running or not hasattr(self, "view_2d"):
+        # `science` is built after the preview widgets, so a signal that
+        # fires during construction must not reach a half-built window
+        if (self._running or not hasattr(self, "view_2d")
+                or not hasattr(self, "science")):
             return
         try:
             cfg = self._collect_config()
@@ -217,7 +232,10 @@ class ABMAWindow(QMainWindow):
         self._preview_elapsed = 0.0
         for v in self._views():
             v.set_arena(cfg.arena)          # single chamber for the preview
-        self.inspector.set_population(self._preview_sim.agent_static())
+        meta = self._preview_sim.agent_static()
+        self.inspector.set_population(meta)
+        self.science.set_population(meta)
+        self.science.set_dynamics(getattr(cfg, "dynamics", []))
         # entering live preview discards any prior run's review buffer
         self._frames = []
         self._live_follow = True
@@ -1589,12 +1607,17 @@ class ABMAWindow(QMainWindow):
         left.addStretch()
         return w
 
-    def _select_agent(self, idx):
-        """Click handler: a hit pins the popup to that agent; -1 unpins/hides."""
+    def _select_agent(self, idx, from_roster: bool = False):
+        """Select an agent everywhere: arena highlight, popup, science panel.
+
+        ``from_roster`` suppresses the floating hover card, which would
+        otherwise appear over the roster the user just clicked.
+        """
         if idx is None or idx < 0:
             self._inspector_pinned = False
             self._hover_idx = None
             self.inspector.hide()
+            self.science.select(None)
             for v in self._views():
                 v.set_selected(None)
         else:
@@ -1603,7 +1626,9 @@ class ABMAWindow(QMainWindow):
             for v in self._views():
                 v.set_selected(idx)
             self.inspector.select(idx)
-            self._show_inspector_popup()
+            self.science.select(idx)
+            if not from_roster:
+                self._show_inspector_popup()
         if self._last_frame is not None:
             self._push_frame(self._active_view(), self._last_frame)
 
@@ -2021,6 +2046,7 @@ class ABMAWindow(QMainWindow):
         self.worker.progress.connect(self._on_progress)
         self.worker.frame.connect(self._on_frame)
         self.worker.agents.connect(self.inspector.set_population)
+        self.worker.agents.connect(self.science.set_population)
         self.worker.log.connect(self._append_log)
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
@@ -2058,6 +2084,9 @@ class ABMAWindow(QMainWindow):
     def _display_frame(self, fr):
         self._last_frame = fr
         self._push_frame(self._active_view(), fr)
+        # the roster and the drive/trace panels read the same frame the arena
+        # does, so what you select is always what you are watching
+        self.science.update_frame(fr)
         sel = self.inspector.selected_index()
         if self._follow_agent and sel is not None and sel < len(fr["x"]):
             self._active_view().center_on(fr["x"][sel], fr["y"][sel])

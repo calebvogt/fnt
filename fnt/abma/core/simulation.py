@@ -39,10 +39,15 @@ from .biology import (
 )
 from .sampling import parse_spec
 from .policy import RuleBasedPolicy
+from .olfaction import OlfactorySystem
+from .rng import (
+    AgentRandom, CH_HEADING, CH_MARK, CH_FIGHT, CH_FIGHT_OUTCOME, CH_MATE,
+)
 from .recorder import (
     TrajectoryRecorder, EventRecorder, ConditionRecorder, write_agents_table,
     parse_start,
 )
+from .record import RunRecord
 
 
 _ARRAY_TO_TRAIT = {v: k for k, v in TRAIT_TO_ARRAY.items()}
@@ -81,6 +86,12 @@ def _appearance_rgba(appearance, sex):
 class AgentMeta:
     """Static, per-agent identity and resolved biology."""
     index: int
+    #: Stable identity for the agent's random stream. ``index`` is a row
+    #: position and would shift if the roster were ever compacted; ``uid`` is
+    #: assigned once at spawn and never reused, so an animal's noise, odour
+    #: signature and receptor profile belong to the *animal* rather than to
+    #: where it happens to sit in the state arrays. See :mod:`.rng`.
+    uid: int
     sexid: str
     shortid: int
     species: str
@@ -117,8 +128,15 @@ class Simulation:
         self.cfg = config
         self.trial_index = trial_index
         self.trial_id = f"{config.trial_prefix}{trial_index + 1:03d}"
-        self.rng = np.random.default_rng(
-            config.seed + trial_index if seed is None else seed)
+        root = config.seed + trial_index if seed is None else seed
+        #: Setup-time draws (founder traits, release scatter, initial condition).
+        #: Sequential, and only consumed when the roster is built.
+        self.rng = np.random.default_rng(root)
+        #: Per-step draws. Counter-based and keyed by stable agent uid, so an
+        #: ablated or added animal perturbs nobody else's trajectory — which is
+        #: what makes a paired study a paired study. See :mod:`.rng`.
+        self.arand = AgentRandom(root)
+        self._step_k = 0
         self.start_dt = parse_start(config.start_datetime)
         self.policy = policy if policy is not None else RuleBasedPolicy()
         self._build_population()
@@ -130,6 +148,7 @@ class Simulation:
         cfg = self.cfg
         self.agents: list[AgentMeta] = []
         self._next_index = 0
+        self._next_uid = 0
         self._next_shortid = 9000 + self.trial_index * 100 + 1
         self._schedule: list[tuple[float, int, str, float]] = []  # onset,idx,attr,val
         self._last_fight: dict[tuple[int, int], float] = {}  # dyad -> last fight time
@@ -161,6 +180,15 @@ class Simulation:
         # ---- mechanistic energy/water budget ----
         self._physio_on = bool(getattr(getattr(cfg, "physiology", None),
                                        "enabled", False))
+
+        # ---- olfactory system (receptors + odour signatures) ----
+        # Off by default, in which case recognition stays the scalar product
+        # `smell_ability x identity_signal` and old configs reproduce exactly.
+        op = getattr(cfg, "olfaction", None)
+        self.olf = (OlfactorySystem(op, self.arand, self.uid)
+                    if op is not None and op.enabled else None)
+        self._recog = None
+        self._olf_dirty = True
 
         # ---- protocol events (timed add/remove of animals and resources) ----
         self._proto_schedule = sorted(
@@ -270,12 +298,14 @@ class Simulation:
             if sd > 0:  # global jitter only for traits without an explicit spec
                 self._jitter_traits(traits, sd, skip=set(specs))
             idx = self._next_index
+            uid = self._next_uid
             shortid = self._next_shortid
             self._next_index += 1
+            self._next_uid += 1
             self._next_shortid += 1
             start = release + self.rng.normal(0, 0.15, 2)
             metas.append(AgentMeta(
-                index=idx, sexid=f"{g.sex}{shortid}", shortid=shortid,
+                index=idx, uid=uid, sexid=f"{g.sex}{shortid}", shortid=shortid,
                 species=g.species, sex=g.sex, group=g.label,
                 genotype=g.genotype, treatment=g.treatment,
                 traits=traits, appearance=getattr(g, "appearance", None),
@@ -297,6 +327,8 @@ class Simulation:
         rng = self.rng
         return {
             "home": np.array([a.home for a in metas], float).reshape(-1, 2),
+            # stable random-stream identity, parallel to the state arrays
+            "uid": np.array([a.uid for a in metas], np.int64),
             "H": rng.uniform(0, 2 * np.pi, m),
             # ---- condition: every bar is 0-100, here and in the CSVs ----
             "hunger": rng.uniform(0, 30, m),
@@ -365,6 +397,7 @@ class Simulation:
         self.mass0 = np.concatenate([self.mass0, st["mass"].copy()])
         self.agents.extend(metas)
         self.n = len(self.agents)
+        self.mark_biology_dirty()   # the cohort changed: recognition restales
 
     # ------------------------------------------------------------------ #
     # Protocol events — timed add/remove of animals and resources
@@ -456,6 +489,9 @@ class Simulation:
         cfg = self.cfg
         n = self.n
         P = self.P
+        # counter for the per-agent random streams; every stochastic draw this
+        # step is a pure function of (seed, agent uid, this counter, channel)
+        self._step_k += 1
 
         # --- apply any treatments whose onset time has arrived ---
         if self._schedule:
@@ -464,6 +500,8 @@ class Simulation:
                 if elapsed_s >= onset_s:
                     getattr(self, attr)[i] = val
                     setattr(self.agents[i].traits, _ARRAY_TO_TRAIT[attr], val)
+                    if attr in ("smell", "identity"):
+                        self.mark_biology_dirty()
                 else:
                     still.append((onset_s, i, attr, val))
             self._schedule = still
@@ -488,6 +526,8 @@ class Simulation:
                         elif op == "add":
                             a[i] += val
                         setattr(self.agents[i].traits, _ARRAY_TO_TRAIT[arr], a[i])
+                    if arr in ("smell", "identity"):
+                        self.mark_biology_dirty()
                     if events is not None:
                         for i in idxs:   # one event row per affected agent
                             events.record(elapsed_s, "intervention",
@@ -505,6 +545,12 @@ class Simulation:
         rec_j = perc["rec_j"]
         need_food = perc["need_food"]
         need_water = perc["need_water"]
+        # Stashed for the frame emitter: the named drives whose sum produced
+        # this step's heading, plus the perception they were computed from.
+        # Summing them and discarding the parts would throw away the only
+        # record of *why* the animal moved where it did (see policy.py).
+        self._last_perc = perc
+        self._last_desired = desired
 
         # --- resolve to movement ---
         dmag = np.linalg.norm(desired, axis=1) + 1e-9
@@ -844,7 +890,10 @@ class Simulation:
         # dt-invariant hazard, as elsewhere in the engine
         p_mark = 1.0 - np.exp(-(rate_h / 3600.0) * boost * dt)
         can = self.alive & (reserve >= cost)
-        fire = can & (self.rng.random(self.n) < p_mark)
+        # per-agent stream: whether one animal marks cannot depend on how many
+        # other animals happened to draw before it this step
+        fire = can & (self.arand.uniform(self.uid, self._step_k, CH_MARK)
+                      < p_mark)
         idxs = np.nonzero(fire)[0]
         if len(idxs) == 0:
             return
@@ -852,6 +901,60 @@ class Simulation:
                            self.identity[idxs])
         self.bladder[idxs] = np.maximum(0.0, self.bladder[idxs] - cost[idxs])
         self.marks_made[idxs] += 1
+
+    # ------------------------------------------------------------------ #
+    # Olfactory recognition
+    # ------------------------------------------------------------------ #
+    def mark_biology_dirty(self) -> None:
+        """Flag that ``smell`` or ``identity`` changed, so recognition restales.
+
+        Called whenever a drug takes effect, an intervention fires, or the
+        roster grows. Recognition is expensive relative to a step but changes
+        only at those moments, so it is rebuilt on demand rather than per step.
+        """
+        self._olf_dirty = True
+
+    def recognition_matrix(self) -> np.ndarray:
+        """``R[i, j]`` — how well animal *i* recognises animal *j*'s scent.
+
+        Two implementations behind one call:
+
+        * **legacy** (default) — the scalar gate ``smell_i x identity_j``.
+        * **mechanistic** (``olfaction.enabled``) — a receptor/signature model
+          whose cohort mean tracks the scalar gate but which degrades
+          *selectively*, so a partially anosmic animal is confused about some
+          individuals and not others. See :mod:`fnt.abma.core.olfaction`.
+
+        Cached; invalidated by :meth:`mark_biology_dirty`.
+        """
+        if self.olf is None:
+            return np.outer(self.smell, self.identity)
+        if self._olf_dirty or self._recog is None:
+            if len(self.olf.uids) != self.n:
+                self.olf.set_roster(self.uid)
+            self.olf.rebuild(self.smell, self.identity)
+            self._recog = self.olf.recognition
+            self._olf_dirty = False
+        return self._recog
+
+    def discrimination_matrix(self) -> np.ndarray:
+        """``C[i, j]`` — identity legibility with detection factored *out*.
+
+        The scent field needs to know how legible a mark's signature is, but
+        not how well the reader can smell at all: the policy already gates
+        marks by the reader's acuity (``k_scent_avoid * smell``), so folding
+        detection in here too would count anosmia twice.
+
+        Legacy path: ``identity_j`` broadcast over readers — every animal reads
+        a given mark equally well, which is what the stored per-cell ``ident``
+        already encodes. Mechanistic path: ``recognition / detection``, i.e. the
+        purely perceptual "can I tell whose this is" term.
+        """
+        if self.olf is None:
+            return np.broadcast_to(self.identity[None, :], (self.n, self.n))
+        recog = self.recognition_matrix()
+        det = self.olf.detection
+        return np.where(det > 1e-9, recog / np.clip(det, 1e-9, None), 0.0)
 
     def territory_area(self) -> np.ndarray:
         """Emergent territory area per agent (m²), or zeros without marking."""
@@ -1033,14 +1136,26 @@ class Simulation:
         # per-step mating probability from the per-second hazard (dt-invariant)
         p_mate = 1.0 - np.exp(-self.mate_rate_hz * dt)
         contact = np.argwhere((dist < self.contact_r) & np.isfinite(dist))
-        for i, j in contact:
+        # Dyadic draws, batched: a contest or a mating belongs to the pair, so
+        # it gets a per-pair stream keyed by both uids. Drawn for every contact
+        # up front rather than inside the loop — vectorised, and (the point)
+        # independent of how many other pairs were resolved first, so removing
+        # or ablating one animal cannot reshuffle another pair's outcome.
+        if len(contact):
+            ua = self.uid[contact[:, 0]]
+            ub = self.uid[contact[:, 1]]
+            k = self._step_k
+            u_mate = self.arand.pair_uniform(ua, ub, k, CH_MATE)
+            u_fight = self.arand.pair_uniform(ua, ub, k, CH_FIGHT)
+            u_win = self.arand.pair_uniform(ua, ub, k, CH_FIGHT_OUTCOME)
+        for pair_k, (i, j) in enumerate(contact):
             if i >= j or not (self.alive[i] and self.alive[j]):
                 continue
             ai, aj = self.agents[i], self.agents[j]
             if ai.sex != aj.sex:
                 # --- mating: opposite sex, female receptive ---
                 fem = i if ai.sex == "F" else j
-                if (rec_j[fem] > 0.3 and self.rng.random() < p_mate
+                if (rec_j[fem] > 0.3 and u_mate[pair_k] < p_mate
                         and elapsed_s - self._last_mate.get((i, j), -1e9)
                         >= self.mate_cooldown_s):
                     self._last_mate[(i, j)] = elapsed_s
@@ -1076,10 +1191,10 @@ class Simulation:
                 # escalate. Keeping this literal is what makes the personality
                 # dial mean something an experimenter can reason about.
                 p_attack = self.aggr[i] * (0.5 + 0.5 * self.bold[i])
-                if self.rng.random() >= p_attack:
+                if u_fight[pair_k] >= p_attack:
                     continue
                 fi, fj = self._fight_power(i), self._fight_power(j)
-                if self.rng.random() < fi / (fi + fj + 1e-9):
+                if u_win[pair_k] < fi / (fi + fj + 1e-9):
                     w, l = i, j
                 else:
                     w, l = j, i
@@ -1133,7 +1248,8 @@ class Simulation:
     # Full trial
     # ------------------------------------------------------------------ #
     def run(self, output_dir: str, progress_cb=None, frame_cb=None,
-            frame_interval_s: float = 300.0, meta_cb=None) -> dict:
+            frame_interval_s: float = 300.0, meta_cb=None,
+            record_frames: bool = True) -> dict:
         cfg = self.cfg
         os.makedirs(output_dir, exist_ok=True)
         traj_path = os.path.join(output_dir, f"uwb_{self.trial_id}_processed.csv")
@@ -1149,6 +1265,14 @@ class Simulation:
         write_agents_table(agents_path, self.agents)
         if meta_cb is not None:
             meta_cb(self.agent_static())
+        # The replayable archive: same frames the live view gets, kept so a
+        # finished run can be reopened and inspected animal by animal rather
+        # than only read back as a table of positions. See core/record.py.
+        rec_path = os.path.join(output_dir, f"record_{self.trial_id}.npz")
+        archive = (RunRecord(trial_id=self.trial_id, n_agents=self.n,
+                             frame_interval_s=frame_interval_s,
+                             agents=self.agent_static())
+                   if record_frames else None)
 
         total_s = cfg.days * 86400.0
         dt = cfg.dt
@@ -1174,8 +1298,13 @@ class Simulation:
                     cond.record(elapsed, self.health, self.energy, self.hunger,
                                 self.thirst, self.stress, self.mass,
                                 self.smell < 0.5, self.bladder)
-                if frame_cb is not None and k % frame_every == 0:
-                    frame_cb(self._frame(elapsed))
+                if k % frame_every == 0 and (frame_cb is not None
+                                             or archive is not None):
+                    fr = self._frame(elapsed)
+                    if archive is not None:
+                        archive.append(fr)
+                    if frame_cb is not None:
+                        frame_cb(fr)
                 if progress_cb is not None and k % report_every == 0:
                     progress_cb(k / n_steps)
         finally:
@@ -1184,13 +1313,79 @@ class Simulation:
             cond.close()
         if progress_cb is not None:
             progress_cb(1.0)
-        return {"trajectory": traj_path, "events": evt_path,
-                "condition": cond_path, "agents": agents_path,
-                "trial_id": self.trial_id}
+        out = {"trajectory": traj_path, "events": evt_path,
+               "condition": cond_path, "agents": agents_path,
+               "trial_id": self.trial_id}
+        if archive is not None and len(archive):
+            archive.agents = self.agent_static()   # final roster + treatments
+            archive.save(rec_path)
+            out["record"] = rec_path
+        return out
+
+    def _drive_magnitudes(self) -> dict:
+        """Per-agent magnitude of each named drive from the last step.
+
+        Zeros for a drive this configuration does not use (``home`` only exists
+        without scent marking, ``scent_home``/``memory`` only with it), so the
+        record has a fixed set of columns either way.
+        """
+        n = self.n
+        perc = getattr(self, "_last_perc", None) or {}
+        drives = perc.get("drives", {})
+        out = {}
+        for name in ("scent_home", "memory", "home", "resource", "social",
+                     "territory", "wander"):
+            v = drives.get(name)
+            out[f"drive_{name}"] = (np.linalg.norm(v, axis=1) if v is not None
+                                    else np.zeros(n))
+        desired = getattr(self, "_last_desired", None)
+        out["desired_x"] = (desired[:, 0].copy() if desired is not None
+                            else np.zeros(n))
+        out["desired_y"] = (desired[:, 1].copy() if desired is not None
+                            else np.zeros(n))
+        return out
+
+    def _perception_summary(self) -> dict:
+        """Per-agent summary of what each animal was sensing last step."""
+        n = self.n
+        perc = getattr(self, "_last_perc", None) or {}
+        own = perc.get("scent_own")
+        foreign = perc.get("scent_foreign")
+        within = perc.get("within")
+        recog = perc.get("recognition")
+        # mean over *other* animals: what this nose makes of its cohort
+        if recog is not None and n > 1:
+            rec_mean = (recog.sum(axis=1) - np.diag(recog)) / (n - 1)
+        else:
+            rec_mean = np.zeros(n)
+        if self.olf is not None and n > 1:
+            det = self.olf.detection
+            det_mean = (det.sum(axis=1) - np.diag(det)) / (n - 1)
+        else:
+            det_mean = self.smell.copy()
+        return {
+            "scent_own": own if own is not None else np.zeros(n),
+            "scent_foreign": foreign if foreign is not None else np.zeros(n),
+            "recognition_mean": rec_mean,
+            "detection_mean": det_mean,
+            "need_food": perc.get("need_food", np.zeros(n)),
+            "need_water": perc.get("need_water", np.zeros(n)),
+            "neighbours": (within.sum(axis=1) if within is not None
+                           else np.zeros(n)),
+            "territory_m2": self.territory_area(),
+        }
 
     def _frame(self, elapsed: float) -> dict:
-        """Snapshot streamed to the live view / inspector (all arrays copied)."""
+        """Snapshot streamed to the live view / inspector (all arrays copied).
+
+        Carries three things: where every animal is, how it is doing, and — the
+        part a trajectory alone cannot recover — what it was trying to do and
+        what it was sensing when it decided.
+        """
         return {
+            **self._drive_magnitudes(),
+            **self._perception_summary(),
+            "marks_made": self.marks_made.copy(),
             "trial": self.trial_id, "elapsed": elapsed,
             "day": int(elapsed // 86400) + 1,
             "hour": self._hour(elapsed), "is_day": self._is_day(elapsed),

@@ -113,7 +113,7 @@ class ScentField:
                 self.ident[r, c] = ident[k]
 
     # ------------------------------------------------------------------ #
-    def sample(self, P: np.ndarray, idx: np.ndarray):
+    def sample(self, P: np.ndarray, idx: np.ndarray, recog=None):
         """Read the local scent landscape for every agent.
 
         Returns ``(own_vec, foreign_vec, own_level, foreign_level)``:
@@ -122,9 +122,24 @@ class ScentField:
           ``own_level``   0..1 how strongly it is standing in its own patch
           ``foreign_level`` 0..1 how much foreign scent is present here
 
-        Foreign marks are weighted by their signature ``ident``: an anonymous
-        mark (MUP-KO) still registers as "somebody passed" but carries far less
-        territorial weight than a recognisable one.
+        Foreign marks are weighted by how legible their signature is, so an
+        anonymous mark still registers as "somebody passed" but carries far
+        less territorial weight than a recognisable one. Two ways to supply
+        that legibility:
+
+        ``recog=None`` (default) reads the ``ident`` stored in the cell — the
+        depositor's ``identity_signal`` at the moment it marked. Every animal
+        reads a given mark equally well; only the *mark* varies.
+
+        ``recog`` as an (n_readers, n_owners) matrix instead reads legibility
+        per reader-owner pair, which is what the mechanistic olfactory model
+        produces: two animals standing on the same mark can disagree about
+        whose it is. This path reads identity *live* rather than as recorded at
+        deposit time, so a mid-run change to an animal's ``identity_signal``
+        retroactively changes how its old marks read. That is a simplification
+        — marks laid before a knockout should still carry the old signature —
+        and it only bites in designs that alter ``identity_signal`` during a
+        run rather than at release.
         """
         n = len(P)
         if n == 0:
@@ -154,7 +169,14 @@ class ScentField:
                             (wo * self._suy[None, :]).sum(1)], axis=1) / norm
         # foreign marks: repulsion, discounted when the signature is unreadable
         anon = float(self.p.anonymous_weight)
-        wf = np.where(other, w * (anon + (1.0 - anon) * idn), 0.0)
+        if recog is None:
+            legible = idn                       # as stored at deposit time
+        else:
+            # per reader-owner legibility; clipped owner index keeps the
+            # gather safe on clean cells (owner -1), which `other` masks out
+            legible = np.asarray(recog)[
+                np.arange(n)[:, None], np.clip(o, 0, None)]
+        wf = np.where(other, w * (anon + (1.0 - anon) * legible), 0.0)
         foreign_vec = -np.stack([(wf * self._sux[None, :]).sum(1),
                                  (wf * self._suy[None, :]).sum(1)],
                                 axis=1) / norm

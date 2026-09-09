@@ -39,20 +39,35 @@ def store(tmp_path):
     return add
 
 
+#: collect_training_examples' default; each patch is placed this many times.
+PLACEMENTS = 3
+
+
 def _collect(td_dir):
     return collect_training_examples(
         td_dir, tile_time_frames=TILE_T, tile_freq_bins=TILE_F,
-        return_groups=True,
+        return_groups=True, placements=PLACEMENTS,
     )
 
 
 def test_one_group_key_per_tile(store):
+    """Every tile carries the (recording, call) it came from — that is what a
+    grouped train/val split is made over.
+
+    The COUNT is placements x examples, not one tile per tile-width: each patch
+    is placed `placements` times at a random column offset rather than being
+    sliced into fixed tiles. Cutting from column 0 every time put each call at
+    the same offset beside a flat-zero pad, and the model learned that layout
+    instead of the call.
+    """
     store('a.wav', 'a_call0', tiles_wide=3)
     store('b.wav', 'b_call0', tiles_wide=1)
 
     specs, targets, weights, groups = _collect(store.dir)
 
-    assert specs.shape[0] == len(groups) == 4
+    assert specs.shape[0] == len(groups), "a tile without provenance"
+    assert len(groups) == 2 * PLACEMENTS, len(groups)
+    assert set(groups) == {('a.wav', 'a_call0'), ('b.wav', 'b_call0')}
     assert specs.shape[1:] == (TILE_F, TILE_T)
     assert targets.shape == specs.shape == weights.shape
 

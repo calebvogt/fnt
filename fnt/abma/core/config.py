@@ -207,6 +207,34 @@ class ScentParams:
 
 
 @dataclass
+class OlfactionParams:
+    """The mechanistic nose (see :mod:`fnt.abma.core.olfaction`).
+
+    Off by default: with ``enabled=False`` recognition stays the scalar product
+    ``smell_ability x identity_signal``, so every config written before this
+    module existed reproduces exactly. Switching it on replaces that scalar with
+    a receptor/signature model whose *cohort mean* still tracks the scalar one —
+    the new content is that recognition now degrades **selectively**, so two
+    animals given the same methimazole dose end up confused about different
+    individuals.
+
+    Every value here is a **free** parameter in the sense of
+    :data:`fnt.abma.core.project.SOURCES`. None is measured from an animal.
+    ``n_channels`` is a coarse functional basis, not a receptor-type count
+    (a mouse has ~1000); it was set to the point where losing half the channels
+    degrades discrimination at roughly the rate the previously validated
+    methimazole dose-response implies.
+    """
+    enabled: bool = False
+    n_channels: int = 64          # chemical channels in the signature space
+    discrimination: float = 3.0   # psychometric slope of the identity readout
+    confusion_threshold: float = 0.20   # separability below which two odours merge
+    #: 0 = a dose lowers every channel's gain uniformly (the scalar model),
+    #: 1 = a dose kills whole channels (what an epithelial lesion does)
+    ablation_selectivity: float = 1.0
+
+
+@dataclass
 class PolicyParams:
     """Free parameters of the rule-based movement policy.
 
@@ -571,6 +599,7 @@ class ExperimentConfig:
     policy: PolicyParams = field(default_factory=PolicyParams)
     scent: ScentParams = field(default_factory=ScentParams)
     physiology: PhysiologyParams = field(default_factory=PhysiologyParams)
+    olfaction: OlfactionParams = field(default_factory=OlfactionParams)
 
     #: 1 = condition bars were 0..1; 2 = bars are 0-100 (current). Configs
     #: written before the change carry no version and are migrated on load.
@@ -660,6 +689,8 @@ class ExperimentConfig:
                                 scent=ScentParams(**d.get("scent", {})),
                                 physiology=PhysiologyParams(
                                     **d.get("physiology", {})),
+                                olfaction=OlfactionParams(
+                                    **d.get("olfaction", {})),
                                 schema_version=2,
                                 **scalars)
 

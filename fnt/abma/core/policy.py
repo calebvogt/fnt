@@ -11,10 +11,26 @@ engine — rule-based agents and learning agents can share the same interface.
   * ``perception`` — a dict of reusable intermediates the engine also needs
     (``dist_home``, ``within``, ``rec_j``, ``need_food``, ``need_water``), so
     they are computed once.
+
+Drive decomposition
+-------------------
+``perception["drives"]`` carries the *named components* whose sum is ``desired``
+— home fidelity, memory, foraging, social attraction, territory avoidance and
+exploratory noise, each as its own (N, 2) vector. Summing them and discarding
+the parts is cheap, but it throws away the only answer to "why did this animal
+go there", which is the question an in-silico experiment exists to ask. The
+engine records their magnitudes each frame, so a trajectory can be read back
+alongside the drives that produced it.
+
+Keeping the decomposition costs one dict of views per step and no extra maths:
+the components were always computed, they were just being added straight into
+an accumulator.
 """
 from __future__ import annotations
 
 import numpy as np
+
+from .rng import CH_HEADING
 
 
 class Policy:
@@ -62,9 +78,25 @@ class RuleBasedPolicy(Policy):
         scented = getattr(sim, "scent", None) is not None
         own_vec = foreign_vec = None
         own_lvl = foreign_lvl = None
+        # How well each animal can attribute a mark to its owner. Legacy: the
+        # scalar gate smell_i x identity_j. With `olfaction.enabled`: a
+        # receptor/signature model that fails selectively (see .olfaction).
+        recog = sim.recognition_matrix()
         if scented:
             idx = np.arange(n)
-            own_vec, foreign_vec, own_lvl, foreign_lvl = sim.scent.sample(P, idx)
+            # Discrimination only: the reader's acuity is applied separately
+            # below as `k_scent_avoid * smell`, so passing full recognition
+            # here would count anosmia twice. Left as None without the
+            # mechanistic nose, so the field keeps reading the deposit-time
+            # signature it stores and legacy runs reproduce exactly.
+            disc = (sim.discrimination_matrix()
+                    if getattr(sim, "olf", None) is not None else None)
+            own_vec, foreign_vec, own_lvl, foreign_lvl = sim.scent.sample(
+                P, idx, recog=disc)
+        #: named components; their sum is `desired`. Kept apart so a run can be
+        #: read back as "what was this animal trying to do", not just "where
+        #: did it end up". See the module docstring.
+        drives: dict[str, np.ndarray] = {}
 
         # --- home-range spring (geometric; legacy path only) ---
         hv = sim.home - P
@@ -74,7 +106,7 @@ class RuleBasedPolicy(Policy):
             # Site fidelity has two channels. (1) Scent: come back to where my
             # own marks are — olfaction-dependent, so it fails under anosmia.
             k_sh = getattr(pp, "k_scent_home", 1.2) if pp is not None else 1.2
-            desired = (k_sh * sim.smell)[:, None] * own_vec
+            drives["scent_home"] = (k_sh * sim.smell)[:, None] * own_vec
             # (2) Spatial memory: an animal remembers where it has been living
             # even with no working nose. `home` tracks REALISED occupancy, so
             # this anchors without prescribing a home-range size — the settling
@@ -84,12 +116,12 @@ class RuleBasedPolicy(Policy):
             # which is the actual methimazole phenotype.
             k_mem = getattr(pp, "k_memory", 0.35) if pp is not None else 0.35
             w_mem = np.clip(k_mem * dist_home, 0.0, 3.0)
-            desired += w_mem[:, None] * home_dir
+            drives["memory"] = w_mem[:, None] * home_dir
         else:
             home_dir = hv / dist_home[:, None]
             w_home = self.k_home * np.clip(
                 (dist_home - sim.home_r) / sim.home_r, 0, 1.5)
-            desired = w_home[:, None] * home_dir
+            drives["home"] = w_home[:, None] * home_dir
 
         # --- resource seeking (hunger/thirst are 0-100 bars) ---
         span = max(1e-6, 100.0 - thr)
@@ -97,7 +129,11 @@ class RuleBasedPolicy(Policy):
         need_water = np.clip((sim.thirst - thr) / span, 0, 1)
         # a hungry animal suspends home fidelity to make a foraging trip
         rel = getattr(pp, "forage_releases_home", 0.0) if pp is not None else 0.0
-        desired *= (1.0 - rel * np.maximum(need_food, need_water))[:, None]
+        # a foraging trip suspends site fidelity, not the other drives
+        release = (1.0 - rel * np.maximum(need_food, need_water))[:, None]
+        for key in ("scent_home", "memory", "home"):
+            if key in drives:
+                drives[key] = drives[key] * release
         # steer for the access point (a walled zone's doorway), not the centre
         food_t = getattr(sim, "food_seek", sim.food)
         water_t = getattr(sim, "water_seek", sim.water)
@@ -130,7 +166,7 @@ class RuleBasedPolicy(Policy):
                 dd = np.linalg.norm(to_door, axis=1)[:, None] + 1e-9
                 exit_vec = self.k_resource * (to_door / dd) * need_water[:, None]
                 res_vec = np.where(leaving[:, None], exit_vec, res_vec)
-        desired += res_vec
+        drives["resource"] = res_vec
 
         # --- pairwise social / territorial forces (olfaction-gated) ---
         diff = P[None, :, :] - P[:, None, :]
@@ -140,7 +176,6 @@ class RuleBasedPolicy(Policy):
         alive_f = sim.alive.astype(float)
         within = (dist < self.perception_r) * alive_f[:, None] * alive_f[None, :]
 
-        recog = np.outer(sim.smell, sim.identity)
         s = sim.sex_m
         mm = np.outer(s, s)
         ff = np.outer(1 - s, 1 - s)
@@ -157,7 +192,7 @@ class RuleBasedPolicy(Policy):
         social_vec = np.where(smag[:, None] > 1e-9,
                               social_vec / (smag[:, None] + 1e-9) * cap[:, None],
                               social_vec)
-        desired += social_vec
+        drives["social"] = social_vec
 
         # --- territory avoidance ---
         if scented:
@@ -172,7 +207,7 @@ class RuleBasedPolicy(Policy):
             # cross a boundary, and territoriality silently becomes lethal.
             avoid = (k_sa * sim.smell) * (1.0 - rel * np.maximum(need_food,
                                                                  need_water))
-            desired += avoid[:, None] * foreign_vec
+            drives["territory"] = avoid[:, None] * foreign_vec
         else:
             to_home = P[:, None, :] - sim.home[None, :, :]
             dth = np.linalg.norm(to_home, axis=2)
@@ -180,20 +215,30 @@ class RuleBasedPolicy(Policy):
             inside = np.clip((sim.home_r[None, :] - dth) / sim.home_r[None, :],
                              0, 1)
             same_sex = mm + ff
-            terr_w = (self.k_territory * sim.smell[:, None]
-                      * sim.identity[None, :] * (0.3 + sim.aggr[None, :])
+            # `recog` here is the same recognition matrix used above; without
+            # the mechanistic nose it factorises back to smell_i x identity_j,
+            # which is exactly what this line used to compute inline.
+            terr_w = (self.k_territory * recog
+                      * (0.3 + sim.aggr[None, :])
                       * inside * same_sex
                       * alive_f[:, None] * alive_f[None, :])
             terr_dir = to_home / (dth[:, :, None] + 1e-9)
-            desired += np.einsum("ij,ijk->ik", terr_w, terr_dir)
+            drives["territory"] = np.einsum("ij,ijk->ik", terr_w, terr_dir)
 
         # --- correlated random walk (per-agent turn rate + wander gain) ---
         # heading drift is diffusive: sd grows with sqrt(dt), so tortuosity per
         # simulated second doesn't change when the integration step does
         jit = np.clip(sim.turn_rate, 1e-3, None) * np.sqrt(dt / self.REF_DT)
-        sim.H += sim.rng.normal(0.0, 1.0, n) * jit
+        # Drawn from each animal's own counter-based stream rather than from a
+        # shared sequential generator, so adding, removing or ablating one
+        # animal leaves every other animal's path bit-identical (see .rng).
+        sim.H += sim.arand.normal(sim.uid, sim._step_k, CH_HEADING) * jit
         rand_dir = np.stack([np.cos(sim.H), np.sin(sim.H)], axis=1)
-        desired += sim.wander[:, None] * rand_dir
+        drives["wander"] = sim.wander[:, None] * rand_dir
+
+        desired = np.zeros((n, 2))
+        for v in drives.values():
+            desired += v
 
         return desired, {
             "dist": dist, "dist_home": dist_home, "within": within,
@@ -201,4 +246,7 @@ class RuleBasedPolicy(Policy):
             # handed back so the engine can drive counter-marking without
             # sampling the scent field a second time
             "scent_own": own_lvl, "scent_foreign": foreign_lvl,
+            # the named parts whose sum is `desired` — recorded per frame so a
+            # trajectory can be read back with the motivation behind it
+            "drives": drives, "recognition": recog,
         }
