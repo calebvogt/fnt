@@ -332,6 +332,23 @@ class TracePlot(QWidget):
             self.history[key].append(_f(frame, key, idx))
         self.update()
 
+    def rebuild(self, frames, idx: int, upto: int) -> None:
+        """Refill the history from a buffer, ending at frame ``upto``.
+
+        Scrubbing must not append: dragging the timeline backwards would
+        otherwise push older samples onto the right-hand end and draw a trace
+        that runs backwards in time. Rebuilding from the buffer makes the plot
+        show the run up to wherever the scrubber is, which is what a scrubber
+        is for.
+        """
+        for d in self.history.values():
+            d.clear()
+        start = max(0, upto - self.window + 1)
+        for frame in frames[start:upto + 1]:
+            for key, _, _ in self.series:
+                self.history[key].append(_f(frame, key, idx))
+        self.update()
+
     def set_visible(self, key: str, on: bool) -> None:
         self.visible[key] = on
         self.update()
@@ -425,6 +442,9 @@ class TraceGroup(QWidget):
 
     def push(self, frame, idx):
         self.plot.push(frame, idx)
+
+    def rebuild(self, frames, idx, upto):
+        self.plot.rebuild(frames, idx, upto)
 
     def clear(self):
         self.plot.clear()
@@ -654,9 +674,16 @@ class SciencePanel(QWidget):
             f"sociability {float(meta.get('sociability', 0)):.2f} · "
             f"smell {float(meta.get('smell_ability', 0)):.2f}")
 
-    def update_frame(self, frame: dict) -> None:
-        """Feed one frame: the roster always, the detail only if something
-        is selected."""
+    def update_frame(self, frame: dict, buffer=None,
+                     index: int | None = None) -> None:
+        """Feed one frame: the roster always, the detail only if selected.
+
+        ``buffer``/``index`` are supplied when the frame came from scrubbing a
+        buffered or reloaded run. The traces are then rebuilt from the buffer
+        up to that index instead of appended to, so dragging the timeline
+        backwards shows the run up to that point rather than a trace that
+        doubles back on itself.
+        """
         if not frame:
             return
         self.roster.update_frame(frame)
@@ -668,5 +695,8 @@ class SciencePanel(QWidget):
             return
         self.drives.set_frame(frame, idx)
         for page in self.pages:
-            page.push(frame, idx)
+            if buffer is not None and index is not None:
+                page.rebuild(buffer, idx, index)
+            else:
+                page.push(frame, idx)
         self.coupling.set_frame(frame, idx)

@@ -145,6 +145,48 @@ def test_the_badge_follows_a_run_of_decisions():
     assert badge(w) == (3, 2, 1), badge(w)
 
 
+def test_a_finished_inference_badges_from_the_store_not_from_memory():
+    """A batch run rewrites a recording's predictions. If you happen to be
+    LOOKING at that recording, the annotations in memory are the ones loaded
+    before the run — so badging the row from memory reports the previous
+    model's count. Observed live: the row read 680 pending while the store
+    held 1, and every other row was correct because no other file was loaded.
+    """
+    w, wavs = gui()
+    seed(w, 5)                                   # 5 stale pendings in memory
+    cur = wavs[w.current_file_idx]
+    base = os.path.basename(cur)
+    calls = []
+
+    def fake_store_counts(fp):
+        calls.append(fp)
+        return (0, 1, 0)                         # what the run just wrote
+
+    real = w._store_status_counts
+    w._store_status_counts = fake_store_counts
+    try:
+        w._set_file_item_state(cur, 'done', 1)
+    finally:
+        w._store_status_counts = real
+    assert calls, "_set_file_item_state did not consult the store"
+    assert w._file_count_cache[base] == (0, 1, 0), w._file_count_cache[base]
+
+
+def test_the_store_badge_falls_back_when_there_is_no_store():
+    """A legacy CSV-only recording still gets a badge."""
+    w, wavs = gui()
+    seed(w, 3)
+    cur = wavs[w.current_file_idx]
+    real_store, real_file = w._store_status_counts, w._file_status_counts
+    w._store_status_counts = lambda fp: None
+    w._file_status_counts = lambda fp: (2, 2, 2)
+    try:
+        w._set_file_item_state(cur, 'done', 6)
+    finally:
+        w._store_status_counts, w._file_status_counts = real_store, real_file
+    assert w._file_count_cache[os.path.basename(cur)] == (2, 2, 2)
+
+
 def test_bulk_paths_were_already_covered():
     """_refresh_annotation_list ends in _update_file_list_counts(), so
     box-select and Accept All never had the problem. Pinned so a future

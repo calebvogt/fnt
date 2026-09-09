@@ -132,3 +132,16 @@ def test_layout_is_self_describing():
     assert got["schema_version"] == RECORD_SCHEMA_VERSION
     assert got["value_fields"] == VALUE_FIELDS
     assert got["state_fields"] == STATE_FIELDS
+
+
+def test_a_loaded_archive_does_not_thin_itself_on_open(tmp_path):
+    """It is already on disk at this resolution; opening must not lose samples."""
+    rec = RunRecord(trial_id="S", n_agents=2, frame_interval_s=60.0)
+    for k in range(300):
+        rec.append(_frame(k * 60.0, 2))
+    path = rec.save(str(tmp_path / "big.npz"))
+    back = RunRecord.load(path)
+    back.cap_bytes = 1                      # a hostile in-memory ceiling
+    assert len(back) == 300
+    assert back.decimation == 1
+    assert np.allclose(back.times(), rec.times())

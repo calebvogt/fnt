@@ -238,6 +238,32 @@ class RunRecord:
                    hour=float(hour), is_day=bool(is_day), index=i)
         return out
 
+    def view_frame(self, index: int) -> dict:
+        """A stored frame plus the display fields the arena views expect.
+
+        Colour, size and sex are properties of the *animal*, not of the moment,
+        so they live in the archive's agent table rather than being stored
+        again for every frame. Rebuilding them here is what lets a finished run
+        be reopened and replayed through the same view code that drew it live.
+        """
+        out = self.frame(index)
+        n = self._n_agents
+        sex_m = np.zeros(n)
+        colour = np.zeros((n, 4))
+        for meta in self.agents:
+            i = int(meta.get("index", -1))
+            if not (0 <= i < n):
+                continue
+            male = str(meta.get("sex", "M")) == "M"
+            sex_m[i] = 1.0 if male else 0.0
+            colour[i] = ((0.29, 0.56, 0.85, 1.0) if male
+                         else (0.88, 0.33, 0.60, 1.0))
+        out.update(sex_m=sex_m, color=colour, size=np.ones(n),
+                   shape=np.zeros(n, int),
+                   anosmic=out["detection_mean"] < 0.5,
+                   estrus=np.zeros(n, bool))
+        return out
+
     def series(self, agent: int, field: str, start: int = 0,
                stop: int | None = None) -> np.ndarray:
         """One agent's history of one field — the trace the GUI plots."""
@@ -300,4 +326,8 @@ class RunRecord:
         rec._frames = frames.astype(np.float64)
         rec._n = len(frames)
         rec._n_agents = rec._values.shape[1]
+        # A loaded archive must never decimate itself just because it is bigger
+        # than the default in-memory ceiling — it is already on disk at this
+        # resolution, and thinning it on open would silently lose samples.
+        rec._cap_frames = max(rec._cap_frames, rec._n)
         return rec

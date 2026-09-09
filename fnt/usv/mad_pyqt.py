@@ -5533,6 +5533,10 @@ class MADMainWindow(QMainWindow):
         # Persisted per-file total annotation count cache.
         # basename -> (accepted, pending, rejected) counts for the file lists
         self._file_count_cache: Dict[str, tuple] = {}
+        #: Recordings a running inference job has queued but not yet written.
+        #: Locked in the Audio list until their turn is done — see
+        #: _is_infer_locked.
+        self._infer_locked: set = set()
         self._loaded_wav_path: Optional[str] = None  # wav the annotations are for
 
         # SAM2-assisted labeling state
@@ -5668,6 +5672,16 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.annotations_selected.connect(
             self._on_box_selection
         )
+        # Which recording you are looking at, and how far through it you are.
+        # The window title carries the PROJECT, the Audio list row carries the
+        # counts — both are somewhere else while your eyes are on the
+        # spectrogram, and the list scrolls the current row out of view on a
+        # 158-file project. Small, above the canvas, updated as you review.
+        self.lbl_view_header = QLabel("")
+        self.lbl_view_header.setStyleSheet(
+            "color: #9a9a9a; font-size: 9px; padding: 1px 4px;")
+        self.lbl_view_header.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        right_layout.addWidget(self.lbl_view_header)
         right_layout.addWidget(self.spectrogram, 1)
 
         # The live training graph lives in its own floating window
@@ -8032,6 +8046,7 @@ class MADMainWindow(QMainWindow):
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
+        self._update_view_header()
         self._update_overview_marks()
         self._refresh_open_gallery()
         return True
@@ -8237,6 +8252,7 @@ class MADMainWindow(QMainWindow):
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
+        self._update_view_header()
         self._update_overview_marks()
         self._refresh_open_gallery()
 
@@ -9001,6 +9017,7 @@ class MADMainWindow(QMainWindow):
             # numbers inference wrote and never moved while you reviewed. One
             # row is all that can have changed.
             self._touch_current_file_badge()
+            self._update_view_header()
         if self._auto_advance and was_pending:
             if not (self._select_next_pending_from_id(successor)
                     or self._select_next_pending_after_id(decided_id)):
@@ -10731,6 +10748,48 @@ class MADMainWindow(QMainWindow):
                 a += 1
         return (a, p, r)
 
+    @staticmethod
+    def _path_key(fp) -> str:
+        """Case-folded absolute path — the key every path set here uses."""
+        return os.path.normcase(os.path.abspath(str(fp)))
+
+    def _is_infer_locked(self, fp) -> bool:
+        """True while a running job still has this recording queued.
+
+        Locked means "the run has not written this file yet", not "a run is
+        going on": a recording the run never targets, or one it has already
+        finished, is free to open and review.
+        """
+        return self._path_key(fp) in getattr(self, '_infer_locked', set())
+
+    def _refresh_file_list_locks(self):
+        """Repaint the Audio list so queued rows read as unavailable."""
+        if not hasattr(self, 'file_list'):
+            return
+        self.file_list.blockSignals(True)
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            fp = item.data(Qt.UserRole)
+            if not fp:
+                continue
+            locked = self._is_infer_locked(fp)
+            flags = item.flags()
+            item.setFlags(flags & ~Qt.ItemIsEnabled if locked
+                          else flags | Qt.ItemIsEnabled)
+            if locked:
+                item.setToolTip(
+                    f"{fp}\n\nQueued for the running inference job. It opens "
+                    "as soon as the run finishes writing it — reviewing it now "
+                    "would mean deciding on detections about to be replaced.")
+        self.file_list.blockSignals(False)
+        self.file_list.viewport().update()
+
+    def _unlock_all_infer_files(self):
+        """Release every lock — the run ended, was stopped, or failed."""
+        if getattr(self, '_infer_locked', None):
+            self._infer_locked = set()
+            self._refresh_file_list_locks()
+
     def _store_status_counts(self, fp):
         """(accepted, pending, rejected) derived from the recording's store.
 
@@ -10769,58 +10828,23 @@ class MADMainWindow(QMainWindow):
             return None
         return (accepted, pending, rejected)
 
-    def _csv_status_counts(self, fp):
-        """(accepted, pending, rejected) for a recording, read from disk so it
-        is correct for files that are not the one on screen.
+    def _stored_status_counts(self, fp):
+        """(accepted, pending, rejected) for a recording, read from its store,
+        so it is correct for files that are not the one on screen.
 
-        The store answers first; the CSV is consulted only for decisions the
-        store cannot hold — an accept made from the gallery with no audio
-        loaded records the status and mints no example until the file is next
-        opened, and those rows would otherwise go uncounted.
+        Named for what it reads. It used to consult a sibling CSV as well, from
+        when the CSV was written continuously and held review decisions the
+        store did not. The .mad now records every decision as a side effect of
+        making it, and a CSV is only ever an export the user asked for.
         """
         from_store = self._store_status_counts(fp)
-        csv_p = pred_csv_sibling_path(fp)
         if from_store is not None:
-            if not os.path.isfile(csv_p):
-                return from_store
-            try:
-                from fnt.usv.usv_detector.mad_inference import read_blob_csv
-                from fnt.usv.usv_detector.fnt_mask_store import (
-                    list_pred_ids, masks_sibling_path, td_iter_meta)
-                h5 = masks_sibling_path(fp)
-                known = {str(m.get('blob_id')) for m in td_iter_meta(h5)
-                         if m.get('blob_id') is not None}
-                known |= {str(m.get('id')) for m in td_iter_meta(h5)}
-                known |= set(list_pred_ids(h5))
-                a, p, r = from_store
-                for row in read_blob_csv(csv_p):
-                    if str(row.get('blob_id')) in known:
-                        continue
-                    st = row.get('status') or 'pending'
-                    if st == 'rejected':
-                        r += 1
-                    elif st == 'pending':
-                        p += 1
-                    else:
-                        a += 1
-                return (a, p, r)
-            except Exception:
-                return from_store
-        if os.path.isfile(csv_p):
-            try:
-                from fnt.usv.usv_detector.mad_inference import read_blob_csv
-                a = p = r = 0
-                for row in read_blob_csv(csv_p):
-                    st = row.get('status') or 'pending'
-                    if st == 'rejected':
-                        r += 1
-                    elif st == 'pending':
-                        p += 1
-                    else:  # 'accepted', hand-labels, anything else
-                        a += 1
-                return (a, p, r)
-            except Exception:
-                pass
+            # The store is the record. A CSV beside it is an EXPORT — a
+            # snapshot taken whenever the user last asked for one — so its rows
+            # are not live state, and merging the ones the store does not
+            # recognise counted detections from an older run as pending. That
+            # is the two-sources-of-truth problem the .mad exists to end.
+            return from_store
         try:
             from fnt.usv.usv_detector.fnt_mask_store import (
                 masks_sibling_path, get_prob_blob_count, td_count,
@@ -10833,14 +10857,17 @@ class MADMainWindow(QMainWindow):
     def _file_status_counts(self, fp):
         """(accepted, pending, rejected) for a wav. Uses the live in-memory
         annotations when ``fp`` is the file actually loaded in the preview (so
-        edits show instantly); otherwise reads the persisted CSV. The
-        loaded-file check is what stops a row's count from briefly showing the
-        *previous* file's number while a new file loads."""
+        edits show instantly); otherwise reads the store. The loaded-file check
+        is what stops a row's count from briefly showing the *previous* file's
+        number while a new file loads.
+
+        NOT for use right after a run rewrites ``fp`` — the annotations in
+        memory are then the ones loaded before it. See _set_file_item_state."""
         loaded = getattr(self, '_loaded_wav_path', None)
         if (loaded and self.audio_data is not None
                 and os.path.normpath(loaded) == os.path.normpath(fp)):
             return self._mem_status_counts()
-        return self._csv_status_counts(fp)
+        return self._stored_status_counts(fp)
 
     def _apply_file_row(self, item, base, counts):
         """Set a list row's display text + delegate data for ``base`` with an
@@ -10894,10 +10921,28 @@ class MADMainWindow(QMainWindow):
         if item is None:
             return
         base = os.path.basename(wav_path)
+        if state in ('done', 'error'):
+            # Finished (or failed) — either way the run is done writing it, so
+            # release the lock AND re-enable the row. One row, not a full
+            # repaint: this fires once per file in a run that may be thousands
+            # of files long.
+            self._infer_locked.discard(self._path_key(wav_path))
+            item.setFlags(item.flags() | Qt.ItemIsEnabled)
         if state == 'done':
             # Freshly inferred — show the accepted/pending/rejected breakdown,
             # and keep the cache in step so the next full refresh agrees.
-            counts = self._file_status_counts(wav_path)
+            #
+            # Read the STORE, not _file_status_counts. That helper prefers the
+            # in-memory annotations for the file on screen, which is right
+            # while reviewing and wrong here: the run has just rewritten this
+            # recording's predictions, and the annotations in memory are the
+            # ones loaded BEFORE it did. Reviewing file 1 while the batch ran
+            # left its badge reading 680 pending from the previous model when
+            # the store held 1 — every other row was right, because no other
+            # file was loaded.
+            counts = self._store_status_counts(wav_path)
+            if counts is None:
+                counts = self._file_status_counts(wav_path)
             self._apply_file_row(item, base, counts)
             if any(counts):
                 self._file_count_cache[base] = counts
@@ -12571,6 +12616,8 @@ class MADMainWindow(QMainWindow):
             self.file_list.addItem(item)
         self.file_list.blockSignals(False)
         self._n_missing_audio = n_missing
+        self._refresh_file_list_locks()
+        self._update_view_header()
         self._scan_all_file_counts()
 
     def _live_worker(self, attr: str):
@@ -12666,7 +12713,7 @@ class MADMainWindow(QMainWindow):
                                        self._counts_pending[chunk:])
         for fp, has_store in batch:
             try:
-                counts = self._csv_status_counts(fp)
+                counts = self._stored_status_counts(fp)
             except Exception:
                 continue
             base = os.path.basename(fp)
@@ -12696,6 +12743,34 @@ class MADMainWindow(QMainWindow):
         if self._counts_pending:
             QTimer.singleShot(
                 0, lambda g=generation: self._read_sidecar_chunk(g))
+
+    def _update_view_header(self):
+        """The line above the spectrogram: recording, position, live counts."""
+        lbl = getattr(self, 'lbl_view_header', None)
+        if lbl is None:
+            return
+        if not self.audio_files or not (
+                0 <= self.current_file_idx < len(self.audio_files)):
+            lbl.setText("")
+            return
+        cur = self.audio_files[self.current_file_idx]
+        base = os.path.basename(cur)
+        pos = f"file {self.current_file_idx + 1}/{len(self.audio_files)}"
+        loaded = getattr(self, '_loaded_wav_path', None)
+        on_screen = (loaded is not None
+                     and os.path.normcase(os.path.abspath(loaded))
+                     == os.path.normcase(os.path.abspath(cur)))
+        if not on_screen:
+            lbl.setText(f"{base}   ·   {pos}   ·   loading…")
+            return
+        acc, pend, rej = self._mem_status_counts()
+        # Coloured to match the spectrogram's own status palette, so the
+        # numbers read as the same three things the outlines do.
+        lbl.setText(
+            f"<b>{base}</b> &nbsp;·&nbsp; {pos} &nbsp;·&nbsp; "
+            f"<span style='color:#3fbf5f'>{acc} accepted</span> &nbsp;·&nbsp; "
+            f"<span style='color:#d8c341'>{pend} pending</span> &nbsp;·&nbsp; "
+            f"<span style='color:#d64545'>{rej} rejected</span>")
 
     def _touch_current_file_badge(self):
         """Re-badge JUST the on-screen recording's Audio-list row from memory.
@@ -12925,6 +13000,15 @@ class MADMainWindow(QMainWindow):
 
     def _on_file_selected(self, row: int):
         if 0 <= row < len(self.audio_files):
+            if self._is_infer_locked(self.audio_files[row]):
+                # Disabled rows are unreachable by mouse, but Prev/Next and
+                # the file-complete prompt set the row directly.
+                self.status_bar.showMessage(
+                    f"{os.path.basename(self.audio_files[row])} is queued for "
+                    "the running inference job — it opens when the run "
+                    "finishes writing it.")
+                self.file_list.setCurrentRow(self.current_file_idx)
+                return
             already = (self.audio_data is not None
                        or self._loading_path == self.audio_files[row])
             if row == self.current_file_idx and already:
@@ -13337,6 +13421,9 @@ class MADMainWindow(QMainWindow):
                     return
                 self._init_or_load_mask_for_current_file()
                 self._loaded_wav_path = filepath
+                # The header says "loading…" until this point, because until
+                # it the annotations in memory still belong to the old file.
+                self._update_view_header()
                 self._sync_scrollbar_from_view()
                 if self._project is not None:
                     self._project.last_opened_file = filepath
@@ -16582,9 +16669,18 @@ class MADMainWindow(QMainWindow):
             self.btn_infer_pause.setEnabled(True)
 
         # Reset queue markers so completion shows live as the run progresses.
+        #
+        # Everything still queued is LOCKED. A run rewrites a recording's
+        # predictions wholesale, so reviewing one before its turn means
+        # deciding on detections that are about to be replaced — and accepting
+        # one mints a training example for a detection that will not exist.
+        # Files already finished, and files this run never touches, stay open:
+        # reviewing finished files while the rest scan is the point.
         for w in wav_paths:
             self._set_file_item_state(w, 'pending')
         self._infer_counted = set()
+        self._infer_locked = {self._path_key(w) for w in wav_paths}
+        self._refresh_file_list_locks()
 
         # Human-readable stage labels so the X/Y is obviously *tiles* scanned by
         # the model (not detections — those are counted at the end).
@@ -16638,6 +16734,9 @@ class MADMainWindow(QMainWindow):
 
         def on_finished(results):
             self._infer_worker = None
+            # However the run ended, nothing else will be written:
+            # release every queued recording.
+            self._unlock_all_infer_files()
             self._last_infer_results = list(results or [])
             # Remember which recordings failed, so the Audio list can say so.
             # Only the files THIS run touched are updated: a re-run of the
@@ -16724,6 +16823,9 @@ class MADMainWindow(QMainWindow):
 
         def on_error(msg: str):
             self._infer_worker = None
+            # However the run ended, nothing else will be written:
+            # release every queued recording.
+            self._unlock_all_infer_files()
             self._close_manifest()
             if hasattr(self, 'btn_infer_pause'):
                 self.btn_infer_pause.setText("Pause")

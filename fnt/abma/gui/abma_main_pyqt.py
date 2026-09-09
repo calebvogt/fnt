@@ -30,7 +30,7 @@ from ..core.config import (
     ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
     TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
     default_dynamics, GrassSpec, blank_experiment, default_vole_experiment,
-    ScentParams,
+    ScentParams, OlfactionParams,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -93,11 +93,15 @@ class ABMARunWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, config: ExperimentConfig, project_dir: str,
-                 analyze: bool = False):
+                 analyze: bool = False, scent_map: bool = False):
         super().__init__()
         self.config = config
         self.project_dir = project_dir
         self.analyze = analyze
+        #: rasterise the territory field for the live view. Off unless the
+        #: user has the map switched on, so a headless-equivalent run costs
+        #: nothing extra.
+        self.scent_map = scent_map
         total_s = config.days * 86400.0
         # ~500 live frames regardless of duration; never finer than one step
         self._frame_interval = max(config.dt, total_s / 500.0)
@@ -127,6 +131,7 @@ class ABMARunWorker(QThread):
                 analyze=self.analyze,
                 meta_cb=lambda meta: self.agents.emit(meta),
                 cancel_cb=self._cancel.is_set,
+                scent_map=self.scent_map,
             )
             self.done.emit(res)
         except Exception:
@@ -211,9 +216,15 @@ class ABMAWindow(QMainWindow):
         try:
             cfg = self._collect_config()
         except Exception as e:
-            # surface config errors (e.g. a typo in a dynamics/attribute cell)
-            # instead of silently freezing the preview
+            # Surface config errors (e.g. a typo in a dynamics/attribute cell)
+            # instead of silently freezing the preview. The roster is emptied
+            # too: a blank experiment reaches here (it has no agent types yet),
+            # and leaving the previous experiment's animals listed would offer
+            # the user cards for a cohort that no longer exists.
             self._stop_preview()
+            self._preview_sim = None
+            self.inspector.set_population([])
+            self.science.set_population([])
             if hasattr(self, "status_label"):
                 self.status_label.setText(f"⚠ preview paused — {e}")
                 self.status_label.setStyleSheet("color:#e0a23a; font-size:11px;")
@@ -222,13 +233,21 @@ class ABMAWindow(QMainWindow):
             self.status_label.setText("Idle.")
             self.status_label.setStyleSheet("color:#8a9099; font-size:11px;")
         if cfg.total_agents() == 0:
+            # an empty config must empty the roster too, or the panel keeps
+            # offering animals from the experiment that was open before
             self._stop_preview()
+            self._preview_sim = None
+            self.inspector.set_population([])
+            self.science.set_population([])
+            self.science.set_dynamics(getattr(cfg, "dynamics", []))
             return
         from ..core.simulation import Simulation
         pcfg = copy.deepcopy(cfg)
         pcfg.n_trials = 1
         pcfg.enable_mortality = False
         self._preview_sim = Simulation(pcfg, trial_index=0)
+        self._preview_sim.emit_scent_map = (
+            hasattr(self, "btn_scent") and self.btn_scent.isChecked())
         self._preview_elapsed = 0.0
         for v in self._views():
             v.set_arena(cfg.arena)          # single chamber for the preview
@@ -474,6 +493,14 @@ class ABMAWindow(QMainWindow):
         self.btn_measure.setToolTip("Measure grid: off → metric → imperial")
         self.btn_measure.clicked.connect(self._cycle_measure)
         tl.addWidget(self.btn_measure)
+        self.btn_scent = QToolButton()
+        self.btn_scent.setText("🐾")
+        self.btn_scent.setCheckable(True)
+        self.btn_scent.setToolTip(
+            "Territory map: show the scent field the animals are navigating "
+            "(colour = whose marks dominate each patch, opacity = how fresh)")
+        self.btn_scent.toggled.connect(self._on_toggle_scent)
+        tl.addWidget(self.btn_scent)
         self._resource_state = -1       # -1 off, 0 lids-on, 1 lids-off
         self.btn_resources = QToolButton()
         self.btn_resources.setText("💧🌿")
@@ -493,6 +520,22 @@ class ABMAWindow(QMainWindow):
         self._inspector_pinned = False
         self._hover_idx = None
         return right
+
+    def _on_toggle_scent(self, on):
+        """Show the emergent territory mosaic under the arena.
+
+        Territory is what the scent model produces and it was previously only
+        visible in a CSV after the run. Switching this on also tells the live
+        simulation to start rasterising the field, so nothing is computed
+        while nobody is looking at it.
+        """
+        for v in self._views():
+            if hasattr(v, "set_scent_visible"):
+                v.set_scent_visible(on)
+        if self._preview_sim is not None:
+            self._preview_sim.emit_scent_map = on
+        if self._last_frame is not None:
+            self._push_frame(self._active_view(), self._last_frame)
 
     def _on_toggle_grass(self, on):
         for v in self._views():
@@ -748,7 +791,7 @@ class ABMAWindow(QMainWindow):
                     lv[k.strip()] = v.strip()
             if len(lv) < 2:
                 raise ValueError("need at least two conditions")
-            from ..core.study import lesion_study, run_study
+            from ..core.study import lesion_study
             study = lesion_study(f"{base.name}_study", base, path.strip(),
                                  lv, replicates=reps)
             study.config_for(0)                 # fail fast on a bad path
@@ -756,17 +799,69 @@ class ABMAWindow(QMainWindow):
             QMessageBox.warning(self, "Could not build study", str(e))
             return
 
+        self._execute_study(study, path.split(".")[-1],
+                            f"varying {path}")
+
+    def _anosmia_study_dialog(self):
+        """Run the saline-vs-methimazole dose-response in one step.
+
+        This is the design ABMA exists for, so it should not require assembling
+        an override path by hand. Nothing here prescribes how far apart animals
+        should sit — spacing is what the run produces.
+        """
+        from ..core.study import anosmia_study
+
+        doses, ok = QInputDialog.getText(
+            self, "Anosmia dose-response — 1/3: doses",
+            "Methimazole doses (0 = saline control), comma separated:",
+            text="0, 0.5, 0.75, 1.0")
+        if not ok or not doses.strip():
+            return
+        reps, ok = QInputDialog.getInt(
+            self, "Anosmia dose-response — 2/3: replicates",
+            "Replicates per dose (paired seeds across arms):", 4, 1, 50)
+        if not ok:
+            return
+        days, ok = QInputDialog.getDouble(
+            self, "Anosmia dose-response — 3/3: duration",
+            "Days per trial:", 3.0, 0.1, 60.0, 1)
+        if not ok:
+            return
+        try:
+            base = self._collect_config()
+            levels = tuple(float(d) for d in doses.split(",") if d.strip())
+            if len(levels) < 2:
+                raise ValueError("need at least two doses")
+            study = anosmia_study(
+                base=base, doses=levels, replicates=reps, days=days,
+                mechanistic_nose=self.in_olf_on.isChecked())
+            study.config_for(0)                 # fail fast
+        except Exception as e:
+            QMessageBox.warning(self, "Could not build study", str(e))
+            return
+        nose = ("mechanistic nose" if self.in_olf_on.isChecked()
+                else "scalar recognition gate")
+        self._execute_study(study, "anosmia",
+                            f"methimazole doses {levels} · {nose}")
+
+    def _execute_study(self, study, slug: str, subtitle: str):
+        """Confirm, run and report a study. Shared by every study builder."""
+        from ..core.study import run_study
+
         root = (self.project.path if self.project
                 else (self.in_outdir.text().strip() or os.getcwd()))
         sdir = os.path.join(root, "studies",
-                            f"{time.strftime('%Y%m%d-%H%M')}_{path.split('.')[-1]}")
-        n_runs = len(lv) * reps
+                            f"{time.strftime('%Y%m%d-%H%M')}_{slug}")
+        n_conditions = len(study.conditions)
+        n_runs = n_conditions * study.replicates
         if QMessageBox.question(
                 self, "Run study?",
-                f"{len(lv)} conditions × {reps} replicates = {n_runs} trials\n"
-                f"varying {path}\n\nOutput: {sdir}") != QMessageBox.Yes:
+                f"{n_conditions} conditions × {study.replicates} replicates "
+                f"= {n_runs} trials\n{subtitle}\n\nOutput: {sdir}") \
+                != QMessageBox.Yes:
             return
-        self._append_log(f"Study: {len(lv)} conditions × {reps} replicates…")
+        self._append_log(
+            f"Study: {n_conditions} conditions × {study.replicates} replicates…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             res = run_study(study, sdir, log_cb=self._append_log)
@@ -835,6 +930,7 @@ class ABMAWindow(QMainWindow):
             ("Start screen…", None, self.show_start_dialog),
             ("&Save Project", "Ctrl+Shift+S", self._save_project),
             ("Run &Study (compare conditions)…", None, self._run_study_dialog),
+            ("Run &Anosmia Dose-Response…", None, self._anosmia_study_dialog),
             (None, None, None),
             ("&New (blank experiment)", "Ctrl+N",
              lambda: self._load_config(blank_experiment())),
@@ -842,6 +938,8 @@ class ABMAWindow(QMainWindow):
             ("&Save Config…", "Ctrl+S", self._save_config),
             ("&Open Config…", "Ctrl+O", self._open_config),
             (None, None, None),
+            ("Open Run &Record… (replay a finished trial)", None,
+             self._open_record),
             ("Open Output &Folder", None, self._open_output),
             (None, None, None),
             ("&Close", "Ctrl+W", self.close),
@@ -854,6 +952,46 @@ class ABMAWindow(QMainWindow):
                 act.setShortcut(shortcut)
             act.triggered.connect(slot)
             m.addAction(act)
+
+    def _open_record(self):
+        """Reopen a finished trial and scrub it, drives and all.
+
+        A run's ``record_<trial>.npz`` holds the same frames the live view was
+        fed, including the drive decomposition, so an experiment from last week
+        can be replayed and interrogated animal by animal instead of being
+        re-run. Loads into the existing transport, so play/pause/scrub and the
+        science panel work exactly as they do live.
+        """
+        from ..core.record import RunRecord
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open a run record", "", "ABMA run record (record_*.npz)")
+        if not path:
+            return
+        try:
+            rec = RunRecord.load(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Could not open record", str(e))
+            return
+        if not len(rec):
+            QMessageBox.information(self, "Empty record",
+                                    "That record contains no frames.")
+            return
+        self._frames = [rec.view_frame(i) for i in range(len(rec))]
+        self.inspector.set_population(rec.agents)
+        self.science.set_population(rec.agents)
+        self._live_follow = False
+        self._play_idx = 0
+        self.scrubber.blockSignals(True)
+        self.scrubber.setRange(0, len(self._frames) - 1)
+        self.scrubber.setValue(0)
+        self.scrubber.blockSignals(False)
+        self._display_frame(self._frames[0], scrub_index=0)
+        note = (f" (decimated {rec.decimation}x)" if rec.decimation > 1 else "")
+        self._append_log(
+            f"Loaded {os.path.basename(path)}: trial {rec.trial_id}, "
+            f"{len(rec)} frames every {rec.sample_interval_s():.0f} s"
+            f"{note}, {rec.n_agents} animals. Scrub to replay.")
 
     def _save_config(self):
         try:
@@ -1278,6 +1416,61 @@ class ABMAWindow(QMainWindow):
         self.in_scent_on.toggled.connect(self._on_arena_edit)
         lay.addWidget(scent_box)
 
+        # ---- olfaction: how recognition actually fails ----
+        olf_box = QGroupBox("Olfactory recognition")
+        ol = QVBoxLayout(olf_box)
+        self.in_olf_on = QCheckBox(
+            "Model receptors and odour signatures (selective anosmia)")
+        self.in_olf_on.setToolTip(
+            "Off: recognition is the scalar product smell_ability x "
+            "identity_signal — every animal is equally confused about "
+            "everybody.\n"
+            "On: a dose ablates whole receptor CHANNELS, and which ones is "
+            "specific to each animal, so two animals at the same dose end up "
+            "confused about different cage-mates. Detecting that somebody "
+            "marked a spot and knowing who become separate failures.\n"
+            "The cohort average tracks the scalar model either way, so the "
+            "dose-response is preserved.")
+        ol.addWidget(self.in_olf_on)
+        o_hint = QLabel(
+            "Every value here is a FREE parameter — none is measured from an "
+            "animal. What the model claims is structural: that recognition "
+            "degrades selectively rather than uniformly.")
+        o_hint.setWordWrap(True)
+        o_hint.setStyleSheet("color:#8a9099; font-size:10px;")
+        ol.addWidget(o_hint)
+        of = QFormLayout()
+        self.in_olf_ch = QSpinBox()
+        self.in_olf_ch.setRange(2, 512)
+        self.in_olf_ch.setValue(64)
+        self.in_olf_ch.setToolTip(
+            "Chemical channels in the signature space. A coarse functional "
+            "basis, not a receptor-type count (a mouse has ~1000).")
+        self.in_olf_disc = _dspin(0.2, 20.0, 3.0, 0.1)
+        self.in_olf_disc.setToolTip("Slope of the identity readout")
+        self.in_olf_thr = _dspin(0.0, 0.9, 0.20, 0.01)
+        self.in_olf_thr.setToolTip(
+            "Separability below which two odours are indistinguishable")
+        self.in_olf_sel = _dspin(0.0, 1.0, 1.0, 0.05)
+        self.in_olf_sel.setToolTip(
+            "0 = a dose lowers every channel uniformly (the old scalar "
+            "model); 1 = whole channels die, which is what an epithelial "
+            "lesion does")
+        for lab, wdg in [("Signature channels", self.in_olf_ch),
+                         ("Discrimination slope", self.in_olf_disc),
+                         ("Confusion threshold", self.in_olf_thr),
+                         ("Ablation selectivity", self.in_olf_sel)]:
+            of.addRow(lab, wdg)
+        ol.addLayout(of)
+        self._olf_fields = (self.in_olf_ch, self.in_olf_disc,
+                            self.in_olf_thr, self.in_olf_sel)
+        for fld in self._olf_fields:
+            fld.setEnabled(False)
+        self.in_olf_on.toggled.connect(
+            lambda on: [f.setEnabled(on) for f in self._olf_fields])
+        self.in_olf_on.toggled.connect(self._on_arena_edit)
+        lay.addWidget(olf_box)
+
         # ---- physiology: energy in / energy out, water in / urine out ----
         phys_box = QGroupBox("Physiology")
         yl = QVBoxLayout(phys_box)
@@ -1663,11 +1856,17 @@ class ABMAWindow(QMainWindow):
             self._update_inspector_dynamic(self._last_frame)
 
     def _push_frame(self, view, fr):
+        kw = {}
+        # only the 2D canvas paints the emergent territory map; the 3D view
+        # ignores it rather than being handed arguments it cannot use
+        if hasattr(view, "set_scent_visible") and "scent_rgba" in fr:
+            kw["scent_rgba"] = fr["scent_rgba"]
+            kw["scent_extent"] = fr.get("scent_extent")
         view.update_agents(
             fr["x"], fr["y"], fr["sex_m"], heading=fr.get("heading"),
             day=fr.get("day"), hour=fr.get("hour"), is_day=fr.get("is_day"),
             alive=fr.get("alive"), colors=fr.get("color"), sizes=fr.get("size"),
-            shapes=fr.get("shape"))
+            shapes=fr.get("shape"), **kw)
 
     # ------------------------------------------------------------------ #
     # Config <-> UI
@@ -1730,6 +1929,13 @@ class ABMAWindow(QMainWindow):
                 anonymous_weight=self.in_scent_anon.value(),
             ),
             physiology=self._physiology_from_ui(),
+            olfaction=OlfactionParams(
+                enabled=self.in_olf_on.isChecked(),
+                n_channels=self.in_olf_ch.value(),
+                discrimination=self.in_olf_disc.value(),
+                confusion_threshold=self.in_olf_thr.value(),
+                ablation_selectivity=self.in_olf_sel.value(),
+            ),
         )
 
     def _load_config(self, cfg: ExperimentConfig):
@@ -1754,6 +1960,19 @@ class ABMAWindow(QMainWindow):
             self.in_phys_on.blockSignals(True)
             self.in_phys_on.setChecked(cfg.physiology.enabled)
             self.in_phys_on.blockSignals(False)
+        if hasattr(self, "in_olf_on"):
+            for fld, v in ((self.in_olf_ch, cfg.olfaction.n_channels),
+                           (self.in_olf_disc, cfg.olfaction.discrimination),
+                           (self.in_olf_thr, cfg.olfaction.confusion_threshold),
+                           (self.in_olf_sel,
+                            cfg.olfaction.ablation_selectivity)):
+                fld.blockSignals(True)
+                fld.setValue(v)
+                fld.blockSignals(False)
+                fld.setEnabled(cfg.olfaction.enabled)
+            self.in_olf_on.blockSignals(True)
+            self.in_olf_on.setChecked(cfg.olfaction.enabled)
+            self.in_olf_on.blockSignals(False)
         if hasattr(self, "in_scent_on"):
             for fld, v in ((self.in_scent_hl, cfg.scent.half_life_h),
                            (self.in_scent_pr, cfg.scent.perception_r),
@@ -1995,22 +2214,39 @@ class ABMAWindow(QMainWindow):
         if box.exec_() != QMessageBox.Ok:
             return
 
-        # Runs are append-only: each execution gets its own folder inside the
-        # project, so history is never overwritten and every run stays
-        # reproducible from its own config.json.
+        project_dir = self._resolve_run_dir(cfg)
+        if project_dir is None:
+            return
+        self._start_run(cfg, project_dir)
+
+    def _resolve_run_dir(self, cfg, ask: bool = True):
+        """Where this execution writes. ``None`` means the user cancelled.
+
+        Runs are append-only: each execution gets its own folder inside the
+        project, so history is never overwritten and every run stays
+        reproducible from its own config.json. ``ask=False`` is for a scripted
+        launch, which has nobody to answer a dialog.
+        """
         if self.project is not None:
             self.project.config = cfg          # keep the working config current
             self.project.save()
-            project_dir = self.project.new_run_dir()
-        else:
-            parent = self.in_outdir.text().strip() or os.getcwd()
-            project_dir = os.path.join(parent, cfg.name)
-            if os.path.exists(os.path.join(project_dir, "data")):
-                if QMessageBox.question(
-                        self, "Overwrite?",
-                        f"{project_dir} already has data. Overwrite trials?"
-                ) != QMessageBox.Yes:
-                    return
+            return self.project.new_run_dir()
+        parent = self.in_outdir.text().strip() or os.getcwd()
+        project_dir = os.path.join(parent, cfg.name)
+        if ask and os.path.exists(os.path.join(project_dir, "data")):
+            if QMessageBox.question(
+                    self, "Overwrite?",
+                    f"{project_dir} already has data. Overwrite trials?"
+            ) != QMessageBox.Yes:
+                return None
+        return project_dir
+
+    def _start_run(self, cfg, project_dir: str):
+        """Begin a run: reset the views, arm the transport, start the worker.
+
+        Split out of :meth:`_on_run` so a scripted launch can start the same
+        run without a confirmation dialog — see :mod:`fnt.abma.gui.launch`.
+        """
         self._project_dir = project_dir
         self._run_cfg = cfg
         self._run_t0 = time.time()
@@ -2042,7 +2278,8 @@ class ABMAWindow(QMainWindow):
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.worker = ABMARunWorker(cfg, project_dir,
-                                    analyze=self.in_analyze.isChecked())
+                                    analyze=self.in_analyze.isChecked(),
+                                    scent_map=self.btn_scent.isChecked())
         self.worker.progress.connect(self._on_progress)
         self.worker.frame.connect(self._on_frame)
         self.worker.agents.connect(self.inspector.set_population)
@@ -2079,14 +2316,21 @@ class ABMAWindow(QMainWindow):
 
     def _render_frame(self, idx):
         if 0 <= idx < len(self._frames):
-            self._display_frame(self._frames[idx])
+            # scrubbing: the panel rebuilds its traces from the buffer rather
+            # than appending, so dragging backwards does not draw a trace that
+            # runs backwards in time
+            self._display_frame(self._frames[idx], scrub_index=idx)
 
-    def _display_frame(self, fr):
+    def _display_frame(self, fr, scrub_index: int | None = None):
         self._last_frame = fr
         self._push_frame(self._active_view(), fr)
         # the roster and the drive/trace panels read the same frame the arena
         # does, so what you select is always what you are watching
-        self.science.update_frame(fr)
+        if scrub_index is None:
+            self.science.update_frame(fr)
+        else:
+            self.science.update_frame(fr, buffer=self._frames,
+                                      index=scrub_index)
         sel = self.inspector.selected_index()
         if self._follow_agent and sel is not None and sel < len(fr["x"]):
             self._active_view().center_on(fr["x"][sel], fr["y"][sel])

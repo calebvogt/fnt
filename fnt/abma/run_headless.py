@@ -13,6 +13,17 @@ Run an experiment from a config, into a project folder, and analyse it::
 Override a few fields for a quick test or a batch sweep::
 
     python -m fnt.abma my_experiment.json --out ~/runs --trials 5 --days 3 --parallel
+
+Run the saline-vs-methimazole dose-response — the design ABMA exists for —
+without touching the GUI::
+
+    python -m fnt.abma --anosmia-study --out ~/studies --doses 0,0.5,0.75,1 \
+        --replicates 4 --days 3
+
+Arms are paired by seed, so replicate *r* starts identically in every arm.
+Results land in ``results/metrics_long.csv`` (tidy, for R) and
+``results/comparison.csv``. The primary readout is ``mean_dist_MM``: emergent
+male-male spacing, which nothing in the config prescribes.
 """
 from __future__ import annotations
 
@@ -44,25 +55,112 @@ def main(argv=None) -> int:
                    help="Run trials in parallel (no live view).")
     p.add_argument("--analyze", action="store_true",
                    help="Run built-in socio-spatial analysis afterwards.")
+    p.add_argument("--anosmia-study", action="store_true",
+                   help="Run the methimazole dose-response study instead of a "
+                        "single experiment. Uses CONFIG as the base if given, "
+                        "otherwise the prairie-vole preset.")
+    p.add_argument("--doses", default="0,0.5,0.75,1.0",
+                   help="Comma-separated methimazole doses (0 = saline).")
+    p.add_argument("--replicates", type=int, default=4,
+                   help="Replicates per condition (paired seeds across arms).")
+    p.add_argument("--scalar-nose", action="store_true",
+                   help="Use the scalar recognition gate instead of the "
+                        "receptor/signature olfactory model.")
+
+    d = p.add_argument_group(
+        "describe a run",
+        "Build a config from a description instead of a JSON file. Combine "
+        "with --watch to open it on screen, or run it headless as usual.")
+    d.add_argument("--preset", help="Arena/paradigm to start from; matched "
+                                    "loosely, e.g. 'voleterra'.")
+    d.add_argument("--list-presets", action="store_true",
+                   help="Print the available presets and exit.")
+    d.add_argument("--species", default="Prairie vole",
+                   help="Species for --males/--females (default: Prairie vole).")
+    d.add_argument("--males", type=int, default=0,
+                   help="Replace the cohort with this many males.")
+    d.add_argument("--females", type=int, default=0,
+                   help="Replace the cohort with this many females.")
+    d.add_argument("--name", help="Name the experiment (sets the run folder).")
+    d.add_argument("--save-config", metavar="PATH",
+                   help="Write the composed config to PATH as well.")
+    d.add_argument("--watch", action="store_true",
+                   help="Open the ABMA window and run it on screen.")
+    d.add_argument("--no-autostart", action="store_true",
+                   help="With --watch, load the design but do not start it.")
+    d.add_argument("--dry-run", action="store_true",
+                   help="Print what would run, then exit without running.")
     args = p.parse_args(argv)
+
+    if args.list_presets:
+        from .core.presets import all_presets
+        for pr in all_presets():
+            print(f"{pr.name}\n    {pr.description}")
+        return 0
 
     if args.write_default:
         default_vole_experiment().to_json(args.write_default)
         print(f"Wrote default config to {args.write_default}")
         return 0
 
-    if not args.config:
-        p.error("a config JSON is required (or use --write-default)")
+    if args.anosmia_study:
+        from .core.study import anosmia_study, run_study
 
-    cfg = ExperimentConfig.from_json(args.config)
-    if args.trials is not None:
-        cfg.n_trials = args.trials
-    if args.days is not None:
-        cfg.days = args.days
-    if args.seed is not None:
-        cfg.seed = args.seed
+        base = (ExperimentConfig.from_json(args.config) if args.config
+                else None)
+        try:
+            doses = tuple(float(d) for d in args.doses.split(",") if d.strip())
+        except ValueError:
+            p.error(f"--doses must be numbers, got {args.doses!r}")
+        if len(doses) < 2:
+            p.error("--doses needs at least two levels to compare")
+        study = anosmia_study(base=base, doses=doses,
+                              replicates=args.replicates, days=args.days,
+                              mechanistic_nose=not args.scalar_nose)
+        if args.seed is not None:
+            study.base_seed = args.seed
+        study_dir = os.path.join(args.out, study.name)
+        run_study(study, study_dir, log_cb=print)
+        print(f"\nStudy written to {study_dir}")
+        print("  results/metrics_long.csv   tidy long table, for R")
+        print("  results/comparison.csv     per-metric arm vs reference")
+        return 0
+
+    described = args.preset or args.males or args.females
+    if not args.config and not described:
+        p.error("a config JSON is required (or --preset/--males/--females, "
+                "or --write-default)")
+
+    from .core.compose import design, summary
+
+    try:
+        cfg = design(
+            preset=args.preset,
+            base=(ExperimentConfig.from_json(args.config) if args.config
+                  else None),
+            males=args.males, females=args.females, species=args.species,
+            days=args.days, trials=args.trials, seed=args.seed,
+            name=args.name)
+    except ValueError as e:
+        p.error(str(e))
     if args.parallel:
         cfg.parallel = True
+    if args.save_config:
+        # the target folder often does not exist yet — asking someone to mkdir
+        # before saving a config they just described is pure friction
+        parent = os.path.dirname(os.path.abspath(args.save_config))
+        os.makedirs(parent, exist_ok=True)
+        cfg.to_json(args.save_config)
+        print(f"Config written to {args.save_config}")
+
+    print(summary(cfg))
+    if args.dry_run:
+        return 0
+
+    if args.watch:
+        from .gui.launch import watch
+        return watch(cfg, out_dir=args.out,
+                     autostart=not args.no_autostart)
 
     project_dir = os.path.join(args.out, cfg.name)
     run_experiment(cfg, project_dir, log_cb=print, analyze=args.analyze)

@@ -220,3 +220,39 @@ def test_configs_without_scent_key_stay_legacy():
     d = cfg.to_dict()
     d.pop("scent")
     assert ExperimentConfig.from_dict(d).scent.enabled is False
+
+
+def test_territory_image_extent_matches_what_it_actually_covers():
+    """A downsampled map must not be stretched over the whole arena.
+
+    The block-average drops a trailing partial block, so the reported extent
+    has to shrink with it — otherwise the territory boundaries slide away from
+    the animals standing on them.
+    """
+    import numpy as np
+    from fnt.abma.core.config import (
+        ExperimentConfig, ArenaConfig, AgentGroup, Genotype, Treatment,
+        TraitProfile, ScentParams,
+    )
+    from fnt.abma.core.simulation import Simulation
+
+    # 2.35 m at 0.10 m cells = 24 cells across, which is not a multiple of the
+    # downsample step the tiny max_side below forces
+    arena = ArenaConfig(width=2.35, height=2.35)
+    cfg = ExperimentConfig(
+        arena=arena, days=0.01, n_trials=1,
+        scent=ScentParams(enabled=True, cell_size=0.10),
+        groups=[AgentGroup("m", "prairie", "M", 2, Genotype({}), Treatment(),
+                           TraitProfile(mass=40.0))])
+    sim = Simulation(cfg, 0)
+    for k in range(40):
+        sim.step(k * cfg.dt, cfg.dt)
+
+    full, extent_full = sim.territory_image(max_side=1000)
+    assert extent_full[1] == pytest.approx(full.shape[1] * sim.scent.cell)
+
+    small, extent = sim.territory_image(max_side=9)
+    assert small.shape[1] < full.shape[1], "max_side did not downsample"
+    assert extent[1] == pytest.approx(small.shape[1] * sim.scent.cell
+                                      * (full.shape[1] // small.shape[1]))
+    assert extent[1] <= extent_full[1]

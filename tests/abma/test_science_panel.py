@@ -163,3 +163,25 @@ def test_every_named_drive_exists_in_the_record_schema():
         assert key in VALUE_FIELDS
     for key, _, _ in CONDITION:
         assert key in VALUE_FIELDS
+
+
+def test_scrubbing_rebuilds_the_trace_instead_of_appending(panel, running_sim):
+    """Dragging the timeline backwards must not draw a trace that doubles back.
+
+    Live frames append; a scrubbed frame refills the history from the buffer up
+    to that index, so the plot always reads left-to-right in run order.
+    """
+    buffer = [running_sim._frame(60.0 * k) for k in range(12)]
+    panel.select(0)
+    for fr in buffer:                       # watch it live to the end
+        panel.update_frame(fr)
+    plot = panel.pages[1].plot              # condition page, real values
+    assert len(plot.history["energy"]) == 12
+
+    panel.update_frame(buffer[3], buffer=buffer, index=3)   # scrub back
+    assert len(plot.history["energy"]) == 4
+    expected = [float(fr["energy"][0]) for fr in buffer[:4]]
+    assert list(plot.history["energy"]) == pytest.approx(expected)
+
+    panel.update_frame(buffer[9], buffer=buffer, index=9)   # scrub forward
+    assert len(plot.history["energy"]) == 10

@@ -57,7 +57,8 @@ def make_project(config: ExperimentConfig, project_dir: str) -> str:
 def run_experiment(config: ExperimentConfig, project_dir: str,
                    progress_cb=None, frame_cb=None, log_cb=None,
                    frame_interval_s: float = 300.0,
-                   analyze: bool = False, meta_cb=None, cancel_cb=None) -> list[dict]:
+                   analyze: bool = False, meta_cb=None, cancel_cb=None,
+                   scent_map: bool = False) -> list[dict]:
     """Run all trials sequentially, with optional live frame streaming.
 
     progress_cb(overall_fraction), frame_cb(frame_dict) for trial 0 only,
@@ -94,7 +95,8 @@ def run_experiment(config: ExperimentConfig, project_dir: str,
         _log(f"Running {n} replicate chamber(s) in lockstep "
              f"({config.total_agents()} agents each, {config.days} days)...")
         results, cancelled = _run_live(config, data_dir, progress_cb, frame_cb,
-                                       log_cb, frame_interval_s, meta_cb, cancel_cb)
+                                       log_cb, frame_interval_s, meta_cb,
+                                       cancel_cb, scent_map)
 
     _log(f"{'Stopped' if cancelled else 'Done'}. "
          f"{len(results)} trial(s) written to {data_dir}")
@@ -110,7 +112,7 @@ def run_experiment(config: ExperimentConfig, project_dir: str,
 
 
 def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
-              frame_interval_s, meta_cb, cancel_cb=None):
+              frame_interval_s, meta_cb, cancel_cb=None, scent_map=False):
     """Step every replicate together; stream a combined multi-chamber frame.
 
     Returns ``(results, cancelled)``. On a cooperative stop the loop breaks and
@@ -121,6 +123,10 @@ def _run_live(config, data_dir, progress_cb, frame_cb, log_cb,
     from .record import RunRecord
     n = config.n_trials
     sims = [Simulation(config, trial_index=i) for i in range(n)]
+    # Only the first chamber rasterises its territory map: the live view shows
+    # one map at a time, and a headless run should not pay for a picture.
+    if scent_map and sims:
+        sims[0].emit_scent_map = True
     offsets = grid_offsets(n, config.arena.width, config.arena.height)
 
     recs = []
@@ -251,6 +257,12 @@ def _combined_frame(frames, sims, offsets, elapsed):
         "y": np.concatenate([f["y"] + offsets[i][1]
                              for i, f in enumerate(frames)]),
     }
+    # the territory map belongs to chamber 0; shift its extent into the grid
+    if "scent_rgba" in frames[0]:
+        x0, x1, y0, y1 = frames[0]["scent_extent"]
+        dx, dy = offsets[0]
+        out["scent_rgba"] = frames[0]["scent_rgba"]
+        out["scent_extent"] = (x0 + dx, x1 + dx, y0 + dy, y1 + dy)
     for key in _FRAME_KEYS:
         out[key] = np.concatenate([f[key] for f in frames])
     return out

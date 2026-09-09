@@ -478,6 +478,35 @@ def all_presets() -> list[Preset]:
     return PRESETS + user_presets()
 
 
+def find_preset(query: str) -> Preset:
+    """Resolve a preset by name, tolerantly. Raises with the options listed.
+
+    Preset names carry punctuation a person will not type ("VoleTerra
+    enclosure (75x75 ft)"), so a loose match on a fragment — "voleterra",
+    "open field", "liddell" — is what makes them usable from a command line or
+    a spoken description. Ambiguity is an error rather than a silent pick.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        raise ValueError(f"no preset given; choose one of {preset_names()}")
+    presets = all_presets()
+    exact = next((p for p in presets if p.name.lower() == q), None)
+    if exact is not None:
+        return exact
+    hits = [p for p in presets if q in p.name.lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise ValueError(
+            f"no preset matches {query!r}; choose one of {preset_names()}")
+    raise ValueError(f"{query!r} is ambiguous — it matches "
+                     f"{[p.name for p in hits]}. Say which one.")
+
+
+def preset_names() -> list[str]:
+    return [p.name for p in all_presets()]
+
+
 def get_preset(name: str) -> ExperimentConfig:
     for p in all_presets():
         if p.name == name:

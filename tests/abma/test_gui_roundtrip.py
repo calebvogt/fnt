@@ -176,3 +176,28 @@ def test_protocol_survives_gui_roundtrip(qapp):
     ctx = win._protocol_context()
     assert "chow_B" in ctx["resource_labels"]
     assert [g.label for g in ctx["groups"]] == ["saline_F", "saline_M"]
+
+
+def test_olfaction_settings_survive_the_gui_round_trip(qapp):
+    """The mechanistic nose must be reachable without hand-editing JSON."""
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import OlfactionParams, default_vole_experiment
+
+    qt_window = ABMAWindow()
+    qt_window._load_config(default_vole_experiment())
+    cfg = qt_window._collect_config()
+    assert cfg.olfaction.enabled is False        # off by default
+
+    qt_window.in_olf_on.setChecked(True)
+    qt_window.in_olf_ch.setValue(32)
+    qt_window.in_olf_sel.setValue(0.25)
+    got = qt_window._collect_config()
+    assert got.olfaction == OlfactionParams(
+        enabled=True, n_channels=32,
+        discrimination=qt_window.in_olf_disc.value(),
+        confusion_threshold=qt_window.in_olf_thr.value(),
+        ablation_selectivity=0.25)
+
+    qt_window._load_config(got)
+    assert qt_window._collect_config().olfaction == got.olfaction
+    assert qt_window.in_olf_ch.isEnabled()

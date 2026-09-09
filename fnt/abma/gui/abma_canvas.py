@@ -97,6 +97,9 @@ class ArenaCanvas(FigureCanvas):
         self._agent_scatters = []
         self._sel_artist = None
         self._heading_artist = None
+        # emergent territory map, painted under the arena when switched on
+        self._scent_artist = None
+        self._scent_visible = False
         self._selected = None
         self._last_xy = None
         self._chambers = [(0.0, 0.0)]
@@ -405,6 +408,8 @@ class ArenaCanvas(FigureCanvas):
         self._agent_scatters = []
         self._sel_artist = None
         self._heading_artist = None
+        # the axes were cleared, so the old image artist is gone with them
+        self._scent_artist = None
         self._trail_artists = []
         self._history.clear()
         self._daynight_text = None
@@ -415,11 +420,39 @@ class ArenaCanvas(FigureCanvas):
         """Reset agent markers and trails (call before a new run)."""
         self.draw_arena()
 
+    def set_scent_visible(self, on: bool) -> None:
+        """Show or hide the emergent territory map under the arena."""
+        self._scent_visible = bool(on)
+        if not on and getattr(self, "_scent_artist", None) is not None:
+            self._scent_artist.set_visible(False)
+            self.draw_idle()
+
+    def _draw_scent(self, rgba, extent) -> None:
+        """Paint the scent field as a translucent layer beneath the animals.
+
+        Drawn under everything (``zorder`` 1) and reusing one image artist, so
+        turning it on costs one blit per frame rather than a redraw of the
+        arena furniture.
+        """
+        if rgba is None or not getattr(self, "_scent_visible", False):
+            if getattr(self, "_scent_artist", None) is not None:
+                self._scent_artist.set_visible(False)
+            return
+        if getattr(self, "_scent_artist", None) is None:
+            self._scent_artist = self.ax.imshow(
+                rgba, extent=extent, origin="lower", interpolation="nearest",
+                zorder=1)
+        else:
+            self._scent_artist.set_data(rgba)
+            self._scent_artist.set_extent(extent)
+            self._scent_artist.set_visible(True)
+
     def update_agents(self, x, y, sex_m, heading=None, day=None, hour=None,
                       is_day=None, alive=None, colors=None, sizes=None,
-                      shapes=None):
+                      shapes=None, scent_rgba=None, scent_extent=None):
         """Redraw agent positions (with fading trails) over the static arena."""
         import numpy as np
+        self._draw_scent(scent_rgba, scent_extent)
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         sex_m = np.asarray(sex_m)

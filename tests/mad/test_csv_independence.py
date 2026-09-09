@@ -159,7 +159,7 @@ def test_a_file_whose_only_state_is_a_rejection_still_loads():
 def test_the_count_badges_come_from_the_store():
     w, wav, root = _session()
     _delete_csvs(root)
-    assert w._csv_status_counts(wav) == (2, 0, 1)
+    assert w._stored_status_counts(wav) == (2, 0, 1)
 
 
 def test_the_store_alone_can_regenerate_the_csv():

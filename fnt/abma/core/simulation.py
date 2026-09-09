@@ -906,7 +906,7 @@ class Simulation:
     # Olfactory recognition
     # ------------------------------------------------------------------ #
     def mark_biology_dirty(self) -> None:
-        """Flag that ``smell`` or ``identity`` changed, so recognition restales.
+        """Flag that ``smell`` or ``identity`` changed, staling the recognition.
 
         Called whenever a drug takes effect, an intervention fires, or the
         roster grows. Recognition is expensive relative to a step but changes
@@ -955,6 +955,50 @@ class Simulation:
         recog = self.recognition_matrix()
         det = self.olf.detection
         return np.where(det > 1e-9, recog / np.clip(det, 1e-9, None), 0.0)
+
+    #: set by a live view that wants the scent map drawn under the arena.
+    #: Off by default: headless runs should not pay to rasterise a picture.
+    emit_scent_map = False
+
+    def territory_image(self, max_side: int = 160):
+        """The scent field as an RGBA image: who owns the ground, how strongly.
+
+        Territory is the thing this whole model exists to produce, and until
+        now it was invisible — an emergent mosaic you could only see by opening
+        a CSV after the fact. Each cell is tinted with its owner's colour and
+        made more opaque by mark strength, so the map that the animals are
+        actually navigating is the map on screen.
+
+        Returns ``(rgba, extent)`` with extent ``(x0, x1, y0, y1)`` in metres,
+        or ``None`` when marking is off. Large arenas are block-averaged down
+        to ``max_side`` so a 75-foot enclosure costs the same as a cage.
+        """
+        if self.scent is None:
+            return None
+        owner, strength = self.scent.occupancy()
+        ny, nx = owner.shape
+        rgba = np.zeros((ny, nx, 4), np.float32)
+        live = owner >= 0
+        if live.any():
+            idx = np.clip(owner[live], 0, max(0, len(self.agent_rgba) - 1))
+            rgba[live, :3] = self.agent_rgba[idx][:, :3]
+            # alpha carries mark strength, so a fresh boundary reads darker
+            # than ground someone crossed once and left
+            rgba[live, 3] = np.clip(strength[live], 0.0, 1.0) * 0.75
+        cell = self.scent.cell
+        step = max(1, int(np.ceil(max(ny, nx) / max(8, max_side))))
+        if step > 1:
+            # Block-average. The trailing partial block is dropped, so the
+            # extent has to shrink with it — reporting the full arena would
+            # stretch the image and slide the territory boundaries off the
+            # positions the animals are actually at.
+            ty, tx = (ny // step) * step, (nx // step) * step
+            rgba = (rgba[:ty, :tx]
+                    .reshape(ty // step, step, tx // step, step, 4)
+                    .mean(axis=(1, 3)))
+            ny, nx = ty, tx
+        out = (np.clip(rgba, 0.0, 1.0) * 255).astype(np.uint8)
+        return out, (0.0, nx * cell, 0.0, ny * cell)
 
     def territory_area(self) -> np.ndarray:
         """Emergent territory area per agent (m²), or zeros without marking."""
@@ -1382,9 +1426,15 @@ class Simulation:
         part a trajectory alone cannot recover — what it was trying to do and
         what it was sensing when it decided.
         """
+        extra = {}
+        if self.emit_scent_map:
+            got = self.territory_image()
+            if got is not None:
+                extra["scent_rgba"], extra["scent_extent"] = got
         return {
             **self._drive_magnitudes(),
             **self._perception_summary(),
+            **extra,
             "marks_made": self.marks_made.copy(),
             "trial": self.trial_id, "elapsed": elapsed,
             "day": int(elapsed // 86400) + 1,
