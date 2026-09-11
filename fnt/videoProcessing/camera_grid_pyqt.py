@@ -830,16 +830,19 @@ class ClockCalibrationDialog(QDialog):
 
         outer = QVBoxLayout(self)
         blurb = QLabel(
-            "Step each camera until it shows the FIRST frame of the same "
-            "second - e.g. the first frame reading :30 on every camera. "
-            "The crop on the right is that camera's burnt-in clock. "
-            "Your alignment overrides the computed one.")
+            "Step each camera until its burnt-in clock reads the TARGET time "
+            "shown below - ideally the first frame that shows that second.\n\n"
+            "The target is the reconstructed timeline, which is the same value "
+            "the large wall-clock overlay renders in the output. Matching every "
+            "camera to it aligns them with each other AND makes that overlay "
+            "truthful; aligning cameras only to each other would leave them "
+            "free to share a common offset from it.")
         blurb.setWordWrap(True)
         blurb.setStyleSheet("color:#bbbbbb;")
         outer.addWidget(blurb)
 
         trow = QHBoxLayout()
-        trow.addWidget(QLabel("Calibrating at:"))
+        trow.addWidget(QLabel("Target time (matches the wall-clock overlay):"))
         self.time_label = QLabel(f"{when:%Y-%m-%d %H:%M:%S}")
         self.time_label.setStyleSheet("color:#ffd400; font-weight:bold;")
         trow.addWidget(self.time_label)
@@ -895,9 +898,17 @@ class ClockCalibrationDialog(QDialog):
         clock.setAlignment(Qt.AlignCenter)
         clock.setStyleSheet("background-color:#101010;")
         clock.setToolTip(
-            "This camera's burnt-in clock, enlarged. Step until it shows the "
-            "first frame of the second you are aligning everything to.")
-        row.addWidget(clock)
+            "This camera's burnt-in clock, enlarged. Step until it reads the "
+            "target time shown beneath it.")
+        col = QVBoxLayout()
+        col.addWidget(clock)
+        target = QLabel(f"target  {self.when:%Y-%m-%d %H:%M:%S}")
+        target.setAlignment(Qt.AlignCenter)
+        target.setStyleSheet("color:#ffd400;")
+        target.setToolTip(
+            "What this camera's clock should read once calibrated.")
+        col.addWidget(target)
+        row.addLayout(col)
 
         buttons = QVBoxLayout()
         nudge = QHBoxLayout()
@@ -1503,6 +1514,21 @@ class CameraGridWindow(QMainWindow):
             self, "Select a trial folder (cameras detected automatically)")
         if not folder:
             return
+        # This button means "load this trial", so it replaces what is loaded.
+        # Merging two trials silently produced duplicate camera names and a
+        # timeline spanning both. Use "Add Camera Folder" to build a set up
+        # camera by camera.
+        if self.tracks:
+            reply = QMessageBox.question(
+                self, "Replace loaded trial",
+                f"{len(self.tracks)} camera(s) are already loaded and not "
+                f"yet queued.\n\nReplace them with this trial?\n\n"
+                f"Choose No, then 'Add This Trial to Queue', if you meant "
+                f"to keep them.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            self._clear_current_trial()
         profile = PROFILE_CHOICES[self.profile_combo.currentIndex()][1]
         self.log(f"Auto-detecting cameras in {folder}  (profile: {profile})")
         worker = DiscoverWorker(folder, profile=profile)
@@ -1795,6 +1821,13 @@ class CameraGridWindow(QMainWindow):
         self._refresh_queue_table()
         self.log(f"Queued {label}: {len(job.chunks)} file(s), "
                  f"{len(job.layout.assignments)} camera(s)")
+        # The job holds its own snapshot, so clear the workspace for the next
+        # trial. Leaving it loaded made the next "Add Trial Folder" MERGE into
+        # it: cameras piled up as Camera1_2, Camera2_2..., and because a job's
+        # chunks come from every loaded track, the next one would have spanned
+        # both trials at once.
+        self._clear_current_trial()
+        self.status.setText(f"Queued {label}. Workspace cleared - add the next trial folder.")
 
     def remove_from_queue(self):
         row = self.queue_table.currentRow()
@@ -1888,6 +1921,28 @@ class CameraGridWindow(QMainWindow):
                 break
         self.designer.apply_layout(GridLayout.filled(names, rows, cols))
         self.on_layout_changed()
+
+    def _clear_current_trial(self):
+        """Empty the workspace so the next trial starts clean.
+
+        Output settings (resolution, frame rate, codec, overlays) are kept:
+        those are usually the same across trials, whereas the cameras, layout,
+        output folder and prefix belong to one trial only.
+        """
+        self.tracks.clear()
+        self.camera_list.clear()
+        self.designer.apply_layout(GridLayout(2, 2))
+        self.grid_combo.blockSignals(True)
+        self.grid_combo.setCurrentText("2 x 2")
+        self.grid_combo.blockSignals(False)
+        self.preview_combo.blockSignals(True)
+        self.preview_combo.clear()
+        self.preview_combo.blockSignals(False)
+        self.coverage.set_tracks([], None)
+        self.out_dir_edit.clear()
+        self.prefix_edit.clear()
+        self.audio_combo.clear()
+        self._update_estimate()
 
     def _discard_sample(self):
         """Delete the temp folder holding the last sample, if any."""
