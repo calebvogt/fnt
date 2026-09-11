@@ -349,6 +349,11 @@ class RunManifest:
             'realtime_factor': timing.get('realtime_factor'),
             'device': timing.get('device'),
             'error': summary.get('error'),
+            # Process + system memory as of this file. Recorded on the error
+            # path too: the reading at the moment a file fails is the one that
+            # says whether the batch ran out of commit or the file is bad.
+            'mem': summary.get('mem') or None,
+            'retry': bool(summary.get('retry')),
             'ts': time.time(),
         }
         assert self._fh is not None

@@ -439,6 +439,66 @@ def was_inferred(h5_path: str) -> bool:
         return False
 
 
+REVIEW_COMPLETE_ATTR = "review_complete"
+REVIEW_COMPLETE_AT_ATTR = "review_complete_at"
+
+
+@_reporting_write
+def set_review_complete(h5_path: str, complete: bool = True) -> None:
+    """Mark (or unmark) this recording as exhaustively reviewed.
+
+    Meaning: *every* call in this recording has been judged — not merely that
+    some were labelled. It is the user's assertion, not something that can be
+    derived, because "I looked and there was nothing else" leaves no trace in
+    the data.
+
+    It is what makes recall mean anything. Ground truth is built from hand
+    labels plus accepted predictions, so a real call the model never proposed
+    and the user never drew is invisible: missing it costs nothing, and recall
+    comes out flattering — worst for exactly the faint, unusual calls the model
+    is weakest on. Only on a recording flagged here can a miss actually be
+    counted, so these files are scored whole while the rest are scored only
+    inside their judged spans.
+    """
+    _require_h5()
+    os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
+    with h5py.File(h5_path, "a") as f:
+        f.attrs[REVIEW_COMPLETE_ATTR] = int(bool(complete))
+        if complete:
+            f.attrs[REVIEW_COMPLETE_AT_ATTR] = datetime.now().isoformat(
+                timespec="seconds")
+        elif REVIEW_COMPLETE_AT_ATTR in f.attrs:
+            # Drop the stamp rather than leave a date claiming a completeness
+            # that has just been withdrawn.
+            del f.attrs[REVIEW_COMPLETE_AT_ATTR]
+
+
+def is_review_complete(h5_path: str) -> bool:
+    """Whether the user has declared this recording exhaustively reviewed."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return False
+    try:
+        with h5py.File(h5_path, "r") as f:
+            return bool(int(f.attrs.get(REVIEW_COMPLETE_ATTR, 0)))
+    except Exception:
+        return False
+
+
+def review_complete_at(h5_path: str) -> str:
+    """When completeness was declared, or '' — shown so a stale claim (labels
+    added since) is at least visible."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return ""
+    try:
+        with h5py.File(h5_path, "r") as f:
+            v = f.attrs.get(REVIEW_COMPLETE_AT_ATTR, "")
+            return v.decode() if isinstance(v, bytes) else str(v or "")
+    except Exception:
+        return ""
+
+
 def get_grid_attrs(h5_path: str) -> Dict:
     """Return the recorded grid params, or {} if the file/attrs are absent."""
     _require_h5()

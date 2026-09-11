@@ -61,6 +61,10 @@ class MADInferenceConfig:
     #: Write a CSV alongside the run. Off by default: the store holds every
     #: detection, and a CSV that is only ever regenerated cannot drift from it.
     save_blob_csv: bool = False
+    #: Re-attempt errored files once, after the main pass. On by default: the
+    #: usual batch failure is transient memory pressure, not a bad recording,
+    #: and losing a quarter of an overnight run to it is the worse outcome.
+    retry_failed: bool = True
     # If True (default), the probability mask is zeroed out in any time
     # column that already contains a confirmed call for this file (rebuilt
     # from the example store via
@@ -1348,11 +1352,21 @@ def run_inference_on_file(
     # for ~75 s of every file and, worse, kept a large block busy exactly when
     # the NEXT file asked for one the same size.
     #
-    # That mattered: a 217-file run failed on 29 of them with "Unable to
-    # allocate 572 MiB" while 25 GB was free. Nothing leaked (RSS across six
-    # consecutive files drifted +-3 MB); the heap had simply been churned by
-    # hours of interleaved 600 MB and 1800 MB allocations until no contiguous
-    # block that size remained. Releasing early is what reduces that pressure.
+    # Worth releasing on its own merits, but NOT the cure for the batch OOMs:
+    # a 217-file run failed 29 files, and a later 262-file run failed 72, both
+    # with "Unable to allocate 572 MiB". An earlier note here blamed heap
+    # fragmentation, reasoning from RSS holding steady (+-3 MB across six
+    # files) that nothing leaked. That was wrong twice over. A 572 MiB
+    # reservation cannot fail for want of a contiguous block in a 64-bit
+    # address space, and RSS is the wrong gauge: Windows trims the working set
+    # while commit keeps climbing.
+    #
+    # The Resource-Exhaustion event for the 2026-09-09 run settles it —
+    # pythonw.exe CommitCharge 78.6 GiB, system commit charge 91.4 GiB against
+    # a 91.4 GiB limit, with physical memory barely touched. Something in the
+    # GUI process leaks; measured here, this module does not (7x30 s and
+    # 5x300 s files, commit flat at 2725 MB, no live ndarray >= 1 MB between
+    # files). ``mem`` in each run summary is what will localise the rest.
     del audio
     t_spec = _time.perf_counter() - _t_spec0
     if progress:
@@ -1614,6 +1628,118 @@ def run_inference_on_file(
     }
 
 
+def _mem_snapshot() -> Dict:
+    """This process's memory right now, in MB. ``{}`` when psutil is absent.
+
+    ``commit_mb`` is the number that matters on Windows. A batch dies when the
+    *system commit charge* reaches its limit, and a leak can grow commit for
+    hours while RSS stays flat — the working set is trimmed, the commit is not.
+    Logging RSS alone is what made an earlier investigation conclude "nothing
+    leaked" from a +-3 MB RSS reading, when the process was in fact on its way
+    to 78.6 GB of commit.
+
+    ``peak_commit_mb`` is monotonic, so a run already trimmed back still
+    reports its high-water mark.
+    """
+    try:
+        import psutil
+        mi = psutil.Process().memory_info()
+    except Exception:
+        return {}
+    out: Dict = {'rss_mb': round(mi.rss / (1 << 20), 1)}
+    priv = getattr(mi, 'private', None)          # Windows: commit charge
+    out['commit_mb'] = round((priv if priv is not None else mi.vms)
+                             / (1 << 20), 1)
+    peak = getattr(mi, 'peak_pagefile', None)    # Windows only
+    if peak is not None:
+        out['peak_commit_mb'] = round(peak / (1 << 20), 1)
+    return out
+
+
+def _system_commit() -> Dict:
+    """System-wide commit limit and headroom, in MB. Windows only; else ``{}``.
+
+    This is the quantity that actually decides whether the next allocation
+    succeeds, and it is not RAM: the 2026-09-09 batch failed 72 recordings with
+    23 GB of physical memory free and roughly 60 MB of commit left.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [('dwLength', wt.DWORD), ('dwMemoryLoad', wt.DWORD),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return {}
+        mb = 1 << 20
+        return {
+            'sys_commit_limit_mb': round(st.ullTotalPageFile / mb, 1),
+            'sys_commit_avail_mb': round(st.ullAvailPageFile / mb, 1),
+            'sys_ram_avail_mb': round(st.ullAvailPhys / mb, 1),
+        }
+    except Exception:
+        return {}
+
+
+def _mem_record(before: Dict) -> Dict:
+    """Memory after a file, plus how much this file added and what is left."""
+    rec = _mem_snapshot()
+    rec.update(_system_commit())
+    b, a = before.get('commit_mb'), rec.get('commit_mb')
+    if b is not None and a is not None:
+        rec['delta_commit_mb'] = round(a - b, 1)
+    return rec
+
+
+def _collect_cycles() -> None:
+    """Free the last file's grids. Call between files — this is not optional.
+
+    Measured over a 275-file run with per-file commit logging: each file
+    retained **exactly 4.00x its full-file grid size**, at every duration
+    (346 s, 600 s, 825 s, 888 s and 1800 s files all came out at 4.00-4.01).
+    That is the audio buffer plus three grids, held in a reference cycle, so
+    nothing frees them until the *cyclic* collector runs.
+
+    The cyclic collector triggers on object *counts*, and one file allocates
+    very few, very large objects, so it can go dozens of files without firing.
+    The run's memory trace is the signature: a straight climb of +2295 MB per
+    600 s file to a peak of 70.1 GB, punctuated by 36 sudden drops (the
+    biggest -62.8 GB) as gen-2 finally ran. System commit headroom reached
+    4.7 GB. The two previous runs died exactly this way.
+
+    A collect costs milliseconds against ~170 s of work per file, and holds
+    the process flat at roughly one file's working set.
+    """
+    import gc
+    gc.collect()
+
+
+def _release_between_files() -> None:
+    """``_collect_cycles`` plus the CUDA cache — for the retry pass only.
+
+    ``empty_cache`` synchronises the device and makes the next file's first
+    allocations slower, which is worth paying once before re-attempting
+    failures and not worth paying between every file.
+    """
+    _collect_cycles()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def run_inference_on_files(
     wav_paths: List[str],
     cfg: MADInferenceConfig,
@@ -1622,6 +1748,7 @@ def run_inference_on_files(
     wait_if_paused: Optional[Callable[[], None]] = None,
     on_device: Optional[Callable[[str], None]] = None,
     on_file_done: Optional[Callable[[Dict], None]] = None,
+    on_retry_start: Optional[Callable[[int], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
@@ -1630,7 +1757,17 @@ def run_inference_on_files(
     tiles; it should block while the run is paused and return on resume/stop.
     ``on_device(device)`` is called once after the model loads; ``on_file_done``
     is called with each file's summary (incl. timing) as it completes — both let
-    the GUI log device + per-file speed live.
+    the GUI log device + per-file speed live. ``on_retry_start(n)`` fires once
+    before the retry pass, with the number of files it will re-attempt.
+
+    Every summary carries a ``mem`` dict (see :func:`_mem_snapshot`), on the
+    error path too — the memory reading at the moment of a failure is the one
+    most worth having.
+
+    When ``cfg.retry_failed`` is set, files that errored are re-attempted once
+    after the main pass. A recovered file *replaces* its error entry in the
+    returned list, so callers counting ``'error'`` keys see the true final
+    state; its summary is marked ``retry: True``.
     """
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     if on_device is not None:
@@ -1640,27 +1777,74 @@ def run_inference_on_files(
             pass
     results: List[Dict] = []
     n = len(wav_paths)
+
+    def _run_one(wav: str, i: int, retry: bool = False) -> Dict:
+        name = Path(wav).name + (" (retry)" if retry else "")
+
+        def _inner(stage: str, si: int, sn: int, _i=i, _n=n, _name=name):
+            if progress:
+                progress(_i, _n, _name, stage, si, sn)
+
+        before = _mem_snapshot()
+        try:
+            s = run_inference_on_file(
+                wav, cfg, model=model, ckpt=ckpt, device=device,
+                progress=_inner, wait_if_paused=wait_if_paused,
+            )
+        except Exception as e:
+            s = {'wav_path': wav, 'error': str(e)}
+        # Before the reading, so `mem` reports what is actually still held
+        # rather than what has merely not been collected yet.
+        _collect_cycles()
+        s['mem'] = _mem_record(before)
+        if retry:
+            s['retry'] = True
+        return s
+
+    def _emit(summary: Dict) -> None:
+        if on_file_done is None:
+            return
+        try:
+            on_file_done(summary)
+        except Exception:
+            pass
+
     for i, wav in enumerate(wav_paths):
         if wait_if_paused is not None:
             wait_if_paused()
         if should_stop and should_stop():
             break
-        name = Path(wav).name
+        results.append(_run_one(wav, i))
+        _emit(results[-1])
 
-        def _inner(stage: str, si: int, sn: int, _i=i, _n=n, _name=name):
-            if progress:
-                progress(_i, _n, _name, stage, si, sn)
-        try:
-            summary = run_inference_on_file(
-                wav, cfg, model=model, ckpt=ckpt, device=device, progress=_inner,
-                wait_if_paused=wait_if_paused,
-            )
-            results.append(summary)
-        except Exception as e:
-            results.append({'wav_path': wav, 'error': str(e)})
-        if on_file_done is not None:
-            try:
-                on_file_done(results[-1])
-            except Exception:
-                pass
+    # --- one retry pass over the failures --------------------------------
+    # A batch failure here is nearly always an out-of-memory one, and it is not
+    # a property of the recording: the 2026-09-09 run lost 72 files that were
+    # the same format, sample rate and duration as 190 that had just succeeded,
+    # each dying on its first allocation before a sample was read.
+    #
+    # Retrying at the END is what makes it worth doing. By then every per-file
+    # grid has been released, so the retry runs with headroom the first attempt
+    # did not have. One pass only: a file that fails twice is not waiting on
+    # memory and needs a person to look at it.
+    if getattr(cfg, 'retry_failed', True):
+        retry_idx = [i for i, r in enumerate(results) if r.get('error')]
+        if retry_idx and not (should_stop and should_stop()):
+            _release_between_files()
+            if on_retry_start is not None:
+                try:
+                    on_retry_start(len(retry_idx))
+                except Exception:
+                    pass
+            for i in retry_idx:
+                if wait_if_paused is not None:
+                    wait_if_paused()
+                if should_stop and should_stop():
+                    break
+                s = _run_one(results[i]['wav_path'], i, retry=True)
+                # Keep the first attempt's error when the retry fails too, so
+                # the reported reason is the one that started the trouble.
+                if not s.get('error'):
+                    results[i] = s
+                _emit(s)
     return results

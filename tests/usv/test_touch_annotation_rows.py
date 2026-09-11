@@ -44,6 +44,7 @@ def win(qapp):
     class W:
         _touch_annotation_rows = MADMainWindow._touch_annotation_rows
         _refresh_annotation_counts = MADMainWindow._refresh_annotation_counts
+        _mark = MADMainWindow._mark          # phase timing, no-op when idle
 
         def __init__(self):
             self.spectrogram = Spec()
@@ -67,6 +68,7 @@ def win(qapp):
         def _update_pred_review_widgets(self): self.tail += 1
         def _update_train_button_count(self): self.tail += 1
         def _update_file_list_counts(self): self.tail += 1
+        def _update_view_header(self): self.tail += 1
         def _update_overview_marks(self): self.tail += 1
         def _refresh_open_gallery(self): self.tail += 1
 
@@ -172,12 +174,33 @@ def test_several_rows_can_be_touched_at_once(win):
     assert a.text(0) == "✕" and b.text(0) == "✕"
 
 
+#: The refreshers at the end of ``_touch_annotation_rows``. Named once so the
+#: stub and the assertion cannot drift apart — a bare literal count here failed
+#: the whole file when ABMA added ``_update_view_header``, which said nothing
+#: about the fast path the test is actually guarding.
+TAIL_REFRESHERS = (
+    '_update_pred_review_widgets', '_update_train_button_count',
+    '_update_file_list_counts', '_update_view_header',
+    '_update_overview_marks', '_refresh_open_gallery',
+)
+
+
 def test_the_tail_still_runs_on_the_fast_path(win):
     """Skipping it would leave the Audio list badges and ticks stale."""
     win.add("a")
     win.spectrogram.annotations[0]['status'] = 'rejected'
     win._touch_annotation_rows(["a"])
-    assert win.tail == 5
+    assert win.tail == len(TAIL_REFRESHERS)
+
+
+def test_the_stub_covers_every_refresher_the_tail_calls(win):
+    """Guards the list above: an unstubbed refresher is an AttributeError."""
+    import inspect
+    from fnt.usv.mad_pyqt import MADMainWindow
+    src = inspect.getsource(MADMainWindow._touch_annotation_rows)
+    for name in TAIL_REFRESHERS:
+        assert f"self.{name}()" in src, f"{name} no longer in the tail"
+        assert callable(getattr(win, name, None)), f"{name} not stubbed"
 
 
 def test_a_stale_index_falls_back_instead_of_crashing(win):
