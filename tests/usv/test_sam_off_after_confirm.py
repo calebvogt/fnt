@@ -1,13 +1,12 @@
-"""Confirming a batch switches SAM off; Paint and Eraser stay armed.
+"""Confirming a batch switches SAM and Paint off; the Eraser stays armed.
 
-Enter ends a call, not the session, which is why confirming stopped disarming
-tools. SAM is the exception: its prompts are cleared on confirm, so the next
-click does not extend the saved call's prompt — it starts segmenting somewhere
-new. Left armed, a stray click proposes a mask the user never asked for.
+Both are drawing tools whose pending stroke is consumed by Enter, so leaving
+either armed means the next click starts a mask the user did not ask for — SAM
+proposes a segment, Paint lays down pixels. Disarming both makes starting the
+next call deliberate, and makes the two behave alike.
 
-Paint and Eraser keep the old behaviour. Labelling with them is a long run of
-the same gesture, and re-arming the brush between every call is the annoyance
-that got tool-persistence added in the first place.
+The Eraser is not a drawing tool: it only removes pixels from a stroke in
+progress, and there is nothing to remove until something is drawn. It persists.
 """
 import pytest
 
@@ -53,7 +52,7 @@ def win(qapp):
 def test_confirming_switches_sam_off(win):
     """The requested change."""
     win.btn_sam.setChecked(True)
-    assert win._reset_labeling_tools_after_confirm() is True
+    assert win._reset_labeling_tools_after_confirm() == "SAM"
     assert win.btn_sam.isChecked() is False
 
 
@@ -66,12 +65,13 @@ def test_the_paint_mode_is_cleared_too(win):
     assert win.spectrogram.paint_mode is None
 
 
-def test_paint_stays_armed(win):
+def test_confirming_switches_paint_off_too(win):
+    """Mirrors SAM: Enter consumes the stroke, so the tool disarms with it."""
     win.btn_paint.setChecked(True)
     win.spectrogram.paint_mode = 'paint'
-    assert win._reset_labeling_tools_after_confirm() is False
-    assert win.btn_paint.isChecked() is True
-    assert win.spectrogram.paint_mode == 'paint'
+    assert win._reset_labeling_tools_after_confirm() == "Paint"
+    assert win.btn_paint.isChecked() is False
+    assert win.spectrogram.paint_mode is None
 
 
 def test_eraser_stays_armed(win):
@@ -94,7 +94,7 @@ def test_prompts_are_always_dropped(win):
 
 
 def test_no_tool_armed_is_not_an_error(win):
-    assert win._reset_labeling_tools_after_confirm() is False
+    assert win._reset_labeling_tools_after_confirm() is None
     assert win.spectrogram.prompts_cleared == 1
 
 
@@ -103,7 +103,7 @@ def test_a_widget_without_clear_sam_prompts_is_survivable(win):
     del type(win.spectrogram).clear_sam_prompts
     win.btn_sam.setChecked(True)
     try:
-        assert win._reset_labeling_tools_after_confirm() is True
+        assert win._reset_labeling_tools_after_confirm() == "SAM"
     finally:
         type(win.spectrogram).clear_sam_prompts = (
             lambda self: setattr(self, 'prompts_cleared',
@@ -127,5 +127,5 @@ def test_confirm_tells_the_user_sam_went_off():
     import inspect
     from fnt.usv.mad_pyqt import MADMainWindow
     src = inspect.getsource(MADMainWindow._confirm_pending)
-    assert "sam_was_on = self._reset_labeling_tools_after_confirm()" in src
-    assert "SAM off" in src
+    assert "tool_off = self._reset_labeling_tools_after_confirm()" in src
+    assert "off — press" in src

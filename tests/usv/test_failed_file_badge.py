@@ -73,7 +73,9 @@ def test_a_file_with_counts_is_not_a_failure(win):
     from fnt.usv.mad_pyqt import _ROLE_FILE_ERROR
     it = _row(win, "busy.wav", (3, 12, 1))
     assert it.data(_ROLE_FILE_ERROR) is None
-    assert "(3, 12, 1)" in it.text()
+    # Stored as (accepted, pending, rejected); DISPLAYED accepted, rejected,
+    # pending, so the count still needing review reads last.
+    assert "(3, 1, 12)" in it.text()
 
 
 def test_the_error_survives_a_file_that_also_has_stale_counts(win):

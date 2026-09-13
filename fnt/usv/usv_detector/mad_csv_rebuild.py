@@ -36,7 +36,12 @@ __all__ = ["rebuild_annotations_csv", "rebuild_folder", "rows_for_wav"]
 _AUTHORITATIVE = ("status", "class", "start_s", "stop_s",
                   "min_freq_hz", "max_freq_hz", "score",
                   "model_name", "threshold", "min_blob_pixels",
-                  "harmonic_call_id", "harmonic_n", "f0_hz")
+                  "harmonic_call_id", "harmonic_n", "f0_hz",
+                  # Observations the user wrote on a call. They live on the
+                  # example, so they survive a re-run and travel with the
+                  # recording, and they belong in the export: a note nobody can
+                  # get at from the data is a note that was never taken.
+                  "note", "tags")
 
 
 def _status_for_kind(kind: str) -> str:
@@ -72,7 +77,7 @@ def _example_rows(h5_path: str) -> Dict[str, Dict]:
         # now rather than in a CSV column, so it survives a close and comes
         # back out on export.
         for k in ("score", "model_name", "threshold", "min_blob_pixels",
-                  "harmonic_call_id", "harmonic_n", "f0_hz"):
+                  "harmonic_call_id", "harmonic_n", "f0_hz", "note", "tags"):
             if meta.get(k) not in (None, ""):
                 row[k] = meta[k]
         # A confirmed label outranks a negative at the same key: accepting after

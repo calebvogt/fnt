@@ -1613,6 +1613,10 @@ def run_inference_on_file(
         'csv_path': csv_path if cfg.save_blob_csv else None,
         'h5_path': h5_path,
         'n_blobs': len(rows),
+        # Poolable counts describing this file's detections, gathered here
+        # because the rows are already in hand — reading them back afterwards
+        # would mean reopening every sidecar over the network.
+        'det_stats': detection_profile(rows),
         'prob_shape': list(prob.shape),
         'sample_rate': sr,
         'nperseg': nperseg, 'noverlap': noverlap, 'nfft': nfft,
@@ -1626,6 +1630,87 @@ def run_inference_on_file(
             'realtime_factor': round(rt_factor, 2),
         },
     }
+
+
+#: Upper edges for the detection-duration histogram, in milliseconds. Fixed so
+#: the per-file histograms simply add up across a run — a quantile cannot be
+#: pooled from per-file quantiles, a histogram can.
+DUR_EDGES_MS = (5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 1e9)
+
+#: Score histogram resolution. 0.05 is fine enough to answer "what would
+#: raising the threshold cost me?" at every cutoff the spin box offers.
+SCORE_BIN = 0.05
+N_SCORE_BINS = 20
+
+#: Peak-frequency histogram, 2.5 kHz bins up to 125 kHz (Nyquist at the 250 kHz
+#: these recordings use). Fine enough to separate the 50-80 kHz band mouse and
+#: vole USVs occupy from the low-frequency noise that gets detected alongside.
+FREQ_BIN_KHZ = 2.5
+N_FREQ_BINS = 50
+
+
+def detection_profile(rows: List[Dict]) -> Dict:
+    """Describe the detections one file produced, as poolable counts.
+
+    This exists so the run summary can characterise its OWN output. The
+    alternative on offer was projecting a reject rate from previous models onto
+    a freshly trained one, which assumes the two behave alike — the very thing
+    retraining is meant to change — and errs in the flattering direction
+    exactly when training worked.
+
+    Everything here is a count in a fixed bin, so summing across files is
+    exact. Quantiles are deliberately not returned: a median of per-file
+    medians is not a median.
+    """
+    score_hist = [0] * N_SCORE_BINS
+    dur_hist = [0] * len(DUR_EDGES_MS)
+    freq_hist = [0] * N_FREQ_BINS
+    for r in rows:
+        try:
+            s = float(r.get('score') or 0.0)
+        except (TypeError, ValueError):
+            s = 0.0
+        b = int(min(max(s, 0.0), 0.9999) / SCORE_BIN)
+        score_hist[min(b, N_SCORE_BINS - 1)] += 1
+        try:
+            ms = (float(r.get('stop_s') or 0.0)
+                  - float(r.get('start_s') or 0.0)) * 1000.0
+        except (TypeError, ValueError):
+            ms = 0.0
+        for i, edge in enumerate(DUR_EDGES_MS):
+            if ms < edge:
+                dur_hist[i] += 1
+                break
+        khz = _row_peak_khz(r)
+        if khz is not None:
+            fb = int(khz / FREQ_BIN_KHZ)
+            if 0 <= fb < N_FREQ_BINS:
+                freq_hist[fb] += 1
+    return {'n': len(rows), 'score_hist': score_hist, 'dur_hist': dur_hist,
+            'freq_hist': freq_hist}
+
+
+def _row_peak_khz(r: Dict) -> Optional[float]:
+    """Where a detection sits in frequency, in kHz.
+
+    Prefers the loudest pixel's frequency, which is what a reader would call
+    the call's frequency; falls back to the band centre when the acoustic
+    metrics were not computed (they need the spectrogram, which the interactive
+    view path does not always pass).
+    """
+    v = r.get('peak_freq_hz')
+    if v in (None, ''):
+        lo, hi = r.get('min_freq_hz'), r.get('max_freq_hz')
+        if lo in (None, '') or hi in (None, ''):
+            return None
+        try:
+            v = (float(lo) + float(hi)) / 2.0
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(v) / 1000.0
+    except (TypeError, ValueError):
+        return None
 
 
 def _mem_snapshot() -> Dict:

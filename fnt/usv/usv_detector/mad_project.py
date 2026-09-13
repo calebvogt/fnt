@@ -110,6 +110,13 @@ class MADProjectConfig:
     classes: List[str] = field(default_factory=lambda: ["USV"])
     last_class: str = "USV"
 
+    # Tags the user has invented, so the right-click menu can offer them again.
+    # The tag itself lives on the call it was applied to; this is only the
+    # vocabulary — without it every tag would have to be retyped from memory,
+    # and "#post-noise" and "#postnoise" would quietly become two things.
+    # Deliberately no presets: the useful tags are the ones this dataset needs.
+    tags: List[str] = field(default_factory=list)
+
     # Model history: list of {name, arch, n_positive_pixels, n_negative_pixels, path, date}.
     models: List[Dict] = field(default_factory=list)
 

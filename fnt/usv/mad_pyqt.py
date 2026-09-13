@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QIcon, QImage, QKeySequence, QPainter, QPen, QColor, QBrush, QPolygonF,
-    QPalette, QCursor,
+    QPalette, QPixmap, QCursor,
 )
 from PyQt5.QtCore import QMimeData
 from PyQt5.QtWidgets import (
@@ -122,6 +123,19 @@ _ROLE_FILE_ERROR = Qt.UserRole + 22
 _ROLE_REVIEW_DONE = Qt.UserRole + 23
 
 
+def _status_icon(ann, is_pred: bool, is_rej: bool) -> str:
+    """Status glyph for a detection row, with a note marker when it has one.
+
+    The marker rides in the Status cell rather than a column of its own: a
+    seventh column would cost width on every row to say something about a
+    handful of them, and "accepted, and I wrote something about it" reads as
+    one fact.
+    """
+    base = "○" if is_pred else ("✕" if is_rej else "●")
+    has = bool((ann.get('note') or '').strip() or ann.get('tags'))
+    return f"{base} ✎" if has else base
+
+
 class FileCountDelegate(QStyledItemDelegate):
     """Render a file-list row as ``name  (A, P, R)`` with A green (accepted),
     P yellow (pending) and R red (rejected). The base name lives in
@@ -189,12 +203,16 @@ class FileCountDelegate(QStyledItemDelegate):
         if has_counts and not err:
             a, p, r = counts
             c_acc, c_pend, c_rej = self._colors()
+            # Displayed accepted, rejected, PENDING — the tuple's own order is
+            # (a, p, r), but pending reads last on purpose: the first two are
+            # work already done, so the number that says "this file still needs
+            # you" sits at the end of the row where the eye stops.
             draw("  (", base_col)
             draw(str(a), c_acc)
             draw(", ", base_col)
-            draw(str(p), c_pend)
-            draw(", ", base_col)
             draw(str(r), c_rej)
+            draw(", ", base_col)
+            draw(str(p), c_pend)
             draw(")", base_col)
         if index.data(_ROLE_REVIEW_DONE):
             # Last, so it reads as a property of the row rather than of the
@@ -564,6 +582,12 @@ class MADSpectrogramWidget(SpectrogramWidget):
         #: (rect, annotation index) for every class label drawn in the
         #: last paint, so the labels are clickable targets too.
         self._label_hits: list = []
+        #: Where each note marker was painted, so it can be clicked. Kept
+        #: apart from _label_hits because clicking the LABEL selects the
+        #: call and its harmonic stack, which a note must not trigger.
+        self._note_hits: list = []
+        #: Annotation index whose note popover is open, or None.
+        self._open_note_idx = None
         self._rubber_start = None
         self._rubber_cur = None
         # Harmonic links as (lower_id, upper_id, n), drawn as dotted lines so a
@@ -1195,6 +1219,13 @@ class MADSpectrogramWidget(SpectrogramWidget):
                 for a, b in zip(lf, lt):
                     self._stroke_fset.add((f0 + int(a), t0 + int(b)))
         region[disk] = value
+        if value == 1:
+            # Record where the brush wrote. Without this the dirty box stays
+            # empty, so has_pending() reports nothing painted and Escape
+            # silently refuses to clear a stroke that is plainly on screen.
+            # The eraser is exempt: it only removes pixels, and a box that is
+            # a superset of the content is always safe.
+            self._note_pending_region(f0, f1, t0, t1)
 
     def _stamp_line(self, a_idx, b_idx):
         """Stamp a line of brush dots between two spec-pixel coords."""
@@ -1218,6 +1249,57 @@ class MADSpectrogramWidget(SpectrogramWidget):
         when two overlap.
         """
         for rect, ai in reversed(getattr(self, '_label_hits', [])):
+            if rect.contains(pos) and 0 <= ai < len(self.annotations):
+                return ai
+        return None
+
+    def _draw_open_note(self, painter):
+        """The revealed note, as a panel anchored to its marker.
+
+        Only one is open at a time. Kept inside the widget's bounds so a call
+        near the right edge does not have its note drawn off screen — the
+        marker is at the call, the panel goes wherever it fits.
+        """
+        ai = getattr(self, '_open_note_idx', None)
+        if ai is None or not (0 <= ai < len(self.annotations)):
+            return
+        rect = next((r for r, i in getattr(self, '_note_hits', [])
+                     if i == ai), None)
+        if rect is None:
+            return                    # its marker is not on screen right now
+        ann = self.annotations[ai]
+        tags = " ".join(ann.get('tags') or [])
+        note = (ann.get('note') or '').strip()
+        body = ((tags + "\n\n" if tags else "") + note) or "(no text)"
+
+        painter.save()
+        f = painter.font()
+        f.setPointSizeF(max(7.0, f.pointSizeF()))
+        painter.setFont(f)
+        fm = painter.fontMetrics()
+        w = min(360, max(180, self.width() // 3))
+        flags = Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop
+        need = fm.boundingRect(0, 0, w - 16, 10000, flags, body)
+        panel = QRectF(rect.left(), rect.bottom() + 6,
+                       w, min(need.height() + 16, 240))
+        if panel.right() > self.width() - 4:
+            panel.moveRight(self.width() - 4)
+        if panel.bottom() > self.height() - 4:
+            panel.moveBottom(rect.top() - 6)
+        painter.setBrush(QColor(28, 28, 32, 240))
+        painter.setPen(QPen(QColor(235, 205, 120), 1))
+        painter.drawRoundedRect(panel, 4, 4)
+        painter.setPen(QColor(230, 230, 230))
+        painter.drawText(panel.adjusted(8, 8, -8, -8), flags, body)
+        painter.restore()
+
+    def note_marker_at(self, pos):
+        """Annotation index whose note marker was drawn under ``pos``.
+
+        Tested before labels and masks: the marker sits just past the end of
+        the label, so whichever is checked first owns that strip of pixels.
+        """
+        for rect, ai in reversed(getattr(self, '_note_hits', [])):
             if rect.contains(pos) and 0 <= ai < len(self.annotations):
                 return ai
         return None
@@ -1317,6 +1399,19 @@ class MADSpectrogramWidget(SpectrogramWidget):
             # easier target — a faint few-pixel sliver is hard to hit, and its
             # name sits just above it in clear space — and clicking it selects
             # the whole harmonic stack, which is one vocalisation.
+            # The note marker first: it sits just past the label's end, so
+            # whichever is tested first owns that strip. Clicking it reveals
+            # the note and does NOT change the selection — reading what you
+            # wrote about a call should not disturb where you are in review.
+            ni = self.note_marker_at(event.pos())
+            if ni is not None:
+                self._open_note_idx = (None if self._open_note_idx == ni
+                                       else ni)
+                self.update()
+                return
+            if self._open_note_idx is not None:
+                self._open_note_idx = None      # click away closes it
+                self.update()
             ai = self.label_at(event.pos())
             if ai is not None:
                 group = self.harmonic_group_of(ai)
@@ -1546,6 +1641,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # Rebuilt every paint: label positions move with pan, zoom and the
         # frequency range, so a stale rect would select the wrong call.
         self._label_hits = []
+        self._note_hits = []
 
         # Visible time-frame slice
         t_start = int(self.view_start * self.sample_rate / self.hop)
@@ -1816,6 +1912,25 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     QRectF(lx - 2, ly - fm.ascent() - 2,
                            tw + 4, fm.height() + 4), ai))
 
+                # A call carrying an observation gets a marker beside its
+                # name. Its own hit rect, not the label's: clicking the label
+                # selects the call and its harmonic stack, and a note must not
+                # ride on that.
+                if (ann.get('note') or '').strip() or ann.get('tags'):
+                    mx = lx + tw + 4
+                    mr = QRectF(mx, ly - fm.ascent(),
+                                fm.height() * 0.8, fm.height() * 0.8)
+                    painter.save()
+                    painter.setPen(QPen(QColor(*pal['halo']), 2))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawText(mr, Qt.AlignCenter, "✎")
+                    painter.setPen(QPen(QColor(235, 205, 120)))
+                    painter.drawText(mr, Qt.AlignCenter, "✎")
+                    painter.restore()
+                    self._note_hits.append((mr.adjusted(-2, -2, 2, 2), ai))
+
+        self._draw_open_note(painter)
+
         # Dotted links from each fundamental to its harmonics. Drawn under
         # the selection highlight so selecting a member never hides its links.
         if (self.show_harmonics and self.harmonic_links
@@ -2074,7 +2189,7 @@ def _balance_report(info: dict) -> List[str]:
         lines.append(
             "  ✖ NO training tile contains a call. The model has no positive "
             "example to learn from and can only predict background — no loss "
-            "function or learning rate can fix this. Label confirmed calls on "
+            "function or learning rate can fix this. Label accepted calls on "
             "at least two recordings so the split can put calls on both sides."
         )
     elif va.get('n_call_tiles', 0) == 0:
@@ -3383,7 +3498,7 @@ class MADEvalDialog(QDialog):
 
         blurb = QLabel(
             "Scores the selected model against the calls you have "
-            "<b>confirmed</b> — hand-drawn labels and accepted predictions, "
+            "<b>accepted</b> — hand-drawn labels and accepted predictions, "
             "one call at a time — not pixel Dice. Every threshold is evaluated "
             "from a single inference pass, so the whole curve costs one run.<br>"
             "<i>Use recordings you have labeled but that the model has not been "
@@ -3399,7 +3514,7 @@ class MADEvalDialog(QDialog):
         self.combo_scope.addItem("Current file only", 'current')
         self.combo_scope.setToolTip(
             "Which recordings in the Audio list to score. Only files that carry "
-            "confirmed calls are used; the rest are reported as skipped.")
+            "accepted calls are used; the rest are reported as skipped.")
         opts.addWidget(self.combo_scope, 1)
         opts.addWidget(QLabel("Score:"))
         self.combo_region = QComboBox()
@@ -3407,7 +3522,7 @@ class MADEvalDialog(QDialog):
         self.combo_region.addItem("Whole recordings", 'file')
         self.combo_region.setToolTip(
             "<b>Reviewed regions only</b> (recommended) scores just the time "
-            "spans you have judged — around confirmed calls and rejections. "
+            "spans you have judged — around accepted and rejected calls. "
             "Detections elsewhere are unjudged, not wrong, so counting them "
             "as false positives understates precision on any recording you "
             "have not finished reviewing. It is also far faster, because the "
@@ -3425,7 +3540,7 @@ class MADEvalDialog(QDialog):
         self.spin_iou.setValue(0.30)
         self.spin_iou.setToolTip(
             "How much a prediction's time/frequency box must overlap a "
-            "confirmed call to count as the same call. 0.3 is forgiving "
+            "accepted call to count as the same call. 0.3 is forgiving "
             "about exact mask edges while still requiring the right call.")
         opts.addWidget(self.spin_iou)
         v.addLayout(opts)
@@ -3436,7 +3551,7 @@ class MADEvalDialog(QDialog):
             "Affordable because 'Reviewed regions only' runs the model on the "
             "judged windows rather than whole recordings.")
         self.chk_auto.setChecked(
-            main._settings.value("mad/train/auto_eval", True, type=bool))
+            main._settings.value("mad/train/auto_eval", False, type=bool))
         self.chk_auto.toggled.connect(
             lambda on: main._settings.setValue("mad/train/auto_eval", bool(on)))
         v.addWidget(self.chk_auto)
@@ -3541,13 +3656,13 @@ class MADEvalDialog(QDialog):
         self.progress.setVisible(False)
         skipped = [f for f in res.files if f.get('skipped')]
         self.lbl_status.setText(
-            f"Scored {res.n_files} file(s) / {res.n_labels} confirmed call(s)"
-            + (f" · {len(skipped)} file(s) skipped (no confirmed calls)"
+            f"Scored {res.n_files} file(s) / {res.n_labels} accepted call(s)"
+            + (f" · {len(skipped)} recording(s) skipped (no accepted calls)"
                if skipped else ""))
         self.table.clear()
         if not res.per_threshold or res.n_labels == 0:
             self.lbl_best.setText(
-                "<span style='color:#c8a05a;'>No confirmed calls found in "
+                "<span style='color:#c8a05a;'>No accepted calls found in "
                 "the chosen scope — label or accept some calls first, or "
                 "switch scope.</span>")
             self.btn_apply.setEnabled(False)
@@ -4005,25 +4120,72 @@ class MADRunSummaryTable(QDialog):
     """
 
     def __init__(self, main, title: str, headline: str, summary_lines,
-                 results, copy_text_fn=None):
+                 results, copy_text_fn=None, infer_lines=None, plots=None):
         super().__init__(main)
         self._main = main
         self._results = list(results or [])
         self._copy_text_fn = copy_text_fn
+        infer_lines = list(infer_lines or [])
+        plots = list(plots or [])
         self.setWindowTitle(title)
-        self.resize(760, 560)
+        self.resize(980 if infer_lines else 760,
+                    700 if plots else 560)
 
         v = QVBoxLayout(self)
         head = QLabel(headline)
         head.setStyleSheet("font-size: 13px; font-weight: 600;")
         v.addWidget(head)
 
-        if summary_lines:
-            box = QLabel("\n".join(summary_lines))
-            box.setWordWrap(True)
-            box.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            box.setStyleSheet("color: #cccccc; font-size: 10px;")
-            v.addWidget(box)
+        # Two columns: training on the left, inference on the right. They
+        # answer different questions — "is the model any good?" and "how much
+        # work did this make for me?" — and as one prose block the second was
+        # found only by reading past the first. The right column is absent
+        # entirely when no post-training inference ran, rather than showing an
+        # empty heading.
+        def _column(title, body_lines, colour, plots=()):
+            wrap = QVBoxLayout()
+            hdr = QLabel(title)
+            hdr.setStyleSheet(
+                f"color:{colour}; font-size:10px; font-weight:600;"
+                "letter-spacing:1px;")
+            wrap.addWidget(hdr)
+            body = QLabel("<br>".join(body_lines))
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            body.setStyleSheet("color:#cccccc; font-size:10px;")
+            body.setAlignment(Qt.AlignTop)
+            if not plots:
+                wrap.addWidget(body, 1)
+                return wrap
+            # Scrolled, because the plots are taller than the dialog and the
+            # per-file table below them must not be pushed off screen.
+            inner = QWidget()
+            iv = QVBoxLayout(inner)
+            iv.setContentsMargins(0, 0, 0, 0)
+            iv.addWidget(body)
+            for pm in plots:
+                lbl = QLabel()
+                lbl.setPixmap(pm)
+                lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                iv.addWidget(lbl)
+            iv.addStretch(1)
+            area = QScrollArea()
+            area.setWidget(inner)
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.NoFrame)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            wrap.addWidget(area, 1)
+            return wrap
+
+        if summary_lines or infer_lines:
+            cols = QHBoxLayout()
+            cols.setSpacing(18)
+            if summary_lines:
+                cols.addLayout(_column("TRAINING", summary_lines, "#8fbfd8"), 1)
+            if infer_lines:
+                cols.addLayout(
+                    _column("INFERENCE", infer_lines, "#c8a05a", plots), 1)
+            v.addLayout(cols)
 
         n_err = sum(1 for r in self._results if r.get('error'))
         n_ok = len(self._results) - n_err
@@ -4142,7 +4304,7 @@ class MADRunSummaryTable(QDialog):
 
 
 class MADConfirmedGalleryDialog(QDialog):
-    """Contact sheet of every confirmed call in the project — the training set.
+    """Contact sheet of every accepted call in the project — the training set.
 
     Checking what a model is actually being taught used to mean opening each
     recording, sorting the detections list by status, and stepping through the
@@ -4674,7 +4836,7 @@ class MADConfirmedGalleryDialog(QDialog):
         box.setWindowTitle("Delete masks")
         box.setText(f"Permanently delete {len(rows)} mask(s)?")
         box.setInformativeText(
-            f"{n_lab} confirmed call(s) and {n_rej} rejection(s) across "
+            f"{n_lab} accepted call(s) and {n_rej} rejected call(s) across "
             f"{len(wavs)} recording(s).\n\n"
             "The mask, its spectrogram patch and its metadata are removed from "
             "each recording's .mad sidecar. This cannot be undone.\n\n"
@@ -4700,7 +4862,7 @@ class MADConfirmedGalleryDialog(QDialog):
             except Exception as e:
                 failed.append(f"{os.path.basename(r['wav'])}: {e}")
         self._main._log(
-            f"Deleted {deleted} confirmed mask(s) from {len(wavs)} recording(s)"
+            f"Deleted {deleted} accepted mask(s) from {len(wavs)} recording(s)"
             + (f" ({absent} already gone)" if absent else ""))
 
         # The open recording holds its own copy of these annotations in memory,
@@ -6243,7 +6405,9 @@ class MADMainWindow(QMainWindow):
             FileCountDelegate(self.file_list, palette_fn=self._overlay_palette))
         self.file_list.setToolTip(
             "Click a row to preview and label it. The count is "
-            "(accepted, pending, rejected) calls for that recording.")
+            "(accepted, rejected, pending) calls for that recording — "
+            "pending last, so the number still needing review is the one "
+            "your eye lands on.")
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         self.file_list.itemDoubleClicked.connect(self._on_file_double_clicked)
         self.file_list.itemSelectionChanged.connect(self._sync_list_buttons)
@@ -6268,7 +6432,7 @@ class MADMainWindow(QMainWindow):
         self.btn_clear_files.setToolTip(
             "Empty the Audio list — or just the recordings holding no calls "
             "at all (never analyzed, or analyzed and nothing found). "
-            "Anything you confirmed or rejected is kept. The dialog "
+            "Anything you accepted or rejected is kept. The dialog "
             "offers both.\n\n"
             "Like Remove File(s), this only unregisters the recordings — "
             "every .wav and its .mad sidecar stay exactly where they are on "
@@ -6286,7 +6450,7 @@ class MADMainWindow(QMainWindow):
             "in a read-only viewer: the full group/dataset tree, every "
             "attribute, and a preview of any stored mask or spectrogram "
             "patch.<br><br>"
-            "The .mad is where MAD keeps everything — confirmed labels, "
+            "The .mad is where MAD keeps everything — accepted calls, "
             "hard negatives, prediction crops, and the spectrogram grid "
             "they were computed on. This is how to see what a run "
             "actually stored.<br><br>"
@@ -6404,7 +6568,7 @@ class MADMainWindow(QMainWindow):
         self.btn_undo = QPushButton("Undo (U)")
         self.btn_undo.setToolTip(
             "Undo the last dropped mask — a pending blob, or the last "
-            "confirmed detection.\nShortcut: U"
+            "accepted detection.\nShortcut: U"
         )
         self.btn_undo.clicked.connect(self._undo_last)
         self.btn_undo.setEnabled(False)
@@ -6486,7 +6650,7 @@ class MADMainWindow(QMainWindow):
             swatch('drawing', "▬ dotted") + " = you're drawing (Enter to "
             "confirm) · " +
             swatch('pending', "▬ solid") + " = prediction, pending review · " +
-            swatch('confirmed', "▬") + " = confirmed · " +
+            swatch('confirmed', "▬") + " = accepted · " +
             swatch('rejected', "▬") + " = rejected · " +
             swatch('selected', "▬") + " = selected."
             "<br><i style='color:#888888;'>Confirmed calls save as "
@@ -6555,7 +6719,7 @@ class MADMainWindow(QMainWindow):
 
         self.btn_eval_model = QPushButton("Evaluate Model…")
         self.btn_eval_model.setToolTip(
-            "Score this model against your confirmed calls at call level — "
+            "Score this model against your accepted calls at call level — "
             "precision / recall / F1 swept across probability thresholds.\n\n"
             "Training reports pixel Dice on tiles, which does not tell you how "
             "many real calls you'll catch. Run this before committing hours to "
@@ -6798,7 +6962,7 @@ class MADMainWindow(QMainWindow):
         tc.addLayout(form)
 
         post_note = QLabel(
-            "Trains on every confirmed label in the Audio list. Labels on only "
+            "Trains on every accepted call in the Audio list. Labels on only "
             "one recording can't be validated against a held-out recording — "
             "the run log says which split it managed.")
         post_note.setStyleSheet("color: #999999; font-size: 9px;")
@@ -6878,7 +7042,7 @@ class MADMainWindow(QMainWindow):
 
         self.btn_train_run = QPushButton("Run Training")
         self.btn_train_run.setToolTip(
-            "Train a new model on every confirmed label in the Audio list.\n"
+            "Train a new model on every accepted call in the Audio list.\n"
             "Shortcut: Ctrl+T")
         self.btn_train_run.setFocusPolicy(Qt.NoFocus)
         self.btn_train_run.clicked.connect(self._on_train_clicked)
@@ -7575,7 +7739,8 @@ class MADMainWindow(QMainWindow):
         filter_row.setSpacing(4)
         filter_row.addWidget(QLabel("Show:"))
         self.combo_det_filter = QComboBox()
-        self.combo_det_filter.addItems(["All", "Pending", "Confirmed", "Rejected"])
+        self.combo_det_filter.addItems(
+            ["All", "Pending", "Accepted", "Rejected", "Has note"])
         self.combo_det_filter.setToolTip(
             "Filter detections: All, Pending (yellow predictions), "
             "Confirmed (blue, saved as training examples), or "
@@ -7617,7 +7782,7 @@ class MADMainWindow(QMainWindow):
         self.annotation_list = QTreeWidget()
         self.annotation_list.setMaximumHeight(200)
         self.annotation_list.setToolTip(
-            "Detections for the current file. Green = confirmed, "
+            "Detections for the current file. Green = accepted, "
             "Yellow = prediction (pending review). Click to jump."
         )
         cols = ["Status", "Time", "Class", "Dur", "kHz", "Px", "Score"]
@@ -7625,7 +7790,7 @@ class MADMainWindow(QMainWindow):
         # Score is the model's per-detection confidence, which people reliably
         # confuse with the Dice reported during training. Say what each is.
         _hdr_tips = {
-            0: ("<b>Status</b> — your decision on this detection: ✓ confirmed, "
+            0: ("<b>Status</b> — your decision on this detection: ✓ accepted, "
                 "✕ rejected, ○ still pending. Sort by it to group the "
                 "undecided ones together."),
             5: ("<b>Px</b> — pixels in this detection's mask. A useful sort "
@@ -7633,7 +7798,7 @@ class MADMainWindow(QMainWindow):
                 "that squeaked past the minimum blob size."),
             6: ("<b>Score</b> — the model's confidence in <i>this one "
                 "detection</i>: the mean predicted probability over its "
-                "pixels, 0 to 1. Only predictions have one; confirmed and "
+                "pixels, 0 to 1. Only predictions have one; accepted and "
                 "rejected calls are your decisions, not the model's.<br><br>"
                 "Sort by it to review the doubtful ones first, or use the "
                 "<b>Min score</b> slider above to hide low-confidence "
@@ -7754,7 +7919,7 @@ class MADMainWindow(QMainWindow):
         if not hasattr(self, 'btn_harmonics'):
             self.btn_harmonics = QPushButton("Detect Harmonics (H)")
             self.btn_harmonics.setToolTip(
-                "Group the pending and confirmed detections in this file into "
+                "Group the pending and accepted detections in this file into "
                 "calls, linking each fundamental to its harmonics (dotted "
                 "lines).\n\n"
                 "Nothing is accepted, rejected or deleted — the grouping is "
@@ -7822,7 +7987,7 @@ class MADMainWindow(QMainWindow):
             "<b>Accept every pending prediction on this recording.</b><br><br>"
             "Only pending (yellow) calls are touched — anything you already "
             "accepted or rejected keeps the decision you made.<br><br>"
-            "Each one is confirmed and saved into the recording's .mad as a "
+            "Each one is accepted and saved into the recording's .mad as a "
             "training example, so the next run trains on it.<br><br>"
             "<b>The Min score filter applies.</b> With it set, this accepts "
             "only the predictions currently visible, not the ones it is "
@@ -8261,7 +8426,7 @@ class MADMainWindow(QMainWindow):
                 st = ann.get('status')
                 is_pred = st == 'prediction'
                 is_rej = st == 'rejected'
-                item.setText(0, "○" if is_pred else ("✕" if is_rej else "●"))
+                item.setText(0, _status_icon(ann, is_pred, is_rej))
                 item.setText(2, "Reject" if is_rej
                              else ann.get('category', ''))
                 score = ann.get('score', 0)
@@ -8334,7 +8499,7 @@ class MADMainWindow(QMainWindow):
             pass
         parts = []
         if n_conf:
-            parts.append(f"{n_conf} confirmed")
+            parts.append(f"{n_conf} accepted")
         if n_pred:
             parts.append(f"{n_pred} prediction(s)")
         if n_rej:
@@ -8388,9 +8553,13 @@ class MADMainWindow(QMainWindow):
                 is_rej = st == 'rejected'
                 if flt == "Pending" and not is_pred:
                     continue
-                if flt == "Confirmed" and (is_pred or is_rej):
+                if flt == "Accepted" and (is_pred or is_rej):
                     continue
                 if flt == "Rejected" and not is_rej:
+                    continue
+                # The point of tagging: getting back to what you flagged.
+                if flt == "Has note" and not (
+                        (ann.get('note') or '').strip() or ann.get('tags')):
                     continue
                 # Score filtering applies to *pending predictions only*. A call
                 # you already accepted or rejected is a decision, not a guess —
@@ -8424,7 +8593,7 @@ class MADMainWindow(QMainWindow):
             mask = ann.get('mask')
             pixels = int(mask.sum()) if mask is not None else 0
             score = ann.get('score', 0)
-            icon = "○" if is_pred else ("✕" if is_rej else "●")
+            icon = _status_icon(ann, is_pred, is_rej)
             score_s = f"{score:.2f}" if is_pred and score else ""
             item = SortableTreeWidgetItem([
                 icon, f"{t0:.2f}s", cls, durs,
@@ -8495,7 +8664,7 @@ class MADMainWindow(QMainWindow):
         tree.blockSignals(False)
         parts = []
         if n_confirmed:
-            parts.append(f"{n_confirmed} confirmed")
+            parts.append(f"{n_confirmed} accepted")
         if n_pred:
             parts.append(f"{n_pred} prediction(s)")
         if n_rej:
@@ -8884,6 +9053,24 @@ class MADMainWindow(QMainWindow):
                 break
         for p in range(start, len(order)):
             if anns[order[p]].get('status') == 'prediction':
+                self._select_review_pos(p)
+                return True
+        return False
+
+    def _select_first_pending(self) -> bool:
+        """Select the first pending detection in display order.
+
+        The wrap target for Skip. Separate from
+        :meth:`_select_next_pending_after_id` because "start again" and "carry
+        on from here" are different intents, and folding the wrap into the
+        latter would silently loop every caller that relies on it stopping —
+        the accept/reject advance among them, which must NOT wrap or review
+        would never end.
+        """
+        order = self._review_order()
+        anns = self.spectrogram.annotations
+        for p, ai in enumerate(order):
+            if anns[ai].get('status') == 'prediction':
                 self._select_review_pos(p)
                 return True
         return False
@@ -9759,7 +9946,16 @@ class MADMainWindow(QMainWindow):
                if sel is not None and 0 <= sel < len(sg.annotations)
                else None)
         if not self._select_next_pending_after_id(sid):
-            self.status_bar.showMessage("No more pending predictions after this")
+            # Past the last pending one, start again at the first. Skipping is
+            # for deferring a decision, so the ones you skipped past are
+            # exactly what you still owe — stopping dead at the end left the
+            # key doing nothing with work outstanding.
+            if self._select_first_pending():
+                self.status_bar.showMessage(
+                    "Back to the first pending detection")
+            else:
+                self.status_bar.showMessage(
+                    "Nothing left pending on this recording")
 
     @staticmethod
     def _annotation_from_example(ex: dict, ann: dict):
@@ -10288,6 +10484,8 @@ class MADMainWindow(QMainWindow):
                                ('model_name', 'threshold', 'min_blob_pixels')
                                if r.get(k) not in (None, '')},
                 'blob_id': r.get('blob_id'),
+                'note': r.get('note') or '',
+                'tags': list(r.get('tags') or []),
                 'csv_path': csv_path if os.path.isfile(csv_path) else None,
             })
             n_added += 1
@@ -10438,7 +10636,7 @@ class MADMainWindow(QMainWindow):
         if n_examples == 0:
             QMessageBox.warning(
                 self, "No training examples",
-                "No confirmed calls yet. Label a call (brush or SAM) and press "
+                "No accepted calls yet. Label a call (brush or SAM) and press "
                 "Enter to confirm it before training."
             )
             return
@@ -10788,19 +10986,33 @@ class MADMainWindow(QMainWindow):
         self._show_run_summary_dialog()
 
     def _show_run_summary_dialog(self):
-        """One dialog covering the training run and any inference that followed."""
+        """One dialog covering the training run and any inference that followed.
+
+        Two columns, not one list: training and inference answer different
+        questions — "is the model any good?" and "how much work did this make
+        for me?" — and running them together as prose meant the second was
+        found by reading past the first. The inference column only appears when
+        post-training inference actually ran.
+        """
         summary = getattr(self, '_last_train_summary', None) or {}
         results = getattr(self, '_last_infer_results', None) or []
 
         lines: List[str] = []
         n_labels = summary.get('n_labels')
+        n_neg = summary.get('n_negatives')
         if n_labels is not None:
-            lines.append(f"Trained on {n_labels} confirmed label(s).")
+            neg = (f"  ·  {n_neg} rejected call(s) as negatives"
+                   if n_neg else "")
+            lines.append(f"Trained on {n_labels} accepted call(s).{neg}")
         dice = summary.get('best_val_dice')
         if isinstance(dice, (int, float)):
             lines.append(
                 f"Best val_dice = {dice:.3f}  "
                 f"(val_loss {summary.get('best_val_loss', float('nan')):.4f})")
+            if summary.get('split_level') != 'file':
+                lines.append(
+                    "  ⚠ val_dice is measured on held-out calls from the SAME "
+                    "recordings it trained on, so it reads optimistically.")
         if summary.get('early_stopped'):
             lines.append("Stopped early — val_loss plateaued.")
         # The operating point, and the evidence for it. A single Dice at 0.5
@@ -10831,38 +11043,60 @@ class MADMainWindow(QMainWindow):
                 "everywhere and will not find any calls. Check the class "
                 "balance and split lines in the Session Logs.")
 
+        infer_lines: List[str] = []
         if results:
             ok = [r for r in results if 'error' not in r]
             errs = [r for r in results if 'error' in r]
             total = sum(int(r.get('n_blobs') or 0) for r in ok)
-            lines.append(
-                f"\nInference ran on {len(ok)} file(s) — "
-                f"{total} pending mask(s) added for review.")
+            infer_lines.append(
+                f"Analyzed {len(ok)} recording(s) — <b>{total}</b> pending "
+                "detection(s) added for review.")
+            # Deliberately NOT an estimate of how many are junk. The only
+            # reject rate on hand comes from PREVIOUS models, and projecting it
+            # onto this model's output assumes the two behave alike — which is
+            # the one thing retraining is meant to falsify. It would also be
+            # wrong in the flattering direction exactly when training worked.
+            # What follows describes the detections this model actually
+            # produced; no human judgement is involved, so nothing is borrowed.
+            secs = sum(float((r.get('timing') or {}).get('audio_dur_s') or 0)
+                       for r in ok)
+            if secs:
+                infer_lines.append(
+                    f"{secs / 3600:.1f} h of audio scanned "
+                    f"({total / (secs / 3600):.0f} detections/h).")
+            infer_lines.extend(self._detection_profile_lines(ok, summary))
             recovered = sum(1 for r in ok if r.get('retry'))
             if recovered:
-                lines.append(
-                    f"{recovered} file(s) failed on the first pass and "
+                infer_lines.append(
+                    f"{recovered} recording(s) failed on the first pass and "
                     "succeeded on retry — no action needed.")
             if errs:
-                lines.append(
-                    f"{len(errs)} file(s) FAILED and hold no detections — "
-                    "listed below and marked ✖ in the Audio list.")
+                infer_lines.append(
+                    f"<span style='color:#d64545;'>{len(errs)} recording(s) "
+                    "FAILED</span> and hold no detections — listed below and "
+                    "marked ✖ in the Audio list.")
 
         lines.extend(self._stop_criterion_lines())
 
-        headline = ("Training complete!" if not results
-                    else "Training and Inference complete!")
-        if not lines:
+        headline = ("Training complete" if not results
+                    else "Training and Inference complete")
+        if not lines and not infer_lines:
             return
 
         def _full_text():
-            out = [headline, ""] + list(lines) + [""]
+            out = [headline, "", "TRAINING"] + list(lines)
+            if infer_lines:
+                out += ["", "INFERENCE"] + list(infer_lines)
+            out.append("")
             for r in results:
                 nm = os.path.basename(str(r.get('wav_path') or ''))
                 out.append(
                     f"   ✖ {nm}: FAILED — {r['error']}" if r.get('error')
                     else f"   • {nm}: {int(r.get('n_blobs') or 0)} pending")
-            return chr(10).join(out)
+            # Plain text for the clipboard: the columns carry light HTML for
+            # emphasis, which would paste as markup.
+            import re as _re
+            return _re.sub(r'<[^>]+>', '', chr(10).join(out))
 
         # The same summary into the Session Logs, before the dialog opens.
         # Everything here existed only in a dialog that is dismissed once and
@@ -10871,12 +11105,16 @@ class MADMainWindow(QMainWindow):
         # files failed — were unrecoverable the moment the user clicked OK,
         # while the per-file timing spam was kept forever. Logging first also
         # means a crash while building the dialog still leaves the record.
-        self._log_run_summary(headline, lines, results)
+        self._log_run_summary(headline, lines + infer_lines, results)
 
         # Every file listed and scrollable, rather than ten of them in a
         # string that elides the rest — including the failures.
         MADRunSummaryTable(self, "Run complete", headline, lines,
-                           results, copy_text_fn=_full_text).exec_()
+                           results, copy_text_fn=_full_text,
+                           infer_lines=infer_lines,
+                           plots=self._detection_plots(
+                               [r for r in results if 'error' not in r],
+                               summary)).exec_()
         # One run's numbers must never be reported against the next.
         self._last_infer_results = []
         # After the summary, not before: evaluation is the next question, not
@@ -10910,6 +11148,269 @@ class MADMainWindow(QMainWindow):
             self._log(f"  … and {len(errs) - MAX_NAMED} more failure(s) — "
                       "see the run manifest for the full list.")
         self._log("=" * 60)
+
+    #: Plot size in the summary column, inches at 100 dpi.
+    PROFILE_FIG = (4.4, 1.5)
+
+    def _detection_plots(self, ok_results, summary):
+        """Small labelled histograms of the run's own output, as QPixmaps.
+
+        Four, in the order a reader needs them:
+
+        1. **Score** — is the model confident, and what does a higher cutoff
+           cost? The only lever left after a run, since scores are stored and
+           the threshold can be raised but not lowered without re-running.
+        2. **Duration** against your accepted calls — does its output look like
+           what you labelled?
+        3. **Frequency** against your accepted calls — same question on the
+           axis a USV reader actually thinks in.
+        4. **Detections per recording**, rank-ordered — is the output spread
+           across the set, or coming from a handful of noisy recordings?
+
+        Returns ``[]`` when matplotlib is missing or nothing was detected;
+        the text lines stand on their own.
+        """
+        try:
+            import numpy as _np
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+        except Exception:
+            return []
+        from fnt.usv.usv_detector.mad_inference import (
+            DUR_EDGES_MS, FREQ_BIN_KHZ, N_SCORE_BINS, SCORE_BIN)
+
+        score = _np.zeros(N_SCORE_BINS, dtype=float)
+        dur = _np.zeros(len(DUR_EDGES_MS), dtype=float)
+        freq = _np.zeros(0, dtype=float)
+        counts = []
+        for r in ok_results:
+            st = r.get('det_stats') or {}
+            counts.append(int(st.get('n') or 0))
+            for key, acc in (('score_hist', score), ('dur_hist', dur)):
+                v = _np.asarray(st.get(key) or [], dtype=float)
+                if v.size == acc.size:
+                    acc += v
+            fv = _np.asarray(st.get('freq_hist') or [], dtype=float)
+            if fv.size:
+                if freq.size != fv.size:
+                    freq = _np.zeros(fv.size, dtype=float)
+                freq += fv
+        total = float(score.sum())
+        if total <= 0:
+            return []
+        ref = self._accepted_call_profile()
+
+        FG, GRID, NEW, REF = '#cccccc', '#3a3a3a', '#6fa8dc', '#c8a05a'
+
+        def _fig():
+            f = Figure(figsize=self.PROFILE_FIG, dpi=100)
+            f.patch.set_facecolor('#2b2b2b')
+            ax = f.add_subplot(111)
+            ax.set_facecolor('#232323')
+            for s in ax.spines.values():
+                s.set_color(GRID)
+            ax.tick_params(colors=FG, labelsize=7)
+            ax.grid(True, color=GRID, linewidth=0.5, alpha=0.6)
+            ax.set_axisbelow(True)
+            return f, ax
+
+        def _pix(f):
+            c = FigureCanvasAgg(f)
+            f.tight_layout(pad=0.4)
+            c.draw()
+            w, h = c.get_width_height()
+            img = QImage(bytes(c.buffer_rgba()), w, h, QImage.Format_RGBA8888)
+            return QPixmap.fromImage(img.copy())
+
+        def _norm(a):
+            s = a.sum()
+            return (a / s * 100.0) if s else a
+
+        out = []
+
+        # 1. score
+        f, ax = _fig()
+        edges = _np.arange(N_SCORE_BINS) * SCORE_BIN
+        ax.bar(edges, score, width=SCORE_BIN * 0.9, align='edge', color=NEW)
+        thr = summary.get('best_threshold')
+        try:
+            if thr is not None:
+                ax.axvline(float(thr), color='#e06c6c', linewidth=1.2,
+                           linestyle='--')
+        except (TypeError, ValueError):
+            pass
+        ax.set_title("Detection score  (dashed = threshold used)",
+                     color=FG, fontsize=8)
+        ax.set_xlabel("score", color=FG, fontsize=7)
+        ax.set_xlim(0, 1)
+        out.append(_pix(f))
+
+        # 2. duration, against the accepted calls
+        f, ax = _fig()
+        x = _np.arange(len(DUR_EDGES_MS))
+        labels = ["<5", "5-10", "10-20", "20-40", "40-80", "80-160",
+                  "160-320", ">320"]
+        ax.bar(x - 0.2, _norm(dur), width=0.4, color=NEW, label="found")
+        rd = _np.asarray(ref.get('dur_hist') or [], dtype=float)
+        if rd.size == dur.size and rd.sum():
+            ax.bar(x + 0.2, _norm(rd), width=0.4, color=REF,
+                   label=f"you accepted (n={ref['n']})")
+            ax.legend(fontsize=6, facecolor='#232323', edgecolor=GRID,
+                      labelcolor=FG)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels[:len(x)], fontsize=6)
+        ax.set_title("Duration (ms), % of each set", color=FG, fontsize=8)
+        out.append(_pix(f))
+
+        # 3. frequency, against the accepted calls
+        if freq.size:
+            f, ax = _fig()
+            fx = _np.arange(freq.size) * FREQ_BIN_KHZ
+            ax.bar(fx, _norm(freq), width=FREQ_BIN_KHZ * 0.9, align='edge',
+                   color=NEW, label="found")
+            rf = _np.asarray(ref.get('freq_hist') or [], dtype=float)
+            if rf.size == freq.size and rf.sum():
+                ax.step(fx, _norm(rf), where='post', color=REF, linewidth=1.4,
+                        label="you accepted")
+                ax.legend(fontsize=6, facecolor='#232323', edgecolor=GRID,
+                          labelcolor=FG)
+            ax.set_title("Peak frequency (kHz), % of each set",
+                         color=FG, fontsize=8)
+            ax.set_xlim(0, freq.size * FREQ_BIN_KHZ)
+            out.append(_pix(f))
+
+        # 4. per-recording concentration
+        if len(counts) >= 5:
+            f, ax = _fig()
+            srt = sorted(counts, reverse=True)
+            ax.fill_between(range(len(srt)), srt, color=NEW, alpha=0.8)
+            ax.set_title("Detections per recording (most to fewest)",
+                         color=FG, fontsize=8)
+            ax.set_xlabel("recording rank", color=FG, fontsize=7)
+            ax.set_xlim(0, max(1, len(srt) - 1))
+            out.append(_pix(f))
+        return out
+
+    def _accepted_call_profile(self):
+        """Duration and frequency histograms of the calls you ACCEPTED.
+
+        The reference the run's output is drawn against. Overlaying the two is
+        the one comparison available with no extra labelling: if 38,000 fresh
+        detections sit at durations and frequencies unlike the 289 calls you
+        taught it, the model is finding something other than what you asked
+        for — visible without judging a single one of them.
+
+        Metadata only; no pixel array is read.
+        """
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            example_kind, masks_sibling_path, td_iter_meta, REJECTED_KINDS)
+        from fnt.usv.usv_detector.mad_inference import (
+            DUR_EDGES_MS, FREQ_BIN_KHZ, N_FREQ_BINS)
+        dur = [0] * len(DUR_EDGES_MS)
+        freq = [0] * N_FREQ_BINS
+        n = 0
+        for fp in self._training_source_paths():
+            try:
+                metas = list(td_iter_meta(masks_sibling_path(fp)))
+            except Exception:
+                continue
+            for m in metas:
+                if example_kind(m) in REJECTED_KINDS:
+                    continue           # negatives are not what it should find
+                try:
+                    ms = (float(m.get('t_stop_s') or 0)
+                          - float(m.get('t_start_s') or 0)) * 1000.0
+                    khz = ((float(m.get('f_low_hz') or 0)
+                            + float(m.get('f_high_hz') or 0)) / 2000.0)
+                except (TypeError, ValueError):
+                    continue
+                for i, edge in enumerate(DUR_EDGES_MS):
+                    if ms < edge:
+                        dur[i] += 1
+                        break
+                fb = int(khz / FREQ_BIN_KHZ)
+                if 0 <= fb < N_FREQ_BINS:
+                    freq[fb] += 1
+                n += 1
+        return {'n': n, 'dur_hist': dur, 'freq_hist': freq}
+
+    def _detection_profile_lines(self, ok_results, summary):
+        """Describe the detections THIS run produced.
+
+        Every figure is computed from the run's own output, so none of it
+        borrows from how you judged a previous model. That matters because the
+        obvious alternative — projecting a past reject rate onto a fresh model
+        — assumes the new model behaves like the old one, which is what
+        retraining is supposed to change.
+
+        None of this says which detections are wrong; nothing here has been
+        judged. It says what the model emitted and what a different threshold
+        would have cost, which are facts about this run.
+        """
+        from fnt.usv.usv_detector.mad_inference import (
+            DUR_EDGES_MS, N_SCORE_BINS, SCORE_BIN)
+        score = [0] * N_SCORE_BINS
+        dur = [0] * len(DUR_EDGES_MS)
+        per_file = []
+        for r in ok_results:
+            st = r.get('det_stats') or {}
+            n = int(st.get('n') or 0)
+            per_file.append(n)
+            for i, v in enumerate(st.get('score_hist') or []):
+                if i < len(score):
+                    score[i] += int(v)
+            for i, v in enumerate(st.get('dur_hist') or []):
+                if i < len(dur):
+                    dur[i] += int(v)
+        total = sum(score)
+        if not total:
+            return []
+        out = []
+
+        # What a higher cutoff would cost. The only lever the user has after a
+        # run: the threshold can be raised on stored detections (each carries
+        # its score) but not lowered without re-running inference.
+        thr = summary.get('best_threshold')
+        try:
+            thr = float(thr)
+        except (TypeError, ValueError):
+            thr = None
+        cuts = [c for c in (0.7, 0.8, 0.9)
+                if thr is None or c > thr + 1e-9][:2]
+        for c in cuts:
+            kept = sum(score[int(c / SCORE_BIN):])
+            out.append(
+                f"Raising the threshold to {c:.2f} would keep "
+                f"<b>{kept:,}</b> ({kept / total * 100:.0f}%) and drop "
+                f"{total - kept:,}.")
+
+        # Duration profile. A mouse USV is tens of milliseconds; a large mass
+        # of very short or very long detections is the shape of noise, and is
+        # visible without judging anything.
+        short = dur[0]
+        long_ = sum(dur[5:])
+        bits = []
+        if short:
+            bits.append(f"{short:,} under 5 ms")
+        if long_:
+            bits.append(f"{long_:,} over 160 ms")
+        if bits:
+            out.append("Duration outliers: " + ", ".join(bits) +
+                       f" (of {total:,}).")
+
+        # Where the detections sit. A run whose output is dominated by a few
+        # recordings is usually a few noisy recordings, not a productive model.
+        if len(per_file) >= 10:
+            top = sorted(per_file, reverse=True)[:max(1, len(per_file) // 20)]
+            share = sum(top) / total * 100
+            if share >= 40:
+                out.append(
+                    f"Concentrated: the busiest {len(top)} recording(s) hold "
+                    f"{share:.0f}% of all detections.")
+        empty = sum(1 for n in per_file if n == 0)
+        if empty:
+            out.append(f"{empty} recording(s) produced no detections.")
+        return out
 
     def _stop_criterion_lines(self):
         """"Is another round of labelling worth it?" — for the run summary.
@@ -10985,7 +11486,12 @@ class MADMainWindow(QMainWindow):
         Reuses the Evaluate dialog rather than inventing a second surface, so
         there is one place where these numbers live and one place to cancel.
         """
-        if not self._settings.value("mad/train/auto_eval", True, type=bool):
+        # Default OFF. A second window opening behind the first one, running a
+        # sweep nobody asked for, is not what "the run finished" should mean —
+        # and its numbers are scored on the recordings the model just trained
+        # on, so they read better than the model is. Evaluate Model… runs it on
+        # demand; the checkbox in that dialog turns this back on.
+        if not self._settings.value("mad/train/auto_eval", False, type=bool):
             return
         try:
             model = (self._selected_deploy_model_path()
@@ -11417,7 +11923,9 @@ class MADMainWindow(QMainWindow):
         a plain string (for sizing); :class:`FileCountDelegate` recolors it."""
         if counts is not None and any(counts):
             a, p, r = counts
-            item.setText(f"{base}  ({a}, {p}, {r})")
+            # Same order the delegate paints: accepted, rejected, pending.
+            # This string is the fallback/sizing text, so it must not disagree.
+            item.setText(f"{base}  ({a}, {r}, {p})")
         elif counts is not None:
             item.setText(f"{base}  (0 detections)")
         else:
@@ -13408,11 +13916,16 @@ class MADMainWindow(QMainWindow):
         acc, pend, rej = self._mem_status_counts()
         # Coloured to match the spectrogram's own status palette, so the
         # numbers read as the same three things the outlines do.
+        #
+        # Order is accepted · rejected · PENDING, not the tuple's own order:
+        # the first two are work already done and the last is work still to do,
+        # so putting pending last means the eye lands on the number that says
+        # whether this recording needs attention.
         lbl.setText(
             f"<b>{base}</b> &nbsp;·&nbsp; {pos} &nbsp;·&nbsp; "
             f"<span style='color:#3fbf5f'>{acc} accepted</span> &nbsp;·&nbsp; "
-            f"<span style='color:#d8c341'>{pend} pending</span> &nbsp;·&nbsp; "
-            f"<span style='color:#d64545'>{rej} rejected</span>")
+            f"<span style='color:#d64545'>{rej} rejected</span> &nbsp;·&nbsp; "
+            f"<span style='color:#d8c341'>{pend} pending</span>")
 
     def _touch_current_file_badge(self):
         """Re-badge JUST the on-screen recording's Audio-list row from memory.
@@ -13559,8 +14072,8 @@ class MADMainWindow(QMainWindow):
                 positives.append(False)
 
         if n_acc == 0:
-            return ("No confirmed calls yet — draw a mask and press Enter to "
-                    "confirm one before training.")
+            return ("No accepted calls yet — draw a mask and press Enter to "
+                    "accept one before training.")
 
         mode = 'call'
         if hasattr(self, 'combo_train_split'):
@@ -13578,10 +14091,14 @@ class MADMainWindow(QMainWindow):
         level = split['split_level']
         level_txt = {'file': 'by recording', 'call': 'by call',
                      'tile': 'by tile'}.get(level, level)
-        neg_txt = f" + {n_rej} rejected as negatives" if n_rej else ""
-        line = (f"{n_acc} confirmed call(s){neg_txt} across {files_with_calls} "
-                f"recording(s) → <b>{tr_calls} train / {va_calls} val</b> "
-                f"(split {level_txt})")
+        # "Accepted" and "rejected", never "confirmed": a reviewer reads
+        # "confirmed" as "I made a decision about this one" — which is true of
+        # BOTH accepts and rejects — while the code only ever meant accepted.
+        neg_txt = (f" · <b>{n_rej}</b> rejected call(s) (trained as negatives)"
+                   if n_rej else "")
+        line = (f"<b>{n_acc}</b> accepted call(s){neg_txt} across "
+                f"{files_with_calls} recording(s) → <b>{tr_calls} train / "
+                f"{va_calls} val</b> (split {level_txt})")
 
         if tr_calls == 0:
             line += ("<br><span style='color:#ff6666'>✖ No calls would reach "
@@ -13744,7 +14261,7 @@ class MADMainWindow(QMainWindow):
         box.setText(f"The Audio list holds {n} recording(s).")
         box.setInformativeText(
             f"{len(empty)} of them hold no calls at all — never analyzed, "
-            f"or analyzed and nothing found. Recordings with confirmed "
+            f"or analyzed and nothing found. Recordings with accepted "
             f"calls OR rejections are kept: rejections train the model as "
             f"hard negatives.\n\n"
             "Nothing is deleted — every .wav and its .mad sidecar stays on "
@@ -14263,7 +14780,7 @@ class MADMainWindow(QMainWindow):
         if anns or n_pred:
             parts = []
             if anns:
-                parts.append(f"{len(anns)} confirmed")
+                parts.append(f"{len(anns)} accepted")
             if n_pred:
                 parts.append(f"{n_pred} prediction(s)")
             self.lbl_mask_status.setText(
@@ -14722,22 +15239,23 @@ class MADMainWindow(QMainWindow):
                 pass
         sg.clear_pending()
         self._refresh_annotation_list()
-        # Paint / Eraser stay armed; SAM is switched off.
-        sam_was_on = self._reset_labeling_tools_after_confirm()
-        self.lbl_mask_status.setText(f"Confirmed {saved} call(s) — '{name}'")
-        if sam_was_on:
+        # SAM and Paint switch off; the Eraser stays armed.
+        tool_off = self._reset_labeling_tools_after_confirm()
+        self.lbl_mask_status.setText(f"Accepted {saved} call(s) — '{name}'")
+        if tool_off:
             # Say it plainly. A tool that turns itself off without a word just
             # reads as clicks that stopped working.
-            hint = "SAM off — press M or the SAM button to label another"
+            key = {"SAM": "M", "Paint": "P"}.get(tool_off, "")
+            hint = (f"{tool_off} off — press {key} or the {tool_off} button "
+                    "to label another")
+        elif self.btn_erase.isChecked():
+            hint = "Eraser still on, label the next call"
         else:
-            tool = ('Paint' if self.btn_paint.isChecked()
-                    else 'Eraser' if self.btn_erase.isChecked() else None)
-            hint = (f"{tool} still on, label the next call"
-                    if tool else "label the next batch")
+            hint = "label the next batch"
         self.status_bar.showMessage(
             f"Saved {saved} example(s) (class '{name}') — {hint}")
-        self._log(f"Confirmed {saved} call(s) as '{name}' (Enter)"
-                  + (" — SAM off" if sam_was_on else ""))
+        self._log(f"Accepted {saved} call(s) as '{name}' (Enter)"
+                  + (f" — {tool_off} off" if tool_off else ""))
 
     def _reset_labeling_tools_after_confirm(self) -> bool:
         """After a confirmed batch: drop the SAM prompt points, and switch SAM
@@ -14759,17 +15277,20 @@ class MADMainWindow(QMainWindow):
         starting a new one. ``clear_sam_prompts`` drops only those, never the
         mask.
         """
-        sam_was_on = self.btn_sam.isChecked()
-        if sam_was_on:
+        off = None
+        for btn, name in ((self.btn_sam, "SAM"), (self.btn_paint, "Paint")):
+            if btn.isChecked():
+                btn.setChecked(False)
+                off = name
+        if off is not None:
             # setChecked does not emit `clicked`, so the paint mode has to be
-            # cleared here — the button going up is not what turns SAM off.
-            self.btn_sam.setChecked(False)
+            # cleared here — the button going up is not what disarms the tool.
             self.spectrogram.set_paint_mode(None)
         try:
             self.spectrogram.clear_sam_prompts()
         except Exception:
             pass
-        return sam_was_on
+        return off
 
     def _deactivate_labeling_tools(self):
         """Turn off whichever labeling tool (SAM / Paint / Eraser) is active and
@@ -15183,7 +15704,7 @@ class MADMainWindow(QMainWindow):
                     pass
             self._refresh_annotation_list()
             self.status_bar.showMessage("Removed last annotation")
-            self._log("Undo: removed last confirmed detection")
+            self._log("Undo: removed last accepted detection")
 
     # ------------------------------------------------------------------
     # Harmonics
@@ -15414,6 +15935,168 @@ class MADMainWindow(QMainWindow):
         out.sort()
         return [i for _d, i in out[:limit]]
 
+    # ------------------------------------------------------------------
+    # Notes and tags on a call
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_notable(ann) -> bool:
+        """Can this call carry a note? Only once it has been judged.
+
+        Deliberately not pending detections. A pending detection is disposable
+        — the next inference run replaces every one of them — so a note there
+        would either be silently lost or would have to pin the detection down
+        and stop it being overwritten. Neither is wanted. Accepted and rejected
+        calls are stored as examples, which already survive a re-run, so a note
+        on one keeps without any special handling.
+        """
+        return (ann or {}).get('status') in (None, 'accepted', 'rejected')
+
+    def _write_call_annotation(self, ann, note=None, tags=None) -> bool:
+        """Persist a note and/or tags onto the example backing this call.
+
+        Writes to whichever store actually holds it — a project's consolidated
+        training store or the per-wav sibling — and updates the in-memory
+        annotation so the canvas redraws without a reload.
+        """
+        from fnt.usv.usv_detector.fnt_mask_store import td_update_meta
+        eid = (ann or {}).get('id')
+        if not eid or not self._is_notable(ann):
+            return False
+        updates = {}
+        if note is not None:
+            updates['note'] = str(note)
+        if tags is not None:
+            updates['tags'] = [str(t) for t in tags]
+        if not updates:
+            return False
+        wav = self._active_review_wav_path()
+        wrote = False
+        for store in self._example_store_paths(wav):
+            try:
+                if td_update_meta(store, str(eid), updates):
+                    wrote = True
+                    break
+            except Exception:
+                continue
+        if wrote:
+            if note is not None:
+                ann['note'] = str(note)
+            if tags is not None:
+                ann['tags'] = [str(t) for t in tags]
+        return wrote
+
+    def _known_tags(self) -> List[str]:
+        """Tags this project has seen, so they can be offered again.
+
+        Without a remembered vocabulary every tag is retyped from memory, and
+        "#post-noise" and "#postnoise" quietly become two different things.
+        """
+        if self._project is not None:
+            return sorted(set(getattr(self._project, 'tags', None) or []))
+        return sorted(set(getattr(self, '_session_tags', None) or []))
+
+    def _remember_tag(self, tag: str):
+        tag = self._normalize_tag(tag)
+        if not tag:
+            return
+        if self._project is not None:
+            known = list(getattr(self._project, 'tags', None) or [])
+            if tag not in known:
+                known.append(tag)
+                self._project.tags = sorted(known)
+                try:
+                    self._project.save()
+                except Exception:
+                    pass
+        else:
+            s = getattr(self, '_session_tags', None)
+            if s is None:
+                s = self._session_tags = []
+            if tag not in s:
+                s.append(tag)
+
+    @staticmethod
+    def _normalize_tag(tag: str) -> str:
+        """``post noise`` -> ``#post-noise``.
+
+        One canonical form, applied on the way in, so the vocabulary does not
+        fill up with spellings of the same idea. The leading ``#`` is added
+        rather than required: the user is typing a tag, they should not have to
+        remember the punctuation.
+        """
+        t = str(tag or '').strip().lstrip('#').strip()
+        t = re.sub(r'\s+', '-', t)
+        t = re.sub(r'[^0-9A-Za-z_\-]', '', t)
+        return f"#{t}" if t else ""
+
+    def _prompt_note(self, ann_idx):
+        sg = self.spectrogram
+        if not (0 <= ann_idx < len(sg.annotations)):
+            return
+        ann = sg.annotations[ann_idx]
+        cur = ann.get('note') or ''
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Note on this call")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "What did you notice? Stored on the call in the .mad, and "
+            "exported alongside it."))
+        edit = QTextEdit()
+        edit.setPlainText(cur)
+        edit.setMinimumSize(460, 160)
+        v.addWidget(edit)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        edit.setFocus()
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        text = edit.toPlainText().strip()
+        if self._write_call_annotation(ann, note=text):
+            self._log(f"Note {'cleared on' if not text else 'saved on'} call "
+                      f"@ {self._ann_time_s(ann):.2f}s")
+            self._after_annotation_edit(ann_idx)
+
+    def _toggle_tag(self, ann_idx, tag: str):
+        sg = self.spectrogram
+        if not (0 <= ann_idx < len(sg.annotations)):
+            return
+        ann = sg.annotations[ann_idx]
+        tag = self._normalize_tag(tag)
+        if not tag:
+            return
+        tags = list(ann.get('tags') or [])
+        if tag in tags:
+            tags.remove(tag)
+            verb = "removed from"
+        else:
+            tags.append(tag)
+            verb = "added to"
+        if self._write_call_annotation(ann, tags=sorted(set(tags))):
+            self._remember_tag(tag)
+            self._log(f"{tag} {verb} call @ {self._ann_time_s(ann):.2f}s")
+            self._after_annotation_edit(ann_idx)
+
+    def _prompt_new_tag(self, ann_idx):
+        text, ok = QInputDialog.getText(
+            self, "New tag",
+            "Tag (a # is added for you; spaces become dashes):")
+        if ok and text.strip():
+            self._toggle_tag(ann_idx, text)
+
+    def _ann_time_s(self, ann) -> float:
+        sr = self.sample_rate or 1
+        dt = self.spectrogram.hop / float(sr) if self.spectrogram.hop else 0.0
+        return float(ann.get('t0', 0)) * dt
+
+    def _after_annotation_edit(self, ann_idx):
+        """Redraw the one thing that changed, and keep the row in step."""
+        self.spectrogram.update()
+        eid = self.spectrogram.annotations[ann_idx].get('id')
+        if not self._touch_annotation_rows([eid]):
+            self._refresh_annotation_list()
+
     def _on_annotation_context_menu(self, ann_idx, global_pos):
         from PyQt5.QtWidgets import QMenu
         sg = self.spectrogram
@@ -15423,9 +16106,43 @@ class MADMainWindow(QMainWindow):
         a_class = menu.addAction("Edit class…")
         a_shape = menu.addAction("Edit shape")
 
+        # --- note + tags -------------------------------------------------
+        # Only on a judged call. A pending detection is replaced wholesale by
+        # the next inference run, so a note on one would be lost without
+        # pinning the detection down — and pending detections are meant to be
+        # disposable. Accepted and rejected calls are stored as examples, which
+        # already survive a re-run.
+        ann = sg.annotations[ann_idx]
+        menu.addSeparator()
+        a_note = a_newtag = None
+        tag_actions = {}
+        if self._is_notable(ann):
+            has_note = bool((ann.get('note') or '').strip())
+            a_note = menu.addAction(
+                "Edit note…" if has_note else "Add note…")
+            tags_menu = menu.addMenu("Tags")
+            on = set(ann.get('tags') or [])
+            for t in self._known_tags():
+                act = tags_menu.addAction(t)
+                act.setCheckable(True)
+                act.setChecked(t in on)
+                tag_actions[act] = t
+            # Any tag on this call that the project has forgotten still shows,
+            # so it can be unticked rather than being stuck on the call.
+            for t in sorted(on - set(self._known_tags())):
+                act = tags_menu.addAction(t)
+                act.setCheckable(True)
+                act.setChecked(True)
+                tag_actions[act] = t
+            if tag_actions:
+                tags_menu.addSeparator()
+            a_newtag = tags_menu.addAction("New tag…")
+        else:
+            greyed = menu.addAction("Notes need an accepted or rejected call")
+            greyed.setEnabled(False)
+
         # --- harmonics ---
         menu.addSeparator()
-        ann = sg.annotations[ann_idx]
         h_n = int(ann.get('harmonic_n') or 1)
         head = menu.addAction(
             f"Harmonic H{h_n} of a call" if h_n > 1 else "Fundamental (H1)")
@@ -15453,6 +16170,15 @@ class MADMainWindow(QMainWindow):
         menu.addSeparator()
         a_del = menu.addAction("Delete")
         act = menu.exec_(global_pos)
+        if act is not None and act in tag_actions:
+            self._toggle_tag(ann_idx, tag_actions[act])
+            return
+        if a_newtag is not None and act == a_newtag:
+            self._prompt_new_tag(ann_idx)
+            return
+        if a_note is not None and act == a_note:
+            self._prompt_note(ann_idx)
+            return
         if act in cand_actions:
             root = sg.annotations[cand_actions[act]].get('id')
             self._set_forced_harmonic(ann_idx, str(root))

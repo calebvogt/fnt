@@ -158,3 +158,61 @@ def test_no_pending_buffer_at_all_is_survivable(sg):
     sg._pending = None
     assert sg.pending_components() == []
     assert sg.has_pending() is False
+
+
+# --------------------------------------- the brush must record its box
+"""The dirty box is not an optimisation detail — Escape depends on it.
+
+``_stamp`` writes brush pixels straight into ``_pending``. When it did not also
+record the region, the box stayed empty, ``has_pending()`` reported nothing
+painted, and Escape silently refused to clear a stroke plainly visible on
+screen. Enter still worked, because ``pending_components`` falls back to the
+stroke history — so the two disagreed about whether anything was drawn.
+"""
+
+
+def _stamp_at(sg, t_idx, f_idx, mode='brush'):
+    sg.paint_mode = mode
+    sg._stamp(t_idx, f_idx)
+
+
+def test_a_brush_stroke_records_its_box(sg):
+    sg.brush_radius_px = 3
+    _stamp_at(sg, 500, 100)
+    assert sg._pending_bbox is not None
+    assert sg.has_pending() is True
+
+
+def test_escape_can_clear_a_brush_stroke(sg):
+    """The reported bug, end to end at the widget level."""
+    sg.brush_radius_px = 3
+    _stamp_at(sg, 500, 100)
+    assert sg.has_pending() is True
+    sg.clear_pending()
+    assert sg.has_pending() is False
+    assert sg._pending_bbox is None
+
+
+def test_a_brush_stroke_is_found_as_a_component(sg):
+    sg.brush_radius_px = 2
+    _stamp_at(sg, 400, 60)
+    assert len(sg.pending_components()) == 1
+
+
+def test_the_eraser_does_not_need_to_grow_the_box(sg):
+    """It only removes pixels; a box that is a superset stays correct."""
+    sg.brush_radius_px = 3
+    _stamp_at(sg, 500, 100)
+    box = sg._pending_bbox
+    _stamp_at(sg, 500, 100, mode='erase')
+    assert sg._pending_bbox == box
+    assert sg.has_pending() is False        # everything painted was erased
+
+
+def test_two_strokes_grow_the_box_to_cover_both(sg):
+    sg.brush_radius_px = 2
+    _stamp_at(sg, 300, 50)
+    _stamp_at(sg, 900, 200)
+    f0, f1, t0, t1 = sg._pending_bbox
+    assert f0 <= 48 and f1 >= 202
+    assert t0 <= 298 and t1 >= 902
