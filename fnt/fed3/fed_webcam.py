@@ -1,9 +1,9 @@
 """Webcam / USB camera capture for the FED3 tab.
 
-Adapted from :mod:`fnt.musestudio.webcam`. The difference is the time base:
-MuseStudio stamps frames with the LSL clock because that is what its EEG inlets
-use. FED3 has no LSL, so frames are stamped with
-:func:`fnt.fed3.fed_session.host_now` — the same host wall clock used for
+Adapted from MuseStudio's webcam capture (since split out to its own project).
+The difference is the time base: MuseStudio stamps frames with the LSL clock
+because that is what its EEG inlets use. FED3 has no LSL, so frames are
+stamped with :func:`fnt.fed3.fed_session.host_now` — the same host wall clock used for
 behavioural events and interaction logs. A pellet at ``host_time`` and a frame
 at ``host_time`` are directly comparable with no alignment step.
 
