@@ -123,6 +123,25 @@ _ROLE_FILE_ERROR = Qt.UserRole + 22
 _ROLE_REVIEW_DONE = Qt.UserRole + 23
 
 
+def _run_threshold(ok_results):
+    """The cutoff the run actually wrote detections at, or None.
+
+    Read from the results rather than from the training summary. Those are
+    different numbers — the summary's ``best_threshold`` is what val_dice
+    preferred, the run uses whatever is in the settings box — and a dashed line
+    labelled "threshold used" that plots the recommendation is worse than no
+    line at all.
+    """
+    for r in ok_results or []:
+        v = r.get('threshold')
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _status_icon(ann, is_pred: bool, is_rej: bool) -> str:
     """Status glyph for a detection row, with a note marker when it has one.
 
@@ -11021,8 +11040,27 @@ class MADMainWindow(QMainWindow):
         bt = summary.get('best_threshold')
         sweep = summary.get('best_val_dice_sweep') or {}
         if bt is not None:
-            lines.append(f"Best threshold {float(bt):.2f} — "
-                         "applied to Inference settings.")
+            # NOT "applied to Inference settings" — nothing ever applied it.
+            # The claim was wrong on every run: 0.60 recommended while 0.70
+            # ran, then 0.70 recommended while 0.60 ran. Inference uses the
+            # threshold in the settings, which is the user's to choose, and
+            # silently overwriting it would change a setting that cannot be
+            # undone without re-running the whole batch.
+            lines.append(f"Best threshold {float(bt):.2f} by val_dice "
+                         "(a suggestion — Inference uses the value in the "
+                         "settings box).")
+            # A flat sweep cannot pick a threshold, and saying "best 0.30"
+            # over a curve that is identical at every cut invites the user to
+            # act on noise.
+            try:
+                vals = [float(v) for v in sweep.values()]
+                if vals and (max(vals) - min(vals)) < 0.005:
+                    lines.append(
+                        "  ⚠ val_dice is flat across the sweep, so it cannot "
+                        "choose a threshold — use Evaluate Model for a "
+                        "call-level curve.")
+            except (TypeError, ValueError):
+                pass
             if sweep:
                 try:
                     pairs = sorted((float(k), float(v))
@@ -11232,15 +11270,13 @@ class MADMainWindow(QMainWindow):
         f, ax = _fig()
         edges = _np.arange(N_SCORE_BINS) * SCORE_BIN
         ax.bar(edges, score, width=SCORE_BIN * 0.9, align='edge', color=NEW)
-        thr = summary.get('best_threshold')
-        try:
-            if thr is not None:
-                ax.axvline(float(thr), color='#e06c6c', linewidth=1.2,
-                           linestyle='--')
-        except (TypeError, ValueError):
-            pass
-        ax.set_title("Detection score  (dashed = threshold used)",
-                     color=FG, fontsize=8)
+        thr = _run_threshold(ok_results)
+        if thr is not None:
+            ax.axvline(thr, color='#e06c6c', linewidth=1.2, linestyle='--')
+        ax.set_title(
+            "Detection score  (dashed = threshold this run used"
+            + (f": {thr:.2f})" if thr is not None else ")"),
+            color=FG, fontsize=8)
         ax.set_xlabel("score", color=FG, fontsize=7)
         ax.set_xlim(0, 1)
         out.append(_pix(f))
@@ -11370,11 +11406,7 @@ class MADMainWindow(QMainWindow):
         # What a higher cutoff would cost. The only lever the user has after a
         # run: the threshold can be raised on stored detections (each carries
         # its score) but not lowered without re-running inference.
-        thr = summary.get('best_threshold')
-        try:
-            thr = float(thr)
-        except (TypeError, ValueError):
-            thr = None
+        thr = _run_threshold(ok_results)
         cuts = [c for c in (0.7, 0.8, 0.9)
                 if thr is None or c > thr + 1e-9][:2]
         for c in cuts:

@@ -1613,6 +1613,12 @@ def run_inference_on_file(
         'csv_path': csv_path if cfg.save_blob_csv else None,
         'h5_path': h5_path,
         'n_blobs': len(rows),
+        # The cutoff these detections were actually written at. Reported so
+        # the run summary can state what ran rather than what training
+        # recommended — those are different numbers, and the summary used to
+        # show the recommendation while claiming it had been applied.
+        'threshold': float(cfg.threshold),
+        'min_blob_pixels': int(cfg.min_blob_pixels),
         # Poolable counts describing this file's detections, gathered here
         # because the rows are already in hand — reading them back afterwards
         # would mean reopening every sidecar over the network.

@@ -96,10 +96,17 @@ def test_the_threshold_trade_is_reported(win):
 
 
 def test_cutoffs_at_or_below_the_run_threshold_are_not_offered(win):
-    """Lowering needs a re-run, so offering it would be a lie."""
+    """Lowering needs a re-run, so offering it would be a lie.
+
+    The bound comes from the threshold the RUN used, carried on the results —
+    not from the training summary's recommendation, which the run may well
+    have ignored.
+    """
     rows = [_row(score=0.95)] * 10
-    out = " ".join(win._detection_profile_lines(_results([rows]),
-                                               {'best_threshold': 0.8}))
+    res = _results([rows])
+    for r in res:
+        r['threshold'] = 0.8
+    out = " ".join(win._detection_profile_lines(res, {'best_threshold': 0.3}))
     assert "to 0.70" not in out and "to 0.80" not in out
     assert "to 0.90" in out
 
@@ -154,3 +161,68 @@ def test_the_summary_no_longer_projects_a_past_reject_rate():
     src = inspect.getsource(MADMainWindow._show_run_summary_dialog)
     code = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
     assert not any("_recent_reject_rate" in ln for ln in code)
+
+
+# ------------------------------- the threshold reported must be the real one
+"""The summary said "Best threshold 0.30 — applied to Inference settings" while
+the run had written detections at 0.50. Nothing ever applied best_threshold;
+the claim was false on every run (0.60 recommended, 0.70 used; then 0.70
+recommended, 0.60 used). The dashed line on the score plot repeated the error,
+labelled "threshold used" while plotting the recommendation.
+"""
+
+from fnt.usv.mad_pyqt import _run_threshold  # noqa: E402
+
+
+def test_the_threshold_comes_from_the_run_not_the_recommendation():
+    assert _run_threshold([{'threshold': 0.5}]) == 0.5
+
+
+def test_results_without_a_threshold_give_none():
+    """Older results predate the field; no line beats a wrong line."""
+    assert _run_threshold([{'n_blobs': 3}]) is None
+    assert _run_threshold([]) is None
+    assert _run_threshold(None) is None
+
+
+def test_a_malformed_threshold_is_not_guessed_at():
+    assert _run_threshold([{'threshold': 'high'}]) is None
+
+
+def test_the_cutoffs_offered_are_above_the_threshold_actually_used(win):
+    """Keyed off 0.5 (what ran), not 0.3 (what training liked) — offering a
+    cut below the run's own threshold would imply a lowering that needs a
+    re-run."""
+    rows = [_row(score=0.95)] * 10
+    res = _results([rows])
+    for r in res:
+        r['threshold'] = 0.75
+    out = " ".join(win._detection_profile_lines(res, {'best_threshold': 0.3}))
+    assert "to 0.70" not in out
+    assert "to 0.80" in out
+
+
+def test_the_summary_no_longer_claims_the_threshold_was_applied():
+    import inspect
+    from fnt.usv.mad_pyqt import MADMainWindow
+    src = inspect.getsource(MADMainWindow._show_run_summary_dialog)
+    code = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
+    joined = "\n".join(code)
+    assert "applied to Inference settings" not in joined
+    assert "a suggestion" in joined
+
+
+def test_a_flat_sweep_is_called_out():
+    """val_dice 0.907 at every cut cannot choose one; saying 'best 0.30'
+    invites acting on noise."""
+    import inspect
+    from fnt.usv.mad_pyqt import MADMainWindow
+    src = inspect.getsource(MADMainWindow._show_run_summary_dialog)
+    assert "flat across the sweep" in src
+
+
+def test_inference_records_the_threshold_it_used():
+    import inspect
+    from fnt.usv.usv_detector.mad_inference import run_inference_on_file
+    src = inspect.getsource(run_inference_on_file)
+    assert "'threshold': float(cfg.threshold)" in src
