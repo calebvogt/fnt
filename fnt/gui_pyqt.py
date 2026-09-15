@@ -321,7 +321,6 @@ class FNTMainWindow(QMainWindow):
         self.create_imaging_tab()
         self.create_wifp_tab()
         self.create_abma_tab()
-        self.create_musestudio_tab()
         self.create_utilities_tab()
         
         # Status bar
@@ -806,46 +805,6 @@ class FNTMainWindow(QMainWindow):
         layout.addWidget(info_group)
 
         layout.addStretch()
-
-    def create_musestudio_tab(self):
-        """Create the MuseStudio tab for Muse S Athena EEG/fNIRS streaming"""
-        tab, layout = self._make_scrollable_tab("Muse")
-
-        desc = QLabel("Stream, record and visualize Muse S Athena EEG/fNIRS data")
-        desc.setFont(QFont("Arial", 10, QFont.Bold))
-        desc.setStyleSheet("color: #cccccc; margin: 10px;")
-        layout.addWidget(desc)
-
-        group = QGroupBox("MuseStudio")
-        group_layout = QGridLayout()
-        buttons = [
-            ("MuseStudio",
-             "Connect to a Muse S Athena over Bluetooth, live-plot EEG/fNIRS, and record to CSV",
-             self.run_musestudio),
-        ]
-        self.create_button_grid(group_layout, buttons)
-        group.setLayout(group_layout)
-        layout.addWidget(group)
-
-        layout.addStretch()
-
-    def run_musestudio(self):
-        """Launch the MuseStudio window"""
-        # Check for the optional deps up front so we can give the install hint.
-        # find_spec only looks the modules up — it doesn't import them into the
-        # launcher process.
-        import importlib.util
-        missing = [m for m in ("mne_lsl", "bleak", "pyqtgraph")
-                   if importlib.util.find_spec(m) is None]
-        if missing:
-            QMessageBox.critical(
-                self, "MuseStudio dependencies missing",
-                "MuseStudio requires OpenMuse, mne-lsl, bleak and pyqtgraph.\n\n"
-                "Reinstall project dependencies with:\n    pip install -e .\n\n"
-                f"Missing: {', '.join(missing)}",
-            )
-            return
-        self.tools.launch("musestudio")
 
     def create_utilities_tab(self):
         """Create the utilities tab"""

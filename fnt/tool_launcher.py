@@ -47,8 +47,6 @@ TOOL_REGISTRY = {
         # NOTE: the FED Processing tool is deliberately NOT registered here. It
         # still opens in-process from fnt.gui_pyqt.run_fed_processing and is
         # owned separately; isolating it is that owner's call.
-        ToolSpec("musestudio", "fnt.musestudio.musestudio_pyqt",
-                 "MuseStudioWindow", "Muse Studio"),
 
         # --- Video processing ---
         ToolSpec("video_trim", "fnt.videoProcessing.video_trim_pyqt",
