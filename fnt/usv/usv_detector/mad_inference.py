@@ -1605,9 +1605,21 @@ def run_inference_on_file(
         progress('blobs', 1, 1)
 
     total = t_spec + t_infer + t_blobs
-    # Realtime factor: seconds of audio scanned per wall-second of inference
-    # (the tile-scan stage). <1 means slower than realtime — typical on CPU.
-    rt_factor = (audio_dur / t_infer) if t_infer > 0 else 0.0
+    # Two rates, because they answer different questions and reporting one
+    # under the other's name is how an ETA comes out at half the truth.
+    #
+    #   realtime_factor — seconds of audio per wall-second of *all* the work
+    #     this file cost: spectrogram, tile scan and blob extraction. This is
+    #     the one to multiply a corpus by. It matches what mad_batch.summarize
+    #     computes run-wide, so a per-file row and the run header finally
+    #     agree; they used to differ by ~35% under the same column name.
+    #   scan_realtime_factor — the tile scan alone, i.e. what the GPU does.
+    #     The right number for comparing devices or batch sizes, and the wrong
+    #     one for "how long will 11,402 files take?".
+    #
+    # <1 means slower than realtime — typical on CPU.
+    rt_factor = (audio_dur / total) if total > 0 else 0.0
+    scan_rt_factor = (audio_dur / t_infer) if t_infer > 0 else 0.0
     return {
         'wav_path': wav_path,
         'csv_path': csv_path if cfg.save_blob_csv else None,
@@ -1634,6 +1646,7 @@ def run_inference_on_file(
             't_blobs': round(t_blobs, 2),
             't_total': round(total, 2),
             'realtime_factor': round(rt_factor, 2),
+            'scan_realtime_factor': round(scan_rt_factor, 2),
         },
     }
 

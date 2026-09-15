@@ -347,6 +347,10 @@ class RunManifest:
             'audio_dur_s': timing.get('audio_dur_s'),
             't_total': timing.get('t_total'),
             'realtime_factor': timing.get('realtime_factor'),
+            # The GPU-only rate, kept separately so comparing devices or
+            # batch sizes across runs doesn't mean re-deriving it from
+            # stage times the manifest doesn't carry.
+            'scan_realtime_factor': timing.get('scan_realtime_factor'),
             'device': timing.get('device'),
             'error': summary.get('error'),
             # Process + system memory as of this file. Recorded on the error

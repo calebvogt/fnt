@@ -147,8 +147,11 @@ def test_the_label_count_moved_to_the_split_preview():
     assert "label" not in w.btn_train_run.text()
     text = w.lbl_split_preview.text()
     assert text, "the split preview must say something"
-    # No confirmed calls in this fixture, so it says so rather than a count.
-    assert "confirmed call" in text, text
+    # No accepted calls in this fixture, so it says so rather than a count.
+    # ("confirmed" was renamed to "accepted" across the UI: a call you have
+    # judged good is accepted, and "confirm" was doing double duty for the
+    # keystroke that commits a mask.)
+    assert "accepted call" in text, text
 
 
 # ----------------------------------------------------------------------

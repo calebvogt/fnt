@@ -3820,7 +3820,11 @@ class MADRunSummaryDialog(QDialog):
     straight to the reviewer.
     """
 
-    COLS = ["File", "Detections", "Calls/min", "Duration", "Scan time",
+    # "Scan time" named the wrong thing: the column holds t_total, which is
+    # spectrogram + scan + blobs. Alongside a "× realtime" that was scan-only,
+    # the two columns didn't divide into each other and neither matched the
+    # header line above them.
+    COLS = ["File", "Detections", "Calls/min", "Duration", "Wall time",
             "× realtime", "Status"]
 
     def __init__(self, main):
@@ -3944,7 +3948,10 @@ class MADRunSummaryDialog(QDialog):
                 continue
             dur = float(r.get('audio_dur_s') or 0.0)
             wall = float(r.get('t_total') or 0.0)
-            rt = float(r.get('realtime_factor') or 0.0)
+            # Recomputed rather than read back, so a manifest written before
+            # realtime_factor meant end-to-end still shows a rate that divides
+            # into the two columns beside it and agrees with the header.
+            rt = (dur / wall) if wall > 0 else 0.0
             rate = (n_det / (dur / 60.0)) if dur > 0 else 0.0
             item = SortableTreeWidgetItem([
                 r.get('name', ''),
@@ -5884,6 +5891,9 @@ class MADMainWindow(QMainWindow):
         # Batch-scale inference target: a folder tree scanned once, kept as a
         # plain path list so thousands of recordings never become list widgets.
         self._infer_folder: Optional[str] = None
+        #: Every folder chosen for a folder-scoped run. _infer_folder keeps
+        #: the first as a single representative root for the run record.
+        self._infer_folders: List[str] = []
         self._infer_folder_wavs: List[str] = []
         self._infer_model_project_dir: Optional[str] = None
 
@@ -7141,7 +7151,7 @@ class MADMainWindow(QMainWindow):
             "Detections save as a standalone CSV next to each recording.")
         self.chk_scope_folder.toggled.connect(self._update_run_button)
         folder_row.addWidget(self.chk_scope_folder)
-        self.btn_pick_infer_folder = QPushButton("Choose Folder…")
+        self.btn_pick_infer_folder = QPushButton("Choose Folder(s)…")
         self.btn_pick_infer_folder.clicked.connect(self._pick_inference_folder)
         folder_row.addWidget(self.btn_pick_infer_folder, 1)
         ibody.addLayout(folder_row)
@@ -11672,6 +11682,14 @@ class MADMainWindow(QMainWindow):
                     target = i
                     break
         if target is None and found:
+            # No remembered pick (a fresh session): the newest model in the
+            # project, not the last row. The combo is filled alphabetically, so
+            # "last row" meant a run-named directory like agent_headless_test
+            # outranked every timestamped one — and on startup this fallback,
+            # not select_latest, is what runs. A stale default here is not
+            # cosmetic: it is the model an 11,000-file batch would use.
+            target = self._latest_project_model_index()
+        if target is None and found:
             target = self.combo_deploy_model.count() - 1
         if target is not None:
             self.combo_deploy_model.setCurrentIndex(target)
@@ -11682,19 +11700,29 @@ class MADMainWindow(QMainWindow):
                 f"Loaded latest model: {self.combo_deploy_model.currentText()}")
 
     def _latest_project_model_index(self) -> Optional[int]:
-        """Combo index of the newest model in the *current* project. Model dirs
-        are timestamp-named and added in sorted order, so the last entry whose
-        path lives under the project's models/ is the latest. None if none."""
+        """Combo index of the newest model in the *current* project, or None.
+
+        Resolved through :meth:`_latest_model_path`, which orders by when the
+        weights were written. This used to take the LAST entry in the combo,
+        on the reasoning that run directories are timestamp-named and added in
+        sorted order — the same assumption ``_latest_model_path`` was already
+        fixed for, and wrong for the same reason. A run given a ``--run-name``
+        sorts lexicographically, letters land after digits, and a stray
+        ``agent_headless_test`` from a one-off headless run outranked every
+        real model. The project then auto-selected a checkpoint months out of
+        date for inference, and for the eval that runs against it.
+        """
         if self._project is None:
             return None
-        proj_models = os.path.normpath(
-            os.path.join(self._project.project_dir, 'models'))
-        latest = None
+        latest = self._latest_model_path()
+        if not latest:
+            return None
+        want = os.path.normcase(os.path.normpath(latest))
         for i in range(self.combo_deploy_model.count()):
             p = self.combo_deploy_model.itemData(i)
-            if p and os.path.normpath(p).startswith(proj_models + os.sep):
-                latest = i
-        return latest
+            if p and os.path.normcase(os.path.normpath(p)) == want:
+                return i
+        return None
 
     def _browse_deploy_model(self):
         root = (self._infer_model_project_dir
@@ -11759,29 +11787,53 @@ class MADMainWindow(QMainWindow):
         self._update_run_button()
 
     def _pick_inference_folder(self):
-        """Choose a folder tree to run inference over, and cache its wav list."""
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose a folder of recordings to analyze",
-            self._default_browse_dir())
-        if not folder:
+        """Choose one or more folder trees to run inference over.
+
+        Uses the same hand-built multi-select dialog as Add Folder rather than
+        ``getExistingDirectory``, which can only ever return one directory — so
+        a run over fourteen trial folders meant fourteen trips through the
+        picker, or pointing at the parent and taking all of its subfolders
+        whether they were wanted or not.
+
+        Each selection is walked to the bottom, so picking a trial folder also
+        picks up its per-channel subfolders without naming them.
+
+        Paths are de-duplicated across selections: choosing a folder and
+        something inside it is an easy mistake with a multi-select, and
+        analysing one recording twice writes its detections twice.
+        """
+        folders = self._pick_folders()
+        if not folders:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            wavs = _list_wavs_in_folder(folder, recursive=True)
+            wavs, seen = [], set()
+            for f in folders:
+                for w in _list_wavs_in_folder(f, recursive=True):
+                    key = os.path.normcase(os.path.abspath(w))
+                    if key not in seen:
+                        seen.add(key)
+                        wavs.append(w)
         finally:
             QApplication.restoreOverrideCursor()
-        self._infer_folder = folder
+        self._infer_folders = list(folders)
+        # One representative root, for the run-record location when no project
+        # is open. Any of them would do; the first is what the user picked.
+        self._infer_folder = folders[0]
         self._infer_folder_wavs = wavs
+        where = folders[0] if len(folders) == 1 else f"{len(folders)} folders"
+        if len(folders) > 1:
+            self.lbl_infer_folder.setToolTip("\n".join(folders))
         if wavs:
             self.chk_scope_folder.setChecked(True)
             self.lbl_infer_folder.setText(
-                f"{len(wavs):,} .wav file(s) under {folder}")
+                f"{len(wavs):,} .wav file(s) under {where}")
             self.lbl_infer_folder.setStyleSheet(
                 "color: #7ec87e; font-size: 9px;")
-            self._log(f"Batch target: {len(wavs)} wav(s) under {folder}")
+            self._log(f"Batch target: {len(wavs)} wav(s) under {where}")
         else:
             self.chk_scope_folder.setChecked(False)
-            self.lbl_infer_folder.setText(f"No .wav files found under {folder}")
+            self.lbl_infer_folder.setText(f"No .wav files found under {where}")
             self.lbl_infer_folder.setStyleSheet(
                 "color: #c8a05a; font-size: 9px;")
         self._update_run_button()
@@ -12153,67 +12205,46 @@ class MADMainWindow(QMainWindow):
         return has_pred_masks(masks_sibling_path(w))
 
     def _confirm_overwrite_predictions(self, wavs) -> bool:
-        """Warn before a re-run touches existing detections. Two modes:
+        """Warn before a re-run touches existing detections. Returns True to
+        proceed.
 
-        • Normal (default): only *pending* predictions are regenerated, so we
-          prompt only for files that still have unreviewed predictions and
-          reassure that reviewed calls / hand-labels are kept.
-        • "Re-detect from scratch": all prior predictions (including Accepted /
-          Rejected) are discarded, so we prompt for any file with predictions
-          and spell out that review decisions will be lost.
-
-        Returns True to proceed."""
+        Used only by the Train + Inference path, which has to ask before the
+        model it will run exists. A plain Run Inference asks the fuller
+        question in :meth:`_confirm_run_scope`, which can also say which of
+        these files this exact model has already analysed.
+        """
         redetect = bool(getattr(self, 'chk_infer_redetect', None)
                         and self.chk_infer_redetect.isChecked())
         if redetect:
+            # 'Re-detect from scratch' discards Accepted and Rejected too, so
+            # any file with predictions is at risk, not just unreviewed ones.
             existing = [w for w in wavs if self._file_has_predictions(w)]
-        else:
-            existing = [w for w in wavs if self._file_has_pending_predictions(w)]
+            return not existing or self._confirm_redetect(wavs, existing)
+
+        existing = [w for w in wavs if self._file_has_pending_predictions(w)]
         if not existing:
             return True
-
-        def _line(w):
-            src = self._file_source_label(w)
-            tag = f"  [{src}]" if src else ""
-            return f"   • {os.path.basename(w)}{tag}"
-        shown = "\n".join(_line(w) for w in existing[:8])
-        more = (f"\n   …and {len(existing) - 8} more"
+        shown = "\n".join(f"   • {os.path.basename(w)}{self._source_tag(w)}"
+                          for w in existing[:8])
+        more = (f"\n   …and {len(existing) - 8:,} more"
                 if len(existing) > 8 else "")
-        if redetect:
-            title = "Re-detect from scratch?"
-            body = (
-                f"'Re-detect from scratch' is on. {len(existing)} of "
-                f"{len(wavs)} file(s) carry predictions from a previous "
-                f"run:\n\n{shown}{more}\n\n"
-                "This will discard ALL of those predictions — including every "
-                "Accepted and Rejected decision — and re-detect everywhere.\n"
-                "Your painted / SAM labels are kept as data, but the model is "
-                "allowed to predict over them too.\n\n"
-                "Continue?")
-        else:
-            title = "Re-run inference on these files?"
-            body = (
-                f"{len(existing)} of {len(wavs)} file(s) still have pending "
-                f"(unreviewed) predictions from a previous run:\n\n"
-                f"{shown}{more}\n\n"
-                "Re-running inference will replace those pending predictions "
-                "with fresh ones. Everything you've already decided is kept:\n"
-                "   • Accepted and Rejected calls stay as they are, and the "
-                "model won't re-detect over them, and\n"
-                "   • your painted / SAM labels are untouched.\n"
-                "Deleted calls stay deleted — but their region re-opens for "
-                "fresh detection.\n\n"
-                "Continue?")
-        # Default depends on what is at stake. A normal re-run only regenerates
-        # pending predictions — nothing you decided is lost — and it is the
-        # routine thing you do after retraining, so Enter should just start it.
-        # "Re-detect from scratch" throws away every Accept and Reject on those
-        # files, so it keeps No: a destructive default one keystroke away is
-        # how a morning of review disappears.
         reply = QMessageBox.warning(
-            self, title, body,
+            self, "Re-run inference on these files?",
+            f"{len(existing):,} of {len(wavs):,} file(s) still have pending "
+            f"(unreviewed) predictions from a previous run:\n\n"
+            f"{shown}{more}\n\n"
+            "Re-running inference will replace those pending predictions "
+            "with fresh ones. Everything you've already decided is kept:\n"
+            "   • Accepted and Rejected calls stay as they are, and the "
+            "model won't re-detect over them, and\n"
+            "   • your painted / SAM labels are untouched.\n"
+            "Deleted calls stay deleted — but their region re-opens for "
+            "fresh detection.\n\n"
+            "Continue?",
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No if redetect else QMessageBox.Yes,
+            # Nothing decided is lost here, and it is the routine thing to do
+            # after retraining, so Enter should just start it.
+            QMessageBox.Yes,
         )
         return reply == QMessageBox.Yes
 
@@ -12233,11 +12264,10 @@ class MADMainWindow(QMainWindow):
                 "the chosen set isn't empty) before running inference."
             )
             return
-        # Warn before clobbering files that already hold detections from a prior
-        # run — re-inferring rewrites their predictions and discards any review
-        # decisions (accept/reject/delete) made on them.
-        if not self._confirm_overwrite_predictions(wavs):
-            return
+        # Whether these files have been analyzed before is asked once, in
+        # _confirm_run_scope, from inside _start_inference — it needs the
+        # config to say which model and settings the earlier run used, and
+        # asking here as well is what produced two dialogs in a row.
         # One-time nudge if a GPU is present but PyTorch can't use it.
         self._show_gpu_setup_dialog(force=False)
         from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
@@ -15290,21 +15320,20 @@ class MADMainWindow(QMainWindow):
                   + (f" — {tool_off} off" if tool_off else ""))
 
     def _reset_labeling_tools_after_confirm(self) -> bool:
-        """After a confirmed batch: drop the SAM prompt points, and switch SAM
-        itself off. Paint and Eraser stay armed. Returns whether SAM was on.
+        """After a confirmed batch: drop the SAM prompt points and switch the
+        drawing tools off. Returns the name of the tool that was on, or None.
 
-        Paint and Eraser persist because labelling with them is a long run of
-        the same gesture — Enter ends a call, not the session, and re-arming
-        the brush between every call was the reason confirming stopped
-        disarming tools at all.
+        SAM and Paint both go off. Each one's next click *creates* something —
+        SAM proposes a segment, Paint lays down pixels — and Enter has just
+        consumed the stroke they were building, so leaving either armed means
+        the click after a confirm starts a mask the user never asked for. M,
+        or the button, arms SAM again; B does the same for Paint.
 
-        SAM is the exception, by request. It is the tool whose next click is
-        expensive and consequential: with prompts cleared, a stray click starts
-        segmenting a fresh region rather than doing nothing, so leaving it
-        armed after a batch invites masks the user never meant to propose. M,
-        or the button, arms it again.
+        The Eraser stays armed. It is not a drawing tool: it removes pixels
+        from a stroke in progress, and with the pending buffer cleared there is
+        nothing for a stray click to damage.
 
-        The prompt points have to go either way: leaving them would make the
+        The prompt points have to go regardless: leaving them would make the
         next click extend the prompt for the call just saved instead of
         starting a new one. ``clear_sam_prompts`` drops only those, never the
         mask.
@@ -17645,7 +17674,7 @@ class MADMainWindow(QMainWindow):
         # freshly trained weights anyway — those detections came from a
         # different model that merely shares the filename weights.pt.
         self._start_inference(cfg, wavs, reporter=self.infer_panel,
-                              skip_resume_prompt=True)
+                              skip_scope_prompt=True)
 
     def _latest_model_path(self) -> Optional[str]:
         """Path to the most recently trained model in the project.
@@ -18072,80 +18101,227 @@ class MADMainWindow(QMainWindow):
         folder = getattr(self, '_infer_folder', None)
         return folder if folder and os.path.isdir(folder) else None
 
-    def _resume_filter(self, cfg, wav_paths: List[str]) -> List[str]:
-        """Drop files already analyzed by this model at these settings.
+    def _scan_predictions(self, wav_paths, predicate, what: str) -> List[str]:
+        """Files matching ``predicate``, with a progress line.
 
-        Turns a re-run — after a crash, a stop, or pointing at an overlapping
-        folder — into a resume rather than a restart. Skipped entirely when
-        'Re-detect from scratch' is on, since that explicitly means redo
-        everything.
+        One sidecar open per recording. Over a network share an 11,000-file
+        batch spends real time here, and without a status line the gap between
+        pressing Run and the dialog appearing reads as a hang.
+        """
+        out: List[str] = []
+        n = len(wav_paths)
+        for i, w in enumerate(wav_paths):
+            if i % 50 == 0 or i == n - 1:
+                self.status_bar.showMessage(
+                    f"Checking which of {n:,} file(s) {what}… ({i + 1:,})")
+                QApplication.processEvents()
+            if predicate(w):
+                out.append(w)
+        return out
+
+    def _source_tag(self, w: str) -> str:
+        src = self._file_source_label(w)
+        return f"  [{src}]" if src else ""
+
+    @staticmethod
+    def _model_display_name(model_path: str) -> str:
+        """A model's name as a person would recognise it.
+
+        Every run writes its checkpoint as ``weights.pt``, so the filename
+        stem — which is what ``RunSettings.model_name`` matches on, and must
+        keep matching on — names every model in the project identically. The
+        run directory is the part that differs.
+        """
+        if not model_path:
+            return "(unknown)"
+        stem = os.path.splitext(os.path.basename(model_path))[0]
+        if stem.lower() != 'weights':
+            return stem
+        run = os.path.basename(os.path.dirname(model_path))
+        return run or stem
+
+    def _confirm_redetect(self, wav_paths, existing) -> bool:
+        """The destructive branch: 'Re-detect from scratch' discards every
+        prediction on these files, Accepted and Rejected included.
+
+        No resume question is asked alongside it — redoing everything is the
+        whole point of the tick-box, so "already analyzed" is not a reason to
+        skip anything."""
+        shown = "\n".join(f"   • {os.path.basename(w)}{self._source_tag(w)}"
+                          for w in existing[:8])
+        more = (f"\n   …and {len(existing) - 8:,} more"
+                if len(existing) > 8 else "")
+        reply = QMessageBox.warning(
+            self, "Re-detect from scratch?",
+            f"'Re-detect from scratch' is on. {len(existing):,} of "
+            f"{len(wav_paths):,} file(s) carry predictions from a previous "
+            f"run:\n\n{shown}{more}\n\n"
+            "This will discard ALL of those predictions — including every "
+            "Accepted and Rejected decision — and re-detect everywhere.\n"
+            "Your painted / SAM labels are kept as data, but the model is "
+            "allowed to predict over them too.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            # A destructive default one keystroke away is how a morning of
+            # review disappears.
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _confirm_run_scope(self, cfg, wav_paths: List[str]) -> List[str]:
+        """Ask once about re-analysing files that have been analysed before.
+
+        This used to be two dialogs back to back. Both said "N of M file(s)
+        already have detections", both offered proceed/cancel, and nothing
+        told you that the first was about *losing unreviewed review work* and
+        the second about *repeating compute already spent*. They are one
+        decision — whether to analyse a recording again — so they are one
+        dialog, stating both costs.
+
+        Returns the files to analyse; an empty list means cancel.
         """
         from fnt.usv.usv_detector.mad_batch import RunSettings, partition_done
-        if getattr(self, 'chk_infer_redetect', None) is not None and \
-                self.chk_infer_redetect.isChecked():
+        wav_paths = list(wav_paths)
+        n = len(wav_paths)
+        if not n:
             return wav_paths
-        if len(wav_paths) < 2:
-            return wav_paths
+        redetect = bool(getattr(self, 'chk_infer_redetect', None) is not None
+                        and self.chk_infer_redetect.isChecked())
         settings = RunSettings.from_config(cfg)
-        manifest_done: set = set()
-        root = self._batch_run_root()
-        if root:
-            try:
-                # Only manifests written at THESE settings count. Unioning
-                # every prior run would mean a retrained model re-run over the
-                # same folder found all of it "already done" and analyzed
-                # nothing while reporting success.
-                from fnt.usv.usv_detector.mad_batch import completed_by_settings
-                manifest_done = completed_by_settings(root, settings)
-            except Exception:
-                pass
+        existing: List[str] = []
+        pending: List[str] = []
+        todo: List[str] = wav_paths
+        done: List[str] = []
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
-
-        def _scan_progress(i, n):
-            self.status_bar.showMessage(
-                f"Checking which of {n:,} file(s) are already analyzed… "
-                f"({i:,})")
-            QApplication.processEvents()
-
         try:
-            todo, done = partition_done(wav_paths, settings, manifest_done,
-                                        progress=_scan_progress)
+            if redetect:
+                existing = self._scan_predictions(
+                    wav_paths, self._file_has_predictions, "hold detections")
+            else:
+                pending = self._scan_predictions(
+                    wav_paths, self._file_has_pending_predictions,
+                    "hold unreviewed detections")
+                # Resuming a one-file run is meaningless, and the scan is not
+                # free, so the "already analyzed" question is only worth
+                # asking for a batch.
+                if n >= 2:
+                    manifest_done: set = set()
+                    root = self._batch_run_root()
+                    if root:
+                        try:
+                            # Only manifests written at THESE settings count.
+                            # Unioning every prior run would mean a retrained
+                            # model re-run over the same folder found all of it
+                            # "already done" and analyzed nothing while
+                            # reporting success.
+                            from fnt.usv.usv_detector.mad_batch import (
+                                completed_by_settings,
+                            )
+                            manifest_done = completed_by_settings(root,
+                                                                  settings)
+                        except Exception:
+                            pass
+
+                    def _scan_progress(i, nn):
+                        self.status_bar.showMessage(
+                            f"Checking which of {nn:,} file(s) are already "
+                            f"analyzed… ({i:,})")
+                        QApplication.processEvents()
+
+                    todo, done = partition_done(wav_paths, settings,
+                                                manifest_done,
+                                                progress=_scan_progress)
         finally:
             QApplication.restoreOverrideCursor()
             self.status_bar.clearMessage()
-        if not done:
+
+        if redetect:
+            if not existing:
+                return wav_paths
+            return wav_paths if self._confirm_redetect(wav_paths,
+                                                       existing) else []
+        if not done and not pending:
             return wav_paths
+
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Resume batch run?")
-        box.setText(
-            f"{len(done):,} of {len(wav_paths):,} file(s) already have "
-            f"detections from '{settings.model_name}' at threshold "
-            f"{settings.threshold:g} / min blob {settings.min_blob_pixels}px.")
-        box.setInformativeText(
-            f"Analyze only the remaining {len(todo):,}, or redo all "
-            f"{len(wav_paths):,}?")
-        b_resume = box.addButton(f"Resume ({len(todo):,})",
+        box.setWindowTitle("Some of these files have been analyzed before")
+        facts = []
+        if done:
+            facts.append(
+                f"{len(done):,} of {n:,} file(s) already have detections from "
+                f"'{self._model_display_name(cfg.model_path)}' at threshold "
+                f"{settings.threshold:g} / min blob "
+                f"{settings.min_blob_pixels}px. Analyzing them again produces "
+                f"the same detections.")
+        if pending:
+            facts.append(
+                f"{len(pending):,} of {n:,} file(s) hold pending (unreviewed) "
+                f"detections. Analyzing a file replaces its pending "
+                f"detections with fresh ones.")
+        box.setText("\n\n".join(facts))
+
+        info = []
+        if pending:
+            info.append(
+                "Kept either way: Accepted and Rejected calls — the model "
+                "won't re-detect over them — and your painted / SAM labels. "
+                "Deleted calls stay deleted, but their region re-opens for "
+                "fresh detection.")
+        else:
+            info.append("No unreviewed work would be lost: everything on "
+                        "those files has already been reviewed.")
+        if done:
+            info.append(f"Analyze only the remaining {len(todo):,}, or redo "
+                        f"all {n:,}?")
+        box.setInformativeText("\n\n".join(info))
+
+        # The full list, not the first eight: it costs nothing behind Details,
+        # and "which files?" is the first thing you ask of a number this size.
+        listed = pending or done
+        head = ("Files with unreviewed detections:" if pending
+                else "Files already analyzed:")
+        cap = 500
+        detail = "\n".join(os.path.basename(w) + self._source_tag(w)
+                           for w in listed[:cap])
+        if len(listed) > cap:
+            detail += f"\n…and {len(listed) - cap:,} more"
+        box.setDetailedText(f"{head}\n{detail}")
+
+        b_all = None
+        if done:
+            b_go = box.addButton(f"Resume ({len(todo):,})",
                                  QMessageBox.AcceptRole)
-        box.addButton(f"Redo all ({len(wav_paths):,})", QMessageBox.AcceptRole)
+            b_all = box.addButton(f"Redo all ({n:,})", QMessageBox.AcceptRole)
+        else:
+            b_go = box.addButton(f"Analyze {n:,} file(s)",
+                                 QMessageBox.AcceptRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
-        box.setDefaultButton(b_resume)
+        box.setDefaultButton(b_go)
         box.exec_()
+
         clicked = box.clickedButton()
         if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+            self._log("Inference cancelled at the re-analysis prompt")
             return []
-        if clicked is b_resume:
-            self._log(f"Resuming: skipping {len(done)} already-analyzed file(s)")
+        if b_all is not None and clicked is b_all:
+            self._log(f"Redoing all {n:,} file(s), including {len(done):,} "
+                      f"already analyzed")
+            return wav_paths
+        if done:
+            self._log(f"Resuming: skipping {len(done):,} already-analyzed "
+                      f"file(s)")
             return todo
         return wav_paths
 
     def _start_inference(self, cfg, wav_paths: List[str], reporter=None,
-                         skip_resume_prompt: bool = False):
+                         skip_scope_prompt: bool = False):
         # A run chained after training must not stop to ask anything: the
         # user pressed one button and walked away. Everything that needs an
         # answer is asked in _on_inline_train, before the run starts.
-        if not skip_resume_prompt:
-            wav_paths = self._resume_filter(cfg, wav_paths)
+        if not skip_scope_prompt:
+            wav_paths = self._confirm_run_scope(cfg, wav_paths)
         if not wav_paths:
             self.status_bar.showMessage("Nothing to analyze")
             self._update_infer_run_enabled()
@@ -18308,12 +18484,18 @@ class MADMainWindow(QMainWindow):
                 tot_audio = sum(t.get('audio_dur_s', 0) for t in tt)
                 tot_scan = sum(t.get('t_infer', 0) for t in tt)
                 tot_wall = sum(t.get('t_total', 0) for t in tt)
-                rt = (tot_audio / tot_scan) if tot_scan > 0 else 0
+                scan_rt = (tot_audio / tot_scan) if tot_scan > 0 else 0
+                rt = (tot_audio / tot_wall) if tot_wall > 0 else 0
                 dev = tt[0].get('device', '?')
+                # End-to-end first: it is the one that predicts how long the
+                # next corpus takes. The scan rate follows as the device
+                # figure it actually is.
                 timing_line = (
-                    f"\nTiming: {tot_audio:.0f}s audio scanned in "
-                    f"{tot_scan:.0f}s ({rt:.2f}× realtime on {dev}); "
-                    f"{tot_wall:.0f}s total wall.")
+                    f"\nTiming: {tot_audio / 3600.0:.1f} h audio in "
+                    f"{tot_wall / 3600.0:.2f} h → {rt:.1f}× realtime "
+                    f"end-to-end on {dev} "
+                    f"(tile scan alone {tot_scan / 3600.0:.2f} h, "
+                    f"{scan_rt:.1f}×).")
             # A file whose retry succeeded carries `retry` and no `error`, so
             # it is already out of `errors` — say so explicitly, or the run
             # reads as if those files never had trouble.
@@ -18417,9 +18599,23 @@ class MADMainWindow(QMainWindow):
                     progress.append(line)
                     self._log(line)
                 return
-            line = (f"  {name}{tag}: {t.get('audio_dur_s')}s audio in "
+            # The detection count belongs on this line, not only in the
+            # manifest: on a 12-day batch it is what tells you at hour one
+            # that the threshold is wrong, while there is still a run to stop.
+            #
+            # The rate is end-to-end (audio ÷ t_total). It used to be the scan
+            # stage alone, printed straight after "600.0s audio in 84.47s" —
+            # which does not divide to the number shown, and led to an ETA
+            # 35% short. The GPU-only figure is still worth having, so it sits
+            # inside the stage breakdown where it is unambiguous.
+            n_det = summary.get('n_blobs')
+            det = "" if n_det is None else f"{int(n_det):,} det · "
+            scan_rt = t.get('scan_realtime_factor')
+            scan_tag = f" ({scan_rt}× scan)" if scan_rt else ""
+            line = (f"  {name}{tag}: {det}{t.get('audio_dur_s')}s audio in "
                     f"{t.get('t_total')}s  [spec {t.get('t_spec')}s · "
-                    f"scan {t.get('t_infer')}s · blobs {t.get('t_blobs')}s] "
+                    f"scan {t.get('t_infer')}s{scan_tag} · "
+                    f"blobs {t.get('t_blobs')}s] "
                     f"→ {t.get('realtime_factor')}× realtime on "
                     f"{t.get('device')}{mem}")
             progress.append(line)

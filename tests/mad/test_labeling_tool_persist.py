@@ -1,14 +1,27 @@
-"""Confirming a call must not disarm the labelling tool.
+"""What Enter does to the labelling tool, tool by tool.
 
-Enter used to switch SAM / Paint / Eraser off, so labelling a file meant
-re-arming the tool between every single call. Labelling is a long run of the
-same gesture -- Enter ends a call, not the session.
+Enter once switched SAM / Paint / Eraser all off, so labelling a file meant
+re-arming between every single call. That went too far and was reverted. The
+rule it settled into is not "keep everything" either:
 
-The SAM prompt points still have to be dropped: leaving them would make the
-next click extend the prompt for the call just saved rather than starting a new
-one, which produces a mask spanning two calls. That distinction (clear the
-prompts, keep the mode) is the whole content of the change, so both halves are
-pinned here.
+* **SAM and Paint go off.** Each one's next click *creates* something -- SAM
+  proposes a segment, Paint lays down pixels -- and Enter has just consumed
+  the stroke they were building. Leaving either armed means the click after a
+  confirm starts a mask nobody asked for. M re-arms SAM, B re-arms Paint.
+* **The Eraser stays armed.** It only removes pixels from a stroke in
+  progress, and with the pending buffer cleared there is nothing a stray
+  click can damage.
+* **The SAM prompt points are dropped either way.** Keeping them would make
+  the next click extend the prompt for the call just saved rather than start
+  a new one, producing one mask over two calls.
+
+Every test here confirms a real call first. That is not incidental: when the
+pending buffer is written without registering a dirty region,
+``pending_components`` returns nothing, ``_confirm_pending`` bails before it
+reaches the tool state, and a test that only asserts "the button is still
+checked" passes while saving nothing. Three tests in this file were doing
+exactly that. ``_pending_call`` now goes through the same bookkeeping the
+brush and SAM do, and the assertions check the call landed.
 
 Runs under pytest, or directly.
 """
@@ -53,8 +66,19 @@ def gui():
 
 
 def _pending_call(sg, f0=120, t0=900):
+    """Put a call in the pending buffer the way a real tool would.
+
+    ``_note_pending_region`` is the part that used to be missing. The pending
+    buffer spans the whole spectrogram, so scanning it per keystroke costs
+    hundreds of milliseconds; ``pending_components`` therefore only looks
+    inside the region a tool says it wrote. Assigning ``_pending`` directly
+    leaves that region unset, so the mask is invisible to every reader of it
+    and Enter quietly does nothing.
+    """
     sg._pending = np.zeros((sg.n_freq_bins, sg.n_time_frames), dtype=np.uint8)
     sg._pending[f0:f0 + 20, t0:t0 + 40] = 1
+    sg._note_pending_region(f0, f0 + 20, t0, t0 + 40)
+    assert sg.has_pending(), "the fixture failed to stage a pending mask"
 
 
 def _arm(w, sg, tool):
@@ -66,7 +90,8 @@ def _arm(w, sg, tool):
 
 
 # ----------------------------------------------------------------------
-def test_sam_survives_confirming_a_call():
+def test_sam_is_switched_off_by_confirming():
+    """Its next click would segment a fresh region, so it must be deliberate."""
     w, _wav = gui()
     sg = w.spectrogram
     _arm(w, sg, 'sam')
@@ -77,20 +102,38 @@ def test_sam_survives_confirming_a_call():
     w._confirm_pending()
 
     assert len(sg.annotations) == before + 1, "the call was not saved"
-    assert w.btn_sam.isChecked(), "SAM was switched off by Enter"
-    assert sg.paint_mode == 'sam'
+    assert not w.btn_sam.isChecked(), "SAM stayed armed after Enter"
+    assert sg.paint_mode is None
 
 
-def test_paint_survives_confirming_a_call():
+def test_paint_is_switched_off_by_confirming():
+    """Same reasoning: its next click lays down pixels."""
     w, _wav = gui()
     sg = w.spectrogram
     _arm(w, sg, 'brush')
     _pending_call(sg, f0=200, t0=1200)
+    before = len(sg.annotations)
 
     w._confirm_pending()
 
-    assert w.btn_paint.isChecked()
-    assert sg.paint_mode == 'brush'
+    assert len(sg.annotations) == before + 1, "the call was not saved"
+    assert not w.btn_paint.isChecked(), "Paint stayed armed after Enter"
+    assert sg.paint_mode is None
+
+
+def test_the_eraser_stays_armed():
+    """It removes pixels from a stroke in progress; with nothing pending there
+    is nothing for a stray click to damage."""
+    w, _wav = gui()
+    sg = w.spectrogram
+    _arm(w, sg, 'eraser')
+    _pending_call(sg, f0=340, t0=2600)
+    before = len(sg.annotations)
+
+    w._confirm_pending()
+
+    assert len(sg.annotations) == before + 1, "the call was not saved"
+    assert w.btn_erase.isChecked(), "the Eraser was switched off by Enter"
 
 
 def test_the_sam_prompt_points_are_still_cleared():
@@ -120,17 +163,22 @@ def test_the_pending_mask_is_still_cleared():
     assert not sg.has_pending(), "the confirmed mask stayed pending"
 
 
-def test_calls_can_be_labelled_back_to_back_without_rearming():
-    """The point of the change, stated as the workflow it enables."""
+def test_labelling_back_to_back_means_re_arming_each_time():
+    """The cost of the rule, stated plainly: three calls, three re-arms.
+
+    This is the workflow the disarm makes slower, and it is accepted — a
+    keystroke per call against a stray click proposing a mask over whatever
+    the user clicked next.
+    """
     w, _wav = gui()
     sg = w.spectrogram
-    _arm(w, sg, 'sam')
     before = len(sg.annotations)
     for i in range(3):
+        _arm(w, sg, 'sam')
         _pending_call(sg, f0=120 + 40 * i, t0=2000 + 200 * i)
         w._confirm_pending()
-        assert sg.paint_mode == 'sam', f"tool dropped after call {i + 1}"
-    assert len(sg.annotations) == before + 3
+        assert sg.paint_mode is None, f"tool still armed after call {i + 1}"
+    assert len(sg.annotations) == before + 3, "not every call was saved"
 
 
 def test_confirming_nothing_leaves_the_tool_alone():

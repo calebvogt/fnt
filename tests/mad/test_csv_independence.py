@@ -62,9 +62,20 @@ def _session(n_labels=3, reject_index=1, with_predictions=False):
     w._show_first_label_info = lambda: None
     sg = w.spectrogram
     for i in range(n_labels):
+        f0, f1 = 120 + 30 * i, 140 + 30 * i
+        t0, t1 = 700 + 300 * i, 740 + 300 * i
         sg._pending = np.zeros((sg.n_freq_bins, sg.n_time_frames), np.uint8)
-        sg._pending[120 + 30 * i:140 + 30 * i, 700 + 300 * i:740 + 300 * i] = 1
+        sg._pending[f0:f1, t0:t1] = 1
+        # Register the dirty region, exactly as the brush and SAM do.
+        # ``pending_components`` only looks inside the box a tool says it
+        # wrote — scanning the full-spectrogram buffer costs hundreds of
+        # milliseconds per keystroke — so a mask assigned straight into
+        # ``_pending`` is invisible to it, ``_confirm_pending`` returns before
+        # saving, and this whole fixture silently produces a project with no
+        # labels in it.
+        sg._note_pending_region(f0, f1, t0, t1)
         w._confirm_pending()
+        assert len(sg.annotations) == i + 1, f"label {i + 1} was not saved"
     if reject_index is not None:
         sg._selected_ann_idx = reject_index
         w._reject_current_pred()
