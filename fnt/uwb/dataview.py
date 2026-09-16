@@ -225,13 +225,28 @@ def epoch_seconds(values, tz=None):
     """
     import pandas as pd
 
-    s = pd.to_datetime(pd.Series(values), errors='coerce')
+    s = pd.Series(values)
+    if not pd.api.types.is_datetime64_any_dtype(s):
+        # Exported CSVs render each time on its own: '...:56.123000-06:00'
+        # for most rows, '...:56-06:00' for one on a whole second, and a trial
+        # crossing DST carries two offsets. Format inference guesses from the
+        # FIRST value and turns the rest into NaT, so parse as ISO 8601 -
+        # through UTC whenever the strings carry an offset.
+        text = s.astype(str).str.strip()
+        has_offset = text.str.contains(r'(?:[+-]\d{2}:?\d{2}|Z)$',
+                                       regex=True).any()
+        s = pd.to_datetime(text, format='ISO8601', utc=bool(has_offset),
+                           errors='coerce')
     if getattr(s.dtype, 'tz', None) is not None:
         s = s.dt.tz_convert('UTC').dt.tz_localize(None)
     elif tz is not None:
         s = (s.dt.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
               .dt.tz_convert('UTC').dt.tz_localize(None))
-    return s.values.astype('datetime64[ns]').astype('int64') / 1e9
+    out = s.to_numpy(dtype='datetime64[ns]').astype('int64') / 1e9
+    # NaT is int64-min, a perfectly finite float; make it NaN so callers'
+    # isfinite() guards actually drop an unparseable time.
+    out[s.isna().to_numpy()] = np.nan
+    return out
 
 
 def overlap_bouts_from_frame(bouts, tz=None):

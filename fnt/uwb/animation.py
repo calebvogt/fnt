@@ -24,6 +24,8 @@ import matplotlib.patheffects as pe
 
 import cv2
 
+from fnt.uwb.identities import SEX_ID, tag_label
+
 
 # Video render resolution per the quality preset shown in the UI.
 QUALITY_DPI = {"Draft (Fast)": 75, "Standard": 100, "High Quality": 150}
@@ -84,11 +86,14 @@ _NEUTRAL_COLOR = 'blue'
 
 
 def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
-                     color_by="None"):
+                     color_by="None", id_type=SEX_ID):
     """Map each tag id to its {'label', 'color'} for the animation.
 
-    Labels follow the configured identities (``sex-identity`` when available,
-    otherwise a ``HexID`` label). Colour is governed by ``color_by``:
+    Labels use ``id_type`` exactly as the preview's Show Tag ID selector does
+    (SexID / Name / Code / HexID / ShortID, see identities.tag_label), so the
+    video reads the same as the view it was tuned in. With
+    ``use_custom_identities`` off, identities are ignored and every tag falls
+    back to its HexID. Colour is governed by ``color_by``:
 
     * ``"None"`` (default) — every tag drawn in a single neutral colour.
     * ``"ID"``            — a distinct colour per tag (``tab20`` palette).
@@ -105,17 +110,9 @@ def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
         id_palette = {tag: cmap(idx % 20) for idx, tag in enumerate(tags)}
 
     for tag in tags:
-        # Label: prefer configured identity, else HexID.
-        if use_custom_identities and tag in tag_identities:
-            info = tag_identities[tag]
-            sex = info.get('sex', 'M')
-            identity = info.get('identity', str(tag))
-            label = f"{sex}-{identity}"
-        else:
-            info = tag_identities.get(tag, {})
-            sex = info.get('sex', 'M')
-            hex_id = hex(int(tag)).upper().replace('0X', '')
-            label = f"HexID {hex_id}"
+        info = tag_identities.get(tag, {}) or {}
+        sex = info.get('sex', 'M')
+        label = tag_label(tag, info if use_custom_identities else None, id_type)
 
         if color_mode == "id":
             color = id_palette[tag]
@@ -227,6 +224,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      zones_xml=None, arena_zones=None, anchors=None,
                      rois=None,
                      tag_identities=None, use_custom_identities=False,
+                     id_type=SEX_ID,
                      color_by="None", marker_size=10, show_battery=False,
                      show_speed=False, show_step=False, gap_s=60.0,
                      label_color=None, label_outline=True,
@@ -292,7 +290,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # Pre-slice each tag's trajectory + resolve its label/colour once.
     tags = list(data['shortid'].unique()) if 'shortid' in data.columns else list(data['ID'].unique())
     id_col = 'shortid' if 'shortid' in data.columns else 'ID'
-    styles = build_tag_styles(tags, tag_identities, use_custom_identities, color_by)
+    styles = build_tag_styles(tags, tag_identities, use_custom_identities, color_by,
+                              id_type=id_type)
     keep_cols = ['Timestamp', 'smoothed_x', 'smoothed_y']
     if show_battery and 'battery_voltage' in data.columns:
         keep_cols.append('battery_voltage')

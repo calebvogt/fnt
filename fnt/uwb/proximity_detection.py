@@ -212,11 +212,14 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
 
     prox_only = prox_only.sort_values(['animal1', 'animal2', 'timestamp'])
 
-    # Calculate time gaps within each pair
-    prox_only['prev_ts'] = prox_only.groupby(
-        ['animal1', 'animal2'])['timestamp'].shift(1)
+    # Time gaps within each pair, measured between real fixes: from the last
+    # fix of the previous in-contact bin to the first fix of this one. The 1 s
+    # bin labels would quantise the gap (two bins 5 s apart can hold fixes
+    # anywhere from 4.0 to 6.0 s apart), so a bout could be bridged or split
+    # by where the fixes happened to fall relative to the bin edges.
+    prev_last = prox_only.groupby(['animal1', 'animal2'])['ts_last'].shift(1)
     prox_only['time_gap'] = (
-        prox_only['timestamp'] - prox_only['prev_ts']
+        prox_only['ts_first'] - prev_last
     ).dt.total_seconds()
 
     # New bout when gap > gap_s or first observation for pair

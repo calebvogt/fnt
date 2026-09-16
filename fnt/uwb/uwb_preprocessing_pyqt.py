@@ -51,6 +51,9 @@ from fnt.uwb.uwb_preview_canvas import (
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
     label_halo, MAX_RENDER_MP, COPY_VIEW_DPI)
 from fnt.uwb import animation as uwb_animation
+from fnt.uwb.identities import (
+    ID_DISPLAY_TYPES, SEX_ID, normalize_id_type, tag_label,
+    identity_field_problems, describe_problems)
 from fnt.uwb import uwb_roi
 
 
@@ -1889,7 +1892,12 @@ class ExportConflictDialog(QDialog):
 
 
 class IdentityAssignmentDialog(QDialog):
-    """Assign sex, identity and an optional active time window to each tag.
+    """Assign sex, identity, optional Name/Code and an active window to each tag.
+
+    Name and Code are free text and optional. They are display labels (Show Tag
+    ID -> Name / Code) and extra smoothed-CSV columns; the SexID remains the key
+    every analysis joins on. Saving a partly-filled roster asks for
+    confirmation (see identities.identity_field_problems).
 
     The Start/Stop pickers TRIM the data: fixes outside a bound window are
     dropped from the preview and from every export. Each bound therefore has an
@@ -1955,7 +1963,9 @@ class IdentityAssignmentDialog(QDialog):
 
         instructions = QLabel(
             "Assign sex (M/F) and IDs. To merge tags (e.g. a lost tag replaced), "
-            "give both the same ID.\n"
+            "give both the same ID. <b>Name</b> and <b>Code</b> are optional "
+            "(e.g. Hera / HER) \u2014 if you use them, fill them in for every "
+            "animal; a replacement tag inherits its animal's.\n"
             "<b>Start / Stop trim the data.</b> Leave a bound on "
             "<i>Auto</i> \u2014 the tag's own first/last fix, shown read-only \u2014 "
             "unless you actually want fixes outside it discarded; choose "
@@ -1967,6 +1977,8 @@ class IdentityAssignmentDialog(QDialog):
         form_layout = QFormLayout()
         self.sex_combos = {}
         self.identity_edits = {}
+        self.name_edits = {}
+        self.code_edits = {}
         self.start_edits = {}
         self.stop_edits = {}
         self.start_modes = {}
@@ -1981,6 +1993,20 @@ class IdentityAssignmentDialog(QDialog):
             sex_combo.addItems(["M", "F"])
             identity_edit = QLineEdit()
             identity_edit.setPlaceholderText(f"e.g., {tag}")
+            # Optional human-friendly labels. Selectable as the on-screen tag
+            # label (Show Tag ID -> Name / Code); the SexID stays the key every
+            # analysis joins on.
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("optional, e.g. Hera")
+            name_edit.setToolTip(
+                "Optional animal name. Shown when Show Tag ID is set to Name. "
+                "If you name any animal, name them all.")
+            code_edit = QLineEdit()
+            code_edit.setPlaceholderText("e.g. HER")
+            code_edit.setFixedWidth(90)
+            code_edit.setToolTip(
+                "Optional short code (e.g. a 3-letter abbreviation). Shown when "
+                "Show Tag ID is set to Code. Must be unique per animal.")
 
             def _picker():
                 e = QDateTimeEdit()
@@ -2004,6 +2030,8 @@ class IdentityAssignmentDialog(QDialog):
             if info:
                 sex_combo.setCurrentIndex(0 if info.get('sex', 'M') == 'M' else 1)
                 identity_edit.setText(info.get('identity', ''))
+                name_edit.setText(str(info.get('name', '') or ''))
+                code_edit.setText(str(info.get('code', '') or ''))
                 # A manual bound keeps its saved value; an automatic one is
                 # re-seeded from the CURRENT data extent, so it can never go
                 # stale.
@@ -2080,7 +2108,12 @@ class IdentityAssignmentDialog(QDialog):
             row1.addWidget(QLabel("Sex:"))
             row1.addWidget(sex_combo)
             row1.addWidget(QLabel("ID:"))
-            row1.addWidget(identity_edit)
+            row1.addWidget(identity_edit, 1)
+            row1.addSpacing(6)
+            row1.addWidget(QLabel("Name:"))
+            row1.addWidget(name_edit, 1)
+            row1.addWidget(QLabel("Code:"))
+            row1.addWidget(code_edit)
             tag_vlayout.addLayout(row1)
 
             row2 = QHBoxLayout()
@@ -2121,6 +2154,8 @@ class IdentityAssignmentDialog(QDialog):
 
             self.sex_combos[tag] = sex_combo
             self.identity_edits[tag] = identity_edit
+            self.name_edits[tag] = name_edit
+            self.code_edits[tag] = code_edit
             self.start_edits[tag] = start_edit
             self.stop_edits[tag] = stop_edit
             self.start_modes[tag] = start_combo
@@ -2228,6 +2263,22 @@ class IdentityAssignmentDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
+
+        # Optional Name/Code: a partly-filled roster is almost always an
+        # oversight, and with Show Tag ID on Name/Code it would mix names with
+        # SexIDs in the same frame. Warn, don't block - leaving some blank is
+        # a legitimate choice mid-trial.
+        problems = identity_field_problems(self.get_identities())
+        if problems:
+            reply = QMessageBox.warning(
+                self, "Incomplete Names / Codes",
+                "Some animals have a Name or Code and others do not, or the "
+                "values clash:\n\n" + "\n".join(describe_problems(problems)) +
+                "\n\nAnimals without one fall back to their SexID when the "
+                "tag label is set to Name or Code. Save anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         super().accept()
 
     def _release_stops(self, tags):
@@ -2257,6 +2308,13 @@ class IdentityAssignmentDialog(QDialog):
                 'start_mode': self.start_modes[tag].currentData(),
                 'stop_mode': self.stop_modes[tag].currentData(),
             }
+            # Optional; only written when set, so a roster without names keeps
+            # exactly the config it had before these fields existed.
+            for key, edit in (('name', self.name_edits[tag]),
+                              ('code', self.code_edits[tag])):
+                value = edit.text().strip()
+                if value:
+                    result[tag][key] = value
         return result
 
 
@@ -3623,7 +3681,7 @@ class PlotSaverWorker(QThread):
         grid = np.arange(t0, t1 + step_ns, step_ns, dtype='int64')
         n_frames, n_tags = len(grid), len(tags)
         if n_frames == 0 or n_tags == 0:
-            return None, None, None, None, None, None
+            return None, None, None, None, None
 
         # Bin fixes onto the grid, one column per tag.
         binned = data.copy()
@@ -3646,21 +3704,6 @@ class PlotSaverWorker(QThread):
             fi = g['fi'].to_numpy()
             X[fi, j] = g[x_col].to_numpy()
             Y[fi, j] = g[y_col].to_numpy()
-
-        # True millisecond observation window per frame: the earliest and latest
-        # real fix (any tag) that landed in each 1 Hz slot. The grid itself is a
-        # regular lattice anchored at t0, so a lattice time carries only t0's
-        # constant sub-second offset - exported as-is it reads as millisecond
-        # precision while every row shares the same fraction. Bout edges are
-        # reported from these instead, so a behaviour's start/stop is a time an
-        # animal was actually observed. -1 marks a frame with no fixes.
-        _fr = pd.DataFrame({'fi': binned['fi'].to_numpy(), 'ts': t.to_numpy()})
-        _agg = _fr.groupby('fi')['ts'].agg(['min', 'max'])
-        frame_first = np.full(n_frames, -1, dtype='int64')
-        frame_last = np.full(n_frames, -1, dtype='int64')
-        _idx = _agg.index.to_numpy()
-        frame_first[_idx] = _agg['min'].to_numpy()
-        frame_last[_idx] = _agg['max'].to_numpy()
 
         # classify() derives dt by reading these as datetime64[ns] (that is
         # what the live preview hands it). Passing float SECONDS made every
@@ -3741,7 +3784,7 @@ class PlotSaverWorker(QThread):
             # Sorted by frame so a renderer can slice one frame's links with
             # two searchsorted calls instead of scanning.
             link_arr = link_arr[np.argsort(link_arr[:, 0], kind='stable')]
-        return grid, have, soc, events, link_arr, (frame_first, frame_last)
+        return grid, have, soc, events, link_arr
 
     # (key, result) for the last classification, shared across every worker in
     # this process. An export classifies the same data twice - once to write
@@ -3786,8 +3829,8 @@ class PlotSaverWorker(QThread):
         """
         cols = ['behavior', 'actor', 'target', 'actor_sex', 'target_sex',
                 'dyad_type', 'Day', 'Date', 'bout_start', 'bout_stop',
-                'duration_s']
-        grid, _have, soc, events, _links, ftimes = self._behavior_classification(data, tags)
+                'duration_s', 'n_frames', 'n_fixes']
+        grid, _have, soc, events, _links = self._behavior_classification(data, tags)
         if grid is None or not events:
             return pd.DataFrame(columns=cols)
 
@@ -3798,7 +3841,35 @@ class PlotSaverWorker(QThread):
         def _as_local(ns):
             ts = pd.Timestamp(int(ns), unit='ns', tz='UTC')
             return ts.tz_convert(tz) if tz is not None else ts
-        dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
+        step_ns = int(grid[1] - grid[0]) if len(grid) > 1 else int(1e9)
+
+        # Each tag's real fix times (int64 ns, sorted), on the same epoch
+        # scale as the grid. The classifier runs on a 1 Hz lattice with
+        # positions held forward, so bout edges are taken from these instead:
+        # the first and last fix the ACTOR or TARGET actually reported inside
+        # the classified window. Another animal's fix in the same second says
+        # nothing about this dyad, and a lattice time only carries the grid's
+        # constant sub-second offset.
+        _t_all = data['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy()
+        tag_ns = {tag: np.sort(_t_all[ix]) for tag, ix in
+                  data.groupby('shortid', sort=False).indices.items()}
+
+        def _dyad_edges(a, b, i, j):
+            lo_ns, hi_ns = int(grid[i]), int(grid[j]) + step_ns
+            first = last = None
+            n = 0
+            for k in (a, b):
+                arr = tag_ns.get(tags[k])
+                if arr is None or not len(arr):
+                    continue
+                lo = int(np.searchsorted(arr, lo_ns, 'left'))
+                hi = int(np.searchsorted(arr, hi_ns, 'left'))
+                if hi <= lo:
+                    continue
+                n += hi - lo
+                first = arr[lo] if first is None else min(first, arr[lo])
+                last = arr[hi - 1] if last is None else max(last, arr[hi - 1])
+            return first, last, n
 
         def _label(i):
             tag = tags[i]
@@ -3822,13 +3893,14 @@ class PlotSaverWorker(QThread):
             if not DISPLACEMENT_ENABLED and ev['behavior'] == 'displacement':
                 continue
             i, j = ev['start_frame'], ev['stop_frame']
-            # Prefer the true observation times bounding this bout over the
-            # lattice times, so start/stop are moments an animal was actually
-            # seen. Falls back to the lattice for a frame with no fixes.
-            t_i = ftimes[0][i] if ftimes is not None else -1
-            t_j = ftimes[1][j] if ftimes is not None else -1
-            ev_start = _as_local(t_i) if t_i > 0 else times[i]
-            ev_stop = _as_local(t_j) if t_j > 0 else times[j]
+            first, last, n_fixes = _dyad_edges(ev['actor'], ev['target'], i, j)
+            if n_fixes:
+                ev_start, ev_stop = _as_local(first), _as_local(last)
+            else:
+                # Classified entirely on held positions: no fix from either
+                # animal fell inside the window, so the lattice slots are the
+                # only edges there are. n_fixes = 0 marks these rows.
+                ev_start, ev_stop = times[i], times[j]
             sa, sb = _sex(ev['actor']), _sex(ev['target'])
             rows.append({
                 'behavior': ev['behavior'],
@@ -3841,12 +3913,16 @@ class PlotSaverWorker(QThread):
                 # downstream filter on "MF" match nothing at all.
                 'dyad_type': _dyad_type(sa, sb),
                 'bout_start': ev_start, 'bout_stop': ev_stop,
-                # Observed span between the true edge fixes. A single-frame
-                # bout is credited one sampling interval (the classifier's
-                # resolution) rather than the sub-second gap between two fixes,
-                # since that is genuinely how long the state was resolved for.
-                'duration_s': float(max((ev_stop - ev_start).total_seconds(),
-                                        (j - i + 1) * dt_s)),
+                # Exactly bout_stop - bout_start, at full resolution, as in
+                # the overlap and ROI bout files. It used to be the larger of
+                # that and the frame count, which the frame count always won
+                # (edge fixes sit inside the frames), so every duration was a
+                # whole number of seconds. The classifier's own measure is
+                # kept alongside as n_frames (1 Hz slots the state held); a
+                # bout backed by one fix reports 0.0 s with n_fixes = 1.
+                'duration_s': float((ev_stop - ev_start).total_seconds()),
+                'n_frames': int(j - i + 1),
+                'n_fixes': int(n_fixes),
             })
         if not rows:
             # Every bout was filtered out - all of them displacement,
@@ -4077,7 +4153,7 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, have, soc, _events, _links, _ft = self._behavior_classification(data, tags)
+        grid, have, soc, _events, _links = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping ethogram")
             return 0
@@ -4150,7 +4226,7 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, have, soc, _events, _links, _ft = self._behavior_classification(data, tags)
+        grid, have, soc, _events, _links = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping social budget")
             return False
@@ -5011,7 +5087,14 @@ class UWBQuickVisualizationWindow(QWidget):
             "One row per DIRECTED behaviour bout - who did it, to whom, when, "
             "and for how long. Columns: behavior (chase), actor, target, "
             "actor_sex, target_sex, dyad_type, Day, Date, bout_start, "
-            "bout_stop, duration_s.\n"
+            "bout_stop, duration_s, n_frames, n_fixes.\n"
+            "\n"
+            "TIMES ARE REAL FIXES. bout_start/bout_stop are the first and last "
+            "fix the actor or target actually reported inside the bout, at "
+            "millisecond resolution, and duration_s is exactly their "
+            "difference. n_frames is how many 1 Hz classifier slots the state "
+            "held; n_fixes how many actor/target fixes back it (0 = classified "
+            "on held positions only, edges are the 1 Hz slots).\n"
             "\n"
             "This is the only place the direction is recorded. The ethogram "
             "raster shows that an animal WAS chasing; this shows WHOM it was "
@@ -5020,7 +5103,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "\n"
             "HOW IT IS BUILT. The smoothed track is binned to a regular 1 Hz "
             "grid and classified in blocks with an overlap margin, exactly as "
-            "the ethogram is. A bout is attributed to the block its onset falls "
+            "the ethogram is (the grid is only the classifier's clock). A bout is attributed to the block its onset falls "
             "in, so one straddling a block boundary is counted exactly once. "
             "actor is the chaser; target is the animal chased.\n"
             "\n"
@@ -5450,7 +5533,7 @@ class UWBQuickVisualizationWindow(QWidget):
         _anim_show_box(
             'chk_anim_show_tag_id', "Show tag ID",
             "Label each marker with the animal's ID, in the same form the "
-            "preview uses (Display ID / HexID / ShortID).")
+            "preview uses (SexID / Name / Code / HexID / ShortID).")
         _anim_show_box(
             'chk_anim_show_behavior', "Show behavior detection",
             "Draw the behaviour overlays from the preview into the video: "
@@ -6375,14 +6458,19 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_tag_id.stateChanged.connect(self._sync_anim_show_options)
         tagid_row.addWidget(self.chk_show_tag_id)
         self.combo_tag_id_type = QComboBox()
-        self.combo_tag_id_type.addItems(["Display ID", "HexID", "ShortID"])
-        self.combo_tag_id_type.setCurrentText("Display ID")
+        self.combo_tag_id_type.addItems(list(ID_DISPLAY_TYPES))
+        self.combo_tag_id_type.setCurrentText(SEX_ID)
         self.combo_tag_id_type.setToolTip(
-            "Which ID to show:\n"
-            "• Display ID: sex + configured identity (e.g. M9627) — the label "
-            "used throughout the tool.\n"
+            "Which ID to show (the video's labels follow this too):\n"
+            "• SexID: sex + configured ID (e.g. F9905) — the key every export "
+            "and analysis uses.\n"
+            "• Name: the animal's name from Configure Identities (e.g. Hera).\n"
+            "• Code: the animal's short code from Configure Identities (e.g. HER).\n"
             "• HexID: the tag's short address in hexadecimal (e.g. 2A).\n"
-            "• ShortID: the decimal tag id as stored in the SQL database (e.g. 42).")
+            "• ShortID: the decimal tag id as stored in the SQL database (e.g. 42).\n"
+            "\n"
+            "An animal with no Name/Code configured falls back to its SexID; "
+            "a tag with no identity at all falls back to its HexID.")
         self.combo_tag_id_type.currentTextChanged.connect(self.on_marker_style_changed)
         tagid_row.addWidget(self.combo_tag_id_type, 1)
         v.addLayout(tagid_row)
@@ -8378,7 +8466,7 @@ class UWBQuickVisualizationWindow(QWidget):
         y_col = y_col or ('smoothed_y' if 'smoothed_y' in g.columns else 'location_y')
         gap = self.spin_time_gap.value()
         dt = g['Timestamp'].diff().dt.total_seconds()
-        grp = (np.ceil(dt.fillna(0)).astype(int) > gap).cumsum()
+        grp = (dt.fillna(0) > gap).cumsum()
         x, y = g[x_col], g[y_col]
         step = np.hypot(x - x.groupby(grp).shift(), y - y.groupby(grp).shift())
         g[prefix + 'step_m'] = step
@@ -8594,26 +8682,15 @@ class UWBQuickVisualizationWindow(QWidget):
             return np.array([cmap(i % 20) for i in range(len(tags))], dtype=float)
         return np.array([self._NEUTRAL] * len(tags), dtype=float)   # None
 
-    def _preview_tag_labels(self, tags, id_type="Display ID"):
-        """One label per tag in the requested format.
+    def _preview_tag_labels(self, tags, id_type=SEX_ID):
+        """One label per tag in the requested format (see identities.tag_label).
 
-        • Display ID: sex + identity (e.g. 'M9627'), matching the network /
-          proximity labels; falls back to HexID when no identity is configured.
-        • HexID: the tag's short address in hex (e.g. '2A').
-        • ShortID: the decimal tag id from the SQL database.
+        SexID / Name / Code / HexID / ShortID. Name and Code fall back to the
+        SexID for an animal without one, and SexID falls back to the HexID for
+        a tag with no identity configured.
         """
-        labels = []
-        for tag in tags:
-            if id_type == "ShortID":
-                labels.append(str(tag))
-            elif id_type == "HexID":
-                labels.append(hex(tag).upper().replace('0X', ''))
-            else:  # Display ID (SexID)
-                info = self.tag_identities.get(tag, {}) or {}
-                sex, ident = info.get('sex', ''), info.get('identity', '')
-                labels.append(f"{sex}{ident}" if (sex and ident)
-                              else hex(tag).upper().replace('0X', ''))
-        return labels
+        return [tag_label(tag, self.tag_identities.get(tag), id_type)
+                for tag in tags]
 
     def on_preview_smoothing_changed(self, *_):
         """Preview smoothing method changed: show/hide the preview Smoothing
@@ -9246,7 +9323,8 @@ class UWBQuickVisualizationWindow(QWidget):
         db_name = (os.path.splitext(os.path.basename(self.db_path))[0]
                    if self.db_path else None)
         if folder and db_name:
-            path = os.path.join(folder, f'{db_name}_SocialOverlapBouts.csv')
+            path = os.path.join(csv_output_dir(folder),
+                                f'{db_name}_SocialOverlapBouts.csv')
             if os.path.exists(path):
                 try:
                     bouts = pd.read_csv(path)
@@ -9748,8 +9826,8 @@ class UWBQuickVisualizationWindow(QWidget):
         Strict by design. A single fix outside the region ends the bout, and
         the next fix back inside starts a new one — nothing is bridged and no
         duration is rounded. A lone fix inside a region reports identical
-        start and stop, credited one second, because its real span cannot be
-        observed.
+        start and stop and 0.0 s (roi_bouts.LONE_READ_S), because its real
+        span cannot be observed; n_reads = 1 marks it.
 
         Bouts are never split at midnight; ``Day`` is the day the bout
         STARTED. The daily summary does its own splitting.
@@ -11273,7 +11351,7 @@ class UWBQuickVisualizationWindow(QWidget):
         # Preview display defaults
         self.chk_show_tracking.setChecked(True)
         self.chk_show_tag_id.setChecked(False)
-        self.combo_tag_id_type.setCurrentText("Display ID")
+        self.combo_tag_id_type.setCurrentText(SEX_ID)
         self.spin_tag_size.setValue(10)
         self.combo_label_color.setCurrentIndex(0)      # Auto
         self.chk_label_outline.setChecked(True)
@@ -12803,29 +12881,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.populate_animation_days_from_list(res['days'])
             self.log_message(f"Found {len(res['days'])} unique days in database")
     
-    def load_unique_days_from_database(self):
-        """Load unique days from database without loading full data"""
-        if not self.db_path or not self.table_name:
-            return
-        
-        try:
-            conn = connect_ro(self.db_path)
-            # Query for distinct dates
-            query = f"""
-                SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), 'localtime') as date
-                FROM {self.table_name}
-                ORDER BY date
-            """
-            df = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            if len(df) > 0:
-                self.populate_animation_days_from_list(df['date'].tolist())
-                self.log_message(f"Found {len(df)} unique days in database")
-            
-        except Exception as e:
-            self.log_message(f"Could not load unique days: {str(e)}")
-    
     def update_tag_selection(self):
         """Update tag checkboxes"""
         for cb in self.tag_checkboxes.values():
@@ -12848,18 +12903,7 @@ class UWBQuickVisualizationWindow(QWidget):
             self.btn_assign_identities.deleteLater()
         
         for tag in self.available_tags:
-            hex_id = hex(tag).upper().replace('0X', '')
-            # Show HexID with identity info only if user has configured it
-            if tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', '')
-                identity = info.get('identity', '')
-                if sex and identity:
-                    cb = QCheckBox(f"HexID {hex_id} ({sex}, {identity})")
-                else:
-                    cb = QCheckBox(f"HexID {hex_id}")
-            else:
-                cb = QCheckBox(f"HexID {hex_id}")
+            cb = QCheckBox(self._tag_checkbox_text(tag))
             cb.setChecked(True)
             cb.stateChanged.connect(self.update_identity_button_state)
             # The preview's frame columns and its timeline range both derive
@@ -12916,20 +12960,28 @@ class UWBQuickVisualizationWindow(QWidget):
         any_selected = any(cb.isChecked() for cb in self.tag_checkboxes.values())
         self.btn_assign_identities.setEnabled(any_selected)
     
+    def _tag_checkbox_text(self, tag):
+        """'HexID 2A (F, 9905) - Hera [HER]': identity shown only once configured.
+
+        Name and Code are appended when set, so the tag list is where you can
+        see at a glance which animals the roster covers.
+        """
+        text = f"HexID {hex(tag).upper().replace('0X', '')}"
+        info = self.tag_identities.get(tag) or {}
+        sex, identity = info.get('sex', ''), info.get('identity', '')
+        if sex and identity:
+            text += f" ({sex}, {identity})"
+        name = str(info.get('name', '') or '').strip()
+        code = str(info.get('code', '') or '').strip()
+        if name or code:
+            text += " \u2014 " + " ".join(
+                p for p in (name, f"[{code}]" if code else "") if p)
+        return text
+
     def update_tag_labels(self):
-        """Update tag checkbox labels to reflect sex and ID information"""
+        """Update tag checkbox labels to reflect sex, ID, name and code."""
         for tag, cb in self.tag_checkboxes.items():
-            hex_id = hex(tag).upper().replace('0X', '')
-            if tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', '')
-                identity = info.get('identity', '')
-                if sex and identity:
-                    cb.setText(f"HexID {hex_id} ({sex}, {identity})")
-                else:
-                    cb.setText(f"HexID {hex_id}")
-            else:
-                cb.setText(f"HexID {hex_id}")
+            cb.setText(self._tag_checkbox_text(tag))
     
     def select_all_tags(self):
         """Select all tags"""
@@ -13053,10 +13105,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # Calculate time differences and group by time gaps (prevents filtering across battery restarts)
         time_gap_threshold = self.spin_time_gap.value()
         data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
-        data['time_diff_s'] = np.ceil(data['time_diff']).astype(int)
-        data['tw_group'] = data.groupby('shortid')['time_diff_s'].apply(
-            lambda x: (x > time_gap_threshold).cumsum()
-        ).reset_index(level=0, drop=True)
+        # Compared at full resolution. (The old ceil-to-whole-seconds step
+        # gave the same groups for an integer threshold, but only by accident
+        # of the spin box's type.)
+        data['tw_group'] = (data['time_diff'] > time_gap_threshold).groupby(
+            data['shortid']).cumsum()
         
         # Calculate distance and velocity within time window groups, on the
         # requested coordinate columns (raw for jump, smoothed for velocity).
@@ -13166,7 +13219,7 @@ class UWBQuickVisualizationWindow(QWidget):
                             "than deleted. See the threshold read-out.")
 
         # Clean up temporary columns
-        data = data.drop(columns=['time_diff', 'time_diff_s', 'tw_group', 'distance', 'velocity'], errors='ignore')
+        data = data.drop(columns=['time_diff', 'tw_group', 'distance', 'velocity'], errors='ignore')
         if 'is_jump' in data.columns:
             data = data.drop(columns=['is_jump'])
         
@@ -13525,6 +13578,8 @@ class UWBQuickVisualizationWindow(QWidget):
             val = cfg[key]
             try:
                 if kind == 'text':
+                    if attr == 'combo_tag_id_type':
+                        val = normalize_id_type(val)   # 'Display ID' -> 'SexID'
                     if w.findText(str(val)) >= 0:
                         w.setCurrentText(str(val))
                 elif kind == 'value':
@@ -13722,7 +13777,8 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'show_tag_id' in config:
                 self.chk_show_tag_id.setChecked(config['show_tag_id'])
             if 'tag_id_type' in config:
-                i = self.combo_tag_id_type.findText(config['tag_id_type'])
+                i = self.combo_tag_id_type.findText(
+                    normalize_id_type(config['tag_id_type']))
                 if i >= 0:
                     self.combo_tag_id_type.setCurrentIndex(i)
 
@@ -14142,6 +14198,9 @@ class UWBQuickVisualizationWindow(QWidget):
             # the video's labels read the way the ones you tuned do.
             'label_color': self.combo_label_color.currentData(),
             'label_outline': self.chk_label_outline.isChecked(),
+            # Which ID the labels show (SexID / Name / Code / HexID /
+            # ShortID), frozen with the rest so a queued render can't change.
+            'tag_id_type': normalize_id_type(self.combo_tag_id_type.currentText()),
             'gap_s': self.spin_time_gap.value(),
             'layers': self.anim_layer_flags(),
             'animation_tags': (list(self._animation_tags)
@@ -14280,7 +14339,7 @@ class UWBQuickVisualizationWindow(QWidget):
         data, remap = worker.merge_tag_data(data)
         if remap:
             tags = [t for t in tags if t not in remap]
-        grid, _have, soc, _events, links, _ft = worker._behavior_classification(
+        grid, _have, soc, _events, links = worker._behavior_classification(
             data, tags, hz=hz, collect_links=True)
         if grid is None:
             return None
@@ -14905,6 +14964,7 @@ class UWBQuickVisualizationWindow(QWidget):
             zones_xml=self.xml_zones, arena_zones=self.arena_zones,
             anchors=self.anchor_positions, rois=self.rois,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
+            id_type=s.get('tag_id_type', SEX_ID),
             color_by=color_by, marker_size=s['tag_size'],
             show_battery=s['show_battery'],
             show_speed=s.get('show_speed', False),
@@ -15839,7 +15899,7 @@ class UWBQuickVisualizationWindow(QWidget):
     _BOUTS_NUMERIC_COLS = ('Day', 'duration_s', 'mean_distance', 'n_reads')
 
     #: Columns of the behaviour-events CSV that must parse as numbers.
-    _BEHAVIOR_NUMERIC_COLS = ('Day', 'duration_s')
+    _BEHAVIOR_NUMERIC_COLS = ('Day', 'duration_s', 'n_frames', 'n_fixes')
 
     def verify_smoothed_csv(self, path, chunksize=2_000_000, numeric_cols=None):
         """Check every numeric column of the written CSV actually parses.
@@ -16493,6 +16553,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 # that later runs would mistake for a complete export — the
                 # failure mode seen when a crash killed a batch mid-write.
                 selected_tags = sorted(selected_tags)
+                # Optional Name/Code columns, decided ONCE for the whole file:
+                # the CSV is streamed tag by tag with the header written from
+                # the first tag, so every tag must carry the same columns. A
+                # column is included when any selected animal has that field;
+                # the rest get a blank.
+                ident_extra_cols = [
+                    key for key in ('name', 'code')
+                    if any(str((self.tag_identities.get(t) or {}).get(key, '')
+                               or '').strip() for t in selected_tags)]
                 smoothed_csv_filename = f'{db_name}_smoothed.csv'
                 smoothed_csv_path = os.path.join(
                     csv_output_dir(output_dir, create=True), smoothed_csv_filename)
@@ -16616,6 +16685,10 @@ class UWBQuickVisualizationWindow(QWidget):
                     else:
                         tag_data['sex'] = 'M'
                         tag_data['identity'] = f'Tag{tag}'
+                    for key in ident_extra_cols:
+                        tag_data[key] = str(
+                            (self.tag_identities.get(tag) or {}).get(key, '')
+                            or '').strip()
 
                     # Regions, before the frame is streamed and dropped:
                     # the name columns have to be in the CSV, and the
@@ -16890,12 +16963,22 @@ class UWBQuickVisualizationWindow(QWidget):
                                  f"dyad types present: {', '.join(seen_d)}"),
                                 ((ev['actor'] != ev['target']).all().item(),
                                  "actor is never its own target"),
-                                ((ev['duration_s'] > 0).all().item(),
-                                 "every duration is positive"),
+                                ((ev['duration_s'] >= 0).all().item(),
+                                 "no negative durations"),
                                 (((ev['bout_stop'] - ev['bout_start'])
-                                  .dt.total_seconds() >= 0).all().item(),
-                                 "bout_stop is never before bout_start"),
-                            ])
+                                  .dt.total_seconds() - ev['duration_s'])
+                                 .abs().max() < 1e-6,
+                                 "duration_s == bout_stop - bout_start for "
+                                 "EVERY row"),
+                                ((ev['n_frames'] >= 1).all().item(),
+                                 "every bout spans at least one classifier "
+                                 "frame"),
+                            ] + ([(True,
+                                   f"note: {int((ev['n_fixes'] == 0).sum()):,} "
+                                   f"bout(s) had no actor/target fix inside "
+                                   f"the window (held positions) and use the "
+                                   f"1 Hz slot edges")]
+                                 if (ev['n_fixes'] == 0).any() else []))
                         if not self.write_verified_csv(
                                 ev, ev_path, self._BEHAVIOR_NUMERIC_COLS):
                             return
