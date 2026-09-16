@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QListWidget, QListWidgetItem, QAbstractItemView,
                              QColorDialog, QInputDialog, QMenu)
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QDateTime,
-                          QByteArray, QMimeData)
+                          QByteArray, QMimeData, QSettings)
 from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
                          QCursor)
 
@@ -200,6 +200,11 @@ _KNOWN_EXPORT_PATTERNS = (
 )
 _KNOWN_EXPORT_DIRS = ('plots', 'animation_Tracking', 'animation_SocialNetworks',
                       'csvs')
+
+# Recently opened databases, newest first. Per-user app settings (never in the
+# analysis folder), under this tool's own key.
+RECENT_DATABASES_KEY = "uwb/recent_databases"
+MAX_RECENT_DATABASES = 10
 
 # Every CSV product goes in one subfolder, so the analysis folder's top level
 # is the handful of things a person opens (config, message log, site map) plus
@@ -4769,10 +4774,25 @@ class UWBQuickVisualizationWindow(QWidget):
         db_group = QGroupBox("Database Selection")
         db_layout = QVBoxLayout()
 
+        open_row = QHBoxLayout()
         btn_select = QPushButton("Select SQLite Database")
         btn_select.setToolTip("Open a UWB SQLite database file (.db) for preprocessing")
         btn_select.clicked.connect(self.select_database)
-        db_layout.addWidget(btn_select)
+        open_row.addWidget(btn_select, 1)
+        self.btn_recent_db = QPushButton("Open Recent ▾")
+        self.btn_recent_db.setToolTip(
+            "Reopen one of the last databases you loaded, newest first. The "
+            "folder it sits in is shown beside the name; hover an entry for "
+            "the full path. A database that has been moved or whose drive is "
+            "not mounted is listed as (not found).")
+        self.btn_recent_db.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }")
+        self.menu_recent_db = QMenu(self.btn_recent_db)
+        self.menu_recent_db.setToolTipsVisible(True)
+        self.menu_recent_db.aboutToShow.connect(self._rebuild_recent_db_menu)
+        self.btn_recent_db.setMenu(self.menu_recent_db)
+        open_row.addWidget(self.btn_recent_db)
+        db_layout.addLayout(open_row)
 
         self.lbl_db = QLabel("No database selected")
         self.lbl_db.setStyleSheet("color: #666666; font-style: italic;")
@@ -12235,6 +12255,58 @@ class UWBQuickVisualizationWindow(QWidget):
         if hasattr(self, 'chk_show_anchors'):
             self.chk_show_anchors.setChecked(False)
 
+    # ---- Recent databases ---------------------------------------------- #
+    @staticmethod
+    def _recent_databases():
+        vals = QSettings("FNT", "UWB").value(RECENT_DATABASES_KEY, [], type=list)
+        return [str(v) for v in (vals or []) if v]
+
+    def _remember_recent_database(self, path):
+        path = os.path.abspath(path)
+        key = os.path.normcase(path)
+        recent = [p for p in self._recent_databases()
+                  if os.path.normcase(p) != key]
+        recent.insert(0, path)
+        QSettings("FNT", "UWB").setValue(RECENT_DATABASES_KEY,
+                                         recent[:MAX_RECENT_DATABASES])
+
+    def _rebuild_recent_db_menu(self):
+        """Refill the Open Recent menu (on every show, so (not found) is live)."""
+        menu = self.menu_recent_db
+        menu.clear()
+        recent = self._recent_databases()
+        if not recent:
+            empty = menu.addAction("(no recent databases)")
+            empty.setEnabled(False)
+            return
+        for path in recent:
+            found = os.path.exists(path)
+            folder = os.path.basename(os.path.dirname(path)) or os.path.dirname(path)
+            text = f"{os.path.basename(path)}   —   {folder}"
+            if not found:
+                text += "   (not found)"
+            elif self.db_path and os.path.normcase(os.path.abspath(self.db_path)) \
+                    == os.path.normcase(path):
+                text += "   (open)"
+            act = menu.addAction(text)
+            act.setToolTip(path)
+            act.setEnabled(found)
+            act.triggered.connect(
+                lambda _checked=False, p=path: self._open_recent_database(p))
+        menu.addSeparator()
+        clear = menu.addAction("Clear Recent")
+        clear.triggered.connect(self._clear_recent_databases)
+
+    def _open_recent_database(self, path):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Database Not Found",
+                                f"This database is no longer at:\n{path}")
+            return
+        self._load_database_path(path)
+
+    def _clear_recent_databases(self):
+        QSettings("FNT", "UWB").setValue(RECENT_DATABASES_KEY, [])
+
     def select_database(self):
         """Select a SQLite database via a file dialog, then load it."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -12373,6 +12445,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
             self.db_path = file_path
             self.lbl_db.setText(f"Selected: {os.path.basename(file_path)}")
+            if not batch:
+                self._remember_recent_database(file_path)
 
             # Reset all settings to defaults before loading new config
             self.reset_to_defaults()
