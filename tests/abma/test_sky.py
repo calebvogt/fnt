@@ -3,7 +3,7 @@
 Solar geometry has known right answers, so these check against them rather than
 against the implementation: the sun's noon elevation at a solstice is
 ``90 - latitude ± 23.44``, it is due south at local noon in the northern
-hemisphere, and Boulder's day length runs from about 9h 20m to about 15h. If
+hemisphere, and at 40° N day length runs from about 9h 20m to about 15h. If
 the model can hit those it can be trusted for "is it dark", which is all the
 behaviour model asks of it.
 """
@@ -22,36 +22,36 @@ from fnt.abma.core.sky import (
     season_of, growth_factor, SEASON_DATES,
 )
 
-BOULDER = SkyParams(enabled=True, latitude=40.0150, longitude=-105.2705,
-                    timezone_hours=-7.0)
+SITE = SkyParams(enabled=True, latitude=40.0, longitude=0.0,
+                 timezone_hours=0.0)
 
 
 # --------------------------------------------------------------------------- #
 # Solar geometry, against known answers
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("month,day,expected", [
-    (6, 21, 90 - 40.015 + 23.44),      # summer solstice
-    (12, 21, 90 - 40.015 - 23.44),     # winter solstice
-    (3, 20, 90 - 40.015),              # equinox
+    (6, 21, 90 - 40.0 + 23.44),        # summer solstice
+    (12, 21, 90 - 40.0 - 23.44),       # winter solstice
+    (3, 20, 90 - 40.0),                # equinox
 ])
 def test_noon_sun_elevation_matches_the_geometry(month, day, expected):
     """Peak elevation over the day, which is solar noon by definition."""
-    best = max(sun_position(datetime(2026, month, day, h, m), BOULDER.latitude,
-                            BOULDER.longitude, BOULDER.timezone_hours)[0]
+    best = max(sun_position(datetime(2026, month, day, h, m), SITE.latitude,
+                            SITE.longitude, SITE.timezone_hours)[0]
                for h in range(10, 15) for m in (0, 15, 30, 45))
     assert best == pytest.approx(expected, abs=1.0)
 
 
 def test_the_sun_is_due_south_at_solar_noon():
-    elevations = [(sun_position(datetime(2026, 6, 21, h, m), BOULDER.latitude,
-                                BOULDER.longitude, BOULDER.timezone_hours), h, m)
+    elevations = [(sun_position(datetime(2026, 6, 21, h, m), SITE.latitude,
+                                SITE.longitude, SITE.timezone_hours), h, m)
                   for h in range(10, 15) for m in (0, 15, 30, 45)]
     (elev, azim), h, m = max(elevations, key=lambda t: t[0][0])
     assert azim == pytest.approx(180.0, abs=3.0)
 
 
 def test_the_sun_rises_in_the_east_and_sets_in_the_west():
-    lat, lon, tz = BOULDER.latitude, BOULDER.longitude, BOULDER.timezone_hours
+    lat, lon, tz = SITE.latitude, SITE.longitude, SITE.timezone_hours
     dawn = sun_position(datetime(2026, 6, 21, 5, 30), lat, lon, tz)
     dusk = sun_position(datetime(2026, 6, 21, 19, 30), lat, lon, tz)
     assert 30 < dawn[1] < 130, f"dawn azimuth {dawn[1]} is not easterly"
@@ -59,9 +59,9 @@ def test_the_sun_rises_in_the_east_and_sets_in_the_west():
 
 
 def test_day_length_swings_with_the_season_at_this_latitude():
-    summer = day_length_hours(datetime(2026, 6, 21), BOULDER)
-    winter = day_length_hours(datetime(2026, 12, 21), BOULDER)
-    equinox = day_length_hours(datetime(2026, 3, 20), BOULDER)
+    summer = day_length_hours(datetime(2026, 6, 21), SITE)
+    winter = day_length_hours(datetime(2026, 12, 21), SITE)
+    equinox = day_length_hours(datetime(2026, 3, 20), SITE)
     assert summer == pytest.approx(14.9, abs=0.5)
     assert winter == pytest.approx(9.3, abs=0.5)
     assert equinox == pytest.approx(12.0, abs=0.3)
@@ -76,15 +76,15 @@ def test_at_the_equator_the_day_barely_changes():
 
 
 def test_night_is_night_and_noon_is_not():
-    assert not sky_state(datetime(2026, 6, 21, 1, 0), BOULDER).is_day
-    assert sky_state(datetime(2026, 6, 21, 12, 0), BOULDER).is_day
+    assert not sky_state(datetime(2026, 6, 21, 1, 0), SITE).is_day
+    assert sky_state(datetime(2026, 6, 21, 12, 0), SITE).is_day
 
 
 def test_twilight_is_a_ramp_not_a_switch():
     """A crepuscular animal needs a dawn to be active in."""
-    values = [sky_state(datetime(2026, 6, 21, 4, 0), BOULDER).daylight,
-              sky_state(datetime(2026, 6, 21, 5, 0), BOULDER).daylight,
-              sky_state(datetime(2026, 6, 21, 6, 0), BOULDER).daylight]
+    values = [sky_state(datetime(2026, 6, 21, 4, 0), SITE).daylight,
+              sky_state(datetime(2026, 6, 21, 5, 0), SITE).daylight,
+              sky_state(datetime(2026, 6, 21, 6, 0), SITE).daylight]
     assert values == sorted(values)
     assert 0.0 < values[1] < 1.0, "no intermediate light level exists"
 
@@ -93,8 +93,8 @@ def test_twilight_is_a_ramp_not_a_switch():
 # Moon
 # --------------------------------------------------------------------------- #
 def test_the_moon_cycles_through_its_phases_in_about_a_month():
-    phases = [moon_position(datetime(2026, 1, d), BOULDER.latitude,
-                            BOULDER.longitude, BOULDER.timezone_hours)[2]
+    phases = [moon_position(datetime(2026, 1, d), SITE.latitude,
+                            SITE.longitude, SITE.timezone_hours)[2]
               for d in range(1, 30)]
     assert min(phases) < 0.15 and max(phases) > 0.85
 
@@ -103,7 +103,7 @@ def test_illumination_peaks_at_full_moon():
     """Phase 0.5 is opposition, which is when the disc is fully lit."""
     lit = []
     for d in range(1, 30):
-        state = sky_state(datetime(2026, 1, d, 23, 0), BOULDER)
+        state = sky_state(datetime(2026, 1, d, 23, 0), SITE)
         lit.append((abs(state.moon_phase - 0.5), state.moon_illumination))
     nearest_full = min(lit)[1]
     nearest_new = max(lit)[1]
@@ -111,9 +111,9 @@ def test_illumination_peaks_at_full_moon():
 
 
 def test_moonlight_only_counts_at_night_and_when_the_moon_is_up():
-    noon = sky_state(datetime(2026, 6, 21, 12, 0), BOULDER)
+    noon = sky_state(datetime(2026, 6, 21, 12, 0), SITE)
     assert noon.night_light == 0.0
-    nights = [sky_state(datetime(2026, 1, d, 23, 0), BOULDER)
+    nights = [sky_state(datetime(2026, 1, d, 23, 0), SITE)
               for d in range(1, 30)]
     assert any(s.night_light > 0 for s in nights)
     assert all(s.night_light == 0 or s.moon_elevation > 0 for s in nights)

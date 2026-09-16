@@ -1601,11 +1601,11 @@ class ABMAWindow(QMainWindow):
         self.in_season.setToolTip("Sets the release date to that solstice or "
                                   "equinox")
         self.in_season.currentIndexChanged.connect(self._on_season_changed)
-        self.in_lat = _dspin(-89.0, 89.0, 40.015, 0.001, "°N")
+        self.in_lat = _dspin(-89.0, 89.0, 40.0, 0.001, "°N")
         self.in_lat.setDecimals(4)
-        self.in_lon = _dspin(-180.0, 180.0, -105.2705, 0.001, "°E")
+        self.in_lon = _dspin(-180.0, 180.0, 0.0, 0.001, "°E")
         self.in_lon.setDecimals(4)
-        self.in_tz = _dspin(-12.0, 14.0, -7.0, 0.5, " h")
+        self.in_tz = _dspin(-12.0, 14.0, 0.0, 0.5, " h")
         self.in_tz.setToolTip("UTC offset the run's clock is in")
         self.in_moon = _dspin(0.0, 1.0, 0.25, 0.05)
         self.in_moon.setToolTip(

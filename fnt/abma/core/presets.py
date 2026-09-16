@@ -20,8 +20,10 @@ from .config import (
 from .physiology import preset_params
 from .sky import season_start
 
-#: VoleTerra's actual site, so sunrise, sunset and day length are its own.
-BOULDER_LAT, BOULDER_LON, BOULDER_TZ = 40.0150, -105.2705, -7.0
+#: Synthetic mid-latitude reference for the outdoor preset (40° N, 0° E,
+#: UTC+0): a real day length and sun path without naming a place. Change the
+#: preset's ``sky`` to model a particular site.
+SITE_LAT, SITE_LON, SITE_TZ = 40.0, 0.0, 0.0
 
 
 def _live_world(cfg: ExperimentConfig,
@@ -187,14 +189,14 @@ def voleterra() -> ExperimentConfig:
         name="voleterra", arena=arena, groups=voles,
         days=10.0, dt=2.0, record_interval=10.0, n_trials=1,
         start_datetime=season_start("summer")))
-    # VoleTerra is a real outdoor site, so it gets a real sky and a real
-    # sward. Boulder's latitude decides day length and the sun's angle; the
+    # VoleTerra is an outdoor enclosure, so it gets a sky and a sward. The
+    # sky's latitude decides day length and the sun's angle; the
     # grass is something the animals push through, wear down and clip into
     # runways. Both are specific to this preset on purpose — the enclosure we
     # can describe exactly is where the building blocks get proven before
     # they are offered for arbitrary arenas.
-    cfg.sky = SkyParams(enabled=True, latitude=BOULDER_LAT,
-                        longitude=BOULDER_LON, timezone_hours=BOULDER_TZ)
+    cfg.sky = SkyParams(enabled=True, latitude=SITE_LAT,
+                        longitude=SITE_LON, timezone_hours=SITE_TZ)
     cfg.sward = SwardParams(enabled=True)
     # The scent grid has to scale with the enclosure. A 10 cm cell is right in
     # a 2.2 m cage (484 cells); across 75 ft it is 52,000 cells, and a cohort's

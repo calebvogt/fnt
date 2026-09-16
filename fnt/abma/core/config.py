@@ -259,12 +259,13 @@ class SkyParams:
     phase all follow (see :mod:`fnt.abma.core.sky`), and season becomes a thing
     you choose rather than a thing you approximate.
 
-    Defaults are VoleTerra's site: Boulder, Colorado.
+    Defaults are a synthetic mid-latitude reference (40° N, 0° E, UTC+0);
+    set the coordinates and UTC offset of the site being modelled.
     """
     enabled: bool = False
-    latitude: float = 40.0150        # deg N
-    longitude: float = -105.2705     # deg E (negative = W)
-    timezone_hours: float = -7.0     # MST; the run's clock is local time
+    latitude: float = 40.0           # deg N
+    longitude: float = 0.0           # deg E (negative = W)
+    timezone_hours: float = 0.0      # UTC offset; the run's clock is local time
     #: Sun elevation (deg) below which it counts as night. 0 is geometric
     #: sunset; -6 is civil twilight, which is closer to when a small mammal
     #: treats the field as dark.

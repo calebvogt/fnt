@@ -533,10 +533,11 @@ day length, and a smooth twilight ramp so a crepuscular animal gets a dawn and
 a dusk instead of a step change. Moonlight suppresses night activity, which is
 one of the better-described behaviours in nocturnal small mammals.
 
-VoleTerra ships with its actual site — Boulder, Colorado (40.015 N, 105.271 W).
-Verified against known geometry: solar noon elevation 73.4° at the summer
-solstice and 26.5° at the winter one, due south at noon, day length 14.9 h vs
-9.2 h.
+The VoleTerra preset turns the sky on at a synthetic mid-latitude reference
+(40° N, 0° E, UTC+0); set `sky.latitude`, `sky.longitude` and
+`sky.timezone_hours` to put a run at your own site. Verified against known
+geometry at that latitude: solar noon elevation 73.4° at the summer solstice
+and 26.5° at the winter one, due south at noon, day length 14.9 h vs 9.2 h.
 
 Season is how you say all of that at once:
 
