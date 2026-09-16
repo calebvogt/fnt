@@ -7934,7 +7934,9 @@ class MADMainWindow(QMainWindow):
         s['auto_adv'].setChecked(self._auto_advance)
         s['auto_adv'].setToolTip(
             "On: after you Accept or Reject, jump straight to the next pending "
-            "detection (fast review).\n"
+            "detection (fast review). Past the last one it cycles back to any "
+            "you skipped earlier, so the file is done only when nothing is "
+            "pending.\n"
             "Off: stay on the current spot — use Back (B) / Next (N) to move "
             "through the list yourself.")
         s['auto_adv'].setFocusPolicy(Qt.NoFocus)
@@ -9089,12 +9091,12 @@ class MADMainWindow(QMainWindow):
     def _select_first_pending(self) -> bool:
         """Select the first pending detection in display order.
 
-        The wrap target for Skip. Separate from
-        :meth:`_select_next_pending_after_id` because "start again" and "carry
-        on from here" are different intents, and folding the wrap into the
-        latter would silently loop every caller that relies on it stopping —
-        the accept/reject advance among them, which must NOT wrap or review
-        would never end.
+        The wrap target for Skip and for the accept/reject auto-advance, both
+        of which cycle back to the calls left pending earlier in the list.
+        Kept separate from :meth:`_select_next_pending_after_id` because "start
+        again" and "carry on from here" are different intents: the plain
+        forward search is also what tells the caller the sweep is over, and
+        folding the wrap into it would leave no way to ask that question.
         """
         order = self._review_order()
         anns = self.spectrogram.annotations
@@ -9633,7 +9635,19 @@ class MADMainWindow(QMainWindow):
         if self._auto_advance and was_pending:
             if not (self._select_next_pending_from_id(successor)
                     or self._select_next_pending_after_id(decided_id)):
-                self._reselect_by_id(decided_id)  # nothing left after — stay
+                # Past the last pending one in display order: wrap to the first
+                # still-pending call instead of stopping dead. Anything skipped
+                # sits *earlier* in the list, so without the wrap a sweep ends
+                # parked on a decided item with work outstanding and the only
+                # way back is a manual click. Safe to cycle, unlike Skip:
+                # every accept/reject takes one call out of pending, so the
+                # loop strictly shrinks and review still terminates.
+                if self._select_first_pending():
+                    self.status_bar.showMessage(
+                        f"Back to the first of "
+                        f"{len(self._pred_indices())} pending detection(s)")
+                else:
+                    self._reselect_by_id(decided_id)  # nothing left — stay
         else:
             self._reselect_by_id(decided_id)  # re-decision / manual: stay put
         self._mark("select")
@@ -12821,7 +12835,60 @@ class MADMainWindow(QMainWindow):
         return isinstance(focus, (QAbstractSpinBox, QLineEdit, QComboBox,
                                   QTextEdit))
 
+    # Events after which a buried modal dialog has to be pulled back in front.
+    # getattr because ApplicationActivate is deprecated in Qt5 and absent in
+    # some builds; a missing one must not take the whole set down.
+    _REFOCUS_EVENTS = frozenset(
+        e for e in (QEvent.WindowActivate,
+                    QEvent.WindowStateChange,
+                    getattr(QEvent, 'ApplicationActivate', None),
+                    getattr(QEvent, 'ApplicationStateChange', None))
+        if e is not None)
+
+    def _raise_blocking_dialog(self) -> bool:
+        """Bring the modal dialog that is blocking input back to the front.
+
+        Alt-tab away from an open Add Folder / Open / Save dialog, then come
+        back via the taskbar, and Windows raises the *main* window — burying
+        the dialog behind it. The dialog is still modal, so every click on the
+        window in front of it is refused, and with no way to reach the thing
+        doing the refusing the only way out is killing the app. Reported
+        against Add Folder; it is the same for every exec_() dialog, hence the
+        fix living here rather than in one picker.
+
+        Deliberately ``activeModalWidget`` and not "a dialog I parented": what
+        matters is what is blocking the user, whoever owns it. A modeless
+        window is left alone — alt-tab still reaches it.
+        """
+        dlg = QApplication.activeModalWidget()
+        if dlg is None or dlg is self or not dlg.isVisible():
+            return False
+        if dlg.isMinimized():
+            dlg.showNormal()
+        # A dialog left on a monitor that has since been unplugged is off every
+        # screen, where raising it changes nothing visible. Only when it lies
+        # entirely outside them all -- a dialog half off the edge is where the
+        # user dragged it.
+        frame = dlg.frameGeometry()
+        if not any(s.availableGeometry().intersects(frame)
+                   for s in QApplication.screens()):
+            dlg.move(self.frameGeometry().center() - dlg.rect().center())
+        dlg.raise_()
+        dlg.activateWindow()
+        return True
+
     def eventFilter(self, obj, event):
+        # The window coming forward is exactly when a modal dialog gets buried
+        # behind it. Deferred: Windows is still settling the z-order as this
+        # arrives, and raising inside the event is undone a moment later.
+        # Watched on the application as well as the window, because a window
+        # that a modal dialog is blocking does not reliably get WindowActivate
+        # of its own when you return to the app from the taskbar -- which is
+        # the exact path the bug was reported through.
+        if event.type() in self._REFOCUS_EVENTS and (
+                obj is self or obj is QApplication.instance()):
+            if QApplication.activeModalWidget() is not None:
+                QTimer.singleShot(0, self._raise_blocking_dialog)
         # Route arrow keys to spectrogram pan/zoom regardless of which control
         # has focus (scrollbars, list, buttons all otherwise eat arrow keys).
         if event.type() in (QEvent.KeyPress, QEvent.ShortcutOverride) and \
@@ -16590,8 +16657,9 @@ class MADMainWindow(QMainWindow):
         Delete is permanent removal that leaves no trace — distinct from Reject
         (which keeps a visible red record). It removes the CSV row entirely and
         drops the stored crop. For a prediction it follows the Auto-advance
-        toggle (on → next pending; off → stay); deleting a *confirmed* detection
-        never advances (there's no review cursor on it)."""
+        toggle (on → next pending, cycling back to ones skipped earlier once
+        past the end; off → stay); deleting a *confirmed* detection never
+        advances (there's no review cursor on it)."""
         if self._focus_is_edit():
             return
         if self._apply_to_box_selection('delete'):
@@ -16629,6 +16697,14 @@ class MADMainWindow(QMainWindow):
         # selection so Back (B) / Next (N) drive navigation.
         if self._auto_advance and next_pending_id is not None:
             self._reselect_by_id(next_pending_id)
+        elif self._auto_advance and was_pending and self._select_first_pending():
+            # Nothing pending after this one, but something skipped earlier is
+            # still waiting: cycle back to it, the same as Accept/Reject. D is
+            # part of the same sweep, and parking on the end of the list with
+            # work outstanding is what that sweep is trying to avoid.
+            self.status_bar.showMessage(
+                f"Deleted detection (D) — back to the first of "
+                f"{len(self._pred_indices())} pending detection(s)")
         else:
             self.spectrogram._selected_ann_idx = None
             self.spectrogram.update()

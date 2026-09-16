@@ -4,8 +4,10 @@ Skipping defers a decision, so the calls you skipped past are exactly the ones
 you still owe. Stopping dead at the last row left the key doing nothing while
 work was outstanding, with no way back to it but the mouse.
 
-Accept/Reject deliberately does NOT wrap: that advance has to be able to
-finish, or review would never end and "all reviewed" would never fire.
+Accept/Reject wraps too (see test_review_cycles_back.py) -- safely, because
+each of those takes a call out of pending, so the cycle shrinks. Skip changes
+no status, which is why its wrap must stay a manual keypress: driven
+automatically it would spin forever.
 """
 import inspect
 
@@ -104,14 +106,16 @@ def test_the_wrap_follows_the_display_order_not_the_annotation_order(win):
     assert win.selected_id() == "c"
 
 
-# --------------------------------------------------- not the other advance
-def test_accept_and_reject_still_stop_at_the_end():
-    """Wrapping that advance would make review unfinishable."""
+# --------------------------------------------------------- the other advance
+def test_accept_and_reject_wrap_as_well():
+    """They used not to, and a file could be left with skipped calls owed and
+    the cursor parked on the last row. Behaviour covered in
+    test_review_cycles_back.py; this just pins the shared wrap target."""
     src = inspect.getsource(MADMainWindow._after_review_decision)
-    assert "_select_first_pending" not in src
+    assert "_select_first_pending" in src
 
 
-def test_only_skip_wraps():
+def test_skip_wraps_too():
     src = inspect.getsource(MADMainWindow._skip_current_pred)
     assert "_select_first_pending" in src
     assert "Back to the first pending detection" in src
