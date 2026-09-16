@@ -46,6 +46,10 @@ except Exception as _e:  # pragma: no cover - depends on optional PyOpenGL
     GL_ERROR = f"{type(_e).__name__}: {_e}"
 
 from PyQt5.QtCore import Qt, pyqtSignal   # cursor shapes; ROI draw signals
+from PyQt5.QtCore import QPointF, QRectF
+from PyQt5.QtGui import (QBrush, QColor, QFont, QLinearGradient, QPainter, QPen,
+                         QPolygonF)
+from PyQt5.QtWidgets import QWidget
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
@@ -1443,3 +1447,127 @@ class UWBPreview2D(FigureCanvas):
 
     def top_down(self):
         self.draw_idle()
+
+
+class LightBar(QWidget):
+    """A day strip that brightens and darkens with the sunlight.
+
+    The strip spans the current local day (midnight to midnight), each column
+    shaded by the light level at that moment - measured irradiance where a
+    solar source was fetched, clear-sky from the sun's position otherwise, and
+    a dim glow through twilight. A marker sits at the playhead and the text
+    reads out the light at that instant.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(24)
+        self.setMaximumHeight(24)
+        self._levels = None          # array of 0-1 levels across the day
+        self._colors = None
+        self._frac = None            # playhead position across the day, 0-1
+        self._level = None
+        self._text = ""
+        self._ticks = ()             # (fraction, label) hour ticks
+        self._moon_poly = None       # lit outline on a unit disc
+        self._moon_up = True
+        self._precip = None          # per-sample QColor or None
+
+    def set_day(self, levels, rgb_fn, ticks=(), moon=None, precip=None):
+        self._precip = None if precip is None else [
+            None if c is None else QColor.fromRgbF(*c) for c in precip]
+        self._levels = None if levels is None else list(levels)
+        if levels is None:
+            self._colors = None
+        else:
+            moon = [0.0] * len(levels) if moon is None else list(moon)
+            self._colors = [QColor.fromRgbF(*rgb_fn(v if v == v else 0.0, m))
+                            for v, m in zip(levels, moon)]
+        self._ticks = tuple(ticks)
+        self.update()
+
+    def set_now(self, frac, level, text, moon_poly=None, moon_up=True):
+        self._frac, self._level, self._text = frac, level, text
+        self._moon_poly, self._moon_up = moon_poly, moon_up
+        self.update()
+
+    def clear(self):
+        self._levels = self._colors = self._frac = self._level = None
+        self._moon_poly = None
+        self._text = ""
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        if not self._colors:
+            p.fillRect(rect, QColor("#2a2a2a"))
+            p.end()
+            return
+        grad = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        n = len(self._colors)
+        for i, c in enumerate(self._colors):
+            grad.setColorAt(i / max(n - 1, 1), c)
+        p.fillRect(rect, QBrush(grad))
+        if self._precip:
+            # Precipitation along the bottom edge, one cell per sample.
+            m = len(self._precip)
+            band = max(4, rect.height() // 4)
+            for i, c in enumerate(self._precip):
+                if c is None:
+                    continue
+                x0 = rect.left() + rect.width() * i / m
+                w = max(1.0, rect.width() / m + 0.5)
+                p.fillRect(QRectF(x0, rect.bottom() - band + 1, w, band), c)
+        p.setPen(QPen(QColor(128, 128, 128, 160), 1))
+        for frac, _label in self._ticks:
+            x = rect.left() + frac * rect.width()
+            p.drawLine(int(x), rect.bottom() - 4, int(x), rect.bottom())
+        if self._frac is not None:
+            x = int(rect.left() + self._frac * rect.width())
+            p.setPen(QPen(QColor("#e0322b"), 2))
+            p.drawLine(x, rect.top(), x, rect.bottom())
+        if self._text:
+            f = QFont("Consolas")
+            f.setStyleHint(QFont.Monospace)
+            f.setPixelSize(10)
+            p.setFont(f)
+            # On a dark backing: the strip under the text runs from night to
+            # noon, so no single text colour would stay readable.
+            tw = p.fontMetrics().horizontalAdvance(self._text) + 10
+            box = rect.adjusted(3, 3, 0, -3)
+            box.setWidth(min(tw, rect.width() - 6))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 150))
+            p.drawRoundedRect(box, 3, 3)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QColor("#f2f2f2"))
+            p.drawText(box.adjusted(5, 0, 0, 0),
+                       Qt.AlignVCenter | Qt.AlignLeft, self._text)
+        if self._moon_poly is not None:
+            self._paint_moon(p, rect)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(90, 90, 90), 1))
+        p.drawRect(rect)
+        p.end()
+
+    def _paint_moon(self, p, rect):
+        """Phase icon at the right end; faded while the moon is down."""
+        r = (rect.height() - 6) / 2.0
+        cx, cy = rect.right() - r - 6, rect.center().y() + 0.5
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 150))
+        p.drawEllipse(QPointF(cx, cy), r + 3, r + 3)
+        p.setOpacity(1.0 if self._moon_up else 0.5)
+        p.setBrush(QColor("#2b3040"))
+        p.setPen(QPen(QColor("#8a8f9c"), 0.8))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#f1efe4"))
+        # y is flipped: the polygon is in maths orientation.
+        p.drawPolygon(QPolygonF([QPointF(cx + x * r, cy - y * r)
+                                 for x, y in self._moon_poly]))
+        p.setOpacity(1.0)
+        p.setRenderHint(QPainter.Antialiasing, False)

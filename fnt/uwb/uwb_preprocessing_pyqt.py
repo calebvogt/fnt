@@ -1,4 +1,5 @@
 import base64
+import html
 import faulthandler
 import io
 import os
@@ -49,8 +50,9 @@ from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
-    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI)
+    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar)
 from fnt.uwb import animation as uwb_animation
+from fnt.uwb import weather as WX
 from fnt.uwb.identities import (
     ID_DISPLAY_TYPES, SEX_ID, normalize_id_type, tag_label,
     identity_field_problems, describe_problems)
@@ -176,13 +178,20 @@ CLEAR_KEEP_SUFFIXES = (
 )
 CLEAR_KEEP_NAMES = (
     'fnt_config.json',      # the settings record; losing it loses provenance
+    'weather_cache',        # raw weather downloads - a cache of the SOURCE
+    'fnt_site.json',        # the site profile; settings, not an export
 )
+
+# Raw weather/solar downloads live here, inside the analysis folder, so a
+# re-run is reproducible offline and a clear does not force a re-download.
+WEATHER_CACHE_DIR = 'weather_cache'
 
 # Files FNT currently writes or has written. Only used to tell the user which
 # deletions are expected and which are strangers - never to decide what goes.
 _KNOWN_EXPORT_PATTERNS = (
     '_smoothed.csv', '_raw.csv', '_SocialOverlapBouts.csv', '_proximity_bouts.csv',
     '_behavior_events.csv', '_ROI_bout_occupancy.csv', '_ROI_DailySummary.csv',
+    '_weather.csv', '_daylight.csv',
     # Retired products. Kept in the list so a re-export of a trial processed by
     # an older build reports clearing them as expected, not as strangers.
     '_network_GBI.csv', '_network_edgelist',
@@ -4464,6 +4473,18 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_t0 = None               # first ping, epoch ms
         self.preview_t1 = None               # last ping, epoch ms
         self.preview_playhead_ms = 0
+        # Weather / sunlight (see fnt/uwb/weather.py). The environment is what
+        # Fetch Weather downloaded; the timeline answers "what was it like at
+        # t" for the preview and the video.
+        self.environment = None
+        self.weather_timeline = None
+        self._weather_summary = None         # provenance, for fnt_config.json
+        self._sun_timeline = None            # (key, sun-only timeline)
+        self._light_day = None               # (day, timeline id) on the bar
+        self._light_span = (0, 1)
+        self._weather_fetching = False
+        self._weather_restore_key = None
+        self._site_name = ""
         self._timeline_guard = False         # suppress slider feedback loops
         self._tag_selection_guard = False    # suppress bulk checkbox churn
         self._preview_active = False         # streaming begins once data exists
@@ -4822,6 +4843,11 @@ class UWBQuickVisualizationWindow(QWidget):
         tz_group.setLayout(tz_group_layout)
         layout.addWidget(tz_group)
 
+        # Where the trial was recorded, and the weather/sunlight sources.
+        # Lives in its own window (Preview → Weather Settings…); built here so
+        # its widgets exist for the config, the export and the batch queue.
+        self._build_weather_dialog()
+
         # Tag selection
         self.tag_group = QGroupBox("Tag Selection")
         self.tag_layout = QVBoxLayout()
@@ -5139,6 +5165,44 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_roi_daily.stateChanged.connect(
             self.on_zone_occupancy_toggled)
         export_layout.addWidget(self.chk_export_roi_daily)
+
+        self.chk_export_weather = QCheckBox("Export Weather && Daylight CSVs")
+        self.chk_export_weather.setChecked(False)
+        self.chk_export_weather.setToolTip(
+            "FILES: {db}_weather.csv and {db}_daylight.csv (needs the site's "
+            "latitude/longitude - Preview → Weather Settings…).\n"
+            "\n"
+            "WEATHER: every record of the selected weather and sunlight "
+            "sources over the recording, one row per source record, in SI "
+            "units: temp_c, rh_pct, dewpoint_c, wind_speed_ms, wind_dir_deg, "
+            "wind_gust_ms, pressure_hpa, precip_mm (per interval), "
+            "precip_rate_mmh, rain_mm and snowfall_cm (where the source "
+            "splits them), precip_type (rain / snow / mixed) with "
+            "precip_basis (reported, or estimated from wet-bulb or air "
+            "temperature), ghi_wm2 (global solar), "
+            "dni_wm2, dhi_wm2, par_wm2, uvb_mwm2, uv_index - blank where a "
+            "source does not measure it. Timestamp is the END of the "
+            "averaging interval (interval_s), in the trial timezone, with the "
+            "integer epoch-ms 'timestamp' beside it. sun_elevation_deg / "
+            "sun_azimuth_deg / sun_phase and moon_elevation_deg / "
+            "moon_illumination / moon_phase are computed at that time. Filter by "
+            "'source' when two sources are present. time_flag marks a "
+            "station time that DST made ambiguous.\n"
+            "\n"
+            "DAYLIGHT: one row per local day - sunrise, sunset, solar noon, "
+            "day length and civil/nautical/astronomical dawn and dusk, "
+            "computed from the coordinates (NOAA solar equations, ~1 min); "
+            "moonrise and moonset (~2 min); the moon's illuminated fraction "
+            "and phase at the midnight ending the date (the night after its "
+            "sunset); dark_h, the hours of the date with the sun below -6°; "
+            "and moonlit_dark_h, how many of those the moon was up.\n"
+            "\n"
+            "Downloads are cached in the analysis folder's weather_cache and "
+            "their URLs, retrieval times and checksums are recorded in "
+            "fnt_config.json.")
+        self.chk_export_weather.stateChanged.connect(self._sync_weather_button)
+        self.chk_export_weather.clicked.connect(self._on_weather_toggle_clicked)
+        export_layout.addWidget(self.chk_export_weather)
 
         self.lbl_occ_sources = QLabel("")
         self.lbl_occ_sources.setWordWrap(True)
@@ -5561,6 +5625,20 @@ class UWBQuickVisualizationWindow(QWidget):
             "in both animals' state text.", indent=18)
         self.chk_anim_beh_displace.setChecked(DISPLACEMENT_ENABLED)
         self.chk_anim_beh_displace.setVisible(DISPLACEMENT_ENABLED)
+        _anim_show_box(
+            'chk_anim_show_weather', "Show weather",
+            "Print the weather line above the title for each frame - "
+            "precipitation first, then temperature, humidity, wind and "
+            "pressure - as the preview shows it (Weather Settings sources "
+            "and units). Offered when the preview's Show Weather is on.\n\n"
+            "If nothing has been fetched yet, the export fetches it (from "
+            "the cache when it can) before rendering.")
+        _anim_show_box(
+            'chk_anim_show_light', "Show light bar",
+            "Draw the day's sunlight strip across the top of the video with "
+            "the current moment marked, precipitation along its bottom edge, "
+            "the light and moon readout, and the moon's phase icon. Offered "
+            "when the preview's Show Light Bar is on.")
 
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
@@ -5945,6 +6023,31 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.preview_canvas_3d = None
                 print(f"3D preview unavailable: {e}")
         self.preview_stack.setLayout(stack_layout)
+
+        # Time, weather and light sit ABOVE the arena, where the exported
+        # video puts them.
+        self.lbl_preview_time = QLabel("--")
+        self.lbl_preview_time.setStyleSheet("color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_time.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_preview_time)
+
+        self.lbl_preview_weather = QLabel("")
+        self.lbl_preview_weather.setStyleSheet(
+            "color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_weather.setAlignment(Qt.AlignCenter)
+        self.lbl_preview_weather.setWordWrap(True)
+        self.lbl_preview_weather.setTextFormat(Qt.RichText)
+        self.lbl_preview_weather.setVisible(False)
+        layout.addWidget(self.lbl_preview_weather)
+        self.light_bar = LightBar()
+        self.light_bar.setToolTip(
+            "Sunlight across the current local day (midnight to midnight); "
+            "red mark = playhead, ticks at 06, 12 and 18 h. Silver = moon up "
+            "at night. A band along the bottom marks precipitation: blue "
+            "rain, white snow, violet mixed - stronger for heavier.")
+        self.light_bar.setVisible(False)
+        layout.addWidget(self.light_bar)
+
         layout.addWidget(self.preview_stack, 1)
 
         # --- transport, directly under the map ---
@@ -6046,14 +6149,719 @@ class UWBQuickVisualizationWindow(QWidget):
 
         layout.addLayout(transport)
 
-        self.lbl_preview_time = QLabel("--")
-        self.lbl_preview_time.setStyleSheet("color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
-        self.lbl_preview_time.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_preview_time)
 
         panel.setLayout(layout)
         panel.setMinimumWidth(520)
         return panel
+
+    _WEATHER_BUTTON_TIP = (
+        "Open the Weather Settings window: the site's latitude/longitude "
+        "(or a site profile), the weather and sunlight sources, display "
+        "units, and Fetch Weather. Available once Show Weather, Show Light "
+        "Bar or the weather export is ticked.")
+
+    WEATHER_UNITS = (("Metric (°C, m/s, hPa)", "metric"),
+                     ("US (°F, mph, inHg)", "us"))
+
+    def _build_weather_dialog(self):
+        """The Site & Weather controls, in a non-modal window."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Weather Settings")
+        dlg.setModal(False)
+        dlg.setMinimumWidth(680)
+        v = QVBoxLayout()
+        v.addWidget(self._build_site_weather_group())
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.hide)
+        v.addWidget(buttons)
+        dlg.setLayout(v)
+        self._weather_dialog = dlg
+        return dlg
+
+    def open_weather_settings(self):
+        """Show the Weather Settings window (it stays open while you scrub)."""
+        dlg = self._weather_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _sync_weather_button(self, *_):
+        """Weather Settings… is offered once weather is actually wanted."""
+        btn = getattr(self, 'btn_weather_settings', None)
+        if btn is None:
+            return
+        wanted = (self.chk_show_weather.isChecked()
+                  or self.chk_show_light_bar.isChecked()
+                  or (hasattr(self, 'chk_export_weather')
+                      and self.chk_export_weather.isChecked()))
+        btn.setEnabled(wanted)
+
+    def _on_weather_toggle_clicked(self, checked):
+        """A deliberate tick with no site set opens the settings straight away."""
+        if checked and not self.site_settings().has_location:
+            self.open_weather_settings()
+
+    def _build_site_weather_group(self):
+        """Site location plus the weather and sunlight sources.
+
+        FNT ships no site locations: the latitude/longitude are whatever the
+        user types here, or loads from a site profile kept with their own
+        data (an ``fnt_site.json`` in the trial's analysis folder is picked up
+        automatically). Everything downloaded is cached in that same folder,
+        so a re-run is reproducible and works offline.
+        """
+        group = QGroupBox("Site && Weather")
+        v = QVBoxLayout()
+
+        coords = QHBoxLayout()
+        coords.addWidget(QLabel("Lat:"))
+        self.edit_site_lat = QLineEdit()
+        self.edit_site_lat.setPlaceholderText("decimal °, N +")
+        self.edit_site_lat.setToolTip(
+            "Site latitude in decimal degrees (north positive), e.g. copied "
+            "from a map app.\n\nUsed for the sun's position (day, twilight, "
+            "night, sunrise/sunset), to pick the nearest SURFRAD station, and "
+            "as the Open-Meteo grid point. Saved in this trial's "
+            "fnt_config.json and in any site profile you save - nowhere else.")
+        coords.addWidget(self.edit_site_lat, 1)
+        coords.addWidget(QLabel("Lon:"))
+        self.edit_site_lon = QLineEdit()
+        self.edit_site_lon.setPlaceholderText("decimal °, E +, W −")
+        self.edit_site_lon.setToolTip(
+            "Site longitude in decimal degrees (east positive, WEST NEGATIVE - "
+            "the Americas are negative).")
+        coords.addWidget(self.edit_site_lon, 1)
+        v.addLayout(coords)
+        for edit in (self.edit_site_lat, self.edit_site_lon):
+            edit.editingFinished.connect(self._on_site_changed)
+
+        prof = QHBoxLayout()
+        btn_load = QPushButton("Load Site Profile…")
+        btn_load.setToolTip(
+            "Load a site profile (.json): location, sources and station URL.\n\n"
+            f"A profile saved as '{WX.SITE_PROFILE_NAME}' in a trial's "
+            "<database>_FNT_analysis folder is loaded automatically when that "
+            "database is opened and has no site set yet.")
+        btn_load.clicked.connect(self.load_site_profile)
+        prof.addWidget(btn_load)
+        btn_save = QPushButton("Save Site Profile…")
+        btn_save.setToolTip(
+            "Save the location and source settings as a reusable .json profile. "
+            f"By default it is written as '{WX.SITE_PROFILE_NAME}' in this "
+            "trial's <database>_FNT_analysis folder, where it is picked up "
+            "automatically and survives a folder clear. Profiles live with "
+            "your data, not in FNT.")
+        btn_save.clicked.connect(self.save_site_profile)
+        prof.addWidget(btn_save)
+        v.addLayout(prof)
+
+        form = QFormLayout()
+        self.combo_weather_source = QComboBox()
+        for key in WX.WEATHER_SOURCES:
+            self.combo_weather_source.addItem(WX.SOURCE_LABELS[key], key)
+        self.combo_weather_source.setToolTip(
+            "Where temperature, humidity, wind, pressure and rain come from.\n\n"
+            "• NOAA SURFRAD: the nearest station of NOAA's radiation network, "
+            "measured, 1-minute averages. Can be tens of km away - the "
+            "distance is shown below.\n"
+            "• Open-Meteo: a weather MODEL evaluated at the site, 15-minute "
+            "values (hourly ERA5 reanalysis where 15-minute data are not "
+            "available). Works anywhere; not a measurement.\n"
+            "• WeatherLink archive: daily text files a Davis weather station "
+            "publishes at a URL you enter (e.g. a campus station), usually "
+            "5-minute averages.\n\n"
+            "Every record is an average ending at its timestamp; the preview "
+            "and video show the record covering the current moment.")
+        form.addRow("Weather:", self.combo_weather_source)
+        self.combo_solar_source = QComboBox()
+        for key in WX.SOLAR_SOURCES:
+            self.combo_solar_source.addItem(WX.SOURCE_LABELS[key], key)
+        self.combo_solar_source.setToolTip(
+            "Where sunlight (global solar irradiance, W/m²) comes from - it "
+            "drives the Light Bar and the ghi_wm2 column.\n\n"
+            "• Computed: sun position only, no download. The light bar then "
+            "shows CLEAR-SKY light, so clouds are invisible.\n"
+            "• NOAA SURFRAD: measured 1-minute global, direct and diffuse "
+            "irradiance, plus PAR and UV-B, at the nearest station.\n"
+            "• Open-Meteo: modelled 15-minute irradiance at the site.\n\n"
+            "Sun elevation, twilight phase and sunrise/sunset are always "
+            "computed from the site's coordinates (NOAA solar equations).")
+        form.addRow("Sunlight:", self.combo_solar_source)
+        v.addLayout(form)
+        self.combo_weather_source.currentIndexChanged.connect(self._on_site_changed)
+        self.combo_solar_source.currentIndexChanged.connect(self._on_site_changed)
+
+        # WeatherLink archive details: only meaningful for that source.
+        self._weatherlink_box = QGroupBox("WeatherLink station archive")
+        wl = QFormLayout()
+        self.edit_weatherlink_url = QLineEdit()
+        self.edit_weatherlink_url.setPlaceholderText(
+            "https://…/wxobs{date:%Y%m%d}.txt")
+        self.edit_weatherlink_url.setToolTip(
+            "URL of ONE day's WeatherLink text export, with {date:%Y%m%d} "
+            "where the date goes (Python date format codes). FNT fills in "
+            "each local date of the recording.\n\nThe file must be the "
+            "standard two-line-header WeatherLink table; column positions are "
+            "read from its header, so optional sensors (Solar Rad., UV) are "
+            "picked up when the station has them.")
+        self.edit_weatherlink_url.editingFinished.connect(self._on_site_changed)
+        wl.addRow("URL:", self.edit_weatherlink_url)
+        units = QHBoxLayout()
+        self.combo_wl_temp = QComboBox()
+        for key, text in (("auto", "Auto"), ("F", "°F"), ("C", "°C")):
+            self.combo_wl_temp.addItem(text, key)
+        self.combo_wl_wind = QComboBox()
+        self.combo_wl_wind.addItems(list(WX.WIND_UNITS))
+        self.combo_wl_rain = QComboBox()
+        self.combo_wl_rain.addItems(list(WX.RAIN_UNITS))
+        for lbl, combo in (("Temp", self.combo_wl_temp), ("Wind", self.combo_wl_wind),
+                           ("Rain", self.combo_wl_rain)):
+            units.addWidget(QLabel(lbl))
+            combo.setMinimumWidth(90)
+            units.addWidget(combo)
+            units.addSpacing(10)
+            combo.currentIndexChanged.connect(self._on_site_changed)
+        units.addStretch(1)
+        unit_tip = ("The units the STATION WRITES ITS FILE IN - not how FNT "
+                    "shows them (that is 'Show values in' below). WeatherLink "
+                    "files do not say, so these tell FNT how to read them; "
+                    "everything is converted to SI on import.\n\n"
+                    "Temp 'Auto' works it out from the file itself: only the "
+                    "right unit makes the file's dew point agree with its "
+                    "temperature and humidity. Choosing °F/°C by hand is "
+                    "checked the same way, and a contradiction is reported. "
+                    "Pressure (inHg vs mb/hPa) is detected from its values. "
+                    "Wind and rain units cannot be detected - check them "
+                    "against the station's own web page once.")
+        for c in (self.combo_wl_temp, self.combo_wl_wind, self.combo_wl_rain):
+            c.setToolTip(unit_tip)
+        wl.addRow("File units:", units)
+        self._weatherlink_box.setLayout(wl)
+        v.addWidget(self._weatherlink_box)
+
+        self.lbl_site_info = QLabel("")
+        self.lbl_site_info.setWordWrap(True)
+        self.lbl_site_info.setStyleSheet("color:#9aa7b4; font-size: 10px;")
+        v.addWidget(self.lbl_site_info)
+
+        disp = QHBoxLayout()
+        disp.addWidget(QLabel("Show values in:"))
+        self.combo_weather_units = QComboBox()
+        for text, key in self.WEATHER_UNITS:
+            self.combo_weather_units.addItem(text, key)
+        self.combo_weather_units.setToolTip(
+            "Units for the weather line in the preview and the video. "
+            "Exported CSVs are always SI (°C, m/s, hPa, mm, W/m²).")
+        self.combo_weather_units.currentIndexChanged.connect(
+            self._update_weather_display)
+        disp.addWidget(self.combo_weather_units, 1)
+        v.addLayout(disp)
+
+        fetch = QHBoxLayout()
+        self.btn_fetch_weather = QPushButton("Fetch Weather")
+        self.btn_fetch_weather.setToolTip(
+            "Download the selected weather and sunlight records for the "
+            "loaded database's whole recording period (selected tags), and "
+            "cache them in the analysis folder's weather_cache.\n\n"
+            "Needs an internet connection the first time; afterwards the "
+            "cache is used, and only days that were still in progress when "
+            "last fetched are downloaded again. SURFRAD posts each day about "
+            "a day later, so the most recent hours may be missing.")
+        self.btn_fetch_weather.clicked.connect(self.fetch_weather)
+        fetch.addWidget(self.btn_fetch_weather)
+        fetch.addStretch(1)
+        v.addLayout(fetch)
+        self.lbl_weather_status = QLabel("")
+        self.lbl_weather_status.setWordWrap(True)
+        v.addWidget(self.lbl_weather_status)
+
+        group.setLayout(v)
+        self._on_site_changed()
+        return group
+
+    def site_settings(self):
+        """The site/source settings shown in the Site & Weather group."""
+        return WX.SiteSettings.from_dict({
+            'name': self._site_name,
+            'latitude': self.edit_site_lat.text().strip() or None,
+            'longitude': self.edit_site_lon.text().strip() or None,
+            'weather_source': self.combo_weather_source.currentData(),
+            'solar_source': self.combo_solar_source.currentData(),
+            'weatherlink_url': self.edit_weatherlink_url.text().strip(),
+            'weatherlink_units': {
+                'temp': self.combo_wl_temp.currentData(),
+                'wind': self.combo_wl_wind.currentText(),
+                'rain': self.combo_wl_rain.currentText(),
+            },
+        })
+
+    @staticmethod
+    def _site_key(settings):
+        d = settings.to_dict()
+        d.pop('name', None)
+        return json.dumps(d, sort_keys=True)
+
+    def apply_site_settings(self, settings):
+        """Show ``settings`` in the Site & Weather group."""
+        widgets = (self.edit_site_lat, self.edit_site_lon,
+                   self.combo_weather_source, self.combo_solar_source,
+                   self.edit_weatherlink_url, self.combo_wl_temp,
+                   self.combo_wl_wind, self.combo_wl_rain)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self._site_name = settings.name or ""
+            self.edit_site_lat.setText(
+                "" if not np.isfinite(settings.latitude) else f"{settings.latitude:g}")
+            self.edit_site_lon.setText(
+                "" if not np.isfinite(settings.longitude) else f"{settings.longitude:g}")
+            for combo, key in ((self.combo_weather_source, settings.weather_source),
+                               (self.combo_solar_source, settings.solar_source)):
+                i = combo.findData(key)
+                combo.setCurrentIndex(max(i, 0))
+            self.edit_weatherlink_url.setText(settings.weatherlink_url)
+            u = settings.weatherlink_units
+            self.combo_wl_temp.setCurrentIndex(
+                max(self.combo_wl_temp.findData(u.get('temp', 'auto')), 0))
+            self.combo_wl_wind.setCurrentText(u.get('wind', 'mph'))
+            self.combo_wl_rain.setCurrentText(u.get('rain', 'in'))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._on_site_changed()
+
+    def _set_weather_status(self, text, color="#9aa7b4"):
+        self.lbl_weather_status.setText(text)
+        self.lbl_weather_status.setStyleSheet(f"color:{color}; font-size: 10px;")
+        btn = getattr(self, 'btn_weather_settings', None)
+        if btn is not None:
+            btn.setToolTip(self._WEATHER_BUTTON_TIP
+                           + (f"\n\nStatus: {text}" if text else ""))
+
+    def _on_site_changed(self, *_):
+        """Re-validate the site settings and drop anything fetched for others."""
+        s = self.site_settings()
+        lat_txt = self.edit_site_lat.text().strip()
+        lon_txt = self.edit_site_lon.text().strip()
+        bad = "border: 1px solid #d9534f;"
+        lat_ok = WX.valid_coordinates(lat_txt or 0, 0) if lat_txt else True
+        lon_ok = WX.valid_coordinates(0, lon_txt or 0) if lon_txt else True
+        self.edit_site_lat.setStyleSheet("" if lat_ok else bad)
+        self.edit_site_lon.setStyleSheet("" if lon_ok else bad)
+        self._weatherlink_box.setVisible(s.weather_source == 'weatherlink')
+
+        notes = []
+        if not s.has_location:
+            notes.append("Enter the site's latitude and longitude, or load a "
+                         "site profile, to use weather and sun position.")
+        else:
+            if s.name:
+                notes.append(f"Site: {s.name}")
+            if 'surfrad' in (s.weather_source, s.solar_source):
+                _code, name, dist = WX.nearest_surfrad(s.latitude, s.longitude)
+                note = f"Nearest SURFRAD station: {name}, {dist:.0f} km away."
+                if dist > 100:
+                    note += " That is far - its weather may not be the site's."
+                notes.append(note)
+        if s.weather_source == 'weatherlink':
+            err = WX.validate_url_template(s.weatherlink_url)
+            if err:
+                notes.append(f"WeatherLink URL: {err}.")
+        self.lbl_site_info.setText("\n".join(notes))
+
+        env = self.environment
+        if env is not None and self._site_key(env.settings) != self._site_key(s):
+            self.environment = None
+            self.weather_timeline = None
+            self._weather_summary = None
+            self._set_weather_status(
+                "Site or sources changed — press Fetch Weather.", "#e5c07b")
+        self._sun_timeline = None
+        self._light_day = None
+        self._update_weather_display()
+
+    def load_site_profile(self):
+        folder = self.analysis_dir_for_db()
+        start = (folder if folder and os.path.isdir(folder)
+                 else os.path.dirname(self.db_path) if self.db_path else "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Site Profile", start,
+            "Site profile (*.json);;All Files (*.*)")
+        if not path:
+            return
+        try:
+            settings = WX.read_site_profile(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Site Profile",
+                                f"Could not read {os.path.basename(path)}:\n{e}")
+            return
+        self.apply_site_settings(settings)
+        self.log_message(f"Site profile loaded: {os.path.basename(path)}"
+                         + (f" ({settings.name})" if settings.name else ""))
+
+    def save_site_profile(self):
+        settings = self.site_settings()
+        if not settings.has_location:
+            QMessageBox.information(
+                self, "Site Profile",
+                "Enter a valid latitude and longitude before saving a profile.")
+            return
+        default = WX.SITE_PROFILE_NAME
+        folder = self.analysis_dir_for_db()
+        if folder:
+            try:
+                os.makedirs(folder, exist_ok=True)
+                default = os.path.join(folder, WX.SITE_PROFILE_NAME)
+            except OSError:
+                pass
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Site Profile", default, "Site profile (*.json)")
+        if not path:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Site Profile", "Name for this site (optional):",
+            text=settings.name)
+        if ok:
+            settings.name = name.strip()
+            self._site_name = settings.name
+        try:
+            WX.write_site_profile(path, settings)
+        except OSError as e:
+            QMessageBox.warning(self, "Site Profile", f"Could not save:\n{e}")
+            return
+        self.log_message(f"Site profile saved: {path}")
+
+    def _autoload_site_profile(self):
+        """Use the analysis folder's ``fnt_site.json`` when no site is set."""
+        folder = self.analysis_dir_for_db()
+        if not folder or self.site_settings().has_location:
+            return
+        path = os.path.join(folder, WX.SITE_PROFILE_NAME)
+        if not os.path.exists(path):
+            return
+        try:
+            settings = WX.read_site_profile(path)
+        except Exception as e:
+            self.log_message(f"Could not read {WX.SITE_PROFILE_NAME}: {e}")
+            return
+        self.apply_site_settings(settings)
+        self.log_message(f"Site profile loaded from {WX.SITE_PROFILE_NAME}"
+                         + (f" ({settings.name})" if settings.name else ""))
+
+    def _weather_job(self, settings, offline=False):
+        """A worker callable: trial span from the database, then fetch.
+
+        Reads the span of the SELECTED tags (the whole recording when none are
+        ticked). Touches no widgets, so it is safe off the GUI thread.
+        """
+        db = self.current_indexed_db() or self.db_path
+        table = self.table_name
+        tags = [t for t, cb in self.tag_checkboxes.items() if cb.isChecked()]
+        raw = getattr(self, '_preview_raw_bounds', None)
+        tz = self.combo_timezone.currentText()
+        cache = os.path.join(self.analysis_dir_for_db(), WEATHER_CACHE_DIR)
+        db_path = self.db_path
+
+        def job():
+            if raw and not tags:
+                lo, hi = raw
+            else:
+                conn = connect_ro(db)
+                try:
+                    if tags:
+                        marks = ",".join("?" * len(tags))
+                        lo, hi = conn.execute(
+                            f"SELECT MIN(timestamp), MAX(timestamp) FROM {table} "
+                            f"WHERE shortid IN ({marks})", tags).fetchone()
+                    else:
+                        lo, hi = conn.execute(
+                            f"SELECT MIN(timestamp), MAX(timestamp) FROM {table}"
+                        ).fetchone()
+                finally:
+                    conn.close()
+            if lo is None or hi is None:
+                raise ValueError("the selected tags have no records")
+            msgs = []
+            env = WX.fetch_environment(
+                settings, tz, int(lo) * 1_000_000, int(hi) * 1_000_000, cache,
+                log=msgs.append, offline=offline)
+            return {'db_path': db_path, 'env': env, 'messages': msgs,
+                    'offline': offline}
+        return job
+
+    def fetch_weather(self):
+        """Fetch Weather button: download (or reuse) for the whole recording."""
+        s = self.site_settings()
+        if not s.has_location:
+            QMessageBox.information(
+                self, "Fetch Weather",
+                "Enter the site's latitude and longitude first (or load a "
+                "site profile).")
+            return
+        if not self.db_path or not self.table_name:
+            QMessageBox.information(
+                self, "Fetch Weather",
+                "Load a database first - weather is fetched for its "
+                "recording period.")
+            return
+        if s.weather_source == 'weatherlink':
+            err = WX.validate_url_template(s.weatherlink_url)
+            if err:
+                QMessageBox.warning(self, "Fetch Weather",
+                                    f"WeatherLink URL: {err}.")
+                return
+        if self._weather_fetching:
+            return
+        self._weather_fetching = True
+        self.btn_fetch_weather.setEnabled(False)
+        self._set_weather_status("Fetching weather…", "#9aa7b4")
+        self._start_db_query(self._weather_job(s), self._on_weather_fetched,
+                             self._on_weather_failed)
+
+    def _restore_weather_from_cache(self):
+        """Rebuild the last fetch from the cache alone - no network."""
+        s = self.site_settings()
+        if (self.environment is not None or self._weather_fetching
+                or not s.has_location or not self.db_path or not self.table_name
+                or (s.weather_source == 'none' and s.solar_source == 'computed')):
+            return
+        cache = os.path.join(self.analysis_dir_for_db(), WEATHER_CACHE_DIR)
+        key = (self.db_path, self._site_key(s))
+        if not os.path.isdir(cache) or self._weather_restore_key == key:
+            return
+        self._weather_restore_key = key
+        self._weather_fetching = True
+        self._start_db_query(self._weather_job(s, offline=True),
+                             self._on_weather_fetched, self._on_weather_failed)
+
+    def _on_weather_fetched(self, res):
+        self._weather_fetching = False
+        self.btn_fetch_weather.setEnabled(True)
+        if res.get('db_path') != self.db_path:
+            return                      # the user moved on to another database
+        env = res['env']
+        if self._site_key(env.settings) != self._site_key(self.site_settings()):
+            self._set_weather_status(
+                "Settings changed while fetching — press Fetch Weather again.",
+                "#e5c07b")
+            return
+        self._install_environment(env, res.get('messages', ()),
+                                  quiet=res.get('offline', False))
+
+    def _on_weather_failed(self, err):
+        self._weather_fetching = False
+        self.btn_fetch_weather.setEnabled(True)
+        self._set_weather_status(f"Weather fetch failed: {err}", "#d9534f")
+        self.log_message(f"Weather fetch failed: {err}")
+
+    def _install_environment(self, env, messages=(), quiet=False):
+        """Adopt a fetched environment for the preview, video and export."""
+        self.environment = env
+        self.weather_timeline = env.timeline()
+        self._weather_summary = env.summary()
+        self._light_day = None
+        parts = []
+        for src, meta in env.meta.items():
+            n = len(env.frames.get(src, ()))
+            label = {'surfrad': f"SURFRAD {meta.get('station', '')}",
+                     'open_meteo': "Open-Meteo",
+                     'weatherlink': "WeatherLink"}.get(src, src)
+            parts.append(f"{label}: {n:,} records")
+        wl = env.meta.get('weatherlink') or {}
+        if wl.get('temp_unit_used'):
+            parts.append(f"station temperatures read as °{wl['temp_unit_used']}"
+                         + (" (checked)" if wl.get('temp_unit_detected')
+                            == wl['temp_unit_used'] else ""))
+        head = ("✓ Weather from cache" if quiet else "✓ Weather ready")
+        status = head + (" — " + "; ".join(parts) if parts else
+                         " — sun position only")
+        mismatch = [w for w in env.warnings if w.startswith("UNIT MISMATCH")]
+        if mismatch:
+            self._set_weather_status("⚠ " + mismatch[0], "#d9534f")
+        else:
+            if env.warnings:
+                status += f"  ({len(env.warnings)} warning(s), see log)"
+            self._set_weather_status(status,
+                                     "#e5c07b" if env.warnings else "#5cb85c")
+        if not quiet:
+            for m in messages:
+                self.log_message(m)
+        self.log_message(status)
+        for w in env.warnings:
+            self.log_message(f"  ⚠ Weather: {w}")
+        self._update_weather_display()
+
+    def _display_timeline(self):
+        """The fetched timeline, or a sun-only one when only the site is set."""
+        if self.weather_timeline is not None:
+            return self.weather_timeline
+        s = self.site_settings()
+        if not s.has_location:
+            return None
+        key = (s.latitude, s.longitude)
+        if self._sun_timeline is None or self._sun_timeline[0] != key:
+            env = WX.Environment(
+                settings=WX.SiteSettings(latitude=s.latitude, longitude=s.longitude),
+                tz=self.combo_timezone.currentText(), start_ns=0, end_ns=0)
+            self._sun_timeline = (key, env.timeline())
+        return self._sun_timeline[1]
+
+    def _update_weather_display(self, *_):
+        """Weather line and light bar for the playhead."""
+        if not hasattr(self, 'lbl_preview_weather') or not hasattr(self, 'chk_show_weather'):
+            return
+        show_w = self.chk_show_weather.isChecked()
+        show_l = self.chk_show_light_bar.isChecked()
+        self.lbl_preview_weather.setVisible(show_w)
+        self.light_bar.setVisible(show_l)
+        if not (show_w or show_l):
+            return
+        tl = self._display_timeline()
+        if tl is None or self.preview_t0 is None:
+            self.lbl_preview_weather.setText(
+                "Weather: set the site in Weather Settings…" if tl is None else "")
+            self.light_bar.clear()
+            return
+        t_ns = int(self.preview_playhead_ms) * 1_000_000
+        state = tl.at(t_ns)
+        if show_w:
+            env = self.environment
+            if env is None:
+                txt = ("Weather: not fetched — press Fetch Weather "
+                       "(Weather Settings…)")
+            elif not env.roles.get('weather'):
+                txt = "Weather: no weather source selected"
+            else:
+                units = self.combo_weather_units.currentData()
+                txt = html.escape(WX.format_weather(state, units)
+                                  or "Weather: no record near this time")
+                pr = WX.format_precip(state, units)
+                if pr:
+                    kind = (state.get('weather') or {}).get('precip_type') or 'rain'
+                    col = {'rain': '#5aa0ff', 'snow': '#e8f1ff',
+                           'mixed': '#b89cff'}.get(kind, '#5aa0ff')
+                    esc = html.escape(pr)
+                    txt = txt.replace(
+                        esc, f"<b style='color:{col}'>{esc}</b>", 1)
+                if any(w.startswith("UNIT MISMATCH") for w in env.warnings):
+                    txt += ("  <b style='color:#d9534f'>⚠ temperature unit "
+                            "mismatch — see Weather Settings</b>")
+            self.lbl_preview_weather.setText(txt)
+        if show_l:
+            tz = self.combo_timezone.currentText()
+            day = pd.Timestamp(t_ns, tz='UTC').tz_convert(tz).normalize()
+            key = (day, id(tl))
+            if self._light_day != key:
+                nxt = (day.tz_localize(None) + pd.Timedelta(days=1)).tz_localize(
+                    tz, ambiguous=True, nonexistent='shift_forward')
+                n = int(max(96, min(480, self.light_bar.width() // 2)))
+                _t, levels, moon = tl.light_strip(day.value, nxt.value, n)
+                rate, kind = tl.precip_strip(day.value, nxt.value, n)
+                self.light_bar.set_day(
+                    levels, WX.light_rgb,
+                    [(h / 24.0, str(h)) for h in (6, 12, 18)], moon=moon,
+                    precip=[WX.precip_rgba(r, k) for r, k in zip(rate, kind)])
+                self._light_day = key
+                self._light_span = (day.value, nxt.value)
+            a, b = self._light_span
+            poly = (WX.moon_disc_polygon(state['moon_illumination'],
+                                         state['moon_waxing'], state['southern'])
+                    if np.isfinite(state['moon_illumination']) else None)
+            self.light_bar.set_now((t_ns - a) / max(b - a, 1), state['light'],
+                                   WX.format_light(state), moon_poly=poly,
+                                   moon_up=state.get('moon_up', True))
+
+    def _fetch_environment_now(self, settings):
+        """Run the Fetch Weather job and wait for it, keeping the window live.
+
+        Used by the export steps, which need the records before they go on.
+        Adopts the result for the preview too. Returns the environment, or
+        None on failure or cancel.
+        """
+        box = {}
+        self._weather_fetching = True
+        self._start_db_query(self._weather_job(settings),
+                             lambda r: box.setdefault('res', r),
+                             lambda e: box.setdefault('err', e))
+        while not box and not self.export_cancelled:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        self._weather_fetching = False
+        if 'err' in box:
+            self.log_message(f"Weather fetch failed: {box['err']}")
+            return None
+        if 'res' not in box:
+            return None
+        env = box['res']['env']
+        for m in box['res'].get('messages', ()):
+            self.log_message(m)
+        for w in env.warnings:
+            self.log_message(f"  ⚠ Weather: {w}")
+        if self._site_key(env.settings) == self._site_key(self.site_settings()):
+            self.environment = env
+            self.weather_timeline = env.timeline()
+            self._light_day = None
+        self._weather_summary = env.summary()
+        return env
+
+    def _export_weather(self, output_dir, db_name, skip_existing=False):
+        """Write {db}_weather.csv and {db}_daylight.csv. Returns False to abort."""
+        s = self.site_settings()
+        w_name, d_name = f'{db_name}_weather.csv', f'{db_name}_daylight.csv'
+        if not s.has_location:
+            self.log_message(
+                "Weather export skipped: set the site's latitude/longitude "
+                "in Preview → Weather Settings….")
+            return True
+        w_path = os.path.join(csv_output_dir(output_dir, create=True), w_name)
+        d_path = os.path.join(csv_output_dir(output_dir, create=True), d_name)
+        if skip_existing and os.path.exists(w_path) and os.path.exists(d_path):
+            self.log_message(f"Skipped (exists): {w_name}, {d_name}")
+            return True
+
+        env = self._fetch_environment_now(s)
+        if env is None:
+            return True
+
+        wf = WX.export_frame(env)
+        if len(wf):
+            dup = wf.duplicated(['source', 'timestamp']).sum()
+            mono = all(g['timestamp'].is_monotonic_increasing
+                       for _k, g in wf.groupby('source'))
+            rh = wf['rh_pct'].dropna()
+            temp = wf['temp_c'].dropna()
+            self.log_audit(w_name, [
+                (bool(dup == 0), "one record per source per timestamp"),
+                (bool(mono), "records are in time order within each source"),
+                (bool(((rh >= 0) & (rh <= 105)).all()),
+                 "relative humidity within 0-105%"),
+                (bool(((temp > -70) & (temp < 65)).all()),
+                 "air temperature within -70..65 °C"),
+                (True, "sources: " + ", ".join(
+                    f"{k} ({v:,})" for k, v in wf['source'].value_counts().items())),
+            ])
+            if not self.write_verified_csv(wf, w_path, self._WEATHER_NUMERIC_COLS):
+                return False
+            self.log_message(f"✓ Exported {w_name} ({len(wf):,} records)")
+        elif env.frames:
+            self.log_message(f"{w_name}: the selected sources returned no "
+                             "records for this recording.")
+        else:
+            self.log_message(f"{w_name} not written: no weather or sunlight "
+                             "source selected (sun position only).")
+
+        dl = WX.daylight_table(s.latitude, s.longitude,
+                               self.combo_timezone.currentText(),
+                               env.start_ns, env.end_ns)
+        for col in dl.columns:
+            if pd.api.types.is_datetime64_any_dtype(dl[col]):
+                dl[col] = dl[col].dt.round('s')
+        if not self.write_verified_csv(dl, d_path, ('Day', 'day_length_h',
+                                                    'max_elevation_deg')):
+            return False
+        self.log_message(f"✓ Exported {d_name} ({len(dl)} day(s))")
+        self.save_config(output_dir)
+        return True
 
     def _build_preview_options_group(self):
         """All preview configuration, as a group for the left settings column.
@@ -6482,6 +7290,53 @@ class UWBQuickVisualizationWindow(QWidget):
             "its marker. Independent of 'Show Tag ID'. Off by default.")
         self.chk_show_battery.stateChanged.connect(self.on_marker_style_changed)
         v.addWidget(self.chk_show_battery)
+
+        # Weather and sunlight for the playhead, from Site & Weather.
+        wx_row = QHBoxLayout()
+        self.chk_show_weather = QCheckBox("Show Weather")
+        self.chk_show_weather.setChecked(False)
+        self.chk_show_weather.setToolTip(
+            "Print the weather at the playhead under the timestamp: "
+            "temperature, humidity, wind, pressure and precipitation, from "
+            "the source chosen in Weather Settings… (press Fetch Weather "
+            "there first).\n\n"
+            "PRECIPITATION leads the line and is highlighted: RAIN, SNOW or "
+            "RAIN/SNOW with its rate. Open-Meteo reports rain and snowfall "
+            "separately; for a station the kind is estimated from the "
+            "wet-bulb temperature and marked (est.). A tipping-bucket gauge "
+            "only registers snow as it melts. SURFRAD has no precipitation "
+            "sensor.\n\n"
+            "Each value is the source's average for the interval containing "
+            "the moment shown (1 min SURFRAD, ~5 min WeatherLink, 15 min "
+            "Open-Meteo). A gap in the record is flagged with its age rather "
+            "than shown as current.")
+        self.chk_show_light_bar = QCheckBox("Show Light Bar")
+        self.chk_show_light_bar.setChecked(False)
+        self.chk_show_light_bar.setToolTip(
+            "A strip under the timestamp spanning the current local day, "
+            "brightening and darkening with the sunlight; the red mark is the "
+            "playhead. Measured irradiance when a sunlight source was fetched, "
+            "clear-sky from the sun's position otherwise, with a dim glow "
+            "through civil/nautical/astronomical twilight.\n\n"
+            "MOON: stretches of night with the moon up are tinted silver in "
+            "proportion to how full and how high it is, and the icon at the "
+            "right end shows the current phase (faded while the moon is "
+            "below the horizon). The readout gives its illuminated fraction, "
+            "phase name and elevation.\n\n"
+            "Needs only the site's latitude/longitude.")
+        for cb in (self.chk_show_weather, self.chk_show_light_bar):
+            cb.stateChanged.connect(self._update_weather_display)
+            cb.stateChanged.connect(self._sync_anim_show_options)
+            cb.stateChanged.connect(self._sync_weather_button)
+            cb.clicked.connect(self._on_weather_toggle_clicked)
+            wx_row.addWidget(cb)
+        wx_row.addStretch(1)
+        self.btn_weather_settings = QPushButton("Weather Settings…")
+        self.btn_weather_settings.setToolTip(self._WEATHER_BUTTON_TIP)
+        self.btn_weather_settings.setEnabled(False)
+        self.btn_weather_settings.clicked.connect(self.open_weather_settings)
+        wx_row.addWidget(self.btn_weather_settings)
+        v.addLayout(wx_row)
 
         # Per-fix kinematics under the marker, measured on the track AS DRAWN:
         # they follow the smoothing method, and "None" makes them the unsmoothed
@@ -8834,6 +9689,7 @@ class UWBQuickVisualizationWindow(QWidget):
             pytz.timezone(self.combo_timezone.currentText()))
         cached = "" if self.preview_current_chunk in self.preview_cache else "  (loading…)"
         self.lbl_preview_time.setText(f"{ts:%Y-%m-%d %H:%M:%S}{cached}")
+        self._update_weather_display()
 
     def _frame_index(self):
         """Index into the active chunk for the current playhead time."""
@@ -11244,6 +12100,18 @@ class UWBQuickVisualizationWindow(QWidget):
             self.on_rois_changed()
         self.anchor_positions = []
 
+        # Weather belongs to a trial's span and site; the next trial brings
+        # its own (config or fnt_site.json).
+        self.environment = None
+        self.weather_timeline = None
+        self._weather_summary = None
+        self._sun_timeline = None
+        self._light_day = None
+        self._weather_restore_key = None
+        if hasattr(self, 'edit_site_lat'):
+            self.apply_site_settings(WX.SiteSettings())
+            self._set_weather_status("")
+
         # Drop all cached preview chunks so nothing leaks across databases. The
         # pane stays visible but goes inert until the new database's tags load.
         self._preview_active = False
@@ -11287,6 +12155,8 @@ class UWBQuickVisualizationWindow(QWidget):
             self._timeline_guard = False
             self.lbl_preview_status.setText("Load a database and select tags to preview")
             self.lbl_preview_time.setText("--")
+            self.lbl_preview_weather.setText("")
+            self.light_bar.clear()
             self._update_cache_label()
             self._set_index_status("Fast index: not built", "#cccccc")
             self.preview_canvas_2d.clear()
@@ -11510,6 +12380,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Load config BEFORE populating combo_table, so that pending_tag_selection
             # is set before on_table_selected() triggers tag checkbox creation
             config_loaded = self.load_config_if_exists()
+            self._autoload_site_profile()
             if config_loaded:
                 self.lbl_config_status.setText("Loaded previous fnt_config.json file.")
                 self.lbl_config_status.setVisible(True)
@@ -12946,6 +13817,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # Apply pending tag selection from loaded config
         self.apply_pending_tag_selection()
 
+        # A trial fetched before comes back from its cache, without a network.
+        QTimer.singleShot(0, self._restore_weather_from_cache)
+
         # Update identity button state
         self.update_identity_button_state()
 
@@ -13354,6 +14228,14 @@ class UWBQuickVisualizationWindow(QWidget):
             'export_roi_bouts': self.chk_export_roi_bouts.isChecked(),
             'export_roi_daily': self.chk_export_roi_daily.isChecked(),
             'export_behavior_events': self.chk_export_behavior.isChecked(),
+            'export_weather': self.chk_export_weather.isChecked(),
+            # Where the trial was recorded and which weather/sunlight sources
+            # were used. Typed by the user or loaded from their own profile.
+            'site': self.site_settings().to_dict(),
+            'weather_display_units': self.combo_weather_units.currentData(),
+            # What the last fetch actually retrieved: station, distance,
+            # record counts, and every file's URL, retrieval time and sha256.
+            'weather_sources': self._weather_summary,
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
@@ -13372,7 +14254,9 @@ class UWBQuickVisualizationWindow(QWidget):
                     ('chk_anim_show_behavior', 'behavior'),
                     ('chk_anim_beh_social', 'social'),
                     ('chk_anim_beh_chase', 'chase'),
-                    ('chk_anim_beh_displace', 'displace'))
+                    ('chk_anim_beh_displace', 'displace'),
+                    ('chk_anim_show_weather', 'weather'),
+                    ('chk_anim_show_light', 'light'))
                 if hasattr(self, attr)},
             'animation_speed': self.combo_animation_speed.currentText(),
             'animation_fps': self.combo_animation_fps.currentText(),
@@ -13445,6 +14329,8 @@ class UWBQuickVisualizationWindow(QWidget):
         'show_battery': ('chk_show_battery', 'checked'),
         'show_speed': ('chk_show_speed', 'checked'),
         'show_step': ('chk_show_step', 'checked'),
+        'show_weather': ('chk_show_weather', 'checked'),
+        'show_light_bar': ('chk_show_light_bar', 'checked'),
         'time_gap': ('spin_time_gap', 'value'),
         # Pinned drawing window. Persisted here because it now governs the
         # exports too, so a trial must reopen framed the way it was exported.
@@ -13821,7 +14707,9 @@ class UWBQuickVisualizationWindow(QWidget):
                                    ('chk_anim_show_behavior', 'behavior'),
                                    ('chk_anim_beh_social', 'social'),
                                    ('chk_anim_beh_chase', 'chase'),
-                                   ('chk_anim_beh_displace', 'displace')):
+                                   ('chk_anim_beh_displace', 'displace'),
+                                   ('chk_anim_show_weather', 'weather'),
+                                   ('chk_anim_show_light', 'light')):
                     cb = getattr(self, attr, None)
                     if cb is not None and name in saved_layers:
                         on = bool(saved_layers[name])
@@ -13829,6 +14717,15 @@ class UWBQuickVisualizationWindow(QWidget):
                         # A saved 'off' is a deliberate clear, so re-syncing
                         # from the preview must not turn it back on.
                         cb._user_cleared = not on
+
+            if 'export_weather' in config:
+                self.chk_export_weather.setChecked(bool(config['export_weather']))
+            if isinstance(config.get('site'), dict):
+                self.apply_site_settings(WX.SiteSettings.from_dict(config['site']))
+            if config.get('weather_display_units'):
+                i = self.combo_weather_units.findData(config['weather_display_units'])
+                if i >= 0:
+                    self.combo_weather_units.setCurrentIndex(i)
 
             if 'export_raw_csv' in config:
                 self.chk_export_raw_csv.setChecked(config['export_raw_csv'])
@@ -14201,6 +15098,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Which ID the labels show (SexID / Name / Code / HexID /
             # ShortID), frozen with the rest so a queued render can't change.
             'tag_id_type': normalize_id_type(self.combo_tag_id_type.currentText()),
+            'weather_units': self.combo_weather_units.currentData(),
             'gap_s': self.spin_time_gap.value(),
             'layers': self.anim_layer_flags(),
             'animation_tags': (list(self._animation_tags)
@@ -14257,6 +15155,8 @@ class UWBQuickVisualizationWindow(QWidget):
         ('chk_anim_beh_social', 'chk_beh_social'),
         ('chk_anim_beh_chase', 'chk_beh_chase'),
         ('chk_anim_beh_displace', 'chk_beh_displace'),
+        ('chk_anim_show_weather', 'chk_show_weather'),
+        ('chk_anim_show_light', 'chk_show_light_bar'),
     )
 
     def _anim_show(self, name):
@@ -14302,6 +15202,8 @@ class UWBQuickVisualizationWindow(QWidget):
             'social': self._anim_show('chk_anim_beh_social'),
             'chase': self._anim_show('chk_anim_beh_chase'),
             'displace': self._anim_show('chk_anim_beh_displace'),
+            'weather': self._anim_show('chk_anim_show_weather'),
+            'light': self._anim_show('chk_anim_show_light'),
         }
 
     def _animation_behavior(self, data, tags, flags=None):
@@ -14956,6 +15858,28 @@ class UWBQuickVisualizationWindow(QWidget):
                 # panel is worth far less than the video.
                 self.log_message(f"Warning: Data View skipped ({e})")
 
+        environment = None
+        if layers_on.get('weather') or layers_on.get('light'):
+            site = self.site_settings()
+            wants_sources = not (site.weather_source == 'none'
+                                 and site.solar_source == 'computed')
+            if (site.has_location and wants_sources and self.environment is None
+                    and self.db_path and self.table_name):
+                if getattr(self, '_clip_rendering', False):
+                    self.set_clip_progress("Building preview: fetching weather…")
+                self.log_message("Fetching weather for the animation overlay...")
+                self._fetch_environment_now(site)
+            environment = self._display_timeline()
+            if environment is None:
+                self.log_message(
+                    "Weather/light overlay skipped: no site latitude/longitude "
+                    "(Weather Settings).")
+            elif layers_on.get('weather') and self.environment is None:
+                self.log_message(
+                    "Weather line skipped: no weather records (check the "
+                    "source in Weather Settings); the light bar uses the "
+                    "sun's position only.")
+
         return uwb_animation.render_animation(
             data, video_output_path,
             frame_interval=frame_interval, trailing_window=trailing_window, fps=fps,
@@ -14976,6 +15900,11 @@ class UWBQuickVisualizationWindow(QWidget):
             show_trail=layers_on.get('trail', True),
             show_labels=layers_on.get('tag_id', True),
             time_range=time_range, data_view=data_view,
+            environment=environment,
+            show_weather=bool(layers_on.get('weather')
+                              and self.environment is not None),
+            show_light=bool(layers_on.get('light')),
+            weather_units=s.get('weather_units', 'metric'),
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
@@ -15901,6 +16830,10 @@ class UWBQuickVisualizationWindow(QWidget):
     #: Columns of the behaviour-events CSV that must parse as numbers.
     _BEHAVIOR_NUMERIC_COLS = ('Day', 'duration_s', 'n_frames', 'n_fixes')
 
+    #: Columns of the weather CSV that must parse as numbers.
+    _WEATHER_NUMERIC_COLS = ('timestamp', 'interval_s', *WX.FIELDS,
+                             'sun_elevation_deg', 'sun_azimuth_deg')
+
     def verify_smoothed_csv(self, path, chunksize=2_000_000, numeric_cols=None):
         """Check every numeric column of the written CSV actually parses.
 
@@ -16151,6 +17084,9 @@ class UWBQuickVisualizationWindow(QWidget):
                 predicted_files.append(f'{db_name}_ROI_bout_occupancy.csv')
             if self.chk_export_roi_daily.isChecked():
                 predicted_files.append(f'{db_name}_ROI_DailySummary.csv')
+        if self.chk_export_weather.isChecked():
+            predicted_files.append(f'{db_name}_weather.csv')
+            predicted_files.append(f'{db_name}_daylight.csv')
 
         predicted_sna_files = []   # social-network animation was removed
 
@@ -16285,13 +17221,14 @@ class UWBQuickVisualizationWindow(QWidget):
         export_roi_bouts = self.chk_export_roi_bouts.isChecked()
         export_roi_daily = self.chk_export_roi_daily.isChecked()
         export_zone_occupancy = export_roi_bouts or export_roi_daily
+        export_weather = self.chk_export_weather.isChecked()
         social_animation = False   # social-network animation was removed
         # Frozen at export start so mid-export clicks can't change them.
 
         if not (export_raw_csv or export_smoothed_csv or save_plots
                 or save_animation or detect_proximity
                 or export_zone_occupancy or export_behavior
-                or social_animation):
+                or export_weather or social_animation):
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
 
@@ -16996,6 +17933,21 @@ class UWBQuickVisualizationWindow(QWidget):
                             "Error: No smoothed data available for behaviour events")
                 except Exception as e:
                     self.log_message(f"Error during behaviour-event export: {e}")
+                    import traceback
+                    traceback.print_exc()
+                self.log_message("=" * 50)
+
+            # Weather and daylight: cheap, and independent of the tracks.
+            if export_weather and not self.export_cancelled:
+                self.log_message("=" * 50)
+                self.log_message("Weather and daylight...")
+                self.lbl_export_progress.setText("Fetching weather and daylight...")
+                QApplication.processEvents()
+                try:
+                    if not self._export_weather(output_dir, db_name, skip_existing):
+                        return
+                except Exception as e:
+                    self.log_message(f"Error during weather export: {e}")
                     import traceback
                     traceback.print_exc()
                 self.log_message("=" * 50)

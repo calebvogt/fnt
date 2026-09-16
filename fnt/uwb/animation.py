@@ -205,6 +205,53 @@ def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
 
+def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):
+    """Per-frame weather line and light bar (blitted like everything else)."""
+    from fnt.uwb import weather as wx
+    t_ns = frame_start.value
+    state = timeline.at(t_ns)
+    if weather_artist is not None:
+        weather_artist.set_text(wx.format_weather(state, units)
+                                or "weather: no record near this time")
+        fig.draw_artist(weather_artist)
+    if light is None:
+        return
+    day = frame_start.normalize()
+    if light['day'] != day:
+        nxt = (day.tz_localize(None) + pd.Timedelta(days=1))
+        nxt = (nxt.tz_localize(day.tz, ambiguous=True, nonexistent='shift_forward')
+               if day.tz is not None else nxt)
+        _t, levels, moon = timeline.light_strip(day.value, nxt.value, 480)
+        rgb = np.array([wx.light_rgb(v if np.isfinite(v) else 0.0, m)
+                        for v, m in zip(levels, moon)])[None, :, :]
+        light['strip'].set_data(rgb)
+        rate, kind = timeline.precip_strip(day.value, nxt.value, 480)
+        band = np.zeros((1, len(rate), 4))
+        for i, (r, k) in enumerate(zip(rate, kind)):
+            c = wx.precip_rgba(r, k)
+            if c is not None:
+                band[0, i] = c
+        light['precip'].set_data(band)
+        light['day'] = day
+        light['span'] = (day.value, nxt.value)
+    a, b = light['span']
+    f = (t_ns - a) / max(b - a, 1)
+    light['cursor'].set_xdata([f, f])
+    light['text'].set_text(wx.format_light(state))
+    lax = light['ax']
+    for key in ('strip', 'precip', 'ticks', 'cursor', 'text'):
+        lax.draw_artist(light[key])
+    k = state.get('moon_illumination', np.nan)
+    if np.isfinite(k):
+        light['moon_lit'].set_xy(wx.moon_disc_polygon(
+            k, state.get('moon_waxing', True), state.get('southern', False)))
+        alpha = 1.0 if state.get('moon_up', True) else 0.5
+        light['moon_disc'].set_alpha(alpha)
+        light['moon_lit'].set_alpha(alpha)
+        light['moon_ax'].draw_artist(light['moon_disc'])
+        light['moon_ax'].draw_artist(light['moon_lit'])
+
+
 def compute_axis_limits(data, layers=None, bg_extent=None, pad_frac=0.05):
     """(x_min, x_max, y_min, y_max) spanning the data (+ background) with padding."""
     x_min, x_max = data['smoothed_x'].min(), data['smoothed_x'].max()
@@ -230,6 +277,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      label_color=None, label_outline=True,
                      axis_limits=None, behavior=None, show_trail=True,
                      show_labels=True, time_range=None, data_view=None,
+                     environment=None, show_weather=False, show_light=False,
+                     weather_units="metric",
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -253,6 +302,12 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     The classification grid is independent of the video frame rate: each video
     frame takes the classification row nearest its own timestamp, so the
     overlay stays correct whatever speed the video is rendered at.
+
+    ``environment`` is a ``weather.WeatherTimeline``. With ``show_weather``
+    each frame prints the weather record covering its moment above the
+    title; with ``show_light`` a strip of the current local day's sunlight is
+    drawn across the top with the moment marked. The figure grows taller for
+    them rather than shrinking the arena.
 
     Callbacks (all optional):
         is_cancelled() -> bool : checked before each frame; True aborts.
@@ -354,10 +409,18 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         rows = (2 + n_a) + 2 + (2 + dyad_rows)
         fs = DVP._fit_fontsize(rows, fig_h)
         panel_w = DVP.panel_width_in(n_a, n_r, fs, dyad_mode)
-    fig = Figure(figsize=(arena_w + panel_w, fig_h), dpi=dpi)
+    if environment is None:
+        show_weather = show_light = False
+    band_w = 0.34 if show_weather else 0.0
+    band_l = 0.34 if show_light else 0.0
+    total_h = fig_h + band_w + band_l
+    px = int(round(total_h * dpi))
+    total_h = (px + px % 2) / dpi   # even pixel height, for video encoders
+    vs = fig_h / total_h          # the original layout, in the lower fig_h
+    fig = Figure(figsize=(arena_w + panel_w, total_h), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
     frac = arena_w / (arena_w + panel_w)
-    ax = fig.add_axes([0.08 * frac, 0.08, 0.86 * frac, 0.86])
+    ax = fig.add_axes([0.08 * frac, 0.08 * vs, 0.86 * frac, 0.86 * vs])
     ax.grid(False)
 
     # Draw the unchanging scene (background image, zones, anchors, axes) ONCE and
@@ -379,7 +442,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # numbers are redrawn per frame.
     if data_view:
         panel = DVP.DataViewPanel(
-            fig, [frac + 0.012, 0.06, (1.0 - frac) - 0.024, 0.88],
+            fig, [frac + 0.012, 0.06 * vs, (1.0 - frac) - 0.024, 0.88 * vs],
             data_view['animals'], data_view.get('roi_names') or [],
             data_view.get('occupancy') or {},
             data_view.get('overlaps') or {},
@@ -388,6 +451,61 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
             bg_color=data_view.get('bg_color', '#1b1b1b'),
             accent=data_view.get('accent', '#ffd166'),
             dyad_mode=dyad_mode)
+
+    # Weather line and light bar, in the band added above the title.
+    weather_artist = None
+    light = None
+    if show_weather:
+        weather_artist = fig.text(
+            0.5, (fig_h + 0.08) / total_h, "", ha='center', va='bottom',
+            fontsize=11, family='monospace', animated=True)
+    if show_light:
+        from fnt.uwb import weather as _wx
+        y0 = (fig_h + band_w + 0.06) / total_h
+        lax = fig.add_axes([0.08 * frac, y0, 0.86 * frac, 0.22 / total_h])
+        lax.set_xlim(0, 1)
+        lax.set_ylim(0, 1)
+        lax.set_xticks([])
+        lax.set_yticks([])
+        strip = lax.imshow(np.zeros((1, 2, 3)), extent=(0, 1, 0, 1),
+                           aspect='auto', interpolation='bilinear',
+                           animated=True)
+        ticks = LineCollection([[(f, 0), (f, 0.25)] for f in (0.25, 0.5, 0.75)],
+                               colors=[(0.5, 0.5, 0.5, 0.8)], linewidths=0.8,
+                               animated=True)
+        lax.add_collection(ticks)
+        precip_img = lax.imshow(np.zeros((1, 2, 4)), extent=(0, 1, 0, 0.26),
+                                aspect='auto', interpolation='nearest',
+                                animated=True)
+        cursor = lax.axvline(0, color='#e0322b', linewidth=2.0, animated=True)
+        ltext = lax.text(0.006, 0.5, "", transform=lax.transAxes,
+                         ha='left', va='center', fontsize=9, color='#f2f2f2',
+                         family='monospace', animated=True,
+                         bbox=dict(boxstyle='round,pad=0.25',
+                                   fc=(0, 0, 0, 0.6), ec='none'))
+        fig_w = arena_w + panel_w
+        mox = fig.add_axes([0.94 * frac + 0.006, y0 - 0.03 / total_h,
+                            0.28 / fig_w, 0.28 / total_h])
+        mox.set_xlim(-1.15, 1.15)
+        mox.set_ylim(-1.15, 1.15)
+        mox.set_aspect('equal')
+        mox.axis('off')
+        # A dark backing that never fades, so the icon reads on any figure
+        # background even while the moon is down.
+        mox.add_patch(Circle((0, 0), 1.14, facecolor=(0, 0, 0, 0.6),
+                             edgecolor='none'))
+        moon_disc = Circle((0, 0), 1.0, facecolor='#2b3040',
+                           edgecolor='#8a8f9c', linewidth=0.6, animated=True)
+        moon_lit = MplPolygon(np.zeros((3, 2)), closed=True,
+                              facecolor='#f1efe4', edgecolor='none',
+                              animated=True)
+        mox.add_patch(moon_disc)
+        mox.add_patch(moon_lit)
+        light = {'ax': lax, 'strip': strip, 'precip': precip_img,
+                 'ticks': ticks,
+                 'cursor': cursor, 'text': ltext, 'day': None,
+                 'span': (0, 1), 'wx': _wx, 'moon_ax': mox,
+                 'moon_disc': moon_disc, 'moon_lit': moon_lit}
 
     canvas.draw()
     width, height = canvas.get_width_height()
@@ -513,6 +631,9 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
         title_artist.set_text(title_text)
         ax.draw_artist(title_artist)
+        if weather_artist is not None or light is not None:
+            _draw_environment(environment, frame_start, weather_artist, light,
+                              weather_units, fig)
 
         for tag, tag_info in tag_data_dict.items():
             trail_line, marker, label, batt_label, readout_label = dyn[tag]
