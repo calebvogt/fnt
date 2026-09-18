@@ -199,8 +199,15 @@ class SampleSpec:
         channels in ``channels``; ``'pool'`` ignores channels entirely, which is
         right for single-mic sets and wrong for these.
     ``spacing``
-        ``'stride'`` for even coverage, ``'random'`` with ``seed`` when an
-        unbiased draw actually matters.
+        ``'stride'`` for even coverage, ``'random'`` when an unbiased draw
+        actually matters.
+    ``seed``
+        Optional, and ``None`` from the import dialog, which draws from
+        entropy: choosing which recordings to look at is not an analysis step,
+        and no one has ever needed to reproduce a draw. Still honoured when
+        set, because the CLI's ``--sample-seed`` is a scripting surface where
+        a repeatable corpus is a reasonable thing to ask for. An older
+        project's recorded seed reads back fine either way.
     """
 
     def __init__(self, per: str = "folder", n: int = 20,
@@ -238,7 +245,8 @@ class SampleSpec:
             return "all recordings"
         where = "per folder" if self.per == "folder" else "in total"
         how = ("evenly spaced" if self.spacing == "stride"
-               else f"random (seed {self.seed})")
+               else f"random (seed {self.seed})" if self.seed is not None
+               else "random")
         chan = {"spread": "spread across channels",
                 "pool": "channels pooled",
                 "only": "channels " + ", ".join(self.channels or ("—",)),

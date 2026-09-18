@@ -9,6 +9,13 @@ with the confirmed-mask gallery.
 
 Rejections are supervision. They are the mistakes the model actually made, and
 they train it as hard negatives.
+
+It went wrong a second way later, and worse: "no cache entry" was read as
+"never analyzed", when the cache is filled in asynchronously and a missing
+entry usually just means the scan has not got there yet. That cleared a
+443-recording project down to 6. Emptiness now has to be established by the
+scan -- ``_counts_scanned`` -- so the fake window below carries one. See
+tests/mad/test_clear_list_safety.py.
 """
 import os
 
@@ -26,16 +33,21 @@ def classifier():
     return MADMainWindow._files_without_detections
 
 
-def _window(counts_by_name, names):
+def _window(counts_by_name, names, scanned=None):
+    """``scanned`` defaults to every name: the state after the scan finishes,
+    which is the only state the clear dialog now offers pruning in. Pass a
+    subset to model a scan still in flight."""
     class W:
         audio_files = [f"/rec/{n}" for n in names]
         _file_count_cache = dict(counts_by_name)
+        _counts_scanned = set(names if scanned is None else scanned)
+        _counts_complete = scanned is None
     return W()
 
 
-def _clearable(classifier, counts, names):
+def _clearable(classifier, counts, names, scanned=None):
     return sorted(os.path.basename(p)
-                  for p in classifier(_window(counts, names)))
+                  for p in classifier(_window(counts, names, scanned)))
 
 
 def test_a_recording_with_only_rejections_is_kept(classifier):
@@ -45,9 +57,18 @@ def test_a_recording_with_only_rejections_is_kept(classifier):
 
 
 def test_never_analyzed_is_clearable(classifier):
-    """No cache entry at all — nothing has ever looked at this recording."""
+    """No cache entry, but the scan probed it and found no sidecar — so this
+    really is a recording nothing has ever looked at."""
     got = _clearable(classifier, {}, ["fresh.wav"])
     assert got == ["fresh.wav"]
+
+
+def test_not_yet_scanned_is_not_clearable(classifier):
+    """The same empty cache entry, but the scan has not reached it. Identical
+    to the case above from the cache alone, and the opposite answer: this is
+    the distinction whose absence cost a project 437 recordings."""
+    got = _clearable(classifier, {}, ["fresh.wav"], scanned=[])
+    assert got == []
 
 
 def test_analyzed_and_silent_is_clearable(classifier):

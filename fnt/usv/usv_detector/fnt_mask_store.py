@@ -605,7 +605,15 @@ PRED_GROUP = "pred_calls"
 #: UI's min-score filter and the "which model produced this" record could not be
 #: answered from the h5 at all. Storing them here is what lets the CSV become a
 #: derived export rather than something that has to be kept in sync.
-PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels")
+#: ``harmonic_*``/``f0_hz`` join the list so a grouping computed at inference
+#: time SURVIVES. Grouping used to run only from the review GUI, which writes
+#: it into an example's metadata — and a freshly-inferred detection is not an
+#: example yet, it is a crop, so the assignment lived in memory and was gone on
+#: the next file switch. Running it per recording during a batch is the whole
+#: point of the inference toggle, and that needs somewhere on the crop to put
+#: the answer.
+PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
+              "harmonic_call_id", "harmonic_n", "f0_hz")
 
 
 @_reporting_write
@@ -762,6 +770,49 @@ def list_pred_ids(h5_path: str) -> List[str]:
             return list(grp.keys()) if grp is not None else []
     except Exception:
         return []
+
+
+@_reporting_write
+def update_pred_attrs(h5_path: str, updates: Dict[str, Dict]) -> int:
+    """Set attributes on stored prediction crops, one file open.
+
+    ``updates`` is ``{blob_id: {attr: value}}``; only names in
+    :data:`PRED_ATTRS` are written, so this cannot invent a field the readers
+    do not know about. A value of ``None`` or ``""`` REMOVES the attribute
+    rather than storing an empty one — that is how a regrouping clears a call
+    id from a detection it no longer applies to, which storing "" would leave
+    looking like a real (blank) assignment.
+
+    Masks are untouched: the alternative for a metadata-only change is
+    :func:`write_pred_masks`, which rewrites every crop in the file. Returns
+    the number of crops actually changed; ids not present are skipped, since a
+    crop can legitimately have been deleted between computing and writing.
+    """
+    _require_h5()
+    if not updates or not os.path.isfile(h5_path):
+        return 0
+    n = 0
+    with h5py.File(h5_path, "a") as f:
+        grp = f.get(PRED_GROUP)
+        if grp is None:
+            return 0
+        for blob_id, attrs in updates.items():
+            ds = grp.get(str(blob_id))
+            if ds is None:
+                continue
+            touched = False
+            for k, v in (attrs or {}).items():
+                if k not in PRED_ATTRS:
+                    continue
+                if v is None or v == "":
+                    if k in ds.attrs:
+                        del ds.attrs[k]
+                        touched = True
+                    continue
+                ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+                touched = True
+            n += bool(touched)
+    return n
 
 
 def read_pred_attrs(h5_path: str) -> List[Dict]:
