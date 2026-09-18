@@ -3192,6 +3192,43 @@ class MADSamPredictWorker(QThread):
             self.error_signal.emit(f"{e}\n\n{traceback.format_exc()}")
 
 
+class MADInferProgressWindow(QDialog):
+    """Floating home for the inference progress box while a batch runs.
+
+    Parentless, like the training graph, so it can sit on another monitor and
+    minimise on its own rather than riding along with the main window.
+
+    Closing it does not stop the run. A plain QDialog would just hide, taking
+    the progress bars, Pause and Stop with it into an invisible window for the
+    rest of a run that can last days — so the close is handed back to the
+    main window, which docks the box into the sidebar where it can still be
+    reached. Stop is the button that stops.
+    """
+
+    def __init__(self, on_close):
+        super().__init__(None)
+        self._on_close = on_close
+        self.setModal(False)
+        self.setWindowTitle("Running Inference")
+        self.setWindowFlags(Qt.Window
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowCloseButtonHint)
+
+    def detach(self):
+        """Forget the close handler — for a close the main window asked for,
+        which must not bounce back into it."""
+        self._on_close = None
+
+    def closeEvent(self, event):
+        cb, self._on_close = self._on_close, None
+        super().closeEvent(event)
+        if cb is not None:
+            # After the event, not inside it: the handler closes and deletes
+            # this window, which is not something to do from within its own
+            # closeEvent.
+            QTimer.singleShot(0, cb)
+
+
 class MADTrainGraphDialog(QDialog):
     """Non-modal window that hosts the live training graph so the spectrogram
     stays usable during a run. Closing it while training is active defers to the
@@ -7286,17 +7323,29 @@ class MADMainWindow(QMainWindow):
             "waits). Resume continues where it left off — nothing is lost.")
         self.btn_infer_pause.setEnabled(False)
         self.btn_infer_pause.clicked.connect(self._toggle_infer_pause)
-        ibody.addWidget(self.btn_infer_pause)
 
         self.infer_panel = MADRunPanel(show_plot=False,
                                        external_log=self.session_log)
         self.infer_panel.run_finished.connect(
             lambda ok: self._update_infer_run_enabled())
-        ibody.addWidget(self.infer_panel)
-        # Where the panel lives normally. A chained training→inference run
-        # lifts it into a floating progress window and puts it back here when
-        # the run ends, so there is one progress widget rather than two that
-        # could disagree.
+        # Every run that floated the panel puts it back when it ends. The
+        # chained path also docks from its own cleanup; docking is idempotent.
+        self.infer_panel.run_finished.connect(
+            lambda ok: self._close_infer_progress_dialog())
+
+        # Pause and the panel travel as one unit. Pause used to sit directly
+        # in this layout, so floating the panel for a run took Stop along and
+        # left Pause behind in the sidebar, under the main window.
+        self._infer_progress_box = QWidget()
+        pbox = QVBoxLayout(self._infer_progress_box)
+        pbox.setContentsMargins(0, 0, 0, 0)
+        pbox.addWidget(self.btn_infer_pause)
+        pbox.addWidget(self.infer_panel)
+        ibody.addWidget(self._infer_progress_box)
+        # Where the progress box lives when no run is floating it. A batch
+        # run lifts it into a floating progress window and puts it back here
+        # when the run ends, so there is one progress widget rather than two
+        # that could disagree.
         self._infer_panel_home = ibody
 
         ivbox.addWidget(self._infer_body)
@@ -10940,53 +10989,77 @@ class MADMainWindow(QMainWindow):
         return path if path and os.path.isfile(path) else None
 
     def _show_infer_progress_dialog(self):
-        """Float the inference progress panel while a chained run works.
+        """Float the inference progress box — Pause, status, bars, Stop — in
+        its own window for the length of a batch run.
 
-        The panel itself is reused rather than duplicated — two progress
-        widgets for one run can disagree, and this one is already wired to the
-        worker as its reporter.
+        Used by both the chained Training + Inference run and a plain Run
+        Inference. The box itself is reused rather than duplicated — two
+        progress widgets for one run can disagree, and this one is already
+        wired to the worker as its reporter.
         """
         if getattr(self, '_infer_dialog', None) is None:
-            dlg = QDialog(None)          # independent — see MADTrainGraphDialog
-            dlg.setModal(False)
-            dlg.setWindowTitle("Running Inference")
-            dlg.setWindowFlags(Qt.Window
-                               | Qt.WindowMinimizeButtonHint
-                               | Qt.WindowCloseButtonHint)
+            dlg = MADInferProgressWindow(
+                on_close=self._on_infer_window_closed)
             lay = QVBoxLayout(dlg)
             lay.setContentsMargins(8, 8, 8, 8)
-            self.infer_panel.setParent(dlg)
-            self.infer_panel.setVisible(True)
-            lay.addWidget(self.infer_panel)
-            # The panel is a status line, two progress bars and a button — its
-            # log goes to the Session Logs pane, so there is nothing here that
-            # wants height. A fixed 760x380 left most of the window empty;
-            # size to what the content asks for and only fix the width, so a
-            # long filename in the status line does not reflow the window.
+            box = self._infer_progress_box
+            box.setParent(dlg)
+            box.setVisible(True)
+            lay.addWidget(box)
+            # A status line, two progress bars and two buttons — the log goes
+            # to the Session Logs pane, so there is nothing here that wants
+            # height. A fixed 760x380 left most of the window empty; size to
+            # what the content asks for and only fix the width, so a long
+            # filename in the status line does not reflow the window.
             lay.addStretch(0)
             dlg.adjustSize()
             dlg.setFixedHeight(dlg.sizeHint().height())
             dlg.resize(560, dlg.sizeHint().height())
+            # Over the main window, not wherever the OS puts a new top-level
+            # window — which on a two-monitor setup can be the other screen.
+            try:
+                c = self.frameGeometry().center()
+                dlg.move(c.x() - dlg.width() // 2, c.y() - dlg.height() // 2)
+            except Exception:
+                pass
             self._infer_dialog = dlg
         self._infer_dialog.show()
         self._infer_dialog.raise_()
+        self._infer_dialog.activateWindow()
+
+    def _on_infer_window_closed(self):
+        """The user closed the floating progress window. The run goes on; its
+        controls go back to the sidebar, and the user is told where."""
+        running = bool(getattr(self, 'btn_infer_pause', None) is not None
+                       and self.btn_infer_pause.isEnabled())
+        self._close_infer_progress_dialog()
+        if running:
+            msg = ("Inference is still running — its progress, Pause and Stop "
+                   "are back in the Run Inference section.")
+            self.status_bar.showMessage(msg, 8000)
+            self._log(msg)
 
     def _close_infer_progress_dialog(self):
-        """Put the progress panel back in the Inference section and close."""
+        """Put the progress box back in the Inference section and close the
+        floating window. Idempotent: the end of a run, the chained cleanup and
+        the window's own close button can all land here.
+        """
         dlg = getattr(self, '_infer_dialog', None)
         if dlg is None:
             return
+        self._infer_dialog = None
         try:
             home = getattr(self, '_infer_panel_home', None)
-            if home is not None:
-                self.infer_panel.setParent(None)
-                home.addWidget(self.infer_panel)
-                self.infer_panel.setVisible(True)
+            box = getattr(self, '_infer_progress_box', None)
+            if home is not None and box is not None:
+                box.setParent(None)
+                home.addWidget(box)
+                box.setVisible(True)
+            dlg.detach()
             dlg.close()
             dlg.deleteLater()
         except Exception:
             pass
-        self._infer_dialog = None
 
     def _post_training_cleanup_after_infer(self, _ok: bool):
         """Slot: fires once after post-training inference finishes."""
@@ -12487,6 +12560,19 @@ class MADMainWindow(QMainWindow):
                     out.append(w)
             except RuntimeError:
                 continue        # C++ side already gone
+        # The training graph, its previews and the inference progress window
+        # are deliberately parentless (so they minimise and move on their
+        # own), which also hides them from findChildren. They are the windows
+        # most worth finding from this menu during a long run.
+        for name in ('_train_dialog', '_preview_dialog', '_infer_dialog'):
+            w = getattr(self, name, None)
+            if w is None or w in out:
+                continue
+            try:
+                if w.isVisible():
+                    out.append(w)
+            except RuntimeError:
+                continue
         return out
 
     def present_window(self, w):
@@ -18403,6 +18489,12 @@ class MADMainWindow(QMainWindow):
             self._update_infer_run_enabled()
             return
         owns_modal = reporter is None
+        # Runs reported through the sidebar panel float it for their duration
+        # — the chained run and a plain Run Inference alike. Floated only now,
+        # after the scope prompt, so cancelling that prompt doesn't leave an
+        # empty progress window behind. It docks back on run_finished.
+        if reporter is getattr(self, 'infer_panel', None):
+            self._show_infer_progress_dialog()
         # Whether this run is the tail of a chained Training + Inference, read
         # now rather than at the end. The queue it used to be read from is
         # cleared by _post_training_cleanup_after_infer, which hangs off the
