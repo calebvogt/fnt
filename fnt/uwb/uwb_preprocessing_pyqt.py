@@ -191,7 +191,7 @@ WEATHER_CACHE_DIR = 'weather_cache'
 _KNOWN_EXPORT_PATTERNS = (
     '_smoothed.csv', '_raw.csv', '_SocialOverlapBouts.csv', '_proximity_bouts.csv',
     '_behavior_events.csv', '_ROI_bout_occupancy.csv', '_ROI_DailySummary.csv',
-    '_weather.csv', '_daylight.csv',
+    '_weather.csv', '_daylight.csv', '_DailyPathGrid.png',
     # Retired products. Kept in the list so a re-export of a trial processed by
     # an older build reports clearing them as expected, not as strangers.
     '_network_GBI.csv', '_network_edgelist',
@@ -2531,6 +2531,7 @@ class PlotSaverWorker(QThread):
             # bad plot silently cancelled every plot after it in this list.
             plot_jobs = [
                 ('daily_paths', self.save_daily_paths_per_tag),
+                ('daily_path_grid', self.save_daily_path_grid),
                 ('trajectory_overview', self.save_trajectory_overview),
                 ('battery_levels', self.save_battery_levels),
                 ('activity_timeline', self.save_activity_timeline),
@@ -2735,6 +2736,140 @@ class PlotSaverWorker(QThread):
         
         return generated
     
+    #: Daily-path grid geometry. One cell per animal-day, in inches.
+    GRID_CELL_W = 1.6
+    #: Cap on the finished figure. matplotlib cannot write past 2^16 px a
+    #: side, and 200 dpi turns 55 in into 11,000 - wide enough for ~34 days
+    #: before the cells start shrinking instead.
+    GRID_MAX_FIG_W = 55.0
+    GRID_MAX_FIG_H = 55.0
+
+    def _grid_row_label(self, member_tags):
+        """Row label: the SexID the CSVs join on (F9801), else the HexID.
+
+        Deliberately the analysis key rather than the hyphenated form the
+        other figures title with - this grid is read alongside the exported
+        tables, and a label you can search for in them is worth more here.
+        """
+        info = (self.tag_identities.get(member_tags[0]) or {}) if self.use_identities else {}
+        sex, ident = info.get('sex'), info.get('identity')
+        if sex and ident:
+            return f"{str(sex)[:1].upper()}{ident}"
+        return " / ".join(f"HexID {hex(t).upper().replace('0X', '')}"
+                          for t in member_tags)
+
+    def save_daily_path_grid(self, data, output_dir, db_name):
+        """Animals in rows, days in columns: the whole trial in one figure.
+
+        The per-animal daily figures wrap days onto several rows, so comparing
+        two animals on the same day means flipping between files. Here an
+        animal is ALWAYS one row and a day always one column, which is what
+        makes a cohort-wide change on day 9 visible at a glance.
+
+        Deliberately bare - no background image, no start/stop markers, a thin
+        line - because at this cell size that furniture covers the track
+        rather than orienting it. Every cell shares one set of axis limits, so
+        cells are comparable; only the outer edges carry ticks.
+
+        Returns True if the figure was written.
+        """
+        self.progress.emit("Generating daily path grid...")
+        output_path = os.path.join(output_dir, f'{db_name}_DailyPathGrid.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_DailyPathGrid.png")
+            return False
+
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+
+        days = sorted(data['Date'].unique())
+        # Rows read as the SexID the rest of the analysis uses, ordered the way
+        # the ROI tables order animals (M9 before M10, sexes kept together).
+        from fnt.uwb import roi_bouts as _RB
+        groups = [(self._grid_row_label(tags), tags)
+                  for _suffix, tags in
+                  self.animal_groups(sorted(data['shortid'].unique()))]
+        groups.sort(key=lambda g: _RB.natural_animal_key(g[0]))
+        if not days or not groups:
+            self.progress.emit("Daily path grid: nothing to plot.")
+            return False
+
+        # One window for every cell, from the tracks themselves: no background
+        # is drawn here, so there is no image extent to honour.
+        x_min, x_max = float(data[x_col].min()), float(data[x_col].max())
+        y_min, y_max = float(data[y_col].min()), float(data[y_col].max())
+        x_pad = (x_max - x_min) * 0.05 or 1.0
+        y_pad = (y_max - y_min) * 0.05 or 1.0
+        x_min, x_max = x_min - x_pad, x_max + x_pad
+        y_min, y_max = y_min - y_pad, y_max + y_pad
+        if self.axis_limits is not None:
+            x_min, x_max, y_min, y_max = self.axis_limits
+
+        n_rows, n_cols = len(groups), len(days)
+        # Cells keep the arena's shape, so a long thin enclosure does not come
+        # out stretched. Shrink the cell (never the layout) if a long trial
+        # would otherwise overflow the figure limits.
+        aspect = (y_max - y_min) / (x_max - x_min) if x_max > x_min else 1.0
+        cell_w = self.GRID_CELL_W
+        cell_w = min(cell_w, (self.GRID_MAX_FIG_W - 1.6) / n_cols)
+        cell_h = cell_w * max(0.3, min(aspect, 3.0))
+        if cell_h * n_rows + 1.2 > self.GRID_MAX_FIG_H:
+            cell_h = (self.GRID_MAX_FIG_H - 1.2) / n_rows
+        fig_w = cell_w * n_cols + 1.6          # row labels on the left
+        fig_h = cell_h * n_rows + 1.2          # day headers + title on top
+        fig = Figure(figsize=(fig_w, fig_h))
+        axes = fig.subplots(n_rows, n_cols, squeeze=False,
+                            sharex=True, sharey=True)
+        # Cells butt up against each other: at this size the gaps cost more
+        # track than they buy in separation, and the frames still divide them.
+        fig.subplots_adjust(left=1.3 / fig_w, right=1 - 0.3 / fig_w,
+                            top=1 - 0.95 / fig_h, bottom=0.25 / fig_h,
+                            wspace=0.04, hspace=0.04)
+
+        for r, (label, member_tags) in enumerate(groups):
+            animal = data[data['shortid'].isin(member_tags)]
+            sex = str((self.tag_identities.get(member_tags[0]) or {})
+                      .get('sex', '') or '')[:1].upper()
+            colour = {'M': '#1f6fd0', 'F': '#d02f4a'}.get(sex, '#1f6fd0')
+            for c, date in enumerate(days):
+                ax = axes[r][c]
+                cell = animal[animal['Date'] == date]
+                if not cell.empty:
+                    ax.plot(cell[x_col], cell[y_col], linewidth=0.5,
+                            alpha=0.85, color=colour, solid_capstyle='round')
+                else:
+                    # An empty cell and a cell whose animal never moved look
+                    # the same otherwise.
+                    ax.text(0.5, 0.5, '\u2013', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=7,
+                            color='#b0b0b0')
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_aspect('equal', adjustable='box')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.4)
+                    spine.set_color('#999999')
+                if r == 0:
+                    ax.set_title(f'Day {c + 1}\n{date}', fontsize=6.5,
+                                 pad=3)
+                if c == 0:
+                    ax.set_ylabel(label, fontsize=8, rotation=0,
+                                  ha='right', va='center', labelpad=8,
+                                  color=colour)
+
+        fig.suptitle(f'Daily paths - {n_rows} animal(s) x {n_cols} day(s)',
+                     fontsize=12, fontweight='bold', y=1 - 0.12 / fig_h)
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_DailyPathGrid.png "
+                           f"({fig_w:.0f}x{fig_h:.0f} in)")
+        return True
+
     def save_trajectory_overview(self, data, output_dir, db_name):
         """Save trajectory overview
         Returns: True if generated, False if skipped"""
@@ -5249,6 +5384,23 @@ class UWBQuickVisualizationWindow(QWidget):
         plot_types = [
             ("daily_paths", "Daily Paths per Tag",
              "One plot per tag showing XY trajectory for each day, color-coded by date"),
+            ("daily_path_grid", "Daily Paths \u2014 Grid (animals \u00d7 days)",
+             "FILE: {db}_DailyPathGrid.png\n"
+             "\n"
+             "One figure for the whole trial: every animal is a ROW, every day "
+             "a COLUMN, each cell that animal's track on that day. An animal "
+             "never wraps onto a second row, so the figure grows sideways with "
+             "the trial - a 20-day cohort is a wide image meant to be zoomed "
+             "into.\n"
+             "\n"
+             "Deliberately bare: no background image, no start/stop markers, a "
+             "thin line, no ticks. At this cell size that furniture hides the "
+             "track. Every cell shares one window (or your pinned XY range), so "
+             "cells are directly comparable; a dash marks a day with no data.\n"
+             "\n"
+             "Rows are coloured by sex (blue M, red F) and labelled with the "
+             "SexID. Use 'Daily Paths per Tag' instead when you want one "
+             "animal large, with the arena drawn behind it."),
             ("trajectory_overview", "Trajectory Overview",
              "All selected tags overlaid on a single plot with optional background image"),
             ("battery_levels", "Battery Levels",
@@ -12238,6 +12390,8 @@ class UWBQuickVisualizationWindow(QWidget):
             if self.preview_canvas_3d is not None:
                 self.preview_canvas_3d.clear()
 
+        self.pending_animation_days = None
+
         # Reset pending table name
         if hasattr(self, 'pending_table_name'):
             delattr(self, 'pending_table_name')
@@ -13548,6 +13702,23 @@ class UWBQuickVisualizationWindow(QWidget):
             cb.toggled.connect(self._sync_all_days_checkbox)
             self.daily_animation_day_checkboxes[date_str] = cb
             self.daily_days_layout_inner.addWidget(cb)
+
+        # A saved/queued selection, now that the dates exist. Dates the trial
+        # no longer has are dropped; a selection matching nothing at all is
+        # ignored rather than leaving every day unticked.
+        pending = getattr(self, 'pending_animation_days', None)
+        self.pending_animation_days = None
+        if pending is not None:
+            wanted = {str(d) for d in pending}
+            if any(d in wanted for d in self.daily_animation_day_checkboxes):
+                for d, cb in self.daily_animation_day_checkboxes.items():
+                    cb.blockSignals(True)
+                    cb.setChecked(d in wanted)
+                    cb.blockSignals(False)
+                self.log_message(
+                    f"Daily animation days restored from the saved settings: "
+                    f"{len(wanted & set(self.daily_animation_day_checkboxes))}"
+                    f" of {len(self.daily_animation_day_checkboxes)} day(s).")
         self._sync_all_days_checkbox()
 
     def on_all_days_clicked(self):
@@ -14392,6 +14563,12 @@ class UWBQuickVisualizationWindow(QWidget):
             'color_by': self.combo_color_by.currentText(),
             'video_quality': self.combo_video_quality.currentText(),
             'daily_animations': self.chk_daily_animations.isChecked(),
+            # WHICH days were ticked. Without this a queued job reloaded the
+            # trial, rebuilt the day list with every box ticked (the default)
+            # and rendered all of them - ignoring the two days the user chose.
+            'daily_animation_days': [d for d, cb in
+                                     self.daily_animation_day_checkboxes.items()
+                                     if cb.isChecked()],
             'full_animation': self.chk_full_animation.isChecked(),
             'tag_identities': self.tag_identities,
             'plot_layers': dict(self.plot_layers),
@@ -14824,6 +15001,12 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'show_battery' in config:
                 self.chk_show_battery.setChecked(config['show_battery'])
 
+            if isinstance(config.get('daily_animation_days'), list):
+                # Applied when the day list is built (the dates are not known
+                # until the database has been scanned).
+                self.pending_animation_days = [str(d) for d
+                                               in config['daily_animation_days']]
+
             if 'animation_tag_size' in config:
                 self.spin_anim_tag_size.setValue(config['animation_tag_size'])
 
@@ -15200,6 +15383,12 @@ class UWBQuickVisualizationWindow(QWidget):
         speed_text = self.combo_animation_speed.currentText()
         all_cbs = self.daily_animation_day_checkboxes
         days = [d for d, cb in all_cbs.items() if cb.isChecked()]
+        # Day N is the trial's Nth day, not the Nth box ticked: exporting only
+        # days 6-7 used to write them as Day1/Day2, which collided with the
+        # real days 1-2 on the next run and made an incremental export
+        # unreadable.
+        trial_days = list(all_cbs.keys())
+        day_numbers = {d: i + 1 for i, d in enumerate(trial_days)}
         gen_daily = self.chk_daily_animations.isChecked()
         return {
             'trailing_window': self.spin_animation_trail.value(),
@@ -15213,6 +15402,8 @@ class UWBQuickVisualizationWindow(QWidget):
             'all_days_selected': (gen_daily and len(all_cbs) > 0
                                   and len(days) == len(all_cbs)),
             'selected_days': days,
+            'trial_days': trial_days,
+            'day_numbers': day_numbers,
             'video_quality': self.combo_video_quality.currentText(),
             'tag_size': self.spin_anim_tag_size.value(),
             'show_battery': self.chk_show_battery_export.isChecked(),
@@ -15700,6 +15891,91 @@ class UWBQuickVisualizationWindow(QWidget):
             return default_temp_dir
         return None
 
+    @staticmethod
+    def _describe_missing_days(gaps, day_numbers, fps, speed_text, limit=8):
+        """'Day 3 (2026-09-17) and Day 5 (2026-09-19) have no video at 30 fps / 240x'."""
+        named = [f"Day {day_numbers.get(d, '?')} ({d})" for d in gaps[:limit]]
+        more = f" and {len(gaps) - limit} more" if len(gaps) > limit else ""
+        return (", ".join(named) + more
+                + f" ha{'s' if len(gaps) == 1 else 've'} no video at "
+                  f"{fps} fps / {speed_text}")
+
+    def _ask_about_missing_days(self, gaps, day_numbers, fps, speed_text,
+                                generate_daily):
+        """What to do when the full video cannot be stitched from whole days.
+
+        Returns 'render_missing', 'scratch' or 'skip_full'. A video named
+        "the full trial" that silently omits day 3 is the one outcome worth
+        interrupting for, so this asks instead of choosing. Unattended runs
+        (the Export Queue) cannot ask: they render the missing days and
+        stitch, which gives the same video as a full render for the cost of
+        the days that are actually missing.
+        """
+        detail = self._describe_missing_days(gaps, day_numbers, fps, speed_text)
+        if (getattr(self, '_batch_active', False)
+                or getattr(self, '_saved_dialogs', None) is not None):
+            self.log_message(
+                f"⚠ Full animation: {detail}. Rendering the missing day(s) "
+                f"and stitching (unattended run).")
+            return 'render_missing'
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Days Missing From the Full Animation")
+        box.setText("The full animation cannot be stitched from the daily "
+                    "videos: not every day of the trial has one.")
+        box.setInformativeText(
+            f"{detail}.\n\n"
+            f"Daily videos are only reused when they were rendered at the "
+            f"same speed and frame rate, so a day rendered at another speed "
+            f"counts as missing here.")
+        render_btn = box.addButton(f"Render the {len(gaps)} Missing Day(s), Then Stitch",
+                                   QMessageBox.AcceptRole)
+        scratch_btn = box.addButton("Render the Full Video From Scratch",
+                                    QMessageBox.ActionRole)
+        skip_btn = box.addButton("Skip the Full Video", QMessageBox.RejectRole)
+        render_btn.setToolTip(
+            "Render only the days that are missing, then stitch every day "
+            "into the full video. Cheapest, and the result covers the whole "
+            "trial."
+            + ("" if generate_daily else
+               "\n\nNote: this also writes those daily videos, which this "
+               "export did not otherwise ask for."))
+        scratch_btn.setToolTip(
+            "Ignore the daily videos and render the whole trial again in one "
+            "pass. Same result, but it re-renders every day.")
+        skip_btn.setToolTip(
+            "Write only the daily videos selected for this export and leave "
+            "the full video alone - useful when you want to add the missing "
+            "days first.")
+        box.setDefaultButton(render_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is scratch_btn:
+            return 'scratch'
+        if clicked is skip_btn:
+            return 'skip_full'
+        return 'render_missing'
+
+    @staticmethod
+    def _video_frame_size(path):
+        """(width, height) of a video without decoding it, or None.
+
+        Daily videos from different exports can differ in size - a change of
+        video quality, or the weather band being switched on - and a writer
+        opened at the first file's size silently drops every frame that does
+        not match. Checked before stitching rather than discovered afterwards
+        in a video that is missing days.
+        """
+        try:
+            cap = cv2.VideoCapture(path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return (w, h) if w and h else None
+        except Exception:
+            return None
+
     def _concat_videos_cv2(self, paths, out_path):
         """Concatenate same-resolution/fps MP4s into one, frame by frame (cv2).
 
@@ -15794,9 +16070,61 @@ class UWBQuickVisualizationWindow(QWidget):
 
             generate_daily = s['generate_daily']
             generate_full = s.get('generate_full', not generate_daily)
-            all_days = s.get('all_days_selected', False)
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            daily_paths = []   # final daily video paths in day order (for concat)
+            day_numbers = s.get('day_numbers') or {}
+            trial_days = s.get('trial_days') or list(s.get('selected_days') or [])
+
+            def _daily_video_path(date_str):
+                """Where this day's video lives, whoever rendered it.
+
+                The name carries the TRIAL day number, the date, the fps and
+                the speed, so a file from an earlier export is only reused
+                when it was rendered at the same settings.
+                """
+                n = day_numbers.get(date_str, trial_days.index(date_str) + 1
+                                    if date_str in trial_days else 1)
+                return os.path.join(
+                    animations_dir,
+                    f"{db_name}_Animation_Day{n}_{date_str}_{fps}fps_{speed_text}.mp4")
+
+            rendered_days = []   # days this run actually produced
+            selected_days = list(s['selected_days']) if generate_daily else []
+            force_full_render = False
+
+            # A full video is meant to be the WHOLE trial. Before rendering
+            # anything, check that every day will have a video at THESE
+            # settings - the ones already on disk plus the ones about to be
+            # rendered - and say so up front rather than quietly producing a
+            # full video with a day missing from the middle of it.
+            if generate_full:
+                covered = set(selected_days) | {
+                    d for d in trial_days if os.path.exists(_daily_video_path(d))}
+                gaps = [d for d in trial_days if d not in covered]
+                if gaps:
+                    choice = self._ask_about_missing_days(
+                        gaps, day_numbers, fps, speed_text, generate_daily)
+                    if choice == 'skip_full':
+                        generate_full = False
+                        self.log_message(
+                            "Full animation skipped: "
+                            + self._describe_missing_days(gaps, day_numbers, fps,
+                                                          speed_text))
+                    elif choice == 'scratch':
+                        force_full_render = True
+                        self.log_message(
+                            "Full animation will be rendered from scratch ("
+                            + self._describe_missing_days(gaps, day_numbers, fps,
+                                                          speed_text) + ").")
+                    else:                      # 'render_missing'
+                        order = {d: i for i, d in enumerate(trial_days)}
+                        selected_days = sorted(set(selected_days) | set(gaps),
+                                               key=lambda d: order.get(d, 0))
+                        generate_daily = True
+                        self.log_message(
+                            "Rendering the missing day(s) as well, then "
+                            "stitching: "
+                            + ", ".join(f"Day {day_numbers.get(d, '?')}"
+                                        for d in gaps))
 
             # ONE set of axis limits, spanning the whole recording, used by
             # every render below. Letting each daily video compute its own
@@ -15815,15 +16143,20 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # ---- Daily animations (one per selected day) ----
             if generate_daily:
-                selected_days = s['selected_days']
                 if not selected_days:
                     self.log_message("⚠ No days selected for daily animations")
                 else:
-                    self.log_message(f"Generating {len(selected_days)} daily animations...")
+                    self.log_message(
+                        f"Generating {len(selected_days)} daily animation(s): "
+                        + ", ".join(f"Day {day_numbers.get(d, '?')}"
+                                    for d in selected_days))
                     for day_idx, date_str in enumerate(selected_days):
                         if self.export_cancelled:
                             return
-                        self.log_message(f"Processing Day {day_idx + 1}/{len(selected_days)}: {date_str}")
+                        day_no = day_numbers.get(date_str, day_idx + 1)
+                        self.log_message(
+                            f"Processing Day {day_no} ({day_idx + 1} of "
+                            f"{len(selected_days)} selected): {date_str}")
                         data_tz = anim_data['Timestamp'].dt.tz
                         date_obj = pd.to_datetime(date_str).date()
                         day_start = (pd.Timestamp(date_obj, tz=data_tz) if data_tz is not None
@@ -15838,35 +16171,83 @@ class UWBQuickVisualizationWindow(QWidget):
                             day_data, temp_frames_dir, frame_interval, trailing_window,
                             fps, color_by, s['use_identities'],
                             total_export_steps, current_export_step,
-                            day_suffix=f"_Day{day_idx + 1}_{date_str}", speed_text=speed_text,
+                            day_suffix=f"_Day{day_no}_{date_str}", speed_text=speed_text,
                             axis_limits=axis_limits)
                         if video_path and not self.export_cancelled:
-                            final_video_path = os.path.join(
-                                animations_dir,
-                                f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
+                            final_video_path = _daily_video_path(date_str)
                             if os.path.exists(final_video_path):
-                                self.log_message(f"⚠ Day {day_idx + 1} animation already exists, skipping: {os.path.basename(final_video_path)}")
+                                self.log_message(f"⚠ Day {day_no} animation already exists, skipping: {os.path.basename(final_video_path)}")
                             elif os.path.exists(video_path):
                                 shutil.move(video_path, final_video_path)
-                                self.log_message(f"✓ Day {day_idx + 1} animation saved: {final_video_path}")
+                                self.log_message(f"✓ Day {day_no} animation saved: {final_video_path}")
                             if os.path.exists(final_video_path):
-                                daily_paths.append(final_video_path)
+                                rendered_days.append(date_str)
 
             # ---- Full animation (whole recording), after the dailies ----
             if generate_full and not self.export_cancelled:
                 full_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
-                if os.path.exists(full_path):
+                # Every day of the trial that has a video at THESE settings,
+                # whether this run made it or an earlier day's export did.
+                # This is what makes the daily workflow work: render day 7
+                # today, and the full video is rebuilt from days 1-7 without
+                # re-rendering the six that are already on disk.
+                on_disk, missing = [], []
+                for d in trial_days:
+                    p = _daily_video_path(d)
+                    (on_disk if os.path.exists(p) else missing).append(d)
+                reused = [d for d in on_disk if d not in rendered_days]
+                can_stitch = bool(on_disk) and not missing and not force_full_render
+                if can_stitch:
+                    sizes = {self._video_frame_size(_daily_video_path(d))
+                             for d in on_disk}
+                    sizes.discard(None)
+                    if len(sizes) > 1:
+                        can_stitch = False
+                        self.log_message(
+                            "⚠ The daily videos were rendered at different "
+                            f"frame sizes ({', '.join(f'{w}x{h}' for w, h in sorted(sizes))}); "
+                            "rendering the full animation from scratch instead.")
+                if (getattr(self, '_export_skip_existing', False)
+                        and os.path.exists(full_path)):
                     self.log_message(f"⚠ Full animation already exists, skipping: {os.path.basename(full_path)}")
-                elif generate_daily and all_days and len(daily_paths) >= 1:
-                    # Every day was rendered — just stitch the daily videos together.
-                    self.lbl_export_progress.setText("Concatenating daily animations into the full video...")
+                elif can_stitch:
+                    self.lbl_export_progress.setText("Stitching daily animations into the full video...")
                     QApplication.processEvents()
-                    self.log_message(f"Building full animation by concatenating {len(daily_paths)} daily animation(s)...")
-                    if self._concat_videos_cv2(daily_paths, full_path):
-                        self.log_message(f"✓ Full animation saved (concatenated dailies): {os.path.basename(full_path)}")
+                    self.log_message(
+                        f"Building the full animation from {len(on_disk)} daily "
+                        f"video(s): {len(rendered_days)} rendered now, "
+                        f"{len(reused)} reused from earlier exports"
+                        + (f" (Day {day_numbers.get(reused[0], '?')}"
+                           f"–Day {day_numbers.get(reused[-1], '?')})" if reused else ""))
+                    # Written aside and swapped in, so a failure half way
+                    # through leaves the previous full video intact.
+                    staged = full_path + '.partial.mp4'
+                    if self._concat_videos_cv2(
+                            [_daily_video_path(d) for d in on_disk], staged):
+                        os.replace(staged, full_path)
+                        self.log_message(
+                            f"✓ Full animation rebuilt from the daily videos: "
+                            f"{os.path.basename(full_path)}")
                     else:
-                        self.log_message("⚠ Concatenation failed; full animation not produced")
+                        try:
+                            if os.path.exists(staged):
+                                os.remove(staged)
+                        except OSError:
+                            pass
+                        self.log_message("⚠ Stitching failed; the previous full animation was left as it was")
                 else:
+                    if missing and generate_daily:
+                        self.log_message(
+                            f"Full animation: {len(missing)} day(s) have no video at "
+                            f"these settings ({', '.join('Day ' + str(day_numbers.get(d, '?')) for d in missing[:6])}"
+                            + (", …" if len(missing) > 6 else "")
+                            + ") — rendering the whole span instead. Tick those days to "
+                              "stitch instead of re-rendering.")
+                    if os.path.exists(full_path):
+                        try:
+                            os.remove(full_path)
+                        except OSError:
+                            pass
                     # No dailies, or only a subset — render the full span from scratch.
                     self.log_message("Generating full animation frames (this may take a while)...")
                     video_path = self.create_animation_frames(
@@ -17225,9 +17606,11 @@ class UWBQuickVisualizationWindow(QWidget):
             fps = anim['fps']
             speed_text = anim['speed_text']
             if anim['generate_daily']:
+                nums = anim.get('day_numbers') or {}
                 for day_idx, date_str in enumerate(anim['selected_days']):
+                    day_no = nums.get(date_str, day_idx + 1)
                     predicted_animation_files.append(
-                        f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
+                        f'{db_name}_Animation_Day{day_no}_{date_str}_{fps}fps_{speed_text}.mp4')
             if anim.get('generate_full', not anim['generate_daily']):
                 predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
 
@@ -17404,6 +17787,9 @@ class UWBQuickVisualizationWindow(QWidget):
 
         skip_existing = False
         output_dir = base_output_dir
+        # The animation step runs from a different method and needs to know
+        # whether this run is in "leave existing files alone" mode.
+        self._export_skip_existing = False
 
         # Clear & Re-export, when that is this job's standing choice. Handled
         # BEFORE and OUTSIDE the conflict branch for two reasons: a folder can
@@ -17443,6 +17829,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if result == ExportConflictDialog.SKIP:
                 skip_existing = True
+                self._export_skip_existing = True
                 output_dir = base_output_dir
             elif result == ExportConflictDialog.OVERWRITE:
                 skip_existing = False
