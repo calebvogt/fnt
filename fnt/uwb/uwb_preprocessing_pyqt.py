@@ -50,7 +50,7 @@ from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
-    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar)
+    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar, MoonIcon)
 from fnt.uwb import animation as uwb_animation
 from fnt.uwb import weather as WX
 from fnt.uwb.identities import (
@@ -5663,11 +5663,17 @@ class UWBQuickVisualizationWindow(QWidget):
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
-        self.combo_animation_speed.addItems(["1x", "5x", "15x", "30x", "60x", "120x", "240x"])
+        self.combo_animation_speed.addItems(
+            ["1x", "5x", "15x", "30x", "60x", "120x", "240x", "480x"])
         self.combo_animation_speed.setCurrentText("60x")
         self.combo_animation_speed.setToolTip(
             "How fast real time plays in the video. "
-            "80x means 80 seconds of tracking data per 1 second of video."
+            "80x means 80 seconds of tracking data per 1 second of video.\n\n"
+            "Each frame advances speed/FPS seconds, so at 480x and 20 fps one "
+            "frame is 24 s of tracking: a day becomes about 3 minutes of "
+            "video. Fast settings skip between frames rather than blurring "
+            "them together - a brief visit between two frames is not drawn, "
+            "though the trail still shows where the animal went."
         )
         speed_layout.addWidget(self.combo_animation_speed)
         animation_options_layout.addLayout(speed_layout)
@@ -6059,14 +6065,34 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_preview_weather.setTextFormat(Qt.RichText)
         self.lbl_preview_weather.setVisible(False)
         layout.addWidget(self.lbl_preview_weather)
+        self.lbl_preview_light = QLabel("")
+        self.lbl_preview_light.setStyleSheet(
+            "color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_light.setAlignment(Qt.AlignCenter)
+        self.lbl_preview_light.setWordWrap(True)
+        self.lbl_preview_light.setVisible(False)
+        layout.addWidget(self.lbl_preview_light)
+
+        # The readout and the moon sit OUTSIDE the strip: anything drawn on it
+        # hides the light it describes, which is worst at dawn.
+        self.light_row = QWidget()
+        light_row = QHBoxLayout()
+        light_row.setContentsMargins(0, 0, 0, 0)
+        light_row.setSpacing(6)
         self.light_bar = LightBar()
         self.light_bar.setToolTip(
             "Sunlight across the current local day (midnight to midnight); "
             "red mark = playhead, ticks at 06, 12 and 18 h. Silver = moon up "
             "at night. A band along the bottom marks precipitation: blue "
             "rain, white snow, violet mixed - stronger for heavier.")
-        self.light_bar.setVisible(False)
-        layout.addWidget(self.light_bar)
+        light_row.addWidget(self.light_bar, 1)
+        self.moon_icon = MoonIcon()
+        self.moon_icon.setToolTip(
+            "The moon's phase now, faded while it is below the horizon.")
+        light_row.addWidget(self.moon_icon)
+        self.light_row.setLayout(light_row)
+        self.light_row.setVisible(False)
+        layout.addWidget(self.light_row)
 
         layout.addWidget(self.preview_stack, 1)
 
@@ -6568,6 +6594,27 @@ class UWBQuickVisualizationWindow(QWidget):
         self.log_message(f"Site profile loaded from {WX.SITE_PROFILE_NAME}"
                          + (f" ({settings.name})" if settings.name else ""))
 
+    def trial_day_one(self):
+        """The recording's FIRST local calendar date - Day 1 everywhere.
+
+        Taken from the day list scanned on load (the whole database), so a
+        per-day video and a mid-trial preview frame agree with the Day column
+        in the exported CSVs. Falls back to the timeline's own start, and to
+        None when nothing is loaded.
+        """
+        days = sorted(getattr(self, 'daily_animation_day_checkboxes', {}) or {})
+        if days:
+            try:
+                return pd.Timestamp(days[0]).date()
+            except (ValueError, TypeError):
+                pass
+        bounds = getattr(self, '_preview_raw_bounds', None) or (
+            (self.preview_t0, self.preview_t1) if self.preview_t0 else None)
+        if bounds and bounds[0]:
+            return (pd.Timestamp(int(bounds[0]), unit='ms', tz='UTC')
+                    .tz_convert(self.combo_timezone.currentText()).date())
+        return None
+
     def _weather_job(self, settings, offline=False):
         """A worker callable: trial span from the database, then fetch.
 
@@ -6733,14 +6780,17 @@ class UWBQuickVisualizationWindow(QWidget):
         show_w = self.chk_show_weather.isChecked()
         show_l = self.chk_show_light_bar.isChecked()
         self.lbl_preview_weather.setVisible(show_w)
-        self.light_bar.setVisible(show_l)
+        self.lbl_preview_light.setVisible(show_l)
+        self.light_row.setVisible(show_l)
         if not (show_w or show_l):
             return
         tl = self._display_timeline()
         if tl is None or self.preview_t0 is None:
             self.lbl_preview_weather.setText(
                 "Weather: set the site in Weather Settings…" if tl is None else "")
+            self.lbl_preview_light.setText("")
             self.light_bar.clear()
+            self.moon_icon.clear()
             return
         t_ns = int(self.preview_playhead_ms) * 1_000_000
         state = tl.at(t_ns)
@@ -6787,9 +6837,9 @@ class UWBQuickVisualizationWindow(QWidget):
             poly = (WX.moon_disc_polygon(state['moon_illumination'],
                                          state['moon_waxing'], state['southern'])
                     if np.isfinite(state['moon_illumination']) else None)
-            self.light_bar.set_now((t_ns - a) / max(b - a, 1), state['light'],
-                                   WX.format_light(state), moon_poly=poly,
-                                   moon_up=state.get('moon_up', True))
+            self.light_bar.set_now((t_ns - a) / max(b - a, 1), state['light'])
+            self.moon_icon.set_moon(poly, state.get('moon_up', True))
+            self.lbl_preview_light.setText(WX.format_light(state))
 
     def _fetch_environment_now(self, settings):
         """Run the Fetch Weather job and wait for it, keeping the window live.
@@ -9708,7 +9758,10 @@ class UWBQuickVisualizationWindow(QWidget):
         ts = pd.Timestamp(self.preview_playhead_ms, unit='ms', tz='UTC').tz_convert(
             pytz.timezone(self.combo_timezone.currentText()))
         cached = "" if self.preview_current_chunk in self.preview_cache else "  (loading…)"
-        self.lbl_preview_time.setText(f"{ts:%Y-%m-%d %H:%M:%S}{cached}")
+        day_one = self.trial_day_one()
+        day = (f"Day {(ts.date() - day_one).days + 1} · "
+               if day_one is not None else "")
+        self.lbl_preview_time.setText(f"{day}{ts:%Y-%m-%d %H:%M:%S}{cached}")
         self._update_weather_display()
 
     def _frame_index(self):
@@ -12176,7 +12229,9 @@ class UWBQuickVisualizationWindow(QWidget):
             self.lbl_preview_status.setText("Load a database and select tags to preview")
             self.lbl_preview_time.setText("--")
             self.lbl_preview_weather.setText("")
+            self.lbl_preview_light.setText("")
             self.light_bar.clear()
+            self.moon_icon.clear()
             self._update_cache_label()
             self._set_index_status("Fast index: not built", "#cccccc")
             self.preview_canvas_2d.clear()
@@ -15974,6 +16029,7 @@ class UWBQuickVisualizationWindow(QWidget):
             show_trail=layers_on.get('trail', True),
             show_labels=layers_on.get('tag_id', True),
             time_range=time_range, data_view=data_view,
+            day_one=self.trial_day_one(),
             environment=environment,
             show_weather=bool(layers_on.get('weather')
                               and self.environment is not None),
