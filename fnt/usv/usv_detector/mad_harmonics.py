@@ -40,6 +40,7 @@ worse than leaving them alone.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -594,3 +595,116 @@ def group_calls(elements: Sequence[Element],
     calls.sort(key=lambda c: (by_id[c.call_id].t0, c.f0_hz))
     return GroupingResult(calls=calls, call_of=call_of,
                           harmonic_of=harmonic_of, links=links)
+
+
+# ----------------------------------------------------------------------
+# Whole-recording grouping (batch)
+# ----------------------------------------------------------------------
+def _forced_from_store(metas) -> Dict[str, Optional[str]]:
+    """Manual corrections recorded on a recording's examples.
+
+    ``harmonic_forced`` holds the id of the element this one was pinned under,
+    or an empty string for "pinned out into its own call" -- which is a
+    different statement from the key being absent (no correction at all), so
+    the two must not collapse here.
+    """
+    out: Dict[str, Optional[str]] = {}
+    for meta in metas:
+        if 'harmonic_forced' not in meta:
+            continue
+        v = meta.get('harmonic_forced')
+        key = str(meta.get('id') or '')
+        if not key:
+            continue
+        out[key] = None if v in (None, '') else str(v)
+    return out
+
+
+def group_recording(store_path: str, wav_name: str = "",
+                    cfg: HarmonicConfig = HarmonicConfig()) -> Optional[Dict]:
+    """Group one recording's detections into calls, reading and writing its
+    ``.mad`` directly. Returns a summary dict, or None if there was nothing to
+    do.
+
+    The batch counterpart to the review GUI's per-file button: a run over 263
+    recordings cannot be a button someone presses 263 times. Both end up in the
+    same place, because both persist the assignment onto the detection itself.
+
+    Two kinds of detection take part and they live in different places in the
+    store. Accepted/edited calls are *examples* (mask + spectrogram patch, so
+    the contour is energy-weighted); still-pending detections are *prediction
+    crops* (mask only, so the contour falls back to the mask centroid -- close
+    for a narrowband tonal call, which is what a USV is). Rejected examples are
+    excluded: the reviewer has already said those are not calls, and letting
+    one anchor a stack would put that decision back in play.
+    """
+    from .fnt_mask_store import (
+        example_kind, get_grid_attrs, read_all_pred_masks, td_iter_file_examples,
+        td_iter_meta, td_update_meta, update_pred_attrs)
+
+    grid = get_grid_attrs(store_path)
+    sr = float(grid.get('sample_rate') or 0.0)
+    nfft = int(grid.get('nfft') or 0)
+    nperseg = int(grid.get('nperseg') or 0)
+    hop = nperseg - int(grid.get('noverlap') or 0)
+    if sr <= 0 or nfft <= 0 or hop <= 0:
+        return None
+
+    elements: List[Element] = []
+    example_ids: set = set()
+    base = os.path.basename(wav_name) if wav_name else ""
+    for ex in td_iter_file_examples(store_path, base) if base else ():
+        meta = ex.get('meta') or {}
+        if example_kind(meta) in ('rejected', 'negative'):
+            continue
+        eid = str(meta.get('id') or '')
+        mask = ex.get('mask')
+        if not eid or mask is None:
+            continue
+        el = contour_from_patch(mask, ex.get('spec'), dict(meta, id=eid))
+        if el is None:
+            el = contour_from_mask(
+                mask, f_bin_offset=int(meta.get('patch_f_off') or 0),
+                t_frame_offset=int(meta.get('patch_t_off') or 0),
+                sample_rate=sr, nfft=nfft, hop=hop, id=eid, meta=meta)
+        if el is not None:
+            elements.append(el)
+            example_ids.add(eid)
+
+    crops = read_all_pred_masks(store_path)
+    for bid, rec in crops.items():
+        key = str(bid)
+        if key in example_ids:
+            continue        # already reviewed; the example is the better copy
+        el = contour_from_mask(
+            rec['mask'], f_bin_offset=int(rec.get('f_off') or 0),
+            t_frame_offset=int(rec.get('t_off') or 0),
+            sample_rate=sr, nfft=nfft, hop=hop, id=key)
+        if el is not None:
+            elements.append(el)
+    if not elements:
+        return None
+
+    forced = _forced_from_store(td_iter_meta(store_path))
+    res = group_calls(elements, cfg, forced=forced)
+
+    f0_of = {c.call_id: c.f0_hz for c in res.calls}
+    pred_updates: Dict[str, Dict] = {}
+    for eid, call in res.call_of.items():
+        fields = {'harmonic_call_id': call,
+                  'harmonic_n': int(res.harmonic_of.get(eid, 1)),
+                  'f0_hz': round(f0_of.get(call, 0.0), 2) or ''}
+        if eid in example_ids:
+            try:
+                td_update_meta(store_path, eid, fields)
+            except Exception:
+                pass
+        else:
+            pred_updates[eid] = fields
+    if pred_updates:
+        try:
+            update_pred_attrs(store_path, pred_updates)
+        except Exception:
+            pass
+    return {'n_elements': len(elements), 'n_calls': res.n_calls,
+            'n_harmonic': sum(1 for n in res.harmonic_of.values() if n > 1)}

@@ -294,6 +294,19 @@ _METRICS_TOOLTIP = (
 )
 
 RECENT_PROJECTS_KEY = "mad/recent_projects"
+#: Shared by the two inference panels, which offer the same option.
+HARMONIC_TOGGLE_TIP = (
+    "<b>Group harmonics into calls</b> once detections are written.\n"
+    "\n"
+    "The model segments <i>elements</i> — a fundamental and each of its "
+    "harmonics are separate connected components. This links a stack back "
+    "into one vocalisation, stamping every detection with its call id and "
+    "harmonic number, so call counts and inter-call intervals are per "
+    "<i>call</i> rather than per element.\n"
+    "\n"
+    "Runs per recording as its detections land. Nothing is merged or "
+    "discarded — the elements stay separate and reviewable, and a "
+    "right-click on any detection corrects its assignment afterwards.")
 #: Detection settings, remembered across sessions. They are a deliberate
 #: choice about how wide a net to cast, not something to be re-decided (or
 #: auto-tuned) on every run — so the last value the user set is the value
@@ -303,6 +316,7 @@ INFER_SETTINGS = {
     "mad/infer/min_blob":   ("spin_infer_min_blob", int),
     "mad/infer/merge":      ("chk_infer_merge", bool),
     "mad/infer/merge_gap":  ("spin_infer_merge_gap", float),
+    "mad/infer/harmonics":  ("chk_infer_harmonics", bool),
     "mad/infer/post_target": ("combo_train_after", str),
 }
 # v2: the v1 key could hold a width saved while the layout was over-constrained
@@ -5334,18 +5348,18 @@ class MADImportSamplingDialog(QDialog):
         self._rb_stride = QRadioButton(
             "Evenly spaced — tiles the whole recording series")
         self._rb_random = QRadioButton("Random")
+        self._rb_random.setToolTip(
+            "Draw at random. The recordings shown in the table below are the "
+            "ones that get imported — the draw is made once for the preview, "
+            "not again on Import.")
         self._rb_stride.setChecked(True)
-        self._spin_seed = QSpinBox()
-        self._spin_seed.setRange(0, 2 ** 31 - 1)
-        self._spin_seed.setValue(12345)
-        self._spin_seed.setPrefix("seed ")
-        self._spin_seed.setEnabled(False)
+        # No seed box. It bought reproducibility of a draw nobody reproduces:
+        # this picks which recordings to look at, and re-running an import to
+        # get the same 70 files back is not a thing anyone has needed. The
+        # spinner cost a control, an explanation, and a default that made the
+        # "random" option quietly deterministic across projects.
         f_s.addWidget(self._rb_stride)
-        row = QHBoxLayout()
-        row.addWidget(self._rb_random)
-        row.addWidget(self._spin_seed)
-        row.addStretch(1)
-        f_s.addLayout(row)
+        f_s.addWidget(self._rb_random)
         v.addWidget(gb_s)
 
         # ---- channels ----------------------------------------------------
@@ -5416,7 +5430,7 @@ class MADImportSamplingDialog(QDialog):
                   self._rb_spread, self._rb_one, self._rb_pool,
                   self._chk_skip):
             w.toggled.connect(lambda _checked: self._refresh())
-        for w in (self._spin_folder, self._spin_total, self._spin_seed):
+        for w in (self._spin_folder, self._spin_total):
             w.valueChanged.connect(lambda _value: self._refresh())
         self._cmb_ch.currentIndexChanged.connect(lambda _i: self._refresh())
 
@@ -5447,8 +5461,8 @@ class MADImportSamplingDialog(QDialog):
         return SampleSpec(
             per=per, n=n,
             spacing="stride" if self._rb_stride.isChecked() else "random",
-            seed=(None if self._rb_stride.isChecked()
-                  else self._spin_seed.value()),
+            seed=None,      # entropy-seeded; see the note by the radio
+
             channel_mode=mode,
             channels=((self._cmb_ch.currentText(),) if mode == "only" else ()))
 
@@ -5476,7 +5490,6 @@ class MADImportSamplingDialog(QDialog):
     def _sync_enabled(self):
         self._spin_folder.setEnabled(self._rb_folder.isChecked())
         self._spin_total.setEnabled(self._rb_total.isChecked())
-        self._spin_seed.setEnabled(self._rb_random.isChecked())
         self._cmb_ch.setEnabled(self._rb_one.isChecked())
 
     def _prepared(self, spec):
@@ -5964,6 +5977,17 @@ class MADMainWindow(QMainWindow):
         # Persisted per-file total annotation count cache.
         # basename -> (accepted, pending, rejected) counts for the file lists
         self._file_count_cache: Dict[str, tuple] = {}
+        #: Basenames the sidecar scan has positively DECIDED about, whether it
+        #: found calls or proved there are none. The cache alone cannot say
+        #: this: a basename missing from it means "no sidecar", "not read yet"
+        #: or "the read failed", and only the first is a statement about the
+        #: recording. Anything that prunes by emptiness must consult this, or
+        #: it prunes the files the scan simply has not reached -- which is how
+        #: a 443-file project was cleared down to 6 while its scan was still
+        #: running. See _files_without_detections.
+        self._counts_scanned: set = set()
+        #: True once the scan has been through every recording in the list.
+        self._counts_complete: bool = False
         #: Basenames declared exhaustively reviewed. Filled by the background
         #: sidecar scan so painting a row never touches the network.
         self._review_done_cache: set = set()
@@ -6494,20 +6518,28 @@ class MADMainWindow(QMainWindow):
         self.btn_remove_files.setEnabled(False)
         btn_row.addWidget(self.btn_remove_files)
 
-        self.btn_clear_files = QPushButton("Clear All")
-        self.btn_clear_files.setToolTip(
-            "Empty the Audio list — or just the recordings holding no calls "
-            "at all (never analyzed, or analyzed and nothing found). "
-            "Anything you accepted or rejected is kept. The dialog "
-            "offers both.\n\n"
-            "Like Remove File(s), this only unregisters the recordings — "
-            "every .wav and its .mad sidecar stay exactly where they are on "
-            "disk, so nothing labelled is lost and re-adding the folder "
-            "brings it all back."
+        # Pruning and emptying used to share one "Clear All" button, so the
+        # routine action sat one mis-click from the rare destructive one — and
+        # a dialog offering both is where a partially-scanned list cleared 437
+        # recordings. The everyday half lives here and can only ever remove
+        # recordings holding nothing; emptying the list is in the File menu,
+        # which is the right amount of effort for something done once a
+        # project.
+        self.btn_remove_empty = QPushButton("Remove Empty…")
+        self.btn_remove_empty.setToolTip(
+            "Drop the recordings holding no calls at all — never analyzed, or "
+            "analyzed and nothing found. Anything you accepted OR rejected "
+            "stays: rejections train the model as hard negatives.\n\n"
+            "Unavailable until MAD has finished checking which recordings "
+            "hold calls, because until then it cannot tell an empty one from "
+            "one it has not opened yet.\n\n"
+            "Like Remove File(s), this only unregisters — every .wav and its "
+            ".mad sidecar stay on disk, and File → Restore Cleared "
+            "Recordings… puts them back."
         )
-        self.btn_clear_files.clicked.connect(self._clear_all_files)
-        self.btn_clear_files.setEnabled(False)
-        btn_row.addWidget(self.btn_clear_files)
+        self.btn_remove_empty.clicked.connect(self._remove_empty_files)
+        self.btn_remove_empty.setEnabled(False)
+        btn_row.addWidget(self.btn_remove_empty)
         vbox.addLayout(btn_row)
 
         self.btn_inspect_mad = QPushButton("Inspect .mad")
@@ -7097,6 +7129,11 @@ class MADMainWindow(QMainWindow):
         self.chk_post_merge.toggled.connect(
             self.spin_post_merge_gap.setEnabled)
 
+        self.chk_post_harmonics = QCheckBox("Group harmonics into calls")
+        self.chk_post_harmonics.setChecked(True)
+        self.chk_post_harmonics.setToolTip(HARMONIC_TOGGLE_TIP)
+        _pf.addRow("", self.chk_post_harmonics)
+
         self._post_infer_settings.setVisible(False)
         tbody.addWidget(self._post_infer_settings)
 
@@ -7260,6 +7297,11 @@ class MADMainWindow(QMainWindow):
         iform.addRow("Merge gap:", self.spin_infer_merge_gap)
         self.chk_infer_merge.toggled.connect(
             self.spin_infer_merge_gap.setEnabled)
+
+        self.chk_infer_harmonics = QCheckBox("Group harmonics into calls")
+        self.chk_infer_harmonics.setChecked(True)
+        self.chk_infer_harmonics.setToolTip(HARMONIC_TOGGLE_TIP)
+        iform.addRow("", self.chk_infer_harmonics)
 
         self.combo_infer_device = QComboBox()
         self._fill_device_combo(self.combo_infer_device)
@@ -7506,12 +7548,16 @@ class MADMainWindow(QMainWindow):
         pair(self.chk_infer_merge, self.chk_post_merge,
              lambda w: w.toggled, lambda w: w.isChecked(),
              lambda w, v: w.setChecked(v))
+        pair(self.chk_infer_harmonics, self.chk_post_harmonics,
+             lambda w: w.toggled, lambda w: w.isChecked(),
+             lambda w, v: w.setChecked(v))
 
         # One definition of what each control means, so the two copies cannot
         # explain themselves differently.
         for src, dst in ((self.spin_infer_threshold, self.spin_post_threshold),
                          (self.spin_infer_min_blob, self.spin_post_min_blob),
                          (self.chk_infer_merge, self.chk_post_merge),
+                         (self.chk_infer_harmonics, self.chk_post_harmonics),
                          (self.spin_infer_merge_gap,
                           self.spin_post_merge_gap)):
             dst.setToolTip(src.toolTip())
@@ -7996,21 +8042,12 @@ class MADMainWindow(QMainWindow):
         if count_label is not None:
             vbox.addWidget(count_label)
 
-        if not hasattr(self, 'btn_harmonics'):
-            self.btn_harmonics = QPushButton("Detect Harmonics (H)")
-            self.btn_harmonics.setToolTip(
-                "Group the pending and accepted detections in this file into "
-                "calls, linking each fundamental to its harmonics (dotted "
-                "lines).\n\n"
-                "Nothing is accepted, rejected or deleted — the grouping is "
-                "recorded alongside each detection, so you keep both the "
-                "element count and the call count.\n\n"
-                "Right-click any detection to correct its assignment; "
-                "corrections survive a re-run.\n"
-                "Shortcut: H")
-            self.btn_harmonics.setFocusPolicy(Qt.NoFocus)
-            self.btn_harmonics.clicked.connect(self._detect_harmonics)
-            vbox.addWidget(self.btn_harmonics)
+        # No Detect Harmonics button here any more. Grouping is a property of
+        # a detection run, not a per-file chore — pressing it 263 times after a
+        # batch was never going to happen, so the recordings that most needed
+        # it were the ones that never got it. It is a toggle on both inference
+        # panels now, running per recording as the run lands. H still regroups
+        # the file on screen, which is what a manual correction needs.
         if not hasattr(self, 'btn_gallery'):
             self.btn_gallery = QPushButton("Detection Gallery (G)")
             self.btn_gallery.setToolTip(
@@ -8996,8 +9033,8 @@ class MADMainWindow(QMainWindow):
         if hasattr(self, 'btn_remove_files'):
             self.btn_remove_files.setEnabled(
                 bool(self.file_list.selectedItems()))
-        if hasattr(self, 'btn_clear_files'):
-            self.btn_clear_files.setEnabled(bool(self.audio_files))
+        if hasattr(self, 'btn_remove_empty'):
+            self.btn_remove_empty.setEnabled(bool(self.audio_files))
         if hasattr(self, 'btn_inspect_mad'):
             # Only offer it for a recording that actually has a sidecar —
             # a file with no labels and no run has nothing to inspect.
@@ -11637,6 +11674,98 @@ class MADMainWindow(QMainWindow):
             # Never let the follow-up cost the user their run summary.
             pass
 
+    #: Where the pre-removal Audio list is parked, inside the project.
+    AUDIO_LIST_BACKUP = "audio_list_backup.json"
+
+    def _audio_list_backup_path(self) -> Optional[str]:
+        if self._project is None or not self._project.project_dir:
+            return None
+        return os.path.join(self._project.project_dir, self.AUDIO_LIST_BACKUP)
+
+    def _snapshot_audio_list(self, n_removing: int) -> None:
+        """Park the current registry before anything leaves it.
+
+        Recovering a cleared list otherwise means reading run manifests out of
+        batch_runs/ by hand, which is how the 443-recording loss was undone.
+        The registry is a few hundred KB of paths at worst, the wavs it names
+        are untouched on disk, and it only has to survive until the user
+        notices -- so one file, overwritten each time, is enough.
+
+        Never raises: this runs on the path to a destructive action, and
+        failing to write insurance must not stop the thing being insured.
+        """
+        path = self._audio_list_backup_path()
+        if not path:
+            return
+        try:
+            import json
+            import time as _time
+            entries = [e.to_dict() for e in self._project.audio_entries()]
+            if not entries:
+                return
+            with open(path, 'w') as f:
+                json.dump({'saved': _time.time(),
+                           'saved_human': _time.strftime('%Y-%m-%d %H:%M:%S'),
+                           'n_before': len(entries),
+                           'n_removed': int(n_removing),
+                           'entries': entries}, f, indent=2)
+        except Exception as ex:
+            self._log(f"audio-list backup failed: {ex}")
+
+    def _restore_audio_list(self):
+        """Put back recordings dropped by the last removal or clear."""
+        path = self._audio_list_backup_path()
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(
+                self, "Nothing to restore",
+                "No previous Audio list is saved for this project.\n\n"
+                "A copy is parked every time recordings leave the list, so "
+                "there will be one after the next removal.")
+            return
+        try:
+            import json
+            with open(path) as f:
+                data = json.load(f)
+            saved = [e for e in (data.get('entries') or []) if e.get('path')]
+        except Exception as ex:
+            QMessageBox.critical(self, "Could not read the saved list", str(ex))
+            return
+        have = {os.path.normcase(os.path.abspath(p)) for p in self.audio_files}
+        back = [e for e in saved
+                if os.path.normcase(os.path.abspath(e['path'])) not in have]
+        if not back:
+            QMessageBox.information(
+                self, "Nothing to restore",
+                f"Every recording in the saved list "
+                f"({data.get('saved_human', 'unknown time')}) is already in "
+                f"the Audio list.")
+            return
+        gone = [e for e in back if not os.path.isfile(e['path'])]
+        msg = (f"Put back {len(back)} recording(s) removed on or before "
+               f"{data.get('saved_human', 'an earlier session')}?")
+        if gone:
+            msg += (f"\n\n{len(gone)} of them are no longer at their saved "
+                    f"path and will come back flagged as missing — use "
+                    f"Locate Missing Recordings… to repoint them.")
+        if QMessageBox.question(
+                self, "Restore cleared recordings", msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        from fnt.usv.usv_detector.mad_registry import RegisteredFile
+        entries = list(self._project.audio_entries())
+        entries.extend(RegisteredFile.from_dict(e) for e in back)
+        self._project.set_audio_entries(entries)
+        try:
+            self._project.save()
+        except Exception as ex:
+            QMessageBox.critical(self, "Could not save the project", str(ex))
+            return
+        self._append_audio_paths([e['path'] for e in back])
+        self._log(f"Restored {len(back)} recording(s) to the Audio list")
+        self.status_bar.showMessage(
+            f"Restored {len(back)} recording(s)")
+
     def _remove_files_by_path(self, paths_to_remove: list,
                               delete_embedded: bool = False):
         """Drop files from the Audio list and unregister them from the project.
@@ -11648,6 +11777,7 @@ class MADMainWindow(QMainWindow):
         was told that in as many words.
         """
         self._auto_save_mask_if_dirty()
+        self._snapshot_audio_list(len(paths_to_remove))
         current_path = (self.audio_files[self.current_file_idx]
                         if self.audio_files else None)
         remove_set = set(paths_to_remove)
@@ -11706,7 +11836,7 @@ class MADMainWindow(QMainWindow):
             self._load_current_file()
         self._update_project_state()
         self.btn_remove_files.setEnabled(bool(self.audio_files))
-        self.btn_clear_files.setEnabled(bool(self.audio_files))
+        self.btn_remove_empty.setEnabled(bool(self.audio_files))
         self._update_scope_labels()
         self._update_run_button()
         n = len(paths_to_remove)
@@ -12343,6 +12473,7 @@ class MADMainWindow(QMainWindow):
                 "Select a trained model (or train one) before running inference."
             )
             return
+        self._infer_group_harmonics = self.chk_infer_harmonics.isChecked()
         wavs = self._gather_inference_targets()
         if not wavs:
             QMessageBox.warning(
@@ -12420,6 +12551,24 @@ class MADMainWindow(QMainWindow):
             self._locate_missing_recordings)
         self.act_locate_missing.setEnabled(False)
         file_menu.addAction(self.act_locate_missing)
+
+        self.act_restore_list = QAction("&Restore Cleared Recordings…", self)
+        self.act_restore_list.setToolTip(
+            "Put back recordings dropped by the last removal. The list is "
+            "saved before anything leaves it.")
+        self.act_restore_list.triggered.connect(self._restore_audio_list)
+        file_menu.addAction(self.act_restore_list)
+
+        # Emptying the list lives here, not next to Remove Empty… in the Audio
+        # panel: it is a once-a-project action, and sharing a row (and a
+        # dialog) with the everyday prune is what made it reachable by
+        # accident. No shortcut, for the same reason.
+        self.act_empty_list = QAction("&Empty the Audio List…", self)
+        self.act_empty_list.setToolTip(
+            "Take every recording out of the Audio list. Nothing is deleted — "
+            "Restore Cleared Recordings… puts them back.")
+        self.act_empty_list.triggered.connect(self._empty_audio_list)
+        file_menu.addAction(self.act_empty_list)
 
         self.act_run_summary = QAction("Batch Run &Summary…", self)
         self.act_run_summary.setShortcut("Ctrl+B")
@@ -14020,6 +14169,11 @@ class MADMainWindow(QMainWindow):
         paths = list(self.audio_files)
         self._counts_generation = getattr(self, '_counts_generation', 0) + 1
         gen = self._counts_generation
+        # Nothing is known again until this scan says so. Adding files restarts
+        # the scan, and until it catches up every recording in the list is
+        # "unknown" -- which must not read as "empty" to anything that prunes.
+        self._counts_scanned = set()
+        self._counts_complete = False
         w = self._live_worker('_counts_worker')
         if w is not None:
             # A superseded probe cannot be interrupted mid-listing, but its
@@ -14031,6 +14185,7 @@ class MADMainWindow(QMainWindow):
         if not paths:
             self._file_count_cache = {}
             self._file_run_info = {}
+            self._counts_complete = True
             self._update_file_list_counts(sync_current=False)
             return
         self._counts_worker = _SidecarScanWorker(paths, self)
@@ -14052,6 +14207,13 @@ class MADMainWindow(QMainWindow):
         """
         if generation != getattr(self, '_counts_generation', 0):
             return          # a newer scan is authoritative
+        # The probe listed every directory, so a recording it did NOT return
+        # has no sidecar of any kind -- decided, and decided empty. That is
+        # real knowledge and the only kind of "empty" that can be established
+        # without opening a file; the rest arrives chunk by chunk below.
+        with_sidecar = {os.path.basename(fp) for fp, _ in found}
+        self._counts_scanned = {os.path.basename(p) for p in self.audio_files
+                                if os.path.basename(p) not in with_sidecar}
         self._counts_pending = list(found)
         self._counts_partial = ({}, {}, set())
         self._read_sidecar_chunk(generation)
@@ -14066,11 +14228,16 @@ class MADMainWindow(QMainWindow):
         batch, self._counts_pending = (self._counts_pending[:chunk],
                                        self._counts_pending[chunk:])
         for fp, has_store in batch:
+            base = os.path.basename(fp)
             try:
                 counts = self._stored_status_counts(fp)
             except Exception:
+                # A failed read says nothing about the recording. Leaving it
+                # out of _counts_scanned keeps it "unknown" rather than
+                # letting one dropped network read make a labelled file
+                # look prunable.
                 continue
-            base = os.path.basename(fp)
+            self._counts_scanned.add(base)
             # Read here rather than per row: this is the one pass that is
             # already allowed to touch every sidecar, off the UI thread and in
             # chunks. Doing it during painting would put a network open behind
@@ -14104,10 +14271,13 @@ class MADMainWindow(QMainWindow):
         self._file_count_cache = cache
         self._file_run_info = runs
         self._review_done_cache = done
-        self._update_file_list_counts(sync_current=False)
         if self._counts_pending:
+            self._update_file_list_counts(sync_current=False)
             QTimer.singleShot(
                 0, lambda g=generation: self._read_sidecar_chunk(g))
+        else:
+            self._counts_complete = True
+            self._update_file_list_counts(sync_current=False)
 
     def _update_view_header(self):
         """The line above the spectrogram: recording, position, live counts."""
@@ -14445,62 +14615,143 @@ class MADMainWindow(QMainWindow):
 
         So: clearable means never analyzed, or analyzed and found nothing at
         all. Anything a person accepted OR rejected stays.
+
+        Emptiness has to be *established*, never inferred from a missing cache
+        entry. The cache fills in asynchronously -- the probe runs on a worker
+        and the sidecars are read two per event-loop turn -- so for most of a
+        big project's first minute a basename is absent because nothing has
+        looked at it yet. Reading absence as "never analyzed" is what cleared
+        443 recordings down to 6, 45 of them carrying finished QC, seconds
+        after adding files restarted the scan. _counts_scanned is the set the
+        scan has actually decided about; everything else is unknown and stays.
         """
+        scanned = getattr(self, '_counts_scanned', None) or set()
         out = []
         for fp in self.audio_files:
-            counts = self._file_count_cache.get(os.path.basename(fp))
-            if counts is None:              # never analyzed
-                out.append(fp)
-                continue
-            if not any(counts):             # analyzed, found nothing
-                out.append(fp)
+            base = os.path.basename(fp)
+            if base not in scanned:
+                continue                    # not looked at yet -- not empty
+            counts = self._file_count_cache.get(base)
+            if counts is None or not any(counts):
+                out.append(fp)              # decided: nothing in it
         return out
 
-    def _clear_all_files(self):
-        """Empty the Audio list — or just the part of it with nothing in it.
+    def _remove_empty_files(self):
+        """Drop the recordings holding nothing — the everyday prune.
 
-        Work out what would actually leave the disk BEFORE asking, so the
-        prompt can say so. Asking a generic "nothing is deleted" question
-        first and only then admitting some files will be deleted makes the
-        first answer meaningless — the user has already agreed to something
-        that was not what happens.
+        Separate from :meth:`_empty_audio_list` on purpose. These were one
+        button and one dialog offering both, which put the routine action a
+        mis-click from the irreversible one and made the safe answer depend on
+        reading two similar sentences. Splitting them means this path CANNOT
+        remove a recording anyone has reviewed, whatever gets clicked.
         """
         n = len(self.audio_files)
         if not n:
             return
+        # Whether the scan has actually decided about the list yet. Pruning on
+        # a partial answer is what cost a 443-recording project its list: the
+        # count was honest about the cache, and the cache was mostly empty.
+        scanned = len(getattr(self, '_counts_scanned', None) or set())
+        if not getattr(self, '_counts_complete', False):
+            QMessageBox.information(
+                self, "Still checking",
+                f"MAD is still checking which recordings hold calls — "
+                f"{scanned} of {n} done.\n\n"
+                "Until that finishes it cannot tell an empty recording from "
+                "one it has not opened yet, so removing by emptiness would "
+                "drop whatever the scan has not reached. Wait for the counts "
+                "in the Audio list to stop filling in, then try again.")
+            return
         empty = self._files_without_detections()
-
+        if not empty:
+            QMessageBox.information(
+                self, "Nothing to remove",
+                f"All {n} recording(s) in the Audio list hold calls, "
+                "predictions or rejections.")
+            return
+        keep = n - len(empty)
         box = QMessageBox(self)
-        box.setWindowTitle("Clear the Audio list")
+        box.setWindowTitle("Remove empty recordings")
         box.setIcon(QMessageBox.Question)
-        box.setText(f"The Audio list holds {n} recording(s).")
+        box.setText(f"Remove {len(empty)} recording(s) holding no calls?")
         box.setInformativeText(
-            f"{len(empty)} of them hold no calls at all — never analyzed, "
-            f"or analyzed and nothing found. Recordings with accepted "
-            f"calls OR rejections are kept: rejections train the model as "
-            f"hard negatives.\n\n"
-            "Nothing is deleted — every .wav and its .mad sidecar stays on "
-            "disk, and re-adding the folder brings the list back.")
-        b_empty = box.addButton(f"Clear {len(empty)} with no detections",
-                                QMessageBox.AcceptRole)
-        b_all = box.addButton(f"Clear all {n}", QMessageBox.DestructiveRole)
-        box.addButton("Cancel", QMessageBox.RejectRole)
-        b_empty.setEnabled(bool(empty))
-        box.setDefaultButton(b_empty if empty else b_all)
+            f"They were never analyzed, or analyzed and nothing was found. "
+            f"The other {keep} stay — anything with accepted calls OR "
+            f"rejections is kept, because rejections train the model as hard "
+            f"negatives.\n\n"
+            "Nothing is deleted: every .wav and its .mad sidecar stays on "
+            "disk, and File → Restore Cleared Recordings… puts these back.")
+        box.addButton(f"Remove {len(empty)}", QMessageBox.AcceptRole)
+        b_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_cancel)
         box.exec_()
         clicked = box.clickedButton()
         if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
             return
-        targets = empty if clicked is b_empty else list(self.audio_files)
+        self._clear_targets(empty)
+
+    def _empty_audio_list(self):
+        """Take every recording out of the list. File menu only.
+
+        Done about once a project — starting over, or switching to a different
+        recording set — so it is worth a trip to the menu. Living beside a
+        button it shared a dialog with is what made it reachable by accident.
+        """
+        n = len(self.audio_files)
+        if not n:
+            return
+        # State the cost in the unit that matters. "443 recordings" is
+        # abstract; "45 of them carry review you did by hand" is the number
+        # worth reading before answering.
+        cache = getattr(self, '_file_count_cache', None) or {}
+        qc = sum(1 for fp in self.audio_files
+                 for c in (cache.get(os.path.basename(fp)),)
+                 if c and (c[0] or c[2]))
+        box = QMessageBox(self)
+        box.setWindowTitle("Empty the Audio list")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"Take all {n} recording(s) out of the Audio list?")
+        detail = ""
+        if qc:
+            detail = (f"{qc} of them carry accepted or rejected calls. "
+                      f"Removing them from the list takes what they "
+                      f"contribute out of the next training run.\n\n")
+        elif not getattr(self, '_counts_complete', False):
+            # Not a blocker here — emptying does not depend on knowing what is
+            # in anything — but the QC figure above is the one thing that
+            # would make someone reconsider, so say when it is not trustworthy.
+            scanned = len(getattr(self, '_counts_scanned', None) or set())
+            detail = (f"MAD is still checking what these recordings hold "
+                      f"({scanned} of {n} done), so it cannot yet say how "
+                      f"many carry finished review.\n\n")
+        box.setInformativeText(
+            detail +
+            "Nothing is deleted — every .wav and its .mad sidecar stays on "
+            "disk, and File → Restore Cleared Recordings… puts the list back.")
+        box.addButton(f"Empty the list ({n})", QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_cancel)      # Enter is never the destructive one
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+            return
+        self._clear_targets(list(self.audio_files))
+
+    def _clear_targets(self, targets: list):
+        """Unregister ``targets``, asking first about any the project owns.
+
+        Shared tail: both callers above have already confirmed WHICH
+        recordings go, and this is the one question neither of them can
+        answer — whether any of them will leave the disk as a result.
+        """
         if not targets:
             return
-
         # Project-owned copies (a legacy recordings/ file, or one made by
         # Pack Project) have to be deleted, not merely unregistered:
         # _rescan_project_wavs re-adopts everything under recordings/ on the
         # next project open, so unregistering alone lets the cleared list
         # come straight back. Asked separately, and only about the files this
-        # clear actually touches.
+        # removal actually touches.
         owned = []
         if self._project is not None:
             try:
@@ -14516,7 +14767,7 @@ class MADMainWindow(QMainWindow):
             warn.setIcon(QMessageBox.Warning)
             warn.setText(
                 f"{len(owned)} of the {len(targets)} recording(s) being "
-                "cleared are stored INSIDE the project.")
+                "removed are stored INSIDE the project.")
             warn.setInformativeText(
                 "Those will be deleted from disk (wav + .mad sidecar). This "
                 f"cannot be undone. The other {len(targets) - len(owned)} are "
@@ -15952,6 +16203,45 @@ class MADMainWindow(QMainWindow):
                 els.append(e)
                 index_of[key] = i
         return els, index_of
+
+    def _group_harmonics_after_infer(self, wav_path) -> None:
+        """Group one recording's detections as its inference lands.
+
+        Per file rather than once at the end, so the grouping is already there
+        when the user clicks into a finished recording while the rest of the
+        batch is still running -- which is the whole review-as-it-goes flow.
+        Cheap next to the scan that produced the detections: masks and
+        metadata only, no audio and no model.
+
+        Failures are logged and swallowed. The detections are already written
+        and correct; a grouping that did not happen costs the call/element
+        distinction on that file and nothing else, and taking down a 263-file
+        run over it would be far worse.
+        """
+        if not getattr(self, '_infer_group_harmonics', False) or not wav_path:
+            return
+        done = getattr(self, '_harmonics_grouped', None)
+        if done is None:
+            done = self._harmonics_grouped = set()
+        key = self._path_key(wav_path)
+        if key in done:
+            return                  # the finish handler re-marks every file
+        done.add(key)
+        try:
+            from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+            from fnt.usv.usv_detector.mad_harmonics import group_recording
+            store = masks_sibling_path(wav_path)
+            if not os.path.isfile(store):
+                return
+            res = group_recording(store, os.path.basename(wav_path))
+        except Exception as ex:
+            self._log(f"Harmonic grouping failed "
+                      f"({os.path.basename(str(wav_path))}): {ex}")
+            return
+        if res:
+            self._log(f"Harmonics ({os.path.basename(str(wav_path))}): "
+                      f"{res['n_elements']} element(s) -> {res['n_calls']} "
+                      f"call(s), {res['n_harmonic']} harmonic")
 
     def _detect_harmonics(self):
         """Group the on-screen detections into calls and show the links."""
@@ -17815,6 +18105,7 @@ class MADMainWindow(QMainWindow):
         # as the Run Inference box (see _link_infer_settings) — taking them
         # from here keeps the code honest about which controls the user was
         # actually looking at when they started this run.
+        self._infer_group_harmonics = self.chk_post_harmonics.isChecked()
         cfg = MADInferenceConfig(
             model_path=model_path,
             threshold=self.spin_post_threshold.value(),
@@ -18556,6 +18847,9 @@ class MADMainWindow(QMainWindow):
         for w in wav_paths:
             self._set_file_item_state(w, 'pending')
         self._infer_counted = set()
+        # Per-run, so re-running a recording regroups it rather than being
+        # skipped as already done.
+        self._harmonics_grouped = set()
         self._infer_locked = {self._path_key(w) for w in wav_paths}
         self._refresh_file_list_locks()
 
@@ -18607,6 +18901,7 @@ class MADMainWindow(QMainWindow):
                         cnt = get_prob_blob_count(masks_sibling_path(wav_paths[j]))
                     except Exception:
                         pass
+                    self._group_harmonics_after_infer(wav_paths[j])
                     self._set_file_item_state(wav_paths[j], 'done', cnt)
 
         def on_finished(results):
@@ -18644,6 +18939,7 @@ class MADMainWindow(QMainWindow):
                     if 'error' in r:
                         self._set_file_item_state(wp, 'error')
                     else:
+                        self._group_harmonics_after_infer(wp)
                         self._set_file_item_state(wp, 'done', r.get('n_blobs'))
             # Aggregate timing across the batch (helps spot CPU vs GPU).
             tt = [r['timing'] for r in results if r.get('timing')]

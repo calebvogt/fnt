@@ -205,7 +205,7 @@ def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
 
-def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):
+def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):  # noqa: E501
     """Per-frame weather line and light bar (blitted like everything else)."""
     from fnt.uwb import weather as wx
     t_ns = frame_start.value
@@ -238,8 +238,9 @@ def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):
     f = (t_ns - a) / max(b - a, 1)
     light['cursor'].set_xdata([f, f])
     light['text'].set_text(wx.format_light(state))
+    fig.draw_artist(light['text'])
     lax = light['ax']
-    for key in ('strip', 'precip', 'ticks', 'cursor', 'text'):
+    for key in ('strip', 'precip', 'ticks', 'cursor'):
         lax.draw_artist(light[key])
     k = state.get('moon_illumination', np.nan)
     if np.isfinite(k):
@@ -278,7 +279,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      axis_limits=None, behavior=None, show_trail=True,
                      show_labels=True, time_range=None, data_view=None,
                      environment=None, show_weather=False, show_light=False,
-                     weather_units="metric",
+                     weather_units="metric", day_one=None,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -302,6 +303,10 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     The classification grid is independent of the video frame rate: each video
     frame takes the classification row nearest its own timestamp, so the
     overlay stays correct whatever speed the video is rendered at.
+
+    ``day_one`` is the trial's first local calendar date, so a daily clip
+    says "Day 3" rather than starting again at Day 1. Defaults to the first
+    date in ``data``.
 
     ``environment`` is a ``weather.WeatherTimeline``. With ``show_weather``
     each frame prints the weather record covering its moment above the
@@ -412,7 +417,9 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     if environment is None:
         show_weather = show_light = False
     band_w = 0.34 if show_weather else 0.0
-    band_l = 0.34 if show_light else 0.0
+    # The light readout sits ABOVE the strip rather than on it: over a dawn
+    # the text and the strip are the same brightness and neither can be read.
+    band_l = 0.58 if show_light else 0.0
     total_h = fig_h + band_w + band_l
     px = int(round(total_h * dpi))
     total_h = (px + px % 2) / dpi   # even pixel height, for video encoders
@@ -461,6 +468,9 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
             fontsize=11, family='monospace', animated=True)
     if show_light:
         from fnt.uwb import weather as _wx
+        ltext = fig.text(0.08 * frac, (fig_h + band_w + 0.34) / total_h, "",
+                         ha='left', va='bottom', fontsize=9,
+                         family='monospace', animated=True)
         y0 = (fig_h + band_w + 0.06) / total_h
         lax = fig.add_axes([0.08 * frac, y0, 0.86 * frac, 0.22 / total_h])
         lax.set_xlim(0, 1)
@@ -478,11 +488,6 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                                 aspect='auto', interpolation='nearest',
                                 animated=True)
         cursor = lax.axvline(0, color='#e0322b', linewidth=2.0, animated=True)
-        ltext = lax.text(0.006, 0.5, "", transform=lax.transAxes,
-                         ha='left', va='center', fontsize=9, color='#f2f2f2',
-                         family='monospace', animated=True,
-                         bbox=dict(boxstyle='round,pad=0.25',
-                                   fc=(0, 0, 0, 0.6), ec='none'))
         fig_w = arena_w + panel_w
         mox = fig.add_axes([0.94 * frac + 0.006, y0 - 0.03 / total_h,
                             0.28 / fig_w, 0.28 / total_h])
@@ -590,6 +595,13 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                                  animated=True)
         ax.add_collection(link_lc)
 
+    # Day 1 is the first local date of the TRIAL, not of this clip, so a
+    # daily video is labelled with its real day number.
+    if day_one is None:
+        day_one = data['Timestamp'].min().date()
+    elif hasattr(day_one, 'date'):
+        day_one = day_one.date()
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     if not video_writer.isOpened():
@@ -628,7 +640,9 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         title_text = title
         if speed_text:
             title_text += f" - Speed: {speed_text}"
-        title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
+        day_n = (frame_start.date() - day_one).days + 1
+        title_text += (f"\nDay {day_n} · Time: "
+                       f"{frame_start.strftime('%Y-%m-%d %H:%M:%S')}")
         title_artist.set_text(title_text)
         ax.draw_artist(title_artist)
         if weather_artist is not None or light is not None:

@@ -1467,10 +1467,7 @@ class LightBar(QWidget):
         self._colors = None
         self._frac = None            # playhead position across the day, 0-1
         self._level = None
-        self._text = ""
         self._ticks = ()             # (fraction, label) hour ticks
-        self._moon_poly = None       # lit outline on a unit disc
-        self._moon_up = True
         self._precip = None          # per-sample QColor or None
 
     def set_day(self, levels, rgb_fn, ticks=(), moon=None, precip=None):
@@ -1486,15 +1483,13 @@ class LightBar(QWidget):
         self._ticks = tuple(ticks)
         self.update()
 
-    def set_now(self, frac, level, text, moon_poly=None, moon_up=True):
-        self._frac, self._level, self._text = frac, level, text
-        self._moon_poly, self._moon_up = moon_poly, moon_up
+    def set_now(self, frac, level):
+        self._frac, self._level = frac, level
         self.update()
 
     def clear(self):
         self._levels = self._colors = self._frac = self._level = None
-        self._moon_poly = None
-        self._text = ""
+        self._precip = None
         self.update()
 
     def paintEvent(self, _event):
@@ -1528,39 +1523,41 @@ class LightBar(QWidget):
             x = int(rect.left() + self._frac * rect.width())
             p.setPen(QPen(QColor("#e0322b"), 2))
             p.drawLine(x, rect.top(), x, rect.bottom())
-        if self._text:
-            f = QFont("Consolas")
-            f.setStyleHint(QFont.Monospace)
-            f.setPixelSize(10)
-            p.setFont(f)
-            # On a dark backing: the strip under the text runs from night to
-            # noon, so no single text colour would stay readable.
-            tw = p.fontMetrics().horizontalAdvance(self._text) + 10
-            box = rect.adjusted(3, 3, 0, -3)
-            box.setWidth(min(tw, rect.width() - 6))
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 150))
-            p.drawRoundedRect(box, 3, 3)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QColor("#f2f2f2"))
-            p.drawText(box.adjusted(5, 0, 0, 0),
-                       Qt.AlignVCenter | Qt.AlignLeft, self._text)
-        if self._moon_poly is not None:
-            self._paint_moon(p, rect)
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(QColor(90, 90, 90), 1))
         p.drawRect(rect)
         p.end()
 
-    def _paint_moon(self, p, rect):
-        """Phase icon at the right end; faded while the moon is down."""
-        r = (rect.height() - 6) / 2.0
-        cx, cy = rect.right() - r - 6, rect.center().y() + 0.5
+
+class MoonIcon(QWidget):
+    """The moon's phase as a small disc, beside the light bar.
+
+    Its own widget rather than something drawn on the bar: anything painted
+    over the strip hides the light it is meant to describe.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(24, 24)
+        self._poly = None
+        self._up = True
+
+    def set_moon(self, poly, up=True):
+        self._poly, self._up = poly, up
+        self.update()
+
+    def clear(self):
+        self._poly = None
+        self.update()
+
+    def paintEvent(self, _event):
+        if self._poly is None:
+            return
+        p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0, 0, 0, 150))
-        p.drawEllipse(QPointF(cx, cy), r + 3, r + 3)
-        p.setOpacity(1.0 if self._moon_up else 0.5)
+        r = min(self.width(), self.height()) / 2.0 - 2.0
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        p.setOpacity(1.0 if self._up else 0.5)
         p.setBrush(QColor("#2b3040"))
         p.setPen(QPen(QColor("#8a8f9c"), 0.8))
         p.drawEllipse(QPointF(cx, cy), r, r)
@@ -1568,6 +1565,5 @@ class LightBar(QWidget):
         p.setBrush(QColor("#f1efe4"))
         # y is flipped: the polygon is in maths orientation.
         p.drawPolygon(QPolygonF([QPointF(cx + x * r, cy - y * r)
-                                 for x, y in self._moon_poly]))
-        p.setOpacity(1.0)
-        p.setRenderHint(QPainter.Antialiasing, False)
+                                 for x, y in self._poly]))
+        p.end()
