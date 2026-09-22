@@ -12228,8 +12228,25 @@ class UWBQuickVisualizationWindow(QWidget):
             f"is more reliable than recovery."
             f"{recover_hint}")
 
-    def _on_index_ready(self, src_path, path):
+    def _retire_index_builder(self):
+        """Release the finished index builder, outside its own signal.
+
+        The builder emits done/failed from inside its run(), so clearing the
+        last reference here destroys a QThread that has not returned yet -
+        which Qt aborts the process for (SIGABRT, exit code 6), killing the
+        tool the moment a large index finished. Same deferred release the
+        chunk loaders and metadata workers use.
+        """
+        w = self.preview_index_builder
+        if w is None:
+            return
+        if not w.isFinished():
+            QTimer.singleShot(50, self._retire_index_builder)
+            return
         self.preview_index_builder = None
+
+    def _on_index_ready(self, src_path, path):
+        self._retire_index_builder()
         self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             # The user moved to another database while this was building. The
@@ -12249,7 +12266,7 @@ class UWBQuickVisualizationWindow(QWidget):
         # in content, so they stay valid — only future reads get faster.
 
     def _on_index_failed(self, src_path, err):
-        self.preview_index_builder = None
+        self._retire_index_builder()
         self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             return
