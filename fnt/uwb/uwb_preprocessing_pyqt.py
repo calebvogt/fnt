@@ -4724,6 +4724,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_inflight = {}           # chunk_index -> running loader
         self.preview_current_chunk = None
         self.preview_pending_current = None  # chunk to display once it lands
+        self._scrub_deadline = None          # forces a read during a long drag
         self.preview_t0 = None               # first ping, epoch ms
         self.preview_t1 = None               # last ping, epoch ms
         self.preview_playhead_ms = 0
@@ -8831,6 +8832,8 @@ class UWBQuickVisualizationWindow(QWidget):
     # nothing; only where you stop is fetched, on a background thread.
     MAX_CACHED_CHUNKS = 6
     SCRUB_DEBOUNCE_MS = 70
+    # Longest a continuous drag or a held arrow key goes without a read.
+    SCRUB_MAX_WAIT_S = 0.30
 
     def preview_time_bounds(self, selected_tags):
         """(min_ts, max_ts) epoch-ms across the selected tags, or None."""
@@ -9211,6 +9214,21 @@ class UWBQuickVisualizationWindow(QWidget):
             self.preview_pending_current = None
             self.lbl_preview_status.setText(f"Load failed: {err}")
 
+    def _chunk_is_wanted(self, idx):
+        """Is a delivered chunk still worth processing?
+
+        The chunk the playhead sits in and its two neighbours are; anything
+        else the user has already scrubbed past. Measured on VT-P002: a single
+        drag across the timeline delivered 88 chunks of which 87 were stale,
+        and processing them cost 23 s of main-thread time — the drag itself
+        should have taken 3. That is what froze the animals in place while the
+        clock kept ticking, since the clock is a label and the scene is not.
+        """
+        if idx == self.preview_pending_current:
+            return True
+        here = self._chunk_index_for(self.preview_playhead_ms)
+        return abs(idx - here) <= 1
+
     def _on_chunk_loaded(self, idx, df):
         """Process a delivered slice on the main thread and cache it.
 
@@ -9218,6 +9236,11 @@ class UWBQuickVisualizationWindow(QWidget):
         read the settings widgets directly, and they are a negligible share of
         the cost (the SQL read dominates).
         """
+        if not self._chunk_is_wanted(idx):
+            # Drop it unprocessed: the playhead has moved on, and paying ~0.3 s
+            # of main-thread time for a chunk that will never be drawn is
+            # exactly the work that starves the one the user is waiting for.
+            return
         try:
             frames = self._process_chunk(df, idx) if df is not None and len(df) else None
         except Exception as e:
@@ -10100,14 +10123,23 @@ class UWBQuickVisualizationWindow(QWidget):
                 # Still waiting on a read: re-state why, so a long load reads as
                 # a wait rather than a dead window while the clock ticks on.
                 self.lbl_preview_status.setText(self._loading_status_text())
-            if not self.preview_scrub_timer.isActive():
-                # Not resident: throttle a background load. Testing isActive()
-                # rather than restarting guarantees the timer still fires while
-                # the arrow key auto-repeats, so a sustained hold keeps
-                # advancing instead of starving the loader until release.
+            # Not resident: throttle a background load. Restarting the timer
+            # on every move is a true debounce — a drag issues ONE read, where
+            # a free-running tick issued one per 70 ms and buried the main
+            # thread in results for positions already scrubbed past. The
+            # deadline keeps a sustained hold (arrow-key auto-repeat, a slow
+            # continuous drag) advancing rather than waiting for release.
+            now = time.monotonic()
+            if self._scrub_deadline is None:
+                self._scrub_deadline = now + self.SCRUB_MAX_WAIT_S
+            if now >= self._scrub_deadline:
+                self.preview_scrub_timer.stop()
+                self._on_scrub_settled()
+            else:
                 self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
 
     def _on_scrub_settled(self):
+        self._scrub_deadline = None
         self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
                             make_current=True)
 

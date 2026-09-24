@@ -84,6 +84,36 @@ def test_loading_status_names_the_cause():
     assert "no fast index" in both and "export" in both
 
 
+def test_stale_chunks_are_dropped_unprocessed():
+    """A drag delivers chunks the playhead has left behind; they must be free.
+
+    Measured on VT-P002 before this: one drag delivered 88 chunks, 87 already
+    stale, and filtering/smoothing them cost 23 s of main-thread time - which
+    is what stopped the scene redrawing while the clock label carried on.
+    """
+    h = types.SimpleNamespace(
+        preview_pending_current=None,
+        preview_playhead_ms=0,
+        _chunk_index_for=lambda ts: 300,
+    )
+    wanted = W._chunk_is_wanted.__get__(h, types.SimpleNamespace)
+
+    assert wanted(300) is True                      # the chunk in view
+    assert wanted(299) is True and wanted(301) is True   # prefetched neighbours
+    assert wanted(298) is False                     # scrubbed past
+    assert wanted(742) is False
+
+    # Whatever the user is actually waiting on is always worth paying for.
+    h.preview_pending_current = 742
+    assert wanted(742) is True
+
+
+def test_scrub_debounce_has_a_floor():
+    """A sustained drag must still get a read, not just one on release."""
+    assert W.SCRUB_DEBOUNCE_MS > 0
+    assert 0 < W.SCRUB_MAX_WAIT_S <= 1.0
+
+
 def test_gap_search_runs_on_a_worker():
     """_handle_empty_chunk must hand the MIN/MAX scan to _start_db_query."""
     started = []
