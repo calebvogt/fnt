@@ -39,9 +39,16 @@ FEATURES: Dict[str, Tuple[str, str]] = {
 #: become the shape of the path.
 DEFAULT_AXES: Tuple[str, str, str] = ('pitch', 'entropy', 'pitch_rate')
 
-#: Frames of centred smoothing (~2.5 ms at 0.5 ms/frame). The per-frame peak is
-#: quantised to one frequency bin (~244 Hz at nfft 1024 / 250 kHz), so the raw
-#: pitch staircases and its derivative is mostly quantisation noise without it.
+#: Frames of centred smoothing (~2.5 ms at 0.5 ms/frame). Pitch is interpolated
+#: between bins (``peak_freq_interp_hz``), which removes the one-bin staircase
+#: on clean signals — but on real recordings the peak also scatters about a bin
+#: from frame to frame from noise (measured ~260 Hz on field USVs, interpolated
+#: or not), and a rate taken over 0.5 ms frames turns that into ~0.7 kHz/ms of
+#: noise. Only averaging over time removes it, and that is exactly what erases
+#: fast trills and frequency jumps — a 6 ms-period ±5 kHz trill is drawn as
+#: ±3.7 kHz at 2.5 ms but ±0.9 kHz at 10 ms. So the default stays short and the
+#: window's slider owns the trade-off: longer for smooth sweeps, shorter for
+#: species with fast frequency modulation.
 DEFAULT_SMOOTH_FRAMES = 5
 
 
@@ -67,6 +74,7 @@ def _smooth(y: np.ndarray, k: int) -> np.ndarray:
 def call_trajectory(
     frames: Dict, dt: float, frame_offset: int = 0,
     smooth_frames: int = DEFAULT_SMOOTH_FRAMES,
+    pitch_key: Optional[str] = None,
 ) -> Optional[Dict[str, np.ndarray]]:
     """One call's path: every :data:`FEATURES` key as an array over the frames
     its mask covers, plus ``frame`` (global spectrogram frame index, for tying a
@@ -77,6 +85,10 @@ def call_trajectory(
     the mask misses are dropped rather than interpolated — a gap in the mask is
     a gap in the evidence. Returns None when fewer than two frames remain, since
     a single point has no path and no rate of change.
+
+    ``pitch_key`` picks the contour pitch and its rate come from; by default the
+    sub-bin ``peak_freq_interp_hz`` when present, else the nearest-bin
+    ``peak_freq_hz``.
     """
     if not frames:
         return None
@@ -90,7 +102,12 @@ def call_trajectory(
         return _smooth(np.asarray(frames[key], dtype=np.float64)[keep] * scale,
                        smooth_frames)
 
-    pitch = s('peak_freq_hz', 1e-3)
+    # Sub-bin pitch when available: the nearest-bin contour moves in 244 Hz
+    # steps, and differentiating steps is what made the rate axis jagged.
+    pitch_key = pitch_key or ('peak_freq_interp_hz'
+                              if 'peak_freq_interp_hz' in frames
+                              else 'peak_freq_hz')
+    pitch = s(pitch_key, 1e-3)
     return {
         'frame': cols + int(frame_offset),
         'time': t_ms,

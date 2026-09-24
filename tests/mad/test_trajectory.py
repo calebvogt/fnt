@@ -149,3 +149,15 @@ def test_progress_only_grows_as_the_playhead_advances():
     t = np.sort(np.random.default_rng(3).uniform(0.2, 0.3, 50))
     ns = [playback_progress(t, p)[0] for p in np.linspace(0.15, 0.35, 200)]
     assert ns == sorted(ns) and ns[0] == 0 and ns[-1] == 50
+
+
+def test_trajectory_pitch_prefers_the_sub_bin_contour():
+    fr = _frames(np.full(20, 40e3))
+    fr['peak_freq_interp_hz'] = np.full(20, 40.1e3)
+    assert call_trajectory(fr, DT)['pitch'][0] == pytest.approx(40.1)
+    # ...unless asked for the nearest-bin one explicitly.
+    assert call_trajectory(fr, DT, pitch_key='peak_freq_hz')['pitch'][0] \
+        == pytest.approx(40.0)
+    # Frame dicts from before the interpolated key existed still work.
+    del fr['peak_freq_interp_hz']
+    assert call_trajectory(fr, DT)['pitch'][0] == pytest.approx(40.0)

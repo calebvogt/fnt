@@ -911,6 +911,42 @@ def _frame_features(full, bb, Pbb, mask, f_low: int, df: float) -> Dict:
     }
 
 
+def _interp_peak_hz(raw_db: np.ndarray, mask: np.ndarray, f_low: int,
+                    df: float) -> np.ndarray:
+    """Sub-bin peak frequency per masked column (NaN where the mask misses).
+
+    The loudest masked bin is only resolved to one bin (~244 Hz at nfft 1024 /
+    250 kHz), so a contour built from it staircases, and its frame-to-frame
+    rate of change is mostly those steps. Fitting a parabola through that bin
+    and its two neighbours on the dB spectrum puts the peak between bins — the
+    standard quadratic interpolation of a spectral peak, accurate to a small
+    fraction of a bin for a Hann window.
+
+    Works on the **unclipped** dB: a call louder than ``db_max`` clips flat
+    across its peak, which would leave no curvature to fit (and several tied
+    bins to choose between). Neighbours are read from the full column even
+    when they fall outside the mask; they are the true spectral shape around
+    the peak. The offset is clamped to ±0.5 bin, and a peak without downward
+    curvature (not a local maximum) keeps its bin centre.
+    """
+    H, W = mask.shape
+    F = raw_db.shape[0]
+    out = np.full(W, np.nan)
+    for t in range(W):
+        rows = np.where(mask[:, t])[0]
+        if rows.size == 0:
+            continue
+        k = f_low + int(rows[int(np.argmax(raw_db[f_low + rows, t]))])
+        p = 0.0
+        if 0 < k < F - 1:
+            a, b, c = raw_db[k - 1, t], raw_db[k, t], raw_db[k + 1, t]
+            den = a - 2.0 * b + c
+            if den < 0:
+                p = min(0.5, max(-0.5, 0.5 * (a - c) / den))
+        out[t] = (k + p) * df
+    return out
+
+
 def call_frame_features(
     spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
     df: float, db_min: float, db_max: float,
@@ -920,18 +956,27 @@ def call_frame_features(
 
     Same inputs as :func:`compute_call_metrics` (minus ``dt``, since nothing here
     depends on frame spacing). Returns a dict of length-W arrays:
-    ``has_mask`` (bool), ``peak_freq_hz`` (the frequency contour),
+    ``has_mask`` (bool), ``peak_freq_hz`` (the frequency contour, to the
+    nearest bin — what the CSV metrics use), ``peak_freq_interp_hz`` (the same
+    contour to a fraction of a bin — see :func:`_interp_peak_hz`),
     ``centroid_hz``, ``bandwidth_hz``, ``power_db`` and ``energy`` (masked-band
     power), plus full-column ``entropy`` and ``tonality``. Mask-dependent arrays
     are NaN where the mask misses a column. None when the mask is empty or
     doesn't fit.
+
+    ``peak_freq_interp_hz`` is deliberately *not* used by
+    :func:`compute_call_metrics`: switching the CSV contour to it would move
+    every existing start/end/mean frequency, slope and excursion.
     """
     prep = _prepare_call(spec_db_cols, mask, f_low, db_min, db_max)
     if prep is None:
         return None
     full, bb, Pbb = prep
-    return _frame_features(full, bb, Pbb, np.asarray(mask, dtype=bool),
-                           f_low, df)
+    mask = np.asarray(mask, dtype=bool)
+    frames = _frame_features(full, bb, Pbb, mask, f_low, df)
+    frames['peak_freq_interp_hz'] = _interp_peak_hz(
+        np.asarray(spec_db_cols, dtype=np.float64), mask, f_low, df)
+    return frames
 
 
 def compute_call_metrics(

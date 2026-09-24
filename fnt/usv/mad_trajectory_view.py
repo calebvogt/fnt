@@ -411,12 +411,17 @@ class MADTrajectoryWindow(QDialog):
         self.slider_smooth.setToolTip(
             "Centred moving average applied to every feature, over this much "
             "time, before the rate of pitch change is taken.\n\n"
-            "Pitch is measured to the nearest frequency bin (about 244 Hz at "
-            "nfft 1024 / 250 kHz), so frame by frame it moves in steps — and "
-            "its rate of change is mostly those steps. A few ms of smoothing "
-            "shows the call's real contour; off shows every raw frame.\n\n"
+            "Pitch is already located between frequency bins, but in real "
+            "recordings the peak still scatters by about a bin from frame to "
+            "frame from noise — and a rate measured over 0.5 ms frames turns "
+            "that into jagged lines. Smoothing removes it by averaging over "
+            "time, which also removes fast frequency modulation:\n"
+            "  • smooth sweeps: up to ~10 ms reads cleanest;\n"
+            "  • fast trills / frequency jumps: keep it at ~1.5–2.5 ms — a "
+            "6 ms-period trill loses most of its swing at 10 ms.\n"
+            "Off shows every raw frame.\n\n"
             "Changes only this picture. The CSV metrics are always computed "
-            "from the unsmoothed frames.")
+            "from the unsmoothed, nearest-bin frames.")
         self.slider_smooth.valueChanged.connect(self._on_smoothing_changed)
         row.addWidget(self.slider_smooth)
         self.lbl_smooth = QLabel("")

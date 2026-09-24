@@ -596,15 +596,30 @@ keep the static view's scale throughout, so Play and Stop never make the box
 jump, and Stop (or reaching the end) returns to the static picture. Opening the
 window mid-playback picks the run up where the playhead is.
 
-**Smoothing.** Pitch is measured to the nearest frequency bin (~244 Hz at
-nfft 1024 / 250 kHz), so frame by frame it moves in steps, and its rate of
-change is mostly those steps — real calls draw as boxy staircases. The
-**Smoothing** slider sets a centred moving average (in ms, converted to frames
-at the file's hop; default 2.5 ms, off shows raw frames, up to 10 ms) applied
-to every feature before the pitch rate is taken. It changes only the picture —
-the CSV metrics are always computed from unsmoothed frames — and is remembered
-between sessions. Each call's spectrogram work is cached separately from its
-smoothing, so dragging the slider redraws instantly, even mid-playback.
+**Smoothing, and what it trades away.** Pitch in the 3D view is located
+*between* frequency bins — a parabola through the loudest bin and its two
+neighbours (`peak_freq_interp_hz`) — which removes the one-bin (~244 Hz)
+staircase a nearest-bin contour draws on clean signals. On real recordings,
+though, the peak also scatters by about a bin from frame to frame from noise
+(measured ~260 Hz on field USVs, interpolated or not), and a rate taken over
+0.5 ms frames turns that into ~0.7 kHz/ms of noise — the same size as real FM
+rates. The **Smoothing** slider (a centred moving average, in ms, remembered
+between sessions) removes it by averaging over time, and that is the trade-off:
+averaging over time is also what erases fast frequency modulation. Measured on
+synthetic calls through the real STFT:
+
+| | 2.5 ms | 10 ms |
+|---|---|---|
+| ±5 kHz trill, 6 ms period — drawn swing | ±3.7 kHz | ±0.9 kHz |
+| 40→55 kHz frequency jump — drawn as a ramp of | 2 ms | 8.7 ms |
+
+So: up to ~10 ms for smooth sweeps (cleanest lines), ~1.5–2.5 ms for species
+with fast trills or step calls. A Savitzky–Golay filter and frequency-domain
+averaging were both tested and did not beat the moving average on this
+trade-off. Smoothing changes only the picture — the CSV metrics always use the
+unsmoothed, nearest-bin contour, so existing numbers never move. Each call's
+spectrogram work is cached separately from its smoothing, so dragging the slider
+redraws instantly, even mid-playback.
 
 **Rotation.** The window opens turning slowly about the vertical axis (a full
 turn a minute) — a 3D shape reads far better in motion than from any single
