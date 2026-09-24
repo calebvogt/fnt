@@ -548,6 +548,78 @@ After a large run the bottleneck is human attention, not compute.
 
 ---
 
+## Call trajectories (3D)
+
+The **3D view (T)** checkbox, at the right end of the line above the
+spectrogram, pops out a window that draws every call as a *path* rather than a
+shape. T opens it and closes it again; closing the window with its own X unticks
+the box. Each spectrogram frame of a
+call becomes one point, plotted by three of its features against each other,
+so the call traces a line through feature space:
+
+| Axis | Default | What it captures |
+|---|---|---|
+| X | **Pitch** (kHz) — loudest masked frequency per frame | where the call is |
+| Y | **Spectral entropy** — full-column, per frame | timbre: tonal vs noisy |
+| Z | **Pitch rate** (kHz/ms) — derivative of pitch | motion: which way it is going, how fast |
+
+Pitch against its own rate of change is a phase portrait: an upsweep sits above
+the zero-rate plane, a downsweep below it, a flat call on it, and a trill loops
+— once per cycle of its frequency modulation. Shapes that are easy to miss
+scrolling a spectrogram separate clearly here. Each axis is a dropdown
+(bandwidth, centroid, tonality, power and time in call are also available), and
+each is scaled independently to fill the box, since kHz, kHz/ms and a 0–1
+entropy share no common unit.
+
+**Only masks are drawn — pending and accepted, never rejected.** Every feature
+is computed over the call's own pixels (`call_frame_features`), so the
+broadband noise under a USV, or a second call overlapping it in time, never
+bends its path. This is the thing a mask-based detector can show that a
+boundary-based one cannot. Rejected masks are excluded outright: they record
+what a call is *not*. Harmonics (`H2`, `H3`…) are hidden by default because a
+harmonic is a scaled copy of its fundamental's contour and would redraw the same
+path higher up the pitch axis; a checkbox brings them back.
+
+**Reading it.** Lines brighten from onset (marked with a dot) to offset, so a
+still frame still shows direction. Accepted calls are green, pending yellow, and
+the call selected in the spectrogram turns white and thick. *In view* follows
+the spectrogram as you scroll; *Whole file* shows every call in the recording.
+
+**Playback.** Stopped, the window is a static picture that follows the
+spectrogram. Press **Play** and it becomes a player driven by the same playhead:
+every call is hidden until the playhead reaches it, then draws itself frame by
+frame behind a bright marker at the current moment, and dims to a ghost once it
+has played — so the call under the playhead is always the one that stands out,
+and the ghosts build up the stretch's repertoire as it plays. It runs at the
+playback speed, so at 0.03x a 40 ms USV takes over a second to trace. The axes
+keep the static view's scale throughout, so Play and Stop never make the box
+jump, and Stop (or reaching the end) returns to the static picture. Opening the
+window mid-playback picks the run up where the playhead is.
+
+**Smoothing.** Pitch is measured to the nearest frequency bin (~244 Hz at
+nfft 1024 / 250 kHz), so frame by frame it moves in steps, and its rate of
+change is mostly those steps — real calls draw as boxy staircases. The
+**Smoothing** slider sets a centred moving average (in ms, converted to frames
+at the file's hop; default 2.5 ms, off shows raw frames, up to 10 ms) applied
+to every feature before the pitch rate is taken. It changes only the picture —
+the CSV metrics are always computed from unsmoothed frames — and is remembered
+between sessions. Each call's spectrogram work is cached separately from its
+smoothing, so dragging the slider redraws instantly, even mid-playback.
+
+**Rotation.** The window opens turning slowly about the vertical axis (a full
+turn a minute) — a 3D shape reads far better in motion than from any single
+angle. Drag to take the camera; release and it carries on from where you left
+it. Axis labels move to whichever edges face the camera, so they never float
+over the data from behind the box.
+
+**Same numbers as the CSV.** `compute_call_metrics` now reduces the very
+per-frame arrays this view draws — contour, entropy, tonality and envelope all
+come from one shared core — so a call's path and its CSV row cannot disagree.
+The refactor is pinned by a test against a frozen copy of the previous
+function: no CSV value moved.
+
+---
+
 ## Review colors
 
 Overlay colors are **not fixed** — they're chosen per spectrogram colormap
@@ -614,6 +686,8 @@ of sync.
 |---|---|
 | `mad_pyqt.py` | PyQt5 GUI (labeling, review, training/inference dialogs). |
 | `mad_inference.py` | Run a checkpoint over a wav → CSV rows + per-call crops. |
+| `mad_trajectory.py` | Calls as paths through feature space: axis catalogue, smoothing, scaling (pure numpy). |
+| `../mad_trajectory_view.py` | The 3D trajectory pop-out (pyqtgraph OpenGL); which calls are drawn. |
 | `mad_training.py` | Train the U-Net from confirmed examples; grouped (leak-free) train/val split. |
 | `mad_examples.py` | Confirmed training-example store (`training_data.h5`). |
 | `mad_dataset.py` | Spectrogram/tile helpers shared by training & inference. |

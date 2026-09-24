@@ -6139,7 +6139,28 @@ class MADMainWindow(QMainWindow):
         self.lbl_view_header.setStyleSheet(
             "color: #9a9a9a; font-size: 9px; padding: 1px 4px;")
         self.lbl_view_header.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        right_layout.addWidget(self.lbl_view_header)
+        # The 3D view's toggle sits at the right end of this line: it is a
+        # view OF the spectrogram, so it belongs above it rather than among the
+        # review tools, and the right end of the header was empty.
+        self.chk_trajectories = QCheckBox("3D view (T)")
+        self.chk_trajectories.setToolTip(
+            "Open a rotating 3D view of the calls on screen, each drawn as a "
+            "path through pitch × timbre (spectral entropy) × motion (rate of "
+            "pitch change) — one point per spectrogram frame, from the call's "
+            "own mask pixels. Pending and accepted masks only.\n\n"
+            "Stopped, it follows the spectrogram as you scroll. Press Play and "
+            "it animates: each call draws itself as the playhead passes "
+            "through it, at the playback speed.\n"
+            "Shortcut: T opens and closes it.")
+        self.chk_trajectories.setFocusPolicy(Qt.NoFocus)
+        self.chk_trajectories.setStyleSheet("font-size: 10px;")
+        self.chk_trajectories.toggled.connect(self._set_trajectory_window_open)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 4, 0)
+        header_row.setSpacing(6)
+        header_row.addWidget(self.lbl_view_header, 1)
+        header_row.addWidget(self.chk_trajectories, 0, Qt.AlignRight)
+        right_layout.addLayout(header_row)
         right_layout.addWidget(self.spectrogram, 1)
 
         # The live training graph lives in its own floating window
@@ -8632,6 +8653,9 @@ class MADMainWindow(QMainWindow):
     def _refresh_annotation_list(self):
         if not hasattr(self, 'annotation_list'):
             return
+        # The 3D view redraws on a debounce, so queueing it before the rebuild
+        # below costs nothing and can't see a half-built list.
+        self._notify_trajectory_view()
         # Backstop for the cached example count. Deleting or clearing calls
         # changes the store from eight different places; all of them end in a
         # full rebuild, so dropping the active recording's entry here covers
@@ -9193,6 +9217,7 @@ class MADMainWindow(QMainWindow):
         return False
 
     def _update_pred_review_widgets(self):
+        self._notify_trajectory_view(selection_only=True)
         order = self._review_order()
         n = len(order)
         pos = self._selected_review_pos(order)
@@ -10286,6 +10311,93 @@ class MADMainWindow(QMainWindow):
         n = n_acc + len(to_reject)
         self._reviewed_count += n
         return n
+
+    def _shortcut_trajectories(self):
+        """T opens the 3D view, or closes it if it is already open."""
+        if not self._focus_is_edit():
+            self.chk_trajectories.toggle()
+
+    def _set_trajectory_window_open(self, on: bool):
+        """The header checkbox (and T) drive this; the window's own X comes
+        back through ``visibility_changed`` so the box always tells the truth."""
+        if on:
+            self._show_trajectory_window()
+            return
+        dlg = getattr(self, '_trajectory_dialog', None)
+        if dlg is not None:
+            try:
+                dlg.close()             # hides; the instance and cache are kept
+            except RuntimeError:
+                self._trajectory_dialog = None
+
+    def _on_trajectory_window_visibility(self, visible: bool):
+        chk = getattr(self, 'chk_trajectories', None)
+        if chk is not None and chk.isChecked() != visible:
+            chk.blockSignals(True)
+            chk.setChecked(visible)
+            chk.blockSignals(False)
+
+    def _show_trajectory_window(self):
+        """Open (or raise) the 3D call-trajectory view.
+
+        One instance for the session, hidden rather than destroyed on close, so
+        reopening is instant and keeps its per-call feature cache and camera.
+        Imported lazily: it pulls in OpenGL, which nothing else in MAD needs.
+        """
+        from fnt.usv.mad_trajectory_view import MADTrajectoryWindow
+        dlg = getattr(self, '_trajectory_dialog', None)
+        if dlg is not None:
+            try:
+                import sip
+                if sip.isdeleted(dlg):
+                    dlg = None
+            except Exception:
+                pass
+        if dlg is None:
+            # The 3D view always uses the dark-background palette: the
+            # colormap-specific ones exist to contrast with a spectrogram,
+            # which this window doesn't draw.
+            dlg = MADTrajectoryWindow(self, overlay_palette(None))
+            dlg.visibility_changed.connect(
+                self._on_trajectory_window_visibility)
+            self._trajectory_dialog = dlg
+        self.present_window(dlg)
+
+    def _notify_trajectory_playback(self, event: str, pos: float = 0.0):
+        """Drive the 3D view's player from the spectrogram's playhead:
+        'start' | 'tick' (every playhead update) | 'stop'."""
+        dlg = getattr(self, '_trajectory_dialog', None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            if event == 'start':
+                dlg.playback_started(self._playback_start_s,
+                                     self._playback_end_s)
+            elif event == 'tick':
+                dlg.playback_tick(pos)
+            else:
+                dlg.playback_stopped()
+        except RuntimeError:
+            self._trajectory_dialog = None     # C++ side already gone
+
+    def _notify_trajectory_view(self, selection_only: bool = False,
+                                view_changed: bool = False):
+        """Tell an open 3D view that the calls, the view or the selection
+        changed. Cheap when the window is closed — which is almost always."""
+        dlg = getattr(self, '_trajectory_dialog', None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            if selection_only:
+                dlg.update_selection()
+            else:
+                dlg.schedule_refresh(view_changed=view_changed)
+        except RuntimeError:
+            self._trajectory_dialog = None     # C++ side already gone
 
     def _show_gallery(self):
         """Open (or refresh) the detection gallery for the current file."""
@@ -12709,11 +12821,12 @@ class MADMainWindow(QMainWindow):
                     out.append(w)
             except RuntimeError:
                 continue        # C++ side already gone
-        # The training graph, its previews and the inference progress window
-        # are deliberately parentless (so they minimise and move on their
-        # own), which also hides them from findChildren. They are the windows
-        # most worth finding from this menu during a long run.
-        for name in ('_train_dialog', '_preview_dialog', '_infer_dialog'):
+        # The training graph, its previews, the inference progress window and
+        # the 3D trajectory view are deliberately parentless (so they minimise
+        # and move on their own), which also hides them from findChildren. They
+        # are the windows most worth finding from this menu.
+        for name in ('_train_dialog', '_preview_dialog', '_infer_dialog',
+                     '_trajectory_dialog'):
             w = getattr(self, name, None)
             if w is None or w in out:
                 continue
@@ -13013,6 +13126,7 @@ class MADMainWindow(QMainWindow):
         # button holds focus and would otherwise swallow the arrow key. Up/Down
         # are fully dedicated to zoom; B/N step Back/Next through detections.
         make(Qt.Key_G, self._show_gallery)         # Gallery (grid review)
+        make(Qt.Key_T, self._shortcut_trajectories)  # 3D call trajectories
         make(Qt.Key_B, self._shortcut_pred_prev)   # Back (previous detection)
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
@@ -17357,6 +17471,7 @@ class MADMainWindow(QMainWindow):
     def _invalidate_spec_cache(self):
         self.spectrogram.cached_view_start = None
         self.spectrogram.cached_view_end = None
+        self._notify_trajectory_view(view_changed=True)   # 'In view' follows
         if self.spectrogram.total_duration > 0:
             # Width matters more than the call here: above ~6000 grid columns
             # this re-renders the whole visible window from raw audio, which
@@ -17445,6 +17560,7 @@ class MADMainWindow(QMainWindow):
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
+            self._notify_trajectory_playback('start')
         except Exception as e:
             self.status_bar.showMessage(f"Playback error: {e}")
 
@@ -17459,6 +17575,7 @@ class MADMainWindow(QMainWindow):
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
+        self._notify_trajectory_playback('stop')
 
     # ------------------------------------------------------------------ #
     # Copying the view out
@@ -17759,6 +17876,7 @@ class MADMainWindow(QMainWindow):
             return
         self.spectrogram.playback_position = current_pos
         self.spectrogram.update()
+        self._notify_trajectory_playback('tick', current_pos)
 
     # ==================================================================
     # Recent projects

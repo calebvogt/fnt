@@ -822,6 +822,118 @@ CALL_METRIC_KEYS = [
 _TONALITY_HALF_BINS = 2
 
 
+def _prepare_call(spec_db_cols, mask, f_low: int, db_min: float,
+                  db_max: float):
+    """Shared input handling for the per-call quantifiers.
+
+    Returns ``(full, bb, Pbb)`` — the full-frequency dB columns clipped to
+    [db_min, db_max], the call-band crop of them, and that crop as linear power
+    — or None when the mask is empty or doesn't fit the columns. Clipping here
+    is what puts predictions (clipped spec) and hand-labels (raw dB) on one
+    scale.
+    """
+    if mask is None or mask.size == 0 or not mask.any():
+        return None
+    H, W = mask.shape
+    full = np.clip(np.asarray(spec_db_cols, dtype=np.float64), db_min, db_max)
+    F_full = full.shape[0]
+    f_hi = f_low + H
+    if f_hi > F_full or full.shape[1] != W:
+        return None
+    bb = full[f_low:f_hi, :]                  # call-band crop (H, W), dB
+    Pbb = np.power(10.0, bb / 10.0)           # linear power in the band
+    return full, bb, Pbb
+
+
+def _frame_features(full, bb, Pbb, mask, f_low: int, df: float) -> Dict:
+    """Per-frame arrays for one call, all of length W (one per time column).
+
+    Mask-dependent features are NaN in columns the mask doesn't touch; entropy
+    and tonality are computed over the full column (CAD parity) so they are
+    defined everywhere. The loops deliberately repeat the exact per-column
+    arithmetic :func:`compute_call_metrics` has always used, so reducing these
+    arrays reproduces its numbers bit for bit — the metric CSV and anything
+    plotted from these frames can never disagree.
+    """
+    H, W = mask.shape
+    F_full = full.shape[0]
+    has = mask.any(axis=0)
+    peak_hz = np.full(W, np.nan)
+    centroid_hz = np.full(W, np.nan)
+    bandwidth_hz = np.full(W, np.nan)
+    Pm = np.where(mask, Pbb, 0.0)
+    freqs = (f_low + np.arange(H)) * df
+    for t in range(W):
+        rows_t = np.where(mask[:, t])[0]
+        if rows_t.size == 0:
+            continue
+        # Loudest masked pixel in the column → the call's frequency contour.
+        peak_row = rows_t[int(np.argmax(bb[rows_t, t]))]
+        peak_hz[t] = (f_low + peak_row) * df
+        bandwidth_hz[t] = (rows_t[-1] - rows_t[0] + 1) * df
+        pw = Pm[:, t]
+        s = float(pw.sum())
+        if s > 0:
+            centroid_hz[t] = float((freqs * pw).sum() / s)
+
+    # --- per-frame spectral entropy + tonality over the FULL column (CAD) ---
+    Pfull = np.power(10.0, full / 10.0)
+    max_ent = np.log2(F_full) if F_full > 1 else 1.0
+    ton = np.zeros(W)
+    ent = np.zeros(W)
+    half = _TONALITY_HALF_BINS
+    for t in range(W):
+        col = Pfull[:, t]
+        s = float(col.sum())
+        if s <= 0:
+            ent[t] = 1.0       # empty column → maximally "noisy"
+            continue
+        pk = int(np.argmax(col))
+        lo, hi = max(0, pk - half), min(F_full, pk + half + 1)
+        ton[t] = float(col[lo:hi].sum()) / s
+        p = col / s
+        p = p[p > 0]
+        ent[t] = float(-(p * np.log2(p)).sum()) / max_ent
+
+    energy = Pm.sum(axis=0)                  # masked band power per frame
+    with np.errstate(divide='ignore'):
+        power_db = np.where(has, 10.0 * np.log10(np.where(has, energy, 1.0)),
+                            np.nan)
+    return {
+        'has_mask': has,
+        'peak_freq_hz': peak_hz,
+        'centroid_hz': centroid_hz,
+        'bandwidth_hz': bandwidth_hz,
+        'energy': energy,
+        'power_db': power_db,
+        'entropy': ent,
+        'tonality': ton,
+    }
+
+
+def call_frame_features(
+    spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
+    df: float, db_min: float, db_max: float,
+) -> Optional[Dict]:
+    """Per-frame features of one call — the time series :func:`compute_call_metrics`
+    summarises into single numbers, before it does.
+
+    Same inputs as :func:`compute_call_metrics` (minus ``dt``, since nothing here
+    depends on frame spacing). Returns a dict of length-W arrays:
+    ``has_mask`` (bool), ``peak_freq_hz`` (the frequency contour),
+    ``centroid_hz``, ``bandwidth_hz``, ``power_db`` and ``energy`` (masked-band
+    power), plus full-column ``entropy`` and ``tonality``. Mask-dependent arrays
+    are NaN where the mask misses a column. None when the mask is empty or
+    doesn't fit.
+    """
+    prep = _prepare_call(spec_db_cols, mask, f_low, db_min, db_max)
+    if prep is None:
+        return None
+    full, bb, Pbb = prep
+    return _frame_features(full, bb, Pbb, np.asarray(mask, dtype=bool),
+                           f_low, df)
+
+
 def compute_call_metrics(
     spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
     df: float, dt: float, db_min: float, db_max: float,
@@ -836,18 +948,20 @@ def compute_call_metrics(
     hand-labels (raw dB) compute on the same scale. Per-frame spectral entropy
     and tonality use the full column (matching CAD's `dsp_detector`). Returns a
     dict keyed by :data:`CALL_METRIC_KEYS`; degenerate metrics are omitted.
+
+    The per-frame quantities come from :func:`call_frame_features`' shared core,
+    so these summaries and any per-frame view of the same call agree exactly.
     """
     m: Dict = {}
-    if mask is None or mask.size == 0 or not mask.any():
+    prep = _prepare_call(spec_db_cols, mask, f_low, db_min, db_max)
+    if prep is None:
         return m
+    full, bb, Pbb = prep
+    mask = np.asarray(mask, dtype=bool)
     H, W = mask.shape
-    full = np.clip(np.asarray(spec_db_cols, dtype=np.float64), db_min, db_max)
     F_full = full.shape[0]
     f_hi = f_low + H
-    if f_hi > F_full or full.shape[1] != W:
-        return m
-    bb = full[f_low:f_hi, :]                  # call-band crop (H, W), dB
-    Pbb = np.power(10.0, bb / 10.0)           # linear power in the band
+    frames = _frame_features(full, bb, Pbb, mask, f_low, df)
     ys, xs = np.where(mask)
     vals_db = bb[mask]
 
@@ -859,17 +973,10 @@ def compute_call_metrics(
     m['peak_freq_hz'] = round(float((f_low + ys[peak_pix]) * df), 2)
 
     # --- frequency contour: peak-power freq per masked time column ---
-    cols, cfreq = [], []
-    for t in range(W):
-        rows_t = np.where(mask[:, t])[0]
-        if rows_t.size == 0:
-            continue
-        peak_row = rows_t[int(np.argmax(bb[rows_t, t]))]
-        cols.append(t)
-        cfreq.append((f_low + peak_row) * df)
-    if cfreq:
-        cols_a = np.asarray(cols, dtype=np.float64)
-        cf = np.asarray(cfreq, dtype=np.float64)
+    has = frames['has_mask']
+    if has.any():
+        cols_a = np.nonzero(has)[0].astype(np.float64)
+        cf = frames['peak_freq_hz'][has]
         m['start_freq_hz'] = round(float(cf[0]), 2)
         m['end_freq_hz'] = round(float(cf[-1]), 2)
         m['mean_freq_hz'] = round(float(cf.mean()), 2)
@@ -901,28 +1008,11 @@ def compute_call_metrics(
         m['spectral_centroid_hz'] = round(float((freqs * row_power).sum() / tot), 2)
 
     # --- per-frame spectral entropy + tonality over the FULL column (CAD) ---
-    Pfull = np.power(10.0, full / 10.0)
-    max_ent = np.log2(F_full) if F_full > 1 else 1.0
-    ton = np.zeros(W)
-    ent = np.zeros(W)
-    half = _TONALITY_HALF_BINS
-    for t in range(W):
-        col = Pfull[:, t]
-        s = float(col.sum())
-        if s <= 0:
-            ent[t] = 1.0       # empty column → maximally "noisy"
-            continue
-        pk = int(np.argmax(col))
-        lo, hi = max(0, pk - half), min(F_full, pk + half + 1)
-        ton[t] = float(col[lo:hi].sum()) / s
-        p = col / s
-        p = p[p > 0]
-        ent[t] = float(-(p * np.log2(p)).sum()) / max_ent
-    m['tonality'] = round(float(ton.mean()), 4)
-    m['spectral_entropy'] = round(float(ent.mean()), 4)
+    m['tonality'] = round(float(frames['tonality'].mean()), 4)
+    m['spectral_entropy'] = round(float(frames['entropy'].mean()), 4)
 
     # --- amplitude envelope over time (masked band energy per frame) ---
-    col_energy = Pm.sum(axis=0)
+    col_energy = frames['energy']
     if W > 1:
         m['peak_time_frac'] = round(int(np.argmax(col_energy)) / float(W - 1), 3)
     env = col_energy[col_energy > 0]
