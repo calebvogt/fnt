@@ -1742,6 +1742,120 @@ class InheritSettingsDialog(QDialog):
         return self.combo.currentData()
 
 
+
+class TagStatsDialog(QDialog):
+    """Measured ping rate and battery for every tag in the loaded database.
+
+    A tag's rate profile (10/1, 4/1, 1/1) is written on its label and nowhere
+    in the data, so a mis-flashed tag or the wrong tag on an animal shows up
+    only as one animal being sampled more often than another - and, eventually,
+    as a battery dead in six days. This reads the profile back out of the
+    recording so it can be checked before the trial, not after it.
+    """
+
+    COLUMNS = [
+        ("HexID", "The ID written on the tag"),
+        ("Animal", "Who it is assigned to in Configure Identities"),
+        ("Median Hz", "Typical rate: the median over the minutes it reported"),
+        ("Peak Hz", "Busiest minute - the fastest rate this tag reached"),
+        ("Quiet Hz", "5th-percentile minute - the slowest it ran, which is "
+                     "where a rest rate shows itself"),
+        ("Median gap", "Median gap between pings, in ms"),
+        ("Common gap", "Most frequent gap between pings, in ms"),
+        ("Pings", "Total reports in this database"),
+        ("Hours", "Span from first to last ping"),
+        ("Battery V", "Most recent voltage"),
+        ("V/day", "Drain: a robust fit over the last 3 days, ignoring the "
+                  "first 12 h while a fresh cell settles"),
+        ("Days left", "Until 2.36 V, where these tags stop reporting, with the "
+                      "range the fit allows. Assumes the plateau holds - below "
+                      "2.55 V these cells fall much faster, and the note says so"),
+        ("Last ping", "Local time of its most recent report"),
+        ("Note", ""),
+    ]
+
+    def __init__(self, stats, labels, tz, db_name, parent=None):
+        from fnt.uwb import tag_stats as TS
+        super().__init__(parent)
+        self.setWindowTitle(f"Tag Statistics — {db_name}")
+        self.resize(1180, 460)
+        self._stats = stats
+        lay = QVBoxLayout()
+
+        head = QLabel(
+            "Measured from the recording, not from the tag's label. Compare "
+            "Peak against Quiet to see the rate pair a tag is running: two "
+            "clearly different numbers mean it switches between an active and "
+            "a rest rate, while a peak close to the quiet figure means it "
+            "holds one rate whatever the animal does. The gap columns and the "
+            "distribution to the right show the same thing per ping.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color:#9aa7b4;")
+        lay.addWidget(head)
+
+        table = QTableWidget(len(stats), len(self.COLUMNS))
+        table.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS])
+        for i, (_name, tip) in enumerate(self.COLUMNS):
+            if tip:
+                table.horizontalHeaderItem(i).setToolTip(tip)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSortingEnabled(False)
+        gap_cols = list(TS.GAP_LABELS)
+        table.setColumnCount(len(self.COLUMNS) + len(gap_cols))
+        table.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS] + gap_cols)
+        for i, label in enumerate(gap_cols, start=len(self.COLUMNS)):
+            table.horizontalHeaderItem(i).setToolTip(
+                f"Percentage of this tag's gaps between pings that fell in {label}")
+        for r, (_idx, row) in enumerate(stats.iterrows()):
+            last = pd.Timestamp(int(row["last_ns"]), tz="UTC").tz_convert(tz)
+            def _num(v, fmt="{:.2f}"):
+                return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else fmt.format(v)
+
+            def _days_left(r):
+                mid = r["days_left"]
+                if mid is None or (isinstance(mid, float) and np.isnan(mid)):
+                    return "—"
+                lo, hi = r.get("days_left_lo"), r.get("days_left_hi")
+                span = ("" if any(x is None or np.isnan(x) for x in (lo, hi))
+                        else f"  ({lo:.0f}–{hi:.0f})")
+                return f"{mid:.0f}{span}"
+            values = [
+                row["HexID"], labels.get(int(row["shortid"]), "—"),
+                _num(row["median_hz"]), _num(row["peak_hz"], "{:.1f}"),
+                _num(row["slow_hz"]), f"{int(row['median_gap_ms'])} ms",
+                f"{int(row['modal_gap_ms'])} ms",
+                f"{int(row['pings']):,}", _num(row["hours"], "{:.1f}"),
+                _num(row["v_last"]), _num(row["v_per_day"], "{:.3f}"),
+                _days_left(row),
+                last.strftime("%m-%d %H:%M"), row["note"] or "",
+            ] + [_num(row[g], "{:.1f}") for g in gap_cols]
+            for c, text in enumerate(values):
+                item = QTableWidgetItem(str(text))
+                if c >= 2 and c != 13:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(r, c, item)
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+        lay.addWidget(table)
+
+        row = QHBoxLayout()
+        btn_copy = QPushButton("Copy Table")
+        btn_copy.setToolTip("Copy every column as tab-separated text, ready to "
+                            "paste into a spreadsheet or an email to the vendor.")
+        btn_copy.clicked.connect(self._copy)
+        row.addWidget(btn_copy)
+        row.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        row.addWidget(buttons)
+        lay.addLayout(row)
+        self.setLayout(lay)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self._stats.to_csv(sep="\t", index=False))
+
+
 class ExportConflictDialog(QDialog):
     """Dialog shown when export would overwrite existing files.
     Shows categorized lists of conflicting and new files."""
@@ -6555,6 +6669,21 @@ class UWBQuickVisualizationWindow(QWidget):
         disp.addWidget(self.combo_weather_units, 1)
         v.addLayout(disp)
 
+        self.chk_weather_autofetch = QCheckBox(
+            "Fetch automatically when a database is opened")
+        self.chk_weather_autofetch.setChecked(True)
+        self.chk_weather_autofetch.setToolTip(
+            "When a database is opened and a site is set, fetch the weather "
+            "for its whole recording without waiting for the button.\n\n"
+            "Cheap after the first time: cached files are reused and only "
+            "days that were still in progress when last fetched are "
+            "downloaded again - so a trial you export daily pulls one new "
+            "day. With no connection it falls back to the cache and says so.\n"
+            "\n"
+            "Turn it off to keep the tool entirely offline until you press "
+            "Fetch Weather.")
+        v.addWidget(self.chk_weather_autofetch)
+
         fetch = QHBoxLayout()
         self.btn_fetch_weather = QPushButton("Fetch Weather")
         self.btn_fetch_weather.setToolTip(
@@ -6838,19 +6967,36 @@ class UWBQuickVisualizationWindow(QWidget):
                              self._on_weather_failed)
 
     def _restore_weather_from_cache(self):
-        """Rebuild the last fetch from the cache alone - no network."""
+        """Bring the weather up to date when a database is opened.
+
+        With auto-fetch on (the default) this is the same job the button
+        runs, so a trial that grew since the last export gets its new days
+        without anyone pressing anything; the cache means it is nearly free
+        for days already held. With it off, or in an unattended batch, only
+        the cache is read - the export step does its own fetching.
+        """
         s = self.site_settings()
         if (self.environment is not None or self._weather_fetching
                 or not s.has_location or not self.db_path or not self.table_name
                 or (s.weather_source == 'none' and s.solar_source == 'computed')):
             return
+        auto = (getattr(self, 'chk_weather_autofetch', None) is not None
+                and self.chk_weather_autofetch.isChecked()
+                and not getattr(self, '_batch_active', False))
         cache = os.path.join(self.analysis_dir_for_db(), WEATHER_CACHE_DIR)
         key = (self.db_path, self._site_key(s))
-        if not os.path.isdir(cache) or self._weather_restore_key == key:
+        if self._weather_restore_key == key:
             return
+        if not auto and not os.path.isdir(cache):
+            return                      # nothing cached and not allowed to fetch
         self._weather_restore_key = key
         self._weather_fetching = True
-        self._start_db_query(self._weather_job(s, offline=True),
+        if auto:
+            self._set_weather_status("Fetching weather for this trial…", "#9aa7b4")
+            self.log_message(
+                "Fetching weather for this recording (Weather Settings → "
+                "'Fetch automatically when a database is opened')…")
+        self._start_db_query(self._weather_job(s, offline=not auto),
                              self._on_weather_fetched, self._on_weather_failed)
 
     def _on_weather_fetched(self, res):
@@ -14087,6 +14233,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     item.widget().deleteLater()
             self.tag_layout.removeItem(self.tag_buttons_layout)
         
+        if hasattr(self, 'btn_tag_stats'):
+            self.btn_tag_stats.deleteLater()
         if hasattr(self, 'btn_assign_identities'):
             self.btn_assign_identities.deleteLater()
         
@@ -14124,6 +14272,29 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         self.btn_assign_identities.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         self.tag_layout.addWidget(self.btn_assign_identities)
+
+        # What rate each tag is ACTUALLY pinging at. The profile is written on
+        # the tag's label and nowhere in the data, so this is the only way to
+        # catch a mis-flashed tag before it costs a trial.
+        self.btn_tag_stats = QPushButton("Tag Statistics...")
+        self.btn_tag_stats.clicked.connect(self.open_tag_stats)
+        self.btn_tag_stats.setEnabled(False)
+        self.btn_tag_stats.setStyleSheet(
+            "QPushButton { padding: 4px 8px; font-size: 10px; }")
+        self.btn_tag_stats.setToolTip(
+            "Measure each tag's ping rate and battery from the recording "
+            "itself: the profile it is really running (10/1, 4/1, 1/1), its "
+            "typical and peak rate, whether it ever drops to its rest mode, "
+            "and how fast the battery is going.\n"
+            "\n"
+            "Worth a look at the start of every trial: a tag flashed with the "
+            "wrong profile samples its animal several times more (or less) "
+            "often than the others, which is a confound before it is a dead "
+            "battery. Nothing in the data says so otherwise.\n"
+            "\n"
+            "Reads the fast indexed copy when there is one; otherwise it "
+            "scans the table once.")
+        self.tag_layout.addWidget(self.btn_tag_stats)
         
         # Whose tags these are. Anything that must not act on the previous
         # trial's widgets can compare this against (db_path, table_name);
@@ -14146,10 +14317,80 @@ class UWBQuickVisualizationWindow(QWidget):
         if not self._preview_active and self.selected_preview_tags():
             self.activate_preview()
 
+    def open_tag_stats(self):
+        """Measure every tag's rate profile and battery, then show the table."""
+        if not self.db_path or not self.table_name:
+            QMessageBox.warning(self, "No Database", "Load a database first.")
+            return
+        if getattr(self, '_tag_stats_running', False):
+            return
+        from fnt.uwb import tag_stats as TS
+        indexed = self.current_indexed_db()
+        db = indexed or self.preview_db_path or self.db_path
+        table = self.table_name
+        tags = sorted(self.tag_checkboxes) or None
+        has_index = bool(indexed)
+        self._tag_stats_running = True
+        self.btn_tag_stats.setEnabled(False)
+        self.btn_tag_stats.setText("Measuring…")
+        self.log_message(
+            "Measuring tag ping rates"
+            + (" from the fast indexed copy…" if has_index
+               else " (no fast index yet, so the table is scanned once)…"))
+
+        def job():
+            conn = connect_ro(db)
+            try:
+                return TS.tag_rate_stats(conn, table, tags=tags,
+                                         has_index=has_index)
+            finally:
+                conn.close()
+
+        self._start_db_query(job, self._on_tag_stats, self._on_tag_stats_failed)
+
+    def _on_tag_stats(self, stats):
+        self._tag_stats_running = False
+        self.btn_tag_stats.setEnabled(True)
+        self.btn_tag_stats.setText("Tag Statistics...")
+        if stats is None or not len(stats):
+            self.log_message("Tag statistics: no pings found for the selected tags.")
+            return
+        labels = {}
+        for tag in stats['shortid']:
+            info = self.tag_identities.get(int(tag)) or {}
+            sex, ident = info.get('sex'), info.get('identity')
+            name = info.get('name')
+            label = f"{str(sex)[:1].upper()}{ident}" if sex and ident else ""
+            labels[int(tag)] = (f"{label} {name}".strip() if name else label) or "—"
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+        for _i, r in stats.iterrows():
+            self.log_message(
+                f"  {r['HexID']}  {labels.get(int(r['shortid']), '') or '-':<16} "
+                f"median {r['median_hz']:>6.2f} Hz | peak {r['peak_hz']:>5.1f} | "
+                f"quiet {r['slow_hz']:>5.2f} | common gap "
+                f"{int(r['modal_gap_ms']):>5} ms | {int(r['pings']):>10,} pings"
+                + (f" — {r['note']}" if r['note'] else ""))
+        TagStatsDialog(stats, labels, self.combo_timezone.currentText(),
+                       db_name, parent=self).exec_()
+
+    def _on_tag_stats_failed(self, err):
+        self._tag_stats_running = False
+        self.btn_tag_stats.setEnabled(True)
+        self.btn_tag_stats.setText("Tag Statistics...")
+        if is_corruption_error(err):
+            self.report_corrupt_database(err)
+            return
+        self.log_message(f"Could not measure tag statistics: {err}")
+
     def update_identity_button_state(self):
         """Enable Configure Identities button if any tag is selected"""
         any_selected = any(cb.isChecked() for cb in self.tag_checkboxes.values())
         self.btn_assign_identities.setEnabled(any_selected)
+        if hasattr(self, 'btn_tag_stats'):
+            # Measurable as soon as there are tags: it reads the recording,
+            # not the selection, and is most useful before anything is set up.
+            self.btn_tag_stats.setEnabled(bool(self.tag_checkboxes)
+                                          and not getattr(self, '_tag_stats_running', False))
     
     def _tag_checkbox_text(self, tag):
         """'HexID 2A (F, 9905) - Hera [HER]': identity shown only once configured.
@@ -14550,6 +14791,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # were used. Typed by the user or loaded from their own profile.
             'site': self.site_settings().to_dict(),
             'weather_display_units': self.combo_weather_units.currentData(),
+            'weather_autofetch': self.chk_weather_autofetch.isChecked(),
             # What the last fetch actually retrieved: station, distance,
             # record counts, and every file's URL, retrieval time and sha256.
             'weather_sources': self._weather_summary,
@@ -15051,6 +15293,9 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.chk_export_weather.setChecked(bool(config['export_weather']))
             if isinstance(config.get('site'), dict):
                 self.apply_site_settings(WX.SiteSettings.from_dict(config['site']))
+            if 'weather_autofetch' in config:
+                self.chk_weather_autofetch.setChecked(
+                    bool(config['weather_autofetch']))
             if config.get('weather_display_units'):
                 i = self.combo_weather_units.findData(config['weather_display_units'])
                 if i >= 0:
