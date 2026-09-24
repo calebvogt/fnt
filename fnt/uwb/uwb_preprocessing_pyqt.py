@@ -9057,6 +9057,33 @@ class UWBQuickVisualizationWindow(QWidget):
         start = self.preview_t0 + idx * c
         return start, start + c
 
+    def _preview_is_indexed(self):
+        """True when preview reads come off the fast indexed copy.
+
+        Reads against the ORIGINAL database are full table scans — there is no
+        index on (shortid, timestamp) in a Wiser export — so a 10-minute chunk
+        costs seconds to minutes instead of a fraction of a second. The copy is
+        rebuilt whenever the source changes, so a database re-downloaded daily
+        spends the first minutes of every session on the slow path.
+        """
+        return bool(self.preview_db_path) and self.preview_db_path != self.db_path
+
+    def _loading_status_text(self):
+        """Status line for a pending chunk, naming anything making it slow.
+
+        A slow load looks exactly like a hang: the clock and the weather line
+        keep updating (both are local arithmetic) while the animals stay frozen
+        at the last resident frame. Saying why turns that into a wait.
+        """
+        why = []
+        if not self._preview_is_indexed():
+            why.append("no fast index yet")
+        if getattr(self, 'exporting', False):
+            why.append("an export is reading the same database")
+        if why:
+            return "Loading… (" + ", ".join(why) + " — this may take a while)"
+        return "Loading…"
+
     def _resident_chunk_for(self, ts_ms):
         """Index of the cached chunk whose span contains ``ts_ms``, else None.
 
@@ -9074,7 +9101,15 @@ class UWBQuickVisualizationWindow(QWidget):
 
         ``_request_chunk`` no-ops for anything already cached or in flight, so
         calling this on every chunk switch is cheap and self-limiting.
+
+        Skipped while reads are slow: without the index each prefetch is another
+        full scan of a multi-GB table, and two of them compete for the same disk
+        as the chunk the user is actually waiting on — warming the neighbours
+        makes the current position land later, not sooner. Same during an
+        export, which streams the whole table and already owns the I/O.
         """
+        if not self._preview_is_indexed() or getattr(self, 'exporting', False):
+            return
         for nb in (idx + 1, idx - 1):
             if (nb >= 0 and nb not in self.preview_cache
                     and nb not in self.preview_inflight):
@@ -9136,7 +9171,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         if make_current:
             self.preview_pending_current = idx
-            self.lbl_preview_status.setText("Loading…")
+            self.lbl_preview_status.setText(self._loading_status_text())
 
         loader = PreviewChunkLoader(self.preview_db_path or self.db_path,
                                     self.table_name, tags, load_start, end, idx)
@@ -9210,16 +9245,42 @@ class UWBQuickVisualizationWindow(QWidget):
         timeline is linear in wall-clock time, so a position can land in dead
         air. Rather than showing an empty scene, find the next sample and move
         the playhead there.
+
+        The search runs on a worker: MIN/MAX over the tag set is instant on the
+        indexed copy but two full scans of a multi-GB original, and on the GUI
+        thread that froze the whole window — once per empty chunk — exactly
+        where a recording gap makes empty chunks most likely.
         """
         tags = self.selected_preview_tags()
         start, _ = self._chunk_bounds(idx)
-        try:
-            conn = connect_ro(self.preview_db_path or self.db_path)
-            nxt = self._nearest_sample_ts(conn, tags, start)
-            conn.close()
-        except Exception:
-            nxt = None
+        db = self.preview_db_path or self.db_path
+        table = self.table_name
+        self.lbl_preview_status.setText("No samples here — looking for the next data…")
 
+        def _search():
+            conn = connect_ro(db)
+            try:
+                return {'idx': idx, 'start': start, 'table': table,
+                        'ts': self._nearest_sample_ts(conn, tags, start)}
+            finally:
+                conn.close()
+
+        self._start_db_query(_search, self._on_gap_search_done,
+                             self._on_gap_search_failed)
+
+    def _on_gap_search_done(self, res):
+        """Move the playhead to the samples the gap search found."""
+        # Stale if the table changed, the preview was torn down, or the user
+        # scrubbed elsewhere while the scan ran — a newer position owns the
+        # playhead and must not be yanked back to this one.
+        if not getattr(self, '_preview_active', False):
+            return
+        if res['table'] != self.table_name:
+            return
+        if self._chunk_index_for(self.preview_playhead_ms) != res['idx']:
+            return
+
+        idx, start, nxt = res['idx'], res['start'], res['ts']
         if nxt is None or self._chunk_index_for(nxt) == idx:
             self.lbl_preview_status.setText("No samples here — try elsewhere on the timeline.")
             return
@@ -9230,6 +9291,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_playhead_ms = nxt
         self._sync_timeline_to_playhead()
         self._request_chunk(self._chunk_index_for(nxt), make_current=True)
+
+    def _on_gap_search_failed(self, err):
+        self.log_message(f"Could not locate nearest samples: {err}")
+        self.lbl_preview_status.setText("No samples here — try elsewhere on the timeline.")
 
     def get_preview_smoothing_method(self):
         """Smoothing method for the LIVE preview (its own 'Smoothing method'
@@ -10030,12 +10095,17 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._show_chunk(resident)   # also warms the new neighbours
             else:
                 self.render_preview_frame()
-        elif not self.preview_scrub_timer.isActive():
-            # Not resident: throttle a background load. Testing isActive() rather
-            # than restarting guarantees the timer still fires while the arrow
-            # key auto-repeats, so a sustained hold keeps advancing instead of
-            # starving the loader until the key is released.
-            self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
+        else:
+            if self.preview_pending_current is not None:
+                # Still waiting on a read: re-state why, so a long load reads as
+                # a wait rather than a dead window while the clock ticks on.
+                self.lbl_preview_status.setText(self._loading_status_text())
+            if not self.preview_scrub_timer.isActive():
+                # Not resident: throttle a background load. Testing isActive()
+                # rather than restarting guarantees the timer still fires while
+                # the arrow key auto-repeats, so a sustained hold keeps
+                # advancing instead of starving the loader until release.
+                self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
 
     def _on_scrub_settled(self):
         self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
