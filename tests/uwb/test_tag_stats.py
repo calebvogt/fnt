@@ -86,7 +86,7 @@ def test_the_numbers_describe_the_rates_that_were_recorded():
     assert st.loc["0011", "0.05-0.08s"] + st.loc["0011", "0.08-0.13s"] > 30
 
 
-def test_rates_and_battery_are_measured():
+def test_rates_and_voltage_are_measured():
     path = _db({0x13: _pings(10, 1, minutes=120, volts=(3.20, 3.00))})
     st = _stats(path, has_index=True).iloc[0]
     assert st["HexID"] == "0013" and st["shortid"] == 0x13
@@ -108,12 +108,20 @@ def test_the_scan_path_matches_the_indexed_path():
         assert fast.loc[hexid, "modal_gap_ms"] == slow.loc[hexid, "modal_gap_ms"]
 
 
-def test_a_flat_battery_is_called_out():
-    # Tags that reach 2.36 V stop reporting; VT-P002's 0006/0007 and T012's
-    # 001D all ended there.
+def test_no_battery_forecast_is_offered():
+    """The fitted days-left estimate is gone, and must not creep back.
+
+    On VT-P002 it called 18 days two days before tag 000B died and 3.4 days
+    six hours before: the cells hold ~2.9 V for most of their life and then
+    fall off a cliff that no slope fitted to the plateau can see. The table
+    reports the voltage and the ping count as measured instead.
+    """
     ts, v = _pings(22, None, minutes=90, volts=(3.14, 2.36))
     st = _stats(_db({0x06: (ts, v)}), has_index=True).iloc[0]
-    assert st["days_left"] == 0.0 and "stop reporting" in st["note"]
+    assert st["v_last"] == 2.36 and st["pings"] > 0
+    for gone in ("days_left", "days_left_lo", "days_left_hi", "v_per_day", "note"):
+        assert gone not in st.index, gone
+    assert not hasattr(TS, "battery_estimate")
 
 
 def test_a_short_recording_still_reports_its_numbers():
@@ -124,70 +132,8 @@ def test_a_short_recording_still_reports_its_numbers():
     assert st["hours"] <= 0.1 and st["pings"] > 0 and st["peak_hz"] > 0
 
 
-def test_battery_drain_needs_more_than_a_day():
-    # A cell settles steeply for hours after it goes in; a slope fitted to
-    # that reads as a tag about to die.
-    short = _stats(_db({0x11: _pings(10, 1, minutes=120, volts=(3.20, 2.95))}),
-                   has_index=True).iloc[0]
-    assert np.isnan(short["v_per_day"]) and np.isnan(short["days_left"])
-
-
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
             print("ok", name)
-
-
-def _hourly(volts_by_hour, start="2026-09-15 12:00"):
-    """(hour timestamps in ns, volts) for battery_estimate."""
-    t0 = pd.Timestamp(start, tz="US/Mountain").value
-    hrs = np.arange(len(volts_by_hour), dtype="float64")
-    return t0 + hrs * 3_600e9, np.asarray(volts_by_hour, dtype="float64")
-
-
-def test_the_settle_is_excluded_not_averaged_in():
-    # A fresh cell: 3.22 -> 2.95 V in four hours (tag 0016 did exactly this),
-    # then a steady 0.02 V/day for five days. End-to-end that reads as ~0.07
-    # V/day; only the plateau is the tag's real drain.
-    settle = list(np.linspace(3.22, 2.95, 5))
-    plateau = list(2.95 - 0.02 * np.arange(1, 5 * 24) / 24.0)
-    est = TS.battery_estimate(*_hourly(settle + plateau))
-    assert abs(est["v_per_day"] - 0.02) < 0.004, est["v_per_day"]
-    naive = (3.22 - plateau[-1]) / ((len(settle) + len(plateau)) / 24.0)
-    assert naive > 2 * est["v_per_day"]        # what the old two-point slope gave
-    # (2.93 - 2.36) / 0.02 is about 28 days, and the range brackets it.
-    assert 20 < est["days_left"] < 40
-    assert est["days_left_lo"] <= est["days_left"] <= est["days_left_hi"]
-
-
-def test_below_the_plateau_the_estimate_is_flagged():
-    volts = list(np.linspace(2.62, 2.48, 4 * 24))      # past the knee
-    est = TS.battery_estimate(*_hourly(volts))
-    assert est["days_left"] > 0 and "expect sooner" in est["note"]
-
-
-def test_a_dead_tag_reads_zero():
-    est = TS.battery_estimate(*_hourly(list(np.linspace(2.50, 2.36, 3 * 24))),
-                              v_now=2.36)
-    assert est["days_left"] == 0.0 and "stop reporting" in est["note"]
-
-
-def test_too_little_data_gives_no_number():
-    est = TS.battery_estimate(*_hourly(list(np.linspace(3.20, 3.05, 20))))
-    assert np.isnan(est["days_left"]) and np.isnan(est["v_per_day"])
-    assert "needs about" in est["note"]
-
-
-def test_a_flat_battery_reports_no_measurable_drain():
-    est = TS.battery_estimate(*_hourly([3.00] * (4 * 24)))
-    assert est["v_per_day"] < TS.MIN_DRAIN_V_DAY
-    assert np.isnan(est["days_left"]) and est["note"] == "no measurable drain yet"
-
-
-def test_one_noisy_hour_does_not_move_the_answer():
-    volts = list(2.95 - 0.03 * np.arange(4 * 24) / 24.0)
-    clean = TS.battery_estimate(*_hourly(volts))
-    volts[-8] = 2.40                                   # a single bad reading
-    noisy = TS.battery_estimate(*_hourly(volts))
-    assert abs(clean["days_left"] - noisy["days_left"]) < 1.0

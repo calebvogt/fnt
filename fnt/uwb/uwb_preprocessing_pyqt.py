@@ -1745,13 +1745,17 @@ class InheritSettingsDialog(QDialog):
 
 
 class TagStatsDialog(QDialog):
-    """Measured ping rate and battery for every tag in the loaded database.
+    """Measured ping rate, ping count and voltage for every tag in the database.
 
     A tag's rate profile (10/1, 4/1, 1/1) is written on its label and nowhere
     in the data, so a mis-flashed tag or the wrong tag on an animal shows up
     only as one animal being sampled more often than another - and, eventually,
     as a battery dead in six days. This reads the profile back out of the
     recording so it can be checked before the trial, not after it.
+
+    No battery forecast: a fitted voltage drain called 18 days two days before
+    a tag died (see fnt/uwb/tag_stats.py). The ping count and the voltage are
+    shown as measured, with what each can and cannot tell you in its tooltip.
     """
 
     COLUMNS = [
@@ -1763,16 +1767,24 @@ class TagStatsDialog(QDialog):
                      "where a rest rate shows itself"),
         ("Median gap", "Median gap between pings, in ms"),
         ("Common gap", "Most frequent gap between pings, in ms"),
-        ("Pings", "Total reports in this database"),
+        ("Pings", "Total reports recorded in this database.\n\n"
+                  "A better guide to battery than voltage. On VT-P002, five "
+                  "battery lives ended at 5.57-5.76 million recorded pings, at "
+                  "both ~22 Hz and ~7 Hz, so a tag's remaining life is roughly "
+                  "(5.6 M - pings) / its rate.\n\n"
+                  "Not yet checked on 1-3 Hz tags. The count starts at this "
+                  "database's first ping, not the battery's: a battery used "
+                  "before, or swapped mid-trial, is not reflected. Pings sent "
+                  "while the system was not recording are not counted either."),
         ("Hours", "Span from first to last ping"),
-        ("Battery V", "Most recent voltage"),
-        ("V/day", "Drain: a robust fit over the last 3 days, ignoring the "
-                  "first 12 h while a fresh cell settles"),
-        ("Days left", "Until 2.36 V, where these tags stop reporting, with the "
-                      "range the fit allows. Assumes the plateau holds - below "
-                      "2.55 V these cells fall much faster, and the note says so"),
+        ("Battery V", "Most recent voltage.\n\n"
+                      "Not a fuel gauge. These cells sit near 2.9 V for most of "
+                      "their life, then fall off a cliff: on VT-P002, tag 000B "
+                      "went from 2.80 V to dead in 49 h and from 2.60 V in 6 h. "
+                      "Readings also run ~30 mV higher in the afternoon than "
+                      "before dawn. Treat anything under ~2.8 V as due for a "
+                      "swap at the next visit."),
         ("Last ping", "Local time of its most recent report"),
-        ("Note", ""),
     ]
 
     def __init__(self, stats, labels, tz, db_name, parent=None):
@@ -1813,27 +1825,18 @@ class TagStatsDialog(QDialog):
             def _num(v, fmt="{:.2f}"):
                 return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else fmt.format(v)
 
-            def _days_left(r):
-                mid = r["days_left"]
-                if mid is None or (isinstance(mid, float) and np.isnan(mid)):
-                    return "—"
-                lo, hi = r.get("days_left_lo"), r.get("days_left_hi")
-                span = ("" if any(x is None or np.isnan(x) for x in (lo, hi))
-                        else f"  ({lo:.0f}–{hi:.0f})")
-                return f"{mid:.0f}{span}"
             values = [
                 row["HexID"], labels.get(int(row["shortid"]), "—"),
                 _num(row["median_hz"]), _num(row["peak_hz"], "{:.1f}"),
                 _num(row["slow_hz"]), f"{int(row['median_gap_ms'])} ms",
                 f"{int(row['modal_gap_ms'])} ms",
                 f"{int(row['pings']):,}", _num(row["hours"], "{:.1f}"),
-                _num(row["v_last"]), _num(row["v_per_day"], "{:.3f}"),
-                _days_left(row),
-                last.strftime("%m-%d %H:%M"), row["note"] or "",
+                _num(row["v_last"]),
+                last.strftime("%m-%d %H:%M"),
             ] + [_num(row[g], "{:.1f}") for g in gap_cols]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(str(text))
-                if c >= 2 and c != 13:
+                if c >= 2:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(r, c, item)
         table.resizeColumnsToContents()
