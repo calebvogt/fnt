@@ -10,6 +10,7 @@ Interactive GUI for loading, cleaning, and exporting UWB tracking data:
 
 - **Load raw data** from `.db` (SQLite) or `.csv` files containing timestamped tag positions
 - **Tag identity mapping** — assign animal IDs, sex, and metadata to each UWB tag
+- **Deployment windows and off-animal intervals** — a Start/Stop per tag, plus any number of intervals when a tag was reporting but not on its animal (e.g. a head cap found off and re-attached); fixes in either are dropped from the preview and every export
 - **Coordinate smoothing** with configurable Savitzky-Golay filter parameters
 - **Timezone handling** — convert UTC timestamps to local time
 - **Day/night segmentation** based on a configurable light cycle

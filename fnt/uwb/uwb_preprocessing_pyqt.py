@@ -54,8 +54,9 @@ from fnt.uwb.uwb_preview_canvas import (
 from fnt.uwb import animation as uwb_animation
 from fnt.uwb import weather as WX
 from fnt.uwb.identities import (
-    ID_DISPLAY_TYPES, SEX_ID, normalize_id_type, tag_label,
-    identity_field_problems, describe_problems)
+    ID_DISPLAY_TYPES, SEX_ID, NAME, CODE, HEX_ID, SHORT_ID, normalize_id_type,
+    tag_label, hex_label, identity_field_problems, describe_problems,
+    OFF_INTERVALS, off_intervals, merge_intervals, inside_intervals)
 from fnt.uwb import uwb_roi
 
 
@@ -2019,6 +2020,135 @@ class ExportConflictDialog(QDialog):
         self.setLayout(layout)
 
 
+class OffAnimalIntervalsDialog(QDialog):
+    """Edit one tag's off-animal intervals: stretches it reported off the animal.
+
+    A tag that came off and went back on - a head cap scratched off in the
+    nest and re-glued the next morning - keeps reporting the whole time, so
+    the data hold hours of a tag lying still under the animal's name.
+    Start/Stop can't carve that out of the middle of a deployment; these
+    intervals do. Fixes inside one are dropped from the preview and every
+    export, so the animal reads as absent rather than as motionless.
+    """
+
+    TIME_FMT = "yyyy-MM-dd HH:mm:ss.zzz"
+
+    def __init__(self, title, intervals, observed=(None, None), parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Off-animal intervals \u2014 {title}")
+        self.setMinimumWidth(940)
+        self._observed = observed
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Periods when this tag was reporting but <b>not on the animal</b> "
+            "(e.g. a head cap found off in the nest and re-attached). Fixes "
+            "inside an interval are removed from the preview and every export "
+            "- the animal reads as absent, not motionless. The tag's own "
+            "hardware statistics are unaffected.")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Off from", "Back on", "Duration", "Note", ""])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # Fixed: ResizeToContents measures the header text, not the label
+        # widget in the cell, and clipped "13 h 46 min".
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 110)
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        for item in intervals or []:
+            self._add_row(item.get('start'), item.get('stop'), item.get('note', ''))
+
+        btn_add = QPushButton("Add interval")
+        btn_add.clicked.connect(lambda: self._add_row())
+        layout.addWidget(btn_add)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def _picker(self, value, fallback):
+        e = QDateTimeEdit()
+        e.setDisplayFormat(self.TIME_FMT)
+        e.setCalendarPopup(True)
+        dt = IdentityAssignmentDialog.parse_time(value) if value else QDateTime()
+        e.setDateTime(dt if dt.isValid() else fallback)
+        return e
+
+    def _default_start(self):
+        """A new row starts where the last one ended, else at the tag's first fix."""
+        if self.table.rowCount():
+            return self.table.cellWidget(self.table.rowCount() - 1, 1).dateTime()
+        first = IdentityAssignmentDialog.parse_time(self._observed[0] or '')
+        return first if first.isValid() else QDateTime.currentDateTime()
+
+    def _add_row(self, start=None, stop=None, note=''):
+        row = self.table.rowCount()
+        begin = self._default_start()
+        self.table.insertRow(row)
+        a = self._picker(start, begin)
+        b = self._picker(stop, a.dateTime().addSecs(3600))
+        dur = QLabel()
+        note_edit = QLineEdit(note or '')
+        note_edit.setPlaceholderText("optional, e.g. head cap off in Z7 nest")
+        rm = QPushButton("Remove")
+
+        def _update():
+            secs = a.dateTime().msecsTo(b.dateTime()) / 1000.0
+            if secs <= 0:
+                dur.setText("\u26a0 ends before it starts")
+                dur.setStyleSheet("color:#e06c75; font-weight:bold;")
+            else:
+                h, m = divmod(int(round(secs / 60.0)), 60)
+                dur.setText(f"{h} h {m:02d} min" if h else f"{m} min")
+                dur.setStyleSheet("")
+        a.dateTimeChanged.connect(_update)
+        b.dateTimeChanged.connect(_update)
+        _update()
+
+        def _remove():
+            for r in range(self.table.rowCount()):
+                if self.table.cellWidget(r, 4) is rm:
+                    self.table.removeRow(r)
+                    return
+        rm.clicked.connect(_remove)
+
+        for col, w in enumerate((a, b, dur, note_edit, rm)):
+            self.table.setCellWidget(row, col, w)
+
+    def intervals(self):
+        """The rows as stored dicts, in the order shown."""
+        out = []
+        for r in range(self.table.rowCount()):
+            a = self.table.cellWidget(r, 0).dateTime().toString(self.TIME_FMT)
+            b = self.table.cellWidget(r, 1).dateTime().toString(self.TIME_FMT)
+            note = self.table.cellWidget(r, 3).text().strip()
+            out.append({'start': a, 'stop': b, 'note': note})
+        return out
+
+    def accept(self):
+        bad = [r + 1 for r in range(self.table.rowCount())
+               if self.table.cellWidget(r, 0).dateTime().msecsTo(
+                   self.table.cellWidget(r, 1).dateTime()) <= 0]
+        if bad:
+            QMessageBox.warning(
+                self, "Interval ends before it starts",
+                f"Row(s) {', '.join(map(str, bad))}: 'Back on' must be later "
+                "than 'Off from'.")
+            return
+        super().accept()
+
+
 class IdentityAssignmentDialog(QDialog):
     """Assign sex, identity, optional Name/Code and an active window to each tag.
 
@@ -2111,6 +2241,10 @@ class IdentityAssignmentDialog(QDialog):
         self.stop_edits = {}
         self.start_modes = {}
         self.stop_modes = {}
+        # Holes inside the deployment (see OffAnimalIntervalsDialog), kept
+        # here as the stored dicts and edited through a per-tag button.
+        self.off_intervals = {}
+        self.off_buttons = {}
         stale = []
 
         for tag in sorted(self.available_tags):
@@ -2242,6 +2376,20 @@ class IdentityAssignmentDialog(QDialog):
             row1.addWidget(name_edit, 1)
             row1.addWidget(QLabel("Code:"))
             row1.addWidget(code_edit)
+            # On the name row rather than beside Start/Stop: the two
+            # millisecond pickers already set the dialog's minimum width, and
+            # a button there pushed every row into a horizontal scroll.
+            self.off_intervals[tag] = off_intervals(info)
+            btn_off = QPushButton()
+            btn_off.setToolTip(
+                "Periods this tag reported while NOT on the animal - e.g. a "
+                "head cap found off and re-attached. Fixes inside them are "
+                "removed from the preview and every export.")
+            btn_off.clicked.connect(lambda _=False, t=tag: self._edit_off_intervals(t))
+            self.off_buttons[tag] = btn_off
+            self._label_off_button(tag)
+            row1.addSpacing(6)
+            row1.addWidget(btn_off)
             tag_vlayout.addLayout(row1)
 
             row2 = QHBoxLayout()
@@ -2409,6 +2557,26 @@ class IdentityAssignmentDialog(QDialog):
                 return
         super().accept()
 
+    def _label_off_button(self, tag):
+        n = len(self.off_intervals.get(tag) or [])
+        btn = self.off_buttons[tag]
+        btn.setText(f"Off-animal ({n})\u2026" if n else "Off-animal\u2026")
+        btn.setStyleSheet("color:#e5c07b; font-weight:bold;" if n else "")
+
+    def _edit_off_intervals(self, tag):
+        tr = self.tag_time_ranges.get(tag) or {}
+        hex_id = hex(tag).upper().replace('0X', '')
+        sexid = (self.sex_combos[tag].currentText()
+                 + self.identity_edits[tag].text().strip())
+        name = self.name_edits[tag].text().strip()
+        title = f"HexID {hex_id}" + (f" \u2014 {sexid}" if sexid.strip() else "") \
+            + (f" ({name})" if name else "")
+        dlg = OffAnimalIntervalsDialog(title, self.off_intervals.get(tag),
+                                       (tr.get('start'), tr.get('end')), self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.off_intervals[tag] = dlg.intervals()
+            self._label_off_button(tag)
+
     def _release_stops(self, tags):
         """Put the flagged tags' Stop bounds back on Auto.
 
@@ -2443,6 +2611,9 @@ class IdentityAssignmentDialog(QDialog):
                 value = edit.text().strip()
                 if value:
                     result[tag][key] = value
+            holes = self.off_intervals.get(tag) or []
+            if holes:
+                result[tag][OFF_INTERVALS] = [dict(h) for h in holes]
         return result
 
 
@@ -2462,7 +2633,7 @@ class PlotSaverWorker(QThread):
                  rois=None, occupancy_sources=None,
                  xml_map_image=None, xml_map_extent=None,
                  bg_offset_x=0.0, bg_offset_y=0.0, behavior_params=None,
-                 axis_limits=None):
+                 axis_limits=None, label_type=SEX_ID):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -2483,6 +2654,10 @@ class PlotSaverWorker(QThread):
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
         self.use_identities = use_identities
+        # Which ID names an animal in the FIGURES (SexID / Name / Code / HexID
+        # / ShortID). Data files never follow it: every CSV keeps the SexID,
+        # the key the analyses join on.
+        self.label_type = normalize_id_type(label_type)
         self.background_image = background_image
         self.bg_width_meters = bg_width_meters
         self.bg_height_meters = bg_height_meters
@@ -2839,7 +3014,9 @@ class PlotSaverWorker(QThread):
                 ax.grid(True, alpha=0.3)
                 ax.set_aspect('equal')
             
-            fig.suptitle(f'Daily Paths - {file_suffix}', fontsize=14, fontweight='bold')
+            title_id = (file_suffix if self.label_type == SEX_ID
+                        else self._animal_label(member_tags))
+            fig.suptitle(f'Daily Paths - {title_id}', fontsize=14, fontweight='bold')
             fig.tight_layout()
             
             self.save_figure(fig, output_path)
@@ -2859,12 +3036,19 @@ class PlotSaverWorker(QThread):
     GRID_MAX_FIG_H = 55.0
 
     def _grid_row_label(self, member_tags):
-        """Row label: the SexID the CSVs join on (F9801), else the HexID.
+        """Row label: the chosen ID, else the SexID the CSVs join on.
 
-        Deliberately the analysis key rather than the hyphenated form the
-        other figures title with - this grid is read alongside the exported
-        tables, and a label you can search for in them is worth more here.
+        By default the analysis key rather than the hyphenated form the other
+        figures title with - this grid is read alongside the exported tables,
+        and a label you can search for in them is worth more here.
         """
+        if self.label_type in (HEX_ID, SHORT_ID):
+            return " / ".join(self._chosen_label(t) for t in member_tags)
+        chosen = self._chosen_label(member_tags[0])
+        return chosen if chosen is not None else self._grid_sexid_label(member_tags)
+
+    def _grid_sexid_label(self, member_tags):
+        """The SexID (F9801), else the HexID(s). Also the grid's row order."""
         info = (self.tag_identities.get(member_tags[0]) or {}) if self.use_identities else {}
         sex, ident = info.get('sex'), info.get('identity')
         if sex and ident:
@@ -2903,10 +3087,13 @@ class PlotSaverWorker(QThread):
         # Rows read as the SexID the rest of the analysis uses, ordered the way
         # the ROI tables order animals (M9 before M10, sexes kept together).
         from fnt.uwb import roi_bouts as _RB
-        groups = [(self._grid_row_label(tags), tags)
+        # Ordered by SexID whatever the rows are labelled with, so choosing
+        # Name does not shuffle the sexes together alphabetically.
+        groups = [(self._grid_sexid_label(tags), self._grid_row_label(tags), tags)
                   for _suffix, tags in
                   self.animal_groups(sorted(data['shortid'].unique()))]
         groups.sort(key=lambda g: _RB.natural_animal_key(g[0]))
+        groups = [(label, tags) for _key, label, tags in groups]
         if not days or not groups:
             self.progress.emit("Daily path grid: nothing to plot.")
             return False
@@ -3028,6 +3215,7 @@ class PlotSaverWorker(QThread):
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
                 color = 'blue'  # Default to blue
+            label = self._chosen_label(tag) or label
             
             ax.plot(tag_data[x_col], tag_data[y_col], 
                    linewidth=1, alpha=0.7, color=color, label=label)
@@ -3129,6 +3317,7 @@ class PlotSaverWorker(QThread):
             else:
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
+            label = self._chosen_label(tag) or label
 
             color = 'tab:blue'
             if self.use_identities and tag in self.tag_identities:
@@ -3326,6 +3515,7 @@ class PlotSaverWorker(QThread):
                 else:
                     hex_id = hex(tag).upper().replace('0X', '')
                     label = f"HexID {hex_id}"
+                label = self._chosen_label(tag) or label
                 
                 ax.plot(tag_data['time_of_day'], tag_data['cumulative_distance'], label=label, alpha=0.7)
             
@@ -3434,6 +3624,7 @@ class PlotSaverWorker(QThread):
             else:
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
+            label = self._chosen_label(tag) or label
             
             median_gap = gaps.median()
             max_gap = gaps.max()
@@ -3475,8 +3666,50 @@ class PlotSaverWorker(QThread):
 
     # ── Home range ───────────────────────────────────────────────────────────
 
+    def _chosen_label(self, tag):
+        """The ID picked under 'Label animals by', or None for the SexID form.
+
+        SexID is the default and keeps each figure's established wording
+        ('F-9905' in titles, 'F9905' on the grid). Name and Code fall back to
+        the SexID for an animal without one (identities.tag_label), so a
+        half-filled roster still labels every animal.
+        """
+        kind = getattr(self, 'label_type', SEX_ID)
+        if kind == SEX_ID:
+            return None
+        if kind == HEX_ID:
+            return f"HexID {hex_label(tag)}"
+        if kind == SHORT_ID:
+            return f"ShortID {int(tag)}"
+        info = self.tag_identities.get(tag) if self.use_identities else None
+        if not info:
+            return None
+        return tag_label(tag, info, kind)
+
+    def _display_animal(self, key):
+        """Figure text for an animal named by its behaviour-table key.
+
+        The behaviour events carry the SexID ('F9905', or 'HexID2A' for an
+        unconfigured tag) because they are also the exported CSV. Figures
+        drawn from them translate that key here, so they follow 'Label
+        animals by' like every other plot while the table does not.
+        """
+        for tag, info in (self.tag_identities.items() if self.use_identities else ()):
+            if f"{info.get('sex', 'M')}{info.get('identity', str(tag))}" == key:
+                return self._chosen_label(tag) or key
+        if str(key).startswith('HexID'):
+            try:
+                tag = int(str(key)[5:], 16)
+            except ValueError:
+                return key
+            return self._chosen_label(tag) or key
+        return key
+
     def _tag_label(self, tag):
-        """Display label for a tag: sex-identity when configured, else hex ID."""
+        """Display label for a tag: the chosen ID, else sex-identity, else hex."""
+        chosen = self._chosen_label(tag)
+        if chosen is not None:
+            return chosen
         if self.use_identities and tag in self.tag_identities:
             info = self.tag_identities[tag]
             return f"{info.get('sex', 'M')}-{info.get('identity', str(tag))}"
@@ -3485,6 +3718,11 @@ class PlotSaverWorker(QThread):
     def _tag_legend_label(self, tag):
         """'HexID 30 - F9701' when identities are configured, else the hex alone."""
         hex_id = hex(tag).upper().replace('0X', '')
+        chosen = self._chosen_label(tag)
+        if chosen is not None:
+            # The legend already leads with the HexID; don't say it twice.
+            return (chosen if self.label_type == HEX_ID
+                    else f"HexID {hex_id} \u2014 {chosen}")
         if self.use_identities and tag in self.tag_identities:
             info = self.tag_identities[tag]
             return (f"HexID {hex_id} \u2014 "
@@ -3507,8 +3745,11 @@ class PlotSaverWorker(QThread):
         if len(member_tags) == 1:
             return self._tag_label(member_tags[0])
         hexes = ', '.join(hex(t).upper().replace('0X', '') for t in member_tags)
+        if self.label_type in (HEX_ID, SHORT_ID):
+            return " / ".join(self._chosen_label(t) for t in member_tags)
         info = self.tag_identities.get(member_tags[0], {}) if self.use_identities else {}
-        name = f"{info.get('sex', '')}{info.get('identity', '')}" or None
+        name = (self._chosen_label(member_tags[0])
+                or f"{info.get('sex', '')}{info.get('identity', '')}" or None)
         return f"HexIDs {hexes}" + (f" — {name}" if name else "")
 
     # Plots that describe an ANIMAL take the merged frame; plots that
@@ -4244,7 +4485,8 @@ class PlotSaverWorker(QThread):
                     y = (counts.loc[animal].to_numpy()
                          if animal in counts.index else np.zeros(len(days)))
                     ax.plot(days, y, marker='o', ms=4, lw=1.6,
-                            color=colour[animal], label=animal, alpha=0.9)
+                            color=colour[animal],
+                            label=self._display_animal(animal), alpha=0.9)
                 ax.set_xlabel('Day', fontsize=9)
                 ax.set_ylabel(f'{beh}s {label}', fontsize=9)
                 ax.set_title(f'{beh.capitalize()} — {label}', fontsize=10)
@@ -4309,8 +4551,9 @@ class PlotSaverWorker(QThread):
             im = ax.imshow(mat, cmap='magma', vmin=0,
                            vmax=max(1.0, mat.max()))
             ax.set_xticks(range(n)); ax.set_yticks(range(n))
-            ax.set_xticklabels(animals, rotation=45, ha='right', fontsize=8)
-            ax.set_yticklabels(animals, fontsize=8)
+            shown = [self._display_animal(a) for a in animals]
+            ax.set_xticklabels(shown, rotation=45, ha='right', fontsize=8)
+            ax.set_yticklabels(shown, fontsize=8)
             ax.set_xlabel(f'target (was {beh}d)', fontsize=9)
             ax.set_ylabel(f'actor (did the {beh[:5]})', fontsize=9)
             ax.set_title(f'{beh.capitalize()}: {int(mat.sum()):,} events',
@@ -5495,6 +5738,31 @@ class UWBQuickVisualizationWindow(QWidget):
         self.plot_types_widget = QWidget()
         plot_types_layout = QVBoxLayout()
         plot_types_layout.setContentsMargins(30, 0, 0, 0)
+
+        # Which ID names each animal in the figures. A setting rather than a
+        # prompt on export: queued and batch runs are unattended, and a
+        # question nobody is there to answer would stall them.
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel("Label animals by:"))
+        self.combo_plot_label_type = QComboBox()
+        self.combo_plot_label_type.addItems(list(ID_DISPLAY_TYPES))
+        self.combo_plot_label_type.setCurrentText(SEX_ID)
+        self.combo_plot_label_type.setToolTip(
+            "Which ID names each animal in the exported figures - row labels, "
+            "titles, legends and axis ticks.\n"
+            "\n"
+            "\u2022 SexID: sex + configured ID (e.g. F9905)\n"
+            "\u2022 Name / Code: from Configure Identities (e.g. Hera / HER); an "
+            "animal without one falls back to its SexID\n"
+            "\u2022 HexID: the address printed on the tag (e.g. 2A)\n"
+            "\u2022 ShortID: the decimal tag number\n"
+            "\n"
+            "Figures only. File names and every exported CSV keep the SexID, "
+            "the key the analyses join on, so changing this never breaks a "
+            "table join or renames a file.")
+        label_row.addWidget(self.combo_plot_label_type, 1)
+        plot_types_layout.addLayout(label_row)
+
         self.plot_type_checkboxes = {}
         plot_types = [
             ("daily_paths", "Daily Paths per Tag",
@@ -5513,8 +5781,9 @@ class UWBQuickVisualizationWindow(QWidget):
              "track. Every cell shares one window (or your pinned XY range), so "
              "cells are directly comparable; a dash marks a day with no data.\n"
              "\n"
-             "Rows are coloured by sex (blue M, red F) and labelled with the "
-             "SexID. Use 'Daily Paths per Tag' instead when you want one "
+             "Rows are coloured by sex (blue M, red F), ordered by SexID, and "
+             "labelled with the ID chosen under 'Label animals by' (SexID by "
+             "default). Use 'Daily Paths per Tag' instead when you want one "
              "animal large, with the arena drawn behind it."),
             ("trajectory_overview", "Trajectory Overview",
              "All selected tags overlaid on a single plot with optional background image"),
@@ -9342,48 +9611,82 @@ class UWBQuickVisualizationWindow(QWidget):
         stop_manual = IdentityAssignmentDialog._mode_of(info, 'stop') == 'manual'
         if not start_manual and not stop_manual:
             return None, None
+        _loc = self._localize_wall_time
+        return (_loc(info['start_time'], tz) if start_manual and 'start_time' in info else None,
+                _loc(info['stop_time'], tz) if stop_manual and 'stop_time' in info else None)
 
-        def _loc(value):
-            try:
-                ts = pd.Timestamp(value)
-            except (ValueError, TypeError):
-                return None
-            if ts is pd.NaT:
-                return None
-            if ts.tzinfo is not None:
-                return ts.tz_convert(tz)
-            try:
-                return ts.tz_localize(tz)
-            except Exception:
-                # Nonexistent (spring forward) or ambiguous (fall back) local
-                # time: take the first valid reading rather than failing.
-                return ts.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
+    @staticmethod
+    def _localize_wall_time(value, tz):
+        """A stored local wall-clock string as a tz-aware Timestamp, or None."""
+        try:
+            ts = pd.Timestamp(value)
+        except (ValueError, TypeError):
+            return None
+        if ts is pd.NaT:
+            return None
+        if ts.tzinfo is not None:
+            return ts.tz_convert(tz)
+        try:
+            return ts.tz_localize(tz)
+        except Exception:
+            # Nonexistent (spring forward) or ambiguous (fall back) local
+            # time: take the first valid reading rather than failing.
+            return ts.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
 
-        return (_loc(info['start_time']) if start_manual and 'start_time' in info else None,
-                _loc(info['stop_time']) if stop_manual and 'stop_time' in info else None)
+    def _tag_off_intervals(self, tag, tz):
+        """The tag's off-animal intervals as merged, tz-aware (start, stop).
 
-    def _trim_to_tag_window(self, data, tag, tz):
-        """Drop fixes outside the tag's active window set in Configure Identities.
+        Set per tag in Configure Identities for a tag that came off its animal
+        and went back on (see identities.off_intervals). Unparseable entries
+        are skipped rather than failing the chunk or the export.
+        """
+        info = (self.tag_identities or {}).get(tag)
+        pairs = []
+        for item in off_intervals(info):
+            a = self._localize_wall_time(item['start'], tz)
+            b = self._localize_wall_time(item['stop'], tz)
+            if a is not None and b is not None:
+                pairs.append((a, b))
+        return merge_intervals(pairs)
 
-        Those Start/Stop pickers are a data-trimming control, not just
-        metadata: a tag deployed late, recovered early, or swapped mid-trial
-        must contribute nothing outside its window. Applied identically to the
-        preview, the occupancy heatmap and every export, so what the preview
-        shows is what the exported files contain.
+    def _trim_tag(self, data, tag, tz):
+        """Drop what the tag's identity record excludes, counted by reason.
+
+        Two controls from Configure Identities, applied together:
+
+          * Start/Stop - the deployment. A tag deployed late, recovered
+            early, or swapped mid-trial contributes nothing outside it.
+          * Off-animal intervals - holes inside the deployment, where the tag
+            was reporting but not on the animal (a head cap off in the nest).
+
+        Applied identically to the preview, the occupancy heatmap and every
+        export, so what the preview shows is what the exported files contain.
+        The removed stretch becomes a gap, and the filters and smoother
+        already split a track at gaps, so nothing is interpolated across it.
 
         ``data`` must already carry a tz-aware 'Timestamp' column. Returns
-        (trimmed_data, n_removed).
+        (trimmed_data, n_outside_window, n_off_animal).
         """
         start, stop = self._tag_window(tag, tz)
-        if start is None and stop is None:
-            return data, 0
-        before = len(data)
-        keep = pd.Series(True, index=data.index)
+        holes = self._tag_off_intervals(tag, tz)
+        if start is None and stop is None and not holes:
+            return data, 0, 0
+        in_window = pd.Series(True, index=data.index)
         if start is not None:
-            keep &= data['Timestamp'] >= start
+            in_window &= data['Timestamp'] >= start
         if stop is not None:
-            keep &= data['Timestamp'] <= stop
-        return data[keep], before - int(keep.sum())
+            in_window &= data['Timestamp'] <= stop
+        off = pd.Series(inside_intervals(data['Timestamp'], holes)
+                        if holes else False, index=data.index)
+        keep = in_window & ~off
+        n_window = int((~in_window).sum())
+        n_off = int((in_window & off).sum())
+        return data[keep], n_window, n_off
+
+    def _trim_to_tag_window(self, data, tag, tz):
+        """``_trim_tag`` with the two counts summed: (trimmed_data, n_removed)."""
+        data, n_window, n_off = self._trim_tag(data, tag, tz)
+        return data, n_window + n_off
 
     def _process_chunk(self, df, idx=None):
         """Filter, smooth and bin one slice into frame arrays, or None if empty.
@@ -9519,7 +9822,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not tags or not self.table_name:
             return None
         tz = pytz.timezone(self.combo_timezone.currentText())
-        windows = {}
+        windows, holes = {}, {}
         for t in tags:
             try:
                 start, stop = self._tag_window(t, tz)
@@ -9528,8 +9831,13 @@ class UWBQuickVisualizationWindow(QWidget):
             windows[t] = (
                 int(start.timestamp() * 1000) if start is not None else None,
                 int(stop.timestamp() * 1000) if stop is not None else None)
+            try:
+                holes[t] = tuple((int(a.timestamp() * 1000), int(b.timestamp() * 1000))
+                                 for a, b in self._tag_off_intervals(t, tz))
+            except Exception:
+                holes[t] = ()
         key = (self.db_path, self.table_name, tuple(tags),
-               tuple(sorted(windows.items())))
+               tuple(sorted(windows.items())), tuple(sorted(holes.items())))
         if getattr(self, '_export_scope_key', None) == key:
             return self._export_scope_value
 
@@ -9549,6 +9857,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     if hi is not None:
                         q += " AND timestamp <= ?"; args.append(hi)
                     total += conn.execute(q, args).fetchone()[0]
+                    # Off-animal holes, clipped to the window. Already merged,
+                    # so no row is subtracted twice.
+                    for a, b in holes[t]:
+                        a = a if lo is None else max(a, lo)
+                        b = b if hi is None else min(b, hi)
+                        if b >= a:
+                            total -= conn.execute(
+                                f"SELECT COUNT(*) FROM {self.table_name} "
+                                f"WHERE shortid = ? AND timestamp BETWEEN ? AND ?",
+                                [t, a, b]).fetchone()[0]
             finally:
                 conn.close()
         except Exception as e:
@@ -12701,6 +13019,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
         self.chk_save_svg.setChecked(False)
+        self.combo_plot_label_type.setCurrentText(SEX_ID)
         for cb in self.plot_type_checkboxes.values():
             cb.setChecked(True)
         self.chk_save_animation.setChecked(False)
@@ -13869,6 +14188,26 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_rolling_window.setVisible(False)
         self.combo_window_units.setVisible(False)
 
+    def plot_label_type(self):
+        """The 'Label animals by' choice, logging any animal it can't honour.
+
+        Name and Code are optional per animal and fall back to the SexID, so a
+        half-filled roster would quietly mix the two on one figure. Say which
+        animals will read differently rather than let it look like a bug.
+        """
+        kind = normalize_id_type(self.combo_plot_label_type.currentText())
+        if kind in (NAME, CODE) and self.tag_identities:
+            key = 'name' if kind == NAME else 'code'
+            missing = sorted({
+                f"{info.get('sex', '')}{info.get('identity', '')}"
+                for info in self.tag_identities.values()
+                if info and not str(info.get(key, '') or '').strip()})
+            if missing:
+                self.log_message(
+                    f"Plot labels: {kind} is not set for {', '.join(missing)} "
+                    f"- labelled by SexID instead.")
+        return kind
+
     def on_save_plots_toggled(self):
         """Handle save plots checkbox toggle"""
         enabled = self.chk_save_plots.isChecked()
@@ -14899,6 +15238,7 @@ class UWBQuickVisualizationWindow(QWidget):
             'weather_sources': self._weather_summary,
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
+            'plot_label_type': normalize_id_type(self.combo_plot_label_type.currentText()),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
@@ -15451,6 +15791,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'save_svg' in config:
                 self.chk_save_svg.setChecked(config['save_svg'])
+
+            if 'plot_label_type' in config:
+                self.combo_plot_label_type.setCurrentText(
+                    normalize_id_type(config['plot_label_type']))
 
             if 'plot_types' in config:
                 for key, value in config['plot_types'].items():
@@ -17056,9 +17400,13 @@ class UWBQuickVisualizationWindow(QWidget):
                         return 'auto'
                     return v.get(f'{which}_time', '-')
 
+                def _holes(v):
+                    n = len(off_intervals(v))
+                    return f" (+{n} off-animal interval{'s' if n != 1 else ''})" if n else ""
+
                 out[key] = {
                     str(t): (f"{v.get('sex', '?')}{v.get('identity', '?')} "
-                             f"{_bound(v, 'start')} → {_bound(v, 'stop')}")
+                             f"{_bound(v, 'start')} → {_bound(v, 'stop')}{_holes(v)}")
                     for t, v in (value or {}).items()}
             elif key == 'arena_zones':
                 names = sorted({r.get('zone') for r in value if isinstance(r, dict)})
@@ -18466,7 +18814,12 @@ class UWBQuickVisualizationWindow(QWidget):
                     # Per-tag time trimming (same helper the preview uses)
                     data_last = (tag_data['Timestamp'].max()
                                  if len(tag_data) else None)
-                    tag_data, trimmed = self._trim_to_tag_window(tag_data, tag, tz)
+                    tag_data, trimmed, off_trimmed = self._trim_tag(tag_data, tag, tz)
+                    if off_trimmed > 0:
+                        n_holes = len(self._tag_off_intervals(tag, tz))
+                        self.log_message(
+                            f"    Excluded {off_trimmed} points inside {n_holes} "
+                            f"off-animal interval(s)")
                     if trimmed > 0:
                         self.log_message(
                             f"    Trimmed {trimmed} points outside the tag's active window")
@@ -18895,6 +19248,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     bg_offset_y=self.bg_offset_y,
                     behavior_params=self._behavior_params(),
                     axis_limits=self.xy_range(),
+                    label_type=self.plot_label_type(),
                 )
                 self.worker.progress.connect(self.update_status)
                 self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, anim_csv_path, animations_dir))

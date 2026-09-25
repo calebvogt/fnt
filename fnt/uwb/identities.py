@@ -154,3 +154,77 @@ def describe_problems(report, limit=12):
             lines.append(f"• {lbl} “{val}” is used by "
                          f"{', '.join(owners)}")
     return lines
+
+
+# ── Off-animal intervals ─────────────────────────────────────────────────────
+#
+# A tag can come off its animal and go back on - a head cap scratched off in
+# the nest and re-glued the next morning. The tag keeps reporting throughout,
+# so the data carry a stretch of a tag lying on the ground under the animal's
+# name. Start/Stop cannot express that: they bound ONE continuous deployment,
+# and a replacement tag is a different tag. These intervals punch holes in the
+# middle of a deployment instead. Fixes inside one are dropped exactly as
+# fixes outside Start/Stop are - from the preview, the heatmaps and every
+# export - so the animal reads as absent rather than as a motionless tag.
+#
+# Stored on the tag's identity record as local wall-clock strings, the same
+# form Start/Stop use:
+#     'off_intervals': [{'start': '2026-09-23 20:52:00.000',
+#                        'stop':  '2026-09-24 10:38:00.000',
+#                        'note':  'head cap off in Z7 nest'}]
+
+OFF_INTERVALS = 'off_intervals'
+
+
+def off_intervals(info):
+    """The tag's off-animal intervals as clean dicts, malformed ones dropped.
+
+    Tolerates a missing key (every config written before this feature) and
+    entries missing a bound; the note is optional.
+    """
+    out = []
+    for item in (info or {}).get(OFF_INTERVALS) or []:
+        if not isinstance(item, dict):
+            continue
+        start = str(item.get('start', '') or '').strip()
+        stop = str(item.get('stop', '') or '').strip()
+        if not start or not stop:
+            continue
+        out.append({'start': start, 'stop': stop,
+                    'note': str(item.get('note', '') or '').strip()})
+    return out
+
+
+def merge_intervals(pairs):
+    """Union of (start, stop) pairs, sorted; inverted or empty pairs dropped.
+
+    Works on anything orderable - Timestamps, epoch ms. Overlapping or
+    touching intervals collapse into one, so counting the rows they cover
+    never counts a row twice.
+    """
+    clean = sorted((a, b) for a, b in pairs
+                   if a is not None and b is not None and b > a)
+    merged = []
+    for a, b in clean:
+        if merged and a <= merged[-1][1]:
+            if b > merged[-1][1]:
+                merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def inside_intervals(values, merged):
+    """Boolean mask: which of ``values`` fall inside any merged interval.
+
+    Bounds are inclusive, like Start/Stop. ``values`` must be sorted-agnostic
+    array-likes comparable with the interval bounds (tz-aware Timestamps
+    against a tz-aware Series, or epoch ms against ints).
+    """
+    import numpy as np
+    import pandas as pd
+    s = pd.Series(values)
+    mask = np.zeros(len(s), dtype=bool)
+    for a, b in merged:
+        mask |= ((s >= a) & (s <= b)).to_numpy()
+    return mask
