@@ -205,6 +205,39 @@ def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
 
 
+def _build_sky_icon(ax, size_pt):
+    """Every sky state's artists, made once and hidden (animated) until drawn.
+
+    ``size_pt`` is the icon's width in points, to turn the shapes' line
+    widths (fractions of the box) into matplotlib linewidths.
+    """
+    from matplotlib.lines import Line2D
+    from fnt.uwb import weather as wx
+    out = {}
+    for state in wx.SKY_STATES:
+        arts = []
+        for shape in wx.sky_icon_shapes(state):
+            kind = shape[0]
+            if kind == "circle":
+                a = Circle(shape[1], shape[2], facecolor=shape[3],
+                           edgecolor='none', animated=True)
+                ax.add_patch(a)
+            elif kind == "poly":
+                a = MplPolygon(np.asarray(shape[1]), closed=True,
+                               facecolor=shape[2], edgecolor='none',
+                               animated=True)
+                ax.add_patch(a)
+            else:
+                (x0, y0), (x1, y1) = shape[1]
+                a = Line2D([x0, x1], [y0, y1], color=shape[2],
+                           linewidth=max(shape[3] * size_pt, 0.6),
+                           solid_capstyle='round', animated=True)
+                ax.add_line(a)
+            arts.append(a)
+        out[state] = arts
+    return out
+
+
 def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):  # noqa: E501
     """Per-frame weather line and light bar (blitted like everything else)."""
     from fnt.uwb import weather as wx
@@ -237,8 +270,13 @@ def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):
     a, b = light['span']
     f = (t_ns - a) / max(b - a, 1)
     light['cursor'].set_xdata([f, f])
-    light['text'].set_text(wx.format_light(state))
+    sky = timeline.sky(t_ns) if hasattr(timeline, 'sky') else None
+    light['text'].set_text(" · ".join(
+        t for t in (wx.format_sky(sky), wx.format_light(state)) if t))
     fig.draw_artist(light['text'])
+    if sky and light.get('sky_ax') is not None:
+        for a in light['sky'].get(sky['state'], ()):
+            light['sky_ax'].draw_artist(a)
     lax = light['ax']
     for key in ('strip', 'precip', 'ticks', 'cursor'):
         lax.draw_artist(light[key])
@@ -506,11 +544,24 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                               animated=True)
         mox.add_patch(moon_disc)
         mox.add_patch(moon_lit)
+        # The sky condition, mirrored on the strip's left. Same size and
+        # backing as the moon so the pair reads as one row of symbols.
+        sky_w = 0.28 / fig_w
+        sky_x = max(0.08 * frac - 0.006 - sky_w, 0.0)
+        sax = fig.add_axes([sky_x, y0 - 0.03 / total_h, sky_w, 0.28 / total_h])
+        sax.set_xlim(-0.07, 1.07)
+        sax.set_ylim(-0.07, 1.07)
+        sax.set_aspect('equal')
+        sax.axis('off')
+        sax.add_patch(Circle((0.5, 0.5), 0.57, facecolor=(0, 0, 0, 0.6),
+                             edgecolor='none'))
+        sky_artists = _build_sky_icon(sax, 0.28 * 72 / 1.14)
         light = {'ax': lax, 'strip': strip, 'precip': precip_img,
                  'ticks': ticks,
                  'cursor': cursor, 'text': ltext, 'day': None,
                  'span': (0, 1), 'wx': _wx, 'moon_ax': mox,
-                 'moon_disc': moon_disc, 'moon_lit': moon_lit}
+                 'moon_disc': moon_disc, 'moon_lit': moon_lit,
+                 'sky_ax': sax, 'sky': sky_artists}
 
     canvas.draw()
     width, height = canvas.get_width_height()

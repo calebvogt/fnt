@@ -50,7 +50,7 @@ from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
     BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
-    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar, MoonIcon)
+    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar, MoonIcon, SkyIcon)
 from fnt.uwb import animation as uwb_animation
 from fnt.uwb import weather as WX
 from fnt.uwb.identities import (
@@ -192,7 +192,7 @@ WEATHER_CACHE_DIR = 'weather_cache'
 _KNOWN_EXPORT_PATTERNS = (
     '_smoothed.csv', '_raw.csv', '_SocialOverlapBouts.csv', '_proximity_bouts.csv',
     '_behavior_events.csv', '_ROI_bout_occupancy.csv', '_ROI_DailySummary.csv',
-    '_weather.csv', '_daylight.csv', '_DailyPathGrid.png',
+    '_weather.csv', '_daylight.csv', '_sky.csv', '_DailyPathGrid.png',
     # Retired products. Kept in the list so a re-export of a trial processed by
     # an older build reports clearing them as expected, not as strangers.
     '_network_GBI.csv', '_network_edgelist',
@@ -5685,7 +5685,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_weather = QCheckBox("Export Weather && Daylight CSVs")
         self.chk_export_weather.setChecked(False)
         self.chk_export_weather.setToolTip(
-            "FILES: {db}_weather.csv and {db}_daylight.csv (needs the site's "
+            "FILES: {db}_weather.csv, {db}_daylight.csv and {db}_sky.csv "
+            "(needs the site's "
             "latitude/longitude - Preview → Weather Settings…).\n"
             "\n"
             "WEATHER: every record of the selected weather and sunlight "
@@ -5712,6 +5713,17 @@ class UWBQuickVisualizationWindow(QWidget):
             "and phase at the midnight ending the date (the night after its "
             "sunset); dark_h, the hours of the date with the sun below -6°; "
             "and moonlit_dark_h, how many of those the moon was up.\n"
+            "\n"
+            "SKY: one row per minute - the condition the sky icon shows "
+            "(sky_state / sky_label: clear, partly cloudy, overcast, fog, "
+            "light rain, rain, heavy rain, snow, rain and snow, thunderstorm) "
+            "with sky_basis 'measured' or 'model' and sky_source. raining "
+            "and precip_rate_mmh come from the weather station's gauge "
+            "wherever it has a record (precip_source says which); "
+            "clear_sky_index and shaded_frac_15min are the measured-sunlight "
+            "evidence for daytime cloud; cloud_cover_pct_model and "
+            "weather_code_model are the model's, used for night cloud, "
+            "thunder and fog, which nothing here measures.\n"
             "\n"
             "Downloads are cached in the analysis folder's weather_cache and "
             "their URLs, retrieval times and checksums are recorded in "
@@ -6618,6 +6630,9 @@ class UWBQuickVisualizationWindow(QWidget):
         light_row = QHBoxLayout()
         light_row.setContentsMargins(0, 0, 0, 0)
         light_row.setSpacing(6)
+        self.sky_icon = SkyIcon()
+        self._sky_icon_state = None
+        light_row.addWidget(self.sky_icon)
         self.light_bar = LightBar()
         self.light_bar.setToolTip(
             "Sunlight across the current local day (midnight to midnight); "
@@ -6873,6 +6888,20 @@ class UWBQuickVisualizationWindow(QWidget):
             "computed from the site's coordinates (NOAA solar equations).")
         form.addRow("Sunlight:", self.combo_solar_source)
         v.addLayout(form)
+        self.chk_model_supplement = QCheckBox(
+            "Fill gaps from the Open-Meteo model (labelled \"model\")")
+        self.chk_model_supplement.setChecked(True)
+        self.chk_model_supplement.setToolTip(
+            "Measured data always come first. With this on, the Open-Meteo "
+            "model is also fetched and used ONLY where the sources above "
+            "have no record, or for what no sensor here measures: cloud at "
+            "night, thunder and fog, for the sky icon. Anything taken from "
+            "the model is labelled 'model' in the preview, the video and "
+            "{db}_sky.csv.\n\n"
+            "Turn it off to show measurements only; the sky icon then "
+            "shows 'sky unknown' where nothing was measured.")
+        self.chk_model_supplement.stateChanged.connect(self._on_site_changed)
+        v.addWidget(self.chk_model_supplement)
         self.combo_weather_source.currentIndexChanged.connect(self._on_site_changed)
         self.combo_solar_source.currentIndexChanged.connect(self._on_site_changed)
 
@@ -6993,6 +7022,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 'wind': self.combo_wl_wind.currentText(),
                 'rain': self.combo_wl_rain.currentText(),
             },
+            'model_supplement': self.chk_model_supplement.isChecked(),
         })
 
     @staticmethod
@@ -7006,7 +7036,8 @@ class UWBQuickVisualizationWindow(QWidget):
         widgets = (self.edit_site_lat, self.edit_site_lon,
                    self.combo_weather_source, self.combo_solar_source,
                    self.edit_weatherlink_url, self.combo_wl_temp,
-                   self.combo_wl_wind, self.combo_wl_rain)
+                   self.combo_wl_wind, self.combo_wl_rain,
+                   self.chk_model_supplement)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -7025,6 +7056,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 max(self.combo_wl_temp.findData(u.get('temp', 'auto')), 0))
             self.combo_wl_wind.setCurrentText(u.get('wind', 'mph'))
             self.combo_wl_rain.setCurrentText(u.get('rain', 'in'))
+            self.chk_model_supplement.setChecked(bool(settings.model_supplement))
         finally:
             for w in widgets:
                 w.blockSignals(False)
@@ -7299,10 +7331,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self._weather_summary = env.summary()
         self._light_day = None
         parts = []
+        in_role = {env.roles.get('weather'), env.roles.get('solar')}
         for src, meta in env.meta.items():
-            n = len(env.frames.get(src, ()))
+            n = self._weather_summary['sources'].get(src, {}).get('records', 0)
             label = {'surfrad': f"SURFRAD {meta.get('station', '')}",
-                     'open_meteo': "Open-Meteo",
+                     'open_meteo': ("Open-Meteo" if src in in_role
+                                    else "Open-Meteo (gaps only)"),
+                     'open_meteo_sky': "Open-Meteo sky (model)",
                      'weatherlink': "WeatherLink"}.get(src, src)
             parts.append(f"{label}: {n:,} records")
         wl = env.meta.get('weatherlink') or {}
@@ -7362,6 +7397,8 @@ class UWBQuickVisualizationWindow(QWidget):
             self.lbl_preview_light.setText("")
             self.light_bar.clear()
             self.moon_icon.clear()
+            self.sky_icon.clear()
+            self._sky_icon_state = None
             return
         t_ns = int(self.preview_playhead_ms) * 1_000_000
         state = tl.at(t_ns)
@@ -7410,7 +7447,38 @@ class UWBQuickVisualizationWindow(QWidget):
                     if np.isfinite(state['moon_illumination']) else None)
             self.light_bar.set_now((t_ns - a) / max(b - a, 1), state['light'])
             self.moon_icon.set_moon(poly, state.get('moon_up', True))
-            self.lbl_preview_light.setText(WX.format_light(state))
+            sky = tl.sky(t_ns)
+            sky_txt = WX.format_sky(sky)
+            if sky and sky['state'] != self._sky_icon_state:
+                self.sky_icon.set_shapes(WX.sky_icon_shapes(sky['state']))
+                self._sky_icon_state = sky['state']
+            self.sky_icon.setToolTip(self._sky_tooltip(sky))
+            self.lbl_preview_light.setText(
+                " · ".join(t for t in (sky_txt, WX.format_light(state)) if t))
+
+    _SKY_SOURCE_NAMES = {'weatherlink': "weather station", 'surfrad': "SURFRAD",
+                         'open_meteo': "Open-Meteo model",
+                         'open_meteo_sky': "Open-Meteo model"}
+
+    def _sky_tooltip(self, sky):
+        """What the sky icon shows now, and what it is based on."""
+        if not sky:
+            return ""
+        lines = [WX.SKY_LABELS.get(sky['state'], sky['state'])]
+        src = self._SKY_SOURCE_NAMES.get(sky.get('source'), sky.get('source') or "")
+        if sky.get('basis') == 'measured':
+            lines.append(f"Measured ({src}).")
+        elif sky.get('basis') == 'model':
+            lines.append(f"Modelled ({src}): nothing measured it here.")
+        else:
+            lines.append("No sky data for this time - only the sun's position.")
+        lines.append(
+            "\nRain comes from the station's gauge wherever it has a record; "
+            "daytime cloud from measured sunlight (how much of the time the "
+            "sun was shaded). Night cloud, thunder and fog are not measured "
+            "here and come from the model. The export writes it minute by "
+            "minute, with the evidence, to {db}_sky.csv.")
+        return "\n".join(lines)
 
     def _fetch_environment_now(self, settings):
         """Run the Fetch Weather job and wait for it, keeping the window live.
@@ -7501,6 +7569,29 @@ class UWBQuickVisualizationWindow(QWidget):
                                                     'max_elevation_deg')):
             return False
         self.log_message(f"✓ Exported {d_name} ({len(dl)} day(s))")
+
+        sky_name = f'{db_name}_sky.csv'
+        sky = WX.sky_frame(env)
+        if len(sky):
+            basis = sky['sky_basis'].replace('', 'unknown').value_counts()
+            self.log_audit(sky_name, [
+                (bool(sky['timestamp'].is_monotonic_increasing
+                      and not sky['timestamp'].duplicated().any()),
+                 "one row per minute, in time order"),
+                (bool(sky['sky_state'].isin(WX.SKY_STATES).all()),
+                 "every sky state is a known one"),
+                (bool((sky.loc[sky['raining'], 'sky_state'].isin(
+                    ('light_rain', 'rain', 'heavy_rain', 'snow', 'mixed',
+                     'thunderstorm'))).all()),
+                 "every raining minute is shown as precipitation"),
+                (True, "basis: " + ", ".join(
+                    f"{k} {100 * v / len(sky):.0f}%" for k, v in basis.items())),
+            ])
+            sky_path = os.path.join(csv_output_dir(output_dir, create=True),
+                                    sky_name)
+            if not self.write_verified_csv(sky, sky_path, self._SKY_NUMERIC_COLS):
+                return False
+            self.log_message(f"✓ Exported {sky_name} ({len(sky):,} minutes)")
         self.save_config(output_dir)
         return True
 
@@ -18059,6 +18150,10 @@ class UWBQuickVisualizationWindow(QWidget):
     #: Columns of the weather CSV that must parse as numbers.
     _WEATHER_NUMERIC_COLS = ('timestamp', 'interval_s', *WX.FIELDS,
                              'sun_elevation_deg', 'sun_azimuth_deg')
+    _SKY_NUMERIC_COLS = ('timestamp', 'precip_rate_mmh', 'precip_rate_15min_mmh',
+                         'clear_sky_index', 'shaded_frac_15min',
+                         'cloud_cover_pct_model', 'weather_code_model',
+                         'sun_elevation_deg')
 
     def verify_smoothed_csv(self, path, chunksize=2_000_000, numeric_cols=None):
         """Check every numeric column of the written CSV actually parses.
@@ -18313,6 +18408,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.chk_export_weather.isChecked():
             predicted_files.append(f'{db_name}_weather.csv')
             predicted_files.append(f'{db_name}_daylight.csv')
+            predicted_files.append(f'{db_name}_sky.csv')
 
         predicted_sna_files = []   # social-network animation was removed
 

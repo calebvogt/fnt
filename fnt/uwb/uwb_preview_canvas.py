@@ -1529,6 +1529,57 @@ class LightBar(QWidget):
         p.end()
 
 
+class SkyIcon(QWidget):
+    """The sky condition (sun, cloud, rain...) as a small icon, beside the
+    light bar. Draws weather.sky_icon_shapes, the same shapes as the video."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(24, 24)
+        self._shapes = ()
+
+    def set_shapes(self, shapes):
+        self._shapes = tuple(shapes or ())
+        self.update()
+
+    def clear(self):
+        self.set_shapes(())
+
+    def paintEvent(self, _event):
+        if not self._shapes:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        size = float(min(self.width(), self.height()))
+        ox = (self.width() - size) / 2.0
+        oy = (self.height() - size) / 2.0
+
+        def pt(x, y):     # unit box, y up -> widget pixels, y down
+            return QPointF(ox + x * size, oy + (1.0 - y) * size)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 150))
+        p.drawEllipse(pt(0.5, 0.5), size / 2.0, size / 2.0)
+        for shape in self._shapes:
+            kind, colour = shape[0], QColor(shape[-2] if shape[0] == "line"
+                                            else shape[-1])
+            if kind == "circle":
+                p.setPen(Qt.NoPen)
+                p.setBrush(colour)
+                p.drawEllipse(pt(*shape[1]), shape[2] * size, shape[2] * size)
+            elif kind == "poly":
+                p.setPen(Qt.NoPen)
+                p.setBrush(colour)
+                p.drawPolygon(QPolygonF([pt(x, y) for x, y in shape[1]]))
+            elif kind == "line":
+                pen = QPen(colour, max(shape[3] * size, 1.0))
+                pen.setCapStyle(Qt.RoundCap)
+                p.setPen(pen)
+                (x0, y0), (x1, y1) = shape[1]
+                p.drawLine(pt(x0, y0), pt(x1, y1))
+        p.end()
+
+
 class MoonIcon(QWidget):
     """The moon's phase as a small disc, beside the light bar.
 

@@ -15,6 +15,12 @@ so a re-run is reproducible and works offline:
 ``weatherlink``  A Davis WeatherLink text archive at a URL the user supplies,
                  one file per day - e.g. a station a university publishes.
 
+``open_meteo`` can also be fetched as a SUPPLEMENT whatever the chosen
+sources (``SiteSettings.model_supplement``): its values are then used only
+where the measurements have no record, or for what no sensor here measures
+(cloud cover at night, thunder, fog), and are always labelled "model".
+Measured data win wherever they exist - see ``WeatherTimeline.sky``.
+
 and ``computed``: the sun's position from the NOAA solar equations, and the
 moon's position, phase and illumination from the Astronomical Almanac's
 low-precision lunar series - both exact enough for behaviour work at any
@@ -110,6 +116,59 @@ OPEN_METEO_VARS = {
     "direct_normal_irradiance": "dni_wm2",
     "diffuse_radiation": "dhi_wm2",
 }
+#: Sky-condition variables, fetched hourly and kept apart from the canonical
+#: frames: they are categories, not measurements, and no sensor source has them.
+OPEN_METEO_SKY_VARS = {"weather_code": "weather_code",
+                       "cloud_cover": "cloud_cover_pct"}
+
+#: Sky conditions the icon can show. ``day``/``night`` mean "no information
+#: about the sky" - drawn in grey so they are never read as clear.
+SKY_STATES = ("clear_day", "partly_cloudy_day", "clear_night",
+              "partly_cloudy_night", "cloudy", "fog", "light_rain", "rain",
+              "heavy_rain", "snow", "mixed", "thunderstorm", "day", "night")
+SKY_LABELS = {
+    "clear_day": "Clear", "partly_cloudy_day": "Partly cloudy",
+    "clear_night": "Clear night", "partly_cloudy_night": "Partly cloudy night",
+    "cloudy": "Overcast", "fog": "Fog", "light_rain": "Light rain",
+    "rain": "Rain", "heavy_rain": "Heavy rain", "snow": "Snow",
+    "mixed": "Rain and snow", "thunderstorm": "Thunderstorm",
+    "day": "Day, sky unknown", "night": "Night, sky unknown",
+}
+#: Rain intensity (mm/h), the American Meteorological Society's classes:
+#: light below 2.5, moderate to 7.6, heavy above.
+RAIN_LIGHT_MMH = 2.5
+RAIN_HEAVY_MMH = 7.6
+#: Intensity is judged on the rate averaged over this centred window: one tip
+#: of a 0.01 in bucket inside a 5-min record reads 3 mm/h, which a drizzle
+#: that took 15 minutes to fill the bucket is not.
+RAIN_WINDOW_MIN = 15
+#: A bucket gauge records rain in steps, so a dry gap this short between two
+#: wet records is taken as rain that had not yet tipped the bucket.
+PRECIP_BRIDGE_MIN = 10
+#: Measured irradiance -> cloud: a minute counts as SHADED when the clear-sky
+#: index (measured GHI / clear-sky GHI) is below this. Only trusted with the
+#: sun at least CSI_MIN_ELEV degrees up, where the clear-sky model is good.
+CSI_SHADED = 0.6
+CSI_MIN_ELEV = 10.0
+#: ...and the sky over a centred window is clear when at most CSI_CLEAR_FRAC
+#: of its minutes are shaded, overcast when at least CSI_OVERCAST_FRAC are.
+CSI_WINDOW_MIN = 15
+CSI_CLEAR_FRAC = 0.15
+CSI_OVERCAST_FRAC = 0.85
+#: Model cloud cover (%): clear below, overcast above, partly between.
+CLOUD_CLEAR_PCT = 25.0
+CLOUD_OVERCAST_PCT = 75.0
+#: A cloud condition must last this long to be shown, so a sky on the edge of
+#: two classes does not flicker. Precipitation is never held or shortened.
+SKY_HOLD_MIN = 10
+#: Within one spell of rain, an intensity lasting less than this is folded
+#: into its neighbour (the spell itself is never shortened).
+RAIN_HOLD_MIN = 5
+#: WMO weather codes (Open-Meteo): fog, and thunderstorm (with/without hail).
+FOG_CODES = (45, 48)
+THUNDER_CODES = (95, 96, 99)
+#: Model fog is only believed where a measured humidity agrees.
+FOG_RH_MIN = 97.0
 
 #: Sun-elevation thresholds (degrees, geometric). -0.833 is the standard
 #: sunrise/sunset: the upper limb on the horizon, refraction included.
@@ -840,6 +899,83 @@ def fetch_open_meteo(lat, lon, start_ns, end_ns, cache, log=None, now_ns=None):
     return _finish_frame(df), meta
 
 
+def parse_open_meteo_sky(payload, now_ns=None):
+    """Hourly weather code and cloud cover, stamped at the hour's end."""
+    block = payload.get("hourly") or {}
+    times = block.get("time") or []
+    cols = list(OPEN_METEO_SKY_VARS.values())
+    if not times:
+        return pd.DataFrame({"time_ns": pd.Series(dtype="int64"),
+                             "interval_s": pd.Series(dtype="float64"),
+                             **{c: pd.Series(dtype="float64") for c in cols}})
+    t = pd.to_datetime(pd.Series(times), utc=True, format="ISO8601")
+    df = pd.DataFrame({"time_ns": t.dt.as_unit("ns").astype("int64").to_numpy(),
+                       "interval_s": 3600.0})
+    for var, col in OPEN_METEO_SKY_VARS.items():
+        df[col] = pd.to_numeric(pd.Series(block.get(var, [None] * len(times))),
+                                errors="coerce").to_numpy()
+    df = df[df[cols].notna().any(axis=1)]
+    if now_ns is not None:
+        df = df[df["time_ns"] <= now_ns]
+    return df.reset_index(drop=True)
+
+
+def fetch_sky_model(lat, lon, start_ns, end_ns, cache, log=None, now_ns=None):
+    """Open-Meteo's hourly weather code and cloud cover at the site.
+
+    What the icon needs and no sensor here measures: cloud at night, thunder,
+    fog. Hourly because the 15-minute feed does not carry cloud cover.
+    """
+    now_ns = now_ns if now_ns is not None else time.time_ns()
+    d0 = pd.Timestamp(int(start_ns), tz="UTC").date()
+    d1 = pd.Timestamp(int(end_ns), tz="UTC").date()
+    frames, rels, used = [], [], set()
+    tag = f"{lat:.4f}_{lon:.4f}"
+    vars_ = ",".join(OPEN_METEO_SKY_VARS)
+    chunk = d0
+    while chunk <= d1:
+        stop = min(d1, chunk + timedelta(days=30))
+        common = (f"latitude={lat:.5f}&longitude={lon:.5f}"
+                  f"&start_date={chunk}&end_date={stop}&timezone=GMT")
+        end_utc = datetime.combine(stop + timedelta(days=1), datetime.min.time(),
+                                   tzinfo=timezone.utc)
+        fr = None
+        for base, label, grace in ((OPEN_METEO_15MIN_URL, "hourly model", 0),
+                                   (OPEN_METEO_HOURLY_URL,
+                                    "hourly ERA5 reanalysis", 6)):
+            rel = (f"open_meteo/{tag}_{chunk}_{stop}_sky"
+                   f"{'' if grace == 0 else '_era5'}.json")
+            path = cache.get(f"{base}?{common}&hourly={vars_}", rel,
+                             end_utc + timedelta(days=grace))
+            if not path:
+                continue
+            try:
+                with open(path) as f:
+                    fr = parse_open_meteo_sky(json.load(f), now_ns)
+            except (OSError, ValueError):
+                fr = None
+            if fr is not None and len(fr):
+                rels.append(rel)
+                used.add(label)
+                break
+        if fr is not None and len(fr):
+            frames.append(fr)
+        chunk = stop + timedelta(days=1)
+    df = (pd.concat(frames, ignore_index=True) if frames
+          else parse_open_meteo_sky({}))
+    pad = 3600 * NS_PER_S
+    df = df[(df["time_ns"] > start_ns - pad) & (df["time_ns"] <= end_ns + pad)]
+    df = (df.sort_values("time_ns").drop_duplicates("time_ns", keep="last")
+            .reset_index(drop=True))
+    meta = {
+        "source": "open_meteo_sky", "kind": "model",
+        "station": "model grid at site", "distance_km": 0.0,
+        "resolution": ", ".join(sorted(used)) or "none", "interval_s": 3600.0,
+        "files": cache.provenance(rels),
+    }
+    return df, meta
+
+
 # --------------------------------------------------------------------------- #
 # Davis WeatherLink text archive
 # --------------------------------------------------------------------------- #
@@ -1066,6 +1202,9 @@ class SiteSettings:
     weatherlink_units: dict = field(default_factory=lambda: {
         "temp": "auto", "wind": "mph", "rain": "in"})
     name: str = ""
+    #: Also fetch the Open-Meteo model, used only where the chosen sources
+    #: have no record or measure nothing (night cloud, thunder, fog).
+    model_supplement: bool = True
 
     @property
     def has_location(self):
@@ -1080,6 +1219,7 @@ class SiteSettings:
             "solar_source": self.solar_source,
             "weatherlink_url": self.weatherlink_url,
             "weatherlink_units": dict(self.weatherlink_units),
+            "model_supplement": bool(self.model_supplement),
         }
 
     @classmethod
@@ -1105,6 +1245,8 @@ class SiteSettings:
             "wind": u.get("wind") if u.get("wind") in WIND_UNITS else "mph",
             "rain": u.get("rain") if u.get("rain") in RAIN_UNITS else "in",
         }
+        if "model_supplement" in d:
+            s.model_supplement = bool(d["model_supplement"])
         return s
 
 
@@ -1119,12 +1261,15 @@ class Environment:
     meta: dict = field(default_factory=dict)       # source -> meta
     roles: dict = field(default_factory=dict)      # 'weather'/'solar' -> source
     warnings: list = field(default_factory=list)
+    #: Non-canonical frames (the hourly sky model), kept out of ``frames`` so
+    #: the export and the lookups only ever see the canonical schema.
+    extra: dict = field(default_factory=dict)
 
     def summary(self):
         out = {"site": self.settings.to_dict(), "roles": dict(self.roles),
                "sources": {}, "warnings": list(self.warnings)}
         for src, meta in self.meta.items():
-            fr = self.frames.get(src)
+            fr = self.frames.get(src, self.extra.get(src))
             m = dict(meta)
             m["records"] = int(len(fr)) if fr is not None else 0
             out["sources"][src] = m
@@ -1152,6 +1297,10 @@ def fetch_environment(settings, tz, start_ns, end_ns, cache_root, log=None,
         if settings.solar_source not in wanted:
             wanted.append(settings.solar_source)
         env.roles["solar"] = settings.solar_source
+    if settings.model_supplement:
+        if "open_meteo" not in wanted:
+            wanted.append("open_meteo")
+        env.roles["supplement"] = "open_meteo"
     lat, lon = settings.latitude, settings.longitude
     for src in wanted:
         try:
@@ -1193,6 +1342,15 @@ def fetch_environment(settings, tz, start_ns, end_ns, cache_root, log=None,
                     f"{SOURCE_LABELS[src]}: covers "
                     f"{_fmt_local(first - iv, tz)} to {_fmt_local(last, tz)}, "
                     f"not the whole trial")
+    if settings.model_supplement:
+        try:
+            fr, meta = fetch_sky_model(lat, lon, start_ns, end_ns, cache, log,
+                                       now_ns=now_ns)
+            env.extra["open_meteo_sky"] = fr
+            env.meta["open_meteo_sky"] = meta
+            env.roles["sky_model"] = "open_meteo_sky"
+        except ValueError as e:
+            env.warnings.append(str(e))
     missing = [u for u, why in cache.failed if why.startswith("not published")]
     if missing:
         env.warnings.append(
@@ -1202,6 +1360,48 @@ def fetch_environment(settings, tz, start_ns, end_ns, cache_root, log=None,
     log(f"Weather: {cache.downloaded} file(s) downloaded, "
         f"{cache.reused} reused from cache")
     return env
+
+
+def _cover_index(ends, ivs, t):
+    """Per time, the index of the record covering it - (end - interval, end]
+    - or -1 where none does."""
+    if len(ends) == 0:
+        return np.full(len(t), -1, dtype=np.int64)
+    i = np.searchsorted(ends, t, "left")
+    j = np.minimum(i, len(ends) - 1)
+    ok = (i < len(ends)) & (ends[j] - ivs[j] < t)
+    return np.where(ok, j, -1)
+
+
+def _bridge(wet, max_gap):
+    """True over dry runs of at most ``max_gap`` samples with wet on both sides."""
+    out = np.zeros(len(wet), dtype=bool)
+    w = np.flatnonzero(wet)
+    if len(w) < 2:
+        return out
+    for a, b in zip(w[:-1], w[1:]):
+        if 1 < b - a <= max_gap + 1:
+            out[a + 1:b] = True
+    return out
+
+
+def _hold_runs(cat, others, min_len):
+    """Fold runs of ``cat`` shorter than ``min_len`` into the run before them
+    (the one after, at the start), carrying the ``others`` arrays along."""
+    cat = cat.copy()
+    others = [o.copy() for o in others]
+    n = len(cat)
+    edges = np.flatnonzero(cat[1:] != cat[:-1]) + 1
+    starts, stops = np.r_[0, edges], np.r_[edges, n]
+    if len(starts) > 1:
+        for a, b in zip(starts, stops):
+            if b - a >= min_len:
+                continue
+            src = a - 1 if a > 0 else b
+            cat[a:b] = cat[src]
+            for o in others:
+                o[a:b] = o[src]
+    return (cat, *others)
 
 
 def _fmt_local(ns, tz):
@@ -1230,6 +1430,8 @@ class WeatherTimeline:
                 fr["precip_type"].to_numpy(dtype=object),
                 fr["precip_basis"].to_numpy(dtype=object),
             )
+        self._sky = None
+        self._sky_built = False
 
     def _record(self, src, t_ns):
         arr = self._arrays.get(src)
@@ -1312,6 +1514,190 @@ class WeatherTimeline:
         rate[good] = r[good]
         kind[good] = ptype[j][good]
         return rate, kind
+
+    # ------------------------------------------------------------------ sky
+    def _measured(self, src):
+        return self.env.meta.get(src, {}).get("kind") == "measured"
+
+    def _by_evidence(self, *sources):
+        """The given sources, measured before modelled, each once."""
+        seen = [s for i, s in enumerate(sources) if s and s not in sources[:i]]
+        return sorted(seen, key=lambda s: not self._measured(s))
+
+    def _cover(self, src, t):
+        """Per time, the index of the record whose interval contains it, or -1."""
+        arr = self._arrays.get(src)
+        return None if arr is None else _cover_index(arr[0], arr[1], t)
+
+    def sky_grid(self):
+        """The sky condition minute by minute over the trial (built once).
+
+        Measured beats modelled at every step:
+        precipitation  the weather station's gauge wherever it has a record;
+                       the model only in the station's gaps.
+        daytime cloud  measured irradiance (sun >= CSI_MIN_ELEV): the share
+                       of minutes the sun was shaded, over a centred window.
+        night cloud,   model only - nothing here measures them - so shown as
+        thunder, fog   "model". Model thunder needs rain at the gauge (or no
+                       gauge); model fog needs the station's humidity to agree.
+        Returns None without a site or a span.
+        """
+        if self._sky_built:
+            return self._sky
+        self._sky_built = True
+        env = self.env
+        if not self.has_location or env.end_ns <= env.start_ns:
+            return None
+        pad = 3600 * NS_PER_S
+        g0 = (int(env.start_ns) - pad) // NS_PER_MIN * NS_PER_MIN
+        t = np.arange(g0, int(env.end_ns) + pad + NS_PER_MIN, NS_PER_MIN,
+                      dtype="int64")
+        n = len(t)
+        el, _az = solar_position(t, self.lat, self.lon)
+        roles = env.roles
+
+        # Precipitation, measured sources first; each fills only what the
+        # better ones left empty.
+        rate = np.full(n, np.nan)
+        kind = np.full(n, "", dtype=object)
+        psrc = np.full(n, "", dtype=object)
+        for src in self._by_evidence(roles.get("weather"), roles.get("supplement")):
+            idx = self._cover(src, t)
+            if idx is None:
+                continue
+            vals = self._arrays[src][2]["precip_rate_mmh"]
+            r = np.where(idx >= 0, vals[np.maximum(idx, 0)], np.nan)
+            fill = np.isnan(rate) & np.isfinite(r)
+            rate[fill] = r[fill]
+            kind[fill] = self._arrays[src][3][idx[fill]]
+            psrc[fill] = src
+        wet = np.isfinite(rate) & (rate > 0)
+        raining = wet | _bridge(wet, PRECIP_BRIDGE_MIN)
+        wet_kind = pd.Series(np.where(wet, kind, None), dtype=object).ffill()
+        kind = np.where(raining & ~wet, wet_kind.fillna("rain").to_numpy(), kind)
+        kind[raining & (kind == "")] = "rain"
+        smooth = (pd.Series(rate).rolling(RAIN_WINDOW_MIN, center=True,
+                                          min_periods=1).mean().to_numpy())
+
+        # The hourly sky model: weather code and cloud cover.
+        code = np.full(n, np.nan)
+        cover = np.full(n, np.nan)
+        sky_src = roles.get("sky_model", "")
+        sm = env.extra.get(sky_src)
+        if sm is not None and len(sm):
+            idx = _cover_index(sm["time_ns"].to_numpy(dtype="int64"),
+                               (sm["interval_s"].to_numpy(dtype=float)
+                                * NS_PER_S).astype("int64"), t)
+            ok = idx >= 0
+            code[ok] = sm["weather_code"].to_numpy(dtype=float)[idx[ok]]
+            cover[ok] = sm["cloud_cover_pct"].to_numpy(dtype=float)[idx[ok]]
+
+        # Daytime cloud from measured irradiance.
+        csi = np.full(n, np.nan)
+        csi_src = np.full(n, "", dtype=object)
+        clear = clear_sky_ghi(el)
+        for src in self._by_evidence(roles.get("solar"), roles.get("weather")):
+            if not self._measured(src):
+                continue
+            idx = self._cover(src, t)
+            if idx is None:
+                continue
+            g = np.where(idx >= 0, self._arrays[src][2]["ghi_wm2"][np.maximum(idx, 0)],
+                         np.nan)
+            ok = np.isfinite(g) & (el >= CSI_MIN_ELEV) & (clear > 0) & np.isnan(csi)
+            csi[ok] = g[ok] / clear[ok]
+            csi_src[ok] = src
+        shaded = np.where(np.isfinite(csi), (csi < CSI_SHADED).astype(float), np.nan)
+        frac = (pd.Series(shaded).rolling(CSI_WINDOW_MIN, center=True,
+                                          min_periods=CSI_WINDOW_MIN // 2 + 1)
+                .mean().to_numpy())
+        # Cloud class: 0 unknown, 1 clear, 2 partly cloudy, 3 overcast.
+        cat = np.zeros(n, dtype=np.int8)
+        cbasis = np.full(n, "", dtype=object)
+        csrc = np.full(n, "", dtype=object)
+        meas = np.isfinite(frac) & np.isfinite(csi)
+        cat[meas] = np.where(frac[meas] <= CSI_CLEAR_FRAC, 1,
+                             np.where(frac[meas] >= CSI_OVERCAST_FRAC, 3, 2))
+        cbasis[meas] = "measured"
+        csrc[meas] = csi_src[meas]
+        by_cover = ~meas & np.isfinite(cover)
+        cat[by_cover] = np.where(cover[by_cover] < CLOUD_CLEAR_PCT, 1,
+                                 np.where(cover[by_cover] > CLOUD_OVERCAST_PCT, 3, 2))
+        by_code = ~meas & ~by_cover & np.isfinite(code)
+        cat[by_code] = np.where(code[by_code] <= 1, 1,
+                                np.where(code[by_code] == 2, 2, 3))
+        cbasis[by_cover | by_code] = "model"
+        csrc[by_cover | by_code] = sky_src
+        cat, cbasis, csrc = _hold_runs(cat, (cbasis, csrc), SKY_HOLD_MIN)
+
+        day = el > SUNRISE_ELEV
+        state = np.where(day, np.array(["day", "clear_day", "partly_cloudy_day",
+                                        "cloudy"], dtype=object)[cat],
+                         np.array(["night", "clear_night", "partly_cloudy_night",
+                                   "cloudy"], dtype=object)[cat])
+        basis, source = cbasis.copy(), csrc.copy()
+
+        # Fog, where the model says so and a measured humidity agrees.
+        rh = np.full(n, np.nan)
+        wsrc = roles.get("weather")
+        if wsrc and self._measured(wsrc):
+            idx = self._cover(wsrc, t)
+            if idx is not None:
+                rh = np.where(idx >= 0,
+                              self._arrays[wsrc][2]["rh_pct"][np.maximum(idx, 0)],
+                              np.nan)
+        fog = (np.isin(code, FOG_CODES) & ~raining
+               & (~np.isfinite(rh) | (rh >= FOG_RH_MIN)))
+        state[fog], basis[fog], source[fog] = "fog", "model", sky_src
+
+        liquid = raining & (kind == "rain")
+        state[liquid] = np.where(smooth[liquid] >= RAIN_HEAVY_MMH, "heavy_rain",
+                                 np.where(smooth[liquid] >= RAIN_LIGHT_MMH,
+                                          "rain", "light_rain"))
+        state[raining & (kind == "snow")] = "snow"
+        state[raining & (kind == "mixed")] = "mixed"
+        edges = np.flatnonzero(np.diff(np.r_[0, raining.astype(np.int8), 0]))
+        for a, b in zip(edges[::2], edges[1::2]):
+            state[a:b] = _hold_runs(state[a:b], (), RAIN_HOLD_MIN)[0]
+        pbasis = np.array(["measured" if self._measured(s) else ("model" if s else "")
+                           for s in psrc], dtype=object)
+        basis[raining], source[raining] = pbasis[raining], psrc[raining]
+        # Thunder is never measured here: the model's, but only while the
+        # gauge has rain (or there is no gauge record to ask).
+        thunder = np.isin(code, THUNDER_CODES) & (raining | np.isnan(rate))
+        state[thunder], basis[thunder], source[thunder] = "thunderstorm", "model", sky_src
+
+        self._sky = {
+            "t0": int(g0), "time_ns": t, "state": state, "basis": basis,
+            "source": source, "raining": raining,
+            "precip_rate_mmh": np.where(np.isfinite(rate), rate, np.nan),
+            "precip_rate_smooth_mmh": smooth, "precip_type": np.where(raining, kind, ""),
+            "precip_source": psrc, "precip_basis": pbasis,
+            "clear_sky_index": csi, "shaded_frac": frac, "cloud_cover_pct": cover,
+            "weather_code": code, "sun_elevation": el,
+        }
+        return self._sky
+
+    def sky(self, t_ns):
+        """The sky condition at ``t`` as a dict (``state``, ``label``, ``basis``
+        'measured'/'model'/'', ``source``, ``raining``...), or None without a
+        site. Outside the fetched span only day/night is known."""
+        g = self.sky_grid()
+        t_ns = int(t_ns)
+        if g is not None:
+            i = (t_ns - g["t0"]) // NS_PER_MIN
+            if 0 <= i < len(g["state"]):
+                out = {k: (v[i] if isinstance(v, np.ndarray) else v)
+                       for k, v in g.items() if k != "t0"}
+                out["raining"] = bool(out["raining"])
+                out["label"] = SKY_LABELS[out["state"]]
+                return out
+        if not self.has_location:
+            return None
+        el, _az = solar_position(np.array([t_ns]), self.lat, self.lon)
+        state = "day" if el[0] > SUNRISE_ELEV else "night"
+        return {"state": state, "label": SKY_LABELS[state], "basis": "",
+                "source": "", "raining": False, "sun_elevation": float(el[0])}
 
     def light_strip(self, t0_ns, t1_ns, n=288):
         """(times_ns, light levels, moonlight) across [t0, t1] for the strip."""
@@ -1440,6 +1826,109 @@ def format_light(state):
     return txt
 
 
+def format_sky(sky):
+    """'Rain · measured', 'Overcast · model', 'Night, sky unknown', or ''."""
+    if not sky:
+        return ""
+    label = SKY_LABELS.get(sky.get("state"), "")
+    basis = sky.get("basis") or ""
+    return f"{label} · {basis}" if label and basis else label
+
+
+# --------------------------------------------------------------------------- #
+# Sky icon: vector shapes in a unit box (x right, y UP), drawn by both the
+# video (matplotlib) and the preview (Qt) so the two always agree.
+#   ("circle", (cx, cy), r, colour)
+#   ("poly", [(x, y), ...], colour)
+#   ("line", [(x0, y0), (x1, y1)], colour, width as a fraction of the box)
+# --------------------------------------------------------------------------- #
+SKY_COLORS = {
+    "sun": "#ffc83d", "moon": "#f1efe4", "cloud": "#dde3ea",
+    "cloud_back": "#9aa5b2", "cloud_rain": "#aeb8c4", "cloud_storm": "#7b8594",
+    "rain": "#4a90ff", "snow": "#ffffff", "bolt": "#ffd23f", "fog": "#b8c0ca",
+    "unknown": "#8a8f9c",
+}
+
+
+def _sun_shapes(cx, cy, r, colour):
+    out = [("circle", (cx, cy), r, colour)]
+    for k in range(8):
+        a = k * math.pi / 4
+        out.append(("line", [(cx + 1.4 * r * math.cos(a), cy + 1.4 * r * math.sin(a)),
+                             (cx + 1.85 * r * math.cos(a), cy + 1.85 * r * math.sin(a))],
+                    colour, 0.055))
+    return out
+
+
+def _crescent_shapes(cx, cy, r, colour):
+    pts = moon_disc_polygon(0.3, waxing=False)
+    return [("poly", [(cx + r * x, cy + r * y) for x, y in pts], colour)]
+
+
+def _cloud_shapes(cx, cy, w, colour):
+    return [("circle", (cx - 0.28 * w, cy - 0.02 * w), 0.2 * w, colour),
+            ("circle", (cx - 0.02 * w, cy + 0.1 * w), 0.28 * w, colour),
+            ("circle", (cx + 0.27 * w, cy), 0.21 * w, colour),
+            ("poly", [(cx - 0.28 * w, cy - 0.22 * w), (cx + 0.27 * w, cy - 0.22 * w),
+                      (cx + 0.27 * w, cy), (cx - 0.28 * w, cy)], colour)]
+
+
+def _drops(xs, top, colour, length=0.16):
+    return [("line", [(x, top), (x - 0.06, top - length)], colour, 0.075) for x in xs]
+
+
+def _flakes(pts, colour):
+    return [("circle", p, 0.045, colour) for p in pts]
+
+
+def sky_icon_shapes(state):
+    """Shapes for ``state`` (one of SKY_STATES); [] for anything else."""
+    c = SKY_COLORS
+    if state == "clear_day":
+        return _sun_shapes(0.5, 0.5, 0.2, c["sun"])
+    if state == "day":
+        return _sun_shapes(0.5, 0.5, 0.2, c["unknown"])
+    if state == "clear_night":
+        return _crescent_shapes(0.5, 0.5, 0.3, c["moon"])
+    if state == "night":
+        return _crescent_shapes(0.5, 0.5, 0.3, c["unknown"])
+    if state == "partly_cloudy_day":
+        return (_sun_shapes(0.37, 0.62, 0.15, c["sun"])
+                + _cloud_shapes(0.57, 0.38, 0.6, c["cloud"]))
+    if state == "partly_cloudy_night":
+        return (_crescent_shapes(0.4, 0.62, 0.22, c["moon"])
+                + _cloud_shapes(0.57, 0.38, 0.6, c["cloud"]))
+    if state == "cloudy":
+        return (_cloud_shapes(0.4, 0.6, 0.5, c["cloud_back"])
+                + _cloud_shapes(0.55, 0.42, 0.7, c["cloud"]))
+    if state == "fog":
+        return (_cloud_shapes(0.5, 0.62, 0.6, c["fog"])
+                + [("line", [(0.2, y), (0.8, y)], c["fog"], 0.06)
+                   for y in (0.34, 0.24)]
+                + [("line", [(0.3, 0.14), (0.7, 0.14)], c["fog"], 0.06)])
+    rain_cloud = _cloud_shapes(0.5, 0.6, 0.72, c["cloud_rain"])
+    if state == "light_rain":
+        return rain_cloud + _drops((0.4, 0.62), 0.36, c["rain"])
+    if state == "rain":
+        return rain_cloud + _drops((0.32, 0.5, 0.68), 0.36, c["rain"], 0.2)
+    if state == "heavy_rain":
+        return (_cloud_shapes(0.5, 0.6, 0.72, c["cloud_storm"])
+                + _drops((0.26, 0.4, 0.54, 0.68, 0.82), 0.36, c["rain"], 0.24))
+    if state == "snow":
+        return rain_cloud + _flakes(((0.32, 0.3), (0.5, 0.22), (0.68, 0.3),
+                                     (0.41, 0.12), (0.59, 0.12)), c["snow"])
+    if state == "mixed":
+        return (rain_cloud + _drops((0.34, 0.62), 0.36, c["rain"])
+                + _flakes(((0.48, 0.26), (0.72, 0.16)), c["snow"]))
+    if state == "thunderstorm":
+        bolt = [(0.52, 0.4), (0.38, 0.2), (0.49, 0.2), (0.42, 0.04),
+                (0.64, 0.27), (0.53, 0.27), (0.6, 0.4)]
+        return (_cloud_shapes(0.5, 0.6, 0.72, c["cloud_storm"])
+                + [("poly", bolt, c["bolt"])]
+                + _drops((0.3, 0.76), 0.36, c["rain"]))
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # Export
 # --------------------------------------------------------------------------- #
@@ -1482,6 +1971,44 @@ def export_frame(env):
     df["Timestamp"] = pd.to_datetime(df["time_ns"], utc=True).dt.tz_convert(env.tz)
     df["timestamp"] = (df["time_ns"] // 1_000_000).astype("int64")
     return df[list(EXPORT_COLUMNS)].reset_index(drop=True)
+
+
+SKY_EXPORT_COLUMNS = ("Timestamp", "timestamp", "sky_state", "sky_label",
+                      "sky_basis", "sky_source", "raining", "precip_type",
+                      "precip_rate_mmh", "precip_rate_15min_mmh",
+                      "precip_source", "precip_basis", "clear_sky_index",
+                      "shaded_frac_15min", "cloud_cover_pct_model",
+                      "weather_code_model", "sun_elevation_deg")
+
+
+def sky_frame(env):
+    """The sky condition minute by minute over the trial, with its evidence."""
+    g = env.timeline().sky_grid()
+    if g is None:
+        return pd.DataFrame(columns=list(SKY_EXPORT_COLUMNS))
+    t = g["time_ns"]
+    keep = (t >= env.start_ns) & (t <= env.end_ns)
+    df = pd.DataFrame({
+        "time_ns": t[keep],
+        "sky_state": g["state"][keep],
+        "sky_basis": g["basis"][keep],
+        "sky_source": g["source"][keep],
+        "raining": g["raining"][keep],
+        "precip_type": g["precip_type"][keep],
+        "precip_rate_mmh": np.round(g["precip_rate_mmh"][keep], 3),
+        "precip_rate_15min_mmh": np.round(g["precip_rate_smooth_mmh"][keep], 3),
+        "precip_source": g["precip_source"][keep],
+        "precip_basis": g["precip_basis"][keep],
+        "clear_sky_index": np.round(g["clear_sky_index"][keep], 3),
+        "shaded_frac_15min": np.round(g["shaded_frac"][keep], 3),
+        "cloud_cover_pct_model": g["cloud_cover_pct"][keep],
+        "weather_code_model": g["weather_code"][keep],
+        "sun_elevation_deg": np.round(g["sun_elevation"][keep], 3),
+    })
+    df["sky_label"] = df["sky_state"].map(SKY_LABELS)
+    df["Timestamp"] = pd.to_datetime(df["time_ns"], utc=True).dt.tz_convert(env.tz)
+    df["timestamp"] = (df["time_ns"] // 1_000_000).astype("int64")
+    return df[list(SKY_EXPORT_COLUMNS)].reset_index(drop=True)
 
 
 def read_site_profile(path):

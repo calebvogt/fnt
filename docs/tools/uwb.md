@@ -15,6 +15,7 @@ Interactive GUI for loading, cleaning, and exporting UWB tracking data:
 - **Timezone handling** — convert UTC timestamps to local time
 - **Day/night segmentation** based on a configurable light cycle
 - **Visual preview** of smoothed trajectories per tag
+- **Weather, sunlight and sky** for the site (latitude/longitude you enter or load from a site profile): a weather line, a daylight strip, the moon's phase, and a sky icon (clear, partly cloudy, overcast, fog, light/moderate/heavy rain, snow, thunderstorm) that follows the playhead in the preview and the video. Measured data win: rain comes from the weather station's gauge wherever it has a record and daytime cloud from measured sunlight; the Open-Meteo model fills only gaps and what nothing measures (night cloud, thunder, fog), and is labelled "model". Exported minute by minute to `{db}_sky.csv` with the evidence behind each minute
 - **Export** cleaned data to CSV with standardized column naming
 
 ## Proximity Detection
