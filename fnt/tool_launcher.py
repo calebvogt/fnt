@@ -39,9 +39,6 @@ class ToolSpec:
 TOOL_REGISTRY = {
     spec.key: spec for spec in [
         # --- Behavior / acquisition ---
-        ToolSpec("abma_designer", "fnt.abma.gui.abma_main_pyqt",
-                 "ABMAWindow", "ABMA Designer",
-                 post_show="show_start_dialog"),   # New / Open project chooser
         ToolSpec("rfid_preprocessing", "fnt.rfid.rfid_preprocessing_pyqt",
                  "RFIDPreprocessingWindow", "RFID PreProcessing"),
         # NOTE: the FED Processing tool is deliberately NOT registered here. It
