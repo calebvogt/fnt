@@ -9,6 +9,12 @@ both collapsed to one row.
 Males only, by default. The territory question this answers is about male
 competition for resource zones; including females makes the denominator a
 different quantity and every percentage means something else.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``. The main
+per-day zone-holder table is :func:`fnt.rfid.core.summaries.zone_holders`; this
+ranking survives because the displacement layer's home/away typing reads it.
 """
 
 from __future__ import annotations

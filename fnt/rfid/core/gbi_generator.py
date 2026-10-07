@@ -1,4 +1,4 @@
-"""Stage 3: bouts -> a group-by-individual (GBI) matrix.
+"""Bouts -> a group-by-individual (GBI) matrix.
 
 Within a zone, take every bout start and stop as an endpoint and sort them.
 Consecutive endpoints bound an interval over which the set of animals present
@@ -16,6 +16,10 @@ probe point sits exactly on the boundary. Because intervals are closed at both
 ends, BOTH the departing and the arriving animal count as present. Those rows
 are the clearest hand-off events in the data, so they are worth keeping; the
 duration is reported as ``min_duration_s`` rather than zero.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``.
 """
 
 from __future__ import annotations
@@ -23,7 +27,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..config.defaults import TrialConfig
 
 EPOCH = pd.Timestamp("1970-01-01")
 GBI_META = ["trial", "day", "zone", "field_time_start", "field_time_stop",
@@ -89,7 +92,7 @@ def create_gbi(bouts: pd.DataFrame, animals: list[str] | None = None,
         for start, stop, duration, day, present in _zone_intervals(
                 _seconds(z["field_time"]), _seconds(z["field_time_stop"]),
                 z["noon_day"].to_numpy(), z["name"].to_numpy(), min_duration_s):
-            row = {"trial": trial, "day": day, "zone": int(zone),
+            row = {"trial": trial, "day": day, "zone": zone,
                    "field_time_start": start, "field_time_stop": stop,
                    "duration_s": duration}
             row.update(dict.fromkeys(animals, 0))
@@ -144,10 +147,10 @@ def melt_gbi(gbi: pd.DataFrame, meta: pd.DataFrame | None = None) -> pd.DataFram
 class GBIGenerator:
     """Config-driven wrapper around :func:`create_gbi`."""
 
-    def __init__(self, config: TrialConfig):
-        self.config = config
+    def __init__(self, min_duration_s: float = 1.0):
+        self.min_duration_s = min_duration_s
 
     def run(self, bouts: pd.DataFrame, animals=None, sex_by_name=None,
             progress=None) -> pd.DataFrame:
         return create_gbi(bouts, animals, sex_by_name,
-                          self.config.min_duration_s, progress)
+                          self.min_duration_s, progress)

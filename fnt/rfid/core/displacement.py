@@ -12,6 +12,10 @@ counts as an upper bound on displacements, not a scored behaviour.
 Zone ownership supplies home/away, which is what makes the events interpretable
 - a resident repelling an intruder and an intruder evicting a resident are very
 different results with the same shape.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``.
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .gbi_generator import GBI_META
 from .zone_ownership import zones_owned_per_day
 
 DISPLACE_SCHEMA = [
@@ -65,7 +68,7 @@ def detect_displacements(gbi: pd.DataFrame, males: list[str],
                 continue
             rows.append({
                 "trial": trial, "day": int(gbi["day"].to_numpy()[during]),
-                "zone": int(z),
+                "zone": z,
                 "field_time_start": gbi["field_time_start"].to_numpy()[during],
                 "field_time_stop": gbi["field_time_stop"].to_numpy()[during],
                 "duration_s": float(gbi["duration_s"].to_numpy()[during]),

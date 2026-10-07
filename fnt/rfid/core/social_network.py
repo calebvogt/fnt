@@ -20,6 +20,10 @@ names are corrected here:
   it as "avg. # of edges between any two nodes". It is the WEIGHTED
   shortest-path length; with SRI weights it lands near 0.02, and an edge count
   can never be below 1.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``.
 """
 
 from __future__ import annotations

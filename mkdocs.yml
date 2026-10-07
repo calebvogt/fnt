@@ -47,6 +47,7 @@ nav:
       - Video Processing: tools/video-processing.md
       - Video Tracking: tools/video-tracking.md
       - UWB Tracking: tools/uwb.md
+      - RFID Tracking: tools/rfid.md
       - Imaging: tools/imaging.md
   - MAD Detector:
       - Overview: mad/overview.md

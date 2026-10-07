@@ -578,7 +578,7 @@ class FNTMainWindow(QMainWindow):
 
         buttons = [
             ("RFID Preprocessing Tool",
-             "Universal RFID preprocessing: raw data → movement bouts → GBI → social networks",
+             "Biomark downloads → cleaned reads, bouts, zone holders and co-occupancy, with QC reports",
              self.run_rfid_preprocessing),
         ]
 

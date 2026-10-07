@@ -22,6 +22,9 @@ FNT bundles a suite of GUI tools spanning the common data modalities in field an
 - :material-map-marker-distance: **[UWB Tracking](tools/uwb.md)**
   Ultra-wideband positional data preprocessing and proximity analysis.
 
+- :material-antenna: **[RFID Tracking](tools/rfid.md)**
+  Biomark reader downloads to cleaned reads, bouts, zone holders and co-occupancy, with QC reports.
+
 - :material-microscope: **[Imaging](tools/imaging.md)**
   Zeiss CZI microscopy viewing, processing, and cell quantification.
 
