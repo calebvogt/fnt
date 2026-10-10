@@ -5,7 +5,7 @@ be scripted into batch and HPC workflows without the GUI. Installed as the
 ``mad`` console script (see ``pyproject.toml``)::
 
     mad analyze    --model weights.pt --input recordings/
-    mad train      --project my_project/ --epochs 30
+    mad train      --project my_project/ --split-mode file
     mad embeddings --model weights.pt --input recordings/ --out emb.npz
 
 Heavy deps (torch, segmentation-models-pytorch) are imported lazily by the
@@ -140,10 +140,54 @@ def _apply_sampling(wavs, args) -> list:
 # ----------------------------------------------------------------------
 # analyze
 # ----------------------------------------------------------------------
+def _group_harmonics_for(wav_path: str) -> None:
+    """Group one recording's detections into calls, as the GUI does after
+    each file of a run. A failure is reported and never fails the file: the
+    detections are already written and correct."""
+    from .fnt_mask_store import masks_sibling_path
+    from .mad_harmonics import group_recording
+    try:
+        store = masks_sibling_path(wav_path)
+        if os.path.isfile(store):
+            group_recording(store, os.path.basename(wav_path))
+    except Exception as e:
+        print(f"  harmonic grouping failed for "
+              f"{os.path.basename(wav_path)}: {e}", file=sys.stderr, flush=True)
+
+
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from .mad_inference import MADInferenceConfig, run_inference_on_files
 
-    wavs = _expand_inputs(args.input)
+    if os.path.isdir(args.model):
+        args.model = os.path.join(args.model, 'weights.pt')
+    wavs = _expand_inputs(args.input) if args.input else []
+    if args.project:
+        from .mad_project import MADProjectConfig
+        try:
+            proj = MADProjectConfig.load(args.project)
+        except Exception as e:
+            print(f"Could not open project {args.project}: {e}",
+                  file=sys.stderr, flush=True)
+            return 2
+        seen = {os.path.normcase(os.path.abspath(w)) for w in wavs}
+        missing = 0
+        for e in proj.audio_entries():
+            key = os.path.normcase(os.path.abspath(e.path))
+            if key in seen:
+                continue
+            if not e.exists():
+                missing += 1      # a moved recording is soft; say so, go on
+                continue
+            seen.add(key)
+            wavs.append(e.path)
+        if missing:
+            print(f"  {missing} registered recording(s) not found on disk "
+                  "— skipped.", file=sys.stderr, flush=True)
+        # What a GUI run on this project would use, unless told otherwise.
+        if not args.log_root and not args.run_dir:
+            args.log_root = proj.project_dir
+        if not args.training_data_dir:
+            args.training_data_dir = proj.training_data_dir
     if not wavs:
         print("No .wav files found in the given input(s).", file=sys.stderr, flush=True)
         return 2
@@ -212,6 +256,11 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     print(f"  Run log: {run_dir}", flush=True)
 
     def _on_done(summary: dict):
+        # Grouped before the manifest records the file, so a run killed in
+        # between redoes the file rather than leaving it ungrouped and marked
+        # done.
+        if 'error' not in summary and args.group_harmonics:
+            _group_harmonics_for(summary.get('wav_path', ''))
         # Flushed per file, so a killed run resumes from exactly here.
         try:
             manifest.record(summary)
@@ -241,6 +290,123 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 # train
 # ----------------------------------------------------------------------
+def add_training_args(p: argparse.ArgumentParser) -> None:
+    """Every training setting, shared by ``mad train`` and the GUI's
+    ``--train`` launch so the two cannot drift apart.
+
+    Defaults match the GUI's training panel, so "train a new model" means the
+    same thing whichever way it is started. A flag left at its default is
+    reported by :func:`training_overrides` as *not given*, which is how a GUI
+    launch knows to keep the value already in its panel.
+    """
+    g = p.add_argument_group('training')
+    g.add_argument('--epochs', type=int, default=1000,
+                   help="Maximum epochs (default: 1000; early stopping ends "
+                        "the run well before).")
+    g.add_argument('--patience', type=int, default=40,
+                   help="Early-stop patience in epochs (default: 40; 0 "
+                        "disables).")
+    g.add_argument('--batch-size', type=int, default=16)
+    g.add_argument('--lr', type=float, default=1e-3,
+                   help="Starting learning rate (default: 1e-3).")
+    g.add_argument('--lr-schedule', default='plateau',
+                   choices=['plateau', 'none'],
+                   help="'plateau' halves the rate when val loss stalls "
+                        "(default); 'none' keeps it fixed.")
+    g.add_argument('--lr-patience', type=int, default=8,
+                   help="Epochs without improvement before the rate is "
+                        "halved (default: 8).")
+    g.add_argument('--arch', default='',
+                   help="unet | unetpp | manet | hrnet (default: project's).")
+    g.add_argument('--encoder', default='resnet18')
+    g.add_argument('--device', default='auto',
+                   choices=['auto', 'cuda', 'mps', 'cpu'])
+    g.add_argument('--loss', default='bce_dice',
+                   choices=['bce_dice', 'focal_tversky'],
+                   help="Segmentation loss (default: bce_dice).")
+    g.add_argument('--split-mode', default='call',
+                   choices=['call', 'auto', 'file'],
+                   help="How validation is held out: 'call' (default) holds "
+                        "out individual calls, so validation shares "
+                        "recordings with training and reads optimistic; "
+                        "'file' holds out whole recordings -- the honest "
+                        "measure of a recording the model has never seen.")
+    g.add_argument('--split-seed', type=int, default=42,
+                   help="Seed for the train/validation split (default: 42).")
+    g.add_argument('--val-fraction', type=float, default=None,
+                   help="Override the project's validation fraction.")
+    g.add_argument('--no-augment', dest='augment', action='store_false',
+                   help="Turn off all training augmentation.")
+    g.add_argument('--no-faint-aug', dest='faint_aug', action='store_false',
+                   help="Turn off faint-call (distance) augmentation.")
+    g.add_argument('--faint-p', type=float, default=0.3,
+                   help="Fraction of training tiles made fainter "
+                        "(default: 0.3).")
+    g.add_argument('--faint-db', type=float, nargs=2, default=(3.0, 18.0),
+                   metavar=('MIN', 'MAX'),
+                   help="Attenuation range in dB (default: 3 18).")
+    g.add_argument('--max-per-recording', type=int, default=150,
+                   help="Cap on examples drawn from any one recording, "
+                        "labels and negatives counted separately (default: "
+                        "150; 0 = no cap).")
+    g.add_argument('--tile-placements', type=int, default=3,
+                   help="Times each call is placed into a training tile "
+                        "(default: 3).")
+    g.add_argument('--run-name', default='',
+                   help="Name for the model run dir (default: timestamped).")
+
+
+#: argparse dest -> UNetTrainingConfig field, for every training flag.
+_TRAIN_FIELD = {
+    'epochs': 'n_epochs', 'patience': 'early_stop_patience',
+    'batch_size': 'batch_size', 'lr': 'learning_rate',
+    'lr_schedule': 'lr_schedule', 'lr_patience': 'lr_plateau_patience',
+    'arch': 'model_arch', 'encoder': 'encoder_name', 'device': 'device',
+    'loss': 'loss', 'split_mode': 'split_mode', 'split_seed': 'split_seed',
+    'val_fraction': 'val_fraction', 'augment': 'augment',
+    'faint_aug': 'augment_faint', 'faint_p': 'faint_p',
+    'faint_db': 'faint_db_range',
+    'max_per_recording': 'max_examples_per_recording',
+    'tile_placements': 'tile_placements', 'run_name': 'run_name',
+}
+
+
+def suppress_training_defaults(p: argparse.ArgumentParser) -> None:
+    """Make every training flag absent from the namespace unless given.
+
+    For the GUI launch, which applies only what was asked for on top of its
+    own panel. Comparing against the defaults instead would silently drop an
+    explicit ``--split-mode call`` whenever the panel happened to say 'file'.
+    """
+    # On the actions themselves: set_defaults() would also seed the namespace
+    # with the SUPPRESS sentinel string, which argparse then tries to convert
+    # with each flag's type.
+    for action in p._actions:
+        if action.dest in _TRAIN_FIELD:
+            action.default = argparse.SUPPRESS
+
+
+def training_overrides(args: argparse.Namespace) -> dict:
+    """``UNetTrainingConfig`` keyword arguments from parsed training flags.
+
+    Only flags present on ``args`` are returned, so a parser built with
+    :func:`suppress_training_defaults` yields just what was given.
+    """
+    out = {}
+    for dest, field_name in _TRAIN_FIELD.items():
+        if not hasattr(args, dest):
+            continue
+        val = getattr(args, dest)
+        if dest == 'arch' and not val:
+            continue
+        if dest == 'val_fraction' and val is None:
+            continue
+        if dest == 'faint_db':
+            val = (float(val[0]), float(val[1]))
+        out[field_name] = val
+    return out
+
+
 def _cmd_train(args: argparse.Namespace) -> int:
     from .mad_project import MADProjectConfig
     from .mad_training import UNetTrainingConfig, train_unet
@@ -267,23 +433,16 @@ def _cmd_train(args: argparse.Namespace) -> int:
     print(f"Training store rebuilt from {len(wavs)} recording(s): "
           f"{n_lab} example(s)", flush=True)
 
+    kw = training_overrides(args)
+    kw.setdefault('model_arch', proj.model_arch or "unet")
+    kw.setdefault('val_fraction', proj.val_fraction)
     cfg = UNetTrainingConfig(
         project_dir=proj.project_dir,
-        run_name=args.run_name or "",
-        model_arch=args.arch or proj.model_arch or "unet",
-        encoder_name=args.encoder,
-        n_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        device=args.device,
-        val_fraction=(args.val_fraction if args.val_fraction is not None
-                      else proj.val_fraction),
-        loss=args.loss,
-        split_mode=args.split_mode,
-        early_stop_patience=args.patience,
         nperseg=proj.nperseg, noverlap=proj.noverlap, nfft=proj.nfft,
         db_min=proj.db_min, db_max=proj.db_max,
+        db_norm=getattr(proj, 'db_norm', 'fixed') or 'fixed',
         training_data_dir=proj.training_data_dir,
+        **kw,
     )
 
     def _progress(epoch: int, n_epochs: int, info: dict):
@@ -314,13 +473,29 @@ def _cmd_train(args: argparse.Namespace) -> int:
                 msg += f"  train_loss={tl:.4f}"
             if vl is not None:
                 msg += f"  val_loss={vl:.4f}"
+            vd = info.get('val_dice')
+            if vd is not None:
+                msg += f"  val_dice={vd:.3f}"
+            lr = info.get('lr')
+            if lr is not None:
+                msg += f"  lr={lr:.1e}"
             print(msg, flush=True)
+        elif status == 'capped':
+            for rec, kinds in sorted((info.get('capped') or {}).items()):
+                parts = ", ".join(f"{k} {kept}/{tot}"
+                                  for k, (kept, tot) in sorted(kinds.items()))
+                print(f"  capped {rec}: {parts}", flush=True)
         elif status == 'early_stop':
             print(f"  early stop at epoch {epoch}", flush=True)
         # 'batch' / 'epoch_preview' / 'done' are intentionally not printed.
 
     print(f"Training {cfg.model_arch} on project '{proj.project_name}' "
-          f"({cfg.n_epochs} epochs, encoder={cfg.encoder_name})", flush=True)
+          f"(max {cfg.n_epochs} epochs, patience {cfg.early_stop_patience}, "
+          f"encoder={cfg.encoder_name}, split={cfg.split_mode}, "
+          f"lr={cfg.learning_rate:g} {cfg.lr_schedule}, augment="
+          f"{'on' if cfg.augment else 'off'}"
+          f"{'+faint' if cfg.augment and cfg.augment_faint else ''}, "
+          f"cap={cfg.max_examples_per_recording or 'off'})", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:
@@ -369,6 +544,41 @@ def _cmd_embeddings(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 # Parser
 # ----------------------------------------------------------------------
+def _cmd_audit_draw(args: argparse.Namespace) -> int:
+    from .mad_audit import draw_audit
+    try:
+        rows = draw_audit(
+            args.source, args.out, per_trial_active=args.active,
+            per_trial_random=args.random, window_s=args.window_s,
+            seed=args.seed, exclude_projects=args.exclude_project,
+            condition_keywords=args.condition, edge_hours=args.edge_hours,
+            progress=lambda m: print(m, flush=True))
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
+    print(f"Done — {len(rows)} clip(s) in {args.out}. Open it in MAD, label "
+          "every call, and mark each clip review complete.", flush=True)
+    return 0
+
+
+def _cmd_audit_score(args: argparse.Namespace) -> int:
+    from .mad_audit import format_table, score_audit
+    res = score_audit(
+        args.audit, args.model, thresholds=args.thresholds,
+        min_blob_pixels=args.min_blob_pixels, merge=args.merge,
+        merge_gap_s=args.merge_gap_s, iou_min=args.iou, device=args.device,
+        progress=lambda m: print(m, flush=True))
+    if not res['n_scored']:
+        print(f"No clip is marked review complete yet "
+              f"({res['n_incomplete']} waiting).", flush=True)
+        return 1
+    print(format_table(res, args.show_threshold), flush=True)
+    if res['n_incomplete']:
+        print(f"({res['n_incomplete']} clip(s) not yet review complete were "
+              "skipped.)", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='mad',
@@ -378,9 +588,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # analyze
     pa = sub.add_parser('analyze', help="Run a trained model over wav files.")
-    pa.add_argument('--model', required=True, help="Path to weights.pt.")
-    pa.add_argument('--input', required=True, nargs='+',
+    pa.add_argument('--model', required=True,
+                    help="Path to weights.pt, or the model run folder.")
+    pa.add_argument('--input', nargs='+', default=[],
                     help="Wav files and/or folders to analyze.")
+    pa.add_argument('--project', default='',
+                    help="Analyze every recording registered in this MAD "
+                         "project (with or instead of --input). Also sets the "
+                         "defaults the GUI would use: runs log to the "
+                         "project's batch_runs, and its labels are shielded.")
+    pa.add_argument('--no-group-harmonics', dest='group_harmonics',
+                    action='store_false', default=True,
+                    help="Skip grouping each recording's harmonics into calls "
+                         "after its detections are written (on by default, "
+                         "matching the GUI).")
     pa.add_argument('--threshold', type=float, default=0.5,
                     help="Probability threshold (default 0.5).")
     pa.add_argument('--min-blob-pixels', type=int, default=8,
@@ -426,26 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
     # train
     pt = sub.add_parser('train', help="Train a model from a MAD project.")
     pt.add_argument('--project', required=True, help="MAD project directory.")
-    pt.add_argument('--epochs', type=int, default=30)
-    pt.add_argument('--arch', default='',
-                    help="unet | unetpp | manet | hrnet (default: project's).")
-    pt.add_argument('--encoder', default='resnet18')
-    pt.add_argument('--batch-size', type=int, default=8)
-    pt.add_argument('--lr', type=float, default=1e-3)
-    pt.add_argument('--device', default='auto',
-                    choices=['auto', 'cuda', 'mps', 'cpu'])
-    pt.add_argument('--loss', default='bce_dice',
-                    choices=['bce_dice', 'focal_tversky'],
-                    help="Segmentation loss (default: bce_dice).")
-    pt.add_argument('--split-mode', default='call',
-                    choices=['call', 'auto', 'file'],
-                    help="How validation is held out (default: call).")
-    pt.add_argument('--val-fraction', type=float, default=None,
-                    help="Override the project's validation fraction.")
-    pt.add_argument('--patience', type=int, default=10,
-                    help="Early-stop patience in epochs (0 disables).")
-    pt.add_argument('--run-name', default='',
-                    help="Name for the model run dir (default: timestamped).")
+    add_training_args(pt)
     pt.set_defaults(func=_cmd_train)
 
     # embeddings
@@ -459,6 +661,49 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument('--device', default='auto',
                     choices=['auto', 'cuda', 'mps', 'cpu'])
     pe.set_defaults(func=_cmd_embeddings)
+
+    # audit
+    pd = sub.add_parser(
+        'audit-draw',
+        help="Cut a held-out audit set of clips into a new MAD project.")
+    pd.add_argument('--out', required=True,
+                    help="New folder for the audit project.")
+    pd.add_argument('--source', required=True, nargs='+',
+                    help="Trial folders to draw from (one folder per trial).")
+    pd.add_argument('--exclude-project', nargs='*', default=[],
+                    help="Training project(s) whose recordings must never be "
+                         "drawn.")
+    pd.add_argument('--active', type=int, default=6,
+                    help="Activity-screened clips per trial (default: 6).")
+    pd.add_argument('--random', type=int, default=4,
+                    help="Uniformly random clips per trial (default: 4).")
+    pd.add_argument('--window-s', type=float, default=60.0)
+    pd.add_argument('--edge-hours', type=float, default=2.0,
+                    help="Skip this much at each trial's start and end "
+                         "(setup/teardown; default: 2).")
+    pd.add_argument('--condition', nargs='+', default=['mmz', 'saline'],
+                    help="Keywords that name a condition in the folder name.")
+    pd.add_argument('--seed', type=int, default=20261009)
+    pd.set_defaults(func=_cmd_audit_draw)
+
+    ps = sub.add_parser('audit-score',
+                        help="Score a model on an audit set's completed clips.")
+    ps.add_argument('--audit', required=True, help="Audit project folder.")
+    ps.add_argument('--model', required=True,
+                    help="weights.pt, or the model run folder.")
+    ps.add_argument('--thresholds', type=float, nargs='+',
+                    default=[0.3, 0.4, 0.5, 0.6, 0.7])
+    ps.add_argument('--min-blob-pixels', type=int, default=50)
+    ps.add_argument('--no-merge', dest='merge', action='store_false')
+    ps.add_argument('--merge-gap-s', type=float, default=0.01)
+    ps.add_argument('--iou', type=float, default=0.3,
+                    help="Box IoU for a detection to count as the call "
+                         "(default: 0.3).")
+    ps.add_argument('--device', default='auto',
+                    choices=['auto', 'cuda', 'mps', 'cpu'])
+    ps.add_argument('--show-threshold', type=float, default=None,
+                    help="Threshold to print (default: best overall F1).")
+    ps.set_defaults(func=_cmd_audit_score)
 
     return p
 

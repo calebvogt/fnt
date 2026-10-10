@@ -27,6 +27,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
+def _model_label(model_path) -> str:
+    """Run-folder name for a checkpoint; see mad_inference.model_label.
+    Imported lazily: mad_inference pulls in the model stack."""
+    from .mad_inference import model_label
+    return model_label(model_path)
+
+
 @dataclass
 class Box:
     """A call as a (time, frequency) rectangle, plus its score."""
@@ -518,7 +525,7 @@ def evaluate_wavs(
         n_unreviewed=n_unreviewed_total,
         n_files=n_scored,
         files=files_out,
-        model_name=Path(cfg.model_path).stem if cfg.model_path else "",
+        model_name=_model_label(cfg.model_path),
         iou_min=iou_min,
     )
 
@@ -722,7 +729,7 @@ def evaluate_labeled_regions(
         scored_s=scored_s,
         total_s=total_s,
         files=files_out,
-        model_name=Path(cfg.model_path).stem if cfg.model_path else "",
+        model_name=_model_label(cfg.model_path),
         iou_min=iou_min,
         scope='reviewed',
     )

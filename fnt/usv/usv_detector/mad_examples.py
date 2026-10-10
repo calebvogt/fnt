@@ -526,6 +526,7 @@ def iter_file_rejected_annotations(
 def reconstruct_file_mask(
     dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
     extra_stores: Optional[Sequence[str]] = None,
+    kinds: Sequence[str] = ("label",),
 ) -> np.ndarray:
     """Rebuild the confirmed-positive mask for one source file.
 
@@ -575,7 +576,10 @@ def reconstruct_file_mask(
         # the overlay, and worse, shielding its pixels from re-detection via
         # inference's preserve_labels. A rejected region is exactly a region
         # the model should be allowed to look at again.
-        if _ms.example_kind(meta) != "label":
+        # ``kinds`` lets inference ask for the rejected set separately: those
+        # are suppressed on a re-run (see mad_inference), but never painted as
+        # labels.
+        if _ms.example_kind(meta) not in kinds:
             continue
         t_off = int(meta.get("patch_t_off") or 0)
         f_off = int(meta.get("patch_f_off") or 0)
@@ -663,6 +667,40 @@ def _place_in_tile(spec: np.ndarray, mask: np.ndarray, tile_h: int,
             _crop_or_pad(w, tile_h, tile_w, 0, 0))
 
 
+def cap_examples_per_recording(examples: List[Dict], cap: int, *,
+                               seed: int = 0,
+                               report: Optional[Dict] = None) -> List[Dict]:
+    """Keep at most ``cap`` examples per (recording, label-or-negative).
+
+    Order is preserved for what is kept, and the choice is seeded, so the same
+    store and seed always train on the same subset.
+    """
+    import os as _os
+    from . import fnt_mask_store as _ms
+    if cap <= 0:
+        return list(examples)
+    buckets: Dict[Tuple[str, str], List[int]] = {}
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        rec = _os.path.basename(str(meta.get("source_wav", "") or ""))
+        kind = ("negative" if _ms.example_kind(meta) in ("negative", "rejected")
+                else "label")
+        buckets.setdefault((rec, kind), []).append(i)
+    # Separate stream from tile placement, so turning the cap on or off does
+    # not also reshuffle where every kept call lands in its tile.
+    rng = np.random.default_rng(int(seed) + 7919)
+    keep = set()
+    for (rec, kind), idx in sorted(buckets.items()):
+        if len(idx) <= cap:
+            keep.update(idx)
+            continue
+        chosen = rng.choice(len(idx), size=cap, replace=False)
+        keep.update(idx[j] for j in chosen)
+        if report is not None:
+            report.setdefault(rec or "?", {})[kind] = (cap, len(idx))
+    return [ex for i, ex in enumerate(examples) if i in keep]
+
+
 def collect_training_examples(
     dataset_dir: str,
     tile_time_frames: int = TILE_TIME_FRAMES,
@@ -671,8 +709,17 @@ def collect_training_examples(
     return_groups: bool = False,
     placements: int = 3,
     seed: int = 0,
+    max_per_recording: int = 0,
+    cap_report: Optional[Dict] = None,
 ):
     """Assemble ``(specs, targets, weights)`` stacks from saved examples.
+
+    ``max_per_recording`` (0 = off) keeps at most that many examples from any
+    one recording, labels and hard negatives counted separately, chosen at
+    random under ``seed``. Pass a dict as ``cap_report`` to have it filled with
+    ``{recording: {'label': (kept, total), ...}}`` for each recording the cap
+    actually trimmed. See ``UNetTrainingConfig.max_examples_per_recording``
+    for why whole examples, and never pixels, are what gets dropped.
 
     Each example patch is sliced into one or more tiles of shape
     ``(tile_freq_bins, tile_time_frames)``. The whole patch is supervised, so
@@ -701,6 +748,9 @@ def collect_training_examples(
     """
     from . import fnt_mask_store as _ms
     examples = list(iter_examples(dataset_dir))
+    if max_per_recording and max_per_recording > 0:
+        examples = cap_examples_per_recording(
+            examples, int(max_per_recording), seed=seed, report=cap_report)
     specs: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []

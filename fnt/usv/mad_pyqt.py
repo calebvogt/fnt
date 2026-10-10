@@ -2151,10 +2151,17 @@ def _train_config_report(cfg, n_examples: int) -> List[str]:
         f"  examples      : {n_examples} accepted label(s)",
         f"  model         : arch={g('model_arch')}  encoder={g('encoder_name')}",
         f"  optimisation  : epochs={g('n_epochs')}  batch={g('batch_size')}  "
-        f"lr={g('learning_rate')}",
+        f"lr={g('learning_rate')}  schedule={g('lr_schedule', 'none')}"
+        + (f" (patience {g('lr_plateau_patience')}, x{g('lr_plateau_factor')})"
+           if g('lr_schedule', 'none') == 'plateau' else ""),
         f"  loss          : {loss_desc}",
         f"  augmentation  : {'on' if g('augment') else 'OFF'}  "
-        f"tile_placements={g('tile_placements')}",
+        f"tile_placements={g('tile_placements')}  faint="
+        + (f"on (p={g('faint_p')}, {tuple(g('faint_db_range', ()))} dB, "
+           f"min SNR {g('faint_min_snr_db')} dB)"
+           if g('augment') and g('augment_faint') else "off"),
+        f"  balance       : max {g('max_examples_per_recording') or 'unlimited'}"
+        f" example(s) per recording",
         f"  split         : mode={g('split_mode', 'auto')}  "
         f"val_fraction={g('val_fraction')}  seed={g('split_seed')}",
         f"  early stop    : {early}",
@@ -10774,7 +10781,7 @@ class MADMainWindow(QMainWindow):
     def _build_inline_train_config(self):
         from fnt.usv.usv_detector.mad_training import UNetTrainingConfig
         sp = self._spec_params()
-        return UNetTrainingConfig(
+        kw = dict(
             project_dir=self._project.project_dir,
             model_arch=self.combo_arch.currentData(),
             encoder_name=self.combo_train_encoder.currentText(),
@@ -10793,6 +10800,10 @@ class MADMainWindow(QMainWindow):
             loss=self.combo_train_loss.currentData() or 'bce_dice',
             split_mode=self.combo_train_split.currentData() or 'call',
         )
+        # A launched run's settings without a panel control (or whose control
+        # could not take the value) win over the panel -- see launch_training.
+        kw.update(getattr(self, '_launch_overrides', None) or {})
+        return UNetTrainingConfig(**kw)
 
     def _apply_latest_training_config(self):
         """Pre-fill the training-option widgets from the most recent model's
@@ -10857,6 +10868,95 @@ class MADMainWindow(QMainWindow):
         except Exception as e:
             self._log(f"Could not apply latest training config: {e}")
 
+    #: Training-config fields that have a control in the training panel, and
+    #: how to set it. Overrides for these are written INTO the panel, so a
+    #: launched run shows exactly what it is training with.
+    def _train_panel_setters(self):
+        def _combo_data(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is not None:
+                    i = w.findData(v)
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+                        return True
+                return False
+            return set_
+
+        def _combo_text(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is not None:
+                    i = w.findText(str(v))
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+                        return True
+                return False
+            return set_
+
+        def _value(name, cast):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is None:
+                    return False
+                w.setValue(cast(v))
+                return True
+            return set_
+
+        def _check(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is None:
+                    return False
+                w.setChecked(bool(v))
+                return True
+            return set_
+
+        return {
+            'n_epochs': _value('spin_train_epochs', int),
+            'early_stop_patience': _value('spin_train_patience', int),
+            'batch_size': _value('spin_train_batch', int),
+            'learning_rate': _value('spin_train_lr', float),
+            'val_fraction': _value('spin_train_val', float),
+            'split_mode': _combo_data('combo_train_split'),
+            'loss': _combo_data('combo_train_loss'),
+            'augment': _check('chk_train_augment'),
+            'encoder_name': _combo_text('combo_train_encoder'),
+            'model_arch': _combo_data('combo_arch'),
+        }
+
+    def launch_training(self, overrides=None, infer_after: bool = False):
+        """Start a run as if Run Training were pressed, with ``overrides``
+        (``UNetTrainingConfig`` fields) applied on top of the panel.
+
+        For runs started from outside -- ``mad-gui --project ... --train``, or
+        a run dictated to an assistant -- so the GUI still shows the usual
+        graph and previews. Fields with a control are set in the panel; the
+        rest (LR schedule, faint augmentation, per-recording cap, ...) apply to
+        this run only.
+
+        Post-training inference runs only with ``infer_after``. A dictated
+        "train a new model" must not quietly re-detect every recording in the
+        project, and the overwrite confirmation it would otherwise raise would
+        sit unanswered on an unattended machine -- passing the flag IS the
+        confirmation.
+        """
+        overrides = dict(overrides or {})
+        setters = self._train_panel_setters()
+        extra = {}
+        for k, v in overrides.items():
+            fn = setters.get(k)
+            if fn is None or not fn(v):
+                extra[k] = v
+        self._launch_overrides = extra
+        self._launch_infer = 'yes' if infer_after else 'no'
+        try:
+            self._on_train_clicked()
+        finally:
+            # One run only: a later press of Run Training uses the panel.
+            self._launch_overrides = {}
+            self._launch_infer = None
+
     def _on_inline_train(self):
         # Already training? The Train button doubles as "re-show the graph".
         if self._training_active:
@@ -10889,8 +10989,13 @@ class MADMainWindow(QMainWindow):
         # Inference" path / active-learning loop). With no target ticked this is
         # "Run Training" — training only. Confirm the overwrite up front so the
         # run proceeds unattended; declining just skips the auto-inference.
-        infer_wavs = self._post_training_targets()
-        if infer_wavs and not self._confirm_overwrite_predictions(infer_wavs):
+        launch = getattr(self, '_launch_infer', None)
+        infer_wavs = [] if launch == 'no' else self._post_training_targets()
+        if launch == 'no':
+            self._log("Post-training inference off for this launched run "
+                      "(start with --infer-after to run it)")
+        elif (infer_wavs and launch != 'yes'
+              and not self._confirm_overwrite_predictions(infer_wavs)):
             infer_wavs = []
             self._log("Post-training inference skipped (declined overwrite)")
         self._post_train_infer_wavs = infer_wavs
@@ -15224,8 +15329,16 @@ class MADMainWindow(QMainWindow):
             # through the event loop lets the overlay paint, keeps the window
             # answering the OS, and lets a second file click supersede this one
             # mid-way instead of queueing behind it.
-            prev_window = (self.spectrogram.view_end
-                           - self.spectrogram.view_start)
+            # Keep the width the user is looking at -- but only when there IS
+            # one. With nothing loaded (straight after opening a project, or
+            # after a failed open) the spectrogram's view is a 10 s
+            # placeholder, and keeping that showed ten seconds under a Window
+            # control reading 2 s, on every file after it as well. The
+            # control is the user's setting, so it decides then.
+            sg0 = self.spectrogram
+            prev_window = ((sg0.view_end - sg0.view_start)
+                           if sg0.total_duration > 0
+                           else self.spin_view_window.value())
 
             def stage_spectrogram():
                 if token != self._audio_token:
@@ -18018,6 +18131,16 @@ class MADMainWindow(QMainWindow):
                 progress.set_main(metrics.get('file_i', 0),
                                   max(1, metrics.get('file_n', 1)))
                 progress.set_sub(0, 1)
+            elif status == 'capped':
+                # Said out loud: the run trains on fewer examples than the
+                # label count in its name, and the log should say whose.
+                for rec, kinds in sorted((metrics.get('capped') or {}).items()):
+                    parts = ", ".join(
+                        f"{k} {kept}/{tot}"
+                        for k, (kept, tot) in sorted(kinds.items()))
+                    line = f"Per-recording cap: {rec} — kept {parts}"
+                    progress.append(line)
+                    self._log(line)
             elif status == 'split':
                 for line in (_split_report(metrics)
                              + _balance_report(metrics)):
@@ -18035,12 +18158,16 @@ class MADMainWindow(QMainWindow):
                 pstr = (f" (no-improve {metrics.get('epochs_without_improvement', 0)}"
                         f"/{metrics.get('patience', 0)})"
                         if metrics.get('patience', 0) else "")
+                # The rate moves now (plateau schedule), and a drop is the
+                # usual reason the curves change slope -- so show it.
+                lr = metrics.get('lr')
+                lrstr = f"  lr={lr:.1e}" if lr is not None else ""
                 progress.set_stage(
                     f"Epoch {epoch}/{total} — "
                     f"train_loss={metrics.get('train_loss', 0):.4f}  "
                     f"val_loss={metrics.get('val_loss', 0):.4f}  "
                     f"val_dice={metrics.get('val_dice', 0):.3f}"
-                    f"{pstr}"
+                    f"{lrstr}{pstr}"
                 )
                 progress.set_main(epoch, total)
                 progress.append(
@@ -19324,11 +19451,60 @@ class MADMainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main():
-    app = QApplication.instance() or QApplication(sys.argv)
+def _launch_parser():
+    """``python -m fnt.usv.mad_pyqt [--project DIR] [--train [training flags]]``
+
+    Opens MAD on a project and, with ``--train``, starts a training run exactly
+    as the Run Training button would, graph and previews included. The
+    training flags are the same set as ``mad train`` (one definition, in
+    ``cli.add_training_args``); only the ones actually given override the
+    panel.
+    """
+    import argparse
+    from fnt.usv.usv_detector.cli import (
+        add_training_args, suppress_training_defaults)
+    p = argparse.ArgumentParser(
+        prog="mad-gui", description="Mask Audio Detector (GUI).")
+    p.add_argument("--project", default="",
+                   help="Open this MAD project on start.")
+    p.add_argument("--train", action="store_true",
+                   help="Start a training run once the project is open.")
+    p.add_argument("--infer-after", action="store_true",
+                   help="With --train: run the panel's post-training "
+                        "inference when training finishes (off by default "
+                        "for launched runs).")
+    add_training_args(p)
+    suppress_training_defaults(p)
+    return p
+
+
+def main(argv=None):
+    parser = _launch_parser()
+    # parse_known_args: Qt has command-line options of its own.
+    args, qt_args = parser.parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    if args.train and not args.project:
+        parser.error("--train needs --project")
+    app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
     win.show()
+    if args.project:
+        from fnt.usv.usv_detector.cli import training_overrides
+        overrides = training_overrides(args)
+
+        def _start():
+            path = args.project
+            if os.path.isdir(path):
+                path = os.path.join(path, PROJECT_INFO_FILENAME)
+            win._open_project_from_path(path)
+            if args.train and win._project is not None:
+                # After the project's own startup work (file list, the
+                # pre-fill from the last run's settings), so the overrides
+                # land on top of it rather than being overwritten by it.
+                QTimer.singleShot(500, lambda: win.launch_training(
+                    overrides, infer_after=args.infer_after))
+        QTimer.singleShot(0, _start)
     if QApplication.instance() is app:
         sys.exit(app.exec_())
 

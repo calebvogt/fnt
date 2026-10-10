@@ -125,6 +125,57 @@ def _resolve_device(pref: str) -> str:
 # ----------------------------------------------------------------------
 # Model loading
 # ----------------------------------------------------------------------
+#: File stems that name a checkpoint's role, not the model. Every training run
+#: saves ``weights.pt``, so a stem from this set says nothing about which run.
+_GENERIC_CHECKPOINT_STEMS = frozenset(
+    {"weights", "best", "model", "checkpoint", "last"})
+
+
+def model_label(model_path) -> str:
+    """The name to record against anything ``model_path`` produced.
+
+    The run folder (``20261006_134117_unet_n=1012``) when the file itself has a
+    generic name, which every MAD run's does; otherwise the file's own stem.
+    Every stored detection used to say ``weights``, so a recording holding
+    reviewed detections from an older run beside fresh ones from a newer run
+    could not say which were which.
+    """
+    if not model_path:
+        return ""
+    p = Path(str(model_path))
+    if p.stem.lower() in _GENERIC_CHECKPOINT_STEMS and p.parent.name:
+        return p.parent.name
+    return p.stem
+
+
+def stored_decision_ids(wav_path: str) -> List[int]:
+    """Integer blob ids that any stored example for ``wav_path`` refers to.
+
+    Those are the prediction ids an accept or a reject was made on. A new run
+    must number its detections above all of them, or a fresh detection takes
+    over an old decision's id. String ids (hand labels, prefixed ids) cannot
+    collide with a run's integer ids and are skipped.
+    """
+    from .fnt_mask_store import store_paths_for, td_iter_meta
+    out: List[int] = []
+    name = Path(wav_path).name
+    for store in store_paths_for(wav_path):
+        if not Path(store).is_file():
+            continue
+        try:
+            for meta in td_iter_meta(store):
+                if Path(str(meta.get('source_wav', ''))).name != name:
+                    continue
+                b = meta.get('blob_id')
+                if isinstance(b, (int, np.integer)):
+                    out.append(int(b))
+                elif isinstance(b, str) and b.strip().isdigit():
+                    out.append(int(b.strip()))
+        except Exception:
+            continue
+    return out
+
+
 def load_model(model_path: str, device: str = "auto"):
     """Load a U-Net checkpoint saved by :func:`train_unet`.
 
@@ -1640,6 +1691,32 @@ def run_inference_on_file(
             # Don't let a label-store hiccup block inference.
             pass
 
+    # Rejected calls stay rejected. This used to come from the CSV's
+    # 'rejected' rows (reviewed_rows above), and silently stopped when the CSV
+    # became an export only: every re-run re-proposed calls the reviewer had
+    # already turned down -- 66 detections sitting on rejected calls across the
+    # anosmia sidecars, and 19 rejections duplicating an earlier one, each a
+    # second hard negative for the same call. The store's rejected examples
+    # keep the exact traced mask, so suppress those, tight to the call.
+    #
+    # Not the label shield above: a rejected region is never painted as a
+    # confirmed call. "Re-detect from scratch" (preserve_labels off) skips it
+    # like it skips everything else.
+    if cfg.preserve_labels:
+        try:
+            from .mad_examples import reconstruct_file_mask
+            from .fnt_mask_store import REJECTED_KINDS, store_paths_for
+            sidecars = [p for p in store_paths_for(wav_path)
+                        if Path(p).is_file()]
+            if sidecars:
+                rej_mask = reconstruct_file_mask(
+                    "", Path(wav_path).name, prob.shape,
+                    extra_stores=sidecars, kinds=REJECTED_KINDS)
+                if rej_mask.any():
+                    prob[_dilate_mask(rej_mask > 0, LABEL_SHIELD_PAD)] = 0.0
+        except Exception:
+            pass
+
     if progress:
         progress('blobs', 0, 1)
     _t_blob0 = _time.perf_counter()
@@ -1659,14 +1736,22 @@ def run_inference_on_file(
             concurrent_fraction=cfg.merge_concurrent_fraction)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
-    # Re-key the fresh predictions so their int blob_ids never collide with the
-    # reviewed predictions we're keeping (whose ids came from an earlier run).
+    # Re-key the fresh predictions so their int blob_ids never collide with an
+    # id a stored decision already points at. Taking the floor from the CSV's
+    # reviewed rows alone stopped working when the CSV became an export: with
+    # no CSV every run numbered from 0, and a new detection inherited the id of
+    # an old, unrelated accept or reject. Review then hid it as "already
+    # loaded" (confirmed_ids) and the store counted it as decided -- 456
+    # detections across 52 anosmia recordings, 404 of them behind an accepted
+    # label. The store's examples are the record of every decision, so they
+    # set the floor.
     kept_int_ids = [r['blob_id'] for r in reviewed_rows]
+    kept_int_ids += stored_decision_ids(wav_path)
     id_offset = (max(kept_int_ids) + 1) if kept_int_ids else 0
     for i, r in enumerate(rows):
         r['blob_id'] = id_offset + i
     # Provenance: which model + settings produced these predictions.
-    model_name = Path(cfg.model_path).stem if cfg.model_path else ''
+    model_name = model_label(cfg.model_path)
     for r in rows:
         r['model_name'] = model_name
         r['threshold'] = cfg.threshold
@@ -1725,7 +1810,7 @@ def run_inference_on_file(
         set_infer_run_attrs(
             h5_path,
             last_infer_at=datetime.now().isoformat(timespec='seconds'),
-            last_infer_model=str(Path(cfg.model_path).parent.name),
+            last_infer_model=model_label(cfg.model_path),
             last_infer_threshold=float(cfg.threshold),
             last_infer_min_blob=int(cfg.min_blob_pixels),
             last_infer_merge=1.0 if cfg.merge_consecutive else 0.0,

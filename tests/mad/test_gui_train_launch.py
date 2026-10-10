@@ -1,0 +1,143 @@
+"""A training run started from outside the GUI, shown in the GUI.
+
+``python -m fnt.usv.mad_pyqt --project P --train --split-mode file`` (or an
+assistant asked to "train a new model") must:
+
+* put every setting that has a control into the panel, so the window shows
+  what the run trains with;
+* carry the settings without a control (LR schedule, faint augmentation,
+  per-recording cap) into this run's config;
+* NOT run post-training inference unless asked -- a dictated "train a new
+  model" must not re-detect every recording in the project, and the overwrite
+  confirmation it would raise would sit unanswered on an unattended machine;
+* leave the next press of Run Training using the panel alone.
+
+Runs under pytest, or directly.
+"""
+import os
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest  # noqa: E402
+from PyQt5.QtWidgets import QApplication  # noqa: E402
+
+import fnt.usv.mad_pyqt as M  # noqa: E402
+from fnt.usv.usv_detector.mad_project import (  # noqa: E402
+    MADProjectConfig, create_mad_project)
+
+_GUI = None
+
+
+def gui():
+    global _GUI
+    if _GUI is None:
+        root = tempfile.mkdtemp(prefix="mad_launch_")
+        proj = os.path.join(root, "p")
+        create_mad_project(proj)
+        app = QApplication.instance() or QApplication([])
+        M.MADMainWindow._apply_dark_theme()
+        w = M.MADMainWindow()
+        w._activate_project(MADProjectConfig.load(proj))
+        for _ in range(20):
+            app.processEvents()
+        _GUI = (w, app)
+    return _GUI[0]
+
+
+class Captured:
+    def __init__(self):
+        self.cfg = None
+        self.post = None
+        self.confirm_asked = False
+
+
+@pytest.fixture
+def win(monkeypatch):
+    """The window with every expensive or blocking step of a run stubbed, so
+    _on_inline_train runs for real up to the hand-off to the worker."""
+    import fnt.usv.usv_detector.mad_examples as ex
+    w = gui()
+    cap = Captured()
+    monkeypatch.setattr(w, "_consolidate_sibling_examples", lambda: True)
+    monkeypatch.setattr(ex, "count_examples", lambda *a, **k: 5)
+    monkeypatch.setattr(w, "_show_gpu_setup_dialog", lambda **k: None)
+    monkeypatch.setattr(w, "_post_training_targets", lambda: ["x.wav"])
+
+    def confirm(_):
+        cap.confirm_asked = True
+        return True
+    monkeypatch.setattr(w, "_confirm_overwrite_predictions", confirm)
+    monkeypatch.setattr(w, "_show_training_dialog", lambda: None)
+    monkeypatch.setattr(w, "_show_preview_dialog", lambda **k: None)
+    monkeypatch.setattr(w.train_panel, "start_run", lambda: None)
+
+    def start(cfg, post_inference_wavs=None, reporter=None):
+        cap.cfg = cfg
+        cap.post = list(post_inference_wavs or [])
+    monkeypatch.setattr(w, "_start_training", start)
+    w._training_active = False
+    w._cap = cap
+    yield w
+    w._training_active = False
+    w._update_run_button()
+    w._set_train_config_enabled(True)
+
+
+def test_panel_settings_are_shown_in_the_panel(win):
+    win.launch_training({"split_mode": "file", "n_epochs": 321,
+                         "early_stop_patience": 17})
+    assert win.combo_train_split.currentData() == "file"
+    assert win.spin_train_epochs.value() == 321
+    assert win.spin_train_patience.value() == 17
+    assert win._cap.cfg.split_mode == "file"
+    assert win._cap.cfg.n_epochs == 321
+
+
+def test_settings_without_a_control_reach_the_run(win):
+    win.launch_training({"max_examples_per_recording": 77,
+                         "augment_faint": False, "lr_schedule": "none"})
+    cfg = win._cap.cfg
+    assert cfg.max_examples_per_recording == 77
+    assert cfg.augment_faint is False
+    assert cfg.lr_schedule == "none"
+
+
+def test_a_launched_run_does_not_infer_unless_asked(win):
+    win.launch_training({})
+    assert win._cap.post == []
+    assert not win._cap.confirm_asked, "an unattended run must not block"
+
+
+def test_infer_after_runs_inference_without_a_blocking_prompt(win):
+    win.launch_training({}, infer_after=True)
+    assert win._cap.post == ["x.wav"]
+    assert not win._cap.confirm_asked, "the flag is the confirmation"
+
+
+def test_the_next_button_press_uses_the_panel_alone(win):
+    win.launch_training({"max_examples_per_recording": 77})
+    win._training_active = False
+    win._on_train_clicked()
+    default = M.UNetTrainingConfig if hasattr(M, "UNetTrainingConfig") else \
+        __import__("fnt.usv.usv_detector.mad_training",
+                   fromlist=["x"]).UNetTrainingConfig
+    assert win._cap.cfg.max_examples_per_recording == \
+        default(project_dir="x").max_examples_per_recording
+    assert win._cap.confirm_asked, "a normal press still confirms overwrite"
+
+
+def test_a_value_the_panel_cannot_hold_still_reaches_the_run(win):
+    """An encoder the dropdown does not list must not be silently dropped."""
+    win.launch_training({"encoder_name": "resnet34_not_in_list"})
+    assert win._cap.cfg.encoder_name == "resnet34_not_in_list"
+
+
+def test_the_launch_parser_needs_a_project_to_train():
+    with pytest.raises(SystemExit):
+        M.main(["--train"])
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-q"]))

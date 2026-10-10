@@ -39,6 +39,13 @@ from typing import Callable, Dict, Iterable, List, Optional
 from .mad_labels import pred_csv_sibling_path
 
 
+def _model_label(model_path) -> str:
+    """Run-folder name for a checkpoint; see mad_inference.model_label.
+    Imported lazily: mad_inference pulls in the model stack."""
+    from .mad_inference import model_label
+    return model_label(model_path)
+
+
 MANIFEST_NAME = "manifest.jsonl"
 RUN_INFO_NAME = "run_info.json"
 
@@ -101,7 +108,7 @@ class RunSettings:
     @classmethod
     def from_config(cls, cfg) -> 'RunSettings':
         return cls(
-            model_name=Path(cfg.model_path).stem if cfg.model_path else "",
+            model_name=_model_label(cfg.model_path),
             threshold=round(float(cfg.threshold), 6),
             min_blob_pixels=int(cfg.min_blob_pixels),
             merge_consecutive=bool(getattr(cfg, 'merge_consecutive', False)),

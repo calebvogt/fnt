@@ -84,6 +84,39 @@ class UNetTrainingConfig:
     # modest label set. Turn off to reproduce un-augmented behavior.
     augment: bool = True
 
+    # Faint-call augmentation (train tiles only, and only with ``augment``).
+    # Attenuates the labelled calls in a tile toward the local noise floor, so
+    # the model also sees each call as it would arrive from across the arena.
+    # The ±10% gain jitter above cannot do this: a distant call is 10-20 dB
+    # down, and scaling the whole normalized tile moves call and background
+    # together. Done in the power domain against a per-frequency-row floor,
+    # and never below ``faint_min_snr_db`` -- attenuating a call into the noise
+    # while still labelling it would teach the model to hallucinate.
+    augment_faint: bool = True
+    faint_p: float = 0.3
+    faint_db_range: Tuple[float, float] = (3.0, 18.0)
+    faint_min_snr_db: float = 3.0
+
+    # Learning-rate schedule. 'plateau' halves the rate when val_loss stops
+    # improving for ``lr_plateau_patience`` epochs (floor: 1/1000 of the start);
+    # 'none' keeps it fixed, which is how every run before 2026-10 trained.
+    # A fixed 1e-3 leaves the model bouncing around the minimum it has found
+    # for the rest of the run -- the gap between train and val loss at the
+    # best epoch says the last stretch of each run was spent there.
+    lr_schedule: str = "plateau"     # 'plateau' | 'none'
+    lr_plateau_patience: int = 8
+    lr_plateau_factor: float = 0.5
+
+    # At most this many examples from any one recording (labels and hard
+    # negatives capped separately; 0 = no cap). One densely-labelled bout can
+    # otherwise outweigh the rest of the project -- a 906-label file against
+    # 1,181 labels across 64 recordings -- and a model fitted mostly to one
+    # recording's acoustics is a worse detector everywhere else. Whole
+    # examples are dropped, never pixels: a dropped call still trains as a
+    # positive wherever it falls inside a kept example's window, so the cap
+    # cannot turn a real call into background.
+    max_examples_per_recording: int = 150
+
     # Segmentation loss: 'bce_dice' (default, symmetric) or 'focal_tversky'
     # (recall-weighted via beta>alpha — better for thin/faint structure that a
     # symmetric loss under-segments). gamma focuses on hard examples.
@@ -461,13 +494,21 @@ class _AugmentedTileDataset:
                  p_freq_mask=0.5, max_freq_frac=0.15, n_freq_masks=2,
                  p_time_mask=0.5, max_time_frac=0.15, n_time_masks=2,
                  p_noise=0.5, noise_std=0.03,
-                 p_gain=0.5, gain_range=(0.9, 1.1)):
+                 p_gain=0.5, gain_range=(0.9, 1.1),
+                 p_faint=0.0, faint_db_range=(3.0, 18.0),
+                 faint_min_snr_db=3.0, db_min=-100.0, db_max=-20.0):
         import torch
         self._torch = torch
         self.specs = specs      # (N, H, W) float32, ~[0,1]
         self.targets = targets
         self.weights = weights
         self.rng = np.random.default_rng(seed)
+        self.p_faint = float(p_faint)
+        self.faint_db_range = (float(faint_db_range[0]),
+                               float(faint_db_range[1]))
+        self.faint_min_snr_db = float(faint_min_snr_db)
+        self.db_min = float(db_min)
+        self.db_span = float(db_max) - float(db_min)
         self.p_time_shift, self.max_shift_frac = p_time_shift, max_shift_frac
         self.p_freq_mask, self.max_freq_frac, self.n_freq_masks = \
             p_freq_mask, max_freq_frac, n_freq_masks
@@ -478,6 +519,47 @@ class _AugmentedTileDataset:
 
     def __len__(self):
         return self.specs.shape[0]
+
+    def attenuate_calls(self, s, t, att_db=None):
+        """Return ``s`` with its labelled calls moved ``att_db`` dB toward the
+        noise floor (random within ``faint_db_range`` when not given).
+
+        Works in power: observed = call + noise, so a call ``att_db`` further
+        away is ``floor + (observed - floor) * 10^(-att/10)``. Scaling the dB
+        values directly would also darken the noise under the call, which is
+        not what distance does. The floor is each frequency row's median --
+        calls cover under 1% of a tile's pixels, so the row median is the
+        noise, and the floor at 20 kHz and at 100 kHz differ by far more than
+        one global number allows.
+
+        A call already within ``faint_min_snr_db`` + the smallest attenuation
+        of its floor is left alone: it is as faint as it can usefully be made,
+        and pushing it further would leave a label on noise.
+        """
+        call = t > 0.5
+        if not call.any() or self.db_span <= 0:
+            return s
+        db = self.db_min + s.astype(np.float64) * self.db_span
+        floor_db = np.median(db, axis=1, keepdims=True)
+        p = np.power(10.0, db / 10.0)
+        floor = np.power(10.0, np.broadcast_to(floor_db, db.shape) / 10.0)
+        snr_db = 10.0 * np.log10(
+            max(float(np.median(p[call])), 1e-30)
+            / max(float(np.median(floor[call])), 1e-30))
+        lo, hi = self.faint_db_range
+        room = snr_db - self.faint_min_snr_db
+        if att_db is None:
+            if room < lo:
+                return s
+            att_db = float(self.rng.uniform(lo, min(hi, room)))
+        else:
+            att_db = float(min(att_db, max(0.0, room)))
+        if att_db <= 0:
+            return s
+        excess = np.clip(p - floor, 0.0, None)
+        p2 = np.where(call, floor + excess * (10.0 ** (-att_db / 10.0)), p)
+        s2 = (10.0 * np.log10(p2) - self.db_min) / self.db_span
+        return np.clip(s2, 0.0, 1.0).astype(s.dtype)
 
     def _bands(self, n_masks, length, max_frac):
         for _ in range(n_masks):
@@ -500,6 +582,11 @@ class _AugmentedTileDataset:
                 s = np.roll(s, sh, axis=1)
                 t = np.roll(t, sh, axis=1)
                 w = np.roll(w, sh, axis=1)
+        # --- distance: the calls fainter, the target unchanged. Before the
+        # masks and noise, which then act on the attenuated tile as they
+        # would on a real distant call.
+        if self.p_faint > 0 and self.rng.random() < self.p_faint:
+            s = self.attenuate_calls(s, t)
         # --- spectral (input spec only) ---
         if self.rng.random() < self.p_freq_mask:
             for a, b in self._bands(self.n_freq_masks, H, self.max_freq_frac):
@@ -726,6 +813,33 @@ ProgressFn = Callable[[int, int, Dict], None]
 # progress(epoch, total_epochs, metrics_dict)
 
 
+def lr_plateau_patience(cfg) -> int:
+    """Epochs of no improvement before the rate drops.
+
+    Never slower to react than early stopping: with a short early-stop
+    patience the run would otherwise end before the rate was ever allowed to
+    fall, and the schedule would be decoration.
+    """
+    pat = max(1, int(getattr(cfg, 'lr_plateau_patience', 8)))
+    es = int(getattr(cfg, 'early_stop_patience', 0) or 0)
+    if es > 0:
+        pat = max(1, min(pat, es // 2))
+    return pat
+
+
+def make_lr_scheduler(optim, cfg):
+    """The configured LR scheduler for ``optim``, or None. Stepped once per
+    epoch with the validation loss."""
+    if getattr(cfg, 'lr_schedule', 'none') != 'plateau':
+        return None
+    import torch
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode='min', factor=float(cfg.lr_plateau_factor),
+        patience=lr_plateau_patience(cfg),
+        threshold=float(cfg.early_stop_min_delta), threshold_mode='abs',
+        min_lr=float(cfg.learning_rate) * 1e-3)
+
+
 def train_unet(
     cfg: UNetTrainingConfig,
     progress: Optional[ProgressFn] = None,
@@ -753,6 +867,7 @@ def train_unet(
     # ---- collect tiles from the self-contained example store ----
     if progress:
         progress(0, cfg.n_epochs, {'status': 'collecting_tiles'})
+    capped: Dict = {}
     specs, targets, weights, groups = collect_training_examples(
         cfg.training_data_dir,
         tile_time_frames=cfg.tile_time_frames,
@@ -766,7 +881,12 @@ def train_unet(
         return_groups=True,
         placements=cfg.tile_placements,
         seed=cfg.split_seed,
+        max_per_recording=int(getattr(cfg, 'max_examples_per_recording', 0)
+                              or 0),
+        cap_report=capped,
     )
+    if progress and capped:
+        progress(0, cfg.n_epochs, {'status': 'capped', 'capped': capped})
 
     # How many recordings actually carry labels. Reported because the split
     # line used to assert "All labels are on ONE recording" whenever the level
@@ -876,7 +996,12 @@ def train_unet(
     # Train tiles are augmented on the fly when enabled; val is always raw.
     if getattr(cfg, 'augment', False):
         train_ds = _AugmentedTileDataset(
-            specs[train_idx], targets[train_idx], weights[train_idx])
+            specs[train_idx], targets[train_idx], weights[train_idx],
+            p_faint=(cfg.faint_p if getattr(cfg, 'augment_faint', False)
+                     else 0.0),
+            faint_db_range=tuple(cfg.faint_db_range),
+            faint_min_snr_db=cfg.faint_min_snr_db,
+            db_min=cfg.db_min, db_max=cfg.db_max)
     else:
         train_ds = TensorDataset(
             to_tensor(specs[train_idx]),
@@ -919,6 +1044,7 @@ def train_unet(
         in_channels=1, classes=1,
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    scheduler = make_lr_scheduler(optim, cfg)
 
     # Name the run by the number of accepted labels (confirmed calls), which is
     # what the user tracks — not the tile count (long calls split into several
@@ -1058,6 +1184,9 @@ def train_unet(
         best_thr = max(dice_sweep, key=dice_sweep.get)
         pos_frac = pos_px / max(1.0, sup_px)  # how sparse the masks are
 
+        lr_now = float(optim.param_groups[0]['lr'])
+        if scheduler is not None:
+            scheduler.step(val_loss)
         improved = val_loss < best_val - cfg.early_stop_min_delta
         if improved:
             best_val = val_loss
@@ -1081,6 +1210,8 @@ def train_unet(
             'patience': cfg.early_stop_patience,
             'n_train_tiles': train_n, 'n_val_tiles': val_n,
             'global_batch': global_batch,
+            # The rate this epoch trained at (before any reduction it caused).
+            'lr': lr_now,
         }
         if improved:
             best_metrics = metrics
@@ -1136,6 +1267,10 @@ def train_unet(
                     'n_train_tiles': int(len(train_idx)),
                     'n_val_tiles': n_val,
                     'trained': datetime.now().isoformat(timespec='seconds'),
+                    # The run folder's name, so anything this checkpoint
+                    # labels says which run it was -- the file is always
+                    # called weights.pt, which says nothing.
+                    'run_name': run_dir.name,
                     # The threshold this checkpoint actually scores best at.
                     # 0.5 is only a convention, and on sparse masks the best
                     # operating point is routinely elsewhere — carrying it with
@@ -1190,6 +1325,11 @@ def train_unet(
         'n_val_groups': split['n_val_groups'],
         'val_groups': split['val_groups'],
         'n_label_recordings': n_label_recordings,
+        # Recordings the per-recording cap trimmed: {name: {kind: (kept,
+        # total)}}. n_labels above is what the store holds; this is what
+        # actually trained.
+        'capped_recordings': {k: {kk: list(vv) for kk, vv in v.items()}
+                              for k, v in capped.items()},
         'split_seed': cfg.split_seed,
         # Positive-pixel balance — the number that explains an all-background
         # collapse after the fact (see the _balance note above).
