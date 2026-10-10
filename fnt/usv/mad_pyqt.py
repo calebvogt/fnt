@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Quiet the noisy Hugging Face cache symlink warning on Windows (symlinks need
 # Developer Mode/admin; caching still works fine without them). Set before any
@@ -11947,7 +11947,11 @@ class MADMainWindow(QMainWindow):
         except Exception as ex:
             QMessageBox.critical(self, "Could not read the saved list", str(ex))
             return
-        have = {os.path.normcase(os.path.abspath(p)) for p in self.audio_files}
+        # Against the registry, not the visible list: in a focus the list
+        # shows a handful of recordings, and comparing against it would
+        # re-register every hidden one as a duplicate.
+        have = {os.path.normcase(os.path.abspath(e.path))
+                for e in self._project.audio_entries()}
         back = [e for e in saved
                 if os.path.normcase(os.path.abspath(e['path'])) not in have]
         if not back:
@@ -12780,6 +12784,15 @@ class MADMainWindow(QMainWindow):
         # panel: it is a once-a-project action, and sharing a row (and a
         # dialog) with the everyday prune is what made it reachable by
         # accident. No shortcut, for the same reason.
+        # Leaves a focus (``--focus`` on launch, or focus_recordings()):
+        # the project always held everything; this shows it again.
+        self.act_show_all = QAction("Show &All Recordings", self)
+        self.act_show_all.setToolTip(
+            "Leave the focus and list every recording in the project.")
+        self.act_show_all.triggered.connect(self.clear_focus)
+        self.act_show_all.setEnabled(False)
+        file_menu.addAction(self.act_show_all)
+
         self.act_empty_list = QAction("&Empty the Audio List…", self)
         self.act_empty_list.setToolTip(
             "Take every recording out of the Audio list. Nothing is deleted — "
@@ -13938,6 +13951,7 @@ class MADMainWindow(QMainWindow):
                 f"Closed project: {self._project.project_name}"
             )
         self._project = None
+        self._focus_keys = None      # a focus belongs to the project it was on
         self.audio_files = []
         self.current_file_idx = 0
         self.audio_data = None
@@ -13991,6 +14005,149 @@ class MADMainWindow(QMainWindow):
         if dup:
             msg += f", skipped {dup} already loaded"
         self.status_bar.showMessage(msg)
+
+    # ------------------------------------------------------------------
+    # Focus: show a chosen handful of the project's recordings
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _focus_items(items) -> List[str]:
+        """Expand focus arguments: a ``.txt`` file is one recording per line
+        (path or bare filename; blank lines and ``#`` comments skipped),
+        anything else is itself a path or filename."""
+        out: List[str] = []
+        for it in items or ():
+            it = str(it).strip().strip('"')
+            if not it:
+                continue
+            if it.lower().endswith('.txt') and os.path.isfile(it):
+                with open(it, encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.split('#', 1)[0].strip().strip('"')
+                        if line:
+                            out.append(line)
+            else:
+                out.append(it)
+        return out
+
+    def _apply_focus(self, paths: List[str]) -> List[str]:
+        """``paths`` (the project's registry, in order) cut down to the focus,
+        or unchanged when there is none.
+
+        Only ever the *displayed* list. The registry is written exclusively
+        from the project's own entries, so a focused session cannot shrink the
+        project -- training still reads every registered recording, and
+        Show All Recordings puts the rest straight back.
+        """
+        keys = getattr(self, '_focus_keys', None)
+        if not keys:
+            return list(paths)
+        return [p for p in paths
+                if self._path_key(p) in keys
+                or os.path.basename(p).lower() in keys]
+
+    def focus_recordings(self, items) -> Tuple[int, List[str]]:
+        """Show only ``items`` in the Audio list. Returns (shown, unmatched).
+
+        Items are matched against the project's registry by full path, then
+        by filename -- so a list of bare names copied out of a report works. A
+        full path to a wav the project does not hold yet is registered first:
+        labelling it has to count toward training, and an unregistered file's
+        labels would not.
+        """
+        if self._project is None:
+            return 0, list(items or ())
+        wanted = self._focus_items(items)
+        entries = self._project.audio_entries()
+        by_path = {self._path_key(e.path) for e in entries}
+        by_name = {os.path.basename(e.path).lower() for e in entries}
+        new = [w for w in wanted
+               if os.path.isabs(w) and os.path.isfile(w)
+               and self._path_key(w) not in by_path
+               and w.lower().endswith('.wav')]
+        if new:
+            self._register_audio_files(new)
+            entries = self._project.audio_entries()
+            by_path = {self._path_key(e.path) for e in entries}
+            by_name = {os.path.basename(e.path).lower() for e in entries}
+        keys, unmatched = set(), []
+        for w in wanted:
+            k = self._path_key(w)
+            n = os.path.basename(w).lower()
+            if k in by_path:
+                keys.add(k)
+            elif n in by_name:
+                keys.add(n)
+            else:
+                unmatched.append(w)
+        if not keys:
+            return 0, unmatched
+        self._focus_keys = keys
+        self._show_registry()
+        n = len(self.audio_files)
+        self._update_focus_banner()
+        self._log(f"Focus: {n} of {len(entries)} recording(s)"
+                  + (f"; {len(unmatched)} not in the project: "
+                     + ", ".join(os.path.basename(u) for u in unmatched[:5])
+                     if unmatched else ""))
+        return n, unmatched
+
+    def clear_focus(self):
+        """Back to every recording in the project."""
+        if not getattr(self, '_focus_keys', None):
+            return
+        current = (self.audio_files[self.current_file_idx]
+                   if 0 <= self.current_file_idx < len(self.audio_files)
+                   else None)
+        self._focus_keys = None
+        self._show_registry(keep=current)
+        self._update_focus_banner()
+        self._log("Showing all recordings")
+
+    def _show_registry(self, keep: Optional[str] = None):
+        """Rebuild the Audio list from the registry through the focus, and
+        open ``keep`` (or the first recording)."""
+        entries = self._project.audio_entries()
+        self.audio_files = self._apply_focus([e.path for e in entries])
+        self._missing_audio = self._missing_paths(entries)
+        self.current_file_idx = (self.audio_files.index(keep)
+                                 if keep in self.audio_files else 0)
+        self._refresh_file_list()
+        self._scan_all_file_counts()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(self.current_file_idx
+                                     if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if self.audio_files:
+            self._load_current_file()
+        self._update_scope_labels()
+        self._update_project_state()
+        self._sync_list_buttons()
+
+    def _update_focus_banner(self):
+        """Say it everywhere a glance lands: a list that silently shows 11 of
+        378 recordings reads as a project that lost 367."""
+        keys = getattr(self, '_focus_keys', None)
+        cfg = self._project
+        name = cfg.project_name if cfg is not None else ""
+        total = len(cfg.audio_entries()) if cfg is not None else 0
+        if keys and cfg is not None:
+            tag = f"focus: {len(self.audio_files)} of {total}"
+            self.setWindowTitle(f"{self.BASE_TITLE} — {name}  [{tag}]")
+            self.lbl_project_status.setText(
+                f"Project: {name} — {tag} (File ▸ Show All Recordings)")
+            self.lbl_project_status.setStyleSheet(
+                "color: #FFB74D; font-size: 10px; padding: 3px 6px;")
+        elif cfg is not None:
+            self.setWindowTitle(f"{self.BASE_TITLE} — {name}")
+            self.lbl_project_status.setText(f"Project: {name}")
+            self.lbl_project_status.setStyleSheet(
+                "color: #4CAF50; font-size: 10px; padding: 3px 6px;")
+        if hasattr(self, 'act_show_all'):
+            self.act_show_all.setEnabled(bool(keys))
+        if hasattr(self, 'act_empty_list'):
+            # Emptying acts on the visible list; in a focus that is a quiet way
+            # to unregister exactly the recordings being worked on.
+            self.act_empty_list.setEnabled(not keys)
 
     def _rescan_project_wavs(self) -> int:
         """Load the project's registered audio into the Audio list.
@@ -14049,7 +14206,7 @@ class MADMainWindow(QMainWindow):
         if adopted or moved or backfilled:
             self._project.save()
 
-        self.audio_files = [e.path for e in entries]
+        self.audio_files = self._apply_focus([e.path for e in entries])
         self.current_file_idx = 0
         self._missing_audio = self._missing_paths(entries)
         self._refresh_file_list()
@@ -14297,7 +14454,7 @@ class MADMainWindow(QMainWindow):
         current = (self.audio_files[self.current_file_idx]
                    if 0 <= self.current_file_idx < len(self.audio_files)
                    else None)
-        self.audio_files = [e.path for e in entries]
+        self.audio_files = self._apply_focus([e.path for e in entries])
         self._missing_audio = self._missing_paths(entries)
         if current in self.audio_files:
             self.current_file_idx = self.audio_files.index(current)
@@ -14916,6 +15073,13 @@ class MADMainWindow(QMainWindow):
         recording set — so it is worth a trip to the menu. Living beside a
         button it shared a dialog with is what made it reachable by accident.
         """
+        if getattr(self, '_focus_keys', None):
+            QMessageBox.information(
+                self, "Showing a focus",
+                "The Audio list is showing a focus, not the whole project. "
+                "File ▸ Show All Recordings first — emptying from here would "
+                "unregister exactly the recordings being worked on.")
+            return
         n = len(self.audio_files)
         if not n:
             return
@@ -19473,6 +19637,11 @@ def _launch_parser():
                    help="With --train: run the panel's post-training "
                         "inference when training finishes (off by default "
                         "for launched runs).")
+    p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
+                   help="Show only these recordings in the Audio list: wav "
+                        "paths, bare filenames, and/or .txt files listing "
+                        "them one per line. The project keeps every "
+                        "recording; File ▸ Show All Recordings returns.")
     add_training_args(p)
     suppress_training_defaults(p)
     return p
@@ -19483,8 +19652,8 @@ def main(argv=None):
     # parse_known_args: Qt has command-line options of its own.
     args, qt_args = parser.parse_known_args(
         sys.argv[1:] if argv is None else argv)
-    if args.train and not args.project:
-        parser.error("--train needs --project")
+    if (args.train or args.focus) and not args.project:
+        parser.error("--train and --focus need --project")
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
@@ -19498,6 +19667,14 @@ def main(argv=None):
             if os.path.isdir(path):
                 path = os.path.join(path, PROJECT_INFO_FILENAME)
             win._open_project_from_path(path)
+            if args.focus and win._project is not None:
+                shown, missing = win.focus_recordings(args.focus)
+                msg = f"Focus: {shown} recording(s)"
+                if missing:
+                    msg += (f" — {len(missing)} not found in the project: "
+                            + ", ".join(os.path.basename(m)
+                                        for m in missing[:3]))
+                win.status_bar.showMessage(msg)
             if args.train and win._project is not None:
                 # After the project's own startup work (file list, the
                 # pre-fill from the last run's settings), so the overrides
