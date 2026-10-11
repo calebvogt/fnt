@@ -5002,6 +5002,106 @@ class _DoubleClickTile(QToolButton):
         event.accept()
 
 
+#: Remembers the audio mode of the last rendered clip.
+CLIP_AUDIO_MODE_KEY = "mad/export/clip_audio_mode"
+
+
+class MADClipOptionsDialog(QDialog):
+    """How a rendered clip should sound: slowed, heterodyned, or silent.
+
+    Asked at render time because the right answer depends on who the clip is
+    for. Slowed keeps the whole spectrum but stretches the call; heterodyne
+    keeps real time and the bout's rhythm but only hears calls near the LO;
+    silent is for a slide that will be talked over. The defaults are whatever
+    the user is listening with right now (see ``default_mode``), so pressing
+    Enter renders what they just heard.
+    """
+
+    def __init__(self, parent, view_dur: float, speeds, speed: float,
+                 lo_khz: int, mode: str = 'slow', nyquist_khz: float = 125.0):
+        super().__init__(parent)
+        self.setWindowTitle("Render Clip")
+        self._view_dur = float(view_dur)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel(f"Audio for this {view_dur:.2f} s window:"))
+
+        self.rb_slow = QRadioButton("Slowed down")
+        self.cmb_speed = QComboBox()
+        for s in speeds:
+            self.cmb_speed.addItem(f"{s:g}x", float(s))
+        i = min(range(len(speeds)), key=lambda k: abs(speeds[k] - speed))
+        self.cmb_speed.setCurrentIndex(i)
+        self.cmb_speed.setToolTip(
+            "Every frequency divided by the inverse of this, so a 40 kHz call "
+            "at 0.1x is heard at 4 kHz — and the clip is 10x longer.")
+        r1 = QHBoxLayout()
+        r1.addWidget(self.rb_slow)
+        r1.addWidget(self.cmb_speed)
+        r1.addStretch()
+        v.addLayout(r1)
+
+        self.rb_het = QRadioButton("Heterodyne, real time — LO")
+        self.spin_lo = QSpinBox()
+        self.spin_lo.setRange(5, max(6, int(nyquist_khz) - 1))
+        self.spin_lo.setSuffix(" kHz")
+        self.spin_lo.setValue(int(lo_khz))
+        self.spin_lo.setToolTip(
+            "Calls within ~12 kHz of the LO are heard, at real time; a call at "
+            "LO + 5 kHz plays at 5 kHz.")
+        r2 = QHBoxLayout()
+        r2.addWidget(self.rb_het)
+        r2.addWidget(self.spin_lo)
+        r2.addStretch()
+        v.addLayout(r2)
+
+        self.rb_silent = QRadioButton("Silent, real time")
+        v.addWidget(self.rb_silent)
+
+        self.lbl_len = QLabel()
+        self.lbl_len.setStyleSheet("color:#9fb8c8; font-size:10px;")
+        v.addWidget(self.lbl_len)
+
+        {'het': self.rb_het, 'silent': self.rb_silent}.get(
+            mode, self.rb_slow).setChecked(True)
+        for w in (self.rb_slow, self.rb_het, self.rb_silent):
+            w.toggled.connect(self._sync)
+        self.cmb_speed.currentIndexChanged.connect(self._sync)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Render")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self._sync()
+
+    def options(self) -> Dict:
+        if self.rb_het.isChecked():
+            return {'mode': 'het', 'lo_hz': self.spin_lo.value() * 1000.0,
+                    'speed': 1.0}
+        if self.rb_silent.isChecked():
+            return {'mode': 'silent', 'speed': 1.0}
+        return {'mode': 'slow', 'speed': float(self.cmb_speed.currentData())}
+
+    def _sync(self, *_):
+        self.cmb_speed.setEnabled(self.rb_slow.isChecked())
+        self.spin_lo.setEnabled(self.rb_het.isChecked())
+        o = self.options()
+        dur = self._view_dur / max(o['speed'], 1e-6)
+        self.lbl_len.setText(f"Clip length: {dur:.1f} s"
+                             + (f" ({dur / 60:.1f} min)" if dur >= 90 else ""))
+
+    @staticmethod
+    def default_mode(last_playback: Optional[str],
+                     last_render: Optional[str]) -> str:
+        """What the user is listening with now, else what they last
+        rendered, else slowed. Playback beats the remembered render: a clip
+        made right after listening with Het should sound like that."""
+        for m in (last_playback, last_render):
+            if m in ('slow', 'het', 'silent'):
+                return m
+        return 'slow'
+
+
 class MADClipDialog(QDialog):
     """Previews a rendered clip and offers to keep it. Closing discards it.
 
@@ -5580,18 +5680,38 @@ class MADClipWorker(QThread):
         super().__init__(parent)
         self.job = job
 
+    @staticmethod
+    def clip_audio(j: dict) -> np.ndarray:
+        """The clip's soundtrack for ``j['mode']`` ('slow' when absent, which
+        is every job written before heterodyne existed): ``n_out`` samples at
+        ``out_sr``, so it always matches the video's length."""
+        mode = j.get('mode', 'slow')
+        n_out = int(j['n_out'])
+        if mode == 'silent':
+            return np.zeros(n_out, dtype=np.float32)
+        seg = np.asarray(j['segment'], dtype=np.float32)
+        if mode == 'het':
+            from fnt.usv.usv_heterodyne import heterodyne_for_playback
+            y = heterodyne_for_playback(seg, j['sr'], j['lo_hz'],
+                                        out_rate=j['out_sr'])
+            # Same length as the video to the sample; resampling rounds.
+            if y.size < n_out:
+                y = np.pad(y, (0, n_out - y.size))
+            return y[:n_out]
+        from scipy import signal as _sig
+        slowed = _sig.resample(seg, n_out)
+        peak = float(np.max(np.abs(slowed))) if len(slowed) else 0.0
+        if peak > 0:
+            # Ultrasonic slowed into the audible band is very quiet.
+            slowed = slowed / peak * 0.97
+        return slowed
+
     def run(self):
         j = self.job
         try:
-            from scipy import signal as _sig
             import soundfile as _sf
-            slowed = _sig.resample(
-                np.asarray(j['segment'], dtype=np.float32), j['n_out'])
-            peak = float(np.max(np.abs(slowed))) if len(slowed) else 0.0
-            if peak > 0:
-                # Ultrasonic slowed into the audible band is very quiet.
-                slowed = slowed / peak * 0.97
-            _sf.write(j['wav'], slowed.astype(np.float32), j['out_sr'],
+            audio = self.clip_audio(j)
+            _sf.write(j['wav'], audio.astype(np.float32), j['out_sr'],
                       subtype='PCM_16')
             proc = subprocess.run(j['cmd'], capture_output=True, text=True)
             if proc.returncode != 0 or not os.path.isfile(j['out']):
@@ -6417,19 +6537,25 @@ class MADMainWindow(QMainWindow):
         self.btn_render_clip.setFocusPolicy(Qt.NoFocus)
         self.btn_render_clip.setToolTip(
             "Render the current view as an mp4: the spectrogram exactly as it "
-            "stands, with the playhead sweeping across it and the audio "
-            "slowed to the Speed setting — so an ultrasonic call is both "
-            "visible and audible.\n"
+            "stands, with the playhead sweeping across it — so an ultrasonic "
+            "call is both visible and audible.\n"
             "\n"
-            "The view and the speed are taken at the moment you press this, "
+            "You choose the sound first: slowed down (whole spectrum, longer "
+            "clip), heterodyne at real time (calls near the LO, rhythm "
+            "intact), or silent. It defaults to what you are listening with.\n"
+            "\n"
+            "The view and the audio settings are taken when you press Render, "
             "so changing them while it renders will not affect the result.\n"
             "\n"
             "The clip opens in a window that plays it. It lives in a temp file "
             "until you Save it — closing that window discards it.\n"
             "\n"
-            "Note the speed multiplies the length: at 0.03x a 0.66 s window "
-            "becomes a 22 s clip. Requires ffmpeg on PATH.")
-        self.btn_render_clip.clicked.connect(self.render_spectrogram_clip)
+            "Slowing multiplies the length: at 0.03x a 0.66 s window becomes "
+            "a 22 s clip. Requires ffmpeg on PATH.")
+        # A lambda: clicked() passes its checked flag, which would arrive as
+        # the options argument.
+        self.btn_render_clip.clicked.connect(
+            lambda _checked=False: self.render_spectrogram_clip())
         controls_layout.addWidget(self.btn_render_clip)
 
         # The controls row is one non-wrapping run of fixed-width widgets, so
@@ -17908,6 +18034,7 @@ class MADMainWindow(QMainWindow):
                 pass
             self.is_playing = True
             self._playback_mode = mode
+            self._last_playback_mode = mode     # Render Clip defaults to it
             self._playback_rate = rate
             (self.btn_het if mode == 'het' else self.btn_play).setText("Stop")
             self._playback_start_s = start_s
@@ -18014,13 +18141,15 @@ class MADMainWindow(QMainWindow):
     CLIP_FPS = 30
     CLIP_TARGET_WIDTH = 1280
 
-    def render_spectrogram_clip(self):
+    def render_spectrogram_clip(self, options: Optional[Dict] = None):
         """Render the current view as an mp4: static frame, sweeping playhead.
 
-        The frame is the view as it stands when the button is pressed, and the
-        audio is slowed by whatever the speed slider reads at that moment —
-        both are snapshotted, so changing either mid-render cannot desync the
-        result from what the user asked for.
+        The frame is the view as it stands when the button is pressed. The
+        audio is chosen in :class:`MADClipOptionsDialog` -- slowed by a
+        speed, heterodyned at real time around an LO, or silent -- defaulting
+        to what the user is listening with; pass ``options`` to skip asking.
+        Everything is snapshotted, so changing the view or the controls
+        mid-render cannot desync the result from what the user asked for.
 
         Only the playhead moves, so ffmpeg animates it from a single still via
         ``drawbox`` rather than being fed thousands of near-identical frames.
@@ -18041,7 +18170,6 @@ class MADMainWindow(QMainWindow):
             return
 
         # --- snapshot everything the render depends on -------------------
-        speed = float(self.playback_speed)
         start_s, stop_s = self.spectrogram.get_view_range()
         total = len(self.audio_data) / self.sample_rate
         start_s, stop_s = max(0.0, start_s), min(total, stop_s)
@@ -18049,6 +18177,30 @@ class MADMainWindow(QMainWindow):
         if view_dur <= 0:
             self.status_bar.showMessage("Nothing to render — empty view.")
             return
+        if options is None:
+            dlg = MADClipOptionsDialog(
+                self, view_dur, self._speed_values,
+                float(self.playback_speed), self.spin_het_lo.value(),
+                mode=MADClipOptionsDialog.default_mode(
+                    getattr(self, '_last_playback_mode', None),
+                    self._settings.value(CLIP_AUDIO_MODE_KEY, None)),
+                nyquist_khz=self.sample_rate / 2000.0)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            options = dlg.options()
+        mode = options.get('mode', 'slow')
+        self._settings.setValue(CLIP_AUDIO_MODE_KEY, mode)
+        speed = float(options.get('speed', 1.0)) if mode == 'slow' else 1.0
+        lo_hz = float(options.get('lo_hz', self.spin_het_lo.value() * 1000.0))
+        if mode == 'het' and lo_hz >= self.sample_rate / 2:
+            self.status_bar.showMessage(
+                f"LO {lo_hz / 1000:g} kHz is above this recording's Nyquist")
+            return
+        audio_desc = {'slow': f"{speed:g}x",
+                      'het': f"heterodyne LO {lo_hz / 1000:g} kHz",
+                      'silent': "silent"}[mode]
+        audio_tag = {'slow': f"{speed:g}x", 'het': f"het{lo_hz / 1000:g}k",
+                     'silent': "silent"}[mode]
         clip_dur = view_dur / max(speed, 1e-6)
         if clip_dur > self.MAX_CLIP_SECONDS:
             if QMessageBox.question(
@@ -18067,7 +18219,7 @@ class MADMainWindow(QMainWindow):
         self.spectrogram._cursor_pos = None
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
         self.status_bar.showMessage(
-            f"Rendering {clip_dur:.1f} s clip at {speed:g}x…")
+            f"Rendering {clip_dur:.1f} s clip ({audio_desc})…")
         QApplication.processEvents()
 
         tmpdir = tempfile.mkdtemp(prefix="mad_clip_")
@@ -18075,7 +18227,7 @@ class MADMainWindow(QMainWindow):
         wav = os.path.join(tmpdir, "audio.wav")
         stem = Path(self._active_wav_path() or "clip").stem
         out = os.path.join(
-            tmpdir, f"{stem}_{start_s:.2f}-{stop_s:.2f}s_{speed:g}x.mp4")
+            tmpdir, f"{stem}_{start_s:.2f}-{stop_s:.2f}s_{audio_tag}.mp4")
         try:
             # --- still frame, scaled to an even, 4-byte-aligned width ----
             dpi = 96.0 * max(1.0, self.CLIP_TARGET_WIDTH
@@ -18106,13 +18258,20 @@ class MADMainWindow(QMainWindow):
                 f"x='{x0:.2f}+({x1:.2f}-{x0:.2f})*t/{clip_dur:.4f}':y=0,"
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
             )
-            out_sr = 44100
+            if mode == 'het':
+                from fnt.usv.usv_heterodyne import HETERODYNE_OUT_SR
+                out_sr = HETERODYNE_OUT_SR
+            else:
+                out_sr = 44100
             job = {
                 'segment': self.audio_data[
                     int(start_s * self.sample_rate):
                     int(stop_s * self.sample_rate)].copy(),
                 'n_out': max(100, int(clip_dur * out_sr)),
                 'out_sr': out_sr,
+                'mode': mode,
+                'lo_hz': lo_hz,
+                'sr': self.sample_rate,
                 'wav': wav,
                 'out': out,
                 'cmd': [
@@ -18147,7 +18306,7 @@ class MADMainWindow(QMainWindow):
         base_meta = (
             f"{os.path.basename(str(self._active_wav_path() or ''))}  ·  "
             f"{start_s:.2f}–{stop_s:.2f} s ({view_dur:.2f} s of audio)  ·  "
-            f"{speed:g}x → {clip_dur:.1f} s clip  ·  "
+            f"{audio_desc} → {clip_dur:.1f} s clip  ·  "
             f"{img.width()}x{img.height()}")
 
         def _reset_button():
