@@ -44,3 +44,43 @@ if QtCore is not None and not getattr(QtCore.QSettings, "_fnt_isolated", False):
                 super().__init__(*args, **kwargs)
 
     QtCore.QSettings = _IsolatedSettings
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Close every window while the QApplication is still alive.
+
+    GUI test modules keep their windows (and the application) in module
+    globals for the life of the run, and nothing closes them: the interpreter
+    tears them down at exit in whatever order module globals happen to be
+    cleared. When the QApplication goes first, each window's destructor runs
+    against a dead application -- an access violation after every test has
+    passed, and a nonzero exit code for a green run (seen as 127 from bash).
+
+    This does what a user does before quitting: let MAD's worker threads
+    finish (bounded, never terminated mid-import), close each window so its
+    closeEvent runs, and flush the deferred deletes while Qt can still
+    process them.
+    """
+    if QtCore is None:
+        return
+    try:
+        from PyQt5.QtWidgets import QApplication
+    except Exception:
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    import sys
+    mad = sys.modules.get("fnt.usv.mad_pyqt")
+    if mad is not None and hasattr(mad, "_join_mad_threads_at_exit"):
+        mad._join_mad_threads_at_exit()
+    for w in list(app.topLevelWidgets()):
+        try:
+            w.close()
+            w.deleteLater()
+        except RuntimeError:            # its C++ side is already gone
+            pass
+    for _ in range(3):
+        app.processEvents()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    app.processEvents()

@@ -150,10 +150,18 @@ def win(monkeypatch):
     w._stop_playback()
 
 
+def played(win):
+    """The last thing sent to the (fake) sound device. A playback error is
+    caught and shown in the status bar, so say what it said."""
+    assert win._fake_sd.played, \
+        f"nothing played; status: {win.status_bar.currentMessage()!r}"
+    return win._fake_sd.played[-1]
+
+
 def test_het_plays_at_48k_and_real_time(win):
     win.slider_speed.setValue(0)              # slowest; must not apply
     win._toggle_het_playback()
-    data, sr = win._fake_sd.played[-1]
+    data, sr = played(win)
     assert sr == HETERODYNE_OUT_SR
     span = win._playback_end_s - win._playback_start_s
     assert abs(data.size / sr - span) < 0.01, "not real time"

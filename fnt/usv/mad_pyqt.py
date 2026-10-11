@@ -70,6 +70,109 @@ try:
 except Exception:
     HAS_SOUNDDEVICE = False
 
+
+#: How long the interpreter waits, per thread, for a MAD worker still running
+#: at exit. The device probe is the one that matters: it imports torch, which
+#: takes seconds, and every window starts it.
+_EXIT_THREAD_WAIT_MS = 30_000
+
+
+def _join_mad_threads_at_exit():
+    """Let any MAD worker thread still running finish before Qt destroys it.
+
+    A QThread destroyed while running aborts the whole process (Qt's fatal
+    "destroyed while thread is still running", 0xC0000409 on Windows -- no
+    message, no traceback). closeEvent stops the window's threads, but a
+    window the interpreter tears down without closing never runs it: every
+    GUI test module did exactly that, passing all its tests and then exiting
+    127, and so does any script that builds a window and returns while the
+    device probe is still importing torch.
+
+    Asks each to stop, then waits (bounded) rather than terminate()-ing --
+    killing a thread mid-import leaves the interpreter in a state worse than
+    the abort. Runs from atexit, registered after PyQt's own import so it runs
+    before PyQt's teardown.
+    """
+    try:
+        app = QApplication.instance()
+    except Exception:
+        return
+    if app is None:
+        return
+    for w in list(app.topLevelWidgets()):
+        try:
+            threads = w.findChildren(QThread)
+        except RuntimeError:           # the C++ side is already gone
+            continue
+        for th in threads:
+            try:
+                if not th.isRunning():
+                    continue
+                if hasattr(th, 'request_stop'):
+                    th.request_stop()
+                th.quit()
+                th.wait(_EXIT_THREAD_WAIT_MS)
+            except RuntimeError:
+                continue
+
+
+import atexit  # noqa: E402
+atexit.register(_join_mad_threads_at_exit)
+
+
+#: Every type MAD hands to scipy.signal (arrays, their scalars, and the plain
+#: Python values passed as parameters). See _guard_scipy_against_partial_torch.
+_SCIPY_PRIME_TYPES = (
+    np.ndarray, np.memmap, np.ma.MaskedArray, np.matrix,
+    np.float16, np.float32, np.float64, np.complex64, np.complex128,
+    np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32,
+    np.uint64, np.bool_, int, float, complex, bool, str, bytes, list, tuple,
+    dict, type(None), slice, range,
+)
+
+
+def _guard_scipy_against_partial_torch() -> bool:
+    """Make scipy safe to call while torch is importing on another thread.
+
+    The device probe imports torch in the background so MAD opens in 1.7 s
+    rather than 3.4 s. But scipy >= 1.15 checks every argument with
+    ``is_torch_array``, which looks torch up in ``sys.modules`` -- and while
+    another thread is mid-import that is a half-built module, so the check
+    raises "partially initialized module 'torch' has no attribute 'Tensor'".
+    resample_poly, sosfiltfilt, resample and spectrogram all do it: pressing
+    Play or Het in MAD's first seconds, or loading the first file, could fail.
+
+    scipy caches that check per type (an lru_cache on _issubclass_fast), so
+    asking it once for every type MAD uses, before torch is anywhere near
+    sys.modules, settles each answer at False for good. Returns True when the
+    cache was primed (or torch is already in), False when this scipy has no
+    such cache and torch was imported here instead -- slower, but with no
+    half-imported module for anyone to see.
+    """
+    if "torch" in sys.modules:
+        return True        # imported, or a probe already primed and started
+    prime = None
+    for mod in ("scipy._external.array_api_compat.common._helpers",
+                "scipy._lib.array_api_compat.common._helpers"):
+        try:
+            prime = getattr(__import__(mod, fromlist=["_"]),
+                            "_issubclass_fast")
+            break
+        except Exception:
+            continue
+    if prime is None or not hasattr(prime, "cache_info"):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            pass
+        return False
+    for t in _SCIPY_PRIME_TYPES:
+        try:
+            prime(t, "torch", "Tensor")
+        except Exception:
+            pass
+    return True
+
 try:
     from PIL import Image as PILImage
     HAS_PIL = True
@@ -13179,6 +13282,9 @@ class MADMainWindow(QMainWindow):
 
     def _start_device_probe(self):
         """Kick off the background compute-device probe (once)."""
+        # Before the probe starts importing torch: from then until it
+        # finishes, scipy would see a half-imported torch.
+        _guard_scipy_against_partial_torch()
         self._device_probe = MADDeviceProbeWorker(self)
         self._device_probe.done_signal.connect(self._on_device_probe_done)
         self._device_probe.start()
