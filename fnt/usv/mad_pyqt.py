@@ -322,6 +322,8 @@ INFER_SETTINGS = {
 # v2: the v1 key could hold a width saved while the layout was over-constrained
 # (see the controls-bar note in _build_ui); those states are not worth migrating.
 SPLITTER_STATE_KEY = "mad/ui/splitter_state_v2"
+#: Heterodyne playback's local-oscillator frequency, in kHz.
+HET_LO_KEY = "mad/audio/het_lo_khz"
 MAX_RECENT_PROJECTS = 8
 
 # Per-pixel mask values
@@ -5908,6 +5910,10 @@ class MADMainWindow(QMainWindow):
         # Playback state
         self.is_playing = False
         self.playback_speed = 1.0
+        # Audio seconds per wall-clock second for the playback in progress:
+        # the Speed slider's value for normal play, 1.0 for heterodyne.
+        self._playback_rate = 1.0
+        self._playback_mode = None          # 'slow' | 'het' while playing
         self._speed_values = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0]
         self._playback_start_time = None
         self._playback_start_s = None
@@ -6319,6 +6325,39 @@ class MADMainWindow(QMainWindow):
         self.btn_play.setToolTip("Play / stop the visible window (Space)")
         self.btn_play.clicked.connect(self._toggle_playback)
         controls_layout.addWidget(self.btn_play)
+
+        # Heterodyne: the window at real time, ultrasound mixed down around
+        # the LO frequency beside it. Speed applies to Play only.
+        self.btn_het = QPushButton("Het")
+        self.btn_het.setFixedWidth(44)
+        self.btn_het.setToolTip(
+            "Heterodyne playback of the visible window at real-time speed "
+            "(Shift+Space).\n\n"
+            "Mixes the recording down by the LO frequency: a call at LO + "
+            "5 kHz is heard at 5 kHz, as it happens — rhythm and sweeps "
+            "intact, instead of stretched out by slowing down.\n"
+            "Calls within about 12 kHz of the LO are audible; set the LO just "
+            "below the calls you want. Both sides of the LO are heard "
+            "(LO ± 5 kHz both play at 5 kHz). Speed does not apply.")
+        self.btn_het.clicked.connect(self._toggle_het_playback)
+        controls_layout.addWidget(self.btn_het)
+
+        self.spin_het_lo = QSpinBox()
+        self.spin_het_lo.setRange(5, 120)
+        self.spin_het_lo.setSuffix(" kHz")
+        self.spin_het_lo.setFixedWidth(70)
+        self.spin_het_lo.setToolTip(
+            "Heterodyne LO: the frequency that plays as silence. Calls within "
+            "~12 kHz of it are heard. Remembered between sessions.")
+        try:
+            self.spin_het_lo.setValue(int(self._settings.value(
+                HET_LO_KEY, 40)))
+        except (TypeError, ValueError):
+            self.spin_het_lo.setValue(40)
+        self.spin_het_lo.valueChanged.connect(
+            lambda v: self._settings.setValue(HET_LO_KEY, int(v)))
+        self.spin_het_lo.installEventFilter(self._wheel_eater)
+        controls_layout.addWidget(self.spin_het_lo)
 
         controls_layout.addWidget(QLabel("Speed:"))
         self.slider_speed = QSlider(Qt.Horizontal)
@@ -13258,6 +13297,7 @@ class MADMainWindow(QMainWindow):
         make(Qt.Key_Enter, self._confirm_pending)
         make(Qt.Key_Escape, self._clear_pending)
         make(Qt.Key_Space, self._shortcut_toggle_playback)
+        make("Shift+Space", self._shortcut_toggle_het_playback)
         make("[", self._shortcut_brush_smaller)
         make("]", self._shortcut_brush_bigger)
         make("V", self._shortcut_cycle_view)
@@ -13412,6 +13452,12 @@ class MADMainWindow(QMainWindow):
             return
         if self.btn_play.isEnabled() or self.is_playing:
             self._toggle_playback()
+
+    def _shortcut_toggle_het_playback(self):
+        if self._focus_is_edit():
+            return
+        if self.btn_het.isEnabled() or self.is_playing:
+            self._toggle_het_playback()
 
     def _shortcut_toggle_brush(self):
         if self._focus_is_edit():
@@ -17772,6 +17818,8 @@ class MADMainWindow(QMainWindow):
         has_audio = self.audio_data is not None and HAS_SOUNDDEVICE
         self.btn_play.setEnabled(has_audio)
         self.slider_speed.setEnabled(has_audio)
+        if hasattr(self, 'btn_het'):
+            self.btn_het.setEnabled(has_audio)
 
     def _on_speed_changed(self, idx: int):
         speed = self._speed_values[idx]
@@ -17794,7 +17842,16 @@ class MADMainWindow(QMainWindow):
         else:
             self._play_visible()
 
-    def _play_visible(self):
+    def _toggle_het_playback(self):
+        """Heterodyne play/stop. Either button stops whatever is playing:
+        pressing Het during slowed playback means "stop this", not "start a
+        second stream on top of it"."""
+        if self.is_playing:
+            self._stop_playback()
+        else:
+            self._play_visible(mode='het')
+
+    def _play_visible(self, mode: str = 'slow'):
         if not HAS_SOUNDDEVICE or self.audio_data is None:
             return
         start_s, stop_s = self.spectrogram.get_view_range()
@@ -17807,14 +17864,31 @@ class MADMainWindow(QMainWindow):
         if len(segment) < 100:
             return
         try:
-            output_sr = 44100
-            original_duration = len(segment) / self.sample_rate
-            output_duration = original_duration / self.playback_speed
-            n_output_samples = int(output_duration * output_sr)
-            if n_output_samples < 100:
-                return
-            from scipy import signal
-            segment = signal.resample(segment, n_output_samples).astype(np.float32)
+            if mode == 'het':
+                from fnt.usv.usv_heterodyne import (
+                    HETERODYNE_OUT_SR, heterodyne_for_playback)
+                output_sr = HETERODYNE_OUT_SR
+                lo_hz = self.spin_het_lo.value() * 1000.0
+                if lo_hz >= self.sample_rate / 2:
+                    self.status_bar.showMessage(
+                        f"LO {lo_hz / 1000:g} kHz is above this recording's "
+                        f"Nyquist ({self.sample_rate / 2000:g} kHz)")
+                    return
+                segment = heterodyne_for_playback(segment, self.sample_rate,
+                                                  lo_hz)
+                if len(segment) < 100:
+                    return
+                rate = 1.0
+            else:
+                output_sr = 44100
+                original_duration = len(segment) / self.sample_rate
+                output_duration = original_duration / self.playback_speed
+                n_output_samples = int(output_duration * output_sr)
+                if n_output_samples < 100:
+                    return
+                from scipy import signal
+                segment = signal.resample(segment, n_output_samples).astype(np.float32)
+                rate = self.playback_speed
             import time as _time
             sd.play(segment, output_sr)
             # Record the wall-clock start as close to sd.play() as possible so
@@ -17833,7 +17907,9 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
             self.is_playing = True
-            self.btn_play.setText("Stop")
+            self._playback_mode = mode
+            self._playback_rate = rate
+            (self.btn_het if mode == 'het' else self.btn_play).setText("Stop")
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
@@ -17848,7 +17924,10 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         self.is_playing = False
+        self._playback_mode = None
         self.btn_play.setText("Play")
+        if hasattr(self, 'btn_het'):
+            self.btn_het.setText("Het")
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
@@ -18146,7 +18225,8 @@ class MADMainWindow(QMainWindow):
             _time.time() - self._playback_start_time - self._playback_latency
         )
         elapsed = max(0.0, elapsed)
-        audio_elapsed = elapsed * self.playback_speed
+        audio_elapsed = elapsed * getattr(self, '_playback_rate',
+                                          self.playback_speed)
         current_pos = self._playback_start_s + audio_elapsed
         if current_pos >= self._playback_end_s:
             self._stop_playback()
