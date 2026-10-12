@@ -182,8 +182,13 @@ def _store_one(d, mask, meta, neighbors=None):
 def test_training_still_sees_a_rejection_as_all_background():
     own = crop_shape()
     with tempfile.TemporaryDirectory() as d:
-        os.rename(_store_one(d, own, meta_for(20, 40, 29, 34), neighbour()),
-                  os.path.join(d, "training_data.h5"))
+        store = _store_one(d, own, meta_for(20, 40, 29, 34), neighbour())
+        # The neighbour is a confirmed call in the store; training rebuilds
+        # windows from labels. Named to sort after the rejection (tile 0).
+        ms.td_save_example(store, tone_patch(), neighbour(),
+                           meta_for(60, 70, 45, 55, kind="label", blob_id=8),
+                           "z_lbl")
+        os.rename(store, os.path.join(d, "training_data.h5"))
         _s, t, w = mx.collect_training_examples(
             d, tile_time_frames=W, tile_freq_bins=H, placements=1, seed=0)
     assert t[0].max() < 0.5, "a rejection's own shape must not become a target"
