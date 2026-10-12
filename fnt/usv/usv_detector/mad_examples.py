@@ -421,11 +421,11 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
             continue
         m = ex["mask"] > 0
         if not m.any():
-            # A rejected *prediction* is stored as a hard negative with its
-            # component deliberately zeroed — nothing in that patch is a call.
-            # It is still a decision the reviewer made and wants to see, so
-            # rebuild the box from the metadata every example carries. A true
-            # hand-painted negative has no such box and is still skipped.
+            # A rejection saved before 2026-10-11 has no shape of its own (see
+            # mad_fix_rejection_shapes, which repairs them). It is still a
+            # decision the reviewer made and wants to see, so rebuild the box
+            # from the metadata every example carries. A true hand-painted
+            # negative has no such box and is still skipped.
             box = _bbox_from_meta(meta)
             if box is None:
                 continue

@@ -149,7 +149,10 @@ def split_example(mask: np.ndarray, meta: Dict) -> Dict:
     # pixels were training the model that a call a human had just accepted was
     # background. ('rejected' is different — a demoted confirmed call that
     # keeps its own trace — so it goes through the geometry path below.)
-    if _ms.example_kind(meta) == "negative":
+    # A negative stamped ``mask_is_own`` already holds just its own shape
+    # (mad_fix_rejection_shapes, and every rejection saved since); moving that
+    # to `neighbors` would protect the rejected call as if it were confirmed.
+    if _ms.example_kind(meta) == "negative" and not meta.get("mask_is_own"):
         out["own"] = np.zeros_like(mask)
         out["neighbors"] = mask
         out["kept"] = 0
@@ -432,20 +435,20 @@ def project_stores(project_dir: str,
                    extra_dirs: Sequence[str] = ()) -> List[str]:
     """Every store a project's labels live in: the training store, plus the
     ``.mad`` beside each recording the project references."""
+    # Through the project loader, not the raw JSON: ``audio_files`` became a
+    # list of registry entries (dicts), so reading it as path strings found no
+    # stores at all, and the cache moved out of ``models/``.
+    from .mad_project import MADProjectConfig
     paths: List[str] = []
-    td = os.path.join(project_dir, "models", "training_data",
-                      _ms.TRAINING_STORE_NAME)
+    wavs: List[str] = []
+    try:
+        cfg = MADProjectConfig.load(project_dir)
+        td = os.path.join(cfg.training_data_dir, _ms.TRAINING_STORE_NAME)
+        wavs = [str(e.path) for e in cfg.audio_entries()]
+    except Exception:
+        td = os.path.join(project_dir, "training_data", _ms.TRAINING_STORE_NAME)
     if os.path.isfile(td):
         paths.append(td)
-    info = os.path.join(project_dir, "mad_project_info.json")
-    wavs: List[str] = []
-    if os.path.isfile(info):
-        try:
-            with open(info) as fh:
-                cfg = json.load(fh)
-            wavs = [str(w) for w in (cfg.get("audio_files") or [])]
-        except Exception:
-            wavs = []
     for wav in wavs:
         for cand in _ms.store_paths_for(wav):
             if os.path.isfile(cand) and cand not in paths:

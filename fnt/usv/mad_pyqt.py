@@ -10853,7 +10853,10 @@ class MADMainWindow(QMainWindow):
         # reject renders as a real outline rather than a filled bounding box.
         # Keyed by example id, which is what the CSV row carries as its call id.
         demoted = {}
-        for store in self._example_store_paths(wav):
+        # Recording's own .mad first: it is the master copy, and the project
+        # store is a cache rebuilt at training time. With the cache first, a
+        # rejection repaired in the .mad still drew from its stale cache copy.
+        for store in reversed(self._example_store_paths(wav)):
             try:
                 from fnt.usv.usv_detector.mad_examples import (
                     _examples_to_annotations)
@@ -16582,9 +16585,10 @@ class MADMainWindow(QMainWindow):
         """Save one connected-component mask as a self-contained example.
         ``comp`` is ``(f0, f1, t0, t1, local_bool)``. Returns the example id.
 
-        ``kind='negative'`` stores the same spectrogram patch with an **empty**
-        mask, so training supervises every pixel of it as "not a call". Used to
-        turn rejections into hard negatives; see :meth:`_save_rejection_negative`.
+        ``kind='negative'`` stores a rejected prediction: ``mask`` is the
+        rejected call's own shape (what the overlay draws and re-runs suppress),
+        and training supervises the whole patch as "not a call" apart from any
+        confirmed neighbours. See :meth:`_save_rejection_negative`.
 
         With a project: saves to ``training_data.h5`` (consolidated store).
         Without: saves to the per-wav ``_FNT_masks.h5`` sibling so labels
@@ -16729,29 +16733,23 @@ class MADMainWindow(QMainWindow):
             if v not in (None, ''):
                 meta[k] = v
         if kind == 'negative':
-            # A hard negative supervises the REJECTED blob as background — not
-            # the whole patch. Zeroing everything would also erase any genuine
-            # confirmed call sharing the crop (rejections often sit right next
-            # to real calls), teaching the model that a call it was elsewhere
-            # told to find is background. Drop this component, keep the rest.
-            keep = mask_patch.copy()
-            if tw > 0:
-                keep[f0:f1, lt0:lt0 + tw] = 0
-            confirmed = getattr(sg, 'mask', None)
-            if confirmed is not None and getattr(confirmed, 'size', 0):
-                win = confirmed[:, pt0:pt0 + W]
-                hh = min(keep.shape[0], win.shape[0])
-                ww = min(keep.shape[1], win.shape[1])
-                if hh > 0 and ww > 0:
-                    np.maximum(keep[:hh, :ww],
-                               (win[:hh, :ww] > 0).astype(np.uint8),
-                               out=keep[:hh, :ww])
-                    if tw > 0:
-                        # The rejected component itself is never positive.
-                        keep[f0:f1, lt0:lt0 + tw] = np.where(
-                            local[:, :tw].astype(bool), 0,
-                            keep[f0:f1, lt0:lt0 + tw])
-            mask_patch = keep
+            # A rejection keeps the store's contract like everything else:
+            # ``mask`` is the rejected call's OWN shape, ``neighbors`` the
+            # confirmed calls sharing the window. Training ignores ``mask`` on a
+            # negative (the target is all background) and excludes the
+            # neighbours from the loss, so a real call in the corner of a
+            # rejection is never taught as noise.
+            #
+            # This used to store the neighbours IN ``mask`` and the rejected
+            # shape nowhere. Three things broke: reopening a file drew every
+            # rejection as a bounding box (no shape to draw); the re-run
+            # suppressor painted the neighbours instead of the rejected call;
+            # and because ``neighbors`` is written exclusive of ``mask``, it
+            # came out empty -- so the confirmed calls the old code meant to
+            # protect were trained as background after all. 2,125 rejections
+            # in the anosmia project were stored that way; see
+            # mad_fix_rejection_shapes for the repair.
+            meta['mask_is_own'] = True
         # Labels always save to the sibling h5 next to the recording — one
         # source of truth per wav, project or not. The project's consolidated
         # training_data.h5 is rebuilt from the Audio list at train time.
