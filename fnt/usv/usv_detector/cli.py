@@ -354,6 +354,11 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
                         "(default: 3).")
     g.add_argument('--run-name', default='',
                    help="Name for the model run dir (default: timestamped).")
+    g.add_argument('--init-from', default='', metavar='WEIGHTS',
+                   help="Fine-tune: start from this weights.pt (or its run "
+                        "folder) instead of ImageNet. With --split-mode file "
+                        "the parent's held-out recordings stay held out. "
+                        "Pair with a lower --lr (e.g. 3e-4) and --patience.")
 
 
 #: argparse dest -> UNetTrainingConfig field, for every training flag.
@@ -368,6 +373,7 @@ _TRAIN_FIELD = {
     'faint_db': 'faint_db_range',
     'max_per_recording': 'max_examples_per_recording',
     'tile_placements': 'tile_placements', 'run_name': 'run_name',
+    'init_from': 'init_from',
 }
 
 
@@ -462,6 +468,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
                   f"group(s) held out, "
                   f"{info.get('n_train_tiles', 0)} train / "
                   f"{info.get('n_val_tiles', 0)} val tiles", flush=True)
+            if info.get('inherited'):
+                print("  (held-out recordings inherited from the parent model)",
+                      flush=True)
             if not info.get('val_held_out', True):
                 print("  WARNING: validation is not held out at the recording "
                       "level — val scores will flatter the model.",
@@ -496,6 +505,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
           f"{'on' if cfg.augment else 'off'}"
           f"{'+faint' if cfg.augment and cfg.augment_faint else ''}, "
           f"cap={cfg.max_examples_per_recording or 'off'})", flush=True)
+    if cfg.init_from:
+        print(f"  fine-tuning from {cfg.init_from}", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:

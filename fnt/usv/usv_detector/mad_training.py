@@ -142,6 +142,14 @@ class UNetTrainingConfig:
 
     wav_paths: List[str] = field(default_factory=list)
 
+    # Fine-tune: start from this checkpoint (a weights.pt or its run folder)
+    # instead of ImageNet. A human-in-the-loop round adds a few recordings to
+    # a model that already works, so retraining from scratch each round costs
+    # hours to relearn what the last run knew. With a file-level split the
+    # parent's held-out recordings stay held out (see _split_tiles), so the
+    # child is scored on recordings NEITHER run trained on.
+    init_from: str = ""
+
     def resolve_run_dir(self, n_examples: int = 0) -> str:
         if self.run_name:
             name = self.run_name
@@ -265,7 +273,7 @@ def grouped_split(
 def _split_tiles(
     groups: List[Tuple[str, str]], n_total: int, val_fraction: float,
     seed: int = 42, positives: Optional[np.ndarray] = None,
-    mode: str = "call",
+    mode: str = "call", fixed_val_groups: Optional[List[str]] = None,
 ) -> Dict:
     """Pick the strongest split the label set supports, and say which one.
 
@@ -294,6 +302,30 @@ def _split_tiles(
         return bool(positives[train_idx].any()) and bool(positives[val_idx].any())
 
     degraded: List[str] = []
+
+    # A fine-tune inherits its parent's held-out recordings. A fresh seeded
+    # split over a label set that has grown would hand some of the parent's
+    # TRAINING recordings to validation -- recordings the weights have already
+    # fit -- and the score would read high for the wrong reason.
+    if (fixed_val_groups and mode in ('file', 'auto') and groups
+            and len(groups) == n_total):
+        keys = [g[0] for g in groups]
+        fixed = set(fixed_val_groups)
+        val_idx = np.array([i for i, k in enumerate(keys) if k in fixed],
+                           dtype=np.int64)
+        train_idx = np.array([i for i, k in enumerate(keys) if k not in fixed],
+                             dtype=np.int64)
+        if len(val_idx) and len(train_idx) and _usable(train_idx, val_idx):
+            present = sorted(fixed & set(keys))
+            return {
+                'degraded_from': [], 'train_idx': train_idx,
+                'val_idx': val_idx, 'split_level': 'file',
+                'val_groups': present, 'n_groups': len(set(keys)),
+                'n_val_groups': len(present), 'val_held_out': True,
+                'inherited': True,
+            }
+        degraded.append('inherited')
+
     levels = [('file', [g[0] for g in groups] if groups else []),
               ('call', [g[1] for g in groups] if groups else [])]
     if mode == 'file':
@@ -840,6 +872,40 @@ def make_lr_scheduler(optim, cfg):
         min_lr=float(cfg.learning_rate) * 1e-3)
 
 
+#: Checkpoint fields a fine-tune must share with its parent. Weights learned on
+#: one spectrogram grid or intensity scale mean nothing on another, and the
+#: failure would not be loud -- just a worse model.
+_INIT_MUST_MATCH = ('model_arch', 'encoder_name', 'nperseg', 'noverlap',
+                    'nfft', 'db_min', 'db_max', 'db_norm', 'tile_freq_bins',
+                    'tile_time_frames')
+
+
+def load_init_checkpoint(cfg: UNetTrainingConfig) -> Dict:
+    """The checkpoint ``cfg.init_from`` names, refused on any mismatch.
+
+    Returns the checkpoint dict with its resolved path under ``'_path'``.
+    """
+    import torch
+    path = cfg.init_from
+    if os.path.isdir(path):
+        path = os.path.join(path, 'weights.pt')
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Cannot fine-tune: no checkpoint at {path}")
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict) or 'state_dict' not in ckpt:
+        raise RuntimeError(f"Cannot fine-tune: {path} is not a MAD checkpoint")
+    run = asdict(cfg)
+    bad = [f"{k}: checkpoint {ckpt[k]!r}, this run {run[k]!r}"
+           for k in _INIT_MUST_MATCH
+           if k in ckpt and k in run and ckpt[k] != run[k]]
+    if bad:
+        raise RuntimeError(
+            f"Cannot fine-tune from {path} -- it was trained on different "
+            "settings:\n  " + "\n  ".join(bad))
+    ckpt['_path'] = os.path.abspath(path)
+    return ckpt
+
+
 def train_unet(
     cfg: UNetTrainingConfig,
     progress: Optional[ProgressFn] = None,
@@ -934,9 +1000,17 @@ def train_unet(
     # split that is balanced by tile count can still be empty of calls on one
     # side, which silently produces a model that only ever predicts background.
     tile_positive = (targets.reshape(n_total, -1) > 0.5).any(axis=1)
+    # Read (and vet) the parent before splitting: a fine-tune's validation set
+    # is its parent's held-out recordings.
+    init_ckpt = (load_init_checkpoint(cfg)
+                 if getattr(cfg, 'init_from', '') else None)
+    inherit = None
+    if init_ckpt is not None and init_ckpt.get('split_level') == 'file':
+        inherit = list(init_ckpt.get('val_groups') or [])
     split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed,
                          positives=tile_positive,
-                         mode=getattr(cfg, 'split_mode', 'call'))
+                         mode=getattr(cfg, 'split_mode', 'call'),
+                         fixed_val_groups=inherit)
     train_idx, val_idx = split['train_idx'], split['val_idx']
 
     # Refuse to burn a GPU run on an unlearnable split. Reaching here means no
@@ -986,6 +1060,7 @@ def train_unet(
             'n_groups': split['n_groups'],
             'n_val_groups': split['n_val_groups'],
             'val_groups': split['val_groups'],
+            'inherited': bool(split.get('inherited')),
             'n_train_tiles': int(len(train_idx)), 'n_val_tiles': n_val,
             'n_label_recordings': n_label_recordings,
         })
@@ -1040,9 +1115,14 @@ def train_unet(
                                    'device_desc': dev_desc,
                                    'requested': cfg.device})
     model = build_model(
-        cfg.model_arch, cfg.encoder_name, cfg.encoder_weights,
+        cfg.model_arch, cfg.encoder_name,
+        # A fine-tune overwrites every weight next, so skip the download.
+        cfg.encoder_weights if init_ckpt is None else None,
         in_channels=1, classes=1,
-    ).to(device)
+    )
+    if init_ckpt is not None:
+        model.load_state_dict(init_ckpt['state_dict'])
+    model = model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
     scheduler = make_lr_scheduler(optim, cfg)
 
@@ -1271,6 +1351,10 @@ def train_unet(
                     # labels says which run it was -- the file is always
                     # called weights.pt, which says nothing.
                     'run_name': run_dir.name,
+                    # The parent of a fine-tune, so a chain of rounds can
+                    # be traced back to where it started.
+                    'init_from': (init_ckpt or {}).get('_path', ''),
+                    'split_inherited': bool(split.get('inherited')),
                     # The threshold this checkpoint actually scores best at.
                     # 0.5 is only a convention, and on sparse masks the best
                     # operating point is routinely elsewhere — carrying it with
@@ -1320,6 +1404,7 @@ def train_unet(
         # How the split was made. Every val_* number above must be read through
         # this: only 'file' means "measured on a recording the model never saw".
         'split_level': split['split_level'],
+        'split_inherited': bool(split.get('inherited')),
         'val_held_out': split['val_held_out'],
         'n_groups': split['n_groups'],
         'n_val_groups': split['n_val_groups'],
