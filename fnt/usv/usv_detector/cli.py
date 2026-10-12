@@ -596,41 +596,6 @@ def _cmd_embeddings(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 # Parser
 # ----------------------------------------------------------------------
-def _cmd_audit_draw(args: argparse.Namespace) -> int:
-    from .mad_audit import draw_audit
-    try:
-        rows = draw_audit(
-            args.source, args.out, per_trial_active=args.active,
-            per_trial_random=args.random, window_s=args.window_s,
-            seed=args.seed, exclude_projects=args.exclude_project,
-            condition_keywords=args.condition, edge_hours=args.edge_hours,
-            progress=lambda m: print(m, flush=True))
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr, flush=True)
-        return 1
-    print(f"Done — {len(rows)} clip(s) in {args.out}. Open it in MAD, label "
-          "every call, and mark each clip review complete.", flush=True)
-    return 0
-
-
-def _cmd_audit_score(args: argparse.Namespace) -> int:
-    from .mad_audit import format_table, score_audit
-    res = score_audit(
-        args.audit, args.model, thresholds=args.thresholds,
-        min_blob_pixels=args.min_blob_pixels, merge=args.merge,
-        merge_gap_s=args.merge_gap_s, iou_min=args.iou, device=args.device,
-        progress=lambda m: print(m, flush=True))
-    if not res['n_scored']:
-        print(f"No clip is marked review complete yet "
-              f"({res['n_incomplete']} waiting).", flush=True)
-        return 1
-    print(format_table(res, args.show_threshold), flush=True)
-    if res['n_incomplete']:
-        print(f"({res['n_incomplete']} clip(s) not yet review complete were "
-              "skipped.)", flush=True)
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='mad',
@@ -713,49 +678,6 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument('--device', default='auto',
                     choices=['auto', 'cuda', 'mps', 'cpu'])
     pe.set_defaults(func=_cmd_embeddings)
-
-    # audit
-    pd = sub.add_parser(
-        'audit-draw',
-        help="Cut a held-out audit set of clips into a new MAD project.")
-    pd.add_argument('--out', required=True,
-                    help="New folder for the audit project.")
-    pd.add_argument('--source', required=True, nargs='+',
-                    help="Trial folders to draw from (one folder per trial).")
-    pd.add_argument('--exclude-project', nargs='*', default=[],
-                    help="Training project(s) whose recordings must never be "
-                         "drawn.")
-    pd.add_argument('--active', type=int, default=6,
-                    help="Activity-screened clips per trial (default: 6).")
-    pd.add_argument('--random', type=int, default=4,
-                    help="Uniformly random clips per trial (default: 4).")
-    pd.add_argument('--window-s', type=float, default=60.0)
-    pd.add_argument('--edge-hours', type=float, default=2.0,
-                    help="Skip this much at each trial's start and end "
-                         "(setup/teardown; default: 2).")
-    pd.add_argument('--condition', nargs='+', default=['mmz', 'saline'],
-                    help="Keywords that name a condition in the folder name.")
-    pd.add_argument('--seed', type=int, default=20261009)
-    pd.set_defaults(func=_cmd_audit_draw)
-
-    ps = sub.add_parser('audit-score',
-                        help="Score a model on an audit set's completed clips.")
-    ps.add_argument('--audit', required=True, help="Audit project folder.")
-    ps.add_argument('--model', required=True,
-                    help="weights.pt, or the model run folder.")
-    ps.add_argument('--thresholds', type=float, nargs='+',
-                    default=[0.3, 0.4, 0.5, 0.6, 0.7])
-    ps.add_argument('--min-blob-pixels', type=int, default=50)
-    ps.add_argument('--no-merge', dest='merge', action='store_false')
-    ps.add_argument('--merge-gap-s', type=float, default=0.01)
-    ps.add_argument('--iou', type=float, default=0.3,
-                    help="Box IoU for a detection to count as the call "
-                         "(default: 0.3).")
-    ps.add_argument('--device', default='auto',
-                    choices=['auto', 'cuda', 'mps', 'cpu'])
-    ps.add_argument('--show-threshold', type=float, default=None,
-                    help="Threshold to print (default: best overall F1).")
-    ps.set_defaults(func=_cmd_audit_score)
 
     return p
 

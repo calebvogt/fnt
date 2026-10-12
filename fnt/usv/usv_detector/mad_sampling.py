@@ -37,6 +37,8 @@ import os
 import random
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
@@ -364,3 +366,104 @@ def sample_paths(paths: Iterable[str], spec: SampleSpec,
                  exclude: Iterable[str] = ()) -> SampleResult:
     """Draw a subset of ``paths`` according to ``spec`` — prepare, then draw."""
     return draw(prepare(paths, spec.channel_mode, spec.channels, exclude), spec)
+
+
+# ----------------------------------------------------------------------
+# Picking recordings worth reviewing
+# ----------------------------------------------------------------------
+# What a targeted QC batch is built from: which trial, mic and time of day a
+# recording belongs to, and whether anything tonal happens in it at all.
+# (These outlived the held-out clip audit they were written for, dropped
+# 2026-10-12 in favour of focused review of whole recordings.)
+
+#: Avisoft multichannel naming: ch<mic><YYYY-MM-DD>_<HH-MM-SS>_<seq>.wav
+_AVISOFT_NAME = re.compile(
+    r"^ch(\d)(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_(\d+)\.wav$", re.I)
+
+
+@dataclass(frozen=True)
+class Recording:
+    path: str
+    trial: str
+    condition: str
+    mic: str
+    start: datetime
+
+
+def parse_recording(path: str, trial: str, condition: str
+                    ) -> Optional[Recording]:
+    """A recording's mic and start time from its Avisoft name, or None."""
+    m = _AVISOFT_NAME.match(os.path.basename(path))
+    if not m:
+        return None
+    try:
+        start = datetime.strptime(f"{m.group(2)} {m.group(3)}",
+                                  "%Y-%m-%d %H-%M-%S")
+    except ValueError:
+        return None
+    return Recording(path=path, trial=trial, condition=condition,
+                     mic=m.group(1), start=start)
+
+
+def phase_of(t: datetime, day_start: int = 7, day_end: int = 19) -> str:
+    """'day' or 'night' by clock hour. Voles are most vocal around dark, so a
+    batch drawn only from daytime would miss the bulk of the calling."""
+    return "day" if day_start <= t.hour < day_end else "night"
+
+
+def condition_of(folder: str, keywords: Sequence[str]) -> str:
+    """The first of ``keywords`` in a trial folder's name ('' if none)."""
+    low = os.path.basename(os.path.normpath(folder)).lower()
+    for k in keywords:
+        if k.lower() in low:
+            return k.lower()
+    return ""
+
+
+def trial_of(folder: str) -> str:
+    """'T005' from 'T005_prairie_anosmic-saline'; the folder name otherwise."""
+    name = os.path.basename(os.path.normpath(folder))
+    m = re.match(r"^(T\d+)", name, re.I)
+    return m.group(1).upper() if m else name
+
+
+def activity_per_window(audio, sr: int, window_s: float, *,
+                        band_hz: Tuple[float, float] = (18_000, 100_000),
+                        peak_db: float = 12.0, max_width: float = 0.15,
+                        nfft: int = 512):
+    """Tonal-frame count in each consecutive ``window_s`` window.
+
+    A frame counts when its strongest in-band bin stands ``peak_db`` above that
+    bin's median (the window's noise floor) while under ``max_width`` of the
+    band is lit -- a narrow ridge, as a USV is, rather than a broadband click
+    or knock. Deliberately crude and deliberately unlike the model: it only
+    has to tell "something tonal happened here" from "nothing did", without
+    sharing the model's blind spots. A tone that never stops is its own floor
+    and does not count; one that switches on and off does, so start the band
+    above it (25 kHz clears the ~21 kHz tone in the anosmia recordings).
+    """
+    import numpy as np
+    x = np.asarray(audio, dtype=np.float32)
+    win = int(round(window_s * sr))
+    if win <= 0 or x.size < win:
+        return np.zeros(0)
+    n_win = x.size // win
+    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
+    band = (freqs >= band_hz[0]) & (freqs <= band_hz[1])
+    if not band.any():
+        return np.zeros(n_win)
+    taper = np.hanning(nfft).astype(np.float32)
+    out = np.zeros(n_win)
+    for w in range(n_win):
+        seg = x[w * win:(w + 1) * win]
+        n_fr = seg.size // nfft
+        if n_fr < 4:
+            continue
+        frames = seg[:n_fr * nfft].reshape(n_fr, nfft) * taper
+        p = np.abs(np.fft.rfft(frames, axis=1))[:, band] ** 2
+        db = 10.0 * np.log10(p + 1e-20)
+        excess = db - np.median(db, axis=0, keepdims=True)
+        peak = excess.max(axis=1)
+        width = (excess > 6.0).mean(axis=1)
+        out[w] = float(np.count_nonzero((peak > peak_db) & (width < max_width)))
+    return out
