@@ -252,6 +252,82 @@ def test_closing_mid_run_offers_stop_or_cancel_not_keep_running(monkeypatch):
         w._quit_when_idle = False
 
 
+
+# ---------------------------------------------------------------------------
+# --infer / --inference-window-only: a dictated inference run, resumable, with
+# only the Running Inference window on screen.
+# ---------------------------------------------------------------------------
+def test_infer_flags_are_validated():
+    for argv in (["--infer", "m"],                                 # no project
+                 ["--project", "p", "--infer", "m", "--train"],
+                 ["--project", "p", "--inference-window-only"]):
+        with pytest.raises(SystemExit):
+            M.main(argv)
+
+
+def test_launch_inference_runs_only_what_is_not_done(monkeypatch, tmp_path):
+    import fnt.usv.usv_detector.mad_batch as MB
+    w = gui()
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "weights.pt").write_bytes(b"x")
+    monkeypatch.setattr(w, "audio_files", ["a.wav", "b.wav", "c.wav"])
+    monkeypatch.setattr(w, "_is_missing", lambda p: False)
+    monkeypatch.setattr(MB, "completed_by_settings", lambda *a, **k: set())
+    monkeypatch.setattr(MB, "partition_done",
+                        lambda wavs, s, md, **k: (wavs[1:], wavs[:1]))
+    started = {}
+    monkeypatch.setattr(w, "_start_inference",
+                        lambda cfg, wavs, **k: started.update(cfg=cfg, wavs=wavs,
+                                                              **k))
+    w.set_post_inference_settings(threshold=0.5, min_blob=50, merge=False)
+    assert w.launch_inference(str(run)) == 2
+    assert started["wavs"] == ["b.wav", "c.wav"]
+    assert started["skip_scope_prompt"] is True
+    cfg = started["cfg"]
+    assert cfg.model_path.endswith("weights.pt")
+    assert (cfg.threshold, cfg.min_blob_pixels, cfg.merge_consecutive) == \
+        (0.5, 50, False)
+
+
+def test_closing_the_inference_window_mid_run_asks_and_keeps_it(monkeypatch):
+    w = gui()
+    quit_ = _Quit(monkeypatch)
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    w.btn_infer_pause.setEnabled(True)            # a run is going
+    stopped, shown = [], []
+
+    class Worker:
+        def request_stop(self):
+            stopped.append(1)
+    monkeypatch.setattr(w, "_infer_worker", Worker(), raising=False)
+    monkeypatch.setattr(w, "_show_infer_progress_dialog",
+                        lambda: shown.append(1))
+    try:
+        monkeypatch.setattr(w, "_window_only_close_prompt",
+                            lambda what="training": "cancel")
+        w._on_infer_window_closed()
+        assert not stopped and shown == [1] and quit_.n == 0
+
+        monkeypatch.setattr(w, "_window_only_close_prompt",
+                            lambda what="training": "stop")
+        w._on_infer_window_closed()
+        assert stopped == [1] and shown == [1, 1]
+        assert quit_.n == 0, "quits after the summary, not on the close"
+    finally:
+        w.btn_infer_pause.setEnabled(False)
+
+
+def test_closing_the_inference_window_after_the_run_quits(monkeypatch):
+    w = gui()
+    quit_ = _Quit(monkeypatch)
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    w.btn_infer_pause.setEnabled(False)           # nothing running
+    w._on_infer_window_closed()
+    QApplication.instance().processEvents()
+    assert quit_.n == 1
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

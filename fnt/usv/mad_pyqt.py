@@ -11456,6 +11456,67 @@ class MADMainWindow(QMainWindow):
         if harmonics is not None:
             self.chk_post_harmonics.setChecked(bool(harmonics))
 
+    def launch_inference(self, model: str) -> int:
+        """Run inference on every recording in the project, as a dictated or
+        command-line launch (``--infer``). Returns how many files it started.
+
+        Detection settings come from the panel (set them first with
+        :meth:`set_post_inference_settings`). Recordings this model already
+        analysed at these settings are skipped without asking -- the run logs
+        and each store's provenance say which -- so a stopped run resumes by
+        launching it again.
+        """
+        from fnt.usv.usv_detector.mad_batch import (
+            RunSettings, completed_by_settings, partition_done)
+        from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
+        quit_after = getattr(self, '_window_only', False)
+        path = model
+        if os.path.isdir(path):
+            path = os.path.join(path, 'weights.pt')
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Model missing", f"No model at {model}")
+            if quit_after:
+                QTimer.singleShot(0, QApplication.instance().quit)
+            return 0
+        self._infer_group_harmonics = self.chk_post_harmonics.isChecked()
+        cfg = MADInferenceConfig(
+            model_path=path,
+            threshold=self.spin_post_threshold.value(),
+            min_blob_pixels=self.spin_post_min_blob.value(),
+            merge_consecutive=self.chk_post_merge.isChecked(),
+            merge_max_gap_s=self.spin_post_merge_gap.value(),
+            device=self._device_value(self.combo_infer_device),
+            save_blob_csv=False,   # the .mad holds the run; CSV is an export
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
+            training_data_dir=(self._project.training_data_dir
+                               if self._project else ""),
+            **self._infer_perf_kwargs(),
+        )
+        wavs = [w for w in self.audio_files if w and not self._is_missing(w)]
+        settings = RunSettings.from_config(cfg)
+        manifest_done: set = set()
+        root = self._batch_run_root()
+        if root:
+            try:
+                manifest_done = completed_by_settings(root, settings)
+            except Exception:
+                pass
+        todo, done = partition_done(wavs, settings, manifest_done)
+        self._log(f"Launched inference with {os.path.basename(os.path.dirname(path))}: "
+                  f"{len(done)} of {len(wavs)} recording(s) already analysed "
+                  f"at these settings, {len(todo)} to run")
+        if not todo:
+            QMessageBox.information(
+                self, "Nothing to analyse",
+                f"All {len(wavs)} recording(s) are already analysed by this "
+                "model at these settings.")
+            if quit_after:
+                QTimer.singleShot(0, QApplication.instance().quit)
+            return 0
+        self._start_inference(cfg, todo, reporter=self.infer_panel,
+                              skip_scope_prompt=True)
+        return len(todo)
+
     def launch_training(self, overrides=None, infer_after: bool = False):
         """Start a run as if Run Training were pressed, with ``overrides``
         (``UNetTrainingConfig`` fields) applied on top of the panel.
@@ -11642,13 +11703,16 @@ class MADMainWindow(QMainWindow):
         if self._train_dialog is not None:
             self._train_dialog.close()
 
-    def _window_only_close_prompt(self) -> str:
+    def _window_only_close_prompt(self, what: str = "training") -> str:
         """'stop' or 'cancel' for closing the only window mid-run. There is
         no 'keep running' here: with the main window hidden, nothing would be
         left on screen to show or stop the run."""
-        box = QMessageBox(self._train_dialog or self)
-        box.setWindowTitle("Training in progress")
-        box.setText("A training run is still in progress.")
+        parent = (self._train_dialog if what == "training"
+                  else getattr(self, '_infer_dialog', None)) or self
+        box = QMessageBox(parent)
+        box.setWindowTitle(f"{what.capitalize()} in progress")
+        box.setText(f"A{'n' if what[0] in 'aeiou' else ''} {what} run is "
+                    "still in progress.")
         box.setInformativeText("Stop it and close MAD?")
         stop = box.addButton("Stop training", QMessageBox.DestructiveRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
@@ -11854,9 +11918,26 @@ class MADMainWindow(QMainWindow):
 
     def _on_infer_window_closed(self):
         """The user closed the floating progress window. The run goes on; its
-        controls go back to the sidebar, and the user is told where."""
+        controls go back to the sidebar, and the user is told where.
+
+        Launched with ``--inference-window-only`` that window is all of MAD:
+        mid-run, closing it asks whether to stop (Cancel puts it back); once
+        the run is over, it quits."""
         running = bool(getattr(self, 'btn_infer_pause', None) is not None
                        and self.btn_infer_pause.isEnabled())
+        if getattr(self, '_window_only', False):
+            self._close_infer_progress_dialog()
+            if not running:
+                QTimer.singleShot(0, QApplication.instance().quit)
+                return
+            if self._window_only_close_prompt("inference") == 'stop':
+                worker = getattr(self, '_infer_worker', None)
+                if worker is not None:
+                    worker.request_stop()
+            # Either way the window comes back: to keep running, or to show
+            # the run winding down to its summary, after which MAD quits.
+            self._show_infer_progress_dialog()
+            return
         self._close_infer_progress_dialog()
         if running:
             msg = ("Inference is still running — its progress, Pause and Stop "
@@ -20100,6 +20181,13 @@ class MADMainWindow(QMainWindow):
             # Refresh the Audio-list status ticks, then auto-open something for
             # review: the currently-previewed file if it was inferred, else the
             # first target file.
+            if getattr(self, '_window_only', False):
+                # Nothing but this run is on screen: show its summary, then
+                # quit. The Audio-list refresh and the auto-opened file are
+                # for a main window that is not there.
+                self._show_inference_summary_dialog(results, cfg)
+                QTimer.singleShot(0, QApplication.instance().quit)
+                return
             self._scan_all_file_counts()
             self._update_run_button()
             active = self._active_wav_path()
@@ -20131,6 +20219,9 @@ class MADMainWindow(QMainWindow):
                 self.btn_infer_pause.setEnabled(False)
             progress.append("\nERROR:\n" + msg)
             progress.mark_done(ok=False)
+            if getattr(self, '_window_only', False):
+                QMessageBox.critical(None, "Inference failed", msg[:2000])
+                QTimer.singleShot(0, QApplication.instance().quit)
 
         def on_device(dev: str):
             desc = dev
@@ -20343,6 +20434,16 @@ def _launch_parser():
                         "and live predictions), not MAD's main window. "
                         "Closing it quits MAD. Not combinable with "
                         "--infer-after, whose progress would be invisible.")
+    p.add_argument("--infer", default=None, metavar="MODEL",
+                   help="Run inference over the project's recordings with "
+                        "this model (weights.pt or its run folder), skipping "
+                        "recordings already analysed at the same settings. "
+                        "Detection settings: the --infer-* flags, else the "
+                        "panel's.")
+    p.add_argument("--inference-window-only", action="store_true",
+                   help="With --infer: show only the Running Inference "
+                        "window (progress, Pause, Stop), not MAD's main "
+                        "window. MAD quits after the run's summary.")
     p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
                    help="Show only these recordings in the Audio list: wav "
                         "paths, bare filenames, and/or .txt files listing "
@@ -20395,10 +20496,17 @@ def main(argv=None):
                                       or args.focus):
         parser.error("--training-window-only needs --train, and does not "
                      "combine with --infer-after or --focus")
+    if args.infer and (args.train or not args.project):
+        parser.error("--infer needs --project and does not combine with "
+                     "--train (use --infer-after)")
+    if args.inference_window_only and (not args.infer or args.focus):
+        parser.error("--inference-window-only needs --infer, and does not "
+                     "combine with --focus")
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
-    apply_launch_window_mode(win, app, args.training_window_only)
+    apply_launch_window_mode(
+        win, app, args.training_window_only or args.inference_window_only)
     if args.project:
         from fnt.usv.usv_detector.cli import training_overrides
         overrides = training_overrides(args)
@@ -20430,6 +20538,16 @@ def main(argv=None):
                     win.launch_training(overrides,
                                         infer_after=args.infer_after)
                 QTimer.singleShot(500, _launch)
+            if args.infer and win._project is not None:
+                def _launch_infer():
+                    win.set_post_inference_settings(
+                        threshold=args.infer_threshold,
+                        min_blob=args.infer_min_blob,
+                        merge=args.infer_merge,
+                        merge_gap=args.infer_merge_gap,
+                        harmonics=args.infer_harmonics)
+                    win.launch_inference(args.infer)
+                QTimer.singleShot(500, _launch_infer)
         QTimer.singleShot(0, _start)
     if QApplication.instance() is app:
         sys.exit(app.exec_())
