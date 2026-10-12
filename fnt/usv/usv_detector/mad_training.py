@@ -42,6 +42,12 @@ class UNetTrainingConfig:
     # Seed for the train/val split. Recorded in the run summary so a reported
     # number can be reproduced exactly.
     split_seed: int = 42
+    # Hold out exactly these recordings (wav basenames) instead of drawing a
+    # split. Two runs are only comparable on the same held-out recordings, and
+    # the seeded draw is not stable across retrains: any change to the label
+    # set re-draws it. ``mad train --holdout-from RUN`` fills this from an
+    # earlier run's summary.
+    holdout_groups: Optional[List[str]] = None
     # How train/val is grouped:
     #   'call' — DEFAULT. Hold out whole calls (masks), regardless of which
     #            recording they came from. Every labelled file trains. This is
@@ -262,12 +268,46 @@ def grouped_split(
     return train_idx, val_idx, val_groups
 
 
+def _pinned_split(groups, n_total: int, holdout, usable) -> Dict:
+    """Hold out exactly the recordings in ``holdout``.
+
+    Fails rather than falling back: the point of pinning is that two runs are
+    scored on the same recordings, and a quietly substituted split would make
+    the comparison it exists for meaningless. A pinned recording with no
+    examples any more is reported in ``holdout_missing``, not an error.
+    """
+    if not groups or len(groups) != n_total:
+        raise RuntimeError("A pinned hold-out needs the source recording of "
+                           "every training tile.")
+    want = {os.path.basename(str(h)) for h in holdout}
+    keys = [os.path.basename(str(g[0])) for g in groups]
+    in_val = np.array([k in want for k in keys], dtype=bool)
+    val_idx = np.flatnonzero(in_val).astype(np.int64)
+    train_idx = np.flatnonzero(~in_val).astype(np.int64)
+    present = sorted(set(keys) & want)
+    if len(val_idx) == 0 or len(train_idx) == 0 or not usable(train_idx,
+                                                               val_idx):
+        raise RuntimeError(
+            f"The pinned hold-out ({len(present)} of {len(want)} recordings "
+            "present) leaves calls on only one side of the split.")
+    return {
+        'degraded_from': [], 'train_idx': train_idx, 'val_idx': val_idx,
+        'split_level': 'file', 'val_groups': present,
+        'n_groups': len(set(keys)), 'n_val_groups': len(present),
+        'val_held_out': True, 'pinned': True,
+        'holdout_missing': sorted(want - set(present)),
+    }
+
+
 def _split_tiles(
     groups: List[Tuple[str, str]], n_total: int, val_fraction: float,
     seed: int = 42, positives: Optional[np.ndarray] = None,
-    mode: str = "call",
+    mode: str = "call", holdout: Optional[List[str]] = None,
 ) -> Dict:
     """Pick the strongest split the label set supports, and say which one.
+
+    ``holdout`` pins a recording-level split to those recordings instead -- see
+    :func:`_pinned_split`.
 
     Preference order, because each level is a weaker guarantee than the last:
 
@@ -292,6 +332,9 @@ def _split_tiles(
         if positives is None:
             return True
         return bool(positives[train_idx].any()) and bool(positives[val_idx].any())
+
+    if holdout:
+        return _pinned_split(groups, n_total, holdout, _usable)
 
     degraded: List[str] = []
     levels = [('file', [g[0] for g in groups] if groups else []),
@@ -936,7 +979,8 @@ def train_unet(
     tile_positive = (targets.reshape(n_total, -1) > 0.5).any(axis=1)
     split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed,
                          positives=tile_positive,
-                         mode=getattr(cfg, 'split_mode', 'call'))
+                         mode=getattr(cfg, 'split_mode', 'call'),
+                         holdout=getattr(cfg, 'holdout_groups', None))
     train_idx, val_idx = split['train_idx'], split['val_idx']
 
     # Refuse to burn a GPU run on an unlearnable split. Reaching here means no
@@ -986,6 +1030,8 @@ def train_unet(
             'n_groups': split['n_groups'],
             'n_val_groups': split['n_val_groups'],
             'val_groups': split['val_groups'],
+            'pinned': bool(split.get('pinned')),
+            'holdout_missing': split.get('holdout_missing', []),
             'n_train_tiles': int(len(train_idx)), 'n_val_tiles': n_val,
             'n_label_recordings': n_label_recordings,
         })
@@ -1324,6 +1370,10 @@ def train_unet(
         'n_groups': split['n_groups'],
         'n_val_groups': split['n_val_groups'],
         'val_groups': split['val_groups'],
+        # True when the held-out recordings were dictated (--holdout-from)
+        # rather than drawn, i.e. this run is scored on another run's set.
+        'holdout_pinned': bool(split.get('pinned')),
+        'holdout_missing': split.get('holdout_missing', []),
         'n_label_recordings': n_label_recordings,
         # Recordings the per-recording cap trimmed: {name: {kind: (kept,
         # total)}}. n_labels above is what the store holds; this is what

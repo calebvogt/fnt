@@ -354,6 +354,10 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
                         "(default: 3).")
     g.add_argument('--run-name', default='',
                    help="Name for the model run dir (default: timestamped).")
+    g.add_argument('--holdout-from', default=None, metavar='RUN',
+                   help="Hold out the same recordings as an earlier run (its "
+                        "folder, name, or training_summary.json), so the two "
+                        "are scored on one validation set.")
 
 
 #: argparse dest -> UNetTrainingConfig field, for every training flag.
@@ -368,7 +372,26 @@ _TRAIN_FIELD = {
     'faint_db': 'faint_db_range',
     'max_per_recording': 'max_examples_per_recording',
     'tile_placements': 'tile_placements', 'run_name': 'run_name',
+    'holdout_from': 'holdout_groups',
 }
+
+
+def resolve_holdout(spec: str, project_dir: str = "") -> List[str]:
+    """The recordings an earlier run held out, from its folder, its name
+    (under ``<project>/models``) or its ``training_summary.json``."""
+    import json
+    cands = [spec, os.path.join(spec, 'training_summary.json')]
+    if project_dir:
+        run = os.path.join(project_dir, 'models', spec)
+        cands += [os.path.join(run, 'training_summary.json')]
+    for c in cands:
+        if os.path.isfile(c) and c.endswith('.json'):
+            with open(c) as fh:
+                groups = json.load(fh).get('val_groups') or []
+            if not groups:
+                raise ValueError(f"{c} records no held-out recordings")
+            return [str(g) for g in groups]
+    raise FileNotFoundError(f"No training_summary.json found for '{spec}'")
 
 
 def suppress_training_defaults(p: argparse.ArgumentParser) -> None:
@@ -403,6 +426,10 @@ def training_overrides(args: argparse.Namespace) -> dict:
             continue
         if dest == 'faint_db':
             val = (float(val[0]), float(val[1]))
+        if dest == 'holdout_from':
+            if not val:
+                continue
+            val = resolve_holdout(val, getattr(args, 'project', '') or '')
         out[field_name] = val
     return out
 
@@ -459,9 +486,14 @@ def _cmd_train(args: argparse.Namespace) -> int:
             level = info.get('split_level', '?')
             print(f"  split: {level}-level — "
                   f"{info.get('n_val_groups', 0)}/{info.get('n_groups', 0)} "
-                  f"group(s) held out, "
+                  f"group(s) held out"
+                  f"{' (pinned)' if info.get('pinned') else ''}, "
                   f"{info.get('n_train_tiles', 0)} train / "
                   f"{info.get('n_val_tiles', 0)} val tiles", flush=True)
+            miss = info.get('holdout_missing') or []
+            if miss:
+                print(f"  pinned hold-out: {len(miss)} recording(s) have no "
+                      f"examples now: {', '.join(miss[:5])}", flush=True)
             if not info.get('val_held_out', True):
                 print("  WARNING: validation is not held out at the recording "
                       "level — val scores will flatter the model.",
