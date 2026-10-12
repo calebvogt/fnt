@@ -111,18 +111,41 @@ def test_other_recordings_and_other_grids_do_not_count(tmp_path):
     assert _by_id(td)['A'] is None
 
 
-def test_the_stored_snapshot_is_kept_alongside(tmp_path):
-    """Union, not replacement: a neighbour the snapshot holds stays positive
-    even when nothing else in the store accounts for it."""
+def test_a_snapshot_pixel_no_label_accounts_for_is_dropped(tmp_path):
+    """Replacement, not union. Snapshots were read from the canvas, which also
+    held pending and rejected detections -- 15,368 snapshot pixels in
+    mad_v5_VC that nobody accepted, trained as calls. A pixel no current label
+    covers was pending, rejected, or a label since deleted."""
     td = _td(tmp_path)
     snap = np.zeros((H, W), dtype=np.uint8)
-    snap[40:45, 50:60] = 1
+    snap[40:45, 50:60] = 1                  # e.g. a pending tone detection
     _save(td, 'A', t_off=0, cols=(5, 20), neighbors=snap)
     _save(td, 'B', t_off=30, cols=(5, 20))
 
     target, _w = _tiles(td)['A']
-    assert target[40:45, 50:60].all()
-    assert target[20:30, 35:50].all()
+    assert not target[40:45, 50:60].any(), "stale snapshot pixel trained as a call"
+    assert target[20:30, 35:50].all(), "a confirmed neighbour was lost"
+
+
+def test_a_rejections_stale_neighbours_are_dropped_too(tmp_path):
+    td = _td(tmp_path)
+    snap = np.zeros((H, W), dtype=np.uint8)
+    snap[40:45, 50:60] = 1
+    _save(td, 'R', t_off=0, cols=(5, 20), kind='negative', neighbors=snap)
+
+    target, weight = _tiles(td)['R']
+    assert target.max() < 0.5
+    assert weight[40:45, 50:60].min() > 0.5, \
+        "pixels nobody accepted are not excluded from a rejection's loss"
+
+
+def test_an_example_that_cannot_be_placed_keeps_its_snapshot(tmp_path):
+    from fnt.usv.usv_detector.mad_examples import _neighbour_placeable
+    snap = np.zeros((H, W), dtype=bool)
+    snap[40:45, 50:60] = True
+    ex = {'meta': {'source_wav': 'a.wav'}, 'mask': np.zeros((H, W)),
+          'neighbors': snap}
+    assert not _neighbour_placeable(ex), "no patch offset: cannot be placed"
 
 
 def test_a_call_far_away_is_not_a_neighbour(tmp_path):

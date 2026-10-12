@@ -755,6 +755,16 @@ def crop_to_context(ex: Dict, context_ms) -> Dict:
 _GRID_KEYS = ("nperseg", "noverlap", "nfft", "sample_rate")
 
 
+def _neighbour_placeable(ex: Dict) -> bool:
+    """Can this example's window be laid over its recording's other calls?
+    Needs its patch offset, its recording, and a mask."""
+    import os as _os
+    meta = ex.get("meta") or {}
+    return (meta.get("patch_t_off") is not None
+            and bool(_os.path.basename(str(meta.get("source_wav", "") or "")))
+            and ex.get("mask") is not None)
+
+
 def confirmed_neighbours(examples: Sequence[Dict]) -> List[Optional[np.ndarray]]:
     """For each example, the OTHER confirmed calls on its recording that fall
     inside its patch window: a bool array shaped like the patch, or ``None``.
@@ -803,7 +813,7 @@ def confirmed_neighbours(examples: Sequence[Dict]) -> List[Optional[np.ndarray]]
     out: List[Optional[np.ndarray]] = [None] * len(examples)
     for i, ex in enumerate(examples):
         meta = ex.get("meta") or {}
-        if not (_placed(meta) and _rec(meta)) or ex.get("mask") is None:
+        if not _neighbour_placeable(ex):
             continue
         found = index.get((_rec(meta),) + tuple(meta.get(k) for k in _GRID_KEYS))
         if found is None:
@@ -891,12 +901,18 @@ def collect_training_examples(
     # it was saved (see confirmed_neighbours) -- and before the cap: a call the
     # cap leaves out of training is still a confirmed call in its neighbours'
     # windows.
+    #
+    # The rebuild REPLACES the snapshot wherever an example can be placed on
+    # its recording. Snapshots were read from the canvas, which also held
+    # pending and rejected detections, so they carried pixels nobody accepted
+    # -- 15,368 of 836,066 snapshot pixels in mad_v5_VC (60 labels, 2,895 on
+    # the 21 kHz tone) -- and a label's neighbours train as calls. Every pixel
+    # of a call confirmed now is in the rebuild; anything only the snapshot
+    # holds was pending, rejected, or a label since deleted. An example that
+    # cannot be placed keeps its snapshot.
     for ex, rebuilt in zip(examples, confirmed_neighbours(examples)):
-        if rebuilt is None:
+        if not _neighbour_placeable(ex):
             continue
-        old = ex.get("neighbors")
-        if old is not None and np.shape(old) == rebuilt.shape:
-            rebuilt = rebuilt | (np.asarray(old) > 0)
         ex["neighbors"] = rebuilt
     # After the neighbours, which place calls by the full patch's offsets.
     if context_ms is not None:

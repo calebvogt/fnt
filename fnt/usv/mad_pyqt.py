@@ -6236,6 +6236,12 @@ class MADMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Here rather than in main(), so MAD opened from anywhere gets it: a
+        # minimized or unfocused window is background work to Windows, which
+        # throttles it -- training and batch inference ran ~1.7x slower that
+        # way (see power.py).
+        from fnt.usv.usv_detector.power import keep_full_speed
+        keep_full_speed()
         self._apply_dark_theme()
         self.setWindowTitle(self.BASE_TITLE)
         self.setMinimumSize(1100, 750)
