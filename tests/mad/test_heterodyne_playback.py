@@ -103,6 +103,60 @@ def test_nothing_in_nothing_out():
     assert heterodyne_for_playback(np.zeros(3), SR).size == 0
 
 
+def test_matched_level_is_the_level_slowed_playback_plays_at():
+    """Live Het plays at the recording's own level, like slowed playback --
+    normalising made it ~31 dB louder, a jolt in headphones."""
+    x = tone(45, amp=0.01)
+    y = heterodyne_for_playback(x, SR, 40_000, match_level=True)
+    ref = np.percentile(np.abs(x), 99.9)
+    assert abs(np.percentile(np.abs(y), 99.9) / ref - 1) < 0.05
+    loud = heterodyne_for_playback(x, SR, 40_000)
+    assert np.percentile(np.abs(loud), 99.9) > 20 * ref, "default still normalises"
+
+
+def test_matched_level_still_respects_the_gain_cap():
+    """A window whose energy is all outside the heard band must not have its
+    hiss pulled up to the window's level."""
+    x = tone(70, amp=0.05) + tone(45, amp=1e-6)   # all the energy far away
+    p = lambda a: np.percentile(np.abs(a), 99.9)  # noqa: E731
+    raw = heterodyne_for_playback(x, SR, 40_000, match_level=True, max_gain=1)
+    y = heterodyne_for_playback(x, SR, 40_000, match_level=True, max_gain=10)
+    assert p(y) <= 10.01 * p(raw)
+    assert p(y) < 0.5 * p(x), "hiss pulled up to the window's level"
+
+
+def test_a_floor_removes_what_lies_below_it():
+    """With the LO at 40 kHz both 30 and 50 kHz play at 10 kHz; a floor at
+    the LO keeps only the side above."""
+    below = heterodyne_for_playback(tone(30), SR, 40_000, max_gain=1.0,
+                                    floor_hz=40_000)
+    above = heterodyne_for_playback(tone(50), SR, 40_000, max_gain=1.0,
+                                    floor_hz=40_000)
+    assert rms(below) < 0.02 * rms(above)
+
+
+def test_the_floor_only_takes_sound_away():
+    """Gain is set before the floor: normalising after it would turn the
+    little the floor left straight back up to full level."""
+    x = tone(30) + tone(50, amp=0.005)
+    full = heterodyne_for_playback(x, SR, 40_000, match_level=True)
+    floored = heterodyne_for_playback(x, SR, 40_000, match_level=True,
+                                      floor_hz=40_000)
+    assert rms(floored) < 0.2 * rms(full)
+
+
+def test_a_floor_below_the_heard_band_changes_nothing():
+    a = heterodyne_for_playback(tone(45), SR, 40_000, max_gain=1.0)
+    b = heterodyne_for_playback(tone(45), SR, 40_000, max_gain=1.0,
+                                floor_hz=10_000)
+    assert abs(rms(b) / rms(a) - 1) < 0.01
+
+
+def test_a_floor_above_nyquist_is_refused():
+    with pytest.raises(ValueError):
+        heterodyne_for_playback(tone(45), SR, 40_000, floor_hz=200_000)
+
+
 # ---------------------------------------------------------------------- GUI
 class FakeSD:
     def __init__(self):
@@ -195,6 +249,33 @@ def test_the_lo_is_remembered(win):
     import fnt.usv.mad_pyqt as M
     win.spin_het_lo.setValue(33)
     assert int(win._settings.value(M.HET_LO_KEY)) == 33
+
+
+def test_live_het_plays_at_the_recordings_own_level(win):
+    win.spin_het_lo.setValue(41)
+    win._toggle_het_playback()
+    data, _ = played(win)
+    seg = win.audio_data[int(win._playback_start_s * win.sample_rate):
+                         int(win._playback_end_s * win.sample_rate)]
+    ref = np.percentile(np.abs(seg - seg.mean()), 99.9)
+    assert np.percentile(np.abs(data), 99.9) <= 1.1 * ref
+
+
+def test_the_floor_is_used_and_remembered(win):
+    import fnt.usv.mad_pyqt as M
+    win.spin_het_lo.setValue(41)
+    win.spin_het_floor.setValue(60)             # well above the 45 kHz call
+    try:
+        win._toggle_het_playback()
+        data, _ = played(win)
+        assert int(win._settings.value(M.HET_FLOOR_KEY)) == 60
+        win._stop_playback()
+        win.spin_het_floor.setValue(0)
+        win._toggle_het_playback()
+        open_ = played(win)[0]
+        assert rms(data) < 0.05 * rms(open_), "the floor did not remove the call"
+    finally:
+        win.spin_het_floor.setValue(0)
 
 
 def test_shift_space_is_the_shortcut(win):

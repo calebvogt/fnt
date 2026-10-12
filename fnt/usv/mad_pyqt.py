@@ -427,6 +427,7 @@ INFER_SETTINGS = {
 SPLITTER_STATE_KEY = "mad/ui/splitter_state_v2"
 #: Heterodyne playback's local-oscillator frequency, in kHz.
 HET_LO_KEY = "mad/audio/het_lo_khz"
+HET_FLOOR_KEY = "mad/audio/het_floor_khz"
 #: Whether the training-window shading (W) is on.
 TRAIN_WINDOWS_KEY = "mad/ui/show_train_windows"
 MAX_RECENT_PROJECTS = 8
@@ -5912,8 +5913,11 @@ class MADClipWorker(QThread):
         seg = np.asarray(j['segment'], dtype=np.float32)
         if mode == 'het':
             from fnt.usv.usv_heterodyne import heterodyne_for_playback
+            # Normalised, unlike live playback: a clip is a file to present,
+            # and its slowed version is peak-normalised too.
             y = heterodyne_for_playback(seg, j['sr'], j['lo_hz'],
-                                        out_rate=j['out_sr'])
+                                        out_rate=j['out_sr'],
+                                        floor_hz=j.get('floor_hz', 0.0))
             # Same length as the video to the sample; resampling rounds.
             if y.size < n_out:
                 y = np.pad(y, (0, n_out - y.size))
@@ -6731,6 +6735,28 @@ class MADMainWindow(QMainWindow):
             lambda v: self._settings.setValue(HET_LO_KEY, int(v)))
         self.spin_het_lo.installEventFilter(self._wheel_eater)
         controls_layout.addWidget(self.spin_het_lo)
+
+        self.spin_het_floor = QSpinBox()
+        self.spin_het_floor.setRange(0, 120)
+        self.spin_het_floor.setSuffix(" kHz")
+        self.spin_het_floor.setSpecialValueText("No floor")
+        self.spin_het_floor.setFixedWidth(80)
+        self.spin_het_floor.setToolTip(
+            "Heterodyne floor: everything below this frequency is removed "
+            "before mixing, so only what lies above it is heard.\n"
+            "Heterodyne already hears only LO ± 12 kHz (28–52 kHz at a "
+            "40 kHz LO), so a floor below that changes nothing. It matters "
+            "between there and the LO: set it to the LO to hear only calls "
+            "above it. 0 = no floor. Remembered between sessions.")
+        try:
+            self.spin_het_floor.setValue(int(self._settings.value(
+                HET_FLOOR_KEY, 0)))
+        except (TypeError, ValueError):
+            self.spin_het_floor.setValue(0)
+        self.spin_het_floor.valueChanged.connect(
+            lambda v: self._settings.setValue(HET_FLOOR_KEY, int(v)))
+        self.spin_het_floor.installEventFilter(self._wheel_eater)
+        controls_layout.addWidget(self.spin_het_floor)
 
         controls_layout.addWidget(QLabel("Speed:"))
         self.slider_speed = QSlider(Qt.Horizontal)
@@ -18336,13 +18362,19 @@ class MADMainWindow(QMainWindow):
                     HETERODYNE_OUT_SR, heterodyne_for_playback)
                 output_sr = HETERODYNE_OUT_SR
                 lo_hz = self.spin_het_lo.value() * 1000.0
-                if lo_hz >= self.sample_rate / 2:
-                    self.status_bar.showMessage(
-                        f"LO {lo_hz / 1000:g} kHz is above this recording's "
-                        f"Nyquist ({self.sample_rate / 2000:g} kHz)")
-                    return
-                segment = heterodyne_for_playback(segment, self.sample_rate,
-                                                  lo_hz)
+                floor_hz = self.spin_het_floor.value() * 1000.0
+                for what, hz in (("LO", lo_hz), ("Floor", floor_hz)):
+                    if hz >= self.sample_rate / 2:
+                        self.status_bar.showMessage(
+                            f"{what} {hz / 1000:g} kHz is above this "
+                            f"recording's Nyquist "
+                            f"({self.sample_rate / 2000:g} kHz)")
+                        return
+                # At the level slowed playback plays the same window: the
+                # normalised version was ~31 dB louder, a jolt in headphones.
+                segment = heterodyne_for_playback(
+                    segment, self.sample_rate, lo_hz, floor_hz=floor_hz,
+                    match_level=True)
                 if len(segment) < 100:
                     return
                 rate = 1.0
@@ -18612,6 +18644,11 @@ class MADMainWindow(QMainWindow):
                 'out_sr': out_sr,
                 'mode': mode,
                 'lo_hz': lo_hz,
+                # The floor the Het button plays with, so the clip sounds
+                # like what was heard. Ignored past Nyquist.
+                'floor_hz': (self.spin_het_floor.value() * 1000.0
+                             if self.spin_het_floor.value() * 1000.0
+                             < self.sample_rate / 2 else 0.0),
                 'sr': self.sample_rate,
                 'wav': wav,
                 'out': out,

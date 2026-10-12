@@ -28,7 +28,8 @@ def heterodyne_for_playback(segment, rate, lo_hz=HETERODYNE_LO_HZ, *,
                             out_rate=HETERODYNE_OUT_SR,
                             band=HETERODYNE_AUDIO_BAND,
                             target_peak=0.6, max_gain=300.0,
-                            fade_s=0.005):
+                            fade_s=0.005, floor_hz=0.0,
+                            match_level=False):
     """Ultrasound -> audible, for listening at real-time speed.
 
     Mixing with a local oscillator at ``lo_hz`` moves a component at ``f`` to
@@ -49,10 +50,20 @@ def heterodyne_for_playback(segment, rate, lo_hz=HETERODYNE_LO_HZ, *,
     ``lo_hz`` and one 5 kHz below are both heard at 5 kHz. Tuning ``lo_hz``
     just below the calls of interest keeps them on one side.
 
+    ``floor_hz`` high-passes the recording before mixing, so only what lies
+    above it is heard. Below ``lo_hz - band[1]`` it changes nothing -- the
+    low-pass already keeps only ``lo_hz +/- band[1]`` (28-52 kHz at a 40 kHz
+    LO) -- so it earns its keep between there and the LO: set it to the LO
+    to hear only the side above it.
+
     Gain is set so the loud end of the segment sits at ``target_peak``, capped
     at ``max_gain`` so a silent window plays as near-silence rather than
-    amplified hiss. Short fades stop the cut edges from clicking. Returns
-    float32 at ``out_rate``; empty input gives empty output.
+    amplified hiss. With ``match_level`` it instead lands at the level of the
+    input itself -- what slowed playback plays at -- so switching between the
+    two in headphones does not jump: normalising made heterodyne ~31 dB
+    louder than slowed playback of the same window. Short fades stop the cut
+    edges from clicking. Returns float32 at ``out_rate``; empty input gives
+    empty output.
     """
     from math import gcd
     from scipy.signal import butter as _butter, resample_poly, sosfiltfilt
@@ -66,23 +77,39 @@ def heterodyne_for_playback(segment, rate, lo_hz=HETERODYNE_LO_HZ, *,
     if not (0 < lo < hi < nyq) or not (0 < lo_hz < nyq):
         raise ValueError(f"band {band} / LO {lo_hz} Hz do not fit a "
                          f"{rate} Hz recording")
+    floor_hz = float(floor_hz or 0.0)
+    if floor_hz >= nyq:
+        raise ValueError(f"floor {floor_hz} Hz does not fit a {rate} Hz "
+                         "recording")
+    # The level slowed playback would play this window at.
+    ref_in = float(np.percentile(np.abs(x), 99.9))
     t = np.arange(x.size) / float(rate)
-    mixed = x * np.cos(2.0 * np.pi * float(lo_hz) * t)
+    carrier = np.cos(2.0 * np.pi * float(lo_hz) * t)
     # Low-pass to the audible band (drops the sum products and every
     # component further than ``hi`` from the oscillator), then a gentle
     # high-pass for the oscillator's own leak through DC and room rumble.
     sos = _butter(8, hi / nyq, btype="low", output="sos")
-    y = sosfiltfilt(sos, mixed)
     sos_hp = _butter(2, lo / nyq, btype="high", output="sos")
-    y = sosfiltfilt(sos_hp, y)
     g = gcd(int(round(rate)), int(out_rate))
-    y = resample_poly(y, int(out_rate) // g, int(round(rate)) // g)
+
+    def _mix_down(sig):
+        y_ = sosfiltfilt(sos_hp, sosfiltfilt(sos, sig * carrier))
+        return resample_poly(y_, int(out_rate) // g, int(round(rate)) // g)
+
+    y = _mix_down(x)
     if y.size == 0:
         return np.zeros(0, dtype=np.float32)
+    # Gain comes from the UNFLOORED mix, so the floor can only take sound
+    # away. Set from the floored one, the gain would turn whatever the floor
+    # removed straight back up to full level.
     # Percentile rather than max: one click would otherwise set the gain for
     # the whole window and leave the calls inaudible.
     ref = float(np.percentile(np.abs(y), 99.9))
-    gain = min(max_gain, target_peak / ref) if ref > 0 else 0.0
+    if floor_hz > 0:
+        y = _mix_down(sosfiltfilt(_butter(8, floor_hz / nyq, btype="high",
+                                          output="sos"), x))
+    target = ref_in if match_level else target_peak
+    gain = min(max_gain, target / ref) if ref > 0 else 0.0
     y = np.clip(y * gain, -1.0, 1.0)
     n_fade = min(int(fade_s * out_rate), y.size // 2)
     if n_fade > 0:
