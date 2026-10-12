@@ -211,8 +211,14 @@ class MADProjectConfig:
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         data = {k: v for k, v in data.items() if k in known}
         cfg = cls(**data)
-        if not cfg.project_dir:
-            cfg.project_dir = os.path.dirname(os.path.abspath(path))
+        # The folder the file sits in IS the project. The stored project_dir
+        # only records where it was created, and trusting it sent a copied or
+        # re-mounted project (another drive letter, the Mac's /Volumes path)
+        # back to the ORIGINAL location for everything derived from it: the
+        # config save, training_data/, models/. A copy saved over the original
+        # project; a re-mounted one saved nowhere, silently, since the GUI's
+        # saves swallow errors.
+        cfg.project_dir = os.path.dirname(os.path.abspath(path))
         if not cfg.project_name and cfg.project_dir:
             cfg.project_name = os.path.basename(os.path.normpath(cfg.project_dir))
         return cfg

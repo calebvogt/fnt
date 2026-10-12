@@ -18715,7 +18715,13 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     def _remember_recent(self, project_dir: str):
         recent = self._settings.value(RECENT_PROJECTS_KEY, [], type=list) or []
-        recent = [p for p in recent if p != project_dir]
+
+        def _same(p):
+            # By location, not spelling: a project_dir now comes from where
+            # the file was opened, so 'Z:/a\b' and 'Z:\a\b' are one project.
+            return (os.path.normcase(os.path.normpath(str(p)))
+                    == os.path.normcase(os.path.normpath(str(project_dir))))
+        recent = [p for p in recent if not _same(p)]
         recent.insert(0, project_dir)
         recent = recent[:MAX_RECENT_PROJECTS]
         self._settings.setValue(RECENT_PROJECTS_KEY, recent)
