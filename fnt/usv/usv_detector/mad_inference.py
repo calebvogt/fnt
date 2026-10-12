@@ -92,6 +92,9 @@ class MADInferenceConfig:
     # together, so they must genuinely share a band to merge. A harmonic
     # overlaps its fundamental almost completely; sweep fragments barely.
     merge_concurrent_fraction: float = 0.5
+    # Build the next file's spectrogram on a background thread while this one
+    # scans on the GPU (see run_inference_on_files). Same output either way.
+    prefetch_next: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -1476,25 +1479,9 @@ def write_embeddings_npz(path: str, results: List[Dict]) -> int:
 # ----------------------------------------------------------------------
 # End-to-end per-file run
 # ----------------------------------------------------------------------
-def run_inference_on_file(
-    wav_path: str,
-    cfg: MADInferenceConfig,
-    model=None, ckpt=None, device: Optional[str] = None,
-    progress: Optional[Callable[[str, int, int], None]] = None,
-    wait_if_paused: Optional[Callable[[], None]] = None,
-) -> Dict:
-    """Run inference on one wav, write sibling PNG + CSV, return summary.
-
-    ``progress`` is invoked with ``(stage, i, n)`` where ``stage`` is one
-    of ``'spec'``, ``'infer'``, ``'blobs'`` so the GUI can show a live
-    bar even for files that take a while.
-    """
-    if model is None:
-        model, ckpt, device = load_model(cfg.model_path, cfg.device)
-    assert ckpt is not None
-    assert device is not None
-
-    # Fall back to checkpoint-saved spec params when cfg leaves them None.
+def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
+    """``(nperseg, noverlap, nfft, db_min, db_max, db_norm)`` for a run:
+    the config's where it sets them, the checkpoint's otherwise."""
     nperseg = int(cfg.nperseg if cfg.nperseg is not None else ckpt.get('nperseg', 512))
     noverlap = int(cfg.noverlap if cfg.noverlap is not None else ckpt.get('noverlap', 384))
     nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
@@ -1504,12 +1491,19 @@ def run_inference_on_file(
     # trained on per-file ranges sees garbage if fed fixed-range input.
     db_norm = str(cfg.db_norm if cfg.db_norm is not None
                   else ckpt.get('db_norm', 'fixed'))
-    tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
-    tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
+    return nperseg, noverlap, nfft, db_min, db_max, db_norm
 
+
+def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict) -> Dict:
+    """Decode a recording and build the model's input spectrogram.
+
+    The CPU half of a file's inference -- on a 10-minute recording, 1.2 s of
+    decoding and 14.6 s of spectrogram against an 11.8 s GPU scan -- split out
+    so :func:`run_inference_on_files` can build the next file's while this one
+    scans. Returns ``{wav_path, spec, sr, audio_dur, db_min, db_max, t_spec}``.
+    """
     import time as _time
-    if progress:
-        progress('spec', 0, 1)
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
     _t_spec0 = _time.perf_counter()
     audio, sr = load_audio(wav_path)
     if audio.ndim > 1:
@@ -1554,7 +1548,52 @@ def run_inference_on_file(
     # 5x300 s files, commit flat at 2725 MB, no live ndarray >= 1 MB between
     # files). ``mem`` in each run summary is what will localise the rest.
     del audio
-    t_spec = _time.perf_counter() - _t_spec0
+    return {'wav_path': wav_path, 'spec': spec, 'sr': sr,
+            'audio_dur': audio_dur, 'db_min': db_min, 'db_max': db_max,
+            't_spec': _time.perf_counter() - _t_spec0}
+
+
+def run_inference_on_file(
+    wav_path: str,
+    cfg: MADInferenceConfig,
+    model=None, ckpt=None, device: Optional[str] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
+    prepared: Optional[Dict] = None,
+) -> Dict:
+    """Run inference on one wav, write sibling PNG + CSV, return summary.
+
+    ``progress`` is invoked with ``(stage, i, n)`` where ``stage`` is one
+    of ``'spec'``, ``'infer'``, ``'blobs'`` so the GUI can show a live
+    bar even for files that take a while.
+
+    ``prepared`` is this file's :func:`prepare_file` result when it was built
+    ahead of time; without it (or for another file) it is built here.
+    """
+    if model is None:
+        model, ckpt, device = load_model(cfg.model_path, cfg.device)
+    assert ckpt is not None
+    assert device is not None
+
+    # Fall back to checkpoint-saved spec params when cfg leaves them None.
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
+    tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
+
+    import time as _time
+    if progress:
+        progress('spec', 0, 1)
+    prefetched = bool(prepared is not None and 'spec' in prepared
+                      and prepared.get('wav_path') == wav_path)
+    if not prefetched:
+        prepared = prepare_file(wav_path, cfg, ckpt)
+    spec, sr = prepared['spec'], prepared['sr']
+    audio_dur, t_spec = prepared['audio_dur'], prepared['t_spec']
+    db_min, db_max = prepared['db_min'], prepared['db_max']
+    # Time this file actually held the run up: the wait for a spectrogram
+    # built in the background, or the whole build when it was not.
+    t_wait = float(prepared.get('t_wait', 0.0)) if prefetched else t_spec
+    del prepared
     if progress:
         progress('spec', 1, 1)
 
@@ -1824,7 +1863,10 @@ def run_inference_on_file(
     if progress:
         progress('blobs', 1, 1)
 
-    total = t_spec + t_infer + t_blobs
+    # Wall time this file took in the run: a spectrogram built in the
+    # background while the previous file scanned counts only as long as
+    # the run waited for it.
+    total = t_wait + t_infer + t_blobs
     # Two rates, because they answer different questions and reporting one
     # under the other's name is how an ETA comes out at half the truth.
     #
@@ -1862,6 +1904,8 @@ def run_inference_on_file(
             'device': device,
             'audio_dur_s': round(audio_dur, 1),
             't_spec': round(t_spec, 2),
+            't_wait': round(t_wait, 2),
+            'prefetched': prefetched,
             't_infer': round(t_infer, 2),
             't_blobs': round(t_blobs, 2),
             't_total': round(total, 2),
@@ -2102,7 +2146,8 @@ def run_inference_on_files(
     results: List[Dict] = []
     n = len(wav_paths)
 
-    def _run_one(wav: str, i: int, retry: bool = False) -> Dict:
+    def _run_one(wav: str, i: int, retry: bool = False,
+                 prepared: Optional[Dict] = None) -> Dict:
         name = Path(wav).name + (" (retry)" if retry else "")
 
         def _inner(stage: str, si: int, sn: int, _i=i, _n=n, _name=name):
@@ -2110,13 +2155,18 @@ def run_inference_on_files(
                 progress(_i, _n, _name, stage, si, sn)
 
         before = _mem_snapshot()
+        # Only passed when there is one: a background build that failed is
+        # simply redone here, so its error is reported exactly as before.
+        extra = ({'prepared': prepared}
+                 if prepared is not None and 'error' not in prepared else {})
         try:
             s = run_inference_on_file(
                 wav, cfg, model=model, ckpt=ckpt, device=device,
-                progress=_inner, wait_if_paused=wait_if_paused,
+                progress=_inner, wait_if_paused=wait_if_paused, **extra,
             )
         except Exception as e:
             s = {'wav_path': wav, 'error': str(e)}
+        del extra, prepared
         # Before the reading, so `mem` reports what is actually still held
         # rather than what has merely not been collected yet.
         _collect_cycles()
@@ -2133,13 +2183,51 @@ def run_inference_on_files(
         except Exception:
             pass
 
-    for i, wav in enumerate(wav_paths):
-        if wait_if_paused is not None:
-            wait_if_paused()
-        if should_stop and should_stop():
-            break
-        results.append(_run_one(wav, i))
-        _emit(results[-1])
+    # Prefetch: build file i+1's spectrogram on a background thread while file
+    # i scans. Per 10-minute recording that is ~16 s of CPU (decode +
+    # spectrogram) against ~12 s of GPU, done one after the other -- so most
+    # of the CPU half can hide behind the scan. One file ahead only: each
+    # spectrogram is 600 MB.
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    pool = (ThreadPoolExecutor(1, thread_name_prefix="mad-prefetch")
+            if getattr(cfg, 'prefetch_next', True) and n > 1 else None)
+    pending: Dict[int, object] = {}
+
+    def _prepare(j: int) -> Dict:
+        try:
+            return prepare_file(wav_paths[j], cfg, ckpt)
+        except Exception as e:      # redone in the foreground; see _run_one
+            return {'wav_path': wav_paths[j], 'error': str(e)}
+
+    def _queue(j: int) -> None:
+        if pool is not None and j < n and j not in pending:
+            pending[j] = pool.submit(_prepare, j)
+
+    try:
+        for i, wav in enumerate(wav_paths):
+            if wait_if_paused is not None:
+                wait_if_paused()
+            if should_stop and should_stop():
+                break
+            prepared = None
+            if pool is not None:
+                _queue(i)
+                _queue(i + 1)
+                _t0 = _time.perf_counter()
+                prepared = pending.pop(i).result()
+                prepared['t_wait'] = _time.perf_counter() - _t0
+            results.append(_run_one(wav, i, prepared=prepared))
+            prepared = None
+            _emit(results[-1])
+    finally:
+        # A stop leaves at most one build running: let it finish rather than
+        # abandon a thread mid-allocation, and drop what it made.
+        if pool is not None:
+            for f in pending.values():
+                f.cancel()
+            pool.shutdown(wait=True)
+            pending.clear()
 
     # --- one retry pass over the failures --------------------------------
     # A batch failure here is nearly always an out-of-memory one, and it is not

@@ -206,6 +206,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         merge_require_freq_overlap=not args.merge_ignore_freq,
         batch_size=args.batch_size,
         amp=not args.no_amp,
+        prefetch_next=not args.no_prefetch,
     )
 
     from .mad_batch import (
@@ -643,6 +644,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "on a GPU with spare VRAM; does not change results.")
     pa.add_argument('--no-amp', action='store_true',
                     help="Disable fp16 mixed precision (CUDA only).")
+    pa.add_argument('--no-prefetch', action='store_true',
+                    help="Build each spectrogram only when its file "
+                         "comes up, instead of during the previous "
+                         "file's scan (slower; same output).")
     pa.add_argument('--no-resume', action='store_true',
                     help="Re-analyze files that already carry detections from "
                          "this model at these settings (default is to skip "
