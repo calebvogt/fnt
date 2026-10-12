@@ -16603,6 +16603,36 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
 
+    @staticmethod
+    def _confirmed_window(annotations, t_lo: int, width: int,
+                          n_freq: int) -> np.ndarray:
+        """Confirmed calls stamped on frames ``[t_lo, t_lo + width)``.
+
+        The neighbours an example records. Confirmed means a label or an
+        accepted detection; pending and rejected detections are left out.
+        This used to read the canvas mask, which stamps EVERY annotation --
+        so a label saved next to a pending tone detection, or next to a
+        rejection, recorded it as a confirmed neighbour, and training
+        supervises a label's neighbours as calls. Measured on the anosmia
+        project: 15,368 of 836,066 neighbour pixels (60 labels) came from
+        detections nobody had accepted, 2,895 of them on the 21 kHz tone.
+        """
+        win = np.zeros((n_freq, max(0, int(width))), dtype=np.uint8)
+        for a in annotations or ():
+            if a.get('status') not in (None, 'accepted'):
+                continue
+            m = a.get('mask')
+            if m is None:
+                continue
+            a0, f0 = int(a['t0']) - t_lo, int(a['f0'])
+            c0, c1 = max(0, a0), min(win.shape[1], a0 + m.shape[1])
+            r1 = min(n_freq, f0 + m.shape[0])
+            if c1 <= c0 or r1 <= f0:
+                continue
+            win[f0:r1, c0:c1] |= (np.asarray(m)[:r1 - f0, c0 - a0:c1 - a0]
+                                  > 0).astype(np.uint8)
+        return win
+
     def _save_component_example(self, class_name: str, comp,
                                 blob_id=None, kind: str = 'label',
                                 score=None, provenance=None) -> str:
@@ -16687,17 +16717,10 @@ class MADMainWindow(QMainWindow):
         if tw > 0:
             mask_patch[f0:f1, lt0:lt0 + tw] = local[:, :tw].astype(np.uint8)
         neighbors_patch = None
-        confirmed = getattr(sg, 'mask', None)
-        if confirmed is not None and getattr(confirmed, 'size', 0):
-            win = confirmed[:, pt0:pt0 + W]
-            hh = min(mask_patch.shape[0], win.shape[0])
-            ww = min(mask_patch.shape[1], win.shape[1])
-            if hh > 0 and ww > 0:
-                nb = np.zeros_like(mask_patch)
-                nb[:hh, :ww] = (win[:hh, :ww] > 0).astype(np.uint8)
-                nb[mask_patch > 0] = 0        # disjoint from this call
-                if nb.any():
-                    neighbors_patch = nb
+        nb = self._confirmed_window(sg.annotations, pt0, W, n_freq)
+        nb[mask_patch > 0] = 0                # disjoint from this call
+        if nb.any():
+            neighbors_patch = nb
 
         df = (sr / 2.0) / (nfft // 2)
         dt = hop / float(sr)

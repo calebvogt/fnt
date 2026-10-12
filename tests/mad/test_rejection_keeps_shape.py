@@ -370,6 +370,61 @@ def test_a_registry_project_finds_its_stores():
     assert sum(r.repaired for r in reps) == 1
 
 
+# ----------------------------------------------------------------------
+# A neighbour is a CONFIRMED call
+# ----------------------------------------------------------------------
+def _ann(status, f0, t0, h=6, w=10, aid=None):
+    return {'id': aid or f"{status}_{t0}", 'category': 'USV', 'status': status,
+            'f0': f0, 'f1': f0 + h, 't0': t0, 't1': t0 + w,
+            'mask': np.ones((h, w), bool)}
+
+
+def test_the_window_holds_only_confirmed_calls():
+    """The canvas mask stamps every annotation, pending and rejected too, and
+    training supervises a label's neighbours as calls."""
+    _w, _wav, _app, M = gui()
+    anns = [_ann(None, 10, 5), _ann('accepted', 20, 20),
+            _ann('prediction', 30, 30), _ann('rejected', 40, 40)]
+    win = M.MADMainWindow._confirmed_window(anns, 0, 60, 64)
+    assert win[10:16, 5:15].all() and win[20:26, 20:30].all()
+    assert not win[30:36, 30:40].any(), "a pending detection is not confirmed"
+    assert not win[40:46, 40:50].any(), "a rejection is not confirmed"
+
+
+def test_the_window_clips_calls_at_its_edges():
+    _w, _wav, _app, M = gui()
+    # one straddling the window's start, one past the top bin, one outside
+    anns = [_ann(None, 10, 95), _ann(None, 60, 120), _ann(None, 30, 150)]
+    win = M.MADMainWindow._confirmed_window(anns, 100, 50, 64)
+    assert win.shape == (64, 50)
+    assert win[10:16, 0:5].all() and not win[10:16, 5:].any()
+    assert win[60:64, 20:30].all()
+    assert int(win.sum()) == 6 * 5 + 4 * 10
+
+
+def test_a_label_saved_beside_a_pending_tone_does_not_claim_it():
+    w, wav, _app, M = gui()
+    h5 = ms.masks_sibling_path(wav)
+    for i in ms.td_list_ids(h5):
+        ms.td_delete(h5, i)
+    sg = w.spectrogram
+    lab = _ann('accepted', 100, 300, aid='me')
+    lab['blob_id'] = 3
+    sg.annotations = [lab,
+                      _ann(None, 150, 360, aid='real'),
+                      _ann('prediction', 60, 340, aid='tone'),
+                      _ann('rejected', 60, 250, aid='rej')]
+    sg._rebuild_confirmed_mask()
+    ex_id = w._save_component_example(
+        'USV', (100, 106, 300, 310, np.ones((6, 10), bool)), blob_id=3)
+    ex = ms.td_read_example(h5, ex_id)
+    t_off = ex["meta"]["patch_t_off"]
+    nb = ex["neighbors"] > 0
+    assert nb[150:156, 360 - t_off:370 - t_off].all(), "confirmed call lost"
+    assert not nb[60:66, 340 - t_off:350 - t_off].any(),         "a pending detection was recorded as a confirmed neighbour"
+    assert not nb[60:66, 250 - t_off:260 - t_off].any(),         "a rejection was recorded as a confirmed neighbour"
+
+
 if __name__ == "__main__":
     import sys
     import traceback
