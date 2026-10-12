@@ -11642,10 +11642,50 @@ class MADMainWindow(QMainWindow):
         if self._train_dialog is not None:
             self._train_dialog.close()
 
+    def _window_only_close_prompt(self) -> str:
+        """'stop' or 'cancel' for closing the only window mid-run. There is
+        no 'keep running' here: with the main window hidden, nothing would be
+        left on screen to show or stop the run."""
+        box = QMessageBox(self._train_dialog or self)
+        box.setWindowTitle("Training in progress")
+        box.setText("A training run is still in progress.")
+        box.setInformativeText("Stop it and close MAD?")
+        stop = box.addButton("Stop training", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec_()
+        return 'stop' if box.clickedButton() is stop else 'cancel'
+
+    def _after_training_run(self):
+        """A training-window-only launch quits once a run it was asked to
+        stop has wound down (see _on_train_dialog_close)."""
+        if getattr(self, '_quit_when_idle', False):
+            QTimer.singleShot(0, QApplication.instance().quit)
+
     def _on_train_dialog_close(self, event):
         """Closing the training window mid-run: keep it in the background (just
         hide) or stop the run — never silently kill a long run. When the close
-        is triggered by 'Stop Training Early', skip the prompt entirely."""
+        is triggered by 'Stop Training Early', skip the prompt entirely.
+
+        Launched with ``--training-window-only`` that window is all of MAD, so
+        closing it quits -- after the run, or after stopping it."""
+        if getattr(self, '_window_only', False):
+            if (not self._training_active
+                    or getattr(self, '_closing_train_windows', False)):
+                event.accept()
+                QTimer.singleShot(0, QApplication.instance().quit)
+                return
+            if self._window_only_close_prompt() != 'stop':
+                event.ignore()
+                return
+            try:
+                self.train_panel._on_stop()
+            except Exception:
+                pass
+            # Quit once the stopped run has written its results; quitting now
+            # would destroy the worker mid-epoch.
+            self._quit_when_idle = True
+            event.accept()
+            return
         if not self._training_active or getattr(self, '_closing_train_windows',
                                                  False):
             event.accept()
@@ -19122,6 +19162,9 @@ class MADMainWindow(QMainWindow):
         worker.progress_signal.connect(on_progress)
         worker.finished_signal.connect(on_finished)
         worker.error_signal.connect(on_error)
+        # After on_finished/on_error, which record the run first.
+        worker.finished_signal.connect(lambda *_: self._after_training_run())
+        worker.error_signal.connect(lambda *_: self._after_training_run())
         progress.cancel_requested.connect(worker.request_stop)
         worker.start()
         if owns_modal:
@@ -20295,6 +20338,11 @@ def _launch_parser():
                    help="With --train: run the panel's post-training "
                         "inference when training finishes (off by default "
                         "for launched runs).")
+    p.add_argument("--training-window-only", action="store_true",
+                   help="With --train: show only the training window (loss "
+                        "and live predictions), not MAD's main window. "
+                        "Closing it quits MAD. Not combinable with "
+                        "--infer-after, whose progress would be invisible.")
     p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
                    help="Show only these recordings in the Audio list: wav "
                         "paths, bare filenames, and/or .txt files listing "
@@ -20324,6 +20372,18 @@ def _launch_parser():
     return p
 
 
+def apply_launch_window_mode(win, app, training_window_only: bool) -> None:
+    """Show MAD's main window -- or, for a dictated training run, keep it
+    hidden so the training window is all that appears (closing that window
+    quits; see _on_train_dialog_close). The app must not quit on its own when
+    that window closes mid-run, so quitting is left to MAD."""
+    win._window_only = bool(training_window_only)
+    if win._window_only:
+        app.setQuitOnLastWindowClosed(False)
+    else:
+        win.show()
+
+
 def main(argv=None):
     parser = _launch_parser()
     # parse_known_args: Qt has command-line options of its own.
@@ -20331,10 +20391,14 @@ def main(argv=None):
         sys.argv[1:] if argv is None else argv)
     if (args.train or args.focus) and not args.project:
         parser.error("--train and --focus need --project")
+    if args.training_window_only and (not args.train or args.infer_after
+                                      or args.focus):
+        parser.error("--training-window-only needs --train, and does not "
+                     "combine with --infer-after or --focus")
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
-    win.show()
+    apply_launch_window_mode(win, app, args.training_window_only)
     if args.project:
         from fnt.usv.usv_detector.cli import training_overrides
         overrides = training_overrides(args)

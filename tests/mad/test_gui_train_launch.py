@@ -175,6 +175,83 @@ def test_undictated_post_inference_settings_keep_the_panel():
     assert not w.chk_post_merge.isChecked()
 
 
+
+# ---------------------------------------------------------------------------
+# --training-window-only: a dictated run shows the training window and nothing
+# else ("what I wanted was just the segmentation training window").
+# ---------------------------------------------------------------------------
+def test_window_only_needs_train_and_refuses_hidden_inference():
+    for argv in (["--project", "p", "--training-window-only"],
+                 ["--project", "p", "--train", "--training-window-only",
+                  "--infer-after"]):
+        with pytest.raises(SystemExit):
+            M.main(argv)
+
+
+def test_window_only_keeps_the_main_window_hidden():
+    w = gui()
+    app = QApplication.instance()
+    try:
+        M.apply_launch_window_mode(w, app, True)
+        assert not w.isVisible() and w._window_only
+        assert not app.quitOnLastWindowClosed()
+    finally:
+        app.setQuitOnLastWindowClosed(True)
+        w._window_only = False
+
+
+class _Quit:
+    def __init__(self, monkeypatch):
+        self.n = 0
+        monkeypatch.setattr(QApplication.instance(), "quit", self)
+
+    def __call__(self):
+        self.n += 1
+
+
+def _close(w):
+    from PyQt5.QtGui import QCloseEvent
+    ev = QCloseEvent()
+    w._on_train_dialog_close(ev)
+    for _ in range(3):
+        QApplication.instance().processEvents()
+    return ev
+
+
+def test_closing_the_only_window_after_the_run_quits(monkeypatch):
+    w = gui()
+    quit_ = _Quit(monkeypatch)
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    w._training_active = False
+    assert _close(w).isAccepted()
+    assert quit_.n == 1
+
+
+def test_closing_mid_run_offers_stop_or_cancel_not_keep_running(monkeypatch):
+    w = gui()
+    quit_ = _Quit(monkeypatch)
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    w._training_active = True
+    stopped = []
+    monkeypatch.setattr(w.train_panel, "_on_stop", lambda: stopped.append(1))
+    try:
+        monkeypatch.setattr(w, "_window_only_close_prompt", lambda: "cancel")
+        assert not _close(w).isAccepted()
+        assert not stopped and quit_.n == 0
+
+        monkeypatch.setattr(w, "_window_only_close_prompt", lambda: "stop")
+        assert _close(w).isAccepted()
+        assert stopped and w._quit_when_idle
+        assert quit_.n == 0, "must not quit before the run winds down"
+
+        w._after_training_run()                 # the worker reports it is done
+        QApplication.instance().processEvents()
+        assert quit_.n == 1
+    finally:
+        w._training_active = False
+        w._quit_when_idle = False
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
