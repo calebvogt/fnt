@@ -11196,6 +11196,30 @@ class MADMainWindow(QMainWindow):
             'model_arch': _combo_data('combo_arch'),
         }
 
+    def set_post_inference_settings(self, threshold=None, min_blob=None,
+                                    merge=None, merge_gap=None,
+                                    harmonics=None) -> None:
+        """Put dictated detection settings into the post-training controls.
+
+        For launched runs (``--infer-threshold`` and friends). Set in the
+        panel rather than passed around it, so the window shows what the
+        re-detection will use -- and because the post-training and Run
+        Inference copies are linked, the Run Inference box agrees with it.
+        A launched run used to inherit whatever the panel last held: min blob
+        100 and merge off, against the 50 / merge-on runs it was meant to
+        repeat. None leaves a setting alone.
+        """
+        if threshold is not None:
+            self.spin_post_threshold.setValue(float(threshold))
+        if min_blob is not None:
+            self.spin_post_min_blob.setValue(int(min_blob))
+        if merge is not None:
+            self.chk_post_merge.setChecked(bool(merge))
+        if merge_gap is not None:
+            self.spin_post_merge_gap.setValue(float(merge_gap))
+        if harmonics is not None:
+            self.chk_post_harmonics.setChecked(bool(harmonics))
+
     def launch_training(self, overrides=None, infer_after: bool = False):
         """Start a run as if Run Training were pressed, with ``overrides``
         (``UNetTrainingConfig`` fields) applied on top of the panel.
@@ -19985,6 +20009,25 @@ def _launch_parser():
                         "paths, bare filenames, and/or .txt files listing "
                         "them one per line. The project keeps every "
                         "recording; File ▸ Show All Recordings returns.")
+    g = p.add_argument_group(
+        "post-training inference",
+        "Detection settings for --infer-after, set in the panel before the "
+        "run starts. Any not given keep the panel's value.")
+    g.add_argument("--infer-threshold", type=float, default=None,
+                   metavar="P", help="Probability threshold.")
+    g.add_argument("--infer-min-blob", type=int, default=None, metavar="PX",
+                   help="Min blob pixels.")
+    g.add_argument("--infer-merge", dest="infer_merge", action="store_true",
+                   default=None, help="Merge consecutive fragments.")
+    g.add_argument("--no-infer-merge", dest="infer_merge",
+                   action="store_false")
+    g.add_argument("--infer-merge-gap", type=float, default=None,
+                   metavar="S", help="Merge gap in seconds.")
+    g.add_argument("--infer-harmonics", dest="infer_harmonics",
+                   action="store_true", default=None,
+                   help="Group harmonics into calls.")
+    g.add_argument("--no-infer-harmonics", dest="infer_harmonics",
+                   action="store_false")
     add_training_args(p)
     suppress_training_defaults(p)
     return p
@@ -20022,8 +20065,16 @@ def main(argv=None):
                 # After the project's own startup work (file list, the
                 # pre-fill from the last run's settings), so the overrides
                 # land on top of it rather than being overwritten by it.
-                QTimer.singleShot(500, lambda: win.launch_training(
-                    overrides, infer_after=args.infer_after))
+                def _launch():
+                    win.set_post_inference_settings(
+                        threshold=args.infer_threshold,
+                        min_blob=args.infer_min_blob,
+                        merge=args.infer_merge,
+                        merge_gap=args.infer_merge_gap,
+                        harmonics=args.infer_harmonics)
+                    win.launch_training(overrides,
+                                        infer_after=args.infer_after)
+                QTimer.singleShot(500, _launch)
         QTimer.singleShot(0, _start)
     if QApplication.instance() is app:
         sys.exit(app.exec_())

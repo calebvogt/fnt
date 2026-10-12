@@ -138,6 +138,43 @@ def test_the_launch_parser_needs_a_project_to_train():
         M.main(["--train"])
 
 
+def test_post_inference_settings_can_be_dictated():
+    """A launched run inherited whatever the panel last held -- min blob 100
+    and merge off, against the 50 / merge-on runs it was meant to repeat."""
+    a = M._launch_parser().parse_args(
+        ["--project", "p", "--train", "--infer-after", "--infer-threshold",
+         "0.45", "--infer-min-blob", "50", "--infer-merge",
+         "--infer-merge-gap", "0.02", "--no-infer-harmonics"])
+    assert (a.infer_threshold, a.infer_min_blob, a.infer_merge,
+            a.infer_merge_gap, a.infer_harmonics) == (0.45, 50, True, 0.02,
+                                                      False)
+    w = gui()
+    w.set_post_inference_settings(
+        threshold=a.infer_threshold, min_blob=a.infer_min_blob,
+        merge=a.infer_merge, merge_gap=a.infer_merge_gap,
+        harmonics=a.infer_harmonics)
+    assert abs(w.spin_post_threshold.value() - 0.45) < 1e-9
+    assert w.spin_post_min_blob.value() == 50
+    assert w.chk_post_merge.isChecked()
+    assert abs(w.spin_post_merge_gap.value() - 0.02) < 1e-9
+    assert not w.chk_post_harmonics.isChecked()
+    # The Run Inference copies are linked: one setting, two widgets.
+    assert w.spin_infer_min_blob.value() == 50
+    assert w.chk_infer_merge.isChecked()
+
+
+def test_undictated_post_inference_settings_keep_the_panel():
+    a = M._launch_parser().parse_args(["--project", "p", "--train"])
+    assert (a.infer_threshold, a.infer_min_blob, a.infer_merge,
+            a.infer_merge_gap, a.infer_harmonics) == (None,) * 5
+    w = gui()
+    w.spin_post_min_blob.setValue(123)
+    w.chk_post_merge.setChecked(False)
+    w.set_post_inference_settings()
+    assert w.spin_post_min_blob.value() == 123
+    assert not w.chk_post_merge.isChecked()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
