@@ -369,6 +369,11 @@ class RunManifest:
             # stage times the manifest doesn't carry.
             'scan_realtime_factor': timing.get('scan_realtime_factor'),
             'device': timing.get('device'),
+            # How the spectrogram was made: 'cuda' or 'cpu', and whether it
+            # was built ahead during the previous file's scan.
+            'spec_backend': timing.get('spec_backend'),
+            'prefetched': timing.get('prefetched'),
+            't_spec': timing.get('t_spec'),
             'error': summary.get('error'),
             # Process + system memory as of this file. Recorded on the error
             # path too: the reading at the moment a file fails is the one that

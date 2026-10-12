@@ -95,6 +95,9 @@ class MADInferenceConfig:
     # Build the next file's spectrogram on a background thread while this one
     # scans on the GPU (see run_inference_on_files). Same output either way.
     prefetch_next: bool = True
+    # Build the inference spectrogram on the GPU (CUDA only) when it
+    # reproduces the CPU one -- 14.5 s -> 1.2 s per 10-minute recording.
+    gpu_spectrogram: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -1494,13 +1497,17 @@ def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
     return nperseg, noverlap, nfft, db_min, db_max, db_norm
 
 
-def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict) -> Dict:
+def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict,
+                 device: Optional[str] = None) -> Dict:
     """Decode a recording and build the model's input spectrogram.
 
     The CPU half of a file's inference -- on a 10-minute recording, 1.2 s of
     decoding and 14.6 s of spectrogram against an 11.8 s GPU scan -- split out
     so :func:`run_inference_on_files` can build the next file's while this one
-    scans. Returns ``{wav_path, spec, sr, audio_dur, db_min, db_max, t_spec}``.
+    scans. Returns ``{wav_path, spec, sr, audio_dur, db_min, db_max, t_spec,
+    spec_backend}``. On CUDA the spectrogram is built on the GPU when it
+    reproduces the CPU one (``cfg.gpu_spectrogram``; see
+    mad_dataset.spec_image_for_device).
     """
     import time as _time
     nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
@@ -1522,11 +1529,19 @@ def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict) -> Dict:
     # asarray, not astype: load_audio already returns float32, and astype
     # copies regardless of dtype — a second 600 MB block for a 10-minute
     # recording, alive at the same moment as the original.
-    spec = compute_full_spec_image(
-        np.asarray(audio, dtype=np.float32), sr,
-        nperseg=nperseg, noverlap=noverlap, nfft=nfft,
-        db_min=db_min, db_max=db_max, as_uint8=True,
-    )
+    if (getattr(cfg, 'gpu_spectrogram', True)
+            and str(device or '').startswith('cuda')):
+        from .mad_dataset import spec_image_for_device
+        spec, backend = spec_image_for_device(
+            np.asarray(audio, dtype=np.float32), sr, nperseg, noverlap, nfft,
+            db_min, db_max, device=str(device))
+    else:
+        spec = compute_full_spec_image(
+            np.asarray(audio, dtype=np.float32), sr,
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+            db_min=db_min, db_max=db_max, as_uint8=True,
+        )
+        backend = 'cpu'
     # The audio is finished with — everything downstream works off the
     # spectrogram. Holding it through the scan and blob phases pinned 600 MB
     # for ~75 s of every file and, worse, kept a large block busy exactly when
@@ -1550,7 +1565,7 @@ def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict) -> Dict:
     del audio
     return {'wav_path': wav_path, 'spec': spec, 'sr': sr,
             'audio_dur': audio_dur, 'db_min': db_min, 'db_max': db_max,
-            't_spec': _time.perf_counter() - _t_spec0}
+            't_spec': _time.perf_counter() - _t_spec0, 'spec_backend': backend}
 
 
 def run_inference_on_file(
@@ -1586,10 +1601,11 @@ def run_inference_on_file(
     prefetched = bool(prepared is not None and 'spec' in prepared
                       and prepared.get('wav_path') == wav_path)
     if not prefetched:
-        prepared = prepare_file(wav_path, cfg, ckpt)
+        prepared = prepare_file(wav_path, cfg, ckpt, device)
     spec, sr = prepared['spec'], prepared['sr']
     audio_dur, t_spec = prepared['audio_dur'], prepared['t_spec']
     db_min, db_max = prepared['db_min'], prepared['db_max']
+    spec_backend = prepared.get('spec_backend', 'cpu')
     # Time this file actually held the run up: the wait for a spectrogram
     # built in the background, or the whole build when it was not.
     t_wait = float(prepared.get('t_wait', 0.0)) if prefetched else t_spec
@@ -1905,6 +1921,7 @@ def run_inference_on_file(
             'audio_dur_s': round(audio_dur, 1),
             't_spec': round(t_spec, 2),
             't_wait': round(t_wait, 2),
+            'spec_backend': spec_backend,
             'prefetched': prefetched,
             't_infer': round(t_infer, 2),
             't_blobs': round(t_blobs, 2),
@@ -2196,7 +2213,7 @@ def run_inference_on_files(
 
     def _prepare(j: int) -> Dict:
         try:
-            return prepare_file(wav_paths[j], cfg, ckpt)
+            return prepare_file(wav_paths[j], cfg, ckpt, device)
         except Exception as e:      # redone in the foreground; see _run_one
             return {'wav_path': wav_paths[j], 'error': str(e)}
 

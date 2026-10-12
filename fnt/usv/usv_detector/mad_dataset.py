@@ -178,6 +178,128 @@ def compute_full_spec_image(
     return out
 
 
+def compute_full_spec_image_torch(
+    audio: np.ndarray, sample_rate: int,
+    nperseg: int, noverlap: int, nfft: int,
+    db_min: float, db_max: float, device: str,
+    chunk_frames: int = 65536,
+) -> np.ndarray:
+    """:func:`compute_full_spec_image` (uint8) computed with torch on ``device``.
+
+    Reproduces ``scipy.signal.spectrogram(window='hann', scaling='density')``
+    step for step in float32 -- per-frame mean removal (scipy's default
+    detrend), the periodic Hann window, density scaling summed the way scipy
+    sums it, the x2 one-sided PSD -- then the same dB / [0, 1] / uint8 steps.
+    The older ``gpu_spectrogram`` module skips the mean removal and the x2,
+    which puts it 3 dB and ~10 grey levels off what the model was trained on.
+
+    Measured on three 10-minute recordings: within one grey level of the CPU
+    image on 0.0004-0.0007% of pixels; detections identical in count, all but
+    9 of 2,057 pixel-identical and those 9 off by one edge pixel; 14.5 s ->
+    1.2 s on an RTX 4070 Ti SUPER. Use through :func:`spec_image_for_device`,
+    which checks agreement first and falls back to the CPU.
+    """
+    import torch
+    from scipy.signal import get_window
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+    hop = max(1, int(nperseg) - int(noverlap))
+    n_freq = int(nfft) // 2 + 1
+    if len(audio) < nperseg:
+        return np.zeros((n_freq, 0), dtype=np.uint8)
+    n_frames = (len(audio) - int(nperseg)) // hop + 1
+    if db_max <= db_min:                 # mirrors spec_to_image
+        db_max = db_min + 1e-3
+    span = float(db_max - db_min)
+    # scipy casts the window to complex64 and sums its square there.
+    wc = get_window('hann', int(nperseg)).astype(np.complex64)
+    scale = float(np.complex64(1.0 / (sample_rate * (wc * wc).sum())).real)
+    out = np.empty((n_freq, n_frames), dtype=np.uint8)
+    with torch.no_grad():
+        win = torch.from_numpy(wc.real.copy()).to(device)
+        x = torch.from_numpy(audio).to(device)
+        for f0 in range(0, n_frames, int(chunk_frames)):
+            f1 = min(n_frames, f0 + int(chunk_frames))
+            fr = x[f0 * hop:(f1 - 1) * hop + int(nperseg)].unfold(
+                0, int(nperseg), hop)
+            fr = fr - fr.mean(dim=1, keepdim=True)
+            X = torch.fft.rfft(fr * win, n=int(nfft), dim=1)
+            p = (X.real * X.real + X.imag * X.imag) * scale
+            del X, fr
+            if int(nfft) % 2 == 0:
+                p[:, 1:-1] *= 2.0       # the Nyquist bin is unpaired
+            else:
+                p[:, 1:] *= 2.0
+            p = torch.log10(p + 1e-10) * 10.0
+            p = torch.clamp((p - db_min) / span, 0.0, 1.0)
+            out[:, f0:f1] = (torch.round(p * 255.0).to(torch.uint8)
+                             .T.cpu().numpy())
+            del p
+        del x, win
+    return out
+
+
+#: Devices whose torch spectrogram was checked against the CPU this process:
+#: ``{device: bool}``.
+_TORCH_SPEC_OK: dict = {}
+
+
+def torch_spectrogram_agrees(device: str) -> bool:
+    """Does the torch spectrogram reproduce the CPU one on ``device``?
+
+    Checked once per process on a synthetic recording (noise plus a sweep and
+    a tone), because a backend can lack an op or compute it differently: it
+    must land within one grey level on at most 0.01% of pixels. Anything
+    else -- including an exception -- answers no, and the CPU is used.
+    """
+    if device in _TORCH_SPEC_OK:
+        return _TORCH_SPEC_OK[device]
+    ok = False
+    try:
+        sr = 250_000
+        rng = np.random.default_rng(0)
+        t = np.arange(2 * sr) / sr
+        x = rng.normal(0, 0.01, t.size)
+        x += 0.05 * np.sin(2 * np.pi * (30_000 + 10_000 * t) * t)
+        x += 0.02 * np.sin(2 * np.pi * 21_500 * t)
+        x = x.astype(np.float32)
+        args = (sr, 512, 384, 1024, -100.0, -20.0)
+        cpu = compute_full_spec_image(x, *args, as_uint8=True)
+        gpu = compute_full_spec_image_torch(x, *args, device=device)
+        d = np.abs(cpu.astype(np.int16) - gpu.astype(np.int16))
+        ok = (cpu.shape == gpu.shape and int(d.max(initial=0)) <= 1
+              and np.count_nonzero(d) <= 1e-4 * d.size)
+    except Exception:
+        ok = False
+    _TORCH_SPEC_OK[device] = ok
+    return ok
+
+
+def spec_image_for_device(
+    audio: np.ndarray, sample_rate: int,
+    nperseg: int, noverlap: int, nfft: int,
+    db_min: float, db_max: float, device: Optional[str] = None,
+) -> Tuple[np.ndarray, str]:
+    """The uint8 inference image, on the GPU when that is safe.
+
+    CUDA only. On Apple Silicon (MPS) the tile scan is the slow half and the
+    prefetch thread already hides the CPU spectrogram behind it, so there is
+    nothing to gain -- and the CPU path is the one every result so far came
+    from. Returns ``(image, backend)``; any GPU failure (a check that does not
+    agree, an out-of-memory) quietly uses the CPU.
+    """
+    if device and str(device).startswith('cuda') \
+            and torch_spectrogram_agrees(str(device)):
+        try:
+            return (compute_full_spec_image_torch(
+                audio, sample_rate, nperseg, noverlap, nfft, db_min, db_max,
+                device=str(device)), 'cuda')
+        except Exception:
+            pass
+    return (compute_full_spec_image(
+        audio, sample_rate, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+        db_min=db_min, db_max=db_max, as_uint8=True), 'cpu')
+
+
 # ----------------------------------------------------------------------
 # Tile cropping / padding helpers
 # ----------------------------------------------------------------------

@@ -28,7 +28,7 @@ class _Fake:
         self.fail_prepare = set(fail_prepare)
         self.lock = threading.Lock()
 
-    def prepare(self, wav, cfg, ckpt):
+    def prepare(self, wav, cfg, ckpt, device=None):
         t0 = time.perf_counter()
         time.sleep(CPU_S)
         if wav in self.fail_prepare:
@@ -158,7 +158,7 @@ def test_a_bundle_for_another_file_is_ignored(monkeypatch):
     class Stop(Exception):
         pass
 
-    def prep(wav, cfg, ckpt):
+    def prep(wav, cfg, ckpt, device=None):
         built.append(wav)
         return {'wav_path': wav, 'spec': np.zeros((4, 4), np.uint8),
                 'sr': 250_000, 'audio_dur': 1.0, 'db_min': -100.0,

@@ -207,6 +207,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         amp=not args.no_amp,
         prefetch_next=not args.no_prefetch,
+        gpu_spectrogram=not args.cpu_spectrogram,
     )
 
     from .mad_batch import (
@@ -648,6 +649,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Build each spectrogram only when its file "
                          "comes up, instead of during the previous "
                          "file's scan (slower; same output).")
+    pa.add_argument('--cpu-spectrogram', action='store_true',
+                    help="Build spectrograms on the CPU even on a CUDA "
+                         "GPU (the GPU one matches it to one grey "
+                         "level and is ~12x faster).")
     pa.add_argument('--no-resume', action='store_true',
                     help="Re-analyze files that already carry detections from "
                          "this model at these settings (default is to skip "
