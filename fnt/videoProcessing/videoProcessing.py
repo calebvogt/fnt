@@ -2144,19 +2144,50 @@ class VideoProcessingGUI(QMainWindow):
             event.accept()
 
 
-def main():
+def _launch_parser():
+    """``--input-dir DIR`` (repeatable) preselects folders; ``--start`` then
+    runs them with the window's default settings, exactly as pressing Start
+    would -- so a dictated or queued run still shows its progress on screen."""
+    import argparse
+    p = argparse.ArgumentParser(prog="video-preprocessing",
+                                description="FNT Video PreProcessing.")
+    p.add_argument("--input-dir", action="append", default=[], metavar="DIR",
+                   help="Folder of videos to process (repeatable).")
+    p.add_argument("--start", action="store_true",
+                   help="Start processing the --input-dir folders at once, "
+                        "with the default settings.")
+    return p
+
+
+def apply_launch_args(window, args) -> None:
+    """Preselect ``args.input_dir`` in ``window``; start if ``args.start``."""
+    for d in args.input_dir:
+        d = os.path.abspath(d)
+        if os.path.isdir(d) and d not in window.selected_dirs:
+            window.selected_dirs.append(d)
+    if window.selected_dirs:
+        window.update_directory_display()
+        window.start_btn.setEnabled(True)
+        if args.start:
+            QTimer.singleShot(500, window.start_processing)
+
+
+def main(argv=None):
     """Main entry point"""
     if not PYQT_AVAILABLE:
         print("PyQt5 is required for this tool. Please install it with: pip install PyQt5")
         return
-    
-    app = QApplication(sys.argv)
+
+    args, qt_args = _launch_parser().parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    app = QApplication([sys.argv[0]] + qt_args)
     app.setApplicationName("Video Processing Tool")
     app.setApplicationVersion("1.0")
-    
+
     window = VideoProcessingGUI()
     window.show()
-    
+    apply_launch_args(window, args)
+
     sys.exit(app.exec_())
 
 
