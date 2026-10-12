@@ -743,6 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Headless runs have no window, so Windows treats them as background work
+    # and throttles them: 47 s per recording instead of 27 (see power.py).
+    from .power import keep_full_speed
+    keep_full_speed()
     return args.func(args)
 
 
