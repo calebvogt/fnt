@@ -701,6 +701,92 @@ def cap_examples_per_recording(examples: List[Dict], cap: int, *,
     return [ex for i, ex in enumerate(examples) if i in keep]
 
 
+#: Spectrogram grid an example's frame offsets are counted on. Two examples'
+#: patches line up only when all of these agree.
+_GRID_KEYS = ("nperseg", "noverlap", "nfft", "sample_rate")
+
+
+def confirmed_neighbours(examples: Sequence[Dict]) -> List[Optional[np.ndarray]]:
+    """For each example, the OTHER confirmed calls on its recording that fall
+    inside its patch window: a bool array shaped like the patch, or ``None``.
+
+    The ``neighbors`` an example stores is a snapshot of the calls confirmed
+    at the moment it was saved. A call accepted later in the same bout is
+    therefore missing from every earlier call's window, and training taught it
+    as background -- the very thing ``neighbors`` exists to prevent, and
+    worst in dense bouts. Measured on the 8x8 mouse project
+    (mad_v1_VoleCosm, 2026-10-11): 48 of 413 labels, 6.7% of all neighbour
+    pixels, 22% on one C57 trial. Rebuilding the windows from the whole store
+    at training time makes the order calls were accepted in irrelevant.
+
+    Only labels (painted calls and accepted detections) are neighbours;
+    rejections never are. A call's own pixels are placed by its stored
+    ``patch_t_off``/``patch_f_off``, so only examples cut on the same
+    recording and the same grid are compared. Recordings are matched by
+    basename, the same key the train/val split groups on.
+    """
+    import bisect
+    import os as _os
+    from . import fnt_mask_store as _ms
+
+    def _rec(meta):
+        return _os.path.basename(str(meta.get("source_wav", "") or ""))
+
+    def _placed(meta):
+        return meta.get("patch_t_off") is not None
+
+    groups: Dict[tuple, List[int]] = {}
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        if (_ms.example_kind(meta) == "label" and _placed(meta) and _rec(meta)
+                and ex.get("mask") is not None):
+            key = (_rec(meta),) + tuple(meta.get(k) for k in _GRID_KEYS)
+            groups.setdefault(key, []).append(i)
+    # Per group: labels sorted by start frame, so each window only visits the
+    # labels that can reach it rather than every label on the recording.
+    index = {}
+    for key, idx in groups.items():
+        idx = sorted(idx, key=lambda j: int(examples[j]["meta"]["patch_t_off"]))
+        starts = [int(examples[j]["meta"]["patch_t_off"]) for j in idx]
+        widest = max(np.asarray(examples[j]["mask"]).shape[1] for j in idx)
+        index[key] = (idx, starts, widest)
+
+    out: List[Optional[np.ndarray]] = [None] * len(examples)
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        if not (_placed(meta) and _rec(meta)) or ex.get("mask") is None:
+            continue
+        found = index.get((_rec(meta),) + tuple(meta.get(k) for k in _GRID_KEYS))
+        if found is None:
+            continue
+        idx, starts, widest = found
+        H, W = np.asarray(ex["mask"]).shape
+        a_t = int(meta["patch_t_off"])
+        a_f = int(meta.get("patch_f_off") or 0)
+        win = None
+        lo = bisect.bisect_left(starts, a_t - widest + 1)
+        hi = bisect.bisect_left(starts, a_t + W)
+        for j in idx[lo:hi]:
+            if j == i:
+                continue
+            bm = examples[j]["meta"]
+            b = np.asarray(examples[j]["mask"]) > 0
+            b_t = int(bm["patch_t_off"])
+            b_f = int(bm.get("patch_f_off") or 0)
+            t0, t1 = max(a_t, b_t), min(a_t + W, b_t + b.shape[1])
+            f0, f1 = max(a_f, b_f), min(a_f + H, b_f + b.shape[0])
+            if t1 <= t0 or f1 <= f0:
+                continue
+            piece = b[f0 - b_f:f1 - b_f, t0 - b_t:t1 - b_t]
+            if not piece.any():
+                continue
+            if win is None:
+                win = np.zeros((H, W), dtype=bool)
+            win[f0 - a_f:f1 - a_f, t0 - a_t:t1 - a_t] |= piece
+        out[i] = win
+    return out
+
+
 def collect_training_examples(
     dataset_dir: str,
     tile_time_frames: int = TILE_TIME_FRAMES,
@@ -748,6 +834,17 @@ def collect_training_examples(
     """
     from . import fnt_mask_store as _ms
     examples = list(iter_examples(dataset_dir))
+    # Neighbours from the whole store, not the snapshot each example took when
+    # it was saved (see confirmed_neighbours) -- and before the cap: a call the
+    # cap leaves out of training is still a confirmed call in its neighbours'
+    # windows.
+    for ex, rebuilt in zip(examples, confirmed_neighbours(examples)):
+        if rebuilt is None:
+            continue
+        old = ex.get("neighbors")
+        if old is not None and np.shape(old) == rebuilt.shape:
+            rebuilt = rebuilt | (np.asarray(old) > 0)
+        ex["neighbors"] = rebuilt
     if max_per_recording and max_per_recording > 0:
         examples = cap_examples_per_recording(
             examples, int(max_per_recording), seed=seed, report=cap_report)
