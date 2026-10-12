@@ -358,6 +358,11 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
                    help="Hold out the same recordings as an earlier run (its "
                         "folder, name, or training_summary.json), so the two "
                         "are scored on one validation set.")
+    g.add_argument('--init-from', default='', metavar='WEIGHTS',
+                   help="Fine-tune: start from this weights.pt (or its run "
+                        "folder) instead of ImageNet. With --split-mode file "
+                        "the parent's held-out recordings stay held out. "
+                        "Pair with a lower --lr (e.g. 3e-4) and --patience.")
 
 
 #: argparse dest -> UNetTrainingConfig field, for every training flag.
@@ -373,6 +378,7 @@ _TRAIN_FIELD = {
     'max_per_recording': 'max_examples_per_recording',
     'tile_placements': 'tile_placements', 'run_name': 'run_name',
     'holdout_from': 'holdout_groups',
+    'init_from': 'init_from',
 }
 
 
@@ -494,6 +500,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
             if miss:
                 print(f"  pinned hold-out: {len(miss)} recording(s) have no "
                       f"examples now: {', '.join(miss[:5])}", flush=True)
+            if info.get('inherited'):
+                print("  (held-out recordings inherited from the parent model)",
+                      flush=True)
             if not info.get('val_held_out', True):
                 print("  WARNING: validation is not held out at the recording "
                       "level — val scores will flatter the model.",
@@ -528,6 +537,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
           f"{'on' if cfg.augment else 'off'}"
           f"{'+faint' if cfg.augment and cfg.augment_faint else ''}, "
           f"cap={cfg.max_examples_per_recording or 'off'})", flush=True)
+    if cfg.init_from:
+        print(f"  fine-tuning from {cfg.init_from}", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:
