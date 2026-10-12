@@ -1759,13 +1759,17 @@ class MADSpectrogramWidget(SpectrogramWidget):
     #: rule it shows is not visible anywhere else, and getting it wrong teaches
     #: real calls as background.
     show_training_windows = True
+    #: Context each side of a call, in frames, that training uses on this
+    #: recording. The main window sets it from the project's context_ms and
+    #: the file's grid (see MADMainWindow._apply_training_context).
+    training_context_frames = EXAMPLE_CONTEXT_FRAMES
 
     def training_windows(self) -> List[Tuple[int, int]]:
         """Frame spans ``[t0, t1)`` that training supervises, merged and sorted.
 
         Accepting or rejecting a call saves it as a training example: a patch
-        of EVERY frequency, from ``EXAMPLE_CONTEXT_FRAMES`` before the call to
-        as many after it, all supervised. So inside these spans anything that
+        of EVERY frequency, from ``training_context_frames`` before the call
+        to as many after it, all supervised. So inside these spans anything that
         is not a confirmed call -- a pending detection, or a call nobody
         marked -- is taught as background, and outside them nothing is used.
 
@@ -1777,7 +1781,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         n = int(self.n_time_frames or 0)
         if n <= 0 or not self.annotations:
             return []
-        ctx = int(EXAMPLE_CONTEXT_FRAMES)
+        ctx = int(self.training_context_frames)
         spans = sorted(
             (max(0, int(a['t0']) - ctx), min(n, int(a['t1']) + ctx))
             for a in self.annotations if a.get('status') != 'prediction')
@@ -6510,8 +6514,9 @@ class MADMainWindow(QMainWindow):
         self.chk_train_windows.setToolTip(
             "Shade the stretches of this recording that training uses.\n\n"
             "Accepting or rejecting a call saves it as a training example "
-            f"covering EVERY frequency, from ~{EXAMPLE_CONTEXT_FRAMES} frames "
-            "(~65 ms) before the call to as many after it. Training "
+            "covering EVERY frequency, from the project's training context "
+            "before the call to as much after it (~65 ms unless the project "
+            "sets context_ms). Training "
             "supervises all of it: inside a shaded band, anything that is not "
             "a confirmed call is taught as background -- including pending "
             "detections and calls nobody marked. Outside the bands nothing is "
@@ -10731,6 +10736,16 @@ class MADMainWindow(QMainWindow):
         if not self._focus_is_edit():
             self.chk_trajectories.toggle()
 
+    def _apply_training_context(self):
+        """Point the shading (and the save margin) at the project's training
+        context, converted to frames on the loaded file's grid."""
+        from fnt.usv.usv_detector.mad_examples import context_frames
+        sg = self.spectrogram
+        ms = getattr(self._project, 'context_ms', None)
+        sg.training_context_frames = context_frames(
+            ms, self.sample_rate, getattr(sg, 'hop', None))
+        sg.update()
+
     def _shortcut_training_windows(self):
         """W shows or hides the training-window shading."""
         if not self._focus_is_edit():
@@ -11223,6 +11238,7 @@ class MADMainWindow(QMainWindow):
             augment=self.chk_train_augment.isChecked(),
             loss=self.combo_train_loss.currentData() or 'bce_dice',
             split_mode=self.combo_train_split.currentData() or 'call',
+            context_ms=getattr(self._project, 'context_ms', None),
         )
         # A launched run's settings without a panel control (or whose control
         # could not take the value) win over the panel -- see launch_training.
@@ -16089,6 +16105,7 @@ class MADMainWindow(QMainWindow):
             noverlap=int(grid.get('noverlap', sp['noverlap'])),
             nfft=int(grid.get('nfft', sp['nfft'])),
         )
+        self._apply_training_context()
         wav_name = os.path.basename(wav_path)
         grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
         self._load_forced_harmonics(wav_path)
@@ -16841,7 +16858,9 @@ class MADMainWindow(QMainWindow):
         # tile, so tiles can be cut with real audio on BOTH sides of the call
         # instead of synthetic fill. Older examples used 64. The training-window
         # overlay reads the same constant, so what it shades is what trains.
-        margin = EXAMPLE_CONTEXT_FRAMES
+        margin = max(EXAMPLE_CONTEXT_FRAMES,
+                     int(getattr(sg, 'training_context_frames',
+                                 EXAMPLE_CONTEXT_FRAMES)))
         pt0 = max(0, t0 - margin)
         pt1 = min(n_time, t1 + margin)
 

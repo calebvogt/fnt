@@ -701,6 +701,55 @@ def cap_examples_per_recording(examples: List[Dict], cap: int, *,
     return [ex for i, ex in enumerate(examples) if i in keep]
 
 
+#: Context saved on each side of a call, in spectrogram frames, when a project
+#: sets no ``context_ms``: ~65 ms at hop 128 / 250 kHz.
+DEFAULT_CONTEXT_FRAMES = 128
+
+
+def context_frames(context_ms, sample_rate, hop) -> int:
+    """Frames of context for ``context_ms`` on a grid (``hop`` samples per
+    frame); the legacy :data:`DEFAULT_CONTEXT_FRAMES` when no context or no
+    usable grid is given."""
+    try:
+        if context_ms is None or not sample_rate or not hop or hop <= 0:
+            return DEFAULT_CONTEXT_FRAMES
+        return max(0, int(round(float(context_ms) / 1000.0
+                                * float(sample_rate) / float(hop))))
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_FRAMES
+
+
+def crop_to_context(ex: Dict, context_ms) -> Dict:
+    """Narrow an example's patch to its own call +/- ``context_ms``.
+
+    Patches are saved with the legacy context (or wider); the project's
+    context decides how much of it trains. Cropping, never padding: an example
+    saved narrower than the context keeps what it has. Measured from the
+    example's own ``mask`` (a label's call, a rejection's own shape), so an
+    example with no own pixels is left alone.
+    """
+    if context_ms is None:
+        return ex
+    m = np.asarray(ex.get("mask")) > 0
+    if m.ndim != 2 or not m.any():
+        return ex
+    meta = dict(ex.get("meta") or {})
+    hop = (meta.get("nperseg") or 0) - (meta.get("noverlap") or 0)
+    ctx = context_frames(context_ms, meta.get("sample_rate"), hop)
+    cols = np.flatnonzero(m.any(axis=0))
+    lo = max(0, int(cols[0]) - ctx)
+    hi = min(m.shape[1], int(cols[-1]) + 1 + ctx)
+    if lo == 0 and hi == m.shape[1]:
+        return ex
+    out = dict(ex)
+    for k in ("spec", "mask", "neighbors"):
+        if out.get(k) is not None:
+            out[k] = np.asarray(out[k])[:, lo:hi]
+    meta["patch_t_off"] = int(meta.get("patch_t_off") or 0) + lo
+    out["meta"] = meta
+    return out
+
+
 #: Spectrogram grid an example's frame offsets are counted on. Two examples'
 #: patches line up only when all of these agree.
 _GRID_KEYS = ("nperseg", "noverlap", "nfft", "sample_rate")
@@ -797,8 +846,12 @@ def collect_training_examples(
     seed: int = 0,
     max_per_recording: int = 0,
     cap_report: Optional[Dict] = None,
+    context_ms: Optional[float] = None,
 ):
     """Assemble ``(specs, targets, weights)`` stacks from saved examples.
+
+    ``context_ms`` crops every patch to its call +/- that much (see
+    :func:`crop_to_context`); None trains each patch as saved.
 
     ``max_per_recording`` (0 = off) keeps at most that many examples from any
     one recording, labels and hard negatives counted separately, chosen at
@@ -845,6 +898,9 @@ def collect_training_examples(
         if old is not None and np.shape(old) == rebuilt.shape:
             rebuilt = rebuilt | (np.asarray(old) > 0)
         ex["neighbors"] = rebuilt
+    # After the neighbours, which place calls by the full patch's offsets.
+    if context_ms is not None:
+        examples = [crop_to_context(ex, context_ms) for ex in examples]
     if max_per_recording and max_per_recording > 0:
         examples = cap_examples_per_recording(
             examples, int(max_per_recording), seed=seed, report=cap_report)

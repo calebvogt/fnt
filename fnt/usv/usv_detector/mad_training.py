@@ -150,6 +150,10 @@ class UNetTrainingConfig:
     # child is scored on recordings NEITHER run trained on.
     init_from: str = ""
 
+    # Context trained on each side of a call, in ms (None = each patch as
+    # saved). From the project's context_ms; see mad_examples.crop_to_context.
+    context_ms: Optional[float] = None
+
     def resolve_run_dir(self, n_examples: int = 0) -> str:
         if self.run_name:
             name = self.run_name
@@ -950,6 +954,7 @@ def train_unet(
         max_per_recording=int(getattr(cfg, 'max_examples_per_recording', 0)
                               or 0),
         cap_report=capped,
+        context_ms=getattr(cfg, 'context_ms', None),
     )
     if progress and capped:
         progress(0, cfg.n_epochs, {'status': 'capped', 'capped': capped})

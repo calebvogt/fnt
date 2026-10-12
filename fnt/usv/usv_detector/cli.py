@@ -359,6 +359,10 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
                         "folder) instead of ImageNet. With --split-mode file "
                         "the parent's held-out recordings stay held out. "
                         "Pair with a lower --lr (e.g. 3e-4) and --patience.")
+    g.add_argument('--context-ms', type=float, default=None, metavar='MS',
+                   help="Context trained on each side of a call, in ms "
+                        "(default: the project's context_ms; unset = each "
+                        "example as saved, ~65 ms at 250 kHz / hop 128).")
 
 
 #: argparse dest -> UNetTrainingConfig field, for every training flag.
@@ -373,7 +377,7 @@ _TRAIN_FIELD = {
     'faint_db': 'faint_db_range',
     'max_per_recording': 'max_examples_per_recording',
     'tile_placements': 'tile_placements', 'run_name': 'run_name',
-    'init_from': 'init_from',
+    'init_from': 'init_from', 'context_ms': 'context_ms',
 }
 
 
@@ -406,6 +410,8 @@ def training_overrides(args: argparse.Namespace) -> dict:
         if dest == 'arch' and not val:
             continue
         if dest == 'val_fraction' and val is None:
+            continue
+        if dest == 'context_ms' and val is None:
             continue
         if dest == 'faint_db':
             val = (float(val[0]), float(val[1]))
@@ -442,6 +448,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
     kw = training_overrides(args)
     kw.setdefault('model_arch', proj.model_arch or "unet")
     kw.setdefault('val_fraction', proj.val_fraction)
+    kw.setdefault('context_ms', getattr(proj, 'context_ms', None))
     cfg = UNetTrainingConfig(
         project_dir=proj.project_dir,
         nperseg=proj.nperseg, noverlap=proj.noverlap, nfft=proj.nfft,
@@ -507,6 +514,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
           f"cap={cfg.max_examples_per_recording or 'off'})", flush=True)
     if cfg.init_from:
         print(f"  fine-tuning from {cfg.init_from}", flush=True)
+    if cfg.context_ms is not None:
+        print(f"  context: {cfg.context_ms:g} ms each side of a call", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:

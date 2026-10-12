@@ -91,7 +91,7 @@ def test_overlapping_windows_merge_and_edges_clip_to_the_file():
 def test_the_save_path_uses_the_same_context_as_the_overlay():
     """If these drift apart the shading lies about what trains."""
     src = inspect.getsource(M.MADMainWindow._save_component_example)
-    assert "margin = EXAMPLE_CONTEXT_FRAMES" in src
+    assert "margin = max(EXAMPLE_CONTEXT_FRAMES" in src
 
 
 # ----------------------------------------------------------------------

@@ -90,6 +90,13 @@ class MADProjectConfig:
     #                (the patch is normalized and quantized when it is saved).
     db_norm: str = 'fixed'
     colormap: str = 'viridis'
+    # Context kept on each side of a call when it trains, in milliseconds.
+    # None = the legacy 128 spectrogram frames (~65 ms at hop 128 / 250 kHz),
+    # a width that scales with the grid rather than with time. Examples are
+    # always SAVED with at least the legacy width; training crops them to
+    # this and the GUI's training-window shading draws it, so it can change
+    # at any time without relabelling.
+    context_ms: Optional[float] = None
 
     # Model architecture — user-selectable per training run.
     #   'unet'     : segmentation_models_pytorch U-Net (default)
