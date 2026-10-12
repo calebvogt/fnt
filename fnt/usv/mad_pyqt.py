@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
     QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate, QToolButton,
+    QStyleOptionSlider,
     QStyleOptionViewItem, QTextEdit, QTreeWidget, QButtonGroup,
     QProgressDialog, QAbstractItemView, QListView, QTreeView,
     QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -54,6 +55,7 @@ from fnt.usv.audio_widgets import (
     MAX_EXPORT_MP, SpectrogramWidget, WaveformOverviewWidget)
 from scipy.ndimage import binary_erosion as ndi_binary_erosion
 from fnt.usv.usv_detector.fnt_mask_store import REJECTED_KINDS
+from fnt.usv.usv_detector.spectrogram import NO_WINDOW
 from fnt.usv.usv_detector.mad_labels import pred_csv_sibling_path
 from fnt.usv.usv_detector.mad_project import (
     MADProjectConfig, PROJECT_INFO_FILENAME, create_mad_project,
@@ -5937,7 +5939,8 @@ class MADClipWorker(QThread):
             audio = self.clip_audio(j)
             _sf.write(j['wav'], audio.astype(np.float32), j['out_sr'],
                       subtype='PCM_16')
-            proc = subprocess.run(j['cmd'], capture_output=True, text=True)
+            proc = subprocess.run(j['cmd'], capture_output=True, text=True,
+                                  **NO_WINDOW)
             if proc.returncode != 0 or not os.path.isfile(j['out']):
                 raise RuntimeError(
                     (proc.stderr or "ffmpeg failed").strip()[:600])
@@ -6175,7 +6178,7 @@ class MADDeviceProbeWorker(QThread):
         try:
             out = subprocess.run(
                 ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=6)
+                capture_output=True, text=True, timeout=6, **NO_WINDOW)
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip().splitlines()[0].strip()
         except Exception:
@@ -6218,6 +6221,38 @@ class MADDeviceProbeWorker(QThread):
 # ======================================================================
 # Main window
 # ======================================================================
+class ClickJumpSlider(QSlider):
+    """A slider that jumps to where its groove is clicked.
+
+    Qt's default moves one page step toward the click, and on a slider with a
+    handful of positions -- the nine playback speeds -- one page is the whole
+    range: a click in the middle sent the handle to an end, and the only way
+    to a middle value was to drag the handle. The press still starts a drag,
+    so click-and-slide works as before.
+    """
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            style = self.style()
+            handle = style.subControlRect(QStyle.CC_Slider, opt,
+                                          QStyle.SC_SliderHandle, self)
+            if not handle.contains(ev.pos()):
+                groove = style.subControlRect(QStyle.CC_Slider, opt,
+                                              QStyle.SC_SliderGroove, self)
+                if self.orientation() == Qt.Horizontal:
+                    span = groove.width() - handle.width()
+                    pos = ev.pos().x() - groove.x() - handle.width() // 2
+                else:
+                    span = groove.height() - handle.height()
+                    pos = ev.pos().y() - groove.y() - handle.height() // 2
+                self.setValue(QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), max(0, pos),
+                    max(1, span), opt.upsideDown))
+        super().mousePressEvent(ev)
+
+
 class MADMainWindow(QMainWindow):
     BASE_TITLE = "FNT Mask Audio Detector"
 
@@ -6759,7 +6794,7 @@ class MADMainWindow(QMainWindow):
         controls_layout.addWidget(self.spin_het_floor)
 
         controls_layout.addWidget(QLabel("Speed:"))
-        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed = ClickJumpSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
         self.slider_speed.setValue(len(self._speed_values) - 1)
         self.slider_speed.setFixedWidth(100)
@@ -8357,7 +8392,7 @@ class MADMainWindow(QMainWindow):
         score_row = QHBoxLayout()
         score_row.setSpacing(4)
         score_row.addWidget(QLabel("Min score:"))
-        self.slider_min_score = QSlider(Qt.Horizontal)
+        self.slider_min_score = ClickJumpSlider(Qt.Horizontal)
         self.slider_min_score.setRange(0, 100)
         self.slider_min_score.setValue(0)
         self.slider_min_score.setToolTip(
@@ -13554,7 +13589,7 @@ class MADMainWindow(QMainWindow):
             out = subprocess.run(
                 ['nvidia-smi',
                  '--query-gpu=name,driver_version', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=6)
+                capture_output=True, text=True, timeout=6, **NO_WINDOW)
             if out.returncode != 0 or not out.stdout.strip():
                 return None
             first = out.stdout.strip().splitlines()[0]
@@ -13567,7 +13602,7 @@ class MADMainWindow(QMainWindow):
         # --query-gpu fields, so parse it out of the plain nvidia-smi output.
         try:
             banner = subprocess.run(['nvidia-smi'], capture_output=True,
-                                    text=True, timeout=6)
+                                    text=True, timeout=6, **NO_WINDOW)
             m = re.search(r'CUDA Version:\s*([0-9]+\.[0-9]+)', banner.stdout)
             if m:
                 info['cuda'] = float(m.group(1))

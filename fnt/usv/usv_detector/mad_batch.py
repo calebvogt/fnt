@@ -195,7 +195,8 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
     A legacy CSV is still honoured for recordings analysed before the store
     carried provenance, so resuming an old run does not redo everything.
     """
-    from .fnt_mask_store import masks_sibling_path, read_pred_attrs
+    from .fnt_mask_store import (
+        get_infer_run_attrs, masks_sibling_path, read_pred_attrs)
 
     h5_path = masks_sibling_path(wav_path)
     if os.path.isfile(h5_path):
@@ -204,7 +205,16 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
             for a in attrs:
                 if not settings.matches_row(a):
                     return False
-            return True
+            # The crops carry model, threshold and min-blob, not how blobs
+            # were merged; the store's run attributes do. Without this a
+            # merge-off re-run skipped every file a merge-on run had done (9
+            # of the first 10 mad_v5_VC recordings) and split nothing. A store
+            # that cannot say is redone: skipping work never done is the worse
+            # failure.
+            merged = get_infer_run_attrs(h5_path).get("last_infer_merge")
+            if merged is None:
+                return False
+            return bool(int(merged)) == bool(settings.merge_consecutive)
         # No crops at all: nothing to attest, leave it to the manifest.
         return False
 
