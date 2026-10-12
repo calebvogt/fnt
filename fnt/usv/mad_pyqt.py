@@ -427,6 +427,8 @@ INFER_SETTINGS = {
 SPLITTER_STATE_KEY = "mad/ui/splitter_state_v2"
 #: Heterodyne playback's local-oscillator frequency, in kHz.
 HET_LO_KEY = "mad/audio/het_lo_khz"
+#: Whether the training-window shading (W) is on.
+TRAIN_WINDOWS_KEY = "mad/ui/show_train_windows"
 MAX_RECENT_PROJECTS = 8
 
 # Per-pixel mask values
@@ -435,6 +437,14 @@ MASK_POSITIVE = 1   # user-painted target
 MASK_NEGATIVE = 2   # auto-assigned inside committed time bands
 
 LABEL_SUFFIX = "_FNT_MAD_labels.png"
+
+#: Frames of context kept on each side of a call when it is saved as a training
+#: example (~65 ms at hop 128 / 250 kHz). Training supervises that whole patch
+#: -- every frequency, from this many frames before the call to as many after
+#: it -- so anything in it that is not a confirmed call is taught as
+#: background. The review overlay shades exactly this span; see
+#: MADSpectrogramWidget.training_windows. Examples saved before 2026-09 used 64.
+EXAMPLE_CONTEXT_FRAMES = 128
 
 
 # ======================================================================
@@ -469,6 +479,9 @@ _SEMANTIC_PALETTE = {
     'prob':      (255, 215, 40),
     'harmonic':  (120, 205, 255),
     'halo':      (0, 0, 0),
+    # Training-window shading: a faint lift of the spectrogram, not a hue --
+    # it marks a region, and must not read as a fifth review state.
+    'train_window': (255, 255, 255),
 }
 # Inverted grayscale is the one *light* background, where white and bright
 #: Stroke width of a mask outline, and of the selected one. The halo pen is
@@ -579,6 +592,7 @@ _SEMANTIC_PALETTE_LIGHT = {
     'prob':      (185, 125, 0),
     'harmonic':  (0, 90, 170),
     'halo':      (255, 255, 255),
+    'train_window': (0, 0, 0),
 }
 _OVERLAY_PALETTES = {
     name: _SEMANTIC_PALETTE
@@ -1741,6 +1755,100 @@ class MADSpectrogramWidget(SpectrogramWidget):
         """Review-overlay colors matched to the loaded spectrogram colormap."""
         return overlay_palette(getattr(self, 'colormap_name', None))
 
+    #: Shade the stretches training supervises (W toggles). On by default: the
+    #: rule it shows is not visible anywhere else, and getting it wrong teaches
+    #: real calls as background.
+    show_training_windows = True
+
+    def training_windows(self) -> List[Tuple[int, int]]:
+        """Frame spans ``[t0, t1)`` that training supervises, merged and sorted.
+
+        Accepting or rejecting a call saves it as a training example: a patch
+        of EVERY frequency, from ``EXAMPLE_CONTEXT_FRAMES`` before the call to
+        as many after it, all supervised. So inside these spans anything that
+        is not a confirmed call -- a pending detection, or a call nobody
+        marked -- is taught as background, and outside them nothing is used.
+
+        Derived from the decisions on screen (anything not pending), so it
+        follows accept / reject / undo / delete with no store reads. Examples
+        saved with the older 64-frame context are drawn at today's width: the
+        shading can overstate one of those, never understate it.
+        """
+        n = int(self.n_time_frames or 0)
+        if n <= 0 or not self.annotations:
+            return []
+        ctx = int(EXAMPLE_CONTEXT_FRAMES)
+        spans = sorted(
+            (max(0, int(a['t0']) - ctx), min(n, int(a['t1']) + ctx))
+            for a in self.annotations if a.get('status') != 'prediction')
+        merged: List[List[int]] = []
+        for lo, hi in spans:
+            if hi <= lo:
+                continue
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        return [(lo, hi) for lo, hi in merged]
+
+    def undecided_in_training_windows(
+            self, windows: Optional[List[Tuple[int, int]]] = None) -> List[int]:
+        """Indices of pending detections that overlap a training window.
+
+        Each will be trained as background where it overlaps, unless it is
+        accepted or rejected -- this is the work a shaded window still needs.
+        Includes detections the min-score slider hides; they train the same.
+        """
+        import bisect
+        wins = self.training_windows() if windows is None else windows
+        if not wins:
+            return []
+        starts = [lo for lo, _hi in wins]
+        out = []
+        for i, a in enumerate(self.annotations):
+            if a.get('status') != 'prediction':
+                continue
+            t0, t1 = int(a['t0']), int(a['t1'])
+            # The last window starting before this detection ends is the only
+            # one that can reach it: windows are disjoint and sorted.
+            k = bisect.bisect_left(starts, t1) - 1
+            if k >= 0 and wins[k][1] > t0:
+                out.append(i)
+        return out
+
+    def _paint_training_windows(self, painter, spec_rect, t_start: int,
+                                t_end: int, pal: dict) -> None:
+        """Faint full-height bands over the supervised spans, dashed at the
+        edges so a band's limit reads even where the spectrogram is bright."""
+        wins = [(lo, hi) for lo, hi in self.training_windows()
+                if hi > t_start and lo < t_end]
+        if not wins:
+            return
+        r, g, b = pal.get('train_window', (255, 255, 255))
+        span = max(1, t_end - t_start)
+        left, width = spec_rect.left(), spec_rect.width()
+        top, bottom = spec_rect.top(), spec_rect.bottom()
+
+        def _x(t):
+            return left + (t - t_start) / span * width
+
+        fill = QColor(r, g, b, 30)
+        edge = QPen(QColor(r, g, b, 170))
+        edge.setStyle(Qt.DashLine)
+        edge.setWidth(1)
+        painter.save()
+        for lo, hi in wins:
+            x0 = max(left, _x(lo))
+            x1 = min(left + width, _x(hi))
+            painter.fillRect(QRectF(x0, top, max(1.0, x1 - x0),
+                                    bottom - top), fill)
+            painter.setPen(edge)
+            if lo > t_start:
+                painter.drawLine(QPointF(_x(lo), top), QPointF(_x(lo), bottom))
+            if hi < t_end:
+                painter.drawLine(QPointF(_x(hi), top), QPointF(_x(hi), bottom))
+        painter.restore()
+
     @staticmethod
     def _stroke_polys(painter, polys, color, width: int, halo,
                       style=Qt.SolidLine):
@@ -1902,6 +2010,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
         )
         painter = QPainter(self)
         painter.drawImage(spec_rect.topLeft(), scaled)
+        # Under every outline and label, over the masks' fill: a region, not a
+        # call, so it must never hide what is drawn inside it.
+        if self.show_training_windows and self.view_mode != 'spec':
+            self._paint_training_windows(painter, spec_rect, t_start, t_end,
+                                         pal)
 
         def _t_to_x(t):
             frac = (t - t_start) / max(1, (t_end - t_start))
@@ -6391,10 +6504,36 @@ class MADMainWindow(QMainWindow):
         self.chk_trajectories.setFocusPolicy(Qt.NoFocus)
         self.chk_trajectories.setStyleSheet("font-size: 10px;")
         self.chk_trajectories.toggled.connect(self._set_trajectory_window_open)
+        # Training windows: what an accept or reject puts into training. It is
+        # a view of the spectrogram too, so it sits beside the 3D toggle.
+        self.chk_train_windows = QCheckBox("Training windows (W)")
+        self.chk_train_windows.setToolTip(
+            "Shade the stretches of this recording that training uses.\n\n"
+            "Accepting or rejecting a call saves it as a training example "
+            f"covering EVERY frequency, from ~{EXAMPLE_CONTEXT_FRAMES} frames "
+            "(~65 ms) before the call to as many after it. Training "
+            "supervises all of it: inside a shaded band, anything that is not "
+            "a confirmed call is taught as background -- including pending "
+            "detections and calls nobody marked. Outside the bands nothing is "
+            "used.\n\n"
+            "So inside a band: accept or reject every detection, and paint any "
+            "call the model missed. The header counts the pending detections "
+            "still inside a band.\nShortcut: W.")
+        self.chk_train_windows.setFocusPolicy(Qt.NoFocus)
+        self.chk_train_windows.setStyleSheet("font-size: 10px;")
+        try:
+            _show_tw = str(self._settings.value(
+                TRAIN_WINDOWS_KEY, "true")).lower() not in ("false", "0")
+        except Exception:
+            _show_tw = True
+        self.chk_train_windows.setChecked(_show_tw)
+        self.spectrogram.show_training_windows = _show_tw
+        self.chk_train_windows.toggled.connect(self._set_training_windows_shown)
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 4, 0)
         header_row.setSpacing(6)
         header_row.addWidget(self.lbl_view_header, 1)
+        header_row.addWidget(self.chk_train_windows, 0, Qt.AlignRight)
         header_row.addWidget(self.chk_trajectories, 0, Qt.AlignRight)
         right_layout.addLayout(header_row)
         right_layout.addWidget(self.spectrogram, 1)
@@ -10592,6 +10731,20 @@ class MADMainWindow(QMainWindow):
         if not self._focus_is_edit():
             self.chk_trajectories.toggle()
 
+    def _shortcut_training_windows(self):
+        """W shows or hides the training-window shading."""
+        if not self._focus_is_edit():
+            self.chk_train_windows.toggle()
+
+    def _set_training_windows_shown(self, on: bool):
+        self.spectrogram.show_training_windows = bool(on)
+        try:
+            self._settings.setValue(TRAIN_WINDOWS_KEY, bool(on))
+        except Exception:
+            pass
+        self.spectrogram.update()
+        self._update_view_header()
+
     def _set_trajectory_window_open(self, on: bool):
         """The header checkbox (and T) drive this; the window's own X comes
         back through ``visibility_changed`` so the box always tells the truth."""
@@ -13543,6 +13696,7 @@ class MADMainWindow(QMainWindow):
         # are fully dedicated to zoom; B/N step Back/Next through detections.
         make(Qt.Key_G, self._show_gallery)         # Gallery (grid review)
         make(Qt.Key_T, self._shortcut_trajectories)  # 3D call trajectories
+        make(Qt.Key_W, self._shortcut_training_windows)  # training windows
         make(Qt.Key_B, self._shortcut_pred_prev)   # Back (previous detection)
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
@@ -14987,11 +15141,21 @@ class MADMainWindow(QMainWindow):
         # the first two are work already done and the last is work still to do,
         # so putting pending last means the eye lands on the number that says
         # whether this recording needs attention.
+        # Pending detections inside a training window will train as background
+        # unless decided -- the one count here that is a correctness problem
+        # rather than a to-do, so it is only shown when it is not zero.
+        inside = ""
+        sg = self.spectrogram
+        if getattr(sg, 'show_training_windows', False) and pend:
+            n_in = len(sg.undecided_in_training_windows())
+            if n_in:
+                inside = (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
+                          f"{n_in} pending inside training windows</span>")
         lbl.setText(
             f"<b>{base}</b> &nbsp;·&nbsp; {pos} &nbsp;·&nbsp; "
             f"<span style='color:#3fbf5f'>{acc} accepted</span> &nbsp;·&nbsp; "
             f"<span style='color:#d64545'>{rej} rejected</span> &nbsp;·&nbsp; "
-            f"<span style='color:#d8c341'>{pend} pending</span>")
+            f"<span style='color:#d8c341'>{pend} pending</span>{inside}")
 
     def _touch_current_file_badge(self):
         """Re-badge JUST the on-screen recording's Audio-list row from memory.
@@ -16675,8 +16839,9 @@ class MADMainWindow(QMainWindow):
         # Context kept on each side of the call. 128 frames (~65 ms at hop
         # 128 / 250 kHz) makes a typical patch wider than a 256-frame training
         # tile, so tiles can be cut with real audio on BOTH sides of the call
-        # instead of synthetic fill. Older examples used 64.
-        margin = 128
+        # instead of synthetic fill. Older examples used 64. The training-window
+        # overlay reads the same constant, so what it shades is what trains.
+        margin = EXAMPLE_CONTEXT_FRAMES
         pt0 = max(0, t0 - margin)
         pt1 = min(n_time, t1 + margin)
 
