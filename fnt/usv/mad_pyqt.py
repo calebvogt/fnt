@@ -20008,7 +20008,7 @@ def _launch_parser():
                    help="Show only these recordings in the Audio list: wav "
                         "paths, bare filenames, and/or .txt files listing "
                         "them one per line. The project keeps every "
-                        "recording; File ▸ Show All Recordings returns.")
+                        "recording; File > Show All Recordings returns.")
     g = p.add_argument_group(
         "post-training inference",
         "Detection settings for --infer-after, set in the panel before the "
