@@ -8006,11 +8006,23 @@ class MADMainWindow(QMainWindow):
                     "grid is not kept, so this cannot be re-filtered after "
                     "the fact.")
 
+        # With --inference-window-only the main window is hidden, and a dialog
+        # owned by a hidden window never appears: MAD sat on an invisible
+        # summary all night. Unowned and brought forward instead.
+        window_only = getattr(self, '_window_only', False)
         dlg = MADRunSummaryTable(
             self, "Inference complete",
             "Inference complete." if total else
             "Inference complete — nothing detected.",
             lines, results)
+        if window_only:
+            # Keeps its reference to MAD for its buttons; loses the owner.
+            dlg.setParent(None)
+            dlg.setWindowFlags(Qt.Window | Qt.WindowTitleHint
+                               | Qt.WindowCloseButtonHint)
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
         dlg.exec_()
 
     def _show_settings_dialog(self):

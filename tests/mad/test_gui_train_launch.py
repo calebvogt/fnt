@@ -328,6 +328,28 @@ def test_closing_the_inference_window_after_the_run_quits(monkeypatch):
     assert quit_.n == 1
 
 
+
+def test_the_window_only_summary_is_its_own_visible_window(monkeypatch):
+    """With the main window hidden, a summary it owned never appeared and MAD
+    waited on it all night (2026-10-12)."""
+    from PyQt5.QtWidgets import QDialog
+    w = gui()
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    seen = {}
+
+    def fake_exec(self):
+        seen["parent"] = self.parentWidget()
+        seen["visible"] = self.isVisible()
+        seen["main"] = getattr(self, "_main", None)
+        return 0
+    monkeypatch.setattr(M.MADRunSummaryTable, "exec_", fake_exec)
+    w._show_inference_summary_dialog(
+        [{"wav_path": "a.wav", "n_blobs": 3, "timing": {}}])
+    assert seen["parent"] is None, "owned by the hidden main window"
+    assert seen["visible"], "not shown before the modal loop"
+    assert seen["main"] is w, "lost its link to MAD"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
