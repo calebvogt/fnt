@@ -15,14 +15,18 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKIP = {"run_all.py", "__init__.py"}
+SKIP = {"run_all.py", "__init__.py", "conftest.py"}
 
 
 def suites():
+    # conftest.py and test_*.py belong to pytest (python -m pytest tests). Run
+    # as plain scripts they only define their tests, and on a CI runner without
+    # pytest installed they fail on the import alone.
     return sorted(
         name for name in os.listdir(HERE)
         if name.endswith(".py") and name not in SKIP
         and not name.endswith("_live.py")
+        and not name.startswith("test_")
     )
 
 
