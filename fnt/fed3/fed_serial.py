@@ -34,9 +34,10 @@ BAUD = 115200
 SETTLE_SECONDS = 2.0
 
 # A link that has heard nothing at all for this long is treated as wedged and
-# recycled. Devices are otherwise silent between pokes, so this is only a
-# backstop against a half-open port that never errors.
-SILENCE_TIMEOUT = 0.0   # 0 disables; see Fed3Link(silence_timeout=...)
+# recycled. Devices are silent between pokes, so this cannot stand alone as a
+# liveness check — the tab pairs it with a PING heartbeat, which is what makes
+# silence meaningful. Sized to comfortably outlast the heartbeat's own retry.
+SILENCE_TIMEOUT = 90.0   # seconds; 0 disables
 
 
 class _PortRegistry:
@@ -108,15 +109,25 @@ class Fed3Link(QThread):
         self._running = False
         self._commands.put(None)        # wake the loop immediately
         if not self.wait(wait_ms):
-            self.terminate()
-            self.wait(1000)
-        # terminate() skips the finally block, so release defensively.
+            # A read is sitting in the serial driver past its own timeout.
+            # Waiting it out is the only safe answer: terminate() kills the
+            # thread wherever it stands, and this loop is mostly Python, so a
+            # thread killed holding the GIL takes the whole application with
+            # it rather than just this link.
+            self.wait(wait_ms)
+        # The loop may still be unwinding, so release defensively.
         if self._claimed:
             PORT_REGISTRY.release(self.port)
             self._claimed = False
 
     def is_live(self):
         return self._running and self.isRunning()
+
+    def seconds_since_rx(self):
+        """Seconds since any byte arrived. Large before the first read."""
+        if not self._last_rx:
+            return 0.0
+        return time.monotonic() - self._last_rx
 
     # --- owning thread ----------------------------------------------------
 
@@ -254,6 +265,18 @@ class PortScannerWorker(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._cancelled = False
+
+    def cancel(self):
+        """Ask the scan to stop at the next port boundary.
+
+        A probe already in flight is left to finish, which it will: each is
+        bounded by its own open and read timeouts. The one thing a caller must
+        never do instead is terminate() this thread. Enumerating ports is
+        almost entirely Python, so killing the thread there strands the GIL and
+        the process deadlocks the moment any other thread needs it.
+        """
+        self._cancelled = True
 
     def run(self):
         try:
@@ -271,9 +294,13 @@ class PortScannerWorker(QThread):
         probe = [p for p in ports
                  if is_candidate_port(p) and p.device not in claimed]
 
-        if probe:
+        if probe and not self._cancelled:
             with ThreadPoolExecutor(max_workers=min(10, len(probe))) as pool:
                 results.extend(r for r in pool.map(_probe_port, probe) if r)
+
+        if self._cancelled:
+            # The tab that asked for this scan is gone; nothing is listening.
+            return
 
         self.finished_scan.emit(results, [p.device for p in ports])
 
@@ -306,7 +333,11 @@ def _probe_port(port_info):
 
         if "PONG_FED3" in response:
             device_id, firmware = proto.parse_pong(response)
-            return device, "FED3 Active", device_id, firmware
+            # Distinguished here so the tab can refuse the device before an
+            # experiment is started on it, rather than after a transfer fails.
+            status = ("FED3 Active" if proto.is_supported(firmware)
+                      else "FED3 (firmware too old)")
+            return device, status, device_id, firmware
     except Exception as exc:  # noqa: BLE001
         text = str(exc).lower()
         if any(k in text for k in ("busy", "already open", "permission denied", "access is denied")):

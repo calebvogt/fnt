@@ -14,6 +14,14 @@ Two things changed from the original implementation:
   host dropped the operation while the device carried on streaming into a buffer
   nobody was draining, which left the next command talking to the tail of a
   half-finished file.
+
+One thing this class deliberately does *not* assume: **that the payload arrives
+uninterrupted**. Firmware 2.0 streams a file from ``loop()``, so a nosepoke
+mid-download can emit an ``EVT`` line between two chunks of file content. Such
+lines are handed back to the caller instead of being written into the file,
+which both keeps the CRC verifiable and stops the behavioural event from being
+lost. The firmware queues events for the duration of a transfer so this should
+not arise; this is the belt to that firmware's braces.
 """
 
 import zlib
@@ -64,6 +72,8 @@ class Fed3Transfer(QObject):
 
     def file_size(self, filename, callback):
         """``callback(ok, size | error_message)``."""
+        if self._reject_if_busy(callback):
+            return False
         self._filename = filename
         return self._begin(_SIZING, callback, proto.cmd_file_size(filename))
 
@@ -74,6 +84,13 @@ class Fed3Transfer(QObject):
         offset is echoed back because the device clamps it when the host's
         mirror is somehow ahead of the file (e.g. the log was rotated).
         """
+        # Refused before anything is stored. Writing ``_filename``/``_offset``
+        # first and only then noticing the link was busy overwrote the *running*
+        # transfer's start offset: the in-flight mirror chunk then reported back
+        # as starting at this request's offset, and the mirror rewrote its copy
+        # of the log from there — truncating it to the last chunk pulled.
+        if self._reject_if_busy(callback):
+            return False
         self._filename = filename
         self._offset = offset
         return self._begin(_DOWNLOADING, callback,
@@ -101,8 +118,16 @@ class Fed3Transfer(QObject):
         if self._state == _IDLE:
             return False
 
-        self._timer.start(TIMEOUT_MS)     # any activity keeps the operation alive
         stripped = line.strip()
+
+        # Asynchronous chatter belongs to the GUI, not to this operation, even
+        # when it lands in the middle of a payload. Returning False lets the
+        # caller handle it normally; the device's CRC covers file bytes only, so
+        # excluding these lines is what makes the checksum verify.
+        if proto.is_out_of_band(stripped):
+            return False
+
+        self._timer.start(TIMEOUT_MS)     # any activity keeps the operation alive
 
         if self._state == _LISTING:
             return self._handle_listing(stripped)
@@ -147,9 +172,9 @@ class Fed3Transfer(QObject):
             # Still waiting for the header.
             header = proto.parse_data_start(stripped)
             if header is not None:
-                name, offset, size = header
+                _name, offset, size = header
                 self._offset = offset          # device may have clamped it
-                self._expected_size = size if size is not None else -1
+                self._expected_size = size
                 return True
             if proto.is_error(stripped):
                 self._fail(stripped)
@@ -196,9 +221,15 @@ class Fed3Transfer(QObject):
 
     # --- plumbing ---------------------------------------------------------
 
+    def _reject_if_busy(self, callback):
+        """Fail ``callback`` when another operation owns the link. True if so."""
+        if not self.busy:
+            return False
+        self._invoke(callback, False, "device is busy with another transfer")
+        return True
+
     def _begin(self, state, callback, command):
-        if self.busy:
-            self._invoke(callback, False, "device is busy with another transfer")
+        if self._reject_if_busy(callback):
             return False
         self._state = state
         self._callback = callback

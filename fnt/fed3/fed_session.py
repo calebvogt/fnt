@@ -11,14 +11,13 @@ Every recording gets a timestamped folder::
             FED/<device>/events.csv          # behavioural events, host + device clock
             FED/<device>/mirror/<FILE>.CSV   # byte-exact copy of the SD card file
             FED/<device>/mirror_state.json   # per-file byte offsets
-            Video/<camera>.mp4               # + <camera>_frames.csv
             Sync/clock_sync.csv              # host vs device RTC at each sync
 
 Time base
 ---------
-Every host-side timestamp in a session — FED events, camera frames, interactions,
+Every host-side timestamp in a session — FED events, interactions,
 clock syncs — is :func:`host_now`, a single wall-clock epoch float. That is what
-makes camera frames and pokes directly comparable without post-hoc alignment.
+makes events directly comparable without post-hoc alignment.
 The device RTC is recorded alongside, never substituted for it, so clock drift
 stays measurable rather than baked in.
 
@@ -76,6 +75,67 @@ def _atomic_write_json(path, payload):
     os.replace(tmp, path)
 
 
+def device_archive_dir(sessions_root, device_name):
+    """Where a device's historical SD files are kept, across all sessions.
+
+    Deliberately outside any one session folder. The card's back catalogue is a
+    property of the device, not of the run that happened to be recording when it
+    was copied; keeping it here means it is downloaded once ever rather than
+    re-downloaded from byte zero into every new session folder.
+    """
+    path = os.path.join(sessions_root, "device_archive", _safe_name(device_name))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class DeviceNames:
+    """User-assigned device labels, remembered between launches.
+
+    Keyed by the on-board FED3 ID rather than by slot or port, because that is
+    the only identifier that survives a replug: ports get renumbered by the
+    kernel and slots are a UI concept. A cage labelled "Cage A — FR1" keeps that
+    label when it is unplugged, moved to another USB socket, and plugged back in.
+    """
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(default_session_root(), "device_names.json")
+        self._labels = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, ValueError):
+            return
+        if isinstance(loaded, dict):
+            self._labels = {str(k): str(v) for k, v in loaded.items() if v}
+
+    def get(self, device_id):
+        """The stored label for a device ID, or "" if it has never been named."""
+        if device_id in (None, ""):
+            return ""
+        return self._labels.get(str(device_id), "")
+
+    def set(self, device_id, label):
+        """Store (or, for an empty label, forget) the name for a device ID."""
+        if device_id in (None, ""):
+            return
+        key = str(device_id)
+        label = (label or "").strip()
+        if label:
+            if self._labels.get(key) == label:
+                return
+            self._labels[key] = label
+        elif key in self._labels:
+            del self._labels[key]
+        else:
+            return
+        try:
+            _atomic_write_json(self.path, self._labels)
+        except OSError:
+            # A name that cannot be written back is not worth interrupting a
+            # recording over; it just will not survive this launch.
+            pass
+
+
 class RecordingSession:
     """The on-disk tree for one recording, plus its logs."""
 
@@ -92,9 +152,8 @@ class RecordingSession:
 
         self.data_dir = os.path.join(self.root, "Data")
         self.fed_dir = os.path.join(self.data_dir, "FED")
-        self.video_dir = os.path.join(self.data_dir, "Video")
         self.sync_dir = os.path.join(self.data_dir, "Sync")
-        for d in (self.root, self.data_dir, self.fed_dir, self.video_dir, self.sync_dir):
+        for d in (self.root, self.data_dir, self.fed_dir, self.sync_dir):
             os.makedirs(d, exist_ok=True)
 
         self.config_path = os.path.join(self.root, "session_config.json")
@@ -120,11 +179,6 @@ class RecordingSession:
         os.makedirs(path, exist_ok=True)
         return path
 
-    def video_path(self, camera_label):
-        return os.path.join(self.video_dir, f"{_safe_name(camera_label)}.mp4")
-
-    def video_frames_path(self, camera_label):
-        return os.path.join(self.video_dir, f"{_safe_name(camera_label)}_frames.csv")
 
     # --- config / state ---------------------------------------------------
 
@@ -158,7 +212,7 @@ class RecordingSession:
 
         ``offset_s`` is device minus host; a growing magnitude across a session
         is RTC drift, and it is what lets device-clock SD timestamps be mapped
-        onto the host time base the camera uses.
+        onto the host time base.
         """
         host_ts = sent_at if sent_at is not None else host_now()
         offset = ""
@@ -318,7 +372,20 @@ def _append_csv(path, fields, row):
         f.flush()
 
 
+# Windows refuses these as file or directory names, with or without an
+# extension, and silently drops trailing dots. A lab that names a cage after the
+# port it is on — "COM3" — would otherwise get an unwritable session folder on
+# the machine that actually runs the experiments.
+_WINDOWS_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)])
+
+
 def _safe_name(name):
-    """Filesystem-safe version of a user-supplied device or camera name."""
+    """Filesystem-safe version of a user-supplied device name."""
     cleaned = "".join(c if c.isalnum() or c in "-_. " else "_" for c in str(name)).strip()
-    return cleaned.replace(" ", "_") or "unnamed"
+    cleaned = cleaned.replace(" ", "_").rstrip(".")
+    if cleaned.split(".")[0].lower() in _WINDOWS_RESERVED:
+        cleaned += "_"
+    return cleaned or "unnamed"
