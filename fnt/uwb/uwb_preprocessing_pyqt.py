@@ -16693,6 +16693,15 @@ class UWBQuickVisualizationWindow(QWidget):
             return default_temp_dir
         return None
 
+    def _batch_anim_temp_dir(self, db_dir, db_name):
+        """Temp-frames folder for a batch render: the run's chosen folder, else
+        a ``temp_frames`` folder inside animation_Tracking -- never
+        animation_Tracking itself, because the render deletes this folder when
+        it finishes and would take the finished videos with it."""
+        return (getattr(self, '_batch_temp_frames_dir', None)
+                or os.path.join(db_dir, f"{db_name}_FNT_analysis",
+                                'animation_Tracking', 'temp_frames'))
+
     @staticmethod
     def _describe_missing_days(gaps, day_numbers, fps, speed_text, limit=8):
         """'Day 3 (2026-09-17) and Day 5 (2026-09-19) have no video at 30 fps / 240x'."""
@@ -18573,9 +18582,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self._anim_temp_frames_dir = None
         if save_animation:
             if batch:
-                self._anim_temp_frames_dir = (
-                    getattr(self, '_batch_temp_frames_dir', None)
-                    or os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking'))
+                self._anim_temp_frames_dir = self._batch_anim_temp_dir(db_dir, db_name)
             else:
                 _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
                 self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
