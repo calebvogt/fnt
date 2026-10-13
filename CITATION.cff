@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use FieldNeuroToolbox (FNT) in your research, please cite it using the metadata below."
+type: software
+title: "FieldNeuroToolbox (FNT)"
+abstract: >-
+  Open-source software for working with field neuroethology data: graphical tools for audio
+  and ultrasonic vocalizations (including the Mask Audio Detector), video processing, tracking
+  and behavioral scoring, ultra-wideband and RFID tracking, feeding devices, fiber photometry
+  and imaging, in one desktop app that runs on an ordinary laptop.
+authors:
+  - family-names: Vogt
+    given-names: Caleb C.
+    orcid: "https://orcid.org/0000-0001-9315-3775"
+    affiliation: "University of Colorado Boulder"
+  - family-names: Garmany
+    given-names: Samuel
+repository-code: "https://github.com/calebvogt/fnt"
+url: "https://github.com/calebvogt/fnt"
+license: AGPL-3.0-or-later
+keywords:
+  - neuroethology
+  - field neuroscience
+  - animal behavior
+  - ultrasonic vocalizations
+  - video tracking
+  - RFID
+  - ultra-wideband

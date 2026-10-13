@@ -137,4 +137,6 @@ In short:
 - If you distribute a modified version, you must release your source code under the same license.
 - If you run a modified version as a network service, you must offer its source code to users of that service.
 
-If you use FNT in published research, please cite this repository: [github.com/calebvogt/fnt](https://github.com/calebvogt/fnt)
+## Citing FNT
+
+If you use FNT in published research, please cite it. The **Cite this repository** button on the repository's GitHub page gives the citation in APA and BibTeX formats, generated from [CITATION.cff](CITATION.cff).
