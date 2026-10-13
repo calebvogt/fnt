@@ -5,8 +5,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QLabel, QTextEdit, QFileDialog, 
                              QMessageBox, QGroupBox, QLineEdit, QProgressBar, QFrame,
                              QScrollArea, QComboBox)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QFont
+
+#: Stops each ffmpeg call opening a console window of its own when the tool
+#: was started without a console (pythonw, a shortcut, a queued launch).
+NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+             if os.name == "nt" else {})
 
 class CompressWorker(QThread):
     """Worker thread for compressing WAV files"""
@@ -75,7 +80,8 @@ class CompressWorker(QThread):
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
-                        check=True
+                        check=True,
+                        **NO_WINDOW
                     )
                     
                     # Show stderr (ffmpeg progress info)
@@ -526,10 +532,43 @@ class CompressWavsWindow(QMainWindow):
             QMessageBox.critical(self, "Error", message)
 
 
-def main():
-    app = QApplication(sys.argv)
+def _launch_parser():
+    """``--input-dir DIR`` (repeatable) preselects folders; ``--start`` then
+    runs them with the window's default settings, exactly as pressing Start
+    Compression would -- so a dictated or queued run still shows its progress
+    on screen."""
+    import argparse
+    p = argparse.ArgumentParser(prog="compress-wavs",
+                                description="FNT Compress WAV Files.")
+    p.add_argument("--input-dir", action="append", default=[], metavar="DIR",
+                   help="Folder of WAV files to compress (repeatable).")
+    p.add_argument("--start", action="store_true",
+                   help="Start compressing the --input-dir folders at once, "
+                        "with the default settings.")
+    return p
+
+
+def apply_launch_args(window, args) -> None:
+    """Preselect ``args.input_dir`` in ``window``; start if ``args.start``."""
+    for d in args.input_dir:
+        d = os.path.abspath(d)
+        if os.path.isdir(d) and d not in window.folder_paths:
+            window.folder_paths.append(d)
+    if window.folder_paths:
+        window.update_folder_display()
+        window.btn_process.setEnabled(True)
+        window.btn_clear.setEnabled(True)
+        if args.start:
+            QTimer.singleShot(500, window.start_compression)
+
+
+def main(argv=None):
+    args, qt_args = _launch_parser().parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    app = QApplication([sys.argv[0]] + qt_args)
     window = CompressWavsWindow()
     window.show()
+    apply_launch_args(window, args)
     sys.exit(app.exec_())
 
 
