@@ -26,11 +26,12 @@ classifiers = [
 dependencies = [
     # Core scientific stack
     "numpy>=1.24",
-    # Pin to the pandas 2.x line: pandas 3.0 makes Copy-on-Write mandatory and
-    # changes groupby.apply / default string dtype, which the preprocessing
-    # pipeline was not written against. Keeps a fresh `pip install -e .` from
-    # silently jumping to 3.x.
-    "pandas>=2.2,<3",
+    # pandas 3 everywhere (2026-10-13). The code was checked for its
+    # Copy-on-Write, string-dtype and groupby.apply changes, and times are
+    # pinned to nanoseconds wherever raw integers are read (pandas 3 parses to
+    # microseconds). Keeps every machine and the release builds on one major
+    # version.
+    "pandas>=3.0,<4",
     "scipy",
     "matplotlib",
     "pytz",
