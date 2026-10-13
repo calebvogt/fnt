@@ -288,6 +288,20 @@ def test_launch_inference_runs_only_what_is_not_done(monkeypatch, tmp_path):
     assert cfg.model_path.endswith("weights.pt")
     assert (cfg.threshold, cfg.min_blob_pixels, cfg.merge_consecutive) == \
         (0.5, 50, False)
+    # A launched run gets a working Stop, as Run Inference does.
+    assert w.infer_panel.btn_stop.isEnabled()
+
+
+def test_window_only_stop_prompt_names_inference(monkeypatch):
+    w = gui()
+    seen = []
+
+    def fake_exec(box):
+        seen.extend(b.text() for b in box.buttons())
+        return 0
+    monkeypatch.setattr(M.QMessageBox, "exec_", fake_exec)
+    w._window_only_close_prompt("inference")
+    assert "Stop inference" in seen and "Stop training" not in seen
 
 
 def test_closing_the_inference_window_mid_run_asks_and_keeps_it(monkeypatch):

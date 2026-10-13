@@ -11525,6 +11525,10 @@ class MADMainWindow(QMainWindow):
             if quit_after:
                 QTimer.singleShot(0, QApplication.instance().quit)
             return 0
+        # As Run Inference does: arm Stop. Without it a launched run had no
+        # working Stop -- the button stayed greyed out for the whole run.
+        self.btn_infer_run.setEnabled(False)
+        self.infer_panel.start_run()
         self._start_inference(cfg, todo, reporter=self.infer_panel,
                               skip_scope_prompt=True)
         return len(todo)
@@ -11726,7 +11730,7 @@ class MADMainWindow(QMainWindow):
         box.setText(f"A{'n' if what[0] in 'aeiou' else ''} {what} run is "
                     "still in progress.")
         box.setInformativeText("Stop it and close MAD?")
-        stop = box.addButton("Stop training", QMessageBox.DestructiveRole)
+        stop = box.addButton(f"Stop {what}", QMessageBox.DestructiveRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
         box.exec_()
         return 'stop' if box.clickedButton() is stop else 'cancel'
