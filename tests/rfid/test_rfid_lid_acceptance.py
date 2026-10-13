@@ -16,14 +16,33 @@ reader test tag 989.002011236362 was read in both paddocks. There are 25
 distinct tags, on 26 (tag, reader) pairs.
 """
 import os
+from pathlib import Path
 
 import pytest
 
-LID = ("/Users/caleb/Library/CloudStorage/OneDrive-UCB-O365/Work/Manuscripts/"
-       "2021_LID_WDOBTerritoryInvasion/Analysis/")
 
-pytestmark = pytest.mark.skipif(not os.path.isdir(LID),
-                                reason="2021 LID dataset not on this machine")
+def _find_lid():
+    """(folder holding the metadata, folder holding T001_Alpha), or (None, None).
+
+    OneDrive keeps the dataset under the home folder on the Mac and on
+    Windows; FNT_LID_2021 can point at its root instead. Both the older
+    Analysis/RFID/Data layout and the current Data/RFID one are accepted.
+    """
+    roots = [os.environ.get("FNT_LID_2021", "")]
+    for onedrive in ("Library/CloudStorage/OneDrive-UCB-O365", "OneDrive - UCB-O365"):
+        roots.append(str(Path.home() / onedrive / "Work" / "Manuscripts"
+                         / "2021_LID_WDOBTerritoryInvasion"))
+    for root in filter(None, roots):
+        for base, rfid in (("Data", "RFID"), ("Analysis", os.path.join("RFID", "Data"))):
+            meta_dir = os.path.join(root, base)
+            if os.path.isdir(os.path.join(meta_dir, rfid, "T001_Alpha")):
+                return meta_dir, os.path.join(meta_dir, rfid)
+    return None, None
+
+
+LID, LID_RFID = _find_lid()
+
+pytestmark = pytest.mark.skipif(LID is None, reason="2021 LID dataset not on this machine")
 
 
 @pytest.fixture(scope="module")
@@ -35,12 +54,13 @@ def result(tmp_path_factory):
 
     out = tmp_path_factory.mktemp("lid") / "LID_2021_FNT_analysis"
     cfg = RFIDConfig(name="LID_2021", output_dir=str(out),
-                     download_dirs=[LID + "RFID/Data/T001_Alpha", LID + "RFID/Data/T002_Bravo"],
+                     download_dirs=[os.path.join(LID_RFID, "T001_Alpha"),
+                                    os.path.join(LID_RFID, "T002_Bravo")],
                      timezone="America/New_York", day_origin="2021-05-07 12:00:00")
     cfg.arena = liddell_8_zone(2)
     cfg.arena.paddocks[0].name, cfg.arena.paddocks[0].trials = "Alpha", ["T001"]
     cfg.arena.paddocks[1].name, cfg.arena.paddocks[1].trials = "Bravo", ["T002"]
-    meta = LID + "LID_2021_metadata.xlsx"
+    meta = os.path.join(LID, "LID_2021_metadata.xlsx")
     grid = read_grid(meta, "metadata")
     header = detect_header_row(grid)
     assert header == 1                                   # row 2, below the notes

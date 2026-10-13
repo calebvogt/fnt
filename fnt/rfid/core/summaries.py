@@ -203,8 +203,10 @@ def overlapping_bouts(bouts: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     b = bouts.reset_index(drop=True)
     animal = pd.factorize(b["animal"].astype(str))[0]
-    start = pd.DatetimeIndex(b["start"]).asi8
-    stop = pd.DatetimeIndex(b["stop"]).asi8
+    # nanoseconds whatever unit pandas chose (pandas 3 parses to microseconds),
+    # so the /1e9 below gives seconds
+    start = pd.DatetimeIndex(b["start"]).as_unit("ns").asi8
+    stop = pd.DatetimeIndex(b["stop"]).as_unit("ns").asi8
     zone = b["zone_id"].astype(str).to_numpy()
     day = b["day"].to_numpy()
     pieces = []

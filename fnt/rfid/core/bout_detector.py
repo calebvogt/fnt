@@ -54,7 +54,8 @@ def gaps(values: np.ndarray) -> np.ndarray:
 def _elapsed(reads: pd.DataFrame) -> np.ndarray:
     if "elapsed" in reads.columns:
         return reads["elapsed"].to_numpy(float)
-    return pd.DatetimeIndex(reads["t"]).asi8 / 1e9
+    # asi8 is in the index's own unit (microseconds under pandas 3): pin ns
+    return pd.DatetimeIndex(reads["t"]).as_unit("ns").asi8 / 1e9
 
 
 def _attach_animal_info(bouts: pd.DataFrame, animals: pd.DataFrame | None) -> pd.DataFrame:

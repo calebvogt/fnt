@@ -89,7 +89,9 @@ def elapsed_seconds(t: pd.Series, tz: str = "") -> tuple[np.ndarray, int]:
     """
     if not len(t):
         return np.array([], float), 0
-    values = pd.DatetimeIndex(t)
+    # asi8 counts in the index's own unit, which pandas 3 makes microseconds
+    # for parsed times; pin nanoseconds so the /1e9 below gives seconds
+    values = pd.DatetimeIndex(t).as_unit("ns")
     if not tz:
         ns, ambiguous = values.asi8, 0
     else:
