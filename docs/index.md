@@ -50,8 +50,8 @@ If you use FNT in your research, please cite the repository:
 
 ```bibtex
 @software{fnt,
-  title  = {FieldNeuroToolbox (fnt)},
-  author = {Vogt, Caleb C. and Contributors},
+  title  = {FieldNeuroToolbox (FNT)},
+  author = {Vogt, Caleb C. and Garmany, Samuel and Lorman, Sophia and Donaldson, Zoe R.},
   url    = {https://github.com/calebvogt/fnt}
 }
 ```

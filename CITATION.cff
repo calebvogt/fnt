@@ -14,6 +14,14 @@ authors:
     affiliation: "University of Colorado Boulder"
   - family-names: Garmany
     given-names: Samuel
+  - family-names: Lorman
+    given-names: Sophia
+    orcid: "https://orcid.org/0009-0005-4678-6760"
+    affiliation: "University of Colorado Boulder"
+  - family-names: Donaldson
+    given-names: Zoe R.
+    orcid: "https://orcid.org/0000-0001-6699-7905"
+    affiliation: "University of Colorado Boulder"
 repository-code: "https://github.com/calebvogt/fnt"
 url: "https://github.com/calebvogt/fnt"
 license: AGPL-3.0-or-later
