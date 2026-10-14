@@ -119,7 +119,9 @@ def network_for_day(gbi: pd.DataFrame, day: int, animals: list[str],
 
     strength = g.strength(weights="weight")
     degree = g.degree()
-    eigen = g.eigenvector_centrality(directed=False, scale=True, weights="weight")
+    # No directed=False: the graph is undirected already, and python-igraph 1.0
+    # rejects that argument ("Invalid mode for eigenvector centrality").
+    eigen = g.eigenvector_centrality(scale=True, weights="weight")
     between = g.betweenness(directed=False, weights=None)
     close = g.closeness(mode="all", normalized=True, weights=None)
     rank = g.pagerank(weights="weight")
