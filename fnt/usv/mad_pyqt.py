@@ -214,6 +214,64 @@ def _new_ann_id(prefix: str) -> str:
     return f"{prefix}_{next(_ANN_ID_SEQ):08d}"
 
 
+def merge_call_masks(anns):
+    """The union of several calls' masks, as ``(f0, f1, t0, t1, mask)``.
+
+    Returns None unless every call overlaps or touches (8-connected) another
+    one, directly or through a chain of them. Merging is for pieces of one
+    vocalisation -- two detections of a faint call plus the stroke painted
+    between them -- and a union of calls that never meet would store two calls
+    as one.
+    """
+    anns = [a for a in anns if a is not None]
+    if len(anns) < 2:
+        return None
+    for a in anns:
+        m = a.get('mask')
+        if m is None or not np.asarray(m).any():
+            return None
+    n = len(anns)
+
+    def _linked(i, j, pad):
+        a, b = anns[i], anns[j]
+        return not (a['t1'] + pad <= b['t0'] or b['t1'] + pad <= a['t0']
+                    or a['f1'] + pad <= b['f0'] or b['f1'] + pad <= a['f0'])
+
+    def _connected(edge):
+        seen, stack = {0}, [0]
+        while stack:
+            i = stack.pop()
+            for j in range(n):
+                if j not in seen and edge(i, j):
+                    seen.add(j)
+                    stack.append(j)
+        return len(seen) == n
+
+    # Boxes first: cheap, and it keeps calls seconds apart from allocating a
+    # union frame that spans the gap.
+    if not _connected(lambda i, j: _linked(i, j, 1)):
+        return None
+    f0 = min(int(a['f0']) for a in anns)
+    f1 = max(int(a['f1']) for a in anns)
+    t0 = min(int(a['t0']) for a in anns)
+    t1 = max(int(a['t1']) for a in anns)
+    placed = []
+    for a in anns:
+        m = np.asarray(a['mask']) > 0
+        h = min(m.shape[0], f1 - int(a['f0']))
+        w = min(m.shape[1], t1 - int(a['t0']))
+        full = np.zeros((f1 - f0, t1 - t0), dtype=bool)
+        r, c = int(a['f0']) - f0, int(a['t0']) - t0
+        full[r:r + h, c:c + w] = m[:h, :w]
+        placed.append(full)
+    from scipy.ndimage import binary_dilation
+    grown = [binary_dilation(p, structure=np.ones((3, 3), bool))
+             for p in placed]
+    if not _connected(lambda i, j: bool((grown[i] & placed[j]).any())):
+        return None
+    return f0, f1, t0, t1, np.logical_or.reduce(placed)
+
+
 _ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
 _ROLE_FILE_COUNTS = Qt.UserRole + 21  # (accepted, pending, rejected) or None
 #: Error text when the last inference run FAILED on this recording.
@@ -745,6 +803,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._open_note_idx = None
         self._rubber_start = None
         self._rubber_cur = None
+        #: Selection a shift-drag adds to; None for a plain drag.
+        self._rubber_base = None
         # Harmonic links as (lower_id, upper_id, n), drawn as dotted lines so a
         # stack reads as one call at a glance. This is the review surface for
         # the grouping rule, not decoration: seeing the links is how a wrong one
@@ -1223,6 +1283,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     return idx
         return None
 
+    def call_at(self, pos, spec_rect=None) -> Optional[int]:
+        """The call under a screen point: its class label, else its mask."""
+        ai = self.label_at(pos)
+        if ai is not None:
+            return ai
+        if spec_rect is None:
+            spec_rect = self._get_spec_rect()
+        idx = self._screen_to_spec_idx(pos.x(), pos.y(), spec_rect)
+        return None if idx is None else self.annotation_at(idx[0], idx[1])
+
+    def selected_indices(self) -> set:
+        """Every highlighted call: the click selection plus the multi-selection."""
+        sel = set(self._selected_set)
+        if self._selected_ann_idx is not None:
+            sel.add(self._selected_ann_idx)
+        return {i for i in sel if 0 <= i < len(self.annotations)}
+
+    def toggle_selected(self, ai: int) -> None:
+        """Shift-click: add a call to the selection, or take it out."""
+        if not (0 <= ai < len(self.annotations)):
+            return
+        sel = self.selected_indices() ^ {ai}
+        self._selected_set = sel
+        self._selected_ann_idx = None
+        self.update()
+        self.annotations_selected.emit(sorted(sel))
+
     # --- vertex editing (Phase F) -------------------------------------
     def _grid_to_screen(self, t, f, spec_rect, bounds):
         """Screen position of the spec PIXEL (t, f) — its centre, not its
@@ -1495,10 +1582,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return out or {ann_idx}
 
     def mousePressEvent(self, event):
-        self._selected_ann_idx = None
-        self._selected_set = set()
         self._rubber_start = None
         self._rubber_cur = None
+        self._rubber_base = None
         # Grab keyboard focus so arrow keys revert to preview pan/zoom (away
         # from the detections list).
         self.setFocus(Qt.MouseFocusReason)
@@ -1509,15 +1595,34 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
         # --- right-click → context menu on an accepted annotation ---
         if event.button() == Qt.RightButton and self._editing_ann_idx is None:
-            ai = self.label_at(event.pos())
-            if ai is None:
-                idx = self._screen_to_spec_idx(
-                    event.pos().x(), event.pos().y(), spec_rect)
-                if idx is not None:
-                    ai = self.annotation_at(idx[0], idx[1])
+            ai = self.call_at(event.pos(), spec_rect)
+            # Right-clicking one of several selected calls keeps them all
+            # selected, because the menu offers to merge them. Anywhere else
+            # the click clears the selection, as every click does.
+            sel = self.selected_indices()
+            if ai is None or ai not in sel or len(sel) < 2:
+                self._selected_ann_idx = None
+                self._selected_set = set()
             if ai is not None:
                 self.request_context_menu.emit(ai, event.globalPos())
             return
+
+        # --- shift-click → add a call to the selection, or take it out ---
+        if (event.button() == Qt.LeftButton and self.paint_mode is None
+                and event.modifiers() & Qt.ShiftModifier):
+            ai = self.call_at(event.pos(), spec_rect)
+            if ai is not None:
+                self.toggle_selected(ai)
+                return
+            # Shift-drag over empty space adds a box of calls to the selection.
+            if spec_rect.contains(event.pos()):
+                self._rubber_base = self.selected_indices()
+                self._rubber_start = event.pos()
+                self._rubber_cur = event.pos()
+            return
+
+        self._selected_ann_idx = None
+        self._selected_set = set()
 
         if self.paint_mode == 'sam':
             if event.button() == Qt.LeftButton:
@@ -1648,17 +1753,22 @@ class MADSpectrogramWidget(SpectrogramWidget):
         redrag rather than an unnoticed deletion.
         """
         start = self._rubber_start
+        # A shift-drag adds to what was selected when it started.
+        base = self._rubber_base
         self._rubber_start = None
         self._rubber_cur = None
+        self._rubber_base = None
         spec_rect = self._get_spec_rect()
         a = self._screen_to_spec_idx(start.x(), start.y(), spec_rect)
         b = self._screen_to_spec_idx(end_pos.x(), end_pos.y(), spec_rect)
-        # A tiny drag = a click on empty space → clear the selection.
+        # A tiny drag = a click on empty space → clear the selection (a
+        # shift-click there leaves it alone).
         if (a is None or b is None or
                 (abs(end_pos.x() - start.x()) < 4 and
                  abs(end_pos.y() - start.y()) < 4)):
-            self._selected_set = set()
-            self.annotations_selected.emit([])
+            if base is None:
+                self._selected_set = set()
+                self.annotations_selected.emit([])
             self.update()
             return
         t_lo, t_hi = sorted((a[0], b[0]))
@@ -1670,6 +1780,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
             if (ann['t0'] >= t_lo and ann['t1'] <= t_hi and
                     ann['f0'] >= f_lo and ann['f1'] <= f_hi):
                 hits.append(i)
+        if base is not None:
+            hits = sorted(set(hits) | base)
+            self._selected_ann_idx = None
         self._selected_set = set(hits)
         self.update()
         self.annotations_selected.emit(sorted(hits))
@@ -8818,6 +8931,9 @@ class MADMainWindow(QMainWindow):
             aid = a.get('id')
             if aid is not None and aid != prev.get('id'):
                 minted.add(str(aid))
+        # A merge says what it minted: its call has a box no earlier call had,
+        # so the accept rule above cannot recognise it.
+        minted |= {str(x) for x in (snap.get('minted_ids') or ())}
         # A None baseline means no example was committed during the
         # operation, so nothing was minted and the store diff has nothing to
         # confirm. Treating it as an empty set would drop the second guard;
@@ -8831,6 +8947,10 @@ class MADMainWindow(QMainWindow):
                 n_del += 1
             except Exception:
                 continue
+            # Gone now, so an example the operation destroyed under the same
+            # id (a merge re-saves under a member's deterministic id) can be
+            # put back below.
+            now_ids.discard(ex_id)
             if self._project is not None:
                 try:
                     from fnt.usv.usv_detector.mad_examples import delete_example
@@ -17722,6 +17842,16 @@ class MADMainWindow(QMainWindow):
         if not (0 <= ann_idx < len(sg.annotations)):
             return
         menu = QMenu(self)
+        # --- merge: right-click on one of several shift- or box-selected calls
+        merge_idx = self._box_sel_indices()
+        a_merge = None
+        if ann_idx in merge_idx and len(merge_idx) >= 2:
+            a_merge = menu.addAction(f"Merge {len(merge_idx)} selected calls")
+            if merge_call_masks([sg.annotations[i] for i in merge_idx]) is None:
+                a_merge.setText(f"Merge {len(merge_idx)} selected calls "
+                                "(they must overlap or touch)")
+                a_merge.setEnabled(False)
+            menu.addSeparator()
         a_class = menu.addAction("Edit class…")
         a_shape = menu.addAction("Edit shape")
 
@@ -17789,6 +17919,13 @@ class MADMainWindow(QMainWindow):
         menu.addSeparator()
         a_del = menu.addAction("Delete")
         act = menu.exec_(global_pos)
+        if a_merge is not None and act == a_merge:
+            self._merge_calls(merge_idx, ann_idx)
+            return
+        if a_merge is not None and act is not None:
+            # Every other entry acts on this one call. Let the multi-selection
+            # go first: an edit or a delete renumbers the calls it points at.
+            self._clear_box_selection()
         if act is not None and act in tag_actions:
             self._toggle_tag(ann_idx, tag_actions[act])
             return
@@ -17964,8 +18101,9 @@ class MADMainWindow(QMainWindow):
         self._update_pred_review_widgets()
 
     def _on_box_selection(self, indices):
-        """Rubber-band drag selected a set of detections — remember their ids
-        (stable across list refresh) so A/R/D act on the whole group."""
+        """A rubber-band drag or a shift-click selected a set of detections —
+        remember their ids (stable across list refresh) so A/R/D, and Merge on
+        the right-click menu, act on the whole group."""
         sg = self.spectrogram
         self._box_sel_ids = [sg.annotations[i].get('id')
                              for i in indices if 0 <= i < len(sg.annotations)]
@@ -17973,7 +18111,8 @@ class MADMainWindow(QMainWindow):
         if n:
             self.status_bar.showMessage(
                 f"{n} detection(s) selected — A=accept, R=reject, "
-                "D=delete, S=skip (all)")
+                "D=delete, S=skip (all)"
+                + ("; right-click one to merge them" if n > 1 else ""))
             self._log(f"Box-selected {n} detection(s)")
         else:
             self.status_bar.showMessage("Selection cleared")
@@ -18323,6 +18462,95 @@ class MADMainWindow(QMainWindow):
                 "Mask shape updated — call accepted")
         else:
             self.status_bar.showMessage("Updated mask shape")
+
+    def _merge_calls(self, indices, anchor_idx=None) -> bool:
+        """Merge several calls into one accepted call (right-click → Merge).
+
+        For a faint call the model found in pieces: accept or select the
+        pieces, paint the stretch between them, shift-click them all and merge.
+        The calls must overlap or touch (:func:`merge_call_masks`), whatever
+        their status; the merged call is accepted, like an edited shape.
+
+        The merged call is saved as one new label example, and every member's
+        example, rejection negative and prediction crop goes -- except the crop
+        of the one detection the merged call stays tied to: the right-clicked
+        call's, else the earliest member's. Keeping a model blob_id means the
+        merged call still counts as a detection the model made (QC scoring
+        reads hits from the blob_id) and reopening the file does not show that
+        detection again as pending. Cmd/Ctrl+Z undoes the whole merge.
+        """
+        sg = self.spectrogram
+        idxs = sorted({i for i in indices if 0 <= i < len(sg.annotations)})
+        members = [sg.annotations[i] for i in idxs]
+        merged = merge_call_masks(members)
+        if merged is None:
+            self.status_bar.showMessage(
+                "Merge needs two or more calls that overlap or touch")
+            return False
+        if self.audio_data is None or self._active_wav_path() is None:
+            return False
+        if anchor_idx not in idxs:
+            anchor_idx = idxs[0]
+        anchor = sg.annotations[anchor_idx]
+        dets = [a for a in [anchor] + sorted(members,
+                                             key=lambda a: (a['t0'], a['f0']))
+                if isinstance(a.get('blob_id'), int)]
+        keep = dets[0] if dets else None
+        default = ((self._project.last_class if self._project
+                    else self._session_last_class) or 'USV')
+        category = anchor.get('category') or default
+        self._snapshot_for_undo("Merge calls", crops=True)
+        # Members go before the merged call is saved: it may take a member's
+        # deterministic example id (the kept detection's), and its neighbours
+        # in the saved patch must not include the pieces it replaces.
+        kept_blob = keep.get('blob_id') if keep else None
+        for a in members:
+            if (isinstance(a.get('blob_id'), int)
+                    and a.get('blob_id') != kept_blob):
+                self._delete_pred_crop(a)
+        for i in reversed(idxs):
+            self._delete_annotation(i, refresh=False)
+        f0, f1, t0, t1, mask = merged
+        try:
+            new_id = self._save_component_example(
+                category, (f0, f1, t0, t1, mask),
+                blob_id=keep.get('blob_id') if keep else None,
+                score=keep.get('score') if keep else None,
+                provenance=keep.get('provenance') if keep else None)
+        except Exception as e:
+            self._undo_review_action()      # put the members back
+            self.status_bar.showMessage(f"Merge failed: {e}")
+            return False
+        if self._undo_stack:
+            self._undo_stack[-1].setdefault('minted_ids', set()).add(
+                str(new_id))
+        ann = {'id': new_id,
+               'blob_id': keep.get('blob_id') if keep else new_id,
+               'category': category, 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
+               'mask': mask, 'status': 'accepted', 'source': 'label',
+               **getattr(self, '_last_example_stats', {})}
+        if keep is not None:
+            ann['score'] = keep.get('score')
+            ann['provenance'] = keep.get('provenance')
+        sg.add_annotation(ann)
+        sg._rebuild_confirmed_mask()
+        self._clear_box_selection()
+        self._pred_review_idx = None        # members' positions are gone
+        sg._selected_ann_idx = len(sg.annotations) - 1
+        sg.update()
+        if self._project is not None:
+            try:
+                self._project.save()
+            except Exception:
+                pass
+        self._refresh_annotation_list()
+        self._select_list_row_for_id(new_id)
+        self._update_pred_review_widgets()
+        self._log(f"Merged {len(members)} calls into one")
+        self.status_bar.showMessage(
+            f"Merged {len(members)} calls into one accepted call "
+            "(Ctrl+Z undoes)")
+        return True
 
     def _on_clear_clicked(self):
         # Discards the in-progress pending mask. Confirmed calls are saved
