@@ -132,9 +132,9 @@ class FakeFed3(threading.Thread):
                 raw, _, self._buf = self._buf.partition(b"\n")
                 command = raw.decode("utf-8", "ignore").strip()
                 if command:
-                    self._handle(command)
+                    self._handle_command(command)
 
-    def _handle(self, command):
+    def _handle_command(self, command):
         if command == "PING":
             if self.profile == "legacy":
                 self._line("PONG_FED3,ID:4")
