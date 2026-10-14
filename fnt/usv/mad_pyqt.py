@@ -10996,23 +10996,26 @@ class MADMainWindow(QMainWindow):
         except Exception:
             return {}, None
 
+    def _row_overlaps_ann(self, r, a, dt, df):
+        """True when detection row ``r`` (seconds, Hz) and annotation ``a``
+        (frames, bins) share any part of their bounding boxes."""
+        if dt <= 0 or df <= 0:
+            return False
+        t_org = self._frame_time_origin_s()
+        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
+        rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
+        return not (a['t1'] <= rt0 or a['t0'] >= rt1
+                    or a['f1'] <= rf0 or a['f0'] >= rf1)
+
     def _find_overlapping_confirmed(self, r, dt, df):
         """Return a confirmed (status-less) annotation whose bbox overlaps the
         CSV row ``r`` (used to reconcile a rejected call against a stale green),
         or None."""
-        if dt <= 0 or df <= 0:
-            return None
-        t_org = self._frame_time_origin_s()
-        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
-        rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
         for a in self.spectrogram.annotations:
             if a.get('status'):  # only status-less confirmed (green) masks
                 continue
-            if a['t1'] <= rt0 or a['t0'] >= rt1:
-                continue
-            if a['f1'] <= rf0 or a['f0'] >= rf1:
-                continue
-            return a
+            if self._row_overlaps_ann(r, a, dt, df):
+                return a
         return None
 
     def _load_predictions_as_annotations(self, wav: Optional[str] = None):
@@ -11138,6 +11141,16 @@ class MADMainWindow(QMainWindow):
         by_key = {str(r.get('blob_id')): r for r in rows}
         for key, d in demoted.items():
             r = by_key.get(key)
+            # A rejected *prediction* keeps the blob_id of the row it came
+            # from, and that row is keyed by blob_id, not by this example id.
+            # Without this match the call loaded twice: a red "Reject" with
+            # the same detection still pending beneath it. Re-running inference
+            # numbers blobs from 1 again, so the number alone is not enough;
+            # the rejection must also overlap the row it claims.
+            if r is None and d.get('blob_id') is not None:
+                cand = by_key.get(str(d['blob_id']))
+                if cand is not None and self._row_overlaps_ann(cand, d, dt, df):
+                    r = cand
             if r is None:
                 t_org = self._frame_time_origin_s()
                 r = {
