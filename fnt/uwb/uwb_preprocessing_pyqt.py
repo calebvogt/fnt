@@ -18286,7 +18286,12 @@ class UWBQuickVisualizationWindow(QWidget):
         for col in df.columns:
             if pd.api.types.is_numeric_dtype(df[col]):
                 continue                       # already parsed above
-            want = df[col].astype(str)
+            # A missing value is written as an empty cell, but astype(str)
+            # renders it 'NaT' / 'None' / 'nan'. Compared as text, every
+            # legitimately missing value - a day with no moonrise - read as
+            # a stray value and aborted the whole export.
+            missing = df[col].isna().to_numpy()
+            want = df[col].astype(str).where(~missing, '')
             if want.nunique() > self._VOCAB_MAX_UNIQUE:
                 # Free text (timestamps): re-rendering can differ legitimately,
                 # so require only that it still parses as the time it was.
@@ -18299,8 +18304,9 @@ class UWBQuickVisualizationWindow(QWidget):
                     # FIRST element and coerces everything else to NaT, so the
                     # whole-second rows were being reported as corruption and
                     # the export aborted on a file that was perfectly good.
-                    bad = pd.to_datetime(back[col], format='ISO8601',
-                                         errors='coerce').isna()
+                    bad = (pd.to_datetime(back[col], format='ISO8601',
+                                          errors='coerce').isna()
+                           & ~missing)        # a NaT written stays empty
                     if bad.any():
                         first = back[col][bad].iloc[0]
                         problems.append(
