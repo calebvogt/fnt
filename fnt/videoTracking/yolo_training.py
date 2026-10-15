@@ -27,14 +27,14 @@ class YOLOTrainingConfig:
     output_dir: str = ""
     run_name: str = ""
     num_iterations: int = 100
-    learning_rate: float = 0.01
+    learning_rate: float = 0.002            # AdamW; SGD wants ~0.01
     batch_size: int = 8
     val_fraction: float = 0.2
     device: str = "auto"
     model_variant: str = "yolo11n-seg"
     imgsz: int = 640
     early_stop_patience: int = 50
-    freeze_backbone: bool = True
+    freeze_backbone: bool = False
     optimizer: str = "AdamW"
     # Online augmentation (mapped to Ultralytics params)
     aug_fliplr: float = 0.0
@@ -43,10 +43,10 @@ class YOLOTrainingConfig:
     aug_scale: float = 0.0
     aug_hsv_v: float = 0.0
     aug_hsv_s: float = 0.0
-    aug_mosaic: float = 0.0
+    aug_mosaic: float = 1.0
     # Copy-paste: animals cut from one training image pasted into another (by
     # their masks). Strong for instance segmentation with few labeled frames.
-    aug_copy_paste: float = 0.0
+    aug_copy_paste: float = 0.3
 
     def resolve_run_dir(self) -> str:
         name = self.run_name or datetime.now().strftime("yolo_%Y%m%d_%H%M%S")

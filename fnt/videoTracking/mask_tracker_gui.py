@@ -4119,6 +4119,14 @@ class MaskTrackerWindow(QMainWindow):
         self.act_show_all_frames.triggered.connect(self.show_all_frames)
         file_menu.addAction(self.act_show_all_frames)
 
+        act_predict = QAction("Predict Unreviewed Frames with a Model…", self)
+        act_predict.setToolTip(
+            "Run a trained model (a folder in models/) on the queue's frames that\n"
+            "have no accepted mask and are not marked empty; its masks replace\n"
+            "any earlier predictions there, for review.")
+        act_predict.triggered.connect(lambda _=False: self._predict_queue_with_model())
+        file_menu.addAction(act_predict)
+
         edit_menu = menu_bar.addMenu("Edit")
         self.act_undo = QAction("Undo", self)
         self.act_undo.setShortcut("Ctrl+Z")
@@ -4869,7 +4877,9 @@ class MaskTrackerWindow(QMainWindow):
             "  infrared or unusual imaging modalities)."
         )
         self.chk_freeze_backbone = QCheckBox("Freeze backbone (train heads only)")
-        self.chk_freeze_backbone.setChecked(True)
+        # Off: with the backbone frozen, the 8x8 zone model (37 frames) found
+        # a mouse in a third of the frames; trained whole, nearly all.
+        self.chk_freeze_backbone.setChecked(False)
         self.chk_freeze_backbone.setToolTip(tip_freeze)
         train_vbox.addWidget(self.chk_freeze_backbone)
 
@@ -4891,6 +4901,9 @@ class MaskTrackerWindow(QMainWindow):
         self.combo_optimizer = QComboBox()
         self.combo_optimizer.addItems(["AdamW", "SGD"])
         self.combo_optimizer.setToolTip(tip_optimizer)
+        self.combo_optimizer.currentTextChanged.connect(
+            lambda name: self.spin_lr.setValue(0.002 if name == "AdamW" else 0.01)
+            if hasattr(self, "spin_lr") else None)
         row.addWidget(self.combo_optimizer)
         train_vbox.addLayout(row)
 
@@ -9450,7 +9463,9 @@ class MaskTrackerWindow(QMainWindow):
         if not is_maskrcnn:
             is_small = "small" in arch_text.lower()
             self.spin_batch.setValue(2 if is_small else 8)
-            self.spin_lr.setValue(0.01)
+            # AdamW wants ~0.002; 0.01 (SGD's rate) trained the first 8x8 zone
+            # model badly.
+            self.spin_lr.setValue(0.002 if self.combo_optimizer.currentText() == "AdamW" else 0.01)
         else:
             self.spin_batch.setValue(2)
             self.spin_lr.setValue(0.005)
@@ -9671,8 +9686,12 @@ class MaskTrackerWindow(QMainWindow):
                 "device": device_choice,
                 "model_variant": model_variant,
                 "imgsz": self._imgsz_override or 640,
-                "aug_mosaic": self._mosaic_override or 0.0,
-                "aug_copy_paste": self._copy_paste_override or 0.0,
+                # Mosaic and copy-paste on by default: with few labeled frames
+                # they made the difference (8x8 zone model, 2026-10-15).
+                "aug_mosaic": (1.0 if self._mosaic_override is None
+                               else self._mosaic_override),
+                "aug_copy_paste": (0.3 if self._copy_paste_override is None
+                                   else self._copy_paste_override),
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
@@ -9932,6 +9951,21 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_train_status.setText(status)
             self.status_bar.showMessage(f"Training complete: {model_path}")
             self._show_train_complete_dialog()
+
+    def _predict_queue_with_model(self, model_dir: Optional[str] = None):
+        """Predict the unreviewed queue frames with a trained model (File menu,
+        or --predict): the post-training inference, for any model."""
+        if model_dir is None:
+            start = os.path.join(self._project_dir, "models") if self._project_dir else ""
+            model_dir = QFileDialog.getExistingDirectory(self, "Model folder", start)
+            if not model_dir:
+                return
+        if not any(os.path.exists(os.path.join(model_dir, n))
+                   for n in ("weights_best.pt", "weights.pt", "model_final.pth")):
+            QMessageBox.warning(self, "No model", f"No trained weights in\n{model_dir}")
+            return
+        self.lbl_train_status.setText(f"Predicting with {os.path.basename(model_dir)}…")
+        self._run_post_train_inference(model_dir)
 
     def _run_post_train_inference(self, model_dir: str):
         """Run the trained model on unlabeled extracted frames."""
@@ -13634,11 +13668,11 @@ def _launch_parser():
     g.add_argument("--freeze", dest="freeze", action="store_true", default=None,
                    help="Freeze the backbone (train the heads only).")
     g.add_argument("--no-freeze", dest="freeze", action="store_false",
-                   help="Train the whole network (the panel freezes the backbone by default).")
+                   help="Train the whole network (the default).")
     g.add_argument("--mosaic", type=float,
-                   help="YOLO mosaic augmentation probability (0-1; default 0).")
+                   help="YOLO mosaic augmentation probability (0-1; default 1).")
     g.add_argument("--copy-paste", dest="copy_paste", type=float,
-                   help="YOLO copy-paste augmentation probability (0-1; default 0): "
+                   help="YOLO copy-paste augmentation probability (0-1; default 0.3): "
                         "animals pasted between training images by their masks.")
     g.add_argument("--optimizer", choices=["AdamW", "SGD"],
                    help="Optimizer (AdamW wants a learning rate near 0.001-0.002; "
@@ -13654,6 +13688,9 @@ def _launch_parser():
     g.add_argument("--no-post-infer", dest="post_infer", action="store_false")
     g.add_argument("--post-infer-conf", dest="post_infer_conf", type=float)
     g.add_argument("--post-infer-max", dest="post_infer_max", type=int)
+    p.add_argument("--predict", metavar="MODEL_DIR", default=None,
+                   help="Once the project is open, predict the queue's unreviewed frames "
+                        "with this trained model (as File > Predict Unreviewed Frames).")
     return p
 
 
@@ -13679,8 +13716,8 @@ def main(argv=None) -> int:
     # parse_known_args: Qt has command-line options of its own.
     args, qt_args = parser.parse_known_args(
         sys.argv[1:] if argv is None else argv)
-    if (args.train or args.focus) and not args.project:
-        parser.error("--train and --focus need --project")
+    if (args.train or args.focus or args.predict) and not args.project:
+        parser.error("--train, --focus and --predict need --project")
     config = None
     if args.project:
         try:
@@ -13707,6 +13744,8 @@ def main(argv=None) -> int:
             print(f"[MTT] training settings: {', '.join(applied)}", flush=True)
         if args.train:
             QTimer.singleShot(500, win._start_training)
+        elif args.predict:
+            QTimer.singleShot(500, lambda: win._predict_queue_with_model(args.predict))
     return app.exec_()
 
 

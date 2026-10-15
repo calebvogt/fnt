@@ -146,6 +146,23 @@ def test_launched_open_never_asks_and_focus_limits_the_queue(monkeypatch):
     w.close()
 
 
+def test_training_defaults_and_predict_flag():
+    """The first 8x8 zone model trained with the backbone frozen, AdamW at 0.01
+    and no mosaic; the defaults are now unfrozen, 0.002 and mosaic + copy-paste."""
+    w = window()
+    assert not w.chk_freeze_backbone.isChecked()
+    w.combo_optimizer.setCurrentText("SGD")
+    assert abs(w.spin_lr.value() - 0.01) < 1e-9
+    w.combo_optimizer.setCurrentText("AdamW")
+    assert abs(w.spin_lr.value() - 0.002) < 1e-9
+    assert w._mosaic_override is None and w._copy_paste_override is None
+    args = G._launch_parser().parse_args(["--project", "p", "--predict", "m", "--mosaic", "0"])
+    assert args.predict == "m"
+    G.apply_training_args(w, args)
+    assert w._mosaic_override == 0.0
+    w.close()
+
+
 def test_augment_turns_the_transforms_on():
     """--augment used to tick only the master checkbox; every transform under it
     stayed off, so the run trained with no augmentation."""
