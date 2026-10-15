@@ -258,5 +258,15 @@ def test_the_label_sits_on_the_body_not_pulled_along_the_tail():
     assert mean_x > 70                                # where the old dot went
 
 
+def test_v_hides_and_shows_the_masks():
+    w, _ = preview()
+    seen = []
+    w.masks_view_changed.connect(seen.append)
+    key(w, Qt.Key_V)
+    assert not w.show_masks
+    key(w, Qt.Key_V)
+    assert w.show_masks and seen == [False, True]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

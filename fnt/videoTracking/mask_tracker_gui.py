@@ -368,6 +368,7 @@ class AnnotationPreviewWidget(QWidget):
     review_requested = pyqtSignal(str)         # A / R / Shift+A: accept, reject, accept_all
     prediction_selected = pyqtSignal()         # a click picked the prediction to review
     replace_prediction_requested = pyqtSignal(int)  # SAM click on a prediction: drop it
+    masks_view_changed = pyqtSignal(bool)      # V: masks shown / hidden
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -433,6 +434,9 @@ class AnnotationPreviewWidget(QWidget):
         self.annotations: List[AnnotationObject] = []
         # The model's mask under review (A / R act on it); None = the first.
         self.review_idx: Optional[int] = None
+        # V: the masks drawn over the frame, or the bare frame (as MAD's
+        # Spec + Mask / Spec only). Clicks still work while they are hidden.
+        self.show_masks = True
 
         self._pending_annotation: Optional[List[Tuple[float, float]]] = None
         self._pending_is_ai = False
@@ -1276,6 +1280,8 @@ class AnnotationPreviewWidget(QWidget):
                 self.sam_pending_changed.emit()
         elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
             self.sam_toggle_requested.emit()
+        elif event.key() == Qt.Key_V:
+            self.set_show_masks(not self.show_masks)
         elif event.key() in (Qt.Key_P, Qt.Key_X) and self._editing_obj_idx is None \
                 and not self._painting:
             self.tool_requested.emit("paint" if event.key() == Qt.Key_P else "erase")
@@ -1322,6 +1328,12 @@ class AnnotationPreviewWidget(QWidget):
             self._clear_drawing()
             self.drawing_mode = "navigate"            # Enter turns the tool off
             self.mode_changed.emit("Navigate")
+
+    def set_show_masks(self, on: bool):
+        """V: masks over the frame, or the bare frame."""
+        self.show_masks = bool(on)
+        self.update()
+        self.masks_view_changed.emit(self.show_masks)
 
     def current_prediction(self) -> Optional[int]:
         """Index of the prediction under review: the one clicked, else the
@@ -1403,7 +1415,7 @@ class AnnotationPreviewWidget(QWidget):
         under_review = self.current_prediction()
         self._label_rects = {}
 
-        for ai, ann in enumerate(self.annotations):
+        for ai, ann in enumerate(self.annotations if self.show_masks else []):
             if ann.inferred:
                 r, g, b = (255, 200, 0)
             else:
@@ -1468,7 +1480,7 @@ class AnnotationPreviewWidget(QWidget):
                 self._label_rects[ai] = QRectF(wcx - 6, wcy - 5 - fm.ascent() - 2,
                                                fm.horizontalAdvance(label) + 14, fm.height() + 9)
 
-        if self._drawing_active:
+        if self._drawing_active and self.show_masks:
             if self.drawing_mode == "manual":
                 self._paint_manual_drawing(painter, pr)
             elif self.drawing_mode in self.OBJECT_TOOLS:
@@ -3908,7 +3920,7 @@ class MaskTrackerWindow(QMainWindow):
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
                       Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_S, Qt.Key_A,
                       Qt.Key_P, Qt.Key_X, Qt.Key_R, Qt.Key_D, Qt.Key_Delete,
-                      Qt.Key_Escape)
+                      Qt.Key_V, Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -4214,6 +4226,10 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.review_requested.connect(self._on_review)
         self.preview.prediction_selected.connect(self._update_review_label)
         self.preview.replace_prediction_requested.connect(self._replace_prediction)
+        self.btn_view_masks.clicked.connect(
+            lambda _=False: self.preview.set_show_masks(not self.preview.show_masks))
+        self.preview.masks_view_changed.connect(
+            lambda on: self.btn_view_masks.setText("Frame + Masks (V)" if on else "Frame Only (V)"))
         self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
@@ -4739,6 +4755,7 @@ class MaskTrackerWindow(QMainWindow):
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
+            "V = show / hide the masks.\n"
             "In a source video (arrow keys), E extracts the frame to the queue."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
@@ -6688,7 +6705,18 @@ class MaskTrackerWindow(QMainWindow):
         self._tools_edit_row.setSpacing(2)
         self._tools_class_row = QHBoxLayout()
         self._tools_class_row.setSpacing(4)
-        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row):
+        self._tools_view_row = QHBoxLayout()
+        self._tools_view_row.setSpacing(4)
+        self._tools_view_row.addWidget(QLabel("View:"))
+        self.btn_view_masks = QPushButton("Frame + Masks (V)")
+        self.btn_view_masks.setToolTip(
+            "Show or hide the masks over the frame, to see the animal underneath\n"
+            "(as MAD's Spec + Mask / Spec only). Shortcut: V")
+        self.btn_view_masks.setFocusPolicy(Qt.NoFocus)
+        self._tools_view_row.addWidget(self.btn_view_masks)
+        self._tools_view_row.addStretch()
+        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row,
+                    self._tools_view_row):
             vbox.addLayout(row)
         group.setLayout(vbox)
         layout.addWidget(group)
