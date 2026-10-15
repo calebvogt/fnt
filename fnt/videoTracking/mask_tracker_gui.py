@@ -182,13 +182,14 @@ class PathLabel(QLabel):
 class AnnotationObject:
     def __init__(self, points: List[Tuple[float, float]], category: str,
                  ann_id: int = -1, is_ai: bool = False, inferred: bool = False,
-                 score: Optional[float] = None):
+                 score: Optional[float] = None, rejected: bool = False):
         self.points = list(points)
         self.category = category
         self.ann_id = ann_id
         self.is_ai = is_ai
         self.inferred = inferred
         self.score = score              # the model's confidence in this one mask
+        self.rejected = rejected        # a prediction the reviewer rejected (kept as a record)
         self._anchor_key = None
         self._anchor: Optional[Tuple[float, float]] = None
 
@@ -1026,7 +1027,8 @@ class AnnotationPreviewWidget(QWidget):
             if self.drawing_mode == "navigate":
                 # A click on one of the model's masks picks it for review.
                 hit_ann = self._find_annotation_at(event.x(), event.y())
-                if hit_ann is not None and self.annotations[hit_ann].inferred:
+                if (hit_ann is not None and self.annotations[hit_ann].inferred
+                        and not self.annotations[hit_ann].rejected):
                     self.review_idx = hit_ann
                     self.prediction_selected.emit()
                     self.update()
@@ -1100,7 +1102,8 @@ class AnnotationPreviewWidget(QWidget):
         # reject, then click, then Enter.
         if self.object_near(*coords) is None:
             hit = self._find_annotation_at(wx, wy)
-            if hit is not None and self.annotations[hit].inferred:
+            if (hit is not None and self.annotations[hit].inferred
+                    and not self.annotations[hit].rejected):
                 self.replace_prediction_requested.emit(hit)
         self.add_sam_click(coords[0], coords[1], positive=True, new_object=new_object)
         self._request_ai_prediction()
@@ -1339,9 +1342,11 @@ class AnnotationPreviewWidget(QWidget):
         """Index of the prediction under review: the one clicked, else the
         first of the frame's model masks; None if the frame has none."""
         i = self.review_idx
-        if i is not None and 0 <= i < len(self.annotations) and self.annotations[i].inferred:
+        if (i is not None and 0 <= i < len(self.annotations)
+                and self.annotations[i].inferred and not self.annotations[i].rejected):
             return i
-        return next((k for k, a in enumerate(self.annotations) if a.inferred), None)
+        return next((k for k, a in enumerate(self.annotations)
+                     if a.inferred and not a.rejected), None)
 
     def mode_name(self) -> str:
         return {"ai": "AI-Assisted Mask", "paint": "Paint", "erase": "Eraser"}.get(
@@ -1416,7 +1421,9 @@ class AnnotationPreviewWidget(QWidget):
         self._label_rects = {}
 
         for ai, ann in enumerate(self.annotations if self.show_masks else []):
-            if ann.inferred:
+            if ann.rejected:
+                r, g, b = (230, 70, 70)
+            elif ann.inferred:
                 r, g, b = (255, 200, 0)
             else:
                 ci = ai % len(CLASS_COLORS)
@@ -1432,6 +1439,8 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
+                elif ann.rejected:
+                    painter.setPen(QPen(color, 1.5, Qt.DashLine))
                 elif ai == under_review:
                     # The prediction A / R act on: white, as MAD marks the
                     # selected detection.
@@ -1460,7 +1469,9 @@ class AnnotationPreviewWidget(QWidget):
                 # parentheses with its own confidence, "(mouse_1 0.42)", in
                 # yellow (white while selected); an accepted mask is plain.
                 label = f"{ann.category}_{instance_num}"
-                if ann.inferred:
+                if ann.rejected:
+                    label = "(rejected)"
+                elif ann.inferred:
                     label = (f"({label} {ann.score:.2f})" if ann.score is not None
                              else f"({label})")
                 font = painter.font()
@@ -1469,7 +1480,9 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setFont(font)
                 painter.setPen(QPen(QColor(0, 0, 0), 3))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
-                if ann.inferred:
+                if ann.rejected:
+                    lbl_color = QColor(240, 110, 110)
+                elif ann.inferred:
                     lbl_color = (QColor(255, 255, 255) if ai == under_review
                                  else QColor(255, 200, 0))
                 else:
@@ -2087,6 +2100,18 @@ class TrainWorker(QThread):
                 os.close(_null_fd)
 
 
+def drop_fragments(mask: np.ndarray, min_frac: float = 0.03) -> np.ndarray:
+    """A predicted mask without its specks: pieces under ``min_frac`` of the
+    mask's area are dropped (a detached tail is kept; the zone model's stray
+    slivers, accepted with the mouse, were not)."""
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep = [i + 1 for i, a in enumerate(areas) if a >= min_frac * areas.sum()]
+    return np.isin(lbl, keep)
+
+
 def _drop_overlapping(detections: list, shape, max_overlap: float = 0.5) -> list:
     """One mask per animal: drop a predicted mask that is mostly (more than
     ``max_overlap`` of its area) inside a higher-scoring one. The first zone
@@ -2178,7 +2203,7 @@ class PostTrainInferenceWorker(QThread):
                         # arrive already coarsened into a polygon.
                         if not mask_to_coco_polygons(mask):
                             continue
-                        mask_bool = np.asarray(mask).astype(bool)
+                        mask_bool = drop_fragments(np.asarray(mask).astype(bool))
                         segmentation = mask_to_rle(mask_bool)
                         bbox = list(mask_bbox(mask_bool))
                         area = int(mask_bool.sum())
@@ -8157,7 +8182,7 @@ class MaskTrackerWindow(QMainWindow):
         max_score = 0.0
         has_inferred = False
         for ann in self._coco.get_annotations_for_image(img_id):
-            if ann.get("inferred", False):
+            if ann.get("inferred", False) and not ann.get("rejected"):
                 s = ann.get("score", 0.0)
                 if s > max_score:
                     max_score = s
@@ -8189,7 +8214,8 @@ class MaskTrackerWindow(QMainWindow):
         if filename not in self._coco._image_id_map:
             return (0, 0)
         img_id = self._coco._image_id_map[filename]
-        anns = self._coco.get_annotations_for_image(img_id)
+        # Rejected predictions are a record, not a mask: they count as nothing.
+        anns = [a for a in self._coco.get_annotations_for_image(img_id) if not a.get("rejected")]
         total = len(anns)
         n_inferred = sum(1 for a in anns if a.get("inferred", False))
         return (total, n_inferred)
@@ -8533,7 +8559,9 @@ class MaskTrackerWindow(QMainWindow):
 
     def _clear_all_inferences(self):
         """Remove all inferred annotations across all frames."""
-        inferred_anns = [a for a in self._coco.annotations if a.get("inferred", False)]
+        # Rejected masks are the reviewer's decisions, not predictions: they stay.
+        inferred_anns = [a for a in self._coco.annotations
+                         if a.get("inferred", False) and not a.get("rejected")]
         if not inferred_anns:
             QMessageBox.information(
                 self, "No Inferences",
@@ -8622,6 +8650,7 @@ class MaskTrackerWindow(QMainWindow):
             ann_obj = AnnotationObject(
                 points, cat_name, ann_id=ann["id"], inferred=is_inferred,
                 score=ann.get("score") if is_inferred else None,
+                rejected=bool(ann.get("rejected")),
             )
             self.preview.annotations.append(ann_obj)
 
@@ -9041,7 +9070,10 @@ class MaskTrackerWindow(QMainWindow):
                 self._coco.remove_annotation(op["ann"]["id"])
         elif t == "edit":
             fields = op["before"] if reverse else op["after"]
-            self._coco.apply_annotation_fields(op["ann_id"], copy.deepcopy(fields))
+            if set(fields) == {"rejected"}:
+                self._coco.reject_annotation(op["ann_id"], bool(fields["rejected"]))
+            else:
+                self._coco.apply_annotation_fields(op["ann_id"], copy.deepcopy(fields))
         elif t == "approve":
             if reverse:
                 self._coco.set_inferred(op["ann_id"], True, op.get("score"))
@@ -9267,7 +9299,7 @@ class MaskTrackerWindow(QMainWindow):
         prediction under review, or accept every prediction on the frame."""
         pv = self.preview
         if action == "accept_all":
-            idxs = [i for i, a in enumerate(pv.annotations) if a.inferred]
+            idxs = [i for i, a in enumerate(pv.annotations) if a.inferred and not a.rejected]
             if not idxs:
                 self.status_bar.showMessage("No predictions on this frame.", 3000)
                 return
@@ -9281,7 +9313,7 @@ class MaskTrackerWindow(QMainWindow):
             if action == "accept":
                 self._on_approve_annotation_by_index(i)
             else:
-                self._on_delete_annotation_by_index(i)
+                self._reject_prediction(i)
         pv.review_idx = None
         self._after_review_step()
 
@@ -9296,21 +9328,38 @@ class MaskTrackerWindow(QMainWindow):
             "Prediction replaced by a SAM mask: Enter saves it (Ctrl+Z brings the prediction back).",
             6000)
 
+    def _reject_prediction(self, idx: int):
+        """R / D / Delete: keep the prediction, marked rejected (Ctrl+Z
+        restores it to pending)."""
+        ann = self.preview.annotations[idx]
+        if ann.ann_id < 0:
+            return
+        self._coco.reject_annotation(ann.ann_id)
+        self._push_undo({
+            "type": "edit", "path": self._current_frame_path(), "ann_id": ann.ann_id,
+            "before": {"rejected": False}, "after": {"rejected": True},
+            "label": "rejection",
+        })
+        ann.rejected = True
+        self.status_bar.showMessage("Prediction rejected (kept, red) — Ctrl+Z to undo", 3000)
+
     def _after_review_step(self):
         pv = self.preview
         self._recalc_current_frame_confidence()
         pv.update()
         if pv.current_prediction() is None:
-            if not pv.annotations:
+            if not any(not a.inferred for a in pv.annotations):
                 self.status_bar.showMessage(
-                    "No masks left on this frame: draw the mice, or press E if it holds none.")
+                    "No accepted masks on this frame: draw the mice, or press E if it holds "
+                    "none (rejected masks are kept as a record).")
             elif self.chk_review_auto.isChecked():
                 self._next_review_frame()
         self._update_review_label()
 
     def _frames_to_review(self) -> List[int]:
         """Queue rows whose frame still has predictions."""
-        ids = {a["image_id"] for a in self._coco.annotations if a.get("inferred", False)}
+        ids = {a["image_id"] for a in self._coco.annotations
+               if a.get("inferred", False) and not a.get("rejected")}
         names = {img["file_name"] for img in self._coco.images if img["id"] in ids}
         return [i for i, (_, _, fp) in enumerate(self._extracted_frames)
                 if os.path.basename(fp) in names]
@@ -9328,7 +9377,7 @@ class MaskTrackerWindow(QMainWindow):
         if not hasattr(self, "lbl_review"):
             return
         pv = self.preview
-        preds = [i for i, a in enumerate(pv.annotations) if a.inferred]
+        preds = [i for i, a in enumerate(pv.annotations) if a.inferred and not a.rejected]
         n_frames = len(self._frames_to_review())
         if preds:
             cur = pv.current_prediction()
@@ -10028,7 +10077,7 @@ class MaskTrackerWindow(QMainWindow):
                 img_id = self._coco._image_id_map[filename]
                 existing = self._coco.get_annotations_for_image(img_id)
                 for ann in existing:
-                    if ann.get("inferred", False):
+                    if ann.get("inferred", False) and not ann.get("rejected"):
                         self._coco.remove_annotation(ann["id"])
 
         max_det = self.spin_post_infer_max.value() or 100
@@ -10081,6 +10130,19 @@ class MaskTrackerWindow(QMainWindow):
         h, w = img.shape[:2]
 
         img_id = self._coco.get_or_add_image(filename, w, h)
+        # A prediction on a spot the reviewer already rejected is not offered
+        # again (mostly the same mask: IoU > 0.5).
+        from .mask_tracker_annotator import segmentation_to_mask
+        rejected = [segmentation_to_mask(a["segmentation"], h, w).astype(bool)
+                    for a in self._coco.get_annotations_for_image(img_id) if a.get("rejected")]
+        if rejected:
+            kept = []
+            for det in detections:
+                m = segmentation_to_mask(det["segmentation"], h, w).astype(bool)
+                if not any(np.count_nonzero(m & r) > 0.5 * np.count_nonzero(m | r)
+                           for r in rejected):
+                    kept.append(det)
+            detections = kept
 
         max_score = 0.0
         for det in detections:

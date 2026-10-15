@@ -119,6 +119,11 @@ def convert_coco_to_yolo(
             polys = [p for p in segmentation_to_polygons(ann["segmentation"], h, w)
                      if len(p) >= 6]
             if len(polys) > 1:
+                # Specks (< 3% of the mask) are dropped, not bridged to the
+                # body: a stray sliver joined by a long thin line is no mouse.
+                areas = [cv2.contourArea(np.asarray(p, np.float32).reshape(-1, 2)) for p in polys]
+                polys = [p for p, a in zip(polys, areas) if a >= 0.03 * sum(areas)] or polys[:1]
+            if len(polys) > 1:
                 # One mask in pieces (a tail cut off by erasing, a tail loop)
                 # is still one animal, but YOLO reads every line as its own
                 # instance: tail fragments trained as extra mice. Join the

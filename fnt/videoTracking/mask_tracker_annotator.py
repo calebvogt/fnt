@@ -427,6 +427,22 @@ class COCOAnnotationManager:
                 self._auto_save()
                 return
 
+    def reject_annotation(self, ann_id: int, rejected: bool = True):
+        """Mark a prediction rejected (or not). A rejected mask stays in the
+        project as a record of what the model got wrong, as MAD keeps rejected
+        detections: it is never a training label (it keeps its inferred flag),
+        the frame's training image shows that spot as background once the
+        frame is reviewed, and later predictions on the same spot are dropped.
+        """
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                if rejected:
+                    ann["rejected"] = True
+                else:
+                    ann.pop("rejected", None)
+                self._auto_save()
+                return
+
     def is_inferred(self, ann_id: int) -> bool:
         for ann in self.annotations:
             if ann["id"] == ann_id:
@@ -581,7 +597,10 @@ class COCOAnnotationManager:
         if empty:
             if self.count_annotations_for_image(img_id, exclude_inferred=True):
                 return -1
-            self.annotations = [a for a in self.annotations if a["image_id"] != img_id]
+            # Pending predictions go; rejected ones stay (a record of the
+            # model's mistakes on a frame now known to hold no animal).
+            self.annotations = [a for a in self.annotations
+                                if a["image_id"] != img_id or a.get("rejected")]
             img["empty"] = True
         else:
             img.pop("empty", None)

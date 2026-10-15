@@ -322,8 +322,9 @@ def test_review_accepts_rejects_and_advances_as_in_mad():
     assert "1 of 3" in w.lbl_review.text() and "2 frame(s) to review" in w.lbl_review.text()
     key(pv, Qt.Key_A, "a")                        # accept the first
     assert not pv.annotations[0].inferred and pv.current_prediction() == 1
-    key(pv, Qt.Key_R, "r")                        # reject the second
-    assert len(pv.annotations) == 2 and pv.current_prediction() == 1
+    key(pv, Qt.Key_R, "r")                        # reject the second: kept, marked rejected
+    assert len(pv.annotations) == 3 and pv.annotations[1].rejected
+    assert pv.current_prediction() == 2
     key(w.btn_accept_pred, Qt.Key_R, "r")         # R with a button focused
     assert w.current_frame_idx == 2               # nothing left on frame 0: next to review
     assert pv.current_prediction() == 0
@@ -389,7 +390,34 @@ def test_overlapping_predictions_keep_the_best_and_labels_pick_and_d_rejects():
         QApplication.sendEvent(pv, QMouseEvent(kind, rect.center(), Qt.LeftButton, buttons, Qt.NoModifier))
     assert pv.current_prediction() == 1           # picked by its label
     key(pv, Qt.Key_D, "d")
-    assert len(pv.annotations) == 1 and pv.annotations[0].score == 0.6
+    assert pv.annotations[1].rejected and not pv.annotations[0].rejected
+    assert w._coco.get_annotation(pv.annotations[1].ann_id)["rejected"]
+    w._undo()                                     # Ctrl+Z: back to pending
+    assert not w._coco.get_annotation(pv.annotations[1].ann_id).get("rejected")
+    w.close()
+
+
+def test_rejections_survive_empty_and_new_predictions_and_specks_drop():
+    """A rejected mask stays when the frame is marked empty and when the queue is
+    predicted again, and a new prediction on the rejected spot is not offered."""
+    from fnt.videoTracking.mask_tracker_annotator import mask_to_rle
+    w = window()
+    cat = w._coco.categories[0]["id"]
+    a = np.zeros((48, 64), bool)
+    a[10:30, 10:40] = True
+    img = w._coco.get_or_add_image(FRAMES[0], 64, 48)
+    rid = w._coco.add_annotation_from_mask(img, cat, a, inferred=True, score=0.5)
+    w._coco.reject_annotation(rid)
+    w._select_frame_row(0)
+    w._on_post_infer_frame(FRAMES[0], [{"segmentation": mask_to_rle(a), "bbox": [10, 10, 30, 20],
+                                        "area": 600, "category_id": 1, "score": 0.9}])
+    anns = w._coco.get_annotations_for_image(img)
+    assert len(anns) == 1 and anns[0]["rejected"]  # the same spot is not offered again
+    w._coco.set_image_empty(FRAMES[0], 64, 48)
+    assert w._coco.get_annotation(rid) is not None and w._coco.is_image_empty(FRAMES[0])
+    speck = a.copy()
+    speck[40:42, 50:52] = True                    # 4 px against 600
+    assert int(G.drop_fragments(speck).sum()) == 600
     w.close()
 
 
