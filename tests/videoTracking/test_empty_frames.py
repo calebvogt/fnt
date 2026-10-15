@@ -93,6 +93,26 @@ def test_training_export_holds_only_reviewed_images(tmp_path):
     assert labels["empty.txt"] == "" and labels["acc.txt"].startswith("0 ")
 
 
+def test_a_mask_in_pieces_is_one_yolo_instance(tmp_path):
+    """A mouse whose tail was cut off by erasing is one mask in two pieces;
+    the YOLO labels made each piece its own instance (an extra "mouse")."""
+    c, cat = manager()
+    m = square_mask()
+    m[35:40, 45:60] = True                        # a separate tail piece
+    img = c.get_or_add_image("pieces.png", 64, 48)
+    c.add_annotation_from_mask(img, cat, m)
+    out = tmp_path / "train.json"
+    c.export(str(out), exclude_inferred=True)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    cv2.imwrite(str(frames / "pieces.png"), np.zeros((48, 64, 3), np.uint8))
+    convert_coco_to_yolo(str(out), str(frames), str(tmp_path / "yolo"), val_fraction=0.5)
+    label = next((tmp_path / "yolo").rglob("labels/*/pieces.txt")).read_text().strip()
+    assert len(label.splitlines()) == 1           # one mouse
+    xy = np.array(label.split()[1:], float).reshape(-1, 2) * (64, 48)
+    assert xy[:, 0].max() > 55 and xy[:, 1].max() > 37   # the tail piece is in the outline
+
+
 # ----------------------------------------------------------------------
 # the window
 # ----------------------------------------------------------------------

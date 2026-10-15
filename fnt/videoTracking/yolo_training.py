@@ -113,9 +113,17 @@ def convert_coco_to_yolo(
             # YOLO wants normalised polygons, so RLE ground truth is traced
             # back to outlines here. The stored mask stays lossless; only this
             # throwaway training copy is polygonised.
-            for seg in segmentation_to_polygons(ann["segmentation"], h, w):
-                if len(seg) < 6:
-                    continue
+            polys = [p for p in segmentation_to_polygons(ann["segmentation"], h, w)
+                     if len(p) >= 6]
+            if len(polys) > 1:
+                # One mask in pieces (a tail cut off by erasing, a tail loop)
+                # is still one animal, but YOLO reads every line as its own
+                # instance: tail fragments trained as extra mice. Join the
+                # pieces into one outline with zero-width bridges, as
+                # Ultralytics does for multi-polygon COCO instances.
+                from ultralytics.data.converter import merge_multi_segment
+                polys = [np.concatenate(merge_multi_segment(polys), axis=0).reshape(-1).tolist()]
+            for seg in polys:
                 coords = []
                 for j in range(0, len(seg), 2):
                     nx = seg[j] / w
