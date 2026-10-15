@@ -141,6 +141,23 @@ def _parser():
                    help="Write the frame names here, one per line, for --focus.")
     e.add_argument("--workers", type=int, default=4,
                    help="Videos read in parallel (default 4).")
+    b = sub.add_parser("infer-videos",
+                       help="Segment every Nth frame of whole videos with a trained model; "
+                            "one <video>_masks.h5 per video (resumes where it stopped).")
+    b.add_argument("--model", required=True, help="Model run folder (or a .pt file).")
+    b.add_argument("--videos", nargs="+", required=True,
+                   help="Video files, folders (searched recursively) and/or .txt lists.")
+    b.add_argument("--step", type=int, default=250,
+                   help="Every Nth frame (default 250: one keyframe per 16.7 s at 15 fps).")
+    b.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default 0.25).")
+    b.add_argument("--imgsz", type=int, default=None,
+                   help="Input size (default: the model's training size).")
+    b.add_argument("--device", default="", help="e.g. 0 or cpu (default: auto).")
+    b.add_argument("--order", choices=["coarse", "name"], default="coarse",
+                   help="coarse (default): spread over every folder and camera from the "
+                        "start, so a stopped run is an even sample; name: alphabetical.")
+    b.add_argument("--no-window", action="store_true",
+                   help="Run without the progress window (log to the console).")
     return p
 
 
@@ -157,6 +174,19 @@ def main(argv=None) -> int:
               f"{res['registered']} video(s) newly registered, "
               f"{len(res['problems'])} problem(s)", flush=True)
         return 1 if res["problems"] and not res["frames"] else 0
+    if args.cmd == "infer-videos":
+        from .mask_tracker_batch import find_videos, order_coarse_to_fine, run_batch
+        videos = find_videos(args.videos)
+        if args.order == "coarse":
+            videos = order_coarse_to_fine(videos)
+        if not videos:
+            print("no videos found", file=sys.stderr)
+            return 1
+        if args.no_window:
+            res = run_batch(args.model, videos, args.step, args.conf, args.imgsz, args.device)
+            return 0 if res["done"] == res["videos"] else 1
+        from .mask_tracker_batch_window import run_with_window
+        return run_with_window(args.model, videos, args.step, args.conf, args.imgsz, args.device)
     return 2
 
 
