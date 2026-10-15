@@ -365,6 +365,7 @@ class AnnotationPreviewWidget(QWidget):
     edit_as_pending_requested = pyqtSignal(int)  # menu: edit a saved mask as a pending object
     review_requested = pyqtSignal(str)         # A / R / Shift+A: accept, reject, accept_all
     prediction_selected = pyqtSignal()         # a click picked the prediction to review
+    replace_prediction_requested = pyqtSignal(int)  # SAM click on a prediction: drop it
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -1083,6 +1084,14 @@ class AnnotationPreviewWidget(QWidget):
         coords = self._widget_to_img(wx, wy)
         if coords is None:
             return
+        # A SAM click on one of the model's masks (and no pending object there)
+        # replaces it: the prediction is dropped (Ctrl+Z restores it) and SAM
+        # segments the animal from the click. Reviewing a coarse prediction was
+        # reject, then click, then Enter.
+        if self.object_near(*coords) is None:
+            hit = self._find_annotation_at(wx, wy)
+            if hit is not None and self.annotations[hit].inferred:
+                self.replace_prediction_requested.emit(hit)
         self.add_sam_click(coords[0], coords[1], positive=True, new_object=new_object)
         self._request_ai_prediction()
 
@@ -4157,6 +4166,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.edit_as_pending_requested.connect(self._edit_as_pending)
         self.preview.review_requested.connect(self._on_review)
         self.preview.prediction_selected.connect(self._update_review_label)
+        self.preview.replace_prediction_requested.connect(self._replace_prediction)
         self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
@@ -4676,7 +4686,8 @@ class MaskTrackerWindow(QMainWindow):
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
             "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
             "Review: A accepts the bold prediction (click one to pick it), R rejects\n"
-            "  it, Shift+A accepts all on the frame.\n"
+            "  it, Shift+A accepts all on the frame. A SAM click on a prediction\n"
+            "  replaces it with SAM's mask.\n"
             "S = skip: leave this frame and go to the next one still to label.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
@@ -9189,6 +9200,17 @@ class MaskTrackerWindow(QMainWindow):
                 self._on_delete_annotation_by_index(i)
         pv.review_idx = None
         self._after_review_step()
+
+    def _replace_prediction(self, idx: int):
+        """A SAM click landed on a prediction: drop it (Ctrl+Z restores it);
+        the SAM mask from the click takes its place when Enter saves it."""
+        self._on_delete_annotation_by_index(idx)
+        self.preview.review_idx = None
+        self._recalc_current_frame_confidence()
+        self._update_review_label()
+        self.status_bar.showMessage(
+            "Prediction replaced by a SAM mask: Enter saves it (Ctrl+Z brings the prediction back).",
+            6000)
 
     def _after_review_step(self):
         pv = self.preview

@@ -335,5 +335,27 @@ def test_review_accepts_rejects_and_advances_as_in_mad():
     w.close()
 
 
+def test_a_sam_click_on_a_prediction_replaces_it():
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    w = window()
+    cat = w._coco.categories[0]["id"]
+    img = w._coco.get_or_add_image(FRAMES[0], 64, 48)
+    m = np.zeros((48, 64), bool)
+    m[10:30, 10:40] = True
+    w._coco.add_annotation_from_mask(img, cat, m, inferred=True, score=0.3)
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    pv.drawing_mode = "ai"
+    x, y = pv._img_to_widget(25, 20)
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+        QApplication.sendEvent(pv, QMouseEvent(kind, QPointF(x, y), Qt.LeftButton, buttons, Qt.NoModifier))
+    assert not pv.annotations                     # the prediction is gone
+    assert len(pv._ai_objects) == 1               # a SAM object from the click
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
