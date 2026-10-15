@@ -187,6 +187,30 @@ class AnnotationObject:
         self.ann_id = ann_id
         self.is_ai = is_ai
         self.inferred = inferred
+        self._anchor_key = None
+        self._anchor: Optional[Tuple[float, float]] = None
+
+    def label_anchor(self) -> Tuple[float, float]:
+        """Where the label and its dot go: the point inside the mask farthest
+        from its edge (the middle of a mouse's back). The mean of the outline's
+        vertices, used before, was pulled along the tail, whose long thin
+        outline holds many of them."""
+        key = hash(tuple(map(tuple, self.points)))
+        if key == self._anchor_key and self._anchor is not None:
+            return self._anchor
+        pts = np.asarray(self.points, dtype=np.float64)
+        x0, y0 = np.floor(pts.min(axis=0)) - 1
+        x1, y1 = np.ceil(pts.max(axis=0)) + 2
+        m = np.zeros((int(y1 - y0), int(x1 - x0)), np.uint8)
+        cv2.fillPoly(m, [np.round(pts - (x0, y0)).astype(np.int32)], 1)
+        if m.any():
+            d = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+            iy, ix = np.unravel_index(int(np.argmax(d)), d.shape)
+            self._anchor = (float(ix + x0), float(iy + y0))
+        else:
+            self._anchor = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+        self._anchor_key = key
+        return self._anchor
 
 
 # ======================================================================
@@ -1374,8 +1398,7 @@ class AnnotationPreviewWidget(QWidget):
             if ann.category and len(ann.points) >= 3:
                 cat_counters[ann.category] = cat_counters.get(ann.category, 0) + 1
                 instance_num = cat_counters[ann.category]
-                cx = sum(p[0] for p in ann.points) / len(ann.points)
-                cy = sum(p[1] for p in ann.points) / len(ann.points)
+                cx, cy = ann.label_anchor()
                 wcx, wcy = self._img_to_widget(cx, cy)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(255, 255, 255)))

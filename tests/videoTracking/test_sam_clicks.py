@@ -245,5 +245,18 @@ def test_m_p_x_request_tools():
     assert got == ["m", "paint", "erase"]
 
 
+def test_the_label_sits_on_the_body_not_pulled_along_the_tail():
+    """The label dot was the mean of the outline's vertices; a long tail's
+    outline holds most of them and dragged it toward the tail."""
+    body = blob(40, 40, 80, 70)                       # 40 x 30 body
+    tail = blob(80, 54, 190, 56)                      # long thin tail
+    outline = G.AnnotationPreviewWidget._mask_outline(body | tail)
+    ann = G.AnnotationObject(outline, "mouse")
+    x, y = ann.label_anchor()
+    assert 50 <= x <= 70 and 48 <= y <= 62          # middle of the body
+    mean_x = sum(p[0] for p in outline) / len(outline)
+    assert mean_x > 70                                # where the old dot went
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
