@@ -1,4 +1,4 @@
-"""FNT Mask Tracker Tool (MTT).
+"""FNT Mask Tracker (MTT).
 
 Unified GUI for instance segmentation annotation and Mask R-CNN training.
 Two tabs:
@@ -330,6 +330,7 @@ class AnnotationPreviewWidget(QWidget):
     edit_mode_blocked = pyqtSignal()
     edit_cancelled = pyqtSignal()
     category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
+    empty_frame_requested = pyqtSignal()       # N: mark / unmark the frame empty
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -786,6 +787,9 @@ class AnnotationPreviewWidget(QWidget):
                 for i in range(len(self.annotations) - 1, -1, -1):
                     if self.annotations[i].inferred:
                         self.approve_annotation_requested.emit(i)
+        elif event.key() == Qt.Key_N and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            self.empty_frame_requested.emit()
         elif Qt.Key_1 <= event.key() <= Qt.Key_9:
             self.category_hotkey.emit(event.key() - Qt.Key_1)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
@@ -3071,7 +3075,7 @@ class SystemProfileWorker(QThread):
 # Main window
 # ======================================================================
 class MaskTrackerWindow(QMainWindow):
-    BASE_TITLE = "FNT Mask Tracker Tool"
+    BASE_TITLE = "Mask Tracker"
 
     def __init__(self):
         super().__init__()
@@ -3413,6 +3417,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.mode_changed.connect(self._on_mode_changed)
         self.preview.advance_frame_requested.connect(self._on_advance_frame)
         self.preview.timeline_advance_requested.connect(self._on_timeline_advance)
+        self.preview.empty_frame_requested.connect(self._toggle_empty_frame)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3540,6 +3545,26 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_sam_model.clicked.connect(self._choose_sam2_model)
         info_layout.addWidget(self.btn_sam_model)
 
+        self.btn_empty_frame = QPushButton("Empty Frame")
+        self.btn_empty_frame.setCheckable(True)
+        self.btn_empty_frame.setToolTip(
+            "Mark this frame as holding no object (N).\n\n"
+            "An empty frame counts as reviewed: it trains as a background\n"
+            "image (negative example), Enter skips it, and post-training\n"
+            "inference leaves it alone. Marking drops the frame's pending\n"
+            "masks; a frame with an accepted mask cannot be marked. Click\n"
+            "again (or N) to unmark."
+        )
+        self._empty_off_style = self._sam_toggle_off_style
+        self._empty_on_style = (
+            "QPushButton { background-color: #6a1b9a; color: white; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; border: 2px solid #ba68c8; }"
+            "QPushButton:hover { background-color: #7b1fa2; }"
+        )
+        self.btn_empty_frame.setStyleSheet(self._empty_off_style)
+        self.btn_empty_frame.clicked.connect(lambda _=False: self._toggle_empty_frame())
+        info_layout.addWidget(self.btn_empty_frame)
+
         self.btn_edit_classes = QPushButton("Edit Object Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
@@ -3563,8 +3588,8 @@ class MaskTrackerWindow(QMainWindow):
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
             self.lbl_active_class, self.combo_active_class,
-            self.btn_sam_toggle, self.btn_sam_model, self.btn_edit_classes,
-            self.lbl_zoom_info,
+            self.btn_sam_toggle, self.btn_sam_model, self.btn_empty_frame,
+            self.btn_edit_classes, self.lbl_zoom_info,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -3844,7 +3869,8 @@ class MaskTrackerWindow(QMainWindow):
             "Editing: drag vertices, right-click to insert one.\n"
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
-            "Space = next queued frame on this video's timeline (Shift+Space = previous).\n"
+            "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
+            "N = mark the frame empty (no object); it trains as a background.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
@@ -6759,14 +6785,79 @@ class MaskTrackerWindow(QMainWindow):
             self._enter_video_mode_at(src[0], target)
             return
         wrapped = (target <= pos) if direction >= 0 else (target >= pos)
-        if wrapped and len(self._scrubber_rows) > 1:
-            self.status_bar.showMessage(
-                "Wrapped to the first queued frame of this video"
-                if direction >= 0 else
-                "Wrapped to the last queued frame of this video",
-                2500,
-            )
+        if wrapped:
+            # Past this video's last (first) queued frame: carry on through the
+            # queue instead of wrapping back within the video, which made Space
+            # bounce between the two frames of a two-frame clip.
+            self._step_queue(direction)
+            return
         self._select_frame_row(row)
+
+    def _step_queue(self, direction: int):
+        """Select the next (direction > 0) or previous queue row, in the order
+        the list shows; wraps at the ends with a status message."""
+        n = self.frame_list.topLevelItemCount()
+        if n == 0:
+            return
+        pos = next((i for i in range(n)
+                    if self.frame_list.topLevelItem(i).data(0, Qt.UserRole)
+                    == self.current_frame_idx), -1)
+        nxt = pos + (1 if direction >= 0 else -1)
+        if nxt >= n or nxt < 0:
+            nxt = 0 if direction >= 0 else n - 1
+            self.status_bar.showMessage(
+                "Wrapped to the start of the queue" if direction >= 0
+                else "Wrapped to the end of the queue", 2500)
+        row = self.frame_list.topLevelItem(nxt).data(0, Qt.UserRole)
+        if row is not None:
+            self._select_frame_row(row)
+
+    def _toggle_empty_frame(self):
+        """Mark (or unmark) the current queue frame as empty: reviewed, holding
+        no object, so it trains as a background image."""
+        if self._annot_in_video_mode or not (
+                0 <= self.current_frame_idx < len(self._extracted_frames)):
+            self.status_bar.showMessage(
+                "Empty Frame applies to a frame in the Training Frames Queue.", 4000)
+            self._sync_empty_button()
+            return
+        _, _, fp = self._extracted_frames[self.current_frame_idx]
+        filename = os.path.basename(fp)
+        advance = False
+        if self._coco.is_image_empty(filename):
+            self._coco.set_image_empty(filename, 0, 0, empty=False)
+            self.status_bar.showMessage(f"{filename}: no longer marked empty", 4000)
+        else:
+            img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            h, w = (img.shape[:2] if img is not None else (0, 0))
+            if self._coco.set_image_empty(filename, w, h, empty=True) < 0:
+                self.status_bar.showMessage(
+                    "This frame has accepted masks; delete them to mark it empty.", 5000)
+                self._sync_empty_button()
+                return
+            self.status_bar.showMessage(f"{filename}: marked empty", 3000)
+            advance = True
+        self._frame_confidence.pop(filename, None)
+        self._load_frame_annotations(fp)
+        self._update_frame_list_item(self.current_frame_idx)
+        self._update_ann_stats()
+        self._sync_empty_button()
+        if advance:
+            self._next_frame()
+
+    def _sync_empty_button(self):
+        """The Empty Frame button shows the current frame's state."""
+        btn = getattr(self, "btn_empty_frame", None)
+        if btn is None:
+            return
+        empty = False
+        if not self._annot_in_video_mode and 0 <= self.current_frame_idx < len(self._extracted_frames):
+            empty = self._coco.is_image_empty(
+                os.path.basename(self._extracted_frames[self.current_frame_idx][2]))
+        btn.blockSignals(True)
+        btn.setChecked(empty)
+        btn.blockSignals(False)
+        btn.setStyleSheet(self._empty_on_style if empty else self._empty_off_style)
 
     def _extract_frame_from_video(self):
         if self._video_cap is None or self.current_video_idx < 0:
@@ -6958,8 +7049,9 @@ class MaskTrackerWindow(QMainWindow):
         has_source = self._frame_source_available(vpath)
         n_total, n_inferred = self._count_annotations_for_file(filename)
         n_approved = n_total - n_inferred
+        is_empty = self._coco.is_image_empty(filename)
 
-        if n_approved > 0:
+        if n_approved > 0 or is_empty:
             name_color = QColor("#4fc456")   # green: has accepted mask(s)
         elif n_total > 0:
             name_color = QColor("#e6c830")   # yellow: pending only
@@ -6991,7 +7083,9 @@ class MaskTrackerWindow(QMainWindow):
             )
 
         # Annotations column: number of masks, broken down by state.
-        if n_approved and n_inferred:
+        if is_empty:
+            ann_text = "empty ✓"
+        elif n_approved and n_inferred:
             ann_text = f"{n_approved} ✓ · {n_inferred} pending"
         elif n_approved:
             ann_text = f"{n_approved} ✓"
@@ -7004,7 +7098,8 @@ class MaskTrackerWindow(QMainWindow):
         item.setForeground(1, name_color)
         item.setToolTip(
             1,
-            f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
+            "Marked empty: no object; trains as a background image" if is_empty
+            else f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
             if n_total else "No annotations yet",
         )
 
@@ -7276,6 +7371,8 @@ class MaskTrackerWindow(QMainWindow):
                 continue
             _, _, fp = self._extracted_frames[i]
             filename = os.path.basename(fp)
+            if self._coco.is_image_empty(filename):
+                continue          # reviewed: holds no object
             total, n_inferred = self._count_annotations_for_file(filename)
             if total == 0 or total == n_inferred:
                 candidates.append(i)
@@ -7474,6 +7571,7 @@ class MaskTrackerWindow(QMainWindow):
 
         if filename not in self._coco._image_id_map:
             self._update_ann_stats()
+            self._sync_empty_button()
             return
 
         img_id = self._coco._image_id_map[filename]
@@ -7504,6 +7602,7 @@ class MaskTrackerWindow(QMainWindow):
 
         self.preview.update()
         self._update_ann_stats()
+        self._sync_empty_button()
 
     # ==================================================================
     # Mode changes
@@ -8265,7 +8364,7 @@ class MaskTrackerWindow(QMainWindow):
         n_train_images = len(set(
             a["image_id"] for a in self._coco.annotations
             if not a.get("inferred", False)
-        ))
+        )) + self._coco.count_empty_images()
 
         arch_text = self.combo_architecture.currentText()
         is_yolo = arch_text.startswith("YOLO")
@@ -8648,8 +8747,8 @@ class MaskTrackerWindow(QMainWindow):
                 n_manual = self._coco.count_annotations_for_image(
                     img_id, exclude_inferred=True,
                 )
-                if n_manual > 0:
-                    continue  # has manual annotations — skip
+                if n_manual > 0 or self._coco.is_image_empty(filename):
+                    continue  # reviewed (masks or marked empty) — skip
             unlabeled_paths.append(fp)
 
         if not unlabeled_paths:
@@ -12135,24 +12234,32 @@ class MaskTrackerWindow(QMainWindow):
         stats = self._coco.get_stats()
         n_this_frame = len(self.preview.annotations)
         n_inferred_frame = sum(1 for a in self.preview.annotations if a.inferred)
-        if stats["num_annotations"] == 0:
+        n_empty = self._coco.count_empty_images()
+        frame_empty = (not self._annot_in_video_mode
+                       and 0 <= self.current_frame_idx < len(self._extracted_frames)
+                       and self._coco.is_image_empty(os.path.basename(
+                           self._extracted_frames[self.current_frame_idx][2])))
+        if stats["num_annotations"] == 0 and n_empty == 0:
             self.lbl_ann_stats.setText("")
         else:
             n_total_inferred = sum(
                 1 for a in self._coco.annotations if a.get("inferred", False)
             )
-            frame_str = f"{n_this_frame} on frame"
+            frame_str = "empty frame" if frame_empty else f"{n_this_frame} on frame"
             if n_inferred_frame > 0:
                 frame_str += f" ({n_inferred_frame} inferred)"
             total_str = f"{stats['num_annotations']} total across {stats['images_with_annotations']} images"
             if n_total_inferred > 0:
                 total_str += f" ({n_total_inferred} inferred)"
+            if n_empty:
+                total_str += f", {n_empty} empty"
             self.lbl_ann_stats.setText(f"{frame_str}  |  {total_str}")
             if n_inferred_frame > 0:
                 self.lbl_ann_stats.setStyleSheet("color: #e6c830; font-size: 10px;")
             else:
                 self.lbl_ann_stats.setStyleSheet("color: #4caf50; font-size: 10px;")
         self._update_frame_list_item(self.current_frame_idx)
+        self._sync_empty_button()
 
     def _update_frame_list_item(self, row: int):
         if row < 0 or row >= len(self._extracted_frames):

@@ -531,13 +531,65 @@ class COCOAnnotationManager:
                 return c["name"]
         return "unknown"
 
+    # -- empty frames ----------------------------------------------------
+    # A frame the reviewer marked as holding no object. It is stored as a flag
+    # on the COCO image ("empty": true) and trains as a background image. The
+    # flag only counts while the frame has no accepted mask, so a mask drawn
+    # later wins without every entry point having to clear it.
+    def _image_entry(self, image_id: int) -> Optional[Dict]:
+        for img in self.images:
+            if img["id"] == image_id:
+                return img
+        return None
+
+    def is_image_empty(self, filename: str) -> bool:
+        img_id = self._image_id_map.get(filename)
+        if img_id is None:
+            return False
+        img = self._image_entry(img_id)
+        return bool(img and img.get("empty")) and not self.count_annotations_for_image(
+            img_id, exclude_inferred=True)
+
+    def set_image_empty(self, filename: str, width: int, height: int, empty: bool = True) -> int:
+        """Mark (or unmark) a frame as empty. Marking drops the frame's pending
+        (inferred) masks; a frame with an accepted mask is refused (-1).
+        Returns the image id."""
+        img_id = self.get_or_add_image(filename, width, height)
+        img = self._image_entry(img_id)
+        if empty:
+            if self.count_annotations_for_image(img_id, exclude_inferred=True):
+                return -1
+            self.annotations = [a for a in self.annotations if a["image_id"] != img_id]
+            img["empty"] = True
+        else:
+            img.pop("empty", None)
+        self._auto_save()
+        return img_id
+
+    def count_empty_images(self) -> int:
+        return sum(1 for img in self.images if self.is_image_empty(img["file_name"]))
+
     def export(self, output_path: str, exclude_inferred: bool = False):
+        """Write the COCO JSON.
+
+        ``exclude_inferred=True`` is the training export: accepted masks only,
+        and only the images a reviewer has finished with -- those with an
+        accepted mask, or marked empty. An image whose masks are all still
+        pending (or that only ever had predictions) is left out: every image in
+        the file trains, and one with no annotation trains as "no object here",
+        which would teach the model that the mice it could not yet see are
+        background.
+        """
+        images = self.images
         if exclude_inferred:
             anns = [a for a in self.annotations if not a.get("inferred", False)]
+            keep = {a["image_id"] for a in anns}
+            keep |= {img["id"] for img in self.images if img.get("empty")}
+            images = [img for img in self.images if img["id"] in keep]
         else:
             anns = self.annotations
         data = {
-            "images": self.images,
+            "images": images,
             "annotations": anns,
             "categories": self.categories,
         }
