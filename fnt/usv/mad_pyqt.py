@@ -20774,6 +20774,7 @@ def _host_like_startup():
         from fnt import tool_host as th
         th.install_faulthandler("MAD (command line)")
         th.install_slot_excepthook()
+        th.install_qt_message_handler()
         if QApplication.instance() is None:
             th._prepare_windows_taskbar()
             th._enable_hidpi()

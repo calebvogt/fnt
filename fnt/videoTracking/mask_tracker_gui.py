@@ -1257,7 +1257,9 @@ class SAM2LoadWorker(QThread):
 
 
 class SAM2PredictWorker(QThread):
-    finished = pyqtSignal(np.ndarray, float)
+    # Not "finished": that would hide QThread.finished, which is what tells
+    # the window the thread has really stopped (see _request_ai_prediction).
+    predicted = pyqtSignal(np.ndarray, float)
     error = pyqtSignal(str)
 
     def __init__(self, segmenter, pos_points, neg_points):
@@ -1269,7 +1271,7 @@ class SAM2PredictWorker(QThread):
     def run(self):
         try:
             mask, score = self.segmenter.predict_mask(self.pos_points, self.neg_points)
-            self.finished.emit(mask, score)
+            self.predicted.emit(mask, score)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -3158,6 +3160,7 @@ class MaskTrackerWindow(QMainWindow):
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
         self._predict_worker: Optional[SAM2PredictWorker] = None
+        self._predict_again = False
         self._image_set = False
         self._ai_enabled = False
 
@@ -7622,6 +7625,7 @@ class MaskTrackerWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not read image:\n{path}")
             return
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self._wait_for_prediction()
         self.preview.clear()
         self.preview.set_frame(img_rgb)
         self._image_set = False
@@ -7852,6 +7856,9 @@ class MaskTrackerWindow(QMainWindow):
             if img is not None:
                 self._segmenter.set_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 self._image_set = True
+        # Points clicked while the model was loading get their mask now.
+        if self.preview.drawing_mode == "ai" and self.preview._ai_positive_points:
+            self._request_ai_prediction()
 
     def _on_sam2_error(self, msg: str):
         self.status_bar.showMessage(f"SAM2 error: {msg}")
@@ -7864,7 +7871,19 @@ class MaskTrackerWindow(QMainWindow):
     # AI prediction
     # ==================================================================
     def _request_ai_prediction(self):
+        """Predict the mask for the current SAM points, one run at a time.
+
+        Every click used to start a new worker and drop the reference to the
+        one still running; Qt aborts the whole process when a running QThread
+        is destroyed ("QThread: Destroyed while thread is still running",
+        0xC0000409 in Qt5Core.dll) -- quick clicks crashed the window. Now a
+        click during a run only asks for one more run, made with the latest
+        points once the current thread has stopped.
+        """
         if self._segmenter is None or self._segmenter.predictor is None:
+            if self.preview._ai_positive_points:
+                self.status_bar.showMessage(
+                    "SAM2 is still loading; the mask follows when it is ready.", 4000)
             return
         if not self._image_set:
             return
@@ -7872,10 +7891,30 @@ class MaskTrackerWindow(QMainWindow):
         neg = list(self.preview._ai_negative_points) or None
         if not pos:
             return
-        self._predict_worker = SAM2PredictWorker(self._segmenter, pos, neg)
-        self._predict_worker.finished.connect(self._on_prediction_done)
-        self._predict_worker.error.connect(self._on_prediction_error)
-        self._predict_worker.start()
+        if self._predict_worker is not None and self._predict_worker.isRunning():
+            self._predict_again = True
+            return
+        self._predict_again = False
+        worker = SAM2PredictWorker(self._segmenter, pos, neg)
+        worker.predicted.connect(self._on_prediction_done)
+        worker.error.connect(self._on_prediction_error)
+        worker.finished.connect(self._on_predict_thread_finished)
+        self._predict_worker = worker
+        worker.start()
+
+    def _on_predict_thread_finished(self):
+        """The prediction thread has stopped: run again if points changed meanwhile."""
+        if getattr(self, "_predict_again", False):
+            self._predict_again = False
+            self._request_ai_prediction()
+
+    def _wait_for_prediction(self):
+        """Let a running prediction finish before the predictor's image changes
+        (or the window closes): SAM2 must not be fed a new image mid-predict."""
+        self._predict_again = False
+        w = self._predict_worker
+        if w is not None and w.isRunning():
+            w.wait(10000)
 
     def _on_prediction_done(self, mask: np.ndarray, score: float):
         self.preview.set_ai_mask(mask, score)
@@ -12352,6 +12391,7 @@ class MaskTrackerWindow(QMainWindow):
         worker = getattr(self, "_sysprofile_worker", None)
         if worker is not None and worker.isRunning():
             worker.wait(2000)
+        self._wait_for_prediction()
         event.accept()
 
 
@@ -12496,6 +12536,7 @@ def _host_like_startup():
         from fnt import tool_host as th
         th.install_faulthandler("Mask Tracker (command line)")
         th.install_slot_excepthook()
+        th.install_qt_message_handler()
         if QApplication.instance() is None:
             th._prepare_windows_taskbar()
             th._enable_hidpi()
