@@ -1,6 +1,6 @@
 """Empty frames and Space in the Mask Tracker.
 
-A frame the reviewer marks empty (N, or the Empty Frame button) is reviewed and
+A frame the reviewer marks empty (E, or the Empty Frame button) is reviewed and
 holds no object: it trains as a background image, Enter and post-training
 inference skip it, and marking it drops its pending masks. The training export
 holds only reviewed images -- an image whose masks are all still pending used
@@ -134,7 +134,7 @@ def test_n_marks_empty_advances_and_unmarks():
     assert w.windowTitle().startswith("Mask Tracker")
     w._select_frame_row(0)
     assert w.current_frame_idx == 0
-    w._toggle_empty_frame()                       # what N and the button call
+    w._toggle_empty_frame()                       # what E and the button call
     assert w._coco.is_image_empty(FRAMES[0])
     assert row_text(w, FRAMES[0]) == "empty ✓"
     assert w.current_frame_idx == 1               # moved on to the next unreviewed frame
@@ -215,6 +215,15 @@ def test_labeling_keys_work_after_clicking_a_button_or_the_list(monkeypatch):
     w._select_frame_row(2)
     key(w.frame_list, Qt.Key_E, "e")                # E with the frame list focused
     assert w._coco.is_image_empty(FRAMES[2])
+
+    # N / B step through the queue row by row, from anywhere in the window.
+    w._select_frame_row(1)
+    key(w.frame_list, Qt.Key_N, "n")
+    assert w.current_frame_idx == 2
+    key(w.btn_empty_frame, Qt.Key_B, "b")
+    key(w.btn_empty_frame, Qt.Key_B, "b")
+    assert w.current_frame_idx == 0
+    assert not w._coco.is_image_empty(FRAMES[1])    # N no longer marks empty
 
     # Text entry keeps its keys.
     before = w.spin_batch.value()

@@ -86,6 +86,18 @@ def test_right_click_excludes_during_a_prompt_and_is_quiet_otherwise(monkeypatch
     assert len(menus) == 1
 
 
+def test_clicks_are_ignored_while_the_model_loads():
+    w, asked = preview()
+    w.set_busy("Loading SAM model…")
+    click(w, 200, 150)
+    click(w, 200, 150, Qt.RightButton)
+    assert w._ai_positive_points == [] and w._ai_negative_points == [] and asked == []
+    w.grab()                                   # the overlay paints without error
+    w.set_busy(None)
+    click(w, 200, 150)
+    assert len(w._ai_positive_points) == 1
+
+
 def test_m_toggles_sam_mode():
     w, _ = preview()
     hits = []

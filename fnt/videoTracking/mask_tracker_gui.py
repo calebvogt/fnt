@@ -330,7 +330,8 @@ class AnnotationPreviewWidget(QWidget):
     edit_mode_blocked = pyqtSignal()
     edit_cancelled = pyqtSignal()
     category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
-    empty_frame_requested = pyqtSignal()       # N: mark / unmark the frame empty
+    empty_frame_requested = pyqtSignal()       # mark / unmark the frame empty (button)
+    queue_step_requested = pyqtSignal(int)     # N / B: next / back in the queue
     sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
     e_key_requested = pyqtSignal()             # E: empty frame (queue) / extract (video)
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
@@ -352,6 +353,8 @@ class AnnotationPreviewWidget(QWidget):
         self._pan_y = 0.0
         self._panning = False
         self._pan_start = None
+        self.busy_text: Optional[str] = None     # set_busy(): overlay + clicks ignored
+        self._ai_click_start = None
 
         self.drawing_mode = "navigate"
         self._drawing_active = False
@@ -535,7 +538,7 @@ class AnnotationPreviewWidget(QWidget):
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
-        if self._pixmap is None:
+        if self._pixmap is None or self.busy_text:
             return
 
         if event.button() == Qt.MiddleButton:
@@ -747,6 +750,8 @@ class AnnotationPreviewWidget(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         click = getattr(self, "_ai_click_start", None)
         self._ai_click_start = None
+        if self.busy_text:
+            click = None
         if self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
@@ -806,9 +811,10 @@ class AnnotationPreviewWidget(QWidget):
                 for i in range(len(self.annotations) - 1, -1, -1):
                     if self.annotations[i].inferred:
                         self.approve_annotation_requested.emit(i)
-        elif event.key() == Qt.Key_N and not self._drawing_active \
+        elif event.key() in (Qt.Key_N, Qt.Key_B) and not self._drawing_active \
                 and self._editing_obj_idx is None:
-            self.empty_frame_requested.emit()
+            # N / B: next / back in the Training Frames Queue, row by row.
+            self.queue_step_requested.emit(1 if event.key() == Qt.Key_N else -1)
         elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
             self.sam_toggle_requested.emit()
         elif event.key() == Qt.Key_E and not self._drawing_active \
@@ -982,7 +988,25 @@ class AnnotationPreviewWidget(QWidget):
             if len(self._pending_annotation) >= 3:
                 painter.drawPolygon(poly)
 
+        if self.busy_text:
+            # Dim the frame and say why clicks are ignored (see set_busy).
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+            f = painter.font()
+            f.setPointSize(max(16, f.pointSize() + 8))
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.busy_text)
+
         painter.end()
+
+    def set_busy(self, text: Optional[str]):
+        """Cover the frame with a message and ignore clicks until cleared
+        (None). Used while SAM2 loads: clicks made before the model is ready
+        cannot be served, and a burst of them is what crashed a session."""
+        self.busy_text = text or None
+        self.setCursor(Qt.WaitCursor if self.busy_text else Qt.ArrowCursor)
+        self.update()
 
     def _paint_manual_drawing(self, painter: QPainter, pr: float):
         if not self._current_points:
@@ -3192,7 +3216,7 @@ class MaskTrackerWindow(QMainWindow):
 
     #: Keys that act on the frame being labeled, whichever widget has focus.
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
-                      Qt.Key_E, Qt.Key_M, Qt.Key_A, Qt.Key_Escape)
+                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_A, Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -3482,6 +3506,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.empty_frame_requested.connect(self._toggle_empty_frame)
         self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
         self.preview.e_key_requested.connect(self._on_e_key)
+        self.preview.queue_step_requested.connect(self._step_queue)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3611,7 +3636,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_empty_frame = QPushButton("Mark as Empty Frame")
         self.btn_empty_frame.setCheckable(True)
         self.btn_empty_frame.setToolTip(
-            "Mark this frame as holding no object (E or N).\n\n"
+            "Mark this frame as holding no object (E).\n\n"
             "An empty frame counts as reviewed: it trains as a background\n"
             "image (negative example), Enter skips it, and post-training\n"
             "inference leaves it alone. Marking drops the frame's pending\n"
@@ -3938,7 +3963,7 @@ class MaskTrackerWindow(QMainWindow):
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
-            "E or N = mark the frame empty (no object); it trains as a background.\n"
+            "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
@@ -7837,11 +7862,19 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_mode.setText("Navigate")
             self._ai_enabled = False
             return
+        if self._sam2_worker is not None and self._sam2_worker.isRunning():
+            # Replacing a loader that is still running would destroy a running
+            # QThread, which aborts the process.
+            self.status_bar.showMessage("A SAM2 model is still loading; try again when it is ready.", 5000)
+            return
+        self._wait_for_prediction()
         self._segmenter = SAM2ImageSegmenter(checkpoint_path, config_name)
         # Force the (possibly new) segmenter to receive the current frame once
         # loaded — important when swapping models mid-session.
         self._image_set = False
-        self.status_bar.showMessage(f"Loading SAM2 ({os.path.basename(checkpoint_path)})...")
+        name = os.path.basename(checkpoint_path)
+        self.status_bar.showMessage(f"Loading SAM2 ({name})...")
+        self.preview.set_busy(f"Loading SAM model ({name})…\nclicks resume when it is ready")
         self._sam2_worker = SAM2LoadWorker(self._segmenter)
         self._sam2_worker.finished.connect(self._on_sam2_loaded)
         self._sam2_worker.error.connect(self._on_sam2_error)
@@ -7850,6 +7883,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_sam2_loaded(self):
         self.status_bar.showMessage(f"SAM2 loaded ({self._segmenter.device})")
+        self.preview.set_busy(None)
         if self.current_frame_idx >= 0 and not self._image_set:
             _, _, path = self._extracted_frames[self.current_frame_idx]
             img = cv2.imread(path)
@@ -7862,6 +7896,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_sam2_error(self, msg: str):
         self.status_bar.showMessage(f"SAM2 error: {msg}")
+        self.preview.set_busy(None)
         QMessageBox.critical(self, "SAM2 Error", msg)
         self.preview.drawing_mode = "navigate"
         self.lbl_mode.setText("Navigate")
