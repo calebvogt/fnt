@@ -465,13 +465,15 @@ class AnnotationPreviewWidget(QWidget):
         self.update()
 
     def cancel_pending(self):
-        """Esc / Clear: drop the pending objects; a mask brought back with Edit
-        Mask is not lost but restored as it was (the window puts it back)."""
-        origins = [o["origin"] for o in self._ai_objects if o.get("origin")]
+        """Esc / Clear: drop the pending objects. A mask brought back with Edit
+        Mask goes back saved, as in MAD: what the Eraser removed stays removed,
+        pixels painted on (a proposal until Enter) are dropped. The window puts
+        it back from (stored annotation, pixels erased)."""
+        restore = [(o["origin"], o["erase"]) for o in self._ai_objects if o.get("origin")]
         self._clear_drawing()
         self.update()
-        if origins:
-            self.edit_cancelled_restore.emit(origins)
+        if restore:
+            self.edit_cancelled_restore.emit(restore)
 
     def _clear_drawing(self):
         self._drawing_active = False
@@ -824,7 +826,10 @@ class AnnotationPreviewWidget(QWidget):
         self._paint_erasing = erase
         self._stroke_snapshot = {"created": [], "snap": {}}
         if not erase:
-            target = self.object_at(ix, iy)
+            # On a pending object: that one. Elsewhere: the object being edited
+            # (a stroke started just off it extended a new object, which then
+            # took the Eraser's focus); a new object only when none is.
+            target = self.object_at(ix, iy) or self.focus_object()
             if target is None:
                 target = self._new_object()
                 self._stroke_snapshot["created"].append(target["id"])
@@ -9010,15 +9015,27 @@ class MaskTrackerWindow(QMainWindow):
         saved mask goes back as it was."""
         self.preview.cancel_pending()
 
-    def _restore_edited(self, origins: list):
-        """Esc on an Edit Mask: the saved masks go back unchanged."""
-        for ann in origins:
-            self._coco.restore_annotation(copy.deepcopy(ann))
+    def _restore_edited(self, restore: list):
+        """Esc on an Edit Mask: the saved mask goes back minus what was erased
+        (paint not yet accepted with Enter is dropped)."""
+        from .mask_tracker_annotator import mask_bbox, mask_to_rle, segmentation_to_mask
+        h, w = self.preview._img_h, self.preview._img_w
+        for ann, erased in restore:
+            ann = copy.deepcopy(ann)
+            if erased is not None and erased.any():
+                m = segmentation_to_mask(ann["segmentation"], h, w).astype(bool) & ~erased
+                if not m.any():
+                    continue                       # erased away entirely
+                ann["segmentation"] = mask_to_rle(m)
+                ann["bbox"] = list(mask_bbox(m))
+                ann["area"] = int(m.sum())
+            self._coco.restore_annotation(ann)
         path = self._current_frame_path()
         if path:
             self._load_frame_annotations(path)
         self._recalc_current_frame_confidence()
-        self.status_bar.showMessage("Edit cancelled: the mask is back as it was.", 4000)
+        self.status_bar.showMessage(
+            "Edit ended: the mask is saved with your erasures; unaccepted paint dropped.", 4000)
 
     def _undo_tool_step(self):
         """Undo: the last SAM click or Paint / Eraser stroke (U)."""

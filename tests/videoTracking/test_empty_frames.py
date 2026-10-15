@@ -435,28 +435,39 @@ def test_a_mask_in_pieces_shows_its_largest_piece():
     w.close()
 
 
-def test_esc_cancels_an_edit_mask_and_the_mask_comes_back():
-    """Esc after Edit Mask threw the mask away; it now cancels the edit."""
+def test_esc_on_an_edit_mask_keeps_erasures_and_drops_paint():
+    """As in MAD: Esc after Edit Mask drops paint not yet accepted (Enter) but
+    keeps what the Eraser removed; the mask is never thrown away."""
     from PyQt5.QtCore import QEvent, QPointF, Qt
     from PyQt5.QtGui import QMouseEvent
     w = window()
     w._select_frame_row(0)
     pv = w.preview
     pv.resize(400, 300)
+    img = w._coco._image_id_map
+
+    def click(ix, iy):
+        x, y = pv._img_to_widget(ix, iy)
+        for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            b = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+            QApplication.sendEvent(pv, QMouseEvent(kind, QPointF(x, y), Qt.LeftButton, b, Qt.NoModifier))
+
     w._set_object_tool("paint")
-    pv.add_pending_mask(square_mask())
-    key(pv, Qt.Key_Return)                        # a saved mask
-    before = w._coco.get_annotations_for_image(w._coco._image_id_map[FRAMES[0]])[0]
-    w._edit_as_pending(0)                         # Edit Mask
-    assert not pv.annotations and len(pv._ai_objects) == 1
-    x, y = pv._img_to_widget(50, 40)              # paint something extra
-    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
-        buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
-        QApplication.sendEvent(pv, QMouseEvent(kind, QPointF(x, y), Qt.LeftButton, buttons, Qt.NoModifier))
-    key(pv, Qt.Key_Escape)                        # cancel
-    assert not pv._ai_objects and len(pv.annotations) == 1
-    after = w._coco.get_annotations_for_image(w._coco._image_id_map[FRAMES[0]])
-    assert len(after) == 1 and after[0]["segmentation"] == before["segmentation"]
+    pv.add_pending_mask(square_mask())            # rows 10-30, cols 10-40: 600 px
+    key(pv, Qt.Key_Return)                        # saved
+    w._edit_as_pending(0)                         # Edit Mask (paint tool)
+    pv.brush_radius = 2
+    click(50, 40)                                 # paint off the mask: dropped on Esc
+    w._set_object_tool("erase")
+    click(20, 20)                                 # erase a bit of it: kept
+    key(pv, Qt.Key_Escape)
+    anns = w._coco.get_annotations_for_image(img[FRAMES[0]])
+    assert len(anns) == 1 and not pv._ai_objects
+    from fnt.videoTracking.mask_tracker_annotator import segmentation_to_mask
+    m = segmentation_to_mask(anns[0]["segmentation"], 48, 64).astype(bool)
+    assert not m[20, 20] and m[12, 38]            # erased spot gone, rest intact
+    assert not m[40, 50]                          # the paint did not stay
+    assert int(m.sum()) < 600
     w.close()
 
 

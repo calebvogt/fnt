@@ -53,6 +53,22 @@ class YOLOTrainingConfig:
         return str(Path(self.output_dir) / name)
 
 
+def join_pieces(polys: List[List[float]]) -> List[float]:
+    """One outline from several polygons (x, y, x, y ...): each piece is spliced
+    into the outline at its closest point, out along a zero-width bridge, round
+    the piece and back -- one instance for YOLO, as Ultralytics joins
+    multi-polygon COCO instances (done here so exporting needs no torch: torch
+    loaded before Qt crashes the process on Windows)."""
+    rings = [np.asarray(p, np.float64).reshape(-1, 2) for p in polys]
+    out = rings[0]
+    for ring in rings[1:]:
+        d = np.linalg.norm(out[:, None, :] - ring[None, :, :], axis=2)
+        a, b = np.unravel_index(int(np.argmin(d)), d.shape)
+        piece = np.roll(ring, -b, axis=0)
+        out = np.concatenate([out[:a + 1], piece, piece[:1], out[a:]])
+    return out.reshape(-1).tolist()
+
+
 def convert_coco_to_yolo(
     coco_json: str,
     images_dir: str,
@@ -129,8 +145,7 @@ def convert_coco_to_yolo(
                 # instance: tail fragments trained as extra mice. Join the
                 # pieces into one outline with zero-width bridges, as
                 # Ultralytics does for multi-polygon COCO instances.
-                from ultralytics.data.converter import merge_multi_segment
-                polys = [np.concatenate(merge_multi_segment(polys), axis=0).reshape(-1).tolist()]
+                polys = [join_pieces(polys)]
             for seg in polys:
                 coords = []
                 for j in range(0, len(seg), 2):
