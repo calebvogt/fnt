@@ -371,12 +371,13 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask: Optional[np.ndarray] = None
         self._ai_mask_contour_pts: List[Tuple[float, float]] = []
         self._ai_score: float = 0.0
-        # SAM objects: one pending object per mouse. A click starts an object,
-        # or refines the pending object it lands in; right-click inside an
-        # object excludes that spot from it; Shift+click always starts a new
-        # one. Each object is predicted from its own points, so touching mice
-        # stay apart, and Enter saves every object as its own mask. Paint and
-        # Eraser edit the pending objects directly (wheel = brush size).
+        # SAM objects: one pending object per mouse. A click on or near a
+        # pending object refines it (a foot or tail SAM left out), as in MAD;
+        # a click elsewhere starts a new one, and Shift+click always does (a
+        # mouse touching another). Right-click inside an object excludes that
+        # spot from it. Each object is predicted from its own points, so
+        # touching mice stay apart, and Enter saves every object as its own
+        # mask. Paint and Eraser edit the pending objects directly.
         self._ai_objects: List[Dict] = []
         self._ai_queue: List[int] = []                 # object ids waiting for SAM
         self._ai_history: List[Tuple] = []             # undo stack (U)
@@ -454,7 +455,7 @@ class AnnotationPreviewWidget(QWidget):
         return next((o for o in self._ai_objects if o["id"] == obj_id), None)
 
     def _new_object(self) -> Dict:
-        obj = {"id": self._ai_next_id, "pos": [], "neg": [], "sam": None,
+        obj = {"id": self._ai_next_id, "pos": [], "neg": [], "sam": None, "score": None,
                "add": None, "erase": None, "mask": None, "outline": [], "version": 0}
         self._ai_next_id += 1
         self._ai_objects.append(obj)
@@ -468,6 +469,32 @@ class AnnotationPreviewWidget(QWidget):
             if m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x]:
                 return o
         return None
+
+    def _near_px(self) -> int:
+        """A click this close (image px) to a pending object refines it: 2% of
+        the longer image side (38 px at 1920), at least 6."""
+        return max(6, int(round(0.02 * max(self._img_w, self._img_h))))
+
+    def object_near(self, ix: float, iy: float) -> Optional[Dict]:
+        """The pending object under image point (ix, iy), else the nearest one
+        within :meth:`_near_px`, else None."""
+        hit = self.object_at(ix, iy)
+        if hit is not None:
+            return hit
+        x, y, r = int(ix), int(iy), self._near_px()
+        best, best_d = None, None
+        for o in self._ai_objects:
+            m = o["mask"]
+            if m is None:
+                continue
+            y0, x0 = max(0, y - r), max(0, x - r)
+            ys, xs = np.nonzero(m[y0:y + r + 1, x0:x + r + 1])
+            if ys.size == 0:
+                continue
+            d = float(np.min(np.hypot(ys + y0 - y, xs + x0 - x)))
+            if d <= r and (best_d is None or d < best_d):
+                best, best_d = o, d
+        return best
 
     def _queue(self, obj: Dict):
         obj["version"] += 1
@@ -489,11 +516,14 @@ class AnnotationPreviewWidget(QWidget):
     def add_sam_click(self, ix: float, iy: float, positive: bool = True,
                       new_object: bool = False) -> Optional[int]:
         """A SAM click at image point (ix, iy). Positive: refine the pending
-        object it lands in, else (or with ``new_object``) start a new one.
-        Negative: exclude the spot from the object it lands in (ignored
+        object it lands on or near, else (or with ``new_object``) start a new
+        one. Negative: exclude the spot from the object it lands in (ignored
         elsewhere). Returns the object id, or None."""
         pt = (int(ix), int(iy))
-        target = None if new_object else self.object_at(ix, iy)
+        if new_object:
+            target = None
+        else:
+            target = self.object_near(ix, iy) if positive else self.object_at(ix, iy)
         if not positive:
             if target is None:
                 return None
@@ -523,16 +553,61 @@ class AnnotationPreviewWidget(QWidget):
                 return obj["id"], obj["version"], list(obj["pos"]), list(obj["neg"])
         return None
 
-    def set_object_mask(self, obj_id: int, version: int, mask: np.ndarray) -> bool:
-        """Store SAM's prediction for an object: the components holding one of
-        its positive points (else the largest). Ignored if the object is gone
-        or its points changed meanwhile (a newer prediction is queued)."""
+    #: A refined mask may grow to at most this many times the object's last
+    #: SAM mask (a click on a blurry tail scored the whole dish highest).
+    MAX_GROWTH = 2.5
+
+    def choose_candidate(self, obj: Dict, cands: np.ndarray,
+                         scores: Optional[np.ndarray] = None) -> int:
+        """Index of the SAM candidate mask to use for ``obj``: the best-scoring
+        one that covers all of its clicks, none of its excluded spots, and no
+        more than MAX_GROWTH times its last mask; each rule is dropped in turn
+        (size, then the clicks, then the exclusions) when no candidate passes.
+        SAM's own top score was both overlapping mice after one was excluded."""
+        h, w = cands.shape[1:]
+        sc = np.zeros(len(cands)) if scores is None else np.asarray(scores, float)
+        order = [int(i) for i in np.argsort(-sc, kind="stable")]
+        prev = None if obj["sam"] is None else int(obj["sam"].sum())
+
+        def hits(m, pts):
+            return [bool(m[y, x]) for x, y in pts if 0 <= y < h and 0 <= x < w]
+
+        def no_neg(m):
+            return not any(hits(m, obj["neg"]))
+
+        def all_pos(m):
+            return all(hits(m, obj["pos"]))
+
+        def small(m):
+            return prev is None or int(m.sum()) <= self.MAX_GROWTH * prev
+
+        for rule in (lambda m: no_neg(m) and all_pos(m) and small(m),
+                     lambda m: no_neg(m) and all_pos(m),
+                     no_neg):
+            ok = [i for i in order if rule(cands[i])]
+            if ok:
+                return ok[0]
+        return order[0]
+
+    def set_object_mask(self, obj_id: int, version: int, mask: np.ndarray,
+                        scores: Optional[np.ndarray] = None) -> bool:
+        """Store SAM's prediction for an object: ``mask`` is one mask or SAM's
+        candidates (with ``scores``), chosen by :meth:`choose_candidate`; the
+        components holding one of its positive points (else the largest) are
+        kept, holes filled. Ignored if the object is gone or its points
+        changed meanwhile (a newer prediction is queued)."""
         obj = self._object(obj_id)
         if obj is None or obj["version"] != version:
             return False
-        m = np.asarray(mask) > 0
-        if m.shape != (self._img_h, self._img_w):
+        cands = np.asarray(mask)
+        if cands.ndim == 2:
+            cands = cands[None]
+        cands = cands > 0
+        if cands.shape[1:] != (self._img_h, self._img_w):
             return False
+        i = self.choose_candidate(obj, cands, scores)
+        m = cands[i]
+        obj["score"] = None if scores is None else float(np.asarray(scores)[i])
         if m.any():
             n, lbl = cv2.connectedComponents(m.astype(np.uint8), connectivity=8)
             keep = {int(lbl[y, x]) for x, y in obj["pos"]
@@ -540,6 +615,13 @@ class AnnotationPreviewWidget(QWidget):
             if not keep:
                 keep = {int(np.argmax(np.bincount(lbl.ravel())[1:])) + 1}
             m = np.isin(lbl, list(keep))
+            # A mouse has no holes; fill them (SAM's lower-scored candidates
+            # can be speckled).
+            cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_NONE)
+            filled = np.zeros(m.shape, np.uint8)
+            cv2.drawContours(filled, cs, -1, 1, thickness=-1)
+            m = filled > 0
         obj["sam"] = m
         self._combine(obj)
         self.update()
@@ -948,7 +1030,7 @@ class AnnotationPreviewWidget(QWidget):
 
     def _add_ai_point(self, wx: float, wy: float, new_object: bool = False):
         """A SAM click at widget position (wx, wy): refines the pending object it
-        lands in, else starts a new one (always new with Shift)."""
+        lands on or near, else starts a new one (always new with Shift)."""
         if self._editing_obj_idx is not None:
             self.edit_mode_blocked.emit()
             return
@@ -1364,8 +1446,7 @@ class AnnotationPreviewWidget(QWidget):
             painter.drawEllipse(QPointF(wx, wy), pr, pr)
 
     def _paint_ai_drawing(self, painter: QPainter, pr: float):
-        """Pending objects: outline + light fill in each object's colour; SAM
-        points green (include) and red (exclude)."""
+        """Pending objects: outline + light fill in each object's colour."""
         for i, obj in enumerate(self._ai_objects):
             r, g, b = self._OBJECT_COLORS[i % len(self._OBJECT_COLORS)]
             if len(obj["outline"]) >= 3:
@@ -1376,12 +1457,6 @@ class AnnotationPreviewWidget(QWidget):
                     wx, wy = self._img_to_widget(px, py)
                     poly.append(QPointF(wx, wy))
                 painter.drawPolygon(poly)
-            painter.setPen(QPen(QColor(0, 0, 0), 1))
-            for pts, colour in ((obj["pos"], QColor(80, 220, 80)), (obj["neg"], QColor(230, 60, 60))):
-                painter.setBrush(QBrush(colour))
-                for px, py in pts:
-                    wx, wy = self._img_to_widget(px, py)
-                    painter.drawEllipse(QPointF(wx, wy), 4, 4)
 
 # ======================================================================
 # Worker threads
@@ -1633,7 +1708,7 @@ class SAM2LoadWorker(QThread):
 class SAM2PredictWorker(QThread):
     # Not "finished": that would hide QThread.finished, which is what tells
     # the window the thread has really stopped (see _request_ai_prediction).
-    predicted = pyqtSignal(np.ndarray, float)
+    predicted = pyqtSignal(object, object)     # candidate masks (k, H, W), their scores
     error = pyqtSignal(str)
 
     def __init__(self, segmenter, pos_points, neg_points):
@@ -1644,8 +1719,12 @@ class SAM2PredictWorker(QThread):
 
     def run(self):
         try:
-            mask, score = self.segmenter.predict_mask(self.pos_points, self.neg_points)
-            self.predicted.emit(mask, score)
+            if hasattr(self.segmenter, "predict_candidates"):
+                masks, scores = self.segmenter.predict_candidates(self.pos_points, self.neg_points)
+            else:
+                mask, score = self.segmenter.predict_mask(self.pos_points, self.neg_points)
+                masks, scores = np.asarray(mask)[None], np.array([score], float)
+            self.predicted.emit(masks, scores)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -3962,11 +4041,12 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_sam_toggle.setChecked(False)
         self.btn_sam_toggle.setToolTip(
             "SAM2-assisted labeling, as in MAD (shortcut M).\n\n"
-            "Click each mouse: a click starts a pending object, or refines\n"
-            "the pending object it lands in (Shift+click always starts a new\n"
-            "one). Right-click inside an object excludes that spot from it;\n"
-            "Shift+right-click drops the object. Enter saves each object as\n"
-            "its own mask (mouse_1, mouse_2, ...), even where they touch.\n"
+            "Click each mouse. A click on or near a pending mouse adds to it\n"
+            "(a foot or tail SAM missed); elsewhere it starts a new mouse.\n"
+            "Shift+click starts a new mouse even where two touch. Right-click\n"
+            "inside a mouse excludes that spot (e.g. the other of two mice);\n"
+            "Shift+right-click drops the mouse. Enter saves each mouse as its\n"
+            "own mask (mouse_1, mouse_2, ...).\n"
             "U undoes, Esc clears. SAM stays on from frame to frame; drag\n"
             "pans; right-click a finished mask to edit it."
         )
@@ -4367,8 +4447,8 @@ class MaskTrackerWindow(QMainWindow):
         info = QLabel(
             "Right-click preview to add Manual Mask or Edit/Delete masks.\n"
             "Manual: click to place vertices, Enter to accept.\n"
-            "SAM (M): click each mouse (a click inside a pending one refines it,\n"
-            "  Shift+click = new one), right-click excludes; Enter saves each as\n"
+            "SAM (M): click each mouse; a click on or near a pending one adds to\n"
+            "  it (Shift+click = new one), right-click excludes; Enter saves each as\n"
             "  its own mask. Paint (P) / Eraser (X): drag, wheel = brush size.\n"
             "  U undoes a click or stroke; Shift+right-click drops an object.\n"
             "Editing: drag vertices, right-click to insert one.\n"
@@ -8410,10 +8490,12 @@ class MaskTrackerWindow(QMainWindow):
         if w is not None and w.isRunning():
             w.wait(10000)
 
-    def _on_prediction_done(self, mask: np.ndarray, score: float):
+    def _on_prediction_done(self, masks: np.ndarray, scores: np.ndarray):
         job = getattr(self._predict_worker, "job", None)
-        if job is not None:
-            self.preview.set_object_mask(job[0], job[1], mask)
+        score = None
+        if job is not None and self.preview.set_object_mask(job[0], job[1], masks, scores):
+            obj = self.preview._object(job[0])
+            score = None if obj is None else obj.get("score")
         self._show_sam_pending_status(score)
 
     def _on_prediction_error(self, msg: str):
@@ -8427,8 +8509,8 @@ class MaskTrackerWindow(QMainWindow):
             msg += f" (SAM score {score:.2f})"
         if waiting:
             msg += f", {waiting} waiting for SAM"
-        msg += (" — Enter saves each as its own mask; click inside an object refines it, "
-                "right-click excludes, Shift+click = new object, U undoes, Esc clears")
+        msg += (" — Enter saves each as its own mask; a click on or near a mouse adds to it, "
+                "Shift+click = new mouse, right-click excludes, U undoes, Esc clears")
         self.status_bar.showMessage(msg)
 
     # -- Paint / Eraser tools -------------------------------------------

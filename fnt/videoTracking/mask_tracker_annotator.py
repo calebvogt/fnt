@@ -114,6 +114,28 @@ class SAM2ImageSegmenter:
         best_idx = int(np.argmax(scores))
         return masks[best_idx].astype(bool), float(scores[best_idx])
 
+    def predict_candidates(
+        self,
+        positive_points: List[Tuple[int, int]],
+        negative_points: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """All of SAM2's candidate masks for these prompts (k x H x W boolean)
+        and their scores. Its top score is not always the object clicked: a
+        click on a blurry tail scored the whole dish highest, and a click with
+        an exclusion still scored both overlapping mice highest. The Mask
+        Tracker chooses among them (AnnotationPreviewWidget.choose_candidate).
+        """
+        if self.predictor is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        points = list(positive_points) + list(negative_points or [])
+        labels = [1] * len(positive_points) + [0] * len(negative_points or [])
+        masks, scores, _ = self.predictor.predict(
+            point_coords=np.array(points, dtype=np.float32),
+            point_labels=np.array(labels, dtype=np.int32),
+            multimask_output=True,
+        )
+        return np.asarray(masks) > 0, np.asarray(scores, dtype=float)
+
 
 # Polygon simplification tolerance (pixels) for CONTOURS DERIVED FROM MASKS.
 # Ground truth is stored as RLE (see mask_to_rle) and is pixel-exact; this

@@ -1,10 +1,11 @@
 """SAM, Paint and Eraser in the Mask Tracker work on pending objects, one per mouse.
 
 In SAM mode a click starts a pending object, or refines the pending object it
-lands in (Shift+click always starts a new one); right-click inside an object
-excludes that spot from it, Shift+right-click drops it. Each object is predicted
-from its own points, so touching mice stay apart, and Enter saves every object
-as its own mask. Paint adds pixels to an object (a new one off any object),
+lands on or near (Shift+click always starts a new one); right-click inside an
+object excludes that spot from it, Shift+right-click drops it. Each object is
+predicted from its own points, so touching mice stay apart; SAM's candidate is
+chosen by the clicks, not its score alone, and holes are filled. Enter saves
+every object as its own mask. Paint adds pixels to an object (a new one off any object),
 Eraser removes them; the wheel sizes the brush. U undoes clicks and strokes. A
 drag pans in SAM mode, a double-click is one click, clicks are ignored while the
 model loads, and M toggles SAM.
@@ -88,6 +89,46 @@ def test_clicks_start_objects_and_a_click_inside_refines_it():
     assert len(w._ai_objects) == 2 and len(w._ai_objects[0]["pos"]) == 2
     click_img(w, 30, 30, mods=Qt.ShiftModifier)            # Shift: a new object even here
     assert len(w._ai_objects) == 3
+
+
+def test_a_click_near_a_mouse_adds_to_it():
+    """A foot or tail SAM left out: a click just outside the mask refines that
+    mouse (as in MAD) instead of starting a new one."""
+    w, _ = preview()
+    click_img(w, 20, 20)
+    predict_all(w, lambda pos, neg: blob(10, 10, 40, 40))
+    click_img(w, 44, 25)                          # 4 px right of the mask (near = 6 px here)
+    assert len(w._ai_objects) == 1 and w._ai_objects[0]["pos"] == [(20, 20), (44, 25)]
+    click_img(w, 120, 100)                        # far away: a new mouse
+    assert len(w._ai_objects) == 2
+
+
+def test_the_candidate_is_chosen_by_the_clicks_not_only_the_score():
+    """SAM's top score was the dish for a tail click, and both overlapping mice
+    after one was excluded; the chosen candidate covers the clicks, none of the
+    exclusions, and grows at most MAX_GROWTH times."""
+    w, _ = preview()
+    click_img(w, 20, 20)
+    one = blob(10, 10, 40, 40)                                      # 900 px
+    w.set_object_mask(*w.next_ai_job()[:2], np.stack([one]), np.array([0.9]))
+    click_img(w, 42, 25)                                            # near: refine
+    tail = one | blob(40, 24, 50, 27)                               # 930 px, low score
+    dish = blob(0, 0, 120, 100)                                     # 12000 px, top score
+    w.set_object_mask(*w.next_ai_job()[:2], np.stack([tail, dish]), np.array([0.35, 0.40]))
+    assert int(w._ai_objects[0]["sam"].sum()) == 930
+    click_img(w, 30, 30, Qt.RightButton)                            # exclude a spot
+    both = blob(10, 10, 50, 40)
+    w.set_object_mask(*w.next_ai_job()[:2], np.stack([both, blob(10, 10, 25, 40)]),
+                      np.array([0.92, 0.55]))
+    assert not w._ai_objects[0]["sam"][30, 30]                      # the exclusion holds
+
+
+def test_holes_in_a_mouse_are_filled():
+    w, _ = preview()
+    click_img(w, 12, 12)
+    ring = blob(10, 10, 40, 40) & ~blob(20, 20, 30, 30)
+    predict_all(w, lambda pos, neg: ring)
+    assert w._ai_objects[0]["sam"][25, 25] and int(w._ai_objects[0]["sam"].sum()) == 900
 
 
 def test_touching_mice_stay_separate_masks():
