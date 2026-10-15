@@ -370,6 +370,7 @@ class AnnotationPreviewWidget(QWidget):
     prediction_selected = pyqtSignal()         # a click picked the prediction to review
     replace_prediction_requested = pyqtSignal(int)  # SAM click on a prediction: drop it
     masks_view_changed = pyqtSignal(bool)      # V: masks shown / hidden
+    edit_cancelled_restore = pyqtSignal(object)  # Esc on an Edit Mask: the saved masks to put back
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -462,6 +463,15 @@ class AnnotationPreviewWidget(QWidget):
         self._clear_drawing()
         self.annotations.clear()
         self.update()
+
+    def cancel_pending(self):
+        """Esc / Clear: drop the pending objects; a mask brought back with Edit
+        Mask is not lost but restored as it was (the window puts it back)."""
+        origins = [o["origin"] for o in self._ai_objects if o.get("origin")]
+        self._clear_drawing()
+        self.update()
+        if origins:
+            self.edit_cancelled_restore.emit(origins)
 
     def _clear_drawing(self):
         self._drawing_active = False
@@ -677,13 +687,15 @@ class AnnotationPreviewWidget(QWidget):
         self.update()
         return True
 
-    def add_pending_mask(self, mask: np.ndarray) -> Optional[int]:
+    def add_pending_mask(self, mask: np.ndarray, origin: Optional[Dict] = None) -> Optional[int]:
         """A finished mask brought back as a pending object (edit it with SAM,
-        Paint or Eraser; Enter saves it again)."""
+        Paint or Eraser; Enter saves it again). ``origin`` is the stored
+        annotation it came from: Esc puts that back unchanged."""
         m = np.asarray(mask) > 0
         if m.shape != (self._img_h, self._img_w) or not m.any():
             return None
         obj = self._new_object()
+        obj["origin"] = origin
         obj["add"] = m.copy()
         self._combine(obj)
         self._ai_history.append(("new", obj["id"]))
@@ -1283,9 +1295,9 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
                 self.edit_cancelled.emit()
             elif self.drawing_mode in self.OBJECT_TOOLS and self._drawing_active:
-                # Clear the pending objects but keep the tool
-                self._clear_drawing()
-                self.update()
+                # Drop the pending objects (an edited saved mask goes back as it
+                # was) but keep the tool.
+                self.cancel_pending()
             else:
                 self._clear_drawing()
                 self.drawing_mode = "navigate"
@@ -4285,6 +4297,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.review_requested.connect(self._on_review)
         self.preview.prediction_selected.connect(self._update_review_label)
         self.preview.replace_prediction_requested.connect(self._replace_prediction)
+        self.preview.edit_cancelled_restore.connect(self._restore_edited)
         self.btn_view_masks.clicked.connect(
             lambda _=False: self.preview.set_show_masks(not self.preview.show_masks))
         self.preview.masks_view_changed.connect(
@@ -8993,9 +9006,19 @@ class MaskTrackerWindow(QMainWindow):
             btn.blockSignals(False)
 
     def _clear_pending_objects(self):
-        """Clear: drop the pending objects (Esc with a tool on)."""
-        self.preview._clear_drawing()
-        self.preview.update()
+        """Clear: drop the pending objects (Esc with a tool on); an edited
+        saved mask goes back as it was."""
+        self.preview.cancel_pending()
+
+    def _restore_edited(self, origins: list):
+        """Esc on an Edit Mask: the saved masks go back unchanged."""
+        for ann in origins:
+            self._coco.restore_annotation(copy.deepcopy(ann))
+        path = self._current_frame_path()
+        if path:
+            self._load_frame_annotations(path)
+        self._recalc_current_frame_confidence()
+        self.status_bar.showMessage("Edit cancelled: the mask is back as it was.", 4000)
 
     def _undo_tool_step(self):
         """Undo: the last SAM click or Paint / Eraser stroke (U)."""
@@ -9022,10 +9045,11 @@ class MaskTrackerWindow(QMainWindow):
         from .mask_tracker_annotator import segmentation_to_mask
         h, w = self.preview._img_h, self.preview._img_w
         mask = segmentation_to_mask(stored["segmentation"], h, w)
+        origin = copy.deepcopy(stored)
         self._on_delete_annotation_by_index(obj_idx)
         if self.preview.drawing_mode not in self.preview.OBJECT_TOOLS:
             self._set_object_tool("paint")
-        self.preview.add_pending_mask(mask)
+        self.preview.add_pending_mask(mask, origin=origin)
         self._show_sam_pending_status()
 
     # ==================================================================

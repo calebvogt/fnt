@@ -435,5 +435,30 @@ def test_a_mask_in_pieces_shows_its_largest_piece():
     w.close()
 
 
+def test_esc_cancels_an_edit_mask_and_the_mask_comes_back():
+    """Esc after Edit Mask threw the mask away; it now cancels the edit."""
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    w = window()
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    w._set_object_tool("paint")
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_Return)                        # a saved mask
+    before = w._coco.get_annotations_for_image(w._coco._image_id_map[FRAMES[0]])[0]
+    w._edit_as_pending(0)                         # Edit Mask
+    assert not pv.annotations and len(pv._ai_objects) == 1
+    x, y = pv._img_to_widget(50, 40)              # paint something extra
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+        QApplication.sendEvent(pv, QMouseEvent(kind, QPointF(x, y), Qt.LeftButton, buttons, Qt.NoModifier))
+    key(pv, Qt.Key_Escape)                        # cancel
+    assert not pv._ai_objects and len(pv.annotations) == 1
+    after = w._coco.get_annotations_for_image(w._coco._image_id_map[FRAMES[0]])
+    assert len(after) == 1 and after[0]["segmentation"] == before["segmentation"]
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
