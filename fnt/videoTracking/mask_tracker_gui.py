@@ -3545,7 +3545,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_sam_model.clicked.connect(self._choose_sam2_model)
         info_layout.addWidget(self.btn_sam_model)
 
-        self.btn_empty_frame = QPushButton("Empty Frame")
+        self.btn_empty_frame = QPushButton("Mark as Empty Frame")
         self.btn_empty_frame.setCheckable(True)
         self.btn_empty_frame.setToolTip(
             "Mark this frame as holding no object (N).\n\n"
@@ -3555,11 +3555,16 @@ class MaskTrackerWindow(QMainWindow):
             "masks; a frame with an accepted mask cannot be marked. Click\n"
             "again (or N) to unmark."
         )
-        self._empty_off_style = self._sam_toggle_off_style
+        # Yellow to mark; red once the frame is marked empty.
+        self._empty_off_style = (
+            "QPushButton { background-color: #fbc02d; color: #1a1a1a; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #fdd835; }"
+        )
         self._empty_on_style = (
-            "QPushButton { background-color: #6a1b9a; color: white; font-weight: bold; "
-            "padding: 3px 6px; border-radius: 3px; border: 2px solid #ba68c8; }"
-            "QPushButton:hover { background-color: #7b1fa2; }"
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; border: 2px solid #ef5350; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
         )
         self.btn_empty_frame.setStyleSheet(self._empty_off_style)
         self.btn_empty_frame.clicked.connect(lambda _=False: self._toggle_empty_frame())
@@ -6858,6 +6863,7 @@ class MaskTrackerWindow(QMainWindow):
         btn.setChecked(empty)
         btn.blockSignals(False)
         btn.setStyleSheet(self._empty_on_style if empty else self._empty_off_style)
+        btn.setText("Marked Empty ✓" if empty else "Mark as Empty Frame")
 
     def _extract_frame_from_video(self):
         if self._video_cap is None or self.current_video_idx < 0:
