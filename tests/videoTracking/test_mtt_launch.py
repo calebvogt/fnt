@@ -146,6 +146,22 @@ def test_launched_open_never_asks_and_focus_limits_the_queue(monkeypatch):
     w.close()
 
 
+def test_augment_turns_the_transforms_on():
+    """--augment used to tick only the master checkbox; every transform under it
+    stayed off, so the run trained with no augmentation."""
+    w = window()
+    args = G._launch_parser().parse_args(["--project", "p", "--augment"])
+    G.apply_training_args(w, args)
+    assert w.chk_augment.isChecked()
+    assert w.combo_aug_rotation.currentText() == "±180°"
+    assert w.chk_aug_scale.isChecked() and w.chk_aug_brightness.isChecked()
+    assert w.chk_aug_contrast.isChecked()
+    args = G._launch_parser().parse_args(["--project", "p", "--augment", "--aug-rotation", "15"])
+    G.apply_training_args(w, args)
+    assert w.combo_aug_rotation.currentText() == "±15°"
+    w.close()
+
+
 def test_training_flags_fill_the_panel_and_leave_the_rest(monkeypatch):
     w = window()
     lr_before = w.spin_lr.value()

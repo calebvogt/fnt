@@ -13152,6 +13152,17 @@ def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
         if value is not None:
             widget.setChecked(bool(value))
             applied.append(f"{flag}={bool(value)}")
+    if getattr(args, "augment", None):
+        # The checkbox alone augments nothing: each transform has its own
+        # control, all off by default, so "--augment" trained with none. It
+        # turns them on: flips + rotation (+-180 deg unless --aug-rotation
+        # says otherwise: top-down views), scale 0.8-1.2, brightness and
+        # contrast +-10%.
+        rot = getattr(args, "aug_rotation", None) or "180"
+        win.combo_aug_rotation.setCurrentIndex({"none": 0, "15": 1, "180": 2}[rot])
+        for chk in (win.chk_aug_scale, win.chk_aug_brightness, win.chk_aug_contrast):
+            chk.setChecked(True)
+        applied.append(f"aug_rotation={rot}")
     if getattr(args, "imgsz", None):
         win._imgsz_override = int(args.imgsz)
         applied.append(f"imgsz={args.imgsz}")
@@ -13190,7 +13201,12 @@ def _launch_parser():
     g.add_argument("--imgsz", type=int,
                    help="YOLO input size in pixels (default 640).")
     g.add_argument("--device", choices=sorted(DEVICE_CHOICES))
-    g.add_argument("--augment", dest="augment", action="store_true", default=None)
+    g.add_argument("--augment", dest="augment", action="store_true", default=None,
+                   help="Augment while training: flips, rotation, scale 0.8-1.2, "
+                        "brightness and contrast +-10%%.")
+    g.add_argument("--aug-rotation", dest="aug_rotation", choices=["none", "15", "180"],
+                   help="Rotation with --augment: 180 (default; top-down views), "
+                        "15 (side views) or none.")
     g.add_argument("--no-augment", dest="augment", action="store_false")
     g.add_argument("--post-infer", dest="post_infer", action="store_true",
                    default=None,
