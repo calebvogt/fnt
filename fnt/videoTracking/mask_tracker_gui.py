@@ -331,6 +331,7 @@ class AnnotationPreviewWidget(QWidget):
     edit_cancelled = pyqtSignal()
     category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
     empty_frame_requested = pyqtSignal()       # N: mark / unmark the frame empty
+    sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -554,6 +555,12 @@ class AnnotationPreviewWidget(QWidget):
                         self.update()
                         self._request_ai_prediction()
                     return
+                if (self.drawing_mode == "ai"
+                        and self._find_annotation_at(event.x(), event.y()) is None):
+                    # SAM mode, no prompt open and not on a mask: nothing to
+                    # do, as in MAD. (The menu's "Add Manual Mask" here read
+                    # as if SAM mode had switched itself off.)
+                    return
                 self._show_context_menu(event.globalPos(), event.x(), event.y())
             elif hasattr(self, "_cls_mask_handler") and self._cls_mask_handler:
                 coords = self._widget_to_img(event.x(), event.y())
@@ -613,29 +620,29 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
 
             elif self.drawing_mode == "ai":
-                # In AI mode, single-click pans (like navigate mode).
-                # Double-click places points — see mouseDoubleClickEvent.
+                # In SAM mode a click places a point (on release, so a drag
+                # still pans), as in MAD; see mouseReleaseEvent.
                 self._panning = True
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
+                self._ai_click_start = (event.x(), event.y())
                 self.setCursor(Qt.ClosedHandCursor)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Double-click places AI mask points when in SAM labeling mode."""
-        if self._pixmap is None:
-            return
-        if event.button() != Qt.LeftButton:
-            return
-        if not self.annotation_keys_enabled:
-            return
-        if self.drawing_mode != "ai":
-            return
+        """SAM points come from single clicks (press + release); the second
+        click of a double-click must not add a duplicate point."""
+        return
+
+    #: A SAM-mode press that moves less than this (px) before release is a
+    #: click (place a point); more is a pan.
+    _CLICK_SLOP = 5
+
+    def _add_ai_point(self, wx: float, wy: float):
+        """A positive SAM point at widget position (wx, wy): starts a new
+        object, or refines the one in progress."""
         if self._editing_obj_idx is not None:
-            # An accidental double-click while reshaping a mask used to start a
-            # second, unrelated SAM mask on top of the one being edited.
             self.edit_mode_blocked.emit()
             return
-
-        coords = self._widget_to_img(event.x(), event.y())
+        coords = self._widget_to_img(wx, wy)
         if coords is None:
             return
         ix, iy = coords
@@ -737,9 +744,20 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        click = getattr(self, "_ai_click_start", None)
+        self._ai_click_start = None
         if self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+            if (click is not None and event.button() == Qt.LeftButton
+                    and self.drawing_mode == "ai"
+                    and abs(event.x() - click[0]) <= self._CLICK_SLOP
+                    and abs(event.y() - click[1]) <= self._CLICK_SLOP):
+                # A click, not a drag: undo the few pixels of pan and place
+                # the point where the button went down.
+                if self._pan_start is not None:
+                    self._pan_x, self._pan_y = self._pan_start[2], self._pan_start[3]
+                self._add_ai_point(click[0], click[1])
             return
         if self._dragging_point:
             self._dragging_point = False
@@ -790,6 +808,8 @@ class AnnotationPreviewWidget(QWidget):
         elif event.key() == Qt.Key_N and not self._drawing_active \
                 and self._editing_obj_idx is None:
             self.empty_frame_requested.emit()
+        elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
+            self.sam_toggle_requested.emit()
         elif Qt.Key_1 <= event.key() <= Qt.Key_9:
             self.category_hotkey.emit(event.key() - Qt.Key_1)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
@@ -3418,6 +3438,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.advance_frame_requested.connect(self._on_advance_frame)
         self.preview.timeline_advance_requested.connect(self._on_timeline_advance)
         self.preview.empty_frame_requested.connect(self._toggle_empty_frame)
+        self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3513,16 +3534,15 @@ class MaskTrackerWindow(QMainWindow):
         self.combo_active_class.setMinimumWidth(90)
         info_layout.addWidget(self.combo_active_class)
 
-        self.btn_sam_toggle = QPushButton("SAM Labeling")
+        self.btn_sam_toggle = QPushButton("SAM Labeling (M)")
         self.btn_sam_toggle.setCheckable(True)
         self.btn_sam_toggle.setChecked(False)
         self.btn_sam_toggle.setToolTip(
-            "Toggle SAM2 AI-assisted labeling mode.\n\n"
-            "When active, double-click on an object to place a\n"
-            "positive point. SAM2 will predict a segmentation mask.\n"
-            "Right-click to add negative (exclude) points.\n"
-            "Enter to accept the mask, or toggle off to cancel.\n\n"
-            "Single-click drag still pans the view while in SAM mode."
+            "SAM2-assisted labeling, as in MAD (shortcut M).\n\n"
+            "Click an object to propose its mask; more clicks on the same\n"
+            "object refine it, right-click excludes an area. Enter accepts,\n"
+            "Esc clears. SAM stays on from frame to frame until you turn\n"
+            "it off. Drag pans; right-click a finished mask to edit it."
         )
         self._sam_toggle_off_style = (
             "QPushButton { background-color: #424242; color: #cccccc; font-weight: bold; "
@@ -3869,8 +3889,8 @@ class MaskTrackerWindow(QMainWindow):
         info = QLabel(
             "Right-click preview to add Manual Mask or Edit/Delete masks.\n"
             "Manual: click to place vertices, Enter to accept.\n"
-            "SAM: toggle SAM Labeling button, double-click to place points,\n"
-            "  right-click to exclude, Enter to accept.\n"
+            "SAM (M): click an object to propose its mask (more clicks refine),\n"
+            "  right-click to exclude, Enter to accept; stays on between frames.\n"
             "Editing: drag vertices, right-click to insert one.\n"
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
@@ -7640,12 +7660,12 @@ class MaskTrackerWindow(QMainWindow):
                 self._sam_instructions_shown = True
                 QMessageBox.information(
                     self, "SAM Labeling Instructions",
-                    "Double-click on an object to add a mask point.\n"
-                    "Right-click to mark areas to exclude from the mask.\n"
-                    "Press Enter to accept the predicted mask.\n"
-                    "Press Escape or toggle the button off to cancel.\n\n"
-                    "You can add multiple positive/negative points\n"
-                    "before accepting to refine the prediction."
+                    "Click an object to propose its mask; more clicks on the\n"
+                    "same object refine it. Right-click excludes an area.\n"
+                    "Enter accepts the mask; Esc clears it.\n\n"
+                    "SAM stays on from frame to frame until you turn it off\n"
+                    "(the button, or M). Drag to pan; right-click a finished\n"
+                    "mask to edit, delete or reclassify it."
                 )
             self.preview.drawing_mode = "ai"
             self.preview.mode_changed.emit("AI-Assisted Mask")
