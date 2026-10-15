@@ -250,5 +250,36 @@ def test_labeling_keys_work_after_clicking_a_button_or_the_list(monkeypatch):
     w.close()
 
 
+def test_eraser_on_a_saved_mask_edits_it_and_enter_esc_turn_the_tools_off():
+    """Clicking a saved mask with the Eraser did nothing (it had to be brought
+    back through a menu first); Enter left Paint on; Esc left the Eraser button
+    lit after the tool went off."""
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    w = window()
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    w._set_object_tool("paint")
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_Return)                        # save it
+    assert len(pv.annotations) == 1 and not pv._ai_objects
+    assert pv.drawing_mode == "navigate" and not w.btn_paint.isChecked()
+
+    w._set_object_tool("erase")
+    assert w.btn_erase.isChecked()
+    x, y = pv._img_to_widget(25, 20)              # on the saved mask
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+        QApplication.sendEvent(pv, QMouseEvent(kind, QPointF(x, y), Qt.LeftButton, buttons, Qt.NoModifier))
+    assert not pv.annotations and len(pv._ai_objects) == 1      # back as a pending object
+    assert int(pv._ai_objects[0]["mask"].sum()) < 600           # and erased
+    key(pv, Qt.Key_Escape)                        # drops the pending object, tool stays
+    assert pv.drawing_mode == "erase" and w.btn_erase.isChecked()
+    key(pv, Qt.Key_Escape)                        # tool off, button too
+    assert pv.drawing_mode == "navigate" and not w.btn_erase.isChecked()
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

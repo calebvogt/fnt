@@ -142,7 +142,7 @@ def test_touching_mice_stay_separate_masks():
     assert len(w.pending_components()) == 2
     key(w, Qt.Key_Return)
     assert saved == [900, 900]                              # two masks, not one of 1800
-    assert not w._ai_objects and w.drawing_mode == "ai"     # SAM stays on
+    assert not w._ai_objects and w.drawing_mode == "navigate"   # Enter turns the tool off
 
 
 def test_right_click_excludes_from_the_object_and_shift_right_click_drops_it():

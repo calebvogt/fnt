@@ -935,6 +935,7 @@ class AnnotationPreviewWidget(QWidget):
                     coords = self._widget_to_img(event.x(), event.y())
                     if self.drawing_mode == "paint" and coords:
                         # Right-drag erases without leaving the brush, as in MAD.
+                        self._edit_saved_mask_at(event.x(), event.y(), *coords)
                         self._begin_stroke(coords[0], coords[1], erase=True)
                         return
                     if coords and self.object_at(*coords) is not None:
@@ -1010,6 +1011,7 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
 
             elif self.drawing_mode in ("paint", "erase"):
+                self._edit_saved_mask_at(event.x(), event.y(), ix, iy)
                 self._begin_stroke(ix, iy, erase=self.drawing_mode == "erase")
             elif self.drawing_mode == "ai":
                 # In SAM mode a click places a point (on release, so a drag
@@ -1018,6 +1020,16 @@ class AnnotationPreviewWidget(QWidget):
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
                 self._ai_click_start = (event.x(), event.y())
                 self.setCursor(Qt.ClosedHandCursor)
+
+    def _edit_saved_mask_at(self, wx: float, wy: float, ix: float, iy: float):
+        """A Paint / Eraser stroke that starts on a saved mask (and no pending
+        object) brings that mask back as a pending object first, so the stroke
+        edits it; clicking a saved mask with the Eraser used to do nothing."""
+        if self.object_at(ix, iy) is not None:
+            return
+        idx = self._find_annotation_at(wx, wy)
+        if idx is not None:
+            self.edit_as_pending_requested.emit(idx)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """SAM points come from single clicks (press + release); the second
@@ -1051,8 +1063,7 @@ class AnnotationPreviewWidget(QWidget):
         menu.addSeparator()
         hit_idx = self._find_annotation_at(wx, wy)
         act_approve = menu.addAction("✔ Approve Mask")
-        act_edit = menu.addAction("Edit Mask (vertices)")
-        act_edit_pending = menu.addAction("Edit with SAM / Paint / Eraser")
+        act_edit = menu.addAction("Edit Mask")
         act_delete = menu.addAction("Delete Mask")
         class_menu = None
         class_actions = {}
@@ -1068,7 +1079,6 @@ class AnnotationPreviewWidget(QWidget):
         if hit_idx is None:
             act_approve.setEnabled(False)
             act_edit.setEnabled(False)
-            act_edit_pending.setEnabled(False)
             act_delete.setEnabled(False)
         elif hit_idx is not None:
             ann = self.annotations[hit_idx]
@@ -1098,14 +1108,8 @@ class AnnotationPreviewWidget(QWidget):
                 if self.annotations[i].inferred:
                     self.approve_annotation_requested.emit(i)
         elif action == act_edit and hit_idx is not None:
-            if self.annotations[hit_idx].inferred:
-                self.approve_annotation_requested.emit(hit_idx)
-            # Drop any half-drawn mask so the edit starts from a clean slate.
-            self._clear_drawing()
-            self._editing_obj_idx = hit_idx
-            self.mode_changed.emit("Editing Mask")
-            self.update()
-        elif action == act_edit_pending and hit_idx is not None:
+            # Back as a pending object (dashed) to reshape with SAM, Paint or
+            # Eraser; Enter saves it again.
             self.edit_as_pending_requested.emit(hit_idx)
         elif action == act_delete and hit_idx is not None:
             self.delete_annotation_requested.emit(hit_idx)
@@ -1266,7 +1270,8 @@ class AnnotationPreviewWidget(QWidget):
                 self._drawing_accepted = True
                 self.annotation_accepted.emit()       # the window saves it
             self._clear_drawing()
-            self.mode_changed.emit(self.mode_name())
+            self.drawing_mode = "navigate"            # Enter turns the tool off
+            self.mode_changed.emit("Navigate")
 
     def mode_name(self) -> str:
         return {"ai": "AI-Assisted Mask", "paint": "Paint", "erase": "Eraser"}.get(
@@ -1450,8 +1455,8 @@ class AnnotationPreviewWidget(QWidget):
         for i, obj in enumerate(self._ai_objects):
             r, g, b = self._OBJECT_COLORS[i % len(self._OBJECT_COLORS)]
             if len(obj["outline"]) >= 3:
-                painter.setPen(QPen(QColor(r, g, b), 2))
-                painter.setBrush(QBrush(QColor(r, g, b, 55)))
+                painter.setPen(QPen(QColor(r, g, b), 2, Qt.DashLine))
+                painter.setBrush(QBrush(QColor(r, g, b, 22)))
                 poly = QPolygonF()
                 for px, py in obj["outline"]:
                     wx, wy = self._img_to_widget(px, py)
@@ -4047,8 +4052,8 @@ class MaskTrackerWindow(QMainWindow):
             "inside a mouse excludes that spot (e.g. the other of two mice);\n"
             "Shift+right-click drops the mouse. Enter saves each mouse as its\n"
             "own mask (mouse_1, mouse_2, ...).\n"
-            "U undoes, Esc clears. SAM stays on from frame to frame; drag\n"
-            "pans; right-click a finished mask to edit it."
+            "U undoes, Esc clears; Enter saves and turns SAM off. Drag pans;\n"
+            "right-click a saved mask to edit it."
         )
         self._sam_toggle_off_style = (
             "QPushButton { background-color: #424242; color: #cccccc; font-weight: bold; "
@@ -4451,8 +4456,8 @@ class MaskTrackerWindow(QMainWindow):
             "  it (Shift+click = new one), right-click excludes; Enter saves each as\n"
             "  its own mask. Paint (P) / Eraser (X): drag, wheel = brush size.\n"
             "  U undoes a click or stroke; Shift+right-click drops an object.\n"
-            "Editing: drag vertices, right-click to insert one.\n"
-            "  Enter commits, Esc cancels; new masks are locked out until then.\n"
+            "Edit Mask (right-click a saved mask), or Paint / Eraser on it, brings\n"
+            "  it back (dashed) to reshape; Enter saves and turns the tool off.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
             "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
@@ -8259,24 +8264,13 @@ class MaskTrackerWindow(QMainWindow):
             self.btn_sam_toggle.setChecked(False)
             self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
             self.btn_sam_toggle.blockSignals(False)
+        self._sync_tool_buttons()       # Paint / Eraser too (Esc, Enter)
 
     def _on_sam_toggle(self, checked: bool):
         """Toggle SAM2 AI labeling mode on/off via the button."""
         if checked:
-            if not getattr(self, '_sam_instructions_shown', False):
-                self._sam_instructions_shown = True
-                QMessageBox.information(
-                    self, "SAM Labeling Instructions",
-                    "Click each mouse: a click starts a pending object, or\n"
-                    "refines the one it lands in (Shift+click = new object).\n"
-                    "Right-click inside an object excludes that spot;\n"
-                    "Shift+right-click drops the object. Enter saves each\n"
-                    "object as its own mask. U undoes; Esc clears.\n"
-                    "Paint (P) and Eraser (X) fix details; wheel = brush size.\n\n"
-                    "SAM stays on from frame to frame until you turn it off\n"
-                    "(the button, or M). Drag to pan; right-click a finished\n"
-                    "mask to edit, delete or reclassify it."
-                )
+            # Straight to the model picker on first use (no instructions box;
+            # the button's tooltip and the help text hold them).
             self.preview.drawing_mode = "ai"
             self._sync_tool_buttons()
             self.preview.mode_changed.emit("AI-Assisted Mask")
@@ -8537,6 +8531,8 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.update()
 
     def _sync_tool_buttons(self):
+        if not hasattr(self, "btn_erase"):
+            return                      # mode changes while the window is built
         mode = self.preview.drawing_mode
         for btn, name in ((self.btn_paint, "paint"), (self.btn_erase, "erase")):
             btn.blockSignals(True)
