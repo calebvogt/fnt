@@ -335,6 +335,7 @@ class AnnotationPreviewWidget(QWidget):
     sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
     e_key_requested = pyqtSignal()             # E: empty frame (queue) / extract (video)
     sam_pending_changed = pyqtSignal()         # SAM pending objects changed (U, right-click)
+    skip_requested = pyqtSignal()              # S: leave this frame, go to the next to label
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -910,6 +911,8 @@ class AnnotationPreviewWidget(QWidget):
                 and self._editing_obj_idx is None:
             # N / B: next / back in the Training Frames Queue, row by row.
             self.queue_step_requested.emit(1 if event.key() == Qt.Key_N else -1)
+        elif event.key() == Qt.Key_S and self._editing_obj_idx is None:
+            self.skip_requested.emit()
         elif event.key() == Qt.Key_U and self.drawing_mode == "ai":
             if self.undo_ai_click():
                 self.sam_pending_changed.emit()
@@ -3327,7 +3330,8 @@ class MaskTrackerWindow(QMainWindow):
 
     #: Keys that act on the frame being labeled, whichever widget has focus.
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
-                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_A, Qt.Key_Escape)
+                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_S, Qt.Key_A,
+                      Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -3618,6 +3622,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
         self.preview.e_key_requested.connect(self._on_e_key)
         self.preview.queue_step_requested.connect(self._step_queue)
+        self.preview.skip_requested.connect(self._skip_frame)
         self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
@@ -3747,6 +3752,20 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_sam_model.clicked.connect(self._choose_sam2_model)
         info_layout.addWidget(self.btn_sam_model)
 
+        self.btn_skip_frame = QPushButton("Skip (S)")
+        self.btn_skip_frame.setToolTip(
+            "Leave this frame as it is and go to the next frame still to\n"
+            "label (no decision recorded; unsaved SAM objects are dropped).\n"
+            "Past the last one it starts again at the first. Shortcut: S"
+        )
+        self.btn_skip_frame.setStyleSheet(
+            "QPushButton { background-color: #5a5a5a; color: white; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #6a6a6a; }"
+        )
+        self.btn_skip_frame.clicked.connect(lambda _=False: self._skip_frame())
+        info_layout.addWidget(self.btn_skip_frame)
+
         self.btn_empty_frame = QPushButton("Mark as Empty Frame")
         self.btn_empty_frame.setCheckable(True)
         self.btn_empty_frame.setToolTip(
@@ -3795,7 +3814,7 @@ class MaskTrackerWindow(QMainWindow):
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
             self.lbl_active_class, self.combo_active_class,
-            self.btn_sam_toggle, self.btn_sam_model, self.btn_empty_frame,
+            self.btn_sam_toggle, self.btn_sam_model, self.btn_skip_frame, self.btn_empty_frame,
             self.btn_edit_classes, self.lbl_zoom_info,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
@@ -4078,6 +4097,7 @@ class MaskTrackerWindow(QMainWindow):
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
             "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
+            "S = skip: leave this frame and go to the next one still to label.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
@@ -7018,6 +7038,17 @@ class MaskTrackerWindow(QMainWindow):
         row = self.frame_list.topLevelItem(nxt).data(0, Qt.UserRole)
         if row is not None:
             self._select_frame_row(row)
+
+    def _skip_frame(self):
+        """S / Skip: leave this frame undecided and go to the next frame still
+        to label, as Skip does in MAD. Unsaved SAM objects are dropped."""
+        self.preview._clear_drawing()
+        before = self.current_frame_idx
+        self._next_frame()
+        if self.current_frame_idx == before:
+            self.status_bar.showMessage("Nothing else left to label in the queue", 4000)
+        else:
+            self.status_bar.showMessage("Skipped: nothing changed on that frame", 2500)
 
     def _toggle_empty_frame(self):
         """Mark (or unmark) the current queue frame as empty: reviewed, holding
