@@ -44,6 +44,9 @@ class YOLOTrainingConfig:
     aug_hsv_v: float = 0.0
     aug_hsv_s: float = 0.0
     aug_mosaic: float = 0.0
+    # Copy-paste: animals cut from one training image pasted into another (by
+    # their masks). Strong for instance segmentation with few labeled frames.
+    aug_copy_paste: float = 0.0
 
     def resolve_run_dir(self) -> str:
         name = self.run_name or datetime.now().strftime("yolo_%Y%m%d_%H%M%S")
@@ -489,6 +492,7 @@ def train_yolo_seg(
         hsv_v=cfg.aug_hsv_v,
         hsv_s=cfg.aug_hsv_s,
         mosaic=cfg.aug_mosaic,
+        copy_paste=cfg.aug_copy_paste,
     )
     elapsed = _time.time() - t0
     print()  # newline after the \r-updating status line

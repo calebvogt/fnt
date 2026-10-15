@@ -3870,6 +3870,7 @@ class MaskTrackerWindow(QMainWindow):
         # YOLO input size for the next run; None = the 640 default.
         self._imgsz_override: Optional[int] = None
         self._mosaic_override: Optional[float] = None
+        self._copy_paste_override: Optional[float] = None
 
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
@@ -9671,6 +9672,7 @@ class MaskTrackerWindow(QMainWindow):
                 "model_variant": model_variant,
                 "imgsz": self._imgsz_override or 640,
                 "aug_mosaic": self._mosaic_override or 0.0,
+                "aug_copy_paste": self._copy_paste_override or 0.0,
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
@@ -13582,6 +13584,12 @@ def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
     if getattr(args, "mosaic", None) is not None:
         win._mosaic_override = float(args.mosaic)
         applied.append(f"mosaic={args.mosaic}")
+    if getattr(args, "copy_paste", None) is not None:
+        win._copy_paste_override = float(args.copy_paste)
+        applied.append(f"copy_paste={args.copy_paste}")
+    if getattr(args, "optimizer", None):
+        win.combo_optimizer.setCurrentText(args.optimizer)
+        applied.append(f"optimizer={args.optimizer}")
     if getattr(args, "imgsz", None):
         win._imgsz_override = int(args.imgsz)
         applied.append(f"imgsz={args.imgsz}")
@@ -13629,6 +13637,12 @@ def _launch_parser():
                    help="Train the whole network (the panel freezes the backbone by default).")
     g.add_argument("--mosaic", type=float,
                    help="YOLO mosaic augmentation probability (0-1; default 0).")
+    g.add_argument("--copy-paste", dest="copy_paste", type=float,
+                   help="YOLO copy-paste augmentation probability (0-1; default 0): "
+                        "animals pasted between training images by their masks.")
+    g.add_argument("--optimizer", choices=["AdamW", "SGD"],
+                   help="Optimizer (AdamW wants a learning rate near 0.001-0.002; "
+                        "SGD near 0.01).")
     g.add_argument("--aug-rotation", dest="aug_rotation", choices=["none", "15", "180"],
                    help="Rotation with --augment: 180 (default; top-down views), "
                         "15 (side views) or none.")
