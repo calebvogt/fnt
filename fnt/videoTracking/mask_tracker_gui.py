@@ -334,6 +334,7 @@ class AnnotationPreviewWidget(QWidget):
     queue_step_requested = pyqtSignal(int)     # N / B: next / back in the queue
     sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
     e_key_requested = pyqtSignal()             # E: empty frame (queue) / extract (video)
+    sam_pending_changed = pyqtSignal()         # SAM pending objects changed (U, right-click)
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -366,6 +367,15 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask: Optional[np.ndarray] = None
         self._ai_mask_contour_pts: List[Tuple[float, float]] = []
         self._ai_score: float = 0.0
+        # SAM as in MAD: every click is its own one-point prompt, queued here
+        # until the window has predicted it; each prediction's object (the
+        # connected component under the click) is OR-ed into the pending mask.
+        # Enter splits the pending mask into connected components, one
+        # annotation each, so separate mice become mouse_1, mouse_2, ...
+        self._ai_clicks: List[Tuple[int, int]] = []
+        self._ai_pending: Optional[np.ndarray] = None
+        self._ai_pending_stack: List[np.ndarray] = []     # flat indices added per click
+        self._ai_pending_contours: List[List[Tuple[float, float]]] = []
 
         self.annotation_keys_enabled = True
 
@@ -410,8 +420,103 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask = None
         self._ai_mask_contour_pts.clear()
         self._ai_score = 0.0
+        self._ai_clicks.clear()
+        self._ai_pending = None
+        self._ai_pending_stack.clear()
+        self._ai_pending_contours.clear()
         self._editing_obj_idx = None
         self._pending_annotation = None
+        self.update()
+
+    # -- SAM pending mask (MAD-style) ------------------------------------
+    #: Pending components smaller than this (px) are dropped on Enter.
+    MIN_OBJECT_PX = 30
+
+    def has_ai_pending(self) -> bool:
+        return self._ai_pending is not None and bool(self._ai_pending.any())
+
+    def add_sam_component(self, mask: np.ndarray, click: Tuple[int, int]) -> bool:
+        """Take the connected component of a SAM proposal under ``click``
+        (else the largest) and OR it into the pending mask. Returns True if
+        pixels were added."""
+        m = np.asarray(mask) > 0
+        if not m.any() or self._img_w <= 0:
+            return False
+        if m.shape != (self._img_h, self._img_w):
+            return False
+        n, lbl = cv2.connectedComponents(m.astype(np.uint8), connectivity=8)
+        cx, cy = int(click[0]), int(click[1])
+        chosen = int(lbl[cy, cx]) if 0 <= cy < lbl.shape[0] and 0 <= cx < lbl.shape[1] else 0
+        if chosen == 0:
+            sizes = np.bincount(lbl.ravel())[1:]
+            if sizes.size == 0:
+                return False
+            chosen = int(np.argmax(sizes)) + 1
+        comp = lbl == chosen
+        if self._ai_pending is None:
+            self._ai_pending = np.zeros((self._img_h, self._img_w), bool)
+        newly = np.flatnonzero(comp & ~self._ai_pending)
+        if newly.size == 0:
+            return False
+        self._ai_pending.flat[newly] = True
+        self._ai_pending_stack.append(newly)
+        self._drawing_active = True
+        self._refresh_pending_contours()
+        return True
+
+    def undo_ai_click(self) -> bool:
+        """Remove what the most recent SAM click added (U)."""
+        if not self._ai_pending_stack or self._ai_pending is None:
+            return False
+        self._ai_pending.flat[self._ai_pending_stack.pop()] = False
+        self._refresh_pending_contours()
+        if not self.has_ai_pending() and not self._ai_clicks:
+            self._drawing_active = False
+        return True
+
+    def remove_pending_component_at(self, ix: float, iy: float) -> bool:
+        """Drop the pending object under image point (ix, iy) (right-click)."""
+        if not self.has_ai_pending():
+            return False
+        x, y = int(ix), int(iy)
+        if not (0 <= y < self._ai_pending.shape[0] and 0 <= x < self._ai_pending.shape[1]):
+            return False
+        if not self._ai_pending[y, x]:
+            return False
+        _, lbl = cv2.connectedComponents(self._ai_pending.astype(np.uint8), connectivity=8)
+        self._ai_pending[lbl == lbl[y, x]] = False
+        self._refresh_pending_contours()
+        if not self.has_ai_pending() and not self._ai_clicks:
+            self._drawing_active = False
+        return True
+
+    def pending_components(self) -> List[np.ndarray]:
+        """The pending mask's connected components (8-connected), smallest
+        dropped, largest first: one annotation each on Enter."""
+        if not self.has_ai_pending():
+            return []
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(
+            self._ai_pending.astype(np.uint8), connectivity=8)
+        order = sorted(range(1, n), key=lambda i: -stats[i, cv2.CC_STAT_AREA])
+        return [lbl == i for i in order if stats[i, cv2.CC_STAT_AREA] >= self.MIN_OBJECT_PX]
+
+    @staticmethod
+    def _mask_outline(mask: np.ndarray) -> List[Tuple[float, float]]:
+        from .mask_tracker_annotator import MASK_SIMPLIFY_EPS
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        approx = cv2.approxPolyDP(max(contours, key=cv2.contourArea), MASK_SIMPLIFY_EPS, True)
+        return [(float(p[0][0]), float(p[0][1])) for p in approx]
+
+    def _refresh_pending_contours(self):
+        self._ai_pending_contours = []
+        if self.has_ai_pending():
+            contours, _ = cv2.findContours(self._ai_pending.astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            self._ai_pending_contours = [
+                [(float(p[0][0]), float(p[0][1])) for p in c] for c in contours]
         self.update()
 
     def _reset_view(self):
@@ -552,19 +657,16 @@ class AnnotationPreviewWidget(QWidget):
                 if self._editing_obj_idx is not None:
                     self._insert_contour_point(event.x(), event.y())
                     return
-                if self.drawing_mode == "ai" and self._drawing_active:
+                if self.drawing_mode == "ai":
+                    # On a pending object: drop it. On a finished mask: its
+                    # menu. Anywhere else nothing, as in MAD (the menu's "Add
+                    # Manual Mask" here read as if SAM mode had switched off).
                     coords = self._widget_to_img(event.x(), event.y())
-                    if coords:
-                        self._ai_negative_points.append((int(coords[0]), int(coords[1])))
-                        self.update()
-                        self._request_ai_prediction()
-                    return
-                if (self.drawing_mode == "ai"
-                        and self._find_annotation_at(event.x(), event.y()) is None):
-                    # SAM mode, no prompt open and not on a mask: nothing to
-                    # do, as in MAD. (The menu's "Add Manual Mask" here read
-                    # as if SAM mode had switched itself off.)
-                    return
+                    if coords and self.remove_pending_component_at(*coords):
+                        self.sam_pending_changed.emit()
+                        return
+                    if self._find_annotation_at(event.x(), event.y()) is None:
+                        return
                 self._show_context_menu(event.globalPos(), event.x(), event.y())
             elif hasattr(self, "_cls_mask_handler") and self._cls_mask_handler:
                 coords = self._widget_to_img(event.x(), event.y())
@@ -641,23 +743,16 @@ class AnnotationPreviewWidget(QWidget):
     _CLICK_SLOP = 5
 
     def _add_ai_point(self, wx: float, wy: float):
-        """A positive SAM point at widget position (wx, wy): starts a new
-        object, or refines the one in progress."""
+        """A SAM click at widget position (wx, wy): queued as its own one-point
+        prompt; its object joins the pending mask when predicted."""
         if self._editing_obj_idx is not None:
             self.edit_mode_blocked.emit()
             return
         coords = self._widget_to_img(wx, wy)
         if coords is None:
             return
-        ix, iy = coords
-
-        if not self._drawing_active:
-            self._drawing_active = True
-            self._ai_positive_points.clear()
-            self._ai_negative_points.clear()
-            self._ai_mask = None
-            self._ai_mask_contour_pts.clear()
-        self._ai_positive_points.append((int(ix), int(iy)))
+        self._drawing_active = True
+        self._ai_clicks.append((int(coords[0]), int(coords[1])))
         self.update()
         self._request_ai_prediction()
 
@@ -815,6 +910,9 @@ class AnnotationPreviewWidget(QWidget):
                 and self._editing_obj_idx is None:
             # N / B: next / back in the Training Frames Queue, row by row.
             self.queue_step_requested.emit(1 if event.key() == Qt.Key_N else -1)
+        elif event.key() == Qt.Key_U and self.drawing_mode == "ai":
+            if self.undo_ai_click():
+                self.sam_pending_changed.emit()
         elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
             self.sam_toggle_requested.emit()
         elif event.key() == Qt.Key_E and not self._drawing_active \
@@ -846,12 +944,17 @@ class AnnotationPreviewWidget(QWidget):
             self.annotation_accepted.emit()
             self.drawing_mode = "navigate"
             self.mode_changed.emit("Navigate")
-        elif self.drawing_mode == "ai" and self._drawing_active and self._ai_mask_contour_pts:
-            self._pending_annotation = list(self._ai_mask_contour_pts)
-            self._pending_is_ai = True
-            self._drawing_accepted = True
-            self.update()
-            self.annotation_accepted.emit()
+        elif self.drawing_mode == "ai" and self._drawing_active and self.has_ai_pending():
+            # One annotation per connected pending object, as MAD does.
+            for comp in self.pending_components():
+                outline = self._mask_outline(comp)
+                if len(outline) < 3:
+                    continue
+                self._pending_annotation = outline
+                self._pending_is_ai = True
+                self._ai_mask = comp
+                self._drawing_accepted = True
+                self.annotation_accepted.emit()       # the window saves it
             self._clear_drawing()
             self.mode_changed.emit("AI-Assisted Mask")
 
@@ -1023,14 +1126,23 @@ class AnnotationPreviewWidget(QWidget):
             painter.drawEllipse(QPointF(wx, wy), pr, pr)
 
     def _paint_ai_drawing(self, painter: QPainter, pr: float):
-        if self._ai_mask_contour_pts and len(self._ai_mask_contour_pts) >= 3:
-            painter.setPen(QPen(QColor(255, 220, 50), 2))
-            painter.setBrush(Qt.NoBrush)
+        # Pending objects: yellow outline over a light fill.
+        painter.setPen(QPen(QColor(255, 220, 50), 2))
+        painter.setBrush(QBrush(QColor(255, 220, 50, 50)))
+        for contour in self._ai_pending_contours:
+            if len(contour) < 3:
+                continue
             poly = QPolygonF()
-            for px, py in self._ai_mask_contour_pts:
+            for px, py in contour:
                 wx, wy = self._img_to_widget(px, py)
                 poly.append(QPointF(wx, wy))
             painter.drawPolygon(poly)
+        # Clicks still waiting for SAM: small markers.
+        painter.setBrush(QBrush(QColor(255, 220, 50)))
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        for px, py in self._ai_clicks:
+            wx, wy = self._img_to_widget(px, py)
+            painter.drawEllipse(QPointF(wx, wy), 4, 4)
 
 
 # ======================================================================
@@ -3184,7 +3296,6 @@ class MaskTrackerWindow(QMainWindow):
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
         self._predict_worker: Optional[SAM2PredictWorker] = None
-        self._predict_again = False
         self._image_set = False
         self._ai_enabled = False
 
@@ -3216,7 +3327,7 @@ class MaskTrackerWindow(QMainWindow):
 
     #: Keys that act on the frame being labeled, whichever widget has focus.
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
-                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_A, Qt.Key_Escape)
+                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_A, Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -3507,6 +3618,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
         self.preview.e_key_requested.connect(self._on_e_key)
         self.preview.queue_step_requested.connect(self._step_queue)
+        self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3607,10 +3719,12 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_sam_toggle.setChecked(False)
         self.btn_sam_toggle.setToolTip(
             "SAM2-assisted labeling, as in MAD (shortcut M).\n\n"
-            "Click an object to propose its mask; more clicks on the same\n"
-            "object refine it, right-click excludes an area. Enter accepts,\n"
-            "Esc clears. SAM stays on from frame to frame until you turn\n"
-            "it off. Drag pans; right-click a finished mask to edit it."
+            "Click each object: every click proposes one object and adds it\n"
+            "to the pending set (clicks that touch merge into one object).\n"
+            "Enter saves each separate object as its own mask (mouse_1,\n"
+            "mouse_2, ...). U undoes the last click, right-click a pending\n"
+            "object drops it, Esc clears. SAM stays on from frame to frame;\n"
+            "drag pans; right-click a finished mask to edit it."
         )
         self._sam_toggle_off_style = (
             "QPushButton { background-color: #424242; color: #cccccc; font-weight: bold; "
@@ -3957,8 +4071,8 @@ class MaskTrackerWindow(QMainWindow):
         info = QLabel(
             "Right-click preview to add Manual Mask or Edit/Delete masks.\n"
             "Manual: click to place vertices, Enter to accept.\n"
-            "SAM (M): click an object to propose its mask (more clicks refine),\n"
-            "  right-click to exclude, Enter to accept; stays on between frames.\n"
+            "SAM (M): click each object; Enter saves each separate one as its own\n"
+            "  mask. U undoes a click, right-click drops a pending object.\n"
             "Editing: drag vertices, right-click to insert one.\n"
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
@@ -7729,9 +7843,11 @@ class MaskTrackerWindow(QMainWindow):
                 self._sam_instructions_shown = True
                 QMessageBox.information(
                     self, "SAM Labeling Instructions",
-                    "Click an object to propose its mask; more clicks on the\n"
-                    "same object refine it. Right-click excludes an area.\n"
-                    "Enter accepts the mask; Esc clears it.\n\n"
+                    "Click each object: every click proposes one object and\n"
+                    "adds it to the pending set (touching clicks merge).\n"
+                    "Enter saves each separate object as its own mask.\n"
+                    "U undoes the last click; right-click a pending object\n"
+                    "to drop it; Esc clears.\n\n"
                     "SAM stays on from frame to frame until you turn it off\n"
                     "(the button, or M). Drag to pan; right-click a finished\n"
                     "mask to edit, delete or reclassify it."
@@ -7891,7 +8007,7 @@ class MaskTrackerWindow(QMainWindow):
                 self._segmenter.set_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 self._image_set = True
         # Points clicked while the model was loading get their mask now.
-        if self.preview.drawing_mode == "ai" and self.preview._ai_positive_points:
+        if self.preview.drawing_mode == "ai" and self.preview._ai_clicks:
             self._request_ai_prediction()
 
     def _on_sam2_error(self, msg: str):
@@ -7916,49 +8032,69 @@ class MaskTrackerWindow(QMainWindow):
         points once the current thread has stopped.
         """
         if self._segmenter is None or self._segmenter.predictor is None:
-            if self.preview._ai_positive_points:
+            if self.preview._ai_clicks:
                 self.status_bar.showMessage(
                     "SAM2 is still loading; the mask follows when it is ready.", 4000)
             return
         if not self._image_set:
             return
-        pos = list(self.preview._ai_positive_points)
-        neg = list(self.preview._ai_negative_points) or None
-        if not pos:
+        if not self.preview._ai_clicks:
             return
         if self._predict_worker is not None and self._predict_worker.isRunning():
-            self._predict_again = True
-            return
-        self._predict_again = False
-        worker = SAM2PredictWorker(self._segmenter, pos, neg)
+            return        # the next queued click runs when this thread stops
+        click = self.preview._ai_clicks[0]
+        worker = SAM2PredictWorker(self._segmenter, [click], None)
+        worker.click = click
         worker.predicted.connect(self._on_prediction_done)
         worker.error.connect(self._on_prediction_error)
         worker.finished.connect(self._on_predict_thread_finished)
         self._predict_worker = worker
         worker.start()
 
+    def _take_click(self):
+        """Pop the click the finished prediction was for, if still queued
+        (Esc or a frame change may have cleared it). Returns it or None."""
+        w = self._predict_worker
+        click = getattr(w, "click", None)
+        clicks = self.preview._ai_clicks
+        if click is not None and clicks and clicks[0] == click:
+            clicks.pop(0)
+            return click
+        return None
+
     def _on_predict_thread_finished(self):
-        """The prediction thread has stopped: run again if points changed meanwhile."""
-        if getattr(self, "_predict_again", False):
-            self._predict_again = False
+        """The prediction thread has stopped: predict the next queued click."""
+        if self.preview._ai_clicks:
             self._request_ai_prediction()
 
     def _wait_for_prediction(self):
         """Let a running prediction finish before the predictor's image changes
         (or the window closes): SAM2 must not be fed a new image mid-predict."""
-        self._predict_again = False
         w = self._predict_worker
         if w is not None and w.isRunning():
             w.wait(10000)
 
     def _on_prediction_done(self, mask: np.ndarray, score: float):
-        self.preview.set_ai_mask(mask, score)
-        self.status_bar.showMessage(
-            f"SAM2 prediction (score={score:.3f}) — Enter to accept, Escape to reject"
-        )
+        click = self._take_click()
+        if click is None:
+            return            # cleared meanwhile (Esc, another frame)
+        self.preview.add_sam_component(mask, click)
+        self._show_sam_pending_status(score)
 
     def _on_prediction_error(self, msg: str):
+        self._take_click()
         self.status_bar.showMessage(f"Prediction error: {msg}")
+
+    def _show_sam_pending_status(self, score: Optional[float] = None):
+        n = len(self.preview.pending_components())
+        waiting = len(self.preview._ai_clicks)
+        msg = f"SAM: {n} object(s) pending"
+        if score is not None:
+            msg += f" (last score {score:.2f})"
+        if waiting:
+            msg += f", {waiting} click(s) waiting"
+        msg += " — Enter accepts (one mask each), U undoes, right-click drops one, Esc clears"
+        self.status_bar.showMessage(msg)
 
     # ==================================================================
     # Class management, active class, undo/redo
