@@ -20742,6 +20742,28 @@ def apply_launch_window_mode(win, app, training_window_only: bool) -> None:
         win.show()
 
 
+def _host_like_startup():
+    """Set MAD up the way the FNT launcher's tool host does.
+
+    A MAD started from the launcher runs inside fnt.tool_host, which installs
+    the native-crash log (every thread's stack to ~/.fnt/faulthandler_crash.log
+    on an access violation), the slot exception hook (a Python error in a
+    button handler is logged instead of aborting the process), HiDPI scaling and
+    console-free child processes. Started from the command line it had none of
+    these, so a crash left no trace. Never blocks startup.
+    """
+    try:
+        from fnt import tool_host as th
+        th.install_faulthandler("MAD (command line)")
+        th.install_slot_excepthook()
+        if QApplication.instance() is None:
+            th._prepare_windows_taskbar()
+            th._enable_hidpi()
+        th._suppress_child_consoles()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     parser = _launch_parser()
     # parse_known_args: Qt has command-line options of its own.
@@ -20759,6 +20781,7 @@ def main(argv=None):
     if args.inference_window_only and (not args.infer or args.focus):
         parser.error("--inference-window-only needs --infer, and does not "
                      "combine with --focus")
+    _host_like_startup()
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()

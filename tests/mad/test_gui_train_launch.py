@@ -367,3 +367,16 @@ def test_the_window_only_summary_is_its_own_visible_window(monkeypatch):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_command_line_mad_gets_the_launchers_crash_log(monkeypatch):
+    """A MAD started from the command line installs the same native-crash log
+    and slot exception hook as one started from the FNT launcher."""
+    import faulthandler
+    import fnt.tool_host as th
+    calls = []
+    monkeypatch.setattr(th, "install_faulthandler", lambda label="": calls.append("fault"))
+    monkeypatch.setattr(th, "install_slot_excepthook", lambda: calls.append("hook"))
+    monkeypatch.setattr(th, "_suppress_child_consoles", lambda: calls.append("consoles"))
+    M._host_like_startup()
+    assert calls[:2] == ["fault", "hook"] and "consoles" in calls
