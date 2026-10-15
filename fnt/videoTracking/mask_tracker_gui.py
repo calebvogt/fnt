@@ -764,7 +764,11 @@ class AnnotationPreviewWidget(QWidget):
                 None if obj["add"] is None else obj["add"].copy(),
                 None if obj["erase"] is None else obj["erase"].copy())
 
-    def _stamp(self, cx: int, cy: int):
+    def _stamp(self, cx: int, cy: int, combine: bool = True):
+        """One brush disc at image point (cx, cy) into the target object's
+        layers. ``combine`` False leaves the object's mask and outline to the
+        caller (a stroke recomputes them once per mouse move, not per disc:
+        per disc, a fast stroke fell behind the mouse and ran on after it)."""
         ys, xs, disc = self._disc(cx, cy)
         if disc.size == 0:
             return
@@ -778,7 +782,8 @@ class AnnotationPreviewWidget(QWidget):
                 obj["erase"][ys, xs] |= disc
                 if obj["add"] is not None:
                     obj["add"][ys, xs] &= ~disc
-                self._combine(obj)
+                if combine:
+                    self._combine(obj)
         else:
             obj = self._object(self._paint_target)
             if obj is None:
@@ -789,13 +794,18 @@ class AnnotationPreviewWidget(QWidget):
             obj["add"][ys, xs] |= disc
             if obj["erase"] is not None:
                 obj["erase"][ys, xs] &= ~disc
-            self._combine(obj)
+            if combine:
+                self._combine(obj)
 
     def _stamp_line(self, p0: Tuple[int, int], p1: Tuple[int, int]):
         steps = max(1, int(max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1])) / max(1, self.brush_radius / 2)))
         for i in range(1, steps + 1):
             t = i / steps
-            self._stamp(int(round(p0[0] + (p1[0] - p0[0]) * t)), int(round(p0[1] + (p1[1] - p0[1]) * t)))
+            self._stamp(int(round(p0[0] + (p1[0] - p0[0]) * t)),
+                        int(round(p0[1] + (p1[1] - p0[1]) * t)), combine=False)
+        obj = self._object(self._paint_target) if self._paint_target is not None else None
+        if obj is not None:
+            self._combine(obj)
 
     def _begin_stroke(self, ix: float, iy: float, erase: bool):
         self._painting = True
