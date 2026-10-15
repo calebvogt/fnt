@@ -3087,6 +3087,14 @@ class MaskTrackerWindow(QMainWindow):
         self.current_frame_idx: int = -1
         self._output_dir: Optional[str] = None
         self._skip_delete_frame_warning: bool = False
+        # Frame filenames the queue is limited to (--focus), None = every frame
+        # in training_frames/.
+        self._focus_names: Optional[set] = None
+        # Started from the command line: opening a project must not stop at a
+        # question nobody is there to answer.
+        self._launched: bool = False
+        # YOLO input size for the next run; None = the 640 default.
+        self._imgsz_override: Optional[int] = None
 
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
@@ -3272,6 +3280,16 @@ class MaskTrackerWindow(QMainWindow):
         )
         act_rebuild.triggered.connect(self._rebuild_source_links)
         file_menu.addAction(act_rebuild)
+
+        file_menu.addSeparator()
+        self.act_show_all_frames = QAction("Show All Frames", self)
+        self.act_show_all_frames.setToolTip(
+            "Leave the focus list (--focus) and show every frame in "
+            "training_frames/ again."
+        )
+        self.act_show_all_frames.setEnabled(False)
+        self.act_show_all_frames.triggered.connect(self.show_all_frames)
+        file_menu.addAction(self.act_show_all_frames)
 
         edit_menu = menu_bar.addMenu("Edit")
         self.act_undo = QAction("Undo", self)
@@ -6015,6 +6033,12 @@ class MaskTrackerWindow(QMainWindow):
 
         if not to_rename:
             return
+        if self._launched:
+            # Renaming is optional housekeeping; never ask (or rename) on a
+            # command-line open. The next interactive open still offers it.
+            print(f"[MTT] {len(to_rename)} model folder(s) use the old naming "
+                  f"scheme; open the project interactively to rename them.")
+            return
 
         names = "\n".join(f"  • {old} → {new}" for _, _, old, new in to_rename)
         reply = QMessageBox.question(
@@ -6095,11 +6119,15 @@ class MaskTrackerWindow(QMainWindow):
         self._rebuild_frame_confidence()
         self._refresh_frame_list()
 
-        self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(self._project_dir)}")
+        self._set_project_title()
         self.status_bar.showMessage(f"Opened project: {self._project_dir}")
         self._update_ann_stats()
         self._add_recent_project(config_path)
-        if missing:
+        if missing and self._launched:
+            self.status_bar.showMessage(
+                f"{len(missing)} project video(s) not found on disk — "
+                f"File > Locate Missing Videos... relinks them.", 10000)
+        elif missing:
             self._prompt_missing_videos(missing)
 
         # Refresh whichever tab is currently visible
@@ -7021,6 +7049,8 @@ class MaskTrackerWindow(QMainWindow):
                 continue
             full = os.path.join(folder, f)
             m = pat.match(Path(f).stem)
+            if self._focus_names is not None and f not in self._focus_names:
+                continue
             if m and m.group("stem") in stem_map:
                 frames.append(
                     (stem_map[m.group("stem")], int(m.group("idx")), full)
@@ -7029,6 +7059,50 @@ class MaskTrackerWindow(QMainWindow):
                 frames.append(("", 0, full))
         self._extracted_frames = frames
         self._refresh_frame_list()
+
+    def focus_frames(self, items) -> Tuple[int, List[str]]:
+        """Limit the frame queue to these frames (``--focus``).
+
+        ``items`` are frame filenames or paths and/or .txt files listing them
+        one per line. The rest of training_frames/ is untouched and File >
+        Show All Frames brings it back. Post-training inference runs on the
+        queue, so it covers only the focused frames too. Returns
+        (frames shown, names not found in training_frames/).
+        """
+        names = expand_focus_items(items)
+        self._focus_names = set(names)
+        self.current_frame_idx = -1
+        if self._output_dir and os.path.isdir(self._output_dir):
+            self._scan_frames_dir(self._output_dir)
+        shown = {os.path.basename(fp) for _, _, fp in self._extracted_frames}
+        missing = [n for n in names if n not in shown]
+        self.act_show_all_frames.setEnabled(True)
+        self._set_project_title()
+        if self._extracted_frames:
+            self._select_frame_row(0)
+        self.status_bar.showMessage(
+            f"Focus: {len(shown)} frame(s)"
+            + (f", {len(missing)} not found" if missing else ""), 8000)
+        return len(shown), missing
+
+    def show_all_frames(self):
+        """Leave the focus list: every frame in training_frames/ again."""
+        self._focus_names = None
+        self.current_frame_idx = -1
+        if self._output_dir and os.path.isdir(self._output_dir):
+            self._scan_frames_dir(self._output_dir)
+            if self._extracted_frames:
+                self._select_frame_row(0)
+        self.act_show_all_frames.setEnabled(False)
+        self._set_project_title()
+
+    def _set_project_title(self):
+        title = self.BASE_TITLE
+        if self._project_dir:
+            title += f" — {os.path.basename(self._project_dir)}"
+        if self._focus_names is not None:
+            title += f" (focus: {len(self._extracted_frames)} frames)"
+        self.setWindowTitle(title)
 
     def _load_existing_frames(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Frames Folder")
@@ -8255,7 +8329,7 @@ class MaskTrackerWindow(QMainWindow):
                 "val_fraction": self.spin_val_frac.value(),
                 "device": device_choice,
                 "model_variant": model_variant,
-                "imgsz": 640,
+                "imgsz": self._imgsz_override or 640,
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
@@ -12054,3 +12128,192 @@ class MaskTrackerWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.wait(2000)
         event.accept()
+
+
+# ======================================================================
+# Command-line launch
+# ======================================================================
+#: --arch value -> Architecture combo text.
+ARCH_CHOICES = {
+    "yolo11n-seg": "YOLOv11-nano-seg",
+    "yolo11s-seg": "YOLOv11-small-seg",
+    "yolo11m-seg": "YOLOv11-medium-seg",
+    "yolo11l-seg": "YOLOv11-large-seg",
+    "maskrcnn": "Mask R-CNN",
+}
+#: --device value -> Device combo text.
+DEVICE_CHOICES = {
+    "auto": "Auto",
+    "cpu": "CPU",
+    "cuda": "CUDA (NVIDIA)",
+    "mps": "MPS (Apple Silicon)",
+}
+
+
+def expand_focus_items(items) -> List[str]:
+    """Frame filenames from --focus items, in order, without duplicates.
+
+    An item is a frame filename or path, or a .txt file listing them one per
+    line (blank lines and lines starting with # are skipped). Names without an
+    image extension are taken as .png, the extension extraction writes.
+    """
+    names: List[str] = []
+    seen = set()
+
+    def _add(raw: str):
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            return
+        name = re.split(r"[\\/]", raw)[-1]
+        if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+            name += ".png"
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    for item in items or ():
+        item = str(item)
+        if item.lower().endswith(".txt") and os.path.isfile(item):
+            with open(item, encoding="utf-8") as fh:
+                for line in fh:
+                    _add(line)
+        else:
+            _add(item)
+    return names
+
+
+from .mask_tracker_cli import resolve_project_config  # noqa: E402
+
+
+def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
+    """Put the training flags that were given into the Train panel.
+
+    Flags left out keep the panel's value, so the window always shows what the
+    run trains with and the next press of Train uses the panel alone. Returns
+    the settings applied, for the log.
+    """
+    applied = []
+    if getattr(args, "arch", None):
+        win.combo_architecture.setCurrentText(ARCH_CHOICES[args.arch])
+        applied.append(f"arch={args.arch}")
+    if getattr(args, "device", None):
+        win.combo_device.setCurrentText(DEVICE_CHOICES[args.device])
+        applied.append(f"device={args.device}")
+    for flag, widget in (("epochs", win.spin_iterations), ("batch", win.spin_batch),
+                         ("lr", win.spin_lr), ("patience", win.spin_patience),
+                         ("val_frac", win.spin_val_frac),
+                         ("post_infer_conf", win.spin_post_infer_conf),
+                         ("post_infer_max", win.spin_post_infer_max)):
+        value = getattr(args, flag, None)
+        if value is not None:
+            widget.setValue(value)
+            applied.append(f"{flag}={value}")
+    for flag, widget in (("augment", win.chk_augment), ("post_infer", win.chk_post_infer)):
+        value = getattr(args, flag, None)
+        if value is not None:
+            widget.setChecked(bool(value))
+            applied.append(f"{flag}={bool(value)}")
+    if getattr(args, "imgsz", None):
+        win._imgsz_override = int(args.imgsz)
+        applied.append(f"imgsz={args.imgsz}")
+    return applied
+
+
+def _launch_parser():
+    """Command line of ``python -m fnt.videoTracking.mask_tracker_gui``.
+
+    Opens the Mask Tracker on a project and, with ``--focus``, shows only the
+    listed frames for review; with ``--train`` it starts a segmentation run
+    exactly as the Train button would, with the loss plot and log on screen.
+    """
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="mask-tracker", description="FNT Mask Tracker (GUI).")
+    p.add_argument("--project", default="",
+                   help="Open this project (its folder or project_config.json).")
+    p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
+                   help="Show only these frames in the frame list: frame "
+                        "filenames or paths, and/or .txt files listing them one "
+                        "per line. File > Show All Frames returns.")
+    p.add_argument("--train", action="store_true",
+                   help="Start a segmentation training run once the project is "
+                        "open, as the Train button would.")
+    g = p.add_argument_group(
+        "training settings",
+        "Set in the Train panel before the run; any not given keep the "
+        "panel's value.")
+    g.add_argument("--arch", choices=sorted(ARCH_CHOICES))
+    g.add_argument("--epochs", type=int)
+    g.add_argument("--batch", type=int)
+    g.add_argument("--lr", type=float)
+    g.add_argument("--patience", type=int)
+    g.add_argument("--val-frac", dest="val_frac", type=float)
+    g.add_argument("--imgsz", type=int,
+                   help="YOLO input size in pixels (default 640).")
+    g.add_argument("--device", choices=sorted(DEVICE_CHOICES))
+    g.add_argument("--augment", dest="augment", action="store_true", default=None)
+    g.add_argument("--no-augment", dest="augment", action="store_false")
+    g.add_argument("--post-infer", dest="post_infer", action="store_true",
+                   default=None,
+                   help="After training, add the model's masks to the frames in "
+                        "the queue that have no approved mask, for review.")
+    g.add_argument("--no-post-infer", dest="post_infer", action="store_false")
+    g.add_argument("--post-infer-conf", dest="post_infer_conf", type=float)
+    g.add_argument("--post-infer-max", dest="post_infer_max", type=int)
+    return p
+
+
+def _host_like_startup():
+    """The crash log, slot exception hook and HiDPI setup that the FNT
+    launcher's tool host gives a tool; a command-line start gets none of them
+    otherwise. Never blocks startup."""
+    try:
+        from fnt import tool_host as th
+        th.install_faulthandler("Mask Tracker (command line)")
+        th.install_slot_excepthook()
+        if QApplication.instance() is None:
+            th._prepare_windows_taskbar()
+            th._enable_hidpi()
+        th._suppress_child_consoles()
+    except Exception:
+        pass
+
+
+def main(argv=None) -> int:
+    parser = _launch_parser()
+    # parse_known_args: Qt has command-line options of its own.
+    args, qt_args = parser.parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    if (args.train or args.focus) and not args.project:
+        parser.error("--train and --focus need --project")
+    config = None
+    if args.project:
+        try:
+            config = resolve_project_config(args.project)
+        except FileNotFoundError as e:
+            parser.error(str(e))
+    _host_like_startup()
+    app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
+    win = MaskTrackerWindow()
+    win._launched = True
+    win.show()
+    if config:
+        win._load_project(config)
+        if args.focus:
+            shown, missing = win.focus_frames(args.focus)
+            note = ""
+            if missing:
+                note = f"; not in training_frames/: {', '.join(missing[:5])}"
+                if len(missing) > 5:
+                    note += " ..."
+            print(f"[MTT] focus: {shown} frame(s){note}", flush=True)
+        applied = apply_training_args(win, args)
+        if applied:
+            print(f"[MTT] training settings: {', '.join(applied)}", flush=True)
+        if args.train:
+            QTimer.singleShot(500, win._start_training)
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
