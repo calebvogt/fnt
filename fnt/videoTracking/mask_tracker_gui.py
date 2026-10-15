@@ -413,6 +413,9 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_queue: List[int] = []                 # object ids waiting for SAM
         self._ai_history: List[Tuple] = []             # undo stack (U)
         self._ai_next_id = 1
+        # The pending object being edited: the Eraser erases from it alone (two
+        # mice side by side: a stroke along their shared edge ate into both).
+        self._focus_id: Optional[int] = None
         self.brush_radius = 8                          # image px
         self._painting = False
         self._paint_erasing = False                    # this stroke erases
@@ -472,6 +475,7 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_objects.clear()
         self._ai_queue.clear()
         self._ai_history.clear()
+        self._focus_id = None
         self._painting = False
         self._stroke_snapshot = None
         self._editing_obj_idx = None
@@ -495,6 +499,15 @@ class AnnotationPreviewWidget(QWidget):
                "add": None, "erase": None, "mask": None, "outline": [], "version": 0}
         self._ai_next_id += 1
         self._ai_objects.append(obj)
+        self._focus_id = obj["id"]
+        return obj
+
+    def focus_object(self) -> Optional[Dict]:
+        """The pending object being edited (the newest one touched), or None."""
+        obj = self._object(self._focus_id) if self._focus_id is not None else None
+        if obj is None and self._ai_objects:
+            obj = self._ai_objects[-1]
+            self._focus_id = obj["id"]
         return obj
 
     def object_at(self, ix: float, iy: float) -> Optional[Dict]:
@@ -572,6 +585,7 @@ class AnnotationPreviewWidget(QWidget):
         else:
             target["pos"].append(pt)
             self._ai_history.append(("pos", target["id"]))
+        self._focus_id = target["id"]
         self._drawing_active = True
         self._queue(target)
         self.update()
@@ -755,8 +769,8 @@ class AnnotationPreviewWidget(QWidget):
         if disc.size == 0:
             return
         if self._paint_erasing:
-            for obj in self._ai_objects:
-                if obj["mask"] is None or not (obj["mask"][ys, xs] & disc).any():
+            for obj in [self._object(self._paint_target)] if self._paint_target is not None else []:
+                if obj is None or obj["mask"] is None or not (obj["mask"][ys, xs] & disc).any():
                     continue
                 self._snap(obj)
                 if obj["erase"] is None:
@@ -793,6 +807,14 @@ class AnnotationPreviewWidget(QWidget):
                 target = self._new_object()
                 self._stroke_snapshot["created"].append(target["id"])
             self._paint_target = target["id"]
+            self._focus_id = target["id"]
+        else:
+            # The Eraser works on the object being edited; with none, on the one
+            # under the brush.
+            target = self.focus_object() if self._focus_id is not None else None
+            if target is None:
+                target = self.object_at(ix, iy)
+            self._paint_target = target["id"] if target is not None else None
         self._drawing_active = True
         self._paint_last = (int(ix), int(iy))
         self._stamp(*self._paint_last)
@@ -1072,8 +1094,8 @@ class AnnotationPreviewWidget(QWidget):
         """A Paint / Eraser stroke that starts on a saved mask (and no pending
         object) brings that mask back as a pending object first, so the stroke
         edits it; clicking a saved mask with the Eraser used to do nothing."""
-        if self.object_at(ix, iy) is not None:
-            return
+        if self.object_at(ix, iy) is not None or self._ai_objects:
+            return          # a mask is being edited: strokes stay on it
         idx = self._find_annotation_at(wx, wy)
         if idx is not None:
             self.edit_as_pending_requested.emit(idx)
@@ -1552,10 +1574,12 @@ class AnnotationPreviewWidget(QWidget):
 
     def _paint_ai_drawing(self, painter: QPainter, pr: float):
         """Pending objects: outline + light fill in each object's colour."""
+        focus = self.focus_object()
         for i, obj in enumerate(self._ai_objects):
             r, g, b = self._OBJECT_COLORS[i % len(self._OBJECT_COLORS)]
             if len(obj["outline"]) >= 3:
-                painter.setPen(QPen(QColor(r, g, b), 2, Qt.DashLine))
+                width = 3.5 if (obj is focus and len(self._ai_objects) > 1) else 2
+                painter.setPen(QPen(QColor(r, g, b), width, Qt.DashLine))
                 painter.setBrush(QBrush(QColor(r, g, b, 22)))
                 poly = QPolygonF()
                 for px, py in obj["outline"]:

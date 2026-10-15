@@ -268,5 +268,35 @@ def test_v_hides_and_shows_the_masks():
     assert w.show_masks and seen == [False, True]
 
 
+def test_the_eraser_works_on_the_object_being_edited_only():
+    """Two mice side by side: a stroke along their shared edge erased from both."""
+    w, _ = preview()
+    left = blob(10, 10, 40, 40)
+    right = blob(40, 10, 70, 40)                  # touches left along x = 40
+    w.add_pending_mask(left)
+    w.add_pending_mask(right)                     # the one now being edited
+    w.drawing_mode = "erase"
+    w.brush_radius = 4
+    drag_img(w, (40, 15), (40, 35))               # down the shared edge
+    a, b = w._ai_objects
+    assert int(a["mask"].sum()) == 900            # untouched
+    assert int(b["mask"].sum()) < 900             # only the edited one erased
+
+
+def test_a_stroke_does_not_pull_in_a_saved_mask_while_one_is_edited():
+    w, _ = preview()
+    w.annotations.append(G.AnnotationObject(
+        [(50, 50), (90, 50), (90, 90), (50, 90)], "mouse", ann_id=7))
+    pulled = []
+    w.edit_as_pending_requested.connect(pulled.append)
+    w.add_pending_mask(blob(10, 10, 40, 40))      # editing another mask
+    w.drawing_mode = "erase"
+    drag_img(w, (70, 70), (75, 75))               # on the saved one
+    assert pulled == []
+    w._clear_drawing()
+    drag_img(w, (70, 70), (75, 75))               # nothing being edited: it comes back
+    assert pulled == [0]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
