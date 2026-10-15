@@ -199,11 +199,11 @@ def test_s_skips_to_the_next_frame_still_to_label():
     w._select_frame_row(0)
     w._toggle_empty_frame()                         # frame 0 empty; now on frame 1
     w._select_frame_row(1)
-    w.preview._ai_clicks.append((5, 5))             # an unsaved SAM click on frame 1
+    w.preview.add_sam_click(5, 5)                   # an unsaved SAM click on frame 1
     w.preview._drawing_active = True
     key(w.btn_skip_frame, Qt.Key_S, "s")            # S with a button focused
     assert w.current_frame_idx == 2                 # next frame still to label
-    assert w.preview._ai_clicks == []               # unsaved SAM work dropped
+    assert w.preview._ai_objects == []              # unsaved SAM work dropped
     assert not w._coco.is_image_empty(FRAMES[1])    # nothing recorded for the skipped frame
     w._select_frame_row(3)
     w._skip_frame()                                 # past the last one: back to the first

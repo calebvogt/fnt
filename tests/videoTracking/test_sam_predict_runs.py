@@ -2,11 +2,11 @@
 
 Each SAM click used to start a new prediction thread and drop the one still
 running; Qt aborts the process when a running QThread is destroyed, which is
-how a labeling session crashed (0xC0000409 in Qt5Core.dll). Clicks now queue:
-one prediction thread at a time, each click predicted with its own point, its
-object added to the pending mask. That abort is a Qt fatal message, which
-neither faulthandler nor the slot exception hook sees, so the Qt message
-handler writes it to the crash log.
+how a labeling session crashed (0xC0000409 in Qt5Core.dll). Objects now queue:
+one prediction thread at a time, each object predicted from its own points. A
+result for an object whose points changed meanwhile is dropped (the newer run
+replaces it). That abort is a Qt fatal message, which neither faulthandler nor
+the slot exception hook sees, so the Qt message handler writes it to the log.
 
 Runs under pytest, or directly.
 """
@@ -27,7 +27,7 @@ H, W = 120, 160
 
 
 class SlowSegmenter:
-    """Stands in for SAM2: a 10 x 10 blob at the clicked point, after a moment."""
+    """Stands in for SAM2: a 10 x 10 blob at the first positive point, after a moment."""
     predictor = object()
 
     def __init__(self):
@@ -60,7 +60,7 @@ def pump(until, timeout=5.0):
     return False
 
 
-def test_quick_clicks_queue_and_each_object_joins_the_pending_mask():
+def test_quick_clicks_run_one_at_a_time_and_each_mouse_is_its_own_object():
     w = G.MaskTrackerWindow()
     seg = SlowSegmenter()
     w._segmenter = seg
@@ -68,17 +68,17 @@ def test_quick_clicks_queue_and_each_object_joins_the_pending_mask():
     w.preview.set_frame(np.zeros((H, W, 3), np.uint8))
     w.preview.drawing_mode = "ai"
     clicks = [(20, 20), (60, 30), (100, 60), (140, 100)]   # four separate mice
-    for c in clicks:
-        w.preview._ai_clicks.append(c)
-        w.preview._drawing_active = True
+    for x, y in clicks:
+        w.preview.add_sam_click(x, y)
         w._request_ai_prediction()
-    assert pump(lambda: not w.preview._ai_clicks and not w._predict_worker.isRunning())
+    assert pump(lambda: not w.preview.has_ai_jobs() and not w._predict_worker.isRunning())
+    pump(lambda: False, timeout=0.2)
     assert seg.max_running == 1                     # never two at once
-    assert seg.calls == [[c] for c in clicks]       # every click predicted, in order, alone
+    assert seg.calls == [[c] for c in clicks]       # each object from its own point, in order
     assert len(w.preview.pending_components()) == 4
 
     # Esc while a prediction runs: its result is dropped, not added.
-    w.preview._ai_clicks.append((80, 80))
+    w.preview.add_sam_click(80, 100, new_object=True)
     w._request_ai_prediction()
     w.preview._clear_drawing()
     assert pump(lambda: not w._predict_worker.isRunning())
