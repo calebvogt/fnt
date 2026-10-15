@@ -363,6 +363,8 @@ class AnnotationPreviewWidget(QWidget):
     tool_requested = pyqtSignal(str)           # P / X: Paint / Eraser on or off
     brush_radius_changed = pyqtSignal(int)     # wheel in Paint / Eraser
     edit_as_pending_requested = pyqtSignal(int)  # menu: edit a saved mask as a pending object
+    review_requested = pyqtSignal(str)         # A / R / Shift+A: accept, reject, accept_all
+    prediction_selected = pyqtSignal()         # a click picked the prediction to review
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -426,6 +428,8 @@ class AnnotationPreviewWidget(QWidget):
         self.available_categories: List[str] = []
 
         self.annotations: List[AnnotationObject] = []
+        # The model's mask under review (A / R act on it); None = the first.
+        self.review_idx: Optional[int] = None
 
         self._pending_annotation: Optional[List[Tuple[float, float]]] = None
         self._pending_is_ai = False
@@ -1009,6 +1013,12 @@ class AnnotationPreviewWidget(QWidget):
                 return
 
             if self.drawing_mode == "navigate":
+                # A click on one of the model's masks picks it for review.
+                hit_ann = self._find_annotation_at(event.x(), event.y())
+                if hit_ann is not None and self.annotations[hit_ann].inferred:
+                    self.review_idx = hit_ann
+                    self.prediction_selected.emit()
+                    self.update()
                 self._panning = True
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
                 self.setCursor(Qt.ClosedHandCursor)
@@ -1232,12 +1242,13 @@ class AnnotationPreviewWidget(QWidget):
             backwards = bool(event.modifiers() & Qt.ShiftModifier)
             self.timeline_advance_requested.emit(-1 if backwards else 1)
         elif event.key() == Qt.Key_A and not self._drawing_active:
-            # Approve all inferred annotations on current frame
-            has_inferred = any(a.inferred for a in self.annotations)
-            if has_inferred:
-                for i in range(len(self.annotations) - 1, -1, -1):
-                    if self.annotations[i].inferred:
-                        self.approve_annotation_requested.emit(i)
+            # As in MAD: A accepts the prediction under review, Shift+A every
+            # prediction on the frame.
+            self.review_requested.emit(
+                "accept_all" if event.modifiers() & Qt.ShiftModifier else "accept")
+        elif event.key() == Qt.Key_R and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            self.review_requested.emit("reject")
         elif event.key() in (Qt.Key_N, Qt.Key_B) and not self._drawing_active \
                 and self._editing_obj_idx is None:
             # N / B: next / back in the Training Frames Queue, row by row.
@@ -1296,6 +1307,14 @@ class AnnotationPreviewWidget(QWidget):
             self._clear_drawing()
             self.drawing_mode = "navigate"            # Enter turns the tool off
             self.mode_changed.emit("Navigate")
+
+    def current_prediction(self) -> Optional[int]:
+        """Index of the prediction under review: the one clicked, else the
+        first of the frame's model masks; None if the frame has none."""
+        i = self.review_idx
+        if i is not None and 0 <= i < len(self.annotations) and self.annotations[i].inferred:
+            return i
+        return next((k for k, a in enumerate(self.annotations) if a.inferred), None)
 
     def mode_name(self) -> str:
         return {"ai": "AI-Assisted Mask", "paint": "Paint", "erase": "Eraser"}.get(
@@ -1366,6 +1385,7 @@ class AnnotationPreviewWidget(QWidget):
 
         pr = self._point_radius()
         cat_counters: Dict[str, int] = {}
+        under_review = self.current_prediction()
 
         for ai, ann in enumerate(self.annotations):
             if ann.inferred:
@@ -1384,6 +1404,10 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
+                elif ai == under_review:
+                    # The prediction A / R act on: bold, lightly filled.
+                    painter.setPen(QPen(color, 3.0))
+                    painter.setBrush(QBrush(QColor(r, g, b, 45)))
                 else:
                     painter.setPen(QPen(color, 1.5))
                 painter.drawPolygon(poly)
@@ -3673,7 +3697,7 @@ class MaskTrackerWindow(QMainWindow):
     #: Keys that act on the frame being labeled, whichever widget has focus.
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
                       Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_S, Qt.Key_A,
-                      Qt.Key_P, Qt.Key_X, Qt.Key_Escape)
+                      Qt.Key_P, Qt.Key_X, Qt.Key_R, Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -3968,6 +3992,8 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.tool_requested.connect(self._on_tool_key)
         self.preview.brush_radius_changed.connect(self._on_brush_radius_changed)
         self.preview.edit_as_pending_requested.connect(self._edit_as_pending)
+        self.preview.review_requested.connect(self._on_review)
+        self.preview.prediction_selected.connect(self._update_review_label)
         self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
@@ -4469,6 +4495,7 @@ class MaskTrackerWindow(QMainWindow):
         self._create_videos_section(layout)
         self._create_extraction_section(layout)
         self._create_frames_section(layout)
+        self._create_review_section(layout)
         self._create_labeling_tools_section(layout)
 
         # Help text
@@ -4484,6 +4511,8 @@ class MaskTrackerWindow(QMainWindow):
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
             "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
+            "Review: A accepts the bold prediction (click one to pick it), R rejects\n"
+            "  it, Shift+A accepts all on the frame.\n"
             "S = skip: leave this frame and go to the next one still to label.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
@@ -6343,6 +6372,73 @@ class MaskTrackerWindow(QMainWindow):
         group.setLayout(vbox)
         layout.addWidget(group)
 
+    @staticmethod
+    def _review_btn_qss(bg: str, hover: str) -> str:
+        return (f"QPushButton {{ background-color: {bg}; color: white; font-weight: bold; "
+                f"padding: 3px 6px; border-radius: 3px; }}"
+                f"QPushButton:hover {{ background-color: {hover}; }}"
+                "QPushButton:disabled { background-color: #3a3a3a; color: #777777; }")
+
+    def _create_review_section(self, layout):
+        """Reviewing the model's masks, as MAD reviews its detections: the
+        prediction under review is drawn bold (click another to pick it); A
+        accepts it, R rejects it (deletes it; Ctrl+Z restores), Shift+A
+        accepts every prediction on the frame. Once a frame has none left the
+        next frame with predictions opens (Auto-advance)."""
+        group = QGroupBox("Review Predictions")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+        self.lbl_review = QLabel("No predictions to review")
+        self.lbl_review.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_review.setWordWrap(True)
+        vbox.addWidget(self.lbl_review)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(2)
+        self.btn_accept_pred = QPushButton("Accept (A)")
+        self.btn_accept_pred.setToolTip(
+            "Accept the prediction under review (bold): it becomes a labeled\n"
+            "mask and trains the next model. Shortcut: A")
+        self.btn_accept_pred.setStyleSheet(self._review_btn_qss("#2d7a3a", "#379247"))
+        self.btn_accept_pred.clicked.connect(lambda _=False: self._on_review("accept"))
+        row1.addWidget(self.btn_accept_pred)
+        self.btn_reject_pred = QPushButton("Reject (R)")
+        self.btn_reject_pred.setToolTip(
+            "Reject the prediction under review: it is deleted (Ctrl+Z\n"
+            "restores it). To fix a nearly right mask instead, use Paint /\n"
+            "Eraser on it or right-click > Edit Mask. Shortcut: R")
+        self.btn_reject_pred.setStyleSheet(self._review_btn_qss("#8a2c2c", "#a83636"))
+        self.btn_reject_pred.clicked.connect(lambda _=False: self._on_review("reject"))
+        row1.addWidget(self.btn_reject_pred)
+        vbox.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(2)
+        self.btn_accept_all_pred = QPushButton("Accept All on Frame")
+        self.btn_accept_all_pred.setToolTip(
+            "Accept every prediction on this frame. Shortcut: Shift+A")
+        self.btn_accept_all_pred.clicked.connect(lambda _=False: self._on_review("accept_all"))
+        row2.addWidget(self.btn_accept_all_pred)
+        self.btn_next_review = QPushButton("Next to Review")
+        self.btn_next_review.setToolTip("Open the next frame that still has predictions.")
+        self.btn_next_review.clicked.connect(lambda _=False: self._next_review_frame())
+        row2.addWidget(self.btn_next_review)
+        vbox.addLayout(row2)
+
+        self.chk_review_auto = QCheckBox("Auto-advance after Accept/Reject")
+        self.chk_review_auto.setChecked(True)
+        self.chk_review_auto.setToolTip(
+            "On: once a frame has no predictions left (and keeps at least one\n"
+            "mask), the next frame with predictions opens.")
+        vbox.addWidget(self.chk_review_auto)
+        for w in (self.btn_accept_pred, self.btn_reject_pred, self.btn_accept_all_pred,
+                  self.btn_next_review, self.chk_review_auto):
+            w.setFocusPolicy(Qt.NoFocus)
+            if isinstance(w, QPushButton):
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
     def _create_labeling_tools_section(self, layout):
         """The labeling tools, in the left column as in MAD: SAM, Paint and
         Eraser; Clear and Undo; the class new masks get. The bar under the
@@ -8034,7 +8130,7 @@ class MaskTrackerWindow(QMainWindow):
             if self._coco.is_image_empty(filename):
                 continue          # reviewed: holds no object
             total, n_inferred = self._count_annotations_for_file(filename)
-            if total == 0 or total == n_inferred:
+            if total == 0 or n_inferred > 0:      # unlabeled, or predictions to review
                 candidates.append(i)
 
         if not candidates:
@@ -8233,6 +8329,7 @@ class MaskTrackerWindow(QMainWindow):
         if filename not in self._coco._image_id_map:
             self._update_ann_stats()
             self._sync_empty_button()
+            self._update_review_label()
             return
 
         img_id = self._coco._image_id_map[filename]
@@ -8261,9 +8358,11 @@ class MaskTrackerWindow(QMainWindow):
             )
             self.preview.annotations.append(ann_obj)
 
+        self.preview.review_idx = None
         self.preview.update()
         self._update_ann_stats()
         self._sync_empty_button()
+        self._update_review_label()
 
     # ==================================================================
     # Mode changes
@@ -8894,6 +8993,81 @@ class MaskTrackerWindow(QMainWindow):
         if path:
             self._load_frame_annotations(path)
             self.preview.update()
+
+    # -- review of the model's masks (as in MAD) --------------------------
+    def _on_review(self, action: str):
+        """A / R / Shift+A (and the Review buttons): accept or reject the
+        prediction under review, or accept every prediction on the frame."""
+        pv = self.preview
+        if action == "accept_all":
+            idxs = [i for i, a in enumerate(pv.annotations) if a.inferred]
+            if not idxs:
+                self.status_bar.showMessage("No predictions on this frame.", 3000)
+                return
+            for i in reversed(idxs):
+                self._on_approve_annotation_by_index(i)
+        else:
+            i = pv.current_prediction()
+            if i is None:
+                self.status_bar.showMessage("No predictions on this frame.", 3000)
+                return
+            if action == "accept":
+                self._on_approve_annotation_by_index(i)
+            else:
+                self._on_delete_annotation_by_index(i)
+        pv.review_idx = None
+        self._after_review_step()
+
+    def _after_review_step(self):
+        pv = self.preview
+        self._recalc_current_frame_confidence()
+        pv.update()
+        if pv.current_prediction() is None:
+            if not pv.annotations:
+                self.status_bar.showMessage(
+                    "No masks left on this frame: draw the mice, or press E if it holds none.")
+            elif self.chk_review_auto.isChecked():
+                self._next_review_frame()
+        self._update_review_label()
+
+    def _frames_to_review(self) -> List[int]:
+        """Queue rows whose frame still has predictions."""
+        ids = {a["image_id"] for a in self._coco.annotations if a.get("inferred", False)}
+        names = {img["file_name"] for img in self._coco.images if img["id"] in ids}
+        return [i for i, (_, _, fp) in enumerate(self._extracted_frames)
+                if os.path.basename(fp) in names]
+
+    def _next_review_frame(self):
+        rows = [r for r in self._frames_to_review() if r != self.current_frame_idx]
+        if not rows:
+            self.status_bar.showMessage("All predictions reviewed.", 5000)
+            self._update_review_label()
+            return
+        later = [r for r in rows if r > self.current_frame_idx]
+        self._select_frame_row(later[0] if later else rows[0])
+
+    def _update_review_label(self):
+        if not hasattr(self, "lbl_review"):
+            return
+        pv = self.preview
+        preds = [i for i, a in enumerate(pv.annotations) if a.inferred]
+        n_frames = len(self._frames_to_review())
+        if preds:
+            cur = pv.current_prediction()
+            stored = self._coco.get_annotation(pv.annotations[cur].ann_id) or {}
+            score = stored.get("score")
+            text = (f"Prediction {preds.index(cur) + 1} of {len(preds)} on this frame"
+                    + (f" (score {score:.2f})" if score is not None else "")
+                    + f" · {n_frames} frame(s) to review")
+            self.lbl_review.setStyleSheet("color: #e6c830; font-size: 10px;")
+        else:
+            text = (f"No predictions on this frame · {n_frames} frame(s) to review"
+                    if n_frames else "No predictions to review")
+            self.lbl_review.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_review.setText(text)
+        for b in (self.btn_accept_pred, self.btn_reject_pred, self.btn_accept_all_pred):
+            b.setEnabled(bool(preds))
+        self.btn_next_review.setEnabled(bool(n_frames))
 
     def _on_approve_annotation_by_index(self, obj_idx: int):
         if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
@@ -9648,6 +9822,7 @@ class MaskTrackerWindow(QMainWindow):
             f"across {n_inferred_frames}/{available} frames"
         )
         self.lbl_train_status.setText(f"{infer_status}. Review inferred masks.")
+        self._update_review_label()
 
         # Log inference results
         self._seg_log_text.append(f"[Inference] {infer_status}")

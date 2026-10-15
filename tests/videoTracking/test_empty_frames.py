@@ -301,5 +301,39 @@ def test_eraser_on_a_saved_mask_edits_it_and_enter_esc_turn_the_tools_off():
     w.close()
 
 
+def test_review_accepts_rejects_and_advances_as_in_mad():
+    """A accepts the prediction under review, R rejects it, Shift+A accepts the
+    frame's rest; a frame with none left opens the next with predictions."""
+    from PyQt5.QtCore import Qt
+    w = window()
+    cat = w._coco.categories[0]["id"] if w._coco.categories else w._coco.add_category("mouse")
+
+    def predict(name, *boxes):
+        img = w._coco.get_or_add_image(name, 64, 48)
+        for (x0, y0, x1, y1) in boxes:
+            m = np.zeros((48, 64), bool)
+            m[y0:y1, x0:x1] = True
+            w._coco.add_annotation_from_mask(img, cat, m, inferred=True, score=0.7)
+    predict(FRAMES[0], (5, 5, 20, 20), (30, 5, 45, 20), (5, 25, 20, 40))
+    predict(FRAMES[2], (10, 10, 30, 30))
+    w._select_frame_row(0)
+    pv = w.preview
+    assert pv.current_prediction() == 0
+    assert "1 of 3" in w.lbl_review.text() and "2 frame(s) to review" in w.lbl_review.text()
+    key(pv, Qt.Key_A, "a")                        # accept the first
+    assert not pv.annotations[0].inferred and pv.current_prediction() == 1
+    key(pv, Qt.Key_R, "r")                        # reject the second
+    assert len(pv.annotations) == 2 and pv.current_prediction() == 1
+    key(w.btn_accept_pred, Qt.Key_R, "r")         # R with a button focused
+    assert w.current_frame_idx == 2               # nothing left on frame 0: next to review
+    assert pv.current_prediction() == 0
+    QApplication.sendEvent(pv, __import__("PyQt5.QtGui", fromlist=["QKeyEvent"]).QKeyEvent(
+        __import__("PyQt5.QtCore", fromlist=["QEvent"]).QEvent.KeyPress, Qt.Key_A,
+        Qt.ShiftModifier, "A"))                   # Shift+A: accept all on frame 2
+    assert not any(a.inferred for a in pv.annotations)
+    assert w.lbl_review.text() == "No predictions to review"
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
