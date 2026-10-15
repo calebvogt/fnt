@@ -181,12 +181,14 @@ class PathLabel(QLabel):
 
 class AnnotationObject:
     def __init__(self, points: List[Tuple[float, float]], category: str,
-                 ann_id: int = -1, is_ai: bool = False, inferred: bool = False):
+                 ann_id: int = -1, is_ai: bool = False, inferred: bool = False,
+                 score: Optional[float] = None):
         self.points = list(points)
         self.category = category
         self.ann_id = ann_id
         self.is_ai = is_ai
         self.inferred = inferred
+        self.score = score              # the model's confidence in this one mask
         self._anchor_key = None
         self._anchor: Optional[Tuple[float, float]] = None
 
@@ -866,6 +868,10 @@ class AnnotationPreviewWidget(QWidget):
 
     def _find_annotation_at(self, wx: float, wy: float) -> Optional[int]:
         pt = QPointF(wx, wy)
+        # A mask's name label (and its dot) picks it too.
+        for oi, rect in reversed(list(getattr(self, "_label_rects", {}).items())):
+            if oi < len(self.annotations) and rect.contains(pt):
+                return oi
         for oi in range(len(self.annotations) - 1, -1, -1):
             ann = self.annotations[oi]
             if len(ann.points) < 3:
@@ -1255,7 +1261,7 @@ class AnnotationPreviewWidget(QWidget):
             # prediction on the frame.
             self.review_requested.emit(
                 "accept_all" if event.modifiers() & Qt.ShiftModifier else "accept")
-        elif event.key() == Qt.Key_R and not self._drawing_active \
+        elif event.key() in (Qt.Key_R, Qt.Key_D, Qt.Key_Delete) and not self._drawing_active \
                 and self._editing_obj_idx is None:
             self.review_requested.emit("reject")
         elif event.key() in (Qt.Key_N, Qt.Key_B) and not self._drawing_active \
@@ -1395,6 +1401,7 @@ class AnnotationPreviewWidget(QWidget):
         pr = self._point_radius()
         cat_counters: Dict[str, int] = {}
         under_review = self.current_prediction()
+        self._label_rects = {}
 
         for ai, ann in enumerate(self.annotations):
             if ann.inferred:
@@ -1414,9 +1421,10 @@ class AnnotationPreviewWidget(QWidget):
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
                 elif ai == under_review:
-                    # The prediction A / R act on: bold, lightly filled.
-                    painter.setPen(QPen(color, 3.0))
-                    painter.setBrush(QBrush(QColor(r, g, b, 45)))
+                    # The prediction A / R act on: white, as MAD marks the
+                    # selected detection.
+                    painter.setPen(QPen(QColor(255, 255, 255), 2.5))
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 40)))
                 else:
                     painter.setPen(QPen(color, 1.5))
                 painter.drawPolygon(poly)
@@ -1436,18 +1444,29 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(255, 255, 255)))
                 painter.drawEllipse(QPointF(wcx, wcy), 3, 3)
+                # As in MAD: a prediction still to review is named in
+                # parentheses with its own confidence, "(mouse_1 0.42)", in
+                # yellow (white while selected); an accepted mask is plain.
                 label = f"{ann.category}_{instance_num}"
                 if ann.inferred:
-                    label += " [inferred]"
+                    label = (f"({label} {ann.score:.2f})" if ann.score is not None
+                             else f"({label})")
                 font = painter.font()
                 font.setPixelSize(max(10, min(14, int(12 * self._zoom ** 0.3))))
                 font.setBold(True)
                 painter.setFont(font)
                 painter.setPen(QPen(QColor(0, 0, 0), 3))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
-                lbl_color = QColor(255, 200, 0) if ann.inferred else QColor(255, 255, 255)
+                if ann.inferred:
+                    lbl_color = (QColor(255, 255, 255) if ai == under_review
+                                 else QColor(255, 200, 0))
+                else:
+                    lbl_color = QColor(r, g, b).lighter(140)
                 painter.setPen(QPen(lbl_color))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
+                fm = QFontMetrics(font)
+                self._label_rects[ai] = QRectF(wcx - 6, wcy - 5 - fm.ascent() - 2,
+                                               fm.horizontalAdvance(label) + 14, fm.height() + 9)
 
         if self._drawing_active:
             if self.drawing_mode == "manual":
@@ -2056,6 +2075,22 @@ class TrainWorker(QThread):
                 os.close(_null_fd)
 
 
+def _drop_overlapping(detections: list, shape, max_overlap: float = 0.5) -> list:
+    """One mask per animal: drop a predicted mask that is mostly (more than
+    ``max_overlap`` of its area) inside a higher-scoring one. The first zone
+    model stacked masks on masks."""
+    from .mask_tracker_annotator import segmentation_to_mask
+    kept, kept_masks = [], []
+    for d in sorted(detections, key=lambda d: -d.get("score", 0.0)):
+        m = segmentation_to_mask(d["segmentation"], shape[0], shape[1]).astype(bool)
+        area = int(m.sum())
+        if area and any(np.count_nonzero(m & k) > max_overlap * area for k in kept_masks):
+            continue
+        kept.append(d)
+        kept_masks.append(m)
+    return kept
+
+
 class PostTrainInferenceWorker(QThread):
     """Run the trained model on unlabeled frames and emit inferred annotations."""
     progress = pyqtSignal(int, int)  # current_frame, total_frames
@@ -2161,6 +2196,7 @@ class PostTrainInferenceWorker(QThread):
                         "score": score,
                     })
 
+                detections = _drop_overlapping(detections, img_rgb.shape[:2])
                 if detections:
                     filename = os.path.basename(path)
                     self.frame_result.emit(filename, detections)
@@ -3833,6 +3869,7 @@ class MaskTrackerWindow(QMainWindow):
         self._launched: bool = False
         # YOLO input size for the next run; None = the 640 default.
         self._imgsz_override: Optional[int] = None
+        self._mosaic_override: Optional[float] = None
 
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
@@ -3869,7 +3906,8 @@ class MaskTrackerWindow(QMainWindow):
     #: Keys that act on the frame being labeled, whichever widget has focus.
     _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
                       Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_S, Qt.Key_A,
-                      Qt.Key_P, Qt.Key_X, Qt.Key_R, Qt.Key_Escape)
+                      Qt.Key_P, Qt.Key_X, Qt.Key_R, Qt.Key_D, Qt.Key_Delete,
+                      Qt.Key_Escape)
 
     def eventFilter(self, obj, event):
         """Send the labeling keys to the preview from anywhere in this window.
@@ -6589,7 +6627,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_reject_pred.setToolTip(
             "Reject the prediction under review: it is deleted (Ctrl+Z\n"
             "restores it). To fix a nearly right mask instead, use Paint /\n"
-            "Eraser on it or right-click > Edit Mask. Shortcut: R")
+            "Eraser on it or right-click > Edit Mask. Shortcut: R (or D, Delete)")
         self.btn_reject_pred.setStyleSheet(self._review_btn_qss("#8a2c2c", "#a83636"))
         self.btn_reject_pred.clicked.connect(lambda _=False: self._on_review("reject"))
         row1.addWidget(self.btn_reject_pred)
@@ -8538,6 +8576,7 @@ class MaskTrackerWindow(QMainWindow):
             is_inferred = ann.get("inferred", False)
             ann_obj = AnnotationObject(
                 points, cat_name, ann_id=ann["id"], inferred=is_inferred,
+                score=ann.get("score") if is_inferred else None,
             )
             self.preview.annotations.append(ann_obj)
 
@@ -9628,6 +9667,7 @@ class MaskTrackerWindow(QMainWindow):
                 "device": device_choice,
                 "model_variant": model_variant,
                 "imgsz": self._imgsz_override or 640,
+                "aug_mosaic": self._mosaic_override or 0.0,
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
@@ -13533,6 +13573,12 @@ def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
         for chk in (win.chk_aug_scale, win.chk_aug_brightness, win.chk_aug_contrast):
             chk.setChecked(True)
         applied.append(f"aug_rotation={rot}")
+    if getattr(args, "freeze", None) is not None:
+        win.chk_freeze_backbone.setChecked(bool(args.freeze))
+        applied.append(f"freeze_backbone={bool(args.freeze)}")
+    if getattr(args, "mosaic", None) is not None:
+        win._mosaic_override = float(args.mosaic)
+        applied.append(f"mosaic={args.mosaic}")
     if getattr(args, "imgsz", None):
         win._imgsz_override = int(args.imgsz)
         applied.append(f"imgsz={args.imgsz}")
@@ -13574,6 +13620,12 @@ def _launch_parser():
     g.add_argument("--augment", dest="augment", action="store_true", default=None,
                    help="Augment while training: flips, rotation, scale 0.8-1.2, "
                         "brightness and contrast +-10%%.")
+    g.add_argument("--freeze", dest="freeze", action="store_true", default=None,
+                   help="Freeze the backbone (train the heads only).")
+    g.add_argument("--no-freeze", dest="freeze", action="store_false",
+                   help="Train the whole network (the panel freezes the backbone by default).")
+    g.add_argument("--mosaic", type=float,
+                   help="YOLO mosaic augmentation probability (0-1; default 0).")
     g.add_argument("--aug-rotation", dest="aug_rotation", choices=["none", "15", "180"],
                    help="Rotation with --augment: 180 (default; top-down views), "
                         "15 (side views) or none.")

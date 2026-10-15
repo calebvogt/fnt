@@ -357,5 +357,41 @@ def test_a_sam_click_on_a_prediction_replaces_it():
     w.close()
 
 
+def test_overlapping_predictions_keep_the_best_and_labels_pick_and_d_rejects():
+    """The first zone model stacked masks on masks; each prediction now carries
+    its own score in its label, a click on the label picks it, D rejects it."""
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    from fnt.videoTracking.mask_tracker_annotator import mask_to_rle
+    a = np.zeros((48, 64), bool)
+    a[10:30, 10:40] = True
+    b = np.zeros((48, 64), bool)
+    b[12:30, 12:40] = True                         # mostly inside a
+    c = np.zeros((48, 64), bool)
+    c[35:45, 45:60] = True
+    dets = [{"segmentation": mask_to_rle(m), "score": sc} for m, sc in ((b, 0.3), (a, 0.6), (c, 0.4))]
+    kept = G._drop_overlapping(dets, (48, 64))
+    assert [d["score"] for d in kept] == [0.6, 0.4]
+
+    w = window()
+    cat = w._coco.categories[0]["id"]
+    img = w._coco.get_or_add_image(FRAMES[0], 64, 48)
+    w._coco.add_annotation_from_mask(img, cat, a, inferred=True, score=0.6)
+    w._coco.add_annotation_from_mask(img, cat, c, inferred=True, score=0.4)
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    pv.grab()                                     # paint: places the labels
+    assert pv.annotations[1].score == 0.4
+    rect = pv._label_rects[1]
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+        QApplication.sendEvent(pv, QMouseEvent(kind, rect.center(), Qt.LeftButton, buttons, Qt.NoModifier))
+    assert pv.current_prediction() == 1           # picked by its label
+    key(pv, Qt.Key_D, "d")
+    assert len(pv.annotations) == 1 and pv.annotations[0].score == 0.6
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

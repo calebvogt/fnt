@@ -98,6 +98,7 @@ class YOLOInference:
             device=self.device,
             verbose=False,
             retina_masks=True,
+            iou=0.5,       # NMS: one box per animal (Ultralytics' 0.7 kept stacked duplicates)
         )
 
         if not results or len(results) == 0:
