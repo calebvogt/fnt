@@ -11601,7 +11601,7 @@ class MADMainWindow(QMainWindow):
         if harmonics is not None:
             self.chk_post_harmonics.setChecked(bool(harmonics))
 
-    def launch_inference(self, model: str) -> int:
+    def launch_inference(self, model: str, wavs: Optional[List[str]] = None) -> int:
         """Run inference on every recording in the project, as a dictated or
         command-line launch (``--infer``). Returns how many files it started.
 
@@ -11637,7 +11637,10 @@ class MADMainWindow(QMainWindow):
                                if self._project else ""),
             **self._infer_perf_kwargs(),
         )
-        wavs = [w for w in self.audio_files if w and not self._is_missing(w)]
+        # The project's recordings, unless the launch named folders
+        # (--infer-folder): then every wav under them, in the order given.
+        wavs = [w for w in (self.audio_files if wavs is None else wavs)
+                if w and not self._is_missing(w)]
         settings = RunSettings.from_config(cfg)
         manifest_done: set = set()
         root = self._batch_run_root()
@@ -13044,6 +13047,13 @@ class MADMainWindow(QMainWindow):
         folders = self._pick_folders()
         if not folders:
             return
+        self.set_inference_folders(folders)
+
+    def set_inference_folders(self, folders) -> List[str]:
+        """Make ``folders`` (each walked to the bottom) the Folder scope of the
+        next inference run, as Choose Folder(s)... does; returns their wavs,
+        de-duplicated in the order given. Detections are written next to each
+        wav; nothing is added to the project."""
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             wavs, seen = [], set()
@@ -13076,6 +13086,7 @@ class MADMainWindow(QMainWindow):
             self.lbl_infer_folder.setStyleSheet(
                 "color: #c8a05a; font-size: 9px;")
         self._update_run_button()
+        return wavs
 
     def _gather_inference_targets(self) -> List[str]:
         """Wav paths to run inference on, from the Audio-list and Folder scope
@@ -20697,6 +20708,13 @@ def _launch_parser():
                         "recordings already analysed at the same settings. "
                         "Detection settings: the --infer-* flags, else the "
                         "panel's.")
+    p.add_argument("--infer-folder", action="append", default=None,
+                   metavar="DIR",
+                   help="With --infer: run on every wav under DIR (repeatable; "
+                        "folders run in the order given) instead of the "
+                        "project's recordings, as Choose Folder(s)... does. "
+                        "Detections are written next to each wav; nothing is "
+                        "added to the project.")
     p.add_argument("--inference-window-only", action="store_true",
                    help="With --infer: show only the Running Inference "
                         "window (progress, Pause, Stop), not MAD's main "
@@ -20781,6 +20799,12 @@ def main(argv=None):
     if args.inference_window_only and (not args.infer or args.focus):
         parser.error("--inference-window-only needs --infer, and does not "
                      "combine with --focus")
+    if args.infer_folder and (not args.infer or args.focus):
+        parser.error("--infer-folder needs --infer, and does not combine "
+                     "with --focus")
+    for d in args.infer_folder or ():
+        if not os.path.isdir(d):
+            parser.error(f"--infer-folder: no such folder: {d}")
     _host_like_startup()
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
@@ -20826,7 +20850,9 @@ def main(argv=None):
                         merge=args.infer_merge,
                         merge_gap=args.infer_merge_gap,
                         harmonics=args.infer_harmonics)
-                    win.launch_inference(args.infer)
+                    wavs = (win.set_inference_folders(args.infer_folder)
+                            if args.infer_folder else None)
+                    win.launch_inference(args.infer, wavs=wavs)
                 QTimer.singleShot(500, _launch_infer)
         QTimer.singleShot(0, _start)
     if QApplication.instance() is app:

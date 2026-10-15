@@ -380,3 +380,38 @@ def test_command_line_mad_gets_the_launchers_crash_log(monkeypatch):
     monkeypatch.setattr(th, "_suppress_child_consoles", lambda: calls.append("consoles"))
     M._host_like_startup()
     assert calls[:2] == ["fault", "hook"] and "consoles" in calls
+
+
+def test_infer_folder_needs_infer_and_real_folders(tmp_path):
+    for argv in (["--project", "p", "--infer-folder", str(tmp_path)],          # no --infer
+                 ["--project", "p", "--infer", "m", "--infer-folder", str(tmp_path / "nope")]):
+        with pytest.raises(SystemExit):
+            M.main(argv)
+
+
+def test_launch_inference_runs_on_named_files(monkeypatch, tmp_path):
+    import fnt.usv.usv_detector.mad_batch as MB
+    w = gui()
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "weights.pt").write_bytes(b"x")
+    monkeypatch.setattr(w, "audio_files", ["project.wav"])
+    monkeypatch.setattr(w, "_is_missing", lambda p: False)
+    monkeypatch.setattr(MB, "completed_by_settings", lambda *a, **k: set())
+    monkeypatch.setattr(MB, "partition_done", lambda wavs, s, md, **k: (wavs, []))
+    started = {}
+    monkeypatch.setattr(w, "_start_inference",
+                        lambda cfg, wavs, **k: started.update(wavs=wavs))
+    assert w.launch_inference(str(run), wavs=["a.wav", "b.wav"]) == 2
+    assert started["wavs"] == ["a.wav", "b.wav"]
+
+
+def test_inference_folders_keep_the_order_given(tmp_path):
+    w = gui()
+    for t in ("T006", "T005"):
+        (tmp_path / t).mkdir()
+        for k in (1, 2):
+            (tmp_path / t / f"ch{k}_{t}.wav").write_bytes(b"")
+    wavs = w.set_inference_folders([str(tmp_path / "T006"), str(tmp_path / "T005")])
+    assert [os.path.basename(os.path.dirname(p)) for p in wavs] == ["T006", "T006", "T005", "T005"]
+    assert w.chk_scope_folder.isChecked()
