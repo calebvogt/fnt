@@ -8570,7 +8570,10 @@ class MaskTrackerWindow(QMainWindow):
                 ann["segmentation"], dims[0], dims[1]
             )
             if polys:
-                seg = polys[0]
+                # The largest piece: a mask in pieces (a tail cut off by
+                # erasing) showed only its first piece, often the fragment.
+                seg = max(polys, key=lambda q: cv2.contourArea(
+                    np.asarray(q, np.float32).reshape(-1, 2)))
                 for i in range(0, len(seg), 2):
                     points.append((float(seg[i]), float(seg[i + 1])))
             is_inferred = ann.get("inferred", False)

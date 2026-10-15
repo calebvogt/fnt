@@ -393,5 +393,19 @@ def test_overlapping_predictions_keep_the_best_and_labels_pick_and_d_rejects():
     w.close()
 
 
+def test_a_mask_in_pieces_shows_its_largest_piece():
+    w = window()
+    cat = w._coco.categories[0]["id"]
+    m = np.zeros((48, 64), bool)
+    m[2:5, 2:6] = True                            # a small piece first in scan order
+    m[20:40, 20:50] = True                        # the body
+    img = w._coco.get_or_add_image(FRAMES[0], 64, 48)
+    w._coco.add_annotation_from_mask(img, cat, m)
+    w._select_frame_row(0)
+    xs = [p[0] for p in w.preview.annotations[0].points]
+    assert min(xs) >= 19                          # the outline is the body's
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
