@@ -116,6 +116,46 @@ def _iter_legacy_examples(dataset_dir: str) -> Iterator[Dict]:
         yield {"meta": meta, "spec": spec, "mask": mask}
 
 
+#: dataset_source_names() results, keyed by the store's files and versions.
+_SOURCE_NAME_CACHE: Dict[tuple, frozenset] = {}
+
+
+def dataset_source_names(dataset_dir: str) -> frozenset:
+    """Names of the recordings with at least one example in the project store
+    (the h5 and any legacy triplets), read from metadata only.
+
+    reconstruct_file_mask reads the whole store to find one recording's
+    examples. Inference asks that for every recording without a sidecar --
+    on a folder run, every recording -- and against a 600 MB store it cost
+    ~8 s a file: ~4 days of a 42,000-file run spent finding nothing. With this
+    index a recording the store doesn't hold is skipped without a read.
+    Cached per store version (each file's size and mtime), so a store rebuilt
+    at the start of training is read afresh.
+    """
+    from . import fnt_mask_store as _ms
+    d = Path(dataset_dir)
+    h5 = Path(_store_path(dataset_dir))
+    legacy = sorted(d.glob("*.json")) if d.is_dir() else []
+    files = [p for p in [h5, *legacy] if p.is_file()]
+    key = (str(d), tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                         for p in files))
+    hit = _SOURCE_NAME_CACHE.get(key)
+    if hit is not None:
+        return hit
+    names = set()
+    if h5.is_file():
+        for meta in _ms.td_iter_meta(str(h5)):
+            names.add(Path(str(meta.get("source_wav", ""))).name)
+    for j in legacy:
+        try:
+            with open(j) as f:
+                names.add(Path(str(json.load(f).get("source_wav", ""))).name)
+        except Exception:
+            continue
+    _SOURCE_NAME_CACHE[key] = frozenset(names)
+    return _SOURCE_NAME_CACHE[key]
+
+
 def iter_examples(dataset_dir: str) -> Iterator[Dict]:
     """Yield example dicts ``{meta, spec, mask}`` from the consolidated h5 store
     **and** any legacy PNG/JSON triplets (h5 wins on id collision).
@@ -553,7 +593,9 @@ def reconstruct_file_mask(
     target = Path(str(wav_name)).name
 
     def _sources():
-        if dataset_dir:
+        # Only when the store holds this recording at all (an index lookup),
+        # rather than reading the whole store to find nothing.
+        if dataset_dir and target in dataset_source_names(dataset_dir):
             yield from iter_examples(dataset_dir)
         for store in (extra_stores or ()):
             if store and Path(store).is_file():

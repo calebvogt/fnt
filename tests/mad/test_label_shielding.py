@@ -218,6 +218,40 @@ def test_inference_calls_the_shield_with_both_stores():
     assert "_dilate_mask(user_mask > 0, LABEL_SHIELD_PAD)" in src
 
 
+# ----------------------------------------------------------------------
+# Recordings the project store does not hold skip it without a read
+# ----------------------------------------------------------------------
+def test_a_recording_the_store_lacks_is_not_read_for(monkeypatch):
+    """Inference asks for every recording without a sidecar -- on a folder run,
+    all of them -- and reading a 600 MB store to find nothing cost ~8 s each."""
+    from fnt.usv.usv_detector import mad_examples as mx
+    with tempfile.TemporaryDirectory() as d:
+        proj = os.path.join(d, "training_data")
+        os.makedirs(proj)
+        _store(os.path.join(proj, "training_data.h5"), [("a", low_call(), "label", 0)])
+        assert mx.dataset_source_names(proj) == frozenset({WAV})
+        reads = []
+        real = mx.iter_examples
+        monkeypatch.setattr(mx, "iter_examples", lambda dd: (reads.append(dd), real(dd))[1])
+        none = reconstruct_file_mask(proj, "other.wav", (H, 1000))
+        assert not none.any() and reads == []
+        got = reconstruct_file_mask(proj, WAV, (H, 1000))
+        assert got.sum() == low_call().sum() and reads == [proj]
+
+
+def test_the_name_index_follows_a_rebuilt_store():
+    from fnt.usv.usv_detector import mad_examples as mx
+    with tempfile.TemporaryDirectory() as d:
+        proj = os.path.join(d, "training_data")
+        os.makedirs(proj)
+        h5 = os.path.join(proj, "training_data.h5")
+        _store(h5, [("a", low_call(), "label", 0)])
+        assert "new.wav" not in mx.dataset_source_names(proj)
+        ms.td_save_example(h5, np.zeros((H, W), np.uint8), low_call(),
+                           meta(0, "label", "b", wav="new.wav"), "b")
+        assert "new.wav" in mx.dataset_source_names(proj)
+
+
 if __name__ == "__main__":
     import sys
     import traceback
