@@ -3951,13 +3951,13 @@ class MaskTrackerWindow(QMainWindow):
             "for Change Class if you picked the wrong one."
         )
         self.lbl_active_class.setToolTip(_tip_active_class)
-        info_layout.addWidget(self.lbl_active_class)
+        self._tools_class_row.addWidget(self.lbl_active_class)
         self.combo_active_class = QComboBox()
         self.combo_active_class.setToolTip(_tip_active_class)
         self.combo_active_class.setMinimumWidth(90)
-        info_layout.addWidget(self.combo_active_class)
+        self._tools_class_row.addWidget(self.combo_active_class, 1)
 
-        self.btn_sam_toggle = QPushButton("SAM Labeling (M)")
+        self.btn_sam_toggle = QPushButton("SAM (M)")
         self.btn_sam_toggle.setCheckable(True)
         self.btn_sam_toggle.setChecked(False)
         self.btn_sam_toggle.setToolTip(
@@ -3982,14 +3982,14 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
         self.btn_sam_toggle.toggled.connect(self._on_sam_toggle)
-        info_layout.addWidget(self.btn_sam_toggle)
+        self._tools_row.addWidget(self.btn_sam_toggle)
 
         self.btn_sam_model = QPushButton("...")
         self.btn_sam_model.setFixedWidth(28)
         self.btn_sam_model.setToolTip("Change the SAM2 model used for AI labeling.")
         self.btn_sam_model.setStyleSheet(self._sam_toggle_off_style)
         self.btn_sam_model.clicked.connect(self._choose_sam2_model)
-        info_layout.addWidget(self.btn_sam_model)
+        self._tools_row.addWidget(self.btn_sam_model)
 
         self.btn_paint = QPushButton("Paint (P)")
         self.btn_paint.setCheckable(True)
@@ -4000,7 +4000,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_paint.setStyleSheet(self._sam_toggle_off_style)
         self.btn_paint.clicked.connect(
             lambda checked: self._set_object_tool("paint" if checked else None))
-        info_layout.addWidget(self.btn_paint)
+        self._tools_row.addWidget(self.btn_paint)
 
         self.btn_erase = QPushButton("Eraser (X)")
         self.btn_erase.setCheckable(True)
@@ -4010,7 +4010,24 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_erase.setStyleSheet(self._sam_toggle_off_style)
         self.btn_erase.clicked.connect(
             lambda checked: self._set_object_tool("erase" if checked else None))
-        info_layout.addWidget(self.btn_erase)
+        self._tools_row.addWidget(self.btn_erase)
+        for btn in (self.btn_sam_toggle, self.btn_paint, self.btn_erase):
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.btn_clear_objects = QPushButton("Clear (Esc)")
+        self.btn_clear_objects.setToolTip(
+            "Drop the pending (unsaved) objects on this frame; the tool stays on.")
+        self.btn_clear_objects.clicked.connect(self._clear_pending_objects)
+        self._tools_edit_row.addWidget(self.btn_clear_objects)
+        self.btn_undo_tool = QPushButton("Undo (U)")
+        self.btn_undo_tool.setToolTip(
+            "Undo the last SAM click or Paint / Eraser stroke. Shortcut: U\n"
+            "(Ctrl+Z undoes saved masks.)")
+        self.btn_undo_tool.clicked.connect(self._undo_tool_step)
+        self._tools_edit_row.addWidget(self.btn_undo_tool)
+        for btn in (self.btn_clear_objects, self.btn_undo_tool):
+            btn.setStyleSheet(self._sam_toggle_off_style)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.btn_skip_frame = QPushButton("Skip (S)")
         self.btn_skip_frame.setToolTip(
@@ -4024,9 +4041,9 @@ class MaskTrackerWindow(QMainWindow):
             "QPushButton:hover { background-color: #6a6a6a; }"
         )
         self.btn_skip_frame.clicked.connect(lambda _=False: self._skip_frame())
-        info_layout.addWidget(self.btn_skip_frame)
+        self._queue_review_row.addWidget(self.btn_skip_frame)
 
-        self.btn_empty_frame = QPushButton("Mark as Empty Frame")
+        self.btn_empty_frame = QPushButton("Mark as Empty Frame (E)")
         self.btn_empty_frame.setCheckable(True)
         self.btn_empty_frame.setToolTip(
             "Mark this frame as holding no object (E).\n\n"
@@ -4049,9 +4066,11 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.btn_empty_frame.setStyleSheet(self._empty_off_style)
         self.btn_empty_frame.clicked.connect(lambda _=False: self._toggle_empty_frame())
-        info_layout.addWidget(self.btn_empty_frame)
+        self._queue_review_row.addWidget(self.btn_empty_frame)
+        for btn in (self.btn_skip_frame, self.btn_empty_frame):
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.btn_edit_classes = QPushButton("Edit Object Classes")
+        self.btn_edit_classes = QPushButton("Edit Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
             "padding: 3px 6px; border-radius: 3px; }"
@@ -4062,7 +4081,7 @@ class MaskTrackerWindow(QMainWindow):
             "(e.g. 'mouse'). These become the segmentation model's classes."
         )
         self.btn_edit_classes.clicked.connect(self._edit_classes)
-        info_layout.addWidget(self.btn_edit_classes)
+        self._tools_class_row.addWidget(self.btn_edit_classes)
 
         self.lbl_zoom_info = QLabel("100%")
         self.lbl_zoom_info.setStyleSheet("color: #999999;")
@@ -4072,11 +4091,7 @@ class MaskTrackerWindow(QMainWindow):
 
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
-            self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
-            self.lbl_active_class, self.combo_active_class,
-            self.btn_sam_toggle, self.btn_sam_model, self.btn_paint, self.btn_erase,
-            self.btn_skip_frame, self.btn_empty_frame,
-            self.btn_edit_classes, self.lbl_zoom_info,
+            self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats, self.lbl_zoom_info,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -4346,6 +4361,7 @@ class MaskTrackerWindow(QMainWindow):
         self._create_videos_section(layout)
         self._create_extraction_section(layout)
         self._create_frames_section(layout)
+        self._create_labeling_tools_section(layout)
 
         # Help text
         info = QLabel(
@@ -6061,6 +6077,7 @@ class MaskTrackerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _create_videos_section(self, layout):
         group = QGroupBox("Source Videos")
+        self._grp_videos = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -6117,6 +6134,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _create_extraction_section(self, layout):
         group = QGroupBox("Frame Extraction")
+        self._grp_extraction = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -6217,6 +6235,25 @@ class MaskTrackerWindow(QMainWindow):
         group.setLayout(vbox)
         layout.addWidget(group)
 
+    def _create_labeling_tools_section(self, layout):
+        """The labeling tools, in the left column as in MAD: SAM, Paint and
+        Eraser; Clear and Undo; the class new masks get. The bar under the
+        preview kept only the mode, frame and zoom. _build_ui makes the
+        buttons with the preview's other controls and places them here."""
+        group = QGroupBox("Labeling Tools")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+        self._tools_row = QHBoxLayout()
+        self._tools_row.setSpacing(2)
+        self._tools_edit_row = QHBoxLayout()
+        self._tools_edit_row.setSpacing(2)
+        self._tools_class_row = QHBoxLayout()
+        self._tools_class_row.setSpacing(4)
+        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row):
+            vbox.addLayout(row)
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
     def _create_frames_section(self, layout):
         group = QGroupBox("Training Frames Queue")
         vbox = QVBoxLayout()
@@ -6292,6 +6329,13 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_shuffle.toggled.connect(self._on_shuffle_toggled)
         nav_row.addWidget(self.btn_shuffle)
         vbox.addLayout(nav_row)
+
+        # Skip (S) and Mark as Empty Frame (E) sit under the queue, as Skip
+        # sits under MAD's detections list. _build_ui makes the buttons.
+        self._queue_review_row = QHBoxLayout()
+        self._queue_review_row.setSpacing(4)
+        vbox.addLayout(self._queue_review_row)
+        vbox.addSpacing(10)       # keep the delete buttons apart from Skip / Empty
 
         delete_row = QHBoxLayout()
         delete_row.setSpacing(4)
@@ -7359,7 +7403,7 @@ class MaskTrackerWindow(QMainWindow):
         btn.setChecked(empty)
         btn.blockSignals(False)
         btn.setStyleSheet(self._empty_on_style if empty else self._empty_off_style)
-        btn.setText("Marked Empty ✓" if empty else "Mark as Empty Frame")
+        btn.setText("Marked Empty ✓ (E)" if empty else "Mark as Empty Frame (E)")
 
     def _extract_frame_from_video(self):
         if self._video_cap is None or self.current_video_idx < 0:
@@ -7726,6 +7770,10 @@ class MaskTrackerWindow(QMainWindow):
         shown = {os.path.basename(fp) for _, _, fp in self._extracted_frames}
         missing = [n for n in names if n not in shown]
         self.act_show_all_frames.setEnabled(True)
+        # A focus session labels a fixed list: the sections that add videos
+        # and extract frames make room for the queue and the labeling tools.
+        self._grp_videos.setVisible(False)
+        self._grp_extraction.setVisible(False)
         self._set_project_title()
         if self._extracted_frames:
             self._select_frame_row(0)
@@ -7743,6 +7791,8 @@ class MaskTrackerWindow(QMainWindow):
             if self._extracted_frames:
                 self._select_frame_row(0)
         self.act_show_all_frames.setEnabled(False)
+        self._grp_videos.setVisible(True)
+        self._grp_extraction.setVisible(True)
         self._set_project_title()
 
     def _set_project_title(self):
@@ -8411,6 +8461,16 @@ class MaskTrackerWindow(QMainWindow):
             btn.setChecked(mode == name)
             btn.setStyleSheet(self._sam_toggle_on_style if mode == name else self._sam_toggle_off_style)
             btn.blockSignals(False)
+
+    def _clear_pending_objects(self):
+        """Clear: drop the pending objects (Esc with a tool on)."""
+        self.preview._clear_drawing()
+        self.preview.update()
+
+    def _undo_tool_step(self):
+        """Undo: the last SAM click or Paint / Eraser stroke (U)."""
+        if self.preview.undo_ai_click():
+            self._show_sam_pending_status()
 
     def _on_tool_key(self, tool: str):
         """P / X: Paint / Eraser on; the same key again turns it off."""
