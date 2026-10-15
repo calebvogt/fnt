@@ -150,6 +150,35 @@ BEHAVIOR_PRESETS = {
 # ======================================================================
 # Annotation data structures
 # ======================================================================
+class PathLabel(QLabel):
+    """A word-wrapping label that can also break inside paths.
+
+    A plain wrapping QLabel cannot break a path (no spaces), so its minimum
+    width is the whole path: one long project folder widened the Mask tab's
+    content to ~620 px inside a ~360 px panel on Windows and clipped every row.
+    A zero-width space after each separator gives the layout break points;
+    text() still returns what was set.
+    """
+
+    _BREAK_AFTER = ("\\", "/", "_", "-", ".")
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._raw = ""
+        self.setWordWrap(True)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._raw = text or ""
+        shown = self._raw
+        for ch in self._BREAK_AFTER:
+            shown = shown.replace(ch, ch + "​")
+        super().setText(shown)
+
+    def text(self) -> str:
+        return self._raw
+
+
 class AnnotationObject:
     def __init__(self, points: List[Tuple[float, float]], category: str,
                  ann_id: int = -1, is_ai: bool = False, inferred: bool = False):
@@ -3047,8 +3076,7 @@ class MaskTrackerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(self.BASE_TITLE)
-        self.setMinimumSize(1100, 750)
-        self.resize(1400, 900)
+        self._fit_to_screen()
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._project_dir: Optional[str] = None
@@ -3127,6 +3155,24 @@ class MaskTrackerWindow(QMainWindow):
         self._tab_anim_timer = QTimer(self)
         self._tab_anim_timer.timeout.connect(self._update_tab_animations)
         self._tab_anim_timer.start(150)
+
+    def _fit_to_screen(self):
+        """Open at 90% of the screen's free area (at least 1400 x 900 where it
+        fits) and never larger than the screen: the fixed 1400 x 900 with a
+        1100 x 750 minimum hung off the bottom of a 768-px laptop screen and
+        left most of a 1920 x 1080 one unused."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(1100, 750)
+            self.resize(1400, 900)
+            return
+        avail = screen.availableGeometry()
+        self.setMinimumSize(min(1100, avail.width()), min(750, avail.height()))
+        w = min(avail.width(), max(1400, int(avail.width() * 0.9)))
+        h = min(avail.height(), max(900, int(avail.height() * 0.9)))
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2,
+                  avail.y() + (avail.height() - h) // 2)
 
     @staticmethod
     def _build_mouse_sprites() -> list:
@@ -3702,7 +3748,10 @@ class MaskTrackerWindow(QMainWindow):
         # Frame column truncates every long video stem. An offset above
         # min_w (not a second character count) so it still widens when the
         # 300 px floor is what set min_w.
-        init_left = min(max_left, min_w + max(70, fm.averageCharWidth() * 10))
+        # On a wide window give the panel about a quarter of it, so the queue
+        # shows whole frame names (camera, date and frame number).
+        init_left = min(max_left, max(min_w + max(70, fm.averageCharWidth() * 10),
+                                      int(self.width() * 0.27)))
         splitter.setSizes([init_left, 800])
         right_panel.setMinimumWidth(300)
         self.tab_widget.setMaximumWidth(max_left)
@@ -5047,7 +5096,7 @@ class MaskTrackerWindow(QMainWindow):
         model_row.addWidget(btn_refresh_models)
         settings_vbox.addLayout(model_row)
 
-        self.lbl_track_model_info = QLabel("No model selected")
+        self.lbl_track_model_info = PathLabel("No model selected")
         self.lbl_track_model_info.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_track_model_info.setWordWrap(True)
         settings_vbox.addWidget(self.lbl_track_model_info)
@@ -5194,7 +5243,7 @@ class MaskTrackerWindow(QMainWindow):
         row_bcm.addWidget(btn_refresh_cls)
         cls_opts.addLayout(row_bcm)
 
-        self.lbl_behavior_model_info = QLabel("No classifier model found")
+        self.lbl_behavior_model_info = PathLabel("No classifier model found")
         self.lbl_behavior_model_info.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_behavior_model_info.setWordWrap(True)
         cls_opts.addWidget(self.lbl_behavior_model_info)
@@ -5619,7 +5668,7 @@ class MaskTrackerWindow(QMainWindow):
         )
         row = QHBoxLayout()
         row.addWidget(_tipped_label("Output:", tip_output))
-        self.lbl_output_dir = QLabel("(auto)")
+        self.lbl_output_dir = PathLabel("(auto)")
         self.lbl_output_dir.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_output_dir.setWordWrap(True)
         self.lbl_output_dir.setToolTip(tip_output)
@@ -5662,6 +5711,9 @@ class MaskTrackerWindow(QMainWindow):
 
         self.frame_list = QTreeWidget()
         self.frame_list.setMaximumHeight(320)
+        # Shorten names in the middle: the frame number at the end is what
+        # tells neighbouring rows apart, the shared video-stem prefix is not.
+        self.frame_list.setTextElideMode(Qt.ElideMiddle)
         self.frame_list.setColumnCount(3)
         self.frame_list.setHeaderLabels(["Frame", "Annotations", "Conf"])
         self.frame_list.setToolTip(
