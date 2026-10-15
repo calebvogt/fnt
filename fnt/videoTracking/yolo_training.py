@@ -153,6 +153,100 @@ def convert_coco_to_yolo(
     return data_yaml_path
 
 
+#: Validation frames shown in the training window's live preview, at most.
+PREVIEW_TILES = 6
+
+
+def preview_set(yolo_dir: str, n: int = PREVIEW_TILES) -> List[dict]:
+    """The validation frames shown in the training window, fixed for the run
+    so their tiles can be compared epoch to epoch: frames with animals first,
+    then one empty frame if there is room (or one in place of the last).
+    Each holds the frame and its ground-truth mask, drawn from the YOLO
+    labels."""
+    img_dir = os.path.join(yolo_dir, "images", "val")
+    lbl_dir = os.path.join(yolo_dir, "labels", "val")
+    if not os.path.isdir(img_dir):
+        return []
+    with_animals, empty = [], []
+    for name in sorted(os.listdir(img_dir)):
+        lbl = os.path.join(lbl_dir, Path(name).stem + ".txt")
+        lines = []
+        if os.path.exists(lbl):
+            with open(lbl) as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        (with_animals if lines else empty).append((name, lines))
+    chosen = with_animals[:n]
+    if empty:
+        chosen = (chosen[:n - 1] if len(chosen) >= n else chosen) + empty[:max(1, n - len(chosen))]
+    out = []
+    for name, lines in chosen:
+        bgr = cv2.imread(os.path.join(img_dir, name), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        h, w = bgr.shape[:2]
+        gt = np.zeros((h, w), np.uint8)
+        for ln in lines:
+            xy = np.array(ln.split()[1:], float).reshape(-1, 2) * (w, h)
+            cv2.fillPoly(gt, [np.round(xy).astype(np.int32)], 1)
+        out.append({"name": name, "bgr": bgr, "gt": gt > 0, "n_gt": len(lines)})
+    return out
+
+
+def epoch_preview_tiles(weights, frames: List[dict], imgsz: int, device: str,
+                        conf: float = 0.25, size: int = 192):
+    """The model at ``weights`` on the preview frames: one tile per frame,
+    cropped around the animals (true and predicted), with the frame (grey),
+    the ground-truth mask, the predicted mask, Dice over the whole frame
+    (None when the frame has no animal and none was predicted; 0 for a
+    prediction on an empty frame) and the counts. Returns (tiles, mean Dice
+    over the frames with animals)."""
+    if not weights or not os.path.exists(str(weights)) or not frames:
+        return [], None
+    from ultralytics import YOLO
+    model = YOLO(str(weights))
+    results = model.predict([f["bgr"] for f in frames], imgsz=imgsz, conf=conf,
+                            device=device, retina_masks=True, verbose=False)
+    tiles, dices = [], []
+    for f, r in zip(frames, results):
+        gt = f["gt"]
+        h, w = gt.shape
+        pred = np.zeros((h, w), bool)
+        n_pred = 0
+        if r.masks is not None and len(r.masks):
+            m = r.masks.data.cpu().numpy() > 0.5
+            if m.shape[1:] != (h, w):
+                m = np.stack([cv2.resize(x.astype(np.uint8), (w, h),
+                                         interpolation=cv2.INTER_NEAREST) > 0 for x in m])
+            pred = m.any(axis=0)
+            n_pred = len(m)
+        if gt.any():
+            dice = float(2 * np.count_nonzero(gt & pred) / (gt.sum() + pred.sum()))
+            dices.append(dice)
+        else:
+            dice = 0.0 if pred.any() else None
+        ys, xs = np.nonzero(gt | pred)
+        if ys.size:
+            x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+            pad = max(24, int(0.25 * max(x1 - x0, y1 - y0)))
+            x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+            x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+        else:
+            x0, y0, x1, y1 = 0, 0, w, h
+        scale = size / max(x1 - x0, y1 - y0)
+        tw, th = max(1, round((x1 - x0) * scale)), max(1, round((y1 - y0) * scale))
+        grey = cv2.cvtColor(f["bgr"][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        tiles.append({
+            "name": f["name"],
+            "img": cv2.resize(grey, (tw, th), interpolation=cv2.INTER_AREA),
+            "gt": cv2.resize(gt[y0:y1, x0:x1].astype(np.uint8), (tw, th),
+                             interpolation=cv2.INTER_NEAREST) > 0,
+            "pred": cv2.resize(pred[y0:y1, x0:x1].astype(np.uint8), (tw, th),
+                               interpolation=cv2.INTER_NEAREST) > 0,
+            "dice": dice, "n_gt": f["n_gt"], "n_pred": n_pred,
+        })
+    return tiles, (float(np.mean(dices)) if dices else None)
+
+
 def _resolve_device(pref: str) -> str:
     """Resolve training device preference to an available backend."""
     import torch
@@ -205,6 +299,9 @@ def train_yolo_seg(
     )
 
     device = _resolve_device(cfg.device)
+    # The training window's live preview: fixed validation frames, re-predicted
+    # by each epoch's weights (as MAD's training window does).
+    preview_frames = preview_set(yolo_data_dir) if progress else []
 
     # --- Diagnostic info ---
     print(f"[YOLO Train] Python: {platform.python_version()}  |  "
@@ -330,6 +427,15 @@ def train_yolo_seg(
                 **map_vals,
             }
             progress(epoch, total, metrics)
+            if preview_frames:
+                try:
+                    tiles, mean_dice = epoch_preview_tiles(
+                        getattr(trainer, "last", None), preview_frames, cfg.imgsz, device)
+                    if tiles:
+                        progress(epoch, total, {"status": "epoch_preview", "epoch": epoch,
+                                                "tiles": tiles, "val_dice": mean_dice})
+                except Exception as exc:     # previews are best-effort; never break a run
+                    print(f"\n[YOLO Train] preview skipped: {exc}")
         if should_stop and should_stop():
             trainer.stop = True
 

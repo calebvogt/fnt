@@ -28,7 +28,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
-    QGroupBox, QSpinBox, QComboBox, QDialog, QAction, QMenuBar,
+    QGroupBox, QSpinBox, QComboBox, QDialog, QGridLayout, QAction, QMenuBar,
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
@@ -1804,6 +1804,169 @@ class AugmentWorker(QThread):
             self.finished.emit(out_path)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class SegPreviewPanel(QWidget):
+    """Per-epoch prediction previews, as in MAD's training window: each epoch
+    adds a page of tiles (a fixed set of validation frames, so a tile can be
+    compared epoch to epoch) with the ground-truth outline, the predicted mask
+    and that frame's Dice. Scrub back through earlier epochs; follows the
+    latest unless you scroll back or untick Follow latest."""
+
+    MAX_HISTORY = 150
+    COLUMNS = 3
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages: List[Tuple[int, Optional[float], list]] = []
+        self._view = 0
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_latest = QPushButton("Latest")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.chk_follow = QCheckBox("Follow latest")
+        self.chk_follow.setChecked(True)
+        self.btn_prev.clicked.connect(lambda: self._go(self._view - 1))
+        self.btn_next.clicked.connect(lambda: self._go(self._view + 1))
+        self.btn_latest.clicked.connect(lambda: self._go(len(self._pages) - 1))
+        self.slider.valueChanged.connect(self._go)
+        for wdg in (self.btn_prev, self.slider, self.btn_next, self.btn_latest, self.chk_follow):
+            nav.addWidget(wdg, 1 if wdg is self.slider else 0)
+        v.addLayout(nav)
+        self.lbl = QLabel("Waiting for the first epoch…")
+        self.lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
+        v.addWidget(self.lbl)
+        legend = QLabel("<span style='color:#39ff88'>▢ outline = your mask</span>"
+                        "&nbsp;&nbsp;&nbsp;<span style='color:#ff6666'>■ fill = predicted</span>")
+        legend.setStyleSheet("font-size: 10px;")
+        legend.setToolTip(
+            "Each tile is a held-out validation frame (never trained on), the\n"
+            "same frames every epoch. Green outline: the mask you drew. Red fill:\n"
+            "what the model predicts (confidence >= 0.25). Red inside green is\n"
+            "right; red outside green is a false detection; green without red is\n"
+            "a miss. dice = 2 x overlap / (predicted + labeled pixels), over the\n"
+            "whole frame. A frame with no animal shows 'empty': any red there is\n"
+            "a false detection.")
+        v.addWidget(legend)
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setSpacing(6)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._grid_host)
+        v.addWidget(scroll, 1)
+
+    def clear(self):
+        self._pages.clear()
+        self._view = 0
+        self.slider.setRange(0, 0)
+        self.lbl.setText("Waiting for the first epoch…")
+        self._render()
+
+    def add_page(self, epoch: int, val_dice: Optional[float], tiles: list):
+        self._pages.append((epoch, val_dice, tiles))
+        if len(self._pages) > self.MAX_HISTORY:
+            self._pages.pop(0)
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, len(self._pages) - 1)
+        self.slider.blockSignals(False)
+        if self.chk_follow.isChecked():
+            self._go(len(self._pages) - 1)
+        else:
+            self._update_label()
+
+    def _go(self, i: int):
+        if not self._pages:
+            return
+        i = max(0, min(int(i), len(self._pages) - 1))
+        self._view = i
+        self.chk_follow.setChecked(i == len(self._pages) - 1)
+        self.slider.blockSignals(True)
+        self.slider.setValue(i)
+        self.slider.blockSignals(False)
+        self._update_label()
+        self._render()
+
+    def _update_label(self):
+        if not self._pages:
+            return
+        epoch, d, tiles = self._pages[self._view]
+        self.lbl.setText(
+            f"Epoch {epoch}  ·  mean Dice {d:.3f} over the frames with animals"
+            if d is not None else f"Epoch {epoch}")
+
+    @staticmethod
+    def tile_pixmap(t: dict) -> QPixmap:
+        rgb = cv2.cvtColor(t["img"], cv2.COLOR_GRAY2RGB)
+        if t["pred"].any():
+            over = rgb.copy()
+            over[t["pred"]] = (255, 80, 80)
+            rgb = cv2.addWeighted(over, 0.45, rgb, 0.55, 0)
+        if t["gt"].any():
+            cs, _ = cv2.findContours(t["gt"].astype(np.uint8), cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(rgb, cs, -1, (57, 255, 136), 1)
+        rgb = np.ascontiguousarray(rgb)
+        h, w = rgb.shape[:2]
+        return QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
+
+    @staticmethod
+    def tile_title(t: dict) -> str:
+        found = f"{t['n_pred']} found"
+        if t["n_gt"] == 0:
+            return "empty · " + ("clean" if t["dice"] is None else f"{found} (false)")
+        return f"dice {t['dice']:.2f} · {t['n_gt']} labeled, {found}"
+
+    def _render(self):
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        if not self._pages:
+            return
+        for k, t in enumerate(self._pages[self._view][2]):
+            cell = QWidget()
+            cv = QVBoxLayout(cell)
+            cv.setContentsMargins(0, 0, 0, 0)
+            cv.setSpacing(2)
+            title = QLabel(self.tile_title(t))
+            ok = t["dice"] is None or (t["n_gt"] and t["dice"] >= 0.7)
+            title.setStyleSheet(f"color: {'#cccccc' if ok else '#ff9e80'}; font-size: 10px;")
+            title.setToolTip(t["name"])
+            img = QLabel()
+            img.setPixmap(self.tile_pixmap(t))
+            img.setToolTip(t["name"])
+            cv.addWidget(title)
+            cv.addWidget(img)
+            self._grid.addWidget(cell, k // self.COLUMNS, k % self.COLUMNS)
+
+
+class SegTrainingWindow(QDialog):
+    """The segmentation training window, popped out like MAD's: the loss/mAP
+    graph and the log on the left, the per-epoch prediction previews on the
+    right. Closing it hides it; training goes on, and Show Training Window
+    (Train panel) brings it back."""
+
+    def __init__(self, main, graph_panel: QWidget, preview_panel: QWidget):
+        super().__init__(main)
+        self.setModal(False)
+        self.setWindowTitle("Segmentation Training")
+        # An ordinary top-level window (not kept above the main window).
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+        split = QSplitter(Qt.Horizontal, self)
+        split.addWidget(graph_panel)
+        split.addWidget(preview_panel)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.addWidget(split)
+        self.resize(1500, 860)
+        split.setSizes([800, 700])      # previews get room for three columns
 
 
 class TrainWorker(QThread):
@@ -4338,8 +4501,9 @@ class MaskTrackerWindow(QMainWindow):
         btn_copy_seg_log.clicked.connect(self._copy_seg_train_log)
         training_viz_layout.addWidget(btn_copy_seg_log)
 
-        self._training_viz_panel.setVisible(False)
-        right_layout.addWidget(self._training_viz_panel, 1)
+        self._seg_preview_panel = SegPreviewPanel()
+        self._seg_train_window = SegTrainingWindow(
+            self, self._training_viz_panel, self._seg_preview_panel)
 
         # Classifier training visualization panel (hidden by default)
         self._cls_training_viz_panel = QWidget()
@@ -5112,6 +5276,14 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.btn_train.clicked.connect(self._start_training)
         train_vbox.addWidget(self.btn_train)
+
+        self.btn_show_train_window = QPushButton("Show Training Window")
+        self.btn_show_train_window.setToolTip(
+            "Bring back the training window: loss and mAP graph, log, and the\n"
+            "per-epoch prediction previews with Dice.")
+        self.btn_show_train_window.setEnabled(False)
+        self.btn_show_train_window.clicked.connect(lambda _=False: self._show_seg_train_window())
+        train_vbox.addWidget(self.btn_show_train_window)
 
         self.train_progress = QProgressBar()
         self.train_progress.setToolTip("Training progress across the configured iterations.")
@@ -9580,10 +9752,18 @@ class MaskTrackerWindow(QMainWindow):
         self._train_worker.error.connect(self._on_train_error)
         self._train_worker.start()
 
-        self._training_viz_panel.setVisible(True)
-        self.preview.setVisible(False)
-        self._scrubber_row.setVisible(False)
-        self._info_row.setVisible(False)
+        self._seg_preview_panel.clear()
+        title = "Segmentation Training"
+        if self._project_dir:
+            title += f" — {os.path.basename(self._project_dir)}"
+        self._seg_train_window.setWindowTitle(title)
+        self._show_seg_train_window()
+        self.btn_show_train_window.setEnabled(True)
+
+    def _show_seg_train_window(self):
+        self._seg_train_window.show()
+        self._seg_train_window.raise_()
+        self._seg_train_window.activateWindow()
 
     def _toggle_pause(self):
         if not hasattr(self, "_train_worker") or not self._train_worker.isRunning():
@@ -9611,6 +9791,10 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_train_status.setText("Stopping training...")
 
     def _on_train_progress(self, iteration: int, total: int, metrics: dict):
+        if metrics.get("status") == "epoch_preview":
+            self._seg_preview_panel.add_page(
+                metrics.get("epoch", iteration), metrics.get("val_dice"), metrics["tiles"])
+            return
         self.train_progress.setValue(iteration)
         loss = metrics.get("loss", 0.0)
         self.lbl_train_status.setText(f"Iteration {iteration}/{total}  —  loss: {loss:.4f}")
@@ -9633,11 +9817,8 @@ class MaskTrackerWindow(QMainWindow):
         self._seg_log_text.append("  ".join(parts))
 
     def _dismiss_training_viz(self):
-        if self._training_viz_panel.isVisible():
-            self._training_viz_panel.setVisible(False)
-            self.preview.setVisible(True)
-            self._scrubber_row.setVisible(True)
-            self._info_row.setVisible(True)
+        """The training graph lives in its own window now; the main window's
+        preview stays up throughout, so there is nothing to swap back."""
 
     def _on_train_finished(self, summary: dict):
         self.btn_pause.setVisible(False)
@@ -13049,19 +13230,11 @@ class MaskTrackerWindow(QMainWindow):
         )
         self._preview_title_row.setVisible(is_classifier)
         # Check if mask model training is in progress
-        mask_training_active = (
-            hasattr(self, "_train_worker")
-            and self._train_worker is not None
-            and self._train_worker.isRunning()
-        )
-        mask_show_viz = is_annotation and mask_training_active
-
         # Classifier training loss panel
         self._cls_training_viz_panel.setVisible(cls_show_loss or cls_graph_visible)
-        # Mask training visualization panel
-        self._training_viz_panel.setVisible(mask_show_viz)
-        # Preview + info row: hidden during any training viz
-        show_preview = not cls_show_loss and not cls_graph_visible and not mask_show_viz
+        # (Mask training has its own window.) Preview + info row: hidden while
+        # the classifier graph is up.
+        show_preview = not cls_show_loss and not cls_graph_visible
         self.preview.setVisible(show_preview)
         self._scrubber_row.setVisible(is_annotation and show_preview)
         self._info_row.setVisible(show_preview)
