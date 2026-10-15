@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
-    QTextEdit, QSplitter, QToolTip,
+    QTextEdit, QSplitter, QToolTip, QAbstractSpinBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer, QSettings
 from PyQt5.QtGui import (
@@ -332,6 +332,7 @@ class AnnotationPreviewWidget(QWidget):
     category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
     empty_frame_requested = pyqtSignal()       # N: mark / unmark the frame empty
     sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
+    e_key_requested = pyqtSignal()             # E: empty frame (queue) / extract (video)
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -810,6 +811,9 @@ class AnnotationPreviewWidget(QWidget):
             self.empty_frame_requested.emit()
         elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
             self.sam_toggle_requested.emit()
+        elif event.key() == Qt.Key_E and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            self.e_key_requested.emit()
         elif Qt.Key_1 <= event.key() <= Qt.Key_9:
             self.category_hotkey.emit(event.key() - Qt.Key_1)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
@@ -3101,6 +3105,9 @@ class MaskTrackerWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(self.BASE_TITLE)
         self._fit_to_screen()
+        # Labeling keys reach the frame whatever was clicked last (see
+        # eventFilter).
+        QApplication.instance().installEventFilter(self)
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._project_dir: Optional[str] = None
@@ -3179,6 +3186,38 @@ class MaskTrackerWindow(QMainWindow):
         self._tab_anim_timer = QTimer(self)
         self._tab_anim_timer.timeout.connect(self._update_tab_animations)
         self._tab_anim_timer.start(150)
+
+    #: Keys that act on the frame being labeled, whichever widget has focus.
+    _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
+                      Qt.Key_E, Qt.Key_M, Qt.Key_A, Qt.Key_Escape)
+
+    def eventFilter(self, obj, event):
+        """Send the labeling keys to the preview from anywhere in this window.
+
+        Keys only reach the widget with keyboard focus. After a click on the
+        Mark as Empty Frame button, the frame list or any other control, Space
+        pressed that control (unmarking the frame it had just marked) or did
+        nothing, instead of moving to the next frame. Text entry -- spin boxes,
+        line edits, editable combos -- keeps its keys.
+        """
+        if (event.type() == event.KeyPress and isinstance(obj, QWidget)
+                and obj is not self.preview and obj.window() is self
+                and event.key() in self._LABELING_KEYS
+                and self.tab_widget.currentIndex() == 0
+                and self.preview.annotation_keys_enabled
+                and not isinstance(obj, (QLineEdit, QAbstractSpinBox, QTextEdit))
+                and not (isinstance(obj, QComboBox) and obj.isEditable())):
+            self.preview.setFocus(Qt.OtherFocusReason)
+            self.preview.keyPressEvent(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_e_key(self):
+        """E: mark the queue frame empty; in a source video, extract the frame."""
+        if self._annot_in_video_mode and self._video_cap is not None:
+            self._extract_frame_from_video()
+        else:
+            self._toggle_empty_frame()
 
     def _fit_to_screen(self):
         """Open at 90% of the screen's free area (at least 1400 x 900 where it
@@ -3439,6 +3478,7 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.timeline_advance_requested.connect(self._on_timeline_advance)
         self.preview.empty_frame_requested.connect(self._toggle_empty_frame)
         self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
+        self.preview.e_key_requested.connect(self._on_e_key)
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3568,7 +3608,7 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_empty_frame = QPushButton("Mark as Empty Frame")
         self.btn_empty_frame.setCheckable(True)
         self.btn_empty_frame.setToolTip(
-            "Mark this frame as holding no object (N).\n\n"
+            "Mark this frame as holding no object (E or N).\n\n"
             "An empty frame counts as reviewed: it trains as a background\n"
             "image (negative example), Enter skips it, and post-training\n"
             "inference leaves it alone. Marking drops the frame's pending\n"
@@ -3895,11 +3935,11 @@ class MaskTrackerWindow(QMainWindow):
             "  Enter commits, Esc cancels; new masks are locked out until then.\n"
             "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
-            "N = mark the frame empty (no object); it trains as a background.\n"
+            "E or N = mark the frame empty (no object); it trains as a background.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
             "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
-            "E = extract current video frame to Training Frames Queue."
+            "In a source video (arrow keys), E extracts the frame to the queue."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
         info.setWordWrap(True)

@@ -193,5 +193,35 @@ def test_space_continues_through_the_queue_instead_of_wrapping(monkeypatch):
     w.close()
 
 
+def key(widget, k, text=""):
+    from PyQt5.QtCore import QEvent, Qt  # noqa: F401
+    from PyQt5.QtGui import QKeyEvent
+    QApplication.sendEvent(widget, QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier, text))
+
+
+def test_labeling_keys_work_after_clicking_a_button_or_the_list(monkeypatch):
+    """Space after clicking Mark as Empty Frame used to press that button again
+    (unmarking the frame) instead of moving on; keys go to the preview now."""
+    from PyQt5.QtCore import Qt
+    w = window()
+    w._select_frame_row(0)
+    w._toggle_empty_frame()                         # mark frame 0 empty -> moves to 1
+    w._select_frame_row(0)
+    monkeypatch.setattr(w, "_scrubber_source", lambda: None)   # no timeline: Space walks the queue
+    key(w.btn_empty_frame, Qt.Key_Space, " ")       # Space with the button focused
+    assert w._coco.is_image_empty(FRAMES[0])        # not unmarked
+    assert w.current_frame_idx != 0                 # moved on
+
+    w._select_frame_row(2)
+    key(w.frame_list, Qt.Key_E, "e")                # E with the frame list focused
+    assert w._coco.is_image_empty(FRAMES[2])
+
+    # Text entry keeps its keys.
+    before = w.spin_batch.value()
+    key(w.spin_batch, Qt.Key_E, "e")
+    assert w.spin_batch.value() == before
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
