@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -662,8 +663,20 @@ class COCOAnnotationManager:
             "categories": self.categories,
         }
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w") as f:
+        # Write, then rename over the old file: the labels are saved on every
+        # action, so a crash or a dropped network drive mid-write would
+        # otherwise leave a truncated annotations.json.
+        tmp = output_path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, output_path)
+                break
+            except PermissionError:     # Windows: the file is open elsewhere
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
     def load(self, json_path: str):
         with open(json_path) as f:

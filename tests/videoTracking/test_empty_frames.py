@@ -56,6 +56,29 @@ def test_marking_empty_drops_pending_and_refuses_accepted():
     assert not c.is_image_empty("pend.png")
 
 
+def test_a_failed_save_leaves_the_previous_file_whole(monkeypatch):
+    """Labels are saved on every action; a save that dies mid-write must not
+    truncate annotations.json."""
+    c, cat = manager()
+    c.add_annotation_from_mask(c.get_or_add_image("a.png", 64, 48), cat, square_mask())
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "annotations.json")
+        c.export(path)
+        before = open(path).read()
+        c.add_annotation_from_mask(c.get_or_add_image("b.png", 64, 48), cat, square_mask())
+
+        def dies(*a, **k):
+            raise OSError("network drive dropped")
+        monkeypatch.setattr(json, "dump", dies)
+        with pytest.raises(OSError):
+            c.export(path)
+        assert open(path).read() == before
+        monkeypatch.undo()
+        c.export(path)
+        assert len(json.load(open(path))["images"]) == 2
+        assert os.listdir(d) == ["annotations.json"]
+
+
 def test_a_mask_drawn_later_wins_over_the_empty_flag():
     c, cat = manager()
     img = c.set_image_empty("f.png", 64, 48)
