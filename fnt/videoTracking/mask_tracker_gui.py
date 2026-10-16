@@ -2931,8 +2931,8 @@ class _ClassifierTrainWorker(QThread):
         from torchvision import transforms, models
 
         from .behavior_classifier import (
-            INPUT_KIND_SCENE, build_scene_model, feature_stats,
-            normalize_features,
+            INPUT_KIND_SCENE, build_scene_model, classification_report,
+            feature_stats, grouped_split, normalize_features,
         )
         from .silhouette_extractor import (
             PAIRWISE_FIELDS, load_clip_masks_npz, scene_sample_from_clip,
@@ -2971,6 +2971,8 @@ class _ClassifierTrainWorker(QThread):
         images: list = []
         vectors: list = []
         kept_labels: list = []
+        kept_videos: list = []
+        kept_clips: list = []
         n_social = 0
         cache: Dict[str, Dict] = {}
         for sample, label in zip(samples, labels):
@@ -2991,6 +2993,8 @@ class _ClassifierTrainWorker(QThread):
             images.append(scene)
             vectors.append(vec)
             kept_labels.append(label)
+            kept_videos.append(sample.get("video") or "")
+            kept_clips.append(clip_dir)
             if len(masks_dict) > 1:
                 n_social += 1
         cache.clear()
@@ -3055,28 +3059,53 @@ class _ClassifierTrainWorker(QThread):
             if aug_list:
                 aug_transform = transforms.Compose(aug_list)
 
-        n_total = len(images)
-        n_val = max(1, int(n_total * val_split)) if val_split > 0 else 0
-
-        if n_val > 0:
-            import random as _rnd
-            from collections import defaultdict as _ddict
-            per_class: dict[int, list[int]] = _ddict(list)
-            for i, lbl in enumerate(labels):
-                per_class[lbl].append(i)
-
-            train_idx, val_idx = [], []
-            for cls_id, idxs in per_class.items():
-                _rnd.shuffle(idxs)
-                n_cls_val = max(1, int(len(idxs) * val_split))
-                val_idx.extend(idxs[:n_cls_val])
-                train_idx.extend(idxs[n_cls_val:])
-
-            if not train_idx:
-                train_idx = val_idx[:]
-        else:
-            train_idx = list(range(n_total))
+        # Whole source videos are held out, never individual samples: the same
+        # huddle seen from each of its two mice, or the next clip of the same
+        # session, would otherwise sit on both sides of the split and score
+        # memory of the session instead of recognition of the behaviour.
+        train_idx, val_idx, split_info = grouped_split(
+            labels, kept_videos, kept_clips, val_split,
+            seed=int(self.config.get("split_seed", 0)),
+        )
+        if not train_idx:
+            train_idx = val_idx[:]
             val_idx = []
+        if val_idx:
+            held = split_info["val_units"]
+            if split_info["unit"] == "video":
+                self.log_message.emit(
+                    f"[Classifier] Validation: {len(held)} of "
+                    f"{split_info['n_units']} source videos held out whole"
+                )
+                for v in held:
+                    self.log_message.emit(f"[Classifier]   val video: {v}")
+            else:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ All clips come from one video, so validation "
+                    f"holds out {len(held)} whole clips of that video. The score is "
+                    f"optimistic: label clips from more videos for an honest one."
+                )
+        for c in split_info["train_only_classes"]:
+            self.log_message.emit(
+                f"[Classifier] ⚠ '{class_names[c]}' comes from a single "
+                f"{split_info['unit']}, so it stays in training and is not validated."
+            )
+        for c in split_info["classes_without_val"]:
+            if c not in split_info["train_only_classes"] and val_idx:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ '{class_names[c]}' has no validation examples."
+                )
+        with open(os.path.join(output_dir, "split.json"), "w") as f:
+            json.dump({
+                "unit": split_info["unit"],
+                "seed": split_info["seed"],
+                "val_fraction": val_split,
+                "val_units": split_info["val_units"],
+                "per_class": {class_names[c]: v
+                              for c, v in split_info["per_class"].items()},
+                "train_only_classes": [class_names[c]
+                                       for c in split_info["train_only_classes"]],
+            }, f, indent=2)
 
         # Whitening statistics come from the training split alone, so the
         # validation score is not quietly inflated by having seen the
@@ -3092,16 +3121,16 @@ class _ClassifierTrainWorker(QThread):
         n_val = len(val_idx)
 
         self.log_message.emit(
-            f"[Classifier] Split: {n_train} train, {n_val} val (stratified per class)"
+            f"[Classifier] Split: {n_train} train, {n_val} val "
+            f"(held out by {split_info['unit']})"
         )
 
         n_classes = len(class_names)
 
-        from collections import Counter as _Counter
-        train_counts = _Counter(train_ds.targets if hasattr(train_ds, "targets") else train_labels)
         for cls_idx, cls_name in enumerate(class_names):
-            cnt = train_counts.get(cls_idx, 0)
-            self.log_message.emit(f"[Classifier]   {cls_name}: {cnt} train")
+            c = split_info["per_class"].get(cls_idx, {"train": 0, "val": 0})
+            self.log_message.emit(
+                f"[Classifier]   {cls_name}: {c['train']} train, {c['val']} val")
 
         if n_train < 10 * n_classes:
             self.log_message.emit(
@@ -3165,6 +3194,8 @@ class _ClassifierTrainWorker(QThread):
         all_train_losses = []
         all_val_losses = []
         best_val_acc = 0.0
+        best_report = None
+        epoch_metrics: list = []
 
         for epoch in range(1, epochs + 1):
             if self._stop_flag:
@@ -3193,8 +3224,8 @@ class _ClassifierTrainWorker(QThread):
             if val_loader is not None:
                 model.eval()
                 v_loss = 0.0
-                correct = 0
-                total = 0
+                y_true: list = []
+                y_pred: list = []
                 with torch.no_grad():
                     for imgs, feats, targets in val_loader:
                         imgs = imgs.to(device)
@@ -3202,29 +3233,36 @@ class _ClassifierTrainWorker(QThread):
                         targets = targets.to(device)
                         outputs = model(imgs, feats)
                         v_loss += criterion(outputs, targets).item()
-                        preds = outputs.argmax(dim=1)
-                        correct += (preds == targets).sum().item()
-                        total += targets.size(0)
+                        y_pred.extend(outputs.argmax(dim=1).cpu().tolist())
+                        y_true.extend(targets.cpu().tolist())
                 val_loss = v_loss / max(len(val_loader), 1)
-                val_acc = correct / max(total, 1)
+                report = classification_report(y_true, y_pred, n_classes)
+                val_acc = report["accuracy"]
+                epoch_metrics.append(report)
+                # Plain accuracy is mostly the commonest behaviour; balanced
+                # accuracy and macro F1 weight every behaviour equally.
+                scores = (f"val_acc={val_acc:.1%}  "
+                          f"bal_acc={report['balanced_accuracy']:.1%}  "
+                          f"macro_F1={report['macro_f1']:.2f}")
 
                 all_val_losses.append(val_loss)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_epoch = epoch
                     best_val_acc = val_acc
+                    best_report = report
                     patience_counter = 0
                     torch.save(model.state_dict(),
                                os.path.join(output_dir, "best_classifier.pth"))
                     self.log_message.emit(
                         f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
-                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  ★ best"
+                        f"val_loss={val_loss:.4f}  {scores}  ★ best"
                     )
                 else:
                     patience_counter += 1
                     self.log_message.emit(
                         f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
-                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  "
+                        f"val_loss={val_loss:.4f}  {scores}  "
                         f"(patience {patience_counter}/{patience})"
                     )
             else:
@@ -3272,12 +3310,43 @@ class _ClassifierTrainWorker(QThread):
         log_path = os.path.join(output_dir, "training_log.csv")
         with open(log_path, "w", newline="") as lf:
             writer = _csv.writer(lf)
-            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc"])
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc",
+                             "val_balanced_acc", "val_macro_f1"])
             for ei in range(len(all_train_losses)):
-                t_loss = all_train_losses[ei]
-                v_loss = all_val_losses[ei] if ei < len(all_val_losses) else ""
-                v_acc = ""
-                writer.writerow([ei + 1, f"{t_loss:.6f}", v_loss if v_loss == "" else f"{v_loss:.6f}", v_acc])
+                row = [ei + 1, f"{all_train_losses[ei]:.6f}"]
+                if ei < len(all_val_losses) and ei < len(epoch_metrics):
+                    m = epoch_metrics[ei]
+                    row += [f"{all_val_losses[ei]:.6f}", f"{m['accuracy']:.4f}",
+                            f"{m['balanced_accuracy']:.4f}", f"{m['macro_f1']:.4f}"]
+                else:
+                    row += ["", "", "", ""]
+                writer.writerow(row)
+
+        # Per-behaviour scores at the best epoch: the confusion matrix (rows
+        # are the labelled behaviour, columns what the model said) shows which
+        # behaviours it mixes up, which one accuracy figure cannot.
+        per_class_out = None
+        if best_report is not None:
+            cm = best_report["confusion"]
+            with open(os.path.join(output_dir, "val_confusion.csv"), "w",
+                      newline="") as cf:
+                cw = _csv.writer(cf)
+                cw.writerow(["labelled / predicted"] + list(class_names))
+                for ci, cname in enumerate(class_names):
+                    cw.writerow([cname] + [int(x) for x in cm[ci]])
+
+            def _num(x):
+                return None if x != x else round(float(x), 4)  # NaN -> null
+
+            per_class_out = {
+                cname: {
+                    "n_val": int(best_report["support"][ci]),
+                    "precision": _num(best_report["precision"][ci]),
+                    "recall": _num(best_report["recall"][ci]),
+                    "f1": _num(best_report["f1"][ci]),
+                }
+                for ci, cname in enumerate(class_names)
+            }
 
         # Save training summary
         summary_out = {
@@ -3296,6 +3365,11 @@ class _ClassifierTrainWorker(QThread):
             "batch_size": batch_size,
             "n_train": n_train,
             "n_val": n_val,
+            "val_held_out_by": split_info["unit"],
+            "best_val_balanced_acc": (best_report["balanced_accuracy"]
+                                      if best_report else None),
+            "best_val_macro_f1": best_report["macro_f1"] if best_report else None,
+            "val_per_class": per_class_out,
             "early_stopping": early_stopping,
         }
         with open(os.path.join(output_dir, "training_summary.json"), "w") as sf:
@@ -3311,6 +3385,23 @@ class _ClassifierTrainWorker(QThread):
                 f"[Classifier] Best model: epoch {best_epoch}  "
                 f"val_loss={best_val_loss:.4f}  val_acc={best_val_acc:.1%}"
             )
+        if per_class_out:
+            self.log_message.emit(
+                f"[Classifier] Per behaviour at the best epoch "
+                f"(balanced acc {best_report['balanced_accuracy']:.1%}, "
+                f"macro F1 {best_report['macro_f1']:.2f}):"
+            )
+            for cname, m in per_class_out.items():
+                if m["n_val"] == 0:
+                    self.log_message.emit(f"[Classifier]   {cname}: not validated")
+                    continue
+                prec = "-" if m["precision"] is None else f"{m['precision']:.2f}"
+                self.log_message.emit(
+                    f"[Classifier]   {cname}: recall {m['recall']:.2f}  "
+                    f"precision {prec}  F1 {m['f1']:.2f}  (n={m['n_val']})"
+                )
+            self.log_message.emit(
+                "[Classifier] Confusion matrix: val_confusion.csv")
 
         if all_train_losses and all_val_losses:
             final_train = all_train_losses[-1]
@@ -12585,6 +12676,8 @@ class MaskTrackerWindow(QMainWindow):
                     "clip_dir": clip["clip_dir"],
                     "obj_id": int(obj_id_str),
                     "fps": float(clip.get("fps", 30.0)),
+                    # The validation split holds out whole source videos.
+                    "video": clip.get("source_video") or "",
                 })
                 class_name_set.add(beh)
                 labels.append(beh)
