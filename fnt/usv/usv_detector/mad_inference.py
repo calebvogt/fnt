@@ -1497,6 +1497,50 @@ def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
     return nperseg, noverlap, nfft, db_min, db_max, db_norm
 
 
+def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
+                        db_max: float = -20.0, db_norm: str = 'fixed',
+                        overwrite: bool = False) -> int:
+    """Add the spectrogram image under each stored prediction crop of a
+    recording analysed before MAD saved them (/pred_specs), recomputed from
+    the audio on the grid recorded in its .mad file. ``db_*`` must be the
+    model's (MAD's defaults: fixed, -100 to -20 dB). Crops that already have
+    one are left alone unless ``overwrite``. Returns the number filled."""
+    from .fnt_mask_store import (masks_sibling_path, get_grid_attrs,
+                                 read_all_pred_masks, spec_crop,
+                                 PRED_SPEC_GROUP)
+    import h5py
+    h5 = masks_sibling_path(wav_path)
+    crops = read_all_pred_masks(h5, include_spec=True)
+    todo = {k: c for k, c in crops.items() if overwrite or 'spec' not in c}
+    if not todo:
+        return 0
+    g = get_grid_attrs(h5)
+    nperseg, noverlap, nfft = (int(g.get('nperseg', 512)),
+                               int(g.get('noverlap', 384)),
+                               int(g.get('nfft', 1024)))
+    audio, sr = load_audio(wav_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    from .mad_dataset import db_range_for
+    db_min, db_max = db_range_for(db_norm, db_min, db_max, audio=audio,
+                                  sample_rate=sr, nperseg=nperseg,
+                                  noverlap=noverlap, nfft=nfft)
+    spec = compute_full_spec_image(np.asarray(audio, dtype=np.float32), sr,
+                                   nperseg=nperseg, noverlap=noverlap,
+                                   nfft=nfft, db_min=db_min, db_max=db_max,
+                                   as_uint8=True)
+    del audio
+    with h5py.File(h5, 'a') as f:
+        sgrp = f.require_group(PRED_SPEC_GROUP)
+        for key, c in todo.items():
+            if key in sgrp:
+                del sgrp[key]
+            sgrp.create_dataset(key, data=spec_crop(spec, c['f_off'], c['t_off'],
+                                                    c['mask'].shape),
+                                compression='gzip', compression_opts=4)
+    return len(todo)
+
+
 def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict,
                  device: Optional[str] = None) -> Dict:
     """Decode a recording and build the model's input spectrogram.
@@ -1663,7 +1707,7 @@ def run_inference_on_file(
     from .fnt_mask_store import (masks_sibling_path as _masks_path,
                                  read_all_pred_masks)
     try:
-        old_crops = read_all_pred_masks(_masks_path(wav_path))
+        old_crops = read_all_pred_masks(_masks_path(wav_path), include_spec=True)
     except Exception:
         old_crops = {}
 
@@ -1830,7 +1874,7 @@ def run_inference_on_file(
     h5_path = None
     try:
         from .fnt_mask_store import (masks_sibling_path, write_pred_masks,
-                                     set_grid_attrs, delete_prob)
+                                     set_grid_attrs, delete_prob, spec_crop)
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
@@ -1852,10 +1896,15 @@ def run_inference_on_file(
             if c is not None:
                 crops.append({'blob_id': r['blob_id'], 'mask': c['mask'],
                               'f_off': c['f_off'], 't_off': c['t_off'],
-                              **_prov(r)})
+                              'spec': c.get('spec'), **_prov(r)})
+        # Each new detection also keeps the image under its mask
+        # (/pred_specs): what the call looks like inside the mask, for contour
+        # measures without the audio.
         for i, b in enumerate(blobs):
             crops.append({'blob_id': id_offset + i, 'mask': b['mask'],
                           'f_off': b['f_low'], 't_off': b['t_start'],
+                          'spec': spec_crop(spec, b['f_low'], b['t_start'],
+                                            np.shape(b['mask'])),
                           **_prov(rows[i] if i < len(rows) else {})})
         write_pred_masks(h5_path, crops)
         # Stamp the run itself, so a file that came back empty is recorded as

@@ -694,7 +694,47 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=['auto', 'cuda', 'mps', 'cpu'])
     pe.set_defaults(func=_cmd_embeddings)
 
+    # add-specs
+    ps = sub.add_parser('add-specs',
+                        help="Add the spectrogram under each stored detection "
+                             "to .mad files made before MAD saved it.")
+    ps.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections.")
+    ps.add_argument('--db-min', type=float, default=-100.0,
+                    help="The model's dB floor (default -100).")
+    ps.add_argument('--db-max', type=float, default=-20.0,
+                    help="The model's dB ceiling (default -20).")
+    ps.add_argument('--db-norm', default='fixed',
+                    help="The model's dB normalisation (default fixed).")
+    ps.add_argument('--overwrite', action='store_true',
+                    help="Recompute crops that already have one.")
+    ps.set_defaults(func=_cmd_add_specs)
+
     return p
+
+
+def _cmd_add_specs(args) -> int:
+    """Backfill /pred_specs for every given recording with stored detections."""
+    from .fnt_mask_store import masks_sibling_path, has_pred_masks
+    from .mad_inference import backfill_pred_specs
+    wavs = [w for w in _expand_inputs(args.input)
+            if has_pred_masks(masks_sibling_path(w))]
+    n_files = n_crops = 0
+    for i, w in enumerate(wavs, 1):
+        try:
+            k = backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
+                                    db_norm=args.db_norm,
+                                    overwrite=args.overwrite)
+        except Exception as e:
+            print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: failed ({e})",
+                  flush=True)
+            continue
+        n_files += bool(k)
+        n_crops += k
+        print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: {k} detection(s)",
+              flush=True)
+    print(f"added spectrograms to {n_crops} detection(s) in {n_files} file(s)")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

@@ -615,6 +615,25 @@ PRED_GROUP = "pred_calls"
 PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
               "harmonic_call_id", "harmonic_n", "f0_hz")
 
+#: The spectrogram image (uint8, MAD's 0-255 levels) inside each prediction
+#: crop, saved beside its mask as ``/pred_specs/<blob_id>`` (same shape and
+#: offsets). A mask says where a call is; these levels say what it looks like
+#: inside, so a call's contour (e.g. the brightest continuous path through
+#: the mask) can be measured from the store without the audio. A mask drawn as
+#: a blob over a fast trill has a flat centroid; the levels inside do not.
+PRED_SPEC_GROUP = "pred_specs"
+
+
+def spec_crop(spec, f_off: int, t_off: int, shape) -> np.ndarray:
+    """The ``shape`` (freq x time) window of a full-file spectrogram image at
+    (f_off, t_off), as uint8 0-255 (a float image in [0, 1] is scaled, as
+    :func:`td_save_example` does for example patches)."""
+    h, w = int(shape[0]), int(shape[1])
+    s = np.asarray(spec[f_off:f_off + h, t_off:t_off + w])
+    if s.dtype != np.uint8:
+        s = (np.clip(s, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return np.ascontiguousarray(s)
+
 
 @_reporting_write
 def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
@@ -625,16 +644,42 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
     offsets on the full spec grid. Any of :data:`PRED_ATTRS` present is stored
     with it. Also caches ``n_pred_blobs`` so file lists can show the count
     without reading any crop.
+
+    A crop may carry ``spec`` (the image under its mask, same shape), written
+    to :data:`PRED_SPEC_GROUP`. A crop without one keeps the spec already
+    stored for its blob_id when the offsets and shape are unchanged (the GUI
+    rewrites crops it has not reshaped without ever holding the image).
     """
     _require_h5()
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
     with h5py.File(h5_path, "a") as f:
-        if PRED_GROUP in f:
-            del f[PRED_GROUP]
+        old_specs = {}
+        if PRED_SPEC_GROUP in f and PRED_GROUP in f:
+            for key in f[PRED_SPEC_GROUP]:
+                if key in f[PRED_GROUP]:
+                    ds = f[PRED_GROUP][key]
+                    old_specs[key] = (int(ds.attrs.get("f_off", 0)),
+                                      int(ds.attrs.get("t_off", 0)),
+                                      f[PRED_SPEC_GROUP][key][()])
+        for g in (PRED_GROUP, PRED_SPEC_GROUP):
+            if g in f:
+                del f[g]
         grp = f.require_group(PRED_GROUP)
+        sgrp = None
         for c in crops:
             m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
             key = str(c["blob_id"])
+            f_off, t_off = int(c.get("f_off", 0)), int(c.get("t_off", 0))
+            s = c.get("spec")
+            if s is None and key in old_specs:
+                of, ot, os_ = old_specs[key]
+                if (of, ot) == (f_off, t_off) and os_.shape == m.shape:
+                    s = os_
+            if s is not None and np.asarray(s).shape == m.shape:
+                if sgrp is None:
+                    sgrp = f.require_group(PRED_SPEC_GROUP)
+                sgrp.create_dataset(key, data=np.asarray(s, np.uint8),
+                                    compression="gzip", compression_opts=4)
             ds = grp.create_dataset(key, data=m, compression="gzip",
                                     compression_opts=4)
             ds.attrs["f_off"] = int(c.get("f_off", 0))
@@ -649,13 +694,14 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
         f.attrs["n_pred_blobs"] = int(len(crops))
 
 
-def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
+def read_all_pred_masks(h5_path: str, include_spec: bool = False) -> Dict[str, Dict]:
     """Return ``{blob_id: {mask(bool), f_off, t_off}}`` for every stored
     prediction crop (cheap — only small per-blob arrays, never the grid).
 
     Any of :data:`PRED_ATTRS` stored with a crop (score, class, model
     provenance) comes back alongside it, so a pending detection can be fully
-    described without consulting the CSV."""
+    described without consulting the CSV. ``include_spec`` adds ``spec`` (the
+    uint8 image under the mask) for crops that have one."""
     _require_h5()
     out: Dict[str, Dict] = {}
     if not os.path.isfile(h5_path):
@@ -664,6 +710,7 @@ def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
         grp = f.get(PRED_GROUP)
         if grp is None:
             return out
+        sgrp = f.get(PRED_SPEC_GROUP) if include_spec else None
         for key in grp:
             ds = grp[key]
             rec = {
@@ -671,6 +718,8 @@ def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
                 "f_off": int(ds.attrs.get("f_off", 0)),
                 "t_off": int(ds.attrs.get("t_off", 0)),
             }
+            if sgrp is not None and key in sgrp:
+                rec["spec"] = sgrp[key][()]
             for k in PRED_ATTRS:
                 if k in ds.attrs:
                     v = ds.attrs[k]
@@ -739,9 +788,10 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
         grp = f.require_group(PRED_GROUP)
         for c in crops:
             key = str(c["blob_id"])
+            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
+            _replace_pred_spec(f, key, c, m)
             if key in grp:
                 del grp[key]
-            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
             ds = grp.create_dataset(key, data=m, compression="gzip",
                                     compression_opts=4)
             ds.attrs["f_off"] = int(c.get("f_off", 0))
@@ -754,6 +804,28 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
         # Kept in step so file lists can still show the count without reading
         # a single crop.
         f.attrs["n_pred_blobs"] = int(len(grp))
+
+
+def _replace_pred_spec(f, key: str, c: Dict, m: np.ndarray) -> None:
+    """Keep /pred_specs/<key> in step with a crop being (re)written: the crop's
+    own ``spec`` if it brings one; else the stored one while the offsets and
+    shape are unchanged; else none (a reshaped mask's old image would be the
+    wrong window). Call before the old crop is deleted."""
+    sgrp = f.get(PRED_SPEC_GROUP)
+    old = sgrp.get(key) if sgrp is not None else None
+    s = c.get("spec")
+    if s is None and old is not None:
+        ds = f[PRED_GROUP].get(key) if PRED_GROUP in f else None
+        if (ds is not None and old.shape == m.shape
+                and int(ds.attrs.get("f_off", 0)) == int(c.get("f_off", 0))
+                and int(ds.attrs.get("t_off", 0)) == int(c.get("t_off", 0))):
+            return                                  # unchanged: keep it
+    if old is not None:
+        del sgrp[key]
+    if s is not None and np.asarray(s).shape == m.shape:
+        f.require_group(PRED_SPEC_GROUP).create_dataset(
+            key, data=np.asarray(s, np.uint8), compression="gzip",
+            compression_opts=4)
 
 
 def list_pred_ids(h5_path: str) -> List[str]:
@@ -866,9 +938,10 @@ def delete_pred_mask(h5_path: str, blob_id) -> None:
         return
     try:
         with h5py.File(h5_path, "a") as f:
-            grp = f.get(PRED_GROUP)
-            if grp is not None and str(blob_id) in grp:
-                del grp[str(blob_id)]
+            for g in (PRED_GROUP, PRED_SPEC_GROUP):
+                grp = f.get(g)
+                if grp is not None and str(blob_id) in grp:
+                    del grp[str(blob_id)]
     except Exception:
         pass
 
@@ -891,6 +964,11 @@ def delete_pred_masks(h5_path: str, blob_ids) -> None:
             for key in list(grp.keys()):
                 if key in want:
                     del grp[key]
+            sgrp = f.get(PRED_SPEC_GROUP)
+            if sgrp is not None:
+                for key in list(sgrp.keys()):
+                    if key in want:
+                        del sgrp[key]
             f.attrs["n_pred_blobs"] = int(len(grp))
     except Exception:
         pass
@@ -903,8 +981,9 @@ def clear_pred_masks(h5_path: str) -> None:
     if not os.path.isfile(h5_path):
         return
     with h5py.File(h5_path, "a") as f:
-        if PRED_GROUP in f:
-            del f[PRED_GROUP]
+        for g in (PRED_GROUP, PRED_SPEC_GROUP):
+            if g in f:
+                del f[g]
         if "n_pred_blobs" in f.attrs:
             del f.attrs["n_pred_blobs"]
 
