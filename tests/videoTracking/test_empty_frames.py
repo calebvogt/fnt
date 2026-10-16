@@ -471,5 +471,22 @@ def test_esc_on_an_edit_mask_keeps_erasures_and_drops_paint():
     w.close()
 
 
+def test_skip_is_recorded_until_the_frame_is_finished():
+    """S on a frame counts a skip (the frames the model got too wrong to fix);
+    finishing the frame ends it."""
+    w = window()
+    w._select_frame_row(0)
+    w._skip_frame()
+    assert w._coco.skip_count(FRAMES[0]) == 1
+    assert w._coco.skipped_images() == [FRAMES[0]]
+    w._select_frame_row(0)
+    w._skip_frame()
+    assert w._coco.skip_count(FRAMES[0]) == 2
+    w._select_frame_row(0)
+    w._toggle_empty_frame()                       # finished: no longer skipped
+    assert w._coco.skip_count(FRAMES[0]) == 0 and w._coco.skipped_images() == []
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

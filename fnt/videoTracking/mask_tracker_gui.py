@@ -7892,9 +7892,20 @@ class MaskTrackerWindow(QMainWindow):
 
     def _skip_frame(self):
         """S / Skip: leave this frame undecided and go to the next frame still
-        to label, as Skip does in MAD. Unsaved SAM objects are dropped."""
+        to label, as Skip does in MAD. Unsaved SAM objects are dropped. The skip
+        is recorded on the frame (shown in the queue): skipped frames are the
+        ones the model got too wrong to fix by hand."""
         self.preview._clear_drawing()
         before = self.current_frame_idx
+        if not self._annot_in_video_mode and 0 <= before < len(self._extracted_frames):
+            fp = self._extracted_frames[before][2]
+            filename = os.path.basename(fp)
+            w = h = 0
+            if filename not in self._coco._image_id_map:
+                img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+                h, w = (img.shape[:2] if img is not None else (0, 0))
+            self._coco.mark_skipped(filename, w, h)
+            self._update_frame_list_item(before)
         self._next_frame()
         if self.current_frame_idx == before:
             self.status_bar.showMessage("Nothing else left to label in the queue", 4000)
@@ -8140,6 +8151,7 @@ class MaskTrackerWindow(QMainWindow):
         n_total, n_inferred = self._count_annotations_for_file(filename)
         n_approved = n_total - n_inferred
         is_empty = self._coco.is_image_empty(filename)
+        n_skipped = self._coco.skip_count(filename)
 
         if n_approved > 0 or is_empty:
             name_color = QColor("#4fc456")   # green: has accepted mask(s)
@@ -8183,15 +8195,17 @@ class MaskTrackerWindow(QMainWindow):
             ann_text = f"{n_inferred} pending"
         else:
             ann_text = ""
+        if n_skipped:
+            ann_text = f"{ann_text} · skipped" if ann_text else "skipped"
         item.setText(1, ann_text)
         item.setData(1, Qt.UserRole, float(n_total))  # numeric sort key
         item.setForeground(1, name_color)
-        item.setToolTip(
-            1,
-            "Marked empty: no object; trains as a background image" if is_empty
-            else f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
-            if n_total else "No annotations yet",
-        )
+        tip = ("Marked empty: no object; trains as a background image" if is_empty
+               else f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
+               if n_total else "No annotations yet")
+        if n_skipped:
+            tip += f"\nSkipped {n_skipped} time(s) (S)"
+        item.setToolTip(1, tip)
 
         # Confidence column.
         conf = self._frame_confidence.get(filename)

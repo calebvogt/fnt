@@ -607,6 +607,33 @@ class COCOAnnotationManager:
         self._auto_save()
         return img_id
 
+    # -- skipped frames --------------------------------------------------
+    # S / Skip on a queue frame is counted on the COCO image ("skipped": n).
+    # A reviewer skips a frame mostly when the model's guess is too poor to fix
+    # by hand, so the skipped frames are the hard cases to bring back once a
+    # better model predicts them. A finished frame (an accepted mask, or marked
+    # empty) no longer counts as skipped.
+    def mark_skipped(self, filename: str, width: int, height: int) -> int:
+        """Count one more skip of the frame; returns its skip count."""
+        img = self._image_entry(self.get_or_add_image(filename, width, height))
+        img["skipped"] = int(img.get("skipped", 0)) + 1
+        self._auto_save()
+        return img["skipped"]
+
+    def skip_count(self, filename: str) -> int:
+        """Times the frame was skipped, or 0 once it is finished."""
+        img_id = self._image_id_map.get(filename)
+        img = self._image_entry(img_id) if img_id is not None else None
+        if not img or not img.get("skipped") or img.get("empty") or any(
+                a["image_id"] == img_id and not a.get("inferred") and not a.get("rejected")
+                for a in self.annotations):
+            return 0
+        return int(img["skipped"])
+
+    def skipped_images(self) -> List[str]:
+        """File names of the frames skipped and still unfinished."""
+        return [img["file_name"] for img in self.images if self.skip_count(img["file_name"])]
+
     def count_empty_images(self) -> int:
         return sum(1 for img in self.images if self.is_image_empty(img["file_name"]))
 
