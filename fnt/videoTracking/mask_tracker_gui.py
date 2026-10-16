@@ -2057,10 +2057,12 @@ class SegTrainingWindow(QDialog):
     (Train panel) brings it back."""
 
     def __init__(self, main, graph_panel: QWidget, preview_panel: QWidget):
-        super().__init__(main)
+        # Unowned (no parent): Windows keeps an owned window stacked above its
+        # owner, so the main window could not be brought in front of it.
+        super().__init__(None)
+        self._main = main
         self.setModal(False)
         self.setWindowTitle("Segmentation Training")
-        # An ordinary top-level window (not kept above the main window).
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
                             | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         split = QSplitter(Qt.Horizontal, self)
@@ -2071,6 +2073,18 @@ class SegTrainingWindow(QDialog):
         lay.addWidget(split)
         self.resize(1500, 860)
         split.setSizes([800, 700])      # previews get room for three columns
+
+    def closeEvent(self, event):
+        """Launched with --training-window-only this window is all of Mask
+        Tracker: closing it quits, after asking if a run is still going."""
+        if getattr(self._main, "_window_only", False):
+            if not self._main._window_only_may_close():
+                event.ignore()
+                return
+            event.accept()
+            QTimer.singleShot(0, QApplication.instance().quit)
+            return
+        super().closeEvent(event)
 
 
 class TrainWorker(QThread):
@@ -10037,6 +10051,37 @@ class MaskTrackerWindow(QMainWindow):
             )
             self.lbl_train_status.setText("Training paused")
 
+    def _run_active(self) -> bool:
+        """A training run or its post-training inference is still going."""
+        return any(getattr(self, w, None) is not None and getattr(self, w).isRunning()
+                   for w in ("_train_worker", "_post_infer_worker"))
+
+    def _window_only_may_close(self) -> bool:
+        """Closing the only window (--training-window-only): fine once the run is
+        over; mid-run, only after the user agrees to stop it (Mask Tracker then
+        quits once the run has wound down and saved)."""
+        if not self._run_active():
+            return True
+        ans = QMessageBox.question(
+            self._seg_train_window, "Training in progress",
+            "Training is still running.\nStop it and close Mask Tracker?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if ans != QMessageBox.Yes:
+            return False
+        self._quit_when_idle = True
+        self._stop_training()
+        w = getattr(self, "_post_infer_worker", None)
+        if w is not None and w.isRunning():
+            w.request_stop()
+        return False            # stays open until the run has stopped, then quits
+
+    def _quit_if_asked(self) -> bool:
+        """After a run: quit if the user stopped it to close the window."""
+        if getattr(self, "_quit_when_idle", False):
+            QTimer.singleShot(0, QApplication.instance().quit)
+            return True
+        return False
+
     def _stop_training(self):
         if hasattr(self, "_train_worker") and self._train_worker.isRunning():
             self._train_worker.request_stop()
@@ -10106,6 +10151,8 @@ class MaskTrackerWindow(QMainWindow):
             "best_str": best_str,
         }
 
+        if self._quit_if_asked():
+            return
         # Trigger post-training inference if enabled, otherwise show dialog now
         if self.chk_post_infer.isChecked() and run_dir:
             self.lbl_train_status.setText("Training done — running inference on unlabeled frames...")
@@ -10300,6 +10347,8 @@ class MaskTrackerWindow(QMainWindow):
 
         model_path = getattr(self, "_last_train_summary", {}).get("model_path", "")
         self.status_bar.showMessage(f"Training + inference complete: {model_path}")
+        if self._quit_if_asked():
+            return
         self._show_train_complete_dialog(infer_status)
 
     def _on_post_infer_error(self, msg: str):
@@ -10329,6 +10378,13 @@ class MaskTrackerWindow(QMainWindow):
         lines.append("")
         lines.append(f"Model saved to:\n{run_dir}")
 
+        if getattr(self, "_window_only", False):
+            # No pop-up over the only window: the summary goes in its log and title.
+            self._seg_log_text.append("")
+            self._seg_log_text.append(f"[{title}] " + " ".join(l for l in lines if l))
+            self._seg_train_window.setWindowTitle(
+                f"{self._seg_train_window.windowTitle()} \u2014 {title.lower()}")
+            return
         QMessageBox.information(self, title, "\n".join(lines))
 
     def _on_train_error(self, msg: str):
@@ -10338,7 +10394,8 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_stop.setVisible(False)
         self._dismiss_training_viz()
         self.lbl_train_status.setText(f"Error: {msg}")
-        QMessageBox.critical(self, "Training Error", msg)
+        QMessageBox.critical(self._seg_train_window if getattr(self, "_window_only", False) else self,
+                             "Training Error", msg)
 
     def _show_training_samples(self, model_dir: str):
         """Run the trained model on a few random frames and show predictions."""
@@ -13685,6 +13742,9 @@ class MaskTrackerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._close_video()
+        win = getattr(self, "_seg_train_window", None)
+        if win is not None and not getattr(self, "_window_only", False):
+            win.hide()          # unowned, so it would otherwise outlive the main window
         # Annotations and the project config are auto-saved on every action.
         self._autosave_project_config()
         self._tab_anim_timer.stop()
@@ -13828,6 +13888,10 @@ def _launch_parser():
     p.add_argument("--train", action="store_true",
                    help="Start a segmentation training run once the project is "
                         "open, as the Train button would.")
+    p.add_argument("--training-window-only", dest="training_window_only", action="store_true",
+                   help="With --train: show only the Segmentation Training window "
+                        "(the main window stays hidden; closing the training window "
+                        "quits), like MAD's --training-window-only.")
     g = p.add_argument_group(
         "training settings",
         "Set in the Train panel before the run; any not given keep the "
@@ -13897,6 +13961,8 @@ def main(argv=None) -> int:
         sys.argv[1:] if argv is None else argv)
     if (args.train or args.focus or args.predict) and not args.project:
         parser.error("--train, --focus and --predict need --project")
+    if args.training_window_only and not args.train:
+        parser.error("--training-window-only needs --train")
     config = None
     if args.project:
         try:
@@ -13907,7 +13973,11 @@ def main(argv=None) -> int:
     app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     win = MaskTrackerWindow()
     win._launched = True
-    win.show()
+    win._window_only = bool(args.training_window_only)
+    if win._window_only:
+        app.setQuitOnLastWindowClosed(False)    # it quits when its training window closes
+    else:
+        win.show()
     if config:
         win._load_project(config)
         if args.focus:

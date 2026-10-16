@@ -230,5 +230,43 @@ def test_train_and_focus_need_a_project():
         G.main(["--project", os.path.join(tempfile.gettempdir(), "no_such_mtt_project")])
 
 
+def test_training_window_only_needs_train():
+    with pytest.raises(SystemExit):
+        G.main(["--project", "x", "--training-window-only"])
+
+
+def test_the_training_window_is_its_own_window():
+    """Owned by the main window it stayed stacked above it: the main window
+    could not be brought to the front during a run."""
+    w = window()
+    assert w._seg_train_window.parent() is None
+    w.close()
+
+
+def test_window_only_closing_quits_once_no_run_is_going(monkeypatch):
+    """--training-window-only: the training window is all of Mask Tracker, so
+    closing it quits; mid-run it asks first, and Cancel keeps it open."""
+    from PyQt5.QtGui import QCloseEvent
+    quit_calls = []
+    monkeypatch.setattr(G.QTimer, "singleShot", lambda ms, fn: quit_calls.append(fn))
+    w = window()
+    w._window_only = True
+    ev = QCloseEvent()
+    w._seg_train_window.closeEvent(ev)                       # nothing running
+    assert ev.isAccepted() and len(quit_calls) == 1
+
+    class Busy:
+        def isRunning(self):
+            return True
+    w._train_worker = Busy()
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Cancel)
+    ev = QCloseEvent()
+    w._seg_train_window.closeEvent(ev)
+    assert not ev.isAccepted() and len(quit_calls) == 1      # still open, no quit
+    del w._train_worker
+    w._window_only = False
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
