@@ -356,6 +356,10 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
                         "(default: 3).")
     g.add_argument('--run-name', default='',
                    help="Name for the model run dir (default: timestamped).")
+    g.add_argument('--run-suffix', default='',
+                   help="Tag appended to the timestamped name, keeping the "
+                        "label count: <date>_<time>_unet_n=<labels>_<tag> "
+                        "(e.g. ft_r7).")
     g.add_argument('--holdout-from', default=None, metavar='RUN',
                    help="Hold out the same recordings as an earlier run (its "
                         "folder, name, or training_summary.json), so the two "
@@ -383,6 +387,7 @@ _TRAIN_FIELD = {
     'faint_db': 'faint_db_range',
     'max_per_recording': 'max_examples_per_recording',
     'tile_placements': 'tile_placements', 'run_name': 'run_name',
+    'run_suffix': 'run_suffix',
     'holdout_from': 'holdout_groups',
     'init_from': 'init_from', 'context_ms': 'context_ms',
 }

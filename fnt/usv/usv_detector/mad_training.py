@@ -27,6 +27,9 @@ import numpy as np
 class UNetTrainingConfig:
     project_dir: str
     run_name: str = ""               # auto-filled from timestamp if empty
+    # Appended to the auto-filled name: <ts>_<arch>_n=<labels>_<suffix>
+    # (e.g. ft_r7), so a tagged run still says how many labels it holds.
+    run_suffix: str = ""
     # Decoder architecture (all via segmentation_models_pytorch):
     #   'unet'   : smp.Unet (baseline)
     #   'unetpp' : smp.UnetPlusPlus (denser skips, finer detail)
@@ -167,6 +170,8 @@ class UNetTrainingConfig:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             arch = (self.model_arch or "unet").lower()
             name = f"{ts}_{arch}_n={n_examples}"
+            if self.run_suffix:
+                name += f"_{self.run_suffix}"
         return str(Path(self.project_dir) / "models" / name)
 
 
