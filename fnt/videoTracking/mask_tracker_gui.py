@@ -356,7 +356,7 @@ class AnnotationPreviewWidget(QWidget):
     approve_annotation_requested = pyqtSignal(int)
     edit_mode_blocked = pyqtSignal()
     edit_cancelled = pyqtSignal()
-    category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
+    category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9, 0 = 10th)
     empty_frame_requested = pyqtSignal()       # mark / unmark the frame empty (button)
     queue_step_requested = pyqtSignal(int)     # N / B: next / back in the queue
     sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
@@ -1342,6 +1342,8 @@ class AnnotationPreviewWidget(QWidget):
             self.e_key_requested.emit()
         elif Qt.Key_1 <= event.key() <= Qt.Key_9:
             self.category_hotkey.emit(event.key() - Qt.Key_1)
+        elif event.key() == Qt.Key_0:
+            self.category_hotkey.emit(9)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
             self._zoom = min(20.0, self._zoom * 1.2)
             self.zoom_changed.emit(self._zoom)
@@ -4499,9 +4501,9 @@ class MaskTrackerWindow(QMainWindow):
 
         self.lbl_active_class = QLabel("Class:")
         _tip_active_class = (
-            "Class assigned to each new mask you accept — no dialog per mask.\n"
-            "Press 1–9 to switch class while annotating; right-click a mask\n"
-            "for Change Class if you picked the wrong one."
+            "Class assigned to each new mask you accept with Enter — no dialog per mask.\n"
+            "A number key (1–9, 0) saves the pending mask as that class instead;\n"
+            "right-click a mask for Change Class if you picked the wrong one."
         )
         self.lbl_active_class.setToolTip(_tip_active_class)
         self._tools_class_row.addWidget(self.lbl_active_class)
@@ -4938,7 +4940,8 @@ class MaskTrackerWindow(QMainWindow):
             "S = skip: leave this frame and go to the next one still to label.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
-            "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
+            "1-9, 0 = class: with a mask pending, save it as that class; else switch the active class.\n"
+            "Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
             "V = show / hide the masks.\n"
             "In a source video (arrow keys), E extracts the frame to the queue."
         )
@@ -6899,9 +6902,16 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_view_masks.setFocusPolicy(Qt.NoFocus)
         self._tools_view_row.addWidget(self.btn_view_masks)
         self._tools_view_row.addStretch()
-        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row,
-                    self._tools_view_row):
+        self.lbl_class_keys = QLabel("")
+        self.lbl_class_keys.setWordWrap(True)
+        self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        self.lbl_class_keys.setToolTip(
+            "Number keys: with a mask pending (SAM or Paint), save it as that class;\n"
+            "otherwise make that class the active one. 0 is the tenth class.")
+        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row):
             vbox.addLayout(row)
+        vbox.addWidget(self.lbl_class_keys)
+        vbox.addLayout(self._tools_view_row)
         group.setLayout(vbox)
         layout.addWidget(group)
 
@@ -9205,14 +9215,26 @@ class MaskTrackerWindow(QMainWindow):
             self.combo_active_class.setCurrentText(self._last_used_category)
         self.combo_active_class.blockSignals(False)
         self.preview.available_categories = list(self._categories)
+        if hasattr(self, "lbl_class_keys"):
+            keys = [str((i + 1) % 10) for i in range(min(10, len(self._categories)))]
+            self.lbl_class_keys.setText("   ".join(f"{k} {c}" for k, c in zip(keys, self._categories)))
 
     def _active_category(self) -> Optional[str]:
         cat = self.combo_active_class.currentText().strip()
         return cat if cat else None
 
     def _on_category_hotkey(self, idx: int):
-        if 0 <= idx < self.combo_active_class.count():
-            self.combo_active_class.setCurrentIndex(idx)
+        """1-9, 0: with a mask pending, save it as that class (click an object, press
+        its number); otherwise make that class the active one."""
+        if not 0 <= idx < self.combo_active_class.count():
+            return
+        self.combo_active_class.setCurrentIndex(idx)
+        pv = self.preview
+        if (pv.drawing_mode in pv.OBJECT_TOOLS and pv._drawing_active and pv.has_ai_pending()
+                and pv._editing_obj_idx is None):
+            pv._finish_annotation()
+            self.status_bar.showMessage(f"Saved as {self.combo_active_class.currentText()}", 2500)
+        else:
             self.status_bar.showMessage(
                 f"Active class: {self.combo_active_class.currentText()}", 2000
             )

@@ -324,6 +324,29 @@ def test_eraser_on_a_saved_mask_edits_it_and_enter_esc_turn_the_tools_off():
     w.close()
 
 
+def test_a_number_key_saves_the_pending_mask_as_that_class():
+    """Click an object, press its class number: saved as that class (user request,
+    objects round 1); with nothing pending the key only switches the class."""
+    from PyQt5.QtCore import Qt
+    w = window()
+    for c in ("running wheel", "hut"):
+        w._coco.add_category(c)
+        w._categories.append(c)
+    w._refresh_active_class_combo()
+    assert "3 hut" in w.lbl_class_keys.text()
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    w._set_object_tool("paint")
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_3)                             # saves it as "hut"
+    assert len(pv.annotations) == 1 and pv.annotations[0].category == "hut"
+    assert not pv._ai_objects
+    key(pv, Qt.Key_2)                             # nothing pending: just switches
+    assert w.combo_active_class.currentText() == "running wheel" and len(pv.annotations) == 1
+    w.close()
+
+
 def test_review_accepts_rejects_and_advances_as_in_mad():
     """A accepts the prediction under review, R rejects it, Shift+A accepts the
     frame's rest; a frame with none left opens the next with predictions."""
