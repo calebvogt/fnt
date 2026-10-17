@@ -9917,7 +9917,10 @@ class MaskTrackerWindow(QMainWindow):
 
         # Export training annotations, excluding inferred (unapproved) masks
         ann_path = os.path.join(self._project_dir, "annotations", "annotations_train.json")
-        self._coco.export(ann_path, exclude_inferred=True)
+        only = getattr(self, "_train_only", None)
+        self._coco.export(ann_path, exclude_inferred=True, only=only)
+        if only is not None:
+            print(f"[MTT] training on the {len(only)} frame(s) of --train-only", flush=True)
 
         # Check that we have actual training data after excluding inferred
         n_approved = sum(
@@ -14077,6 +14080,10 @@ def _launch_parser():
     p.add_argument("--train", action="store_true",
                    help="Start a segmentation training run once the project is "
                         "open, as the Train button would.")
+    p.add_argument("--train-only", dest="train_only", nargs="+", default=None, metavar="ITEM",
+                   help="With --train: train on these frames only (names, and/or .txt files "
+                        "listing them) -- e.g. while new classes are labelled on a subset, so "
+                        "the other frames don't teach the new objects as background.")
     p.add_argument("--training-window-only", dest="training_window_only", action="store_true",
                    help="With --train: show only the Segmentation Training window "
                         "(the main window stays hidden; closing the training window "
@@ -14126,6 +14133,18 @@ def _launch_parser():
     return p
 
 
+def read_frame_names(items) -> set:
+    """Frame file names from names, paths and .txt lists (one per line)."""
+    out = set()
+    for it in items:
+        if it.lower().endswith(".txt") and os.path.isfile(it):
+            with open(it, encoding="utf-8") as fh:
+                out |= {os.path.basename(l.strip()) for l in fh if l.strip() and not l.startswith("#")}
+        else:
+            out.add(os.path.basename(it))
+    return out
+
+
 def _host_like_startup():
     """The crash log, slot exception hook and HiDPI setup that the FNT
     launcher's tool host gives a tool; a command-line start gets none of them
@@ -14152,6 +14171,8 @@ def main(argv=None) -> int:
         parser.error("--train, --focus and --predict need --project")
     if args.training_window_only and not args.train:
         parser.error("--training-window-only needs --train")
+    if args.train_only and not args.train:
+        parser.error("--train-only needs --train")
     config = None
     if args.project:
         try:
@@ -14177,6 +14198,8 @@ def main(argv=None) -> int:
                 if len(missing) > 5:
                     note += " ..."
             print(f"[MTT] focus: {shown} frame(s){note}", flush=True)
+        if args.train_only:
+            win._train_only = read_frame_names(args.train_only)
         applied = apply_training_args(win, args)
         if applied:
             print(f"[MTT] training settings: {', '.join(applied)}", flush=True)

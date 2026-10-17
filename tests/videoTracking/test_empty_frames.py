@@ -413,6 +413,23 @@ def test_one_class_still_saves_silently_and_turns_the_tool_off():
     w.close()
 
 
+def test_train_only_narrows_the_training_export(tmp_path):
+    """New classes labelled on a subset: --train-only keeps the other (mouse-only)
+    frames out of training, so they don't teach the new objects as background."""
+    c, cat = manager()
+    for name in ("a.png", "b.png", "c.png"):
+        img = c.get_or_add_image(name, 64, 48)
+        c.add_annotation_from_mask(img, cat, square_mask())
+    out = tmp_path / "train.json"
+    c.export(str(out), exclude_inferred=True, only={"a.png", "c.png"})
+    d = json.load(open(out))
+    assert sorted(i["file_name"] for i in d["images"]) == ["a.png", "c.png"]
+    assert len(d["annotations"]) == 2
+    lst = tmp_path / "frames.txt"
+    lst.write_text(chr(10).join(["a.png", "# note", "sub/c.png"]))
+    assert G.read_frame_names([str(lst), "x/b.png"]) == {"a.png", "b.png", "c.png"}
+
+
 def test_review_accepts_rejects_and_advances_as_in_mad():
     """A accepts the prediction under review, R rejects it, Shift+A accepts the
     frame's rest; a frame with none left opens the next with predictions."""

@@ -638,7 +638,8 @@ class COCOAnnotationManager:
     def count_empty_images(self) -> int:
         return sum(1 for img in self.images if self.is_image_empty(img["file_name"]))
 
-    def export(self, output_path: str, exclude_inferred: bool = False):
+    def export(self, output_path: str, exclude_inferred: bool = False,
+               only: Optional[set] = None):
         """Write the COCO JSON.
 
         ``exclude_inferred=True`` is the training export: accepted masks only,
@@ -648,6 +649,10 @@ class COCOAnnotationManager:
         the file trains, and one with no annotation trains as "no object here",
         which would teach the model that the mice it could not yet see are
         background.
+
+        ``only`` (frame file names) narrows the export further to those frames:
+        when new classes are labelled on a subset, the other frames would teach
+        the new objects as background.
         """
         images = self.images
         if exclude_inferred:
@@ -657,6 +662,11 @@ class COCOAnnotationManager:
             images = [img for img in self.images if img["id"] in keep]
         else:
             anns = self.annotations
+        if only is not None:
+            names = {os.path.basename(n) for n in only}
+            images = [img for img in images if os.path.basename(img["file_name"]) in names]
+            ids = {img["id"] for img in images}
+            anns = [a for a in anns if a["image_id"] in ids]
         data = {
             "images": images,
             "annotations": anns,
