@@ -219,6 +219,53 @@ class AnnotationObject:
 # ======================================================================
 # Category selector dialog (replaces QInputDialog dropdown)
 # ======================================================================
+PICKER_KEYS = "1234567890QWERTYUIOP"
+
+
+class ClassPickerDialog(QDialog):
+    """A keypad for the class of the mask just accepted (projects with several classes).
+
+    One button per class with its key (1-9, 0, then Q-P); a key or a click picks, Enter
+    keeps the highlighted class (the active one), Esc goes back to the pending mask."""
+
+    def __init__(self, categories: List[str], current: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Class")
+        self.categories = list(categories)[:len(PICKER_KEYS)]
+        self.selected: Optional[str] = None
+        self._default = current if current in self.categories else (self.categories[0] if self.categories else None)
+        self.setStyleSheet(
+            "QDialog { background-color: #2b2b2b; color: #cccccc; }"
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; text-align: left; "
+            "border-radius: 3px; padding: 6px 10px; color: #dddddd; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+            "QPushButton:default { border: 2px solid #2979ff; }")
+        grid = QGridLayout(self)
+        prompt = QLabel("Class? Key or click; Enter keeps the highlighted one.")
+        prompt.setWordWrap(True)
+        grid.addWidget(prompt, 0, 0, 1, 2)
+        for i, cat in enumerate(self.categories):
+            btn = QPushButton(f"{PICKER_KEYS[i]}   {cat}")
+            btn.setAutoDefault(False)
+            if cat == self._default:
+                btn.setDefault(True)
+            btn.clicked.connect(lambda _c, c=cat: self._pick(c))
+            grid.addWidget(btn, 1 + i // 2, i % 2)
+
+    def _pick(self, cat: str):
+        self.selected = cat
+        self.accept()
+
+    def keyPressEvent(self, e):
+        text = e.text().upper()
+        if text and text in PICKER_KEYS[:len(self.categories)]:
+            self._pick(self.categories[PICKER_KEYS.index(text)])
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter) and self._default:
+            self._pick(self._default)
+        else:
+            super().keyPressEvent(e)
+
+
 class CategorySelectDialog(QDialog):
     """List-based category selector with the last-used category pre-selected."""
 
@@ -378,6 +425,10 @@ class AnnotationPreviewWidget(QWidget):
         self.setMinimumSize(400, 300)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
+        # Set by the window: asked before Enter saves pending masks (the class keypad);
+        # False keeps them pending. And whether the tool stays on after a save.
+        self.before_finish = None
+        self.keep_tool_after_save = False
         self.setMouseTracking(True)
 
         self._image_rgb: Optional[np.ndarray] = None
@@ -1290,7 +1341,8 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
                 self.annotation_edited.emit(idx)
             elif self._drawing_active:
-                self._finish_annotation()
+                if self.before_finish is None or self.before_finish():
+                    self._finish_annotation()
             else:
                 self.advance_frame_requested.emit()
         elif event.key() == Qt.Key_Escape:
@@ -1380,8 +1432,9 @@ class AnnotationPreviewWidget(QWidget):
                 self._drawing_accepted = True
                 self.annotation_accepted.emit()       # the window saves it
             self._clear_drawing()
-            self.drawing_mode = "navigate"            # Enter turns the tool off
-            self.mode_changed.emit("Navigate")
+            if not self.keep_tool_after_save:
+                self.drawing_mode = "navigate"        # Enter turns the tool off
+                self.mode_changed.emit("Navigate")
 
     def set_show_masks(self, on: bool):
         """V: masks over the frame, or the bare frame."""
@@ -4392,6 +4445,7 @@ class MaskTrackerWindow(QMainWindow):
         right_layout.addWidget(self._preview_title_row)
 
         self.preview = AnnotationPreviewWidget()
+        self.preview.before_finish = self._pick_class_for_pending
         self.preview.annotation_accepted.connect(self._on_annotation_accepted)
         self.preview.ai_prediction_requested.connect(self._request_ai_prediction)
         self.preview.zoom_changed.connect(
@@ -9217,11 +9271,25 @@ class MaskTrackerWindow(QMainWindow):
             self.combo_active_class.setCurrentText(self._last_used_category)
         self.combo_active_class.blockSignals(False)
         self.preview.available_categories = list(self._categories)
+        # Several classes: the tool stays on between masks (labelling a frame's objects
+        # one after another), and Enter asks the class.
+        self.preview.keep_tool_after_save = len(self._categories) > 1
         if hasattr(self, "lbl_class_keys"):
             keys = [str((i + 1) % 10) for i in range(min(10, len(self._categories)))]
             items = [f"{k}  {c}" for k, c in zip(keys, self._categories)]
             # Two per line: one long line widened the whole left panel.
             self.lbl_class_keys.setText("\n".join("      ".join(items[i:i + 2]) for i in range(0, len(items), 2)))
+
+    def _pick_class_for_pending(self) -> bool:
+        """Before Enter saves pending masks: with several classes, ask which (the keypad;
+        Enter keeps the active class). False leaves the masks pending."""
+        if len(self._categories) <= 1:
+            return True
+        dlg = ClassPickerDialog(self._categories, self._active_category() or "", parent=self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.selected:
+            return False
+        self.combo_active_class.setCurrentText(dlg.selected)
+        return True
 
     def _active_category(self) -> Optional[str]:
         cat = self.combo_active_class.currentText().strip()

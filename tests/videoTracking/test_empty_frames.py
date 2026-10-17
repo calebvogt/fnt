@@ -347,6 +347,72 @@ def test_a_number_key_saves_the_pending_mask_as_that_class():
     w.close()
 
 
+def _multiclass_window():
+    w = window()
+    for c in ("running wheel", "hut"):
+        w._coco.add_category(c)
+        w._categories.append(c)
+    w._refresh_active_class_combo()
+    w._select_frame_row(0)
+    w.preview.resize(400, 300)
+    return w
+
+
+def test_enter_asks_the_class_when_there_are_several(monkeypatch):
+    """Objects round 1: Enter on a pending mask opens the class keypad; the pick is
+    saved and the tool stays on for the next object. Cancel keeps the mask pending."""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QDialog
+
+    class Pick:
+        answer = "hut"
+
+        def __init__(self, cats, current, parent=None):
+            self.selected = None
+
+        def exec_(self):
+            self.selected = Pick.answer
+            return QDialog.Accepted if Pick.answer else QDialog.Rejected
+
+    monkeypatch.setattr(G, "ClassPickerDialog", Pick)
+    w = _multiclass_window()
+    pv = w.preview
+    w._set_object_tool("paint")
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_Return)
+    assert [a.category for a in pv.annotations] == ["hut"]
+    assert pv.drawing_mode == "paint" and w.btn_paint.isChecked()        # still on
+    Pick.answer = None                                                    # Esc in the keypad
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_Return)
+    assert len(pv.annotations) == 1 and len(pv._ai_objects) == 1         # still pending
+    w.close()
+
+
+def test_the_class_keypad_keys():
+    from PyQt5.QtCore import QEvent, Qt
+    from PyQt5.QtGui import QKeyEvent
+    d = G.ClassPickerDialog(["mouse", "running wheel", "hut"], "mouse")
+    d.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_3, Qt.NoModifier, "3"))
+    assert d.selected == "hut"
+    d = G.ClassPickerDialog(["mouse", "running wheel", "hut"], "running wheel")
+    d.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier, ""))
+    assert d.selected == "running wheel"                                 # Enter keeps it
+
+
+def test_one_class_still_saves_silently_and_turns_the_tool_off():
+    from PyQt5.QtCore import Qt
+    w = window()
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    w._set_object_tool("paint")
+    pv.add_pending_mask(square_mask())
+    key(pv, Qt.Key_Return)
+    assert [a.category for a in pv.annotations] == ["mouse"] and pv.drawing_mode == "navigate"
+    w.close()
+
+
 def test_review_accepts_rejects_and_advances_as_in_mad():
     """A accepts the prediction under review, R rejects it, Shift+A accepts the
     frame's rest; a frame with none left opens the next with predictions."""
