@@ -126,7 +126,7 @@ def test_both_animals_get_their_side_of_a_social_behaviour():
         press(win, Qt.Key_5)                       # relabel bout 2: anogenital investigation
         r = read_review(bouts)
         assert (r["0"]["actor"], r["0"]["recipient"]) == ("1", "2")
-        assert r["0"]["recipient_label"] == "receives facial investigation"
+        assert r["0"]["recipient_label"] == "facial investigation"      # mutual
         assert (r["1"]["actor"], r["1"]["recipient"]) == ("2", "1")
         assert r["1"]["actor_label"] == "chase" and r["1"]["recipient_label"] == "chased / flees"
         assert r["2"]["actor_label"] == "anogenital investigation"
@@ -172,7 +172,7 @@ def test_a_bout_splits_into_labelled_segments():
         press(win, Qt.Key_A)
         segs = read_segments(bouts)["0"]
         assert [(int(r["frame0"]), int(r["frame1"]), r["actor_label"], r["recipient_label"]) for r in segs] == [
-            (10, 14, "facial investigation", "receives facial investigation"),
+            (10, 14, "facial investigation", "facial investigation"),
             (15, 20, "anogenital investigation", "receives anogenital investigation")]
         assert win.idx == 1
         win.close()

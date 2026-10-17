@@ -11,6 +11,8 @@ Most behaviours belong to one animal or pass between two, so every bout has an *
 colour -- mask, spine, nose (dot) and tail base (ring) -- with its role's label floating
 beside it: "anogenital investigation ->" on the investigator, "<- receives anogenital
 investigation" on the other. Both labels are saved, so the classifier learns each side.
+Mutual behaviours (facial investigation, huddle, fight / tumble) carry the same label on
+both animals, without arrows.
 
 A bout can hold more than one behaviour -- a facial investigation that turns into an
 anogenital one -- so it is labelled in **segments**: split it at a frame (X) and give each
@@ -58,14 +60,17 @@ ETHOGRAM = [
     "sniff / explore", "self-groom", "chase", "fight / tumble", "other",
 ]
 # What the recipient is doing when the actor does a social behaviour. Behaviours not
-# listed belong to the actor alone.
+# listed belong to the actor alone. Mutual ones (both animals doing the same) carry the same
+# label on both: in facial investigation, two heads together, who investigates whom can't
+# be told apart even by a trained observer.
 RECIPROCAL = {
-    "facial investigation": "receives facial investigation",
+    "facial investigation": "facial investigation",
     "anogenital investigation": "receives anogenital investigation",
     "chase": "chased / flees",
     "fight / tumble": "fight / tumble",
     "huddle": "huddle",
 }
+MUTUAL = {"facial investigation", "huddle", "fight / tumble"}
 # Candidate-rule names -> ethogram entries.
 KIND_TO_LABEL = {
     "immobile": "immobile", "huddle": "huddle", "nose_nose": "facial investigation",
@@ -538,7 +543,8 @@ class BehaviorReviewWindow(QWidget):
             text = actor_label if role == "actor" else rec_label
             if not text:
                 continue
-            text = (text + " →") if (role == "actor" and rec_label) else ("← " + text if role == "recipient" else text)
+            if actor_label not in MUTUAL:
+                text = (text + " →") if (role == "actor" and rec_label) else ("← " + text if role == "recipient" else text)
             draw_tag(img, text, (x, y), ROLE_COLOURS[role])
         img = np.vstack([img, self._timeline(img.shape[1])])
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
