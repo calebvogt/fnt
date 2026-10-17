@@ -37,6 +37,8 @@ from . import mask_pose as mp
 # Tracking.
 MAX_GAP_S = 1.0          # a track survives this long without a detection
 MIN_TRACK_S = 1.0        # shorter tracks are dropped as flicker
+STITCH_GAP_S = 3.0       # pieces this far apart in time may be one animal (see stitch_tracks)
+STITCH_DIST_BL = 1.0     # ... if the next starts within this many body lengths of the last
 # Candidate rules. BL = body length, nose to tail base (the scratchpad prototype measured
 # with the tail in, about 1.8 BL, and these are its thresholds converted).
 NOSE_NEAR_BL = 0.5
@@ -160,8 +162,57 @@ def link_tracks(dets: Sequence[Sequence[Dict]], fps: float, max_gap_s: float = M
                 tracks[next_id] = {t: d}
                 last[next_id] = (t, d)
                 next_id += 1
+    tracks = stitch_tracks(tracks, fps)
     min_len = max(1, int(round(min_track_s * fps)))
     return {k: v for k, v in tracks.items() if len(v) >= min_len}
+
+
+def stitch_tracks(tracks: Dict[int, Dict[int, Dict]], fps: float, max_gap_s: float = STITCH_GAP_S,
+                  max_dist_bl: float = STITCH_DIST_BL, max_overlap: int = 3) -> Dict[int, Dict[int, Dict]]:
+    """Join track pieces of one animal that lost its detection briefly.
+
+    A piece that starts up to ``max_gap_s`` after another ends (or overlaps its last
+    ``max_overlap`` frames: a brief double detection), within ``max_dist_bl`` body lengths of
+    where that one ended, continues it -- but only when each is the other's best match, so
+    two animals close together are never joined across. Body length here is estimated from
+    the mask area (1.5 x its square root), before any keypoints exist. Where pieces
+    overlap, the earlier piece's detections are kept."""
+    def ends(tr):
+        t0, t1 = min(tr), max(tr)
+        area = float(np.median([d["crop"].sum() for d in tr.values()]))
+        return t0, t1, tr[t0]["centroid"], tr[t1]["centroid"], 1.5 * np.sqrt(area)
+
+    info = {k: ends(v) for k, v in tracks.items()}
+    max_gap = int(round(max_gap_s * fps))
+    cands = []
+    for a, (a0, a1, _, a_end, a_bl) in info.items():
+        for b, (b0, b1, b_start, _, _) in info.items():
+            if a == b or b1 <= a1:
+                continue
+            gap = b0 - a1
+            if -max_overlap <= gap <= max_gap:
+                d = float(np.linalg.norm(b_start - a_end)) / max(a_bl, 1.0)
+                if d < max_dist_bl:
+                    cands.append((d + max(gap, 0) / fps * 0.1, a, b))
+    best_next: Dict[int, Tuple[float, int]] = {}
+    best_prev: Dict[int, Tuple[float, int]] = {}
+    for c, a, b in cands:
+        if a not in best_next or c < best_next[a][0]:
+            best_next[a] = (c, b)
+        if b not in best_prev or c < best_prev[b][0]:
+            best_prev[b] = (c, a)
+    links = {a: b for a, (_, b) in best_next.items() if best_prev.get(b, (None, None))[1] == a}
+    heads = [k for k in tracks if k not in set(links.values())]
+    out: Dict[int, Dict[int, Dict]] = {}
+    for h in sorted(heads):
+        merged = dict(tracks[h])
+        k = h
+        while k in links:
+            k = links[k]
+            for t, d in tracks[k].items():
+                merged.setdefault(t, d)
+        out[h] = merged
+    return out
 
 
 # ---------------------------------------------------------------- features

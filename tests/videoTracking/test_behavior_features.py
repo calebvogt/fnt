@@ -195,6 +195,32 @@ def test_a_session_caps_each_kind_across_windows(tmp_path):
     assert all(float(r["dur_s"]) >= 9 for r in ano)                    # each window's longest
 
 
+def _blob(x, y=25):
+    m = np.zeros((60, 400), bool); m[y - 5:y + 5, x:x + 20] = True
+    return bf._as_det(m, 0.9)
+
+
+def test_a_two_second_loss_is_stitched():
+    dets = [[_blob(100)]] * 20 + [[]] * 30 + [[_blob(104)]] * 20      # lost for 2 s, same place
+    tracks = bf.link_tracks(dets, fps=15)
+    assert len(tracks) == 1 and len(next(iter(tracks.values()))) == 40
+
+
+def test_a_far_reappearance_is_not_stitched():
+    dets = [[_blob(20)]] * 20 + [[]] * 30 + [[_blob(300)]] * 20
+    assert len(bf.link_tracks(dets, fps=15)) == 2
+
+
+def test_stitching_takes_only_mutual_best_matches():
+    # Two animals vanish side by side; one piece reappears next to the first.
+    dets = [[_blob(100), _blob(130)]] * 20 + [[]] * 20 + [[_blob(102)]] * 20
+    tracks = bf.link_tracks(dets, fps=15)
+    lengths = sorted(len(v) for v in tracks.values())
+    assert lengths == [20, 40]
+    joined = [v for v in tracks.values() if len(v) == 40][0]
+    assert joined[0]["bbox"][0] == 100                                   # the nearer one
+
+
 def test_link_tracks_bridges_a_short_gap():
     m1 = np.zeros((50, 80), bool); m1[20:30, 10:30] = True
     det = bf._as_det(m1, 0.9)
