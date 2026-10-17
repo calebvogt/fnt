@@ -158,6 +158,24 @@ def _parser():
                         "start, so a stopped run is an even sample; name: alphabetical.")
     b.add_argument("--no-window", action="store_true",
                    help="Run without the progress window (log to the console).")
+    w = sub.add_parser("behavior-window",
+                       help="Masks on every frame of a stretch of video, tracks, mask-first pose and "
+                            "candidate behaviour bouts (tracks.h5, tracks/pairs/bouts CSVs).")
+    w.add_argument("--model", required=True, help="Model run folder (or a .pt file).")
+    w.add_argument("--video", required=True)
+    w.add_argument("--start", type=int, default=0, help="First frame (default 0).")
+    w.add_argument("--seconds", type=float, default=60.0, help="Length (default 60 s).")
+    w.add_argument("--out", required=True, help="Output folder.")
+    w.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default 0.25).")
+    w.add_argument("--imgsz", type=int, default=None,
+                   help="Input size (default: the model's training size).")
+    w.add_argument("--device", default="", help="e.g. 0 or cpu (default: auto).")
+    w.add_argument("--crops", type=int, default=0,
+                   help="Also save nose-up body crops of this size (px) for embeddings.")
+    s_ = sub.add_parser("behavior-session",
+                        help="Pool windows' candidate bouts into one behavior_review session CSV.")
+    s_.add_argument("--bouts", nargs="+", required=True, help="*_bouts.csv files.")
+    s_.add_argument("--out", required=True, help="Session CSV to write.")
     return p
 
 
@@ -187,6 +205,28 @@ def main(argv=None) -> int:
             return 0 if res["done"] == res["videos"] else 1
         from .mask_tracker_batch_window import run_with_window
         return run_with_window(args.model, videos, args.step, args.conf, args.imgsz, args.device)
+    if args.cmd == "behavior-window":
+        import cv2
+        from .behavior_features import run_window, yolo_detector
+        cap = cv2.VideoCapture(args.video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+        cap.release()
+        n = int(round(args.seconds * fps))
+
+        def progress(i, total):
+            if i % 150 == 0 or i == total:
+                print(f"  {i}/{total} frames", flush=True)
+
+        paths = run_window(args.video, args.start, n, args.out,
+                           yolo_detector(args.model, args.conf, args.imgsz, args.device),
+                           os.path.basename(os.path.normpath(args.model)), args.crops, progress)
+        for k, v in paths.items():
+            print(f"{k}: {v}")
+        return 0
+    if args.cmd == "behavior-session":
+        from .behavior_features import build_session
+        print(f"{build_session(args.bouts, args.out)} bouts -> {args.out}")
+        return 0
     return 2
 
 
