@@ -2061,6 +2061,8 @@ class SegTrainingWindow(QDialog):
         # owner, so the main window could not be brought in front of it.
         super().__init__(None)
         self._main = main
+        # Unowned, it no longer inherits the main window's stylesheet either.
+        self.setStyleSheet(DARK_STYLESHEET)
         self.setModal(False)
         self.setWindowTitle("Segmentation Training")
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint

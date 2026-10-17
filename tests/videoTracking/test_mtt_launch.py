@@ -243,6 +243,14 @@ def test_the_training_window_is_its_own_window():
     w.close()
 
 
+def test_the_training_window_is_dark():
+    """Unowned, it no longer inherited the main window's stylesheet and came
+    up in light mode (seen with --training-window-only)."""
+    w = window()
+    assert w._seg_train_window.styleSheet() == G.DARK_STYLESHEET
+    w.close()
+
+
 def test_window_only_closing_quits_once_no_run_is_going(monkeypatch):
     """--training-window-only: the training window is all of Mask Tracker, so
     closing it quits; mid-run it asks first, and Cancel keeps it open."""
