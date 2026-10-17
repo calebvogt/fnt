@@ -4968,6 +4968,8 @@ class MaskTrackerWindow(QMainWindow):
         # Training data summary (inline at top)
         self.lbl_train_annotations = QLabel("Total annotations: —")
         self.lbl_train_classes = QLabel("Classes: —")
+        # Wraps: with ten object classes one line was ~1,900 px and widened the panel.
+        self.lbl_train_classes.setWordWrap(True)
         for lbl in (self.lbl_train_annotations, self.lbl_train_classes):
             lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
             train_vbox.addWidget(lbl)
