@@ -6,18 +6,25 @@ are the labels the classifier learns from. The window stands alone -- like MAD's
 inference and training windows -- so a review session can be handed over without the mask
 labelling GUI.
 
+Most behaviours belong to one animal or pass between two, so every bout has an **actor**
+(the focal animal) and, for social behaviours, a **recipient**. Each is drawn in its own
+colour -- mask, spine, nose (dot) and tail base (ring) -- with its role's label floating
+beside it: "anogenital sniff ->" on the sniffer, "<- receives anogenital sniff" on the
+other. Both labels are saved, so the classifier learns each side of an interaction.
+
 Input is a bouts CSV with at least ``video``, ``frame0``, ``frame1`` and ``kind`` (the
-proposed behaviour). Optional columns: ``focal`` and ``other`` (track ids), ``tracks_csv``
-(per-frame keypoints with ``t``/``frame``, ``track``, ``cx``, ``cy``, ``nose_x``,
-``nose_y``, ``tb_x``, ``tb_y``) to centre the view and draw noses (red) and tail bases
-(blue), and ``bout_id``.
+proposed behaviour). Optional columns: ``focal`` and ``other`` (track ids: actor and
+recipient), ``tracks_csv`` (per-frame ``frame``, ``track``, ``cx``, ``cy``, ``nose_x``,
+``nose_y``, ``tb_x``, ``tb_y``) for keypoints and to centre the view, ``tracks_h5`` (a
+Mask Tracker track store) for the masks and spines, and ``bout_id``.
 
 Decisions go to ``<bouts>_review.csv`` beside it after every key press (write-then-
 rename), so a session can stop at any point and pick up where it left off.
 
-Keys: A accept, R reject (not this behaviour), 1-9 / 0 relabel from the ethogram,
-F flip head and tail of the focal animal (and accept), S skip, Space play/pause,
-N / Right next, B / Left back.
+Keys: A accept, R reject (not this behaviour), 1-9 / 0 relabel the actor from the
+ethogram (the recipient's label follows), W swap actor and recipient, F head and tail
+are swapped on the actor (accept and note it), S skip, Space play/pause, N / Right next,
+B / Left back.
 """
 from __future__ import annotations
 
@@ -41,27 +48,46 @@ ETHOGRAM = [
     "immobile", "wheel running", "huddle", "nose-nose sniff", "anogenital sniff",
     "sniff / explore", "self-groom", "chase", "fight / tumble", "other",
 ]
+# What the recipient is doing when the actor does a social behaviour. Behaviours not
+# listed belong to the actor alone.
+RECIPROCAL = {
+    "nose-nose sniff": "nose-nose sniff",
+    "anogenital sniff": "receives anogenital sniff",
+    "chase": "chased / flees",
+    "fight / tumble": "fight / tumble",
+    "huddle": "huddle",
+}
 # Candidate-rule names -> ethogram entries.
 KIND_TO_LABEL = {
     "immobile": "immobile", "huddle": "huddle", "nose_nose": "nose-nose sniff",
     "anogenital": "anogenital sniff", "chase": "chase", "head_only": "sniff / explore",
     "wheel": "wheel running", "fight": "fight / tumble",
 }
+# Okabe-Ito, as BGR: actor orange, recipient sky blue, anyone else grey.
+ROLE_COLOURS = {"actor": (0, 159, 230), "recipient": (233, 180, 86), "other": (150, 150, 150)}
 PAD_S = 0.5            # context shown before and after each bout
 VIEW = 640             # side of the square view, px
-REVIEW_FIELDS = ["bout_id", "kind", "decision", "label", "flipped", "reviewed_at"]
+REVIEW_FIELDS = ["bout_id", "kind", "decision", "label", "actor", "recipient", "actor_label",
+                 "recipient_label", "flipped", "reviewed_at"]
 
 
 def review_path(bouts_csv: str) -> str:
     return os.path.splitext(bouts_csv)[0] + "_review.csv"
 
 
+def recipient_label(actor_label: str, recipient) -> str:
+    """The recipient's side of the actor's behaviour; empty for a solo behaviour or no
+    recipient."""
+    if recipient in (None, ""):
+        return ""
+    return RECIPROCAL.get(actor_label, "")
+
+
 def load_bouts(path: str) -> List[Dict]:
     with open(path, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     for i, r in enumerate(rows):
-        r.setdefault("bout_id", "")
-        if not r["bout_id"]:
+        if not r.get("bout_id"):
             r["bout_id"] = str(i)
         for k in ("video", "frame0", "frame1", "kind"):
             if not r.get(k):
@@ -120,6 +146,24 @@ def _num(r: Optional[Dict], k: str) -> Optional[float]:
     return None if v is None or np.isnan(v) else v
 
 
+def _same(a, b) -> bool:
+    try:
+        return a not in (None, "") and b not in (None, "") and int(float(a)) == int(float(b))
+    except ValueError:
+        return False
+
+
+def draw_tag(img, text: str, anchor, colour, scale: float):
+    """A label on a dark plate, above ``anchor`` (x, y), kept inside the image."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    th = max(1, int(round(2 * scale)))
+    (tw, tht), base = cv2.getTextSize(text, font, 0.6 * scale, th)
+    x = int(np.clip(anchor[0] - tw / 2, 2, img.shape[1] - tw - 2))
+    y = int(np.clip(anchor[1], tht + 6, img.shape[0] - 4))
+    cv2.rectangle(img, (x - 4, y - tht - 6), (x + tw + 4, y + base), (25, 25, 25), -1)
+    cv2.putText(img, text, (x, y - 2), font, 0.6 * scale, colour, th, cv2.LINE_AA)
+
+
 class BehaviorReviewWindow(QWidget):
     def __init__(self, bouts_csv: str, ethogram: Optional[List[str]] = None):
         super().__init__()
@@ -131,11 +175,13 @@ class BehaviorReviewWindow(QWidget):
         self.out_path = review_path(bouts_csv)
         self.decisions = load_review(self.out_path)
         self._kp_cache: Dict[str, _Keypoints] = {}
+        self._h5_cache: Dict[str, object] = {}
         self._frames: List[np.ndarray] = []
         self._in_bout: List[bool] = []
         self._pos = 0
         self._playing = True
         self.idx = 0
+        self.actor = self.recipient = ""
         self.setWindowTitle(f"Behavior Review — {os.path.basename(bouts_csv)} ({len(self.bouts)} bouts)")
         self._build()
         self._timer = QTimer(self)
@@ -160,23 +206,24 @@ class BehaviorReviewWindow(QWidget):
         self.table.setFocusPolicy(Qt.NoFocus)
         for i, b in enumerate(self.bouts):
             dur = (int(b["frame1"]) - int(b["frame0"]) + 1)
-            self.table.setItem(i, 0, QTableWidgetItem(b["bout_id"]))
-            self.table.setItem(i, 1, QTableWidgetItem(KIND_TO_LABEL.get(b["kind"], b["kind"])))
             secs = _num(b, "dur_s")
+            who = f"  {b.get('focal', '')}→{b['other']}" if b.get("other") else ""
+            self.table.setItem(i, 0, QTableWidgetItem(b["bout_id"]))
+            self.table.setItem(i, 1, QTableWidgetItem(KIND_TO_LABEL.get(b["kind"], b["kind"]) + who))
             self.table.setItem(i, 2, QTableWidgetItem(f"{secs:.1f} s" if secs else f"{dur} fr"))
-            self.table.setItem(i, 3, QTableWidgetItem(""))
+            self.table.setItem(i, 3, QTableWidgetItem("        "))
             self._show_decision(i)
         self.table.cellClicked.connect(lambda r, _c: self.show_bout(r))
         left.addWidget(self.table, 1)
         keys = "\n".join(f"{(i + 1) % 10}  {name}" for i, name in enumerate(self.ethogram))
-        self.lbl_keys = QLabel("Relabel:\n" + keys)
+        self.lbl_keys = QLabel("Relabel the actor:\n" + keys + "\n\nW  swap actor and recipient")
         self.lbl_keys.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         left.addWidget(self.lbl_keys)
         self.lbl_progress = QLabel("")
         left.addWidget(self.lbl_progress)
         lw = QWidget()
         lw.setLayout(left)
-        lw.setFixedWidth(360)
+        lw.setFixedWidth(380)
         root.addWidget(lw)
 
         right = QVBoxLayout()
@@ -188,22 +235,26 @@ class BehaviorReviewWindow(QWidget):
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.addWidget(self.view, 1)
-        legend = QLabel("red = focal animal's nose · yellow = the other's nose · blue = tail bases · "
-                        "yellow border = the bout, grey = 0.5 s either side")
+        legend = QLabel(
+            "<span style='color:#e69f00'>■ actor (focal animal)</span> &nbsp; "
+            "<span style='color:#56b4e9'>■ recipient</span> &nbsp; "
+            "<span style='color:#969696'>■ others</span> &nbsp; · &nbsp; "
+            "● nose &nbsp; ○ tail base &nbsp; — spine &nbsp; · &nbsp; "
+            "yellow border = the bout, grey = 0.5 s either side")
         legend.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         right.addWidget(legend)
         row = QHBoxLayout()
         for text, slot in (("< Back (B)", self.prev_bout), ("Accept (A)", self.accept),
-                           ("Reject (R)", self.reject), ("Flip head (F)", self.flip),
-                           ("Skip (S)", self.skip), ("Play/Pause (Space)", self.toggle_play),
-                           ("Next (N) >", self.next_bout)):
+                           ("Reject (R)", self.reject), ("Swap roles (W)", self.swap_roles),
+                           ("Head/tail swapped (F)", self.flip), ("Skip (S)", self.skip),
+                           ("Play/Pause (Space)", self.toggle_play), ("Next (N) >", self.next_bout)):
             btn = QPushButton(text)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.clicked.connect(slot)
             row.addWidget(btn)
         right.addLayout(row)
         root.addLayout(right, 1)
-        self.resize(1200, 820)
+        self.resize(1320, 860)
 
     def _show_decision(self, i: int):
         d = self.decisions.get(self.bouts[i]["bout_id"])
@@ -213,8 +264,11 @@ class BehaviorReviewWindow(QWidget):
             return
         text = {"accept": "✓", "reject": "✗", "relabel": "→ " + d.get("label", ""),
                 "skip": "skipped"}.get(d["decision"], d["decision"])
+        b = self.bouts[i]
+        if d.get("actor") and not _same(d.get("actor"), b.get("focal")):
+            text += " (roles swapped)"
         if d.get("flipped") == "1":
-            text += " (flip)"
+            text += " (head/tail)"
         item.setText(text)
 
     # ---------------------------------------------------------------- playback
@@ -226,6 +280,78 @@ class BehaviorReviewWindow(QWidget):
             self._kp_cache[p] = _Keypoints(p)
         return self._kp_cache[p]
 
+    def _track_store(self, b: Dict):
+        p = b.get("tracks_h5") or ""
+        if not p or not os.path.exists(p):
+            return None
+        if p not in self._h5_cache:
+            from .track_store import TrackMaskReader
+            self._h5_cache[p] = TrackMaskReader(p)
+        return self._h5_cache[p]
+
+    def _role(self, track) -> str:
+        if _same(track, self.actor):
+            return "actor"
+        if _same(track, self.recipient):
+            return "recipient"
+        return "other"
+
+    def _labels(self) -> Dict[str, str]:
+        b = self.bouts[self.idx]
+        actor_label = KIND_TO_LABEL.get(b["kind"], b["kind"])
+        return {"actor": actor_label, "recipient": recipient_label(actor_label, self.recipient)}
+
+    def _draw_animals(self, img, frame: int, kp, store, scale: float):
+        """Masks, spines, noses and tail bases in role colours, and the role labels."""
+        from .mask_pose import mask_geometry
+        labels = self._labels()
+        dets = store.detections_for_frame(frame) if store is not None else []
+        overlay = img.copy()
+        for d in dets:
+            m = d["mask"]
+            if m is None:
+                continue
+            overlay[m.astype(bool)] = ROLE_COLOURS[self._role(d["object_id"])]
+        cv2.addWeighted(overlay, 0.35, img, 0.65, 0, dst=img)
+        lw = max(1, int(round(2 * scale)))
+        tags = []
+        for d in dets:
+            role = self._role(d["object_id"])
+            col = ROLE_COLOURS[role]
+            m = d["mask"]
+            if m is None:
+                continue
+            cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(img, cnts, -1, col, lw)
+            if role != "other":
+                x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
+                g = mask_geometry(m[y1:y2 + 1, x1:x2 + 1], (x1, y1))
+                if g is not None:
+                    cv2.polylines(img, [g["spine"].astype(np.int32)], False, col, lw)
+                tags.append((role, (d["bbox"][0] + d["bbox"][2]) / 2, d["bbox"][1]))
+        for track in (self.actor, self.recipient):
+            r = kp.get(frame, track) if kp else None
+            if _num(r, "nose_x") is None:
+                continue
+            col = ROLE_COLOURS[self._role(track)]
+            nose = (int(_num(r, "nose_x")), int(_num(r, "nose_y")))
+            tb = (int(_num(r, "tb_x")), int(_num(r, "tb_y")))
+            cv2.circle(img, nose, int(7 * scale), (20, 20, 20), -1)
+            cv2.circle(img, nose, int(5 * scale), col, -1)
+            cv2.circle(img, tb, int(7 * scale), (20, 20, 20), lw + 2)
+            cv2.circle(img, tb, int(7 * scale), col, lw)
+            if store is None:
+                tags.append((self._role(track), nose[0], nose[1] - 20 * scale))
+        for role, x, y in tags:
+            text = labels[role] if role == "actor" else labels["recipient"]
+            if not text:
+                continue
+            if role == "actor" and labels["recipient"]:
+                text += " →"
+            elif role == "recipient":
+                text = "← " + text
+            draw_tag(img, text, (x, y - 8 * scale), ROLE_COLOURS[role], scale)
+
     def _load_frames(self, b: Dict):
         cap = cv2.VideoCapture(b["video"])
         fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
@@ -233,7 +359,8 @@ class BehaviorReviewWindow(QWidget):
         pad = int(round(PAD_S * fps))
         start = max(0, f0 - pad)
         kp = self._keypoints(b)
-        ids = [x for x in (b.get("focal"), b.get("other")) if x not in (None, "")]
+        store = self._track_store(b)
+        ids = [x for x in (self.actor, self.recipient) if x not in (None, "")]
         pts = []
         if kp:
             for f in range(f0, f1 + 1):
@@ -257,38 +384,39 @@ class BehaviorReviewWindow(QWidget):
                     centre, side = np.array([float(b["cx"]), float(b["cy"])]), min(h, w, 720)
                 else:
                     centre, side = np.array([w / 2, h / 2]), None
-            if kp:
-                for i, col in zip(ids, ((0, 0, 255), (0, 200, 255))):
-                    r = kp.get(f, i)
-                    if _num(r, "nose_x") is not None:
-                        cv2.circle(img, (int(_num(r, "nose_x")), int(_num(r, "nose_y"))), 7, col, -1)
-                        cv2.circle(img, (int(_num(r, "tb_x")), int(_num(r, "tb_y"))), 6, (255, 128, 0), -1)
+            scale = (side or max(h, w)) / VIEW          # drawing sizes in view pixels
+            if kp or store is not None:
+                self._draw_animals(img, f, kp, store, scale)
             if side:
                 x0 = int(np.clip(centre[0] - side / 2, 0, w - side))
                 y0 = int(np.clip(centre[1] - side / 2, 0, h - side))
                 img = img[y0:y0 + side, x0:x0 + side]
-            scale = VIEW / max(img.shape[:2])
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, None, fx=VIEW / max(img.shape[:2]), fy=VIEW / max(img.shape[:2]),
+                             interpolation=cv2.INTER_AREA)
             frames.append(img)
             inb.append(f0 <= f <= f1)
         cap.release()
         return frames, inb, fps
 
-    def show_bout(self, i: int):
+    def show_bout(self, i: int, keep_roles: bool = False):
         if not self.bouts:
             return
         self.idx = max(0, min(i, len(self.bouts) - 1))
         b = self.bouts[self.idx]
+        if not keep_roles:
+            self.actor, self.recipient = b.get("focal", ""), b.get("other", "")
         self._frames, self._in_bout, fps = self._load_frames(b)
         self._pos = 0
         self._timer.start(int(1000 / fps))
         self._playing = True
         self.table.selectRow(self.idx)
         dur = (int(b["frame1"]) - int(b["frame0"]) + 1) / fps
-        who = f"  tracks {b.get('focal', '')}" + (f" → {b['other']}" if b.get("other") else "")
-        self.lbl_info.setText(f"#{b['bout_id']}  {KIND_TO_LABEL.get(b['kind'], b['kind'])}  "
-                              f"{dur:.1f} s{who}   {os.path.basename(b['video'])} "
-                              f"frames {b['frame0']}-{b['frame1']}")
+        labels = self._labels()
+        who = f"  actor: track {self.actor}"
+        if self.recipient:
+            who += f" → recipient: track {self.recipient} ({labels['recipient']})"
+        self.lbl_info.setText(f"#{b['bout_id']}  {labels['actor']}  {dur:.1f} s{who}   "
+                              f"{os.path.basename(b['video'])} frames {b['frame0']}-{b['frame1']}")
         self._update_progress()
         self._tick()
 
@@ -313,12 +441,16 @@ class BehaviorReviewWindow(QWidget):
         self.lbl_progress.setText(f"{n} of {len(self.bouts)} reviewed")
 
     # ---------------------------------------------------------------- decisions
-    def _decide(self, decision: str, label: Optional[str] = None, flipped: bool = False):
+    def _decide(self, decision: str, actor_label: Optional[str] = None, flipped: bool = False):
         b = self.bouts[self.idx]
         proposed = KIND_TO_LABEL.get(b["kind"], b["kind"])
+        if actor_label is None:
+            actor_label = proposed if decision == "accept" else ""
         self.decisions[b["bout_id"]] = {
             "bout_id": b["bout_id"], "kind": b["kind"], "decision": decision,
-            "label": label if label is not None else (proposed if decision == "accept" else ""),
+            "label": actor_label, "actor": self.actor, "recipient": self.recipient,
+            "actor_label": actor_label,
+            "recipient_label": recipient_label(actor_label, self.recipient) if actor_label else "",
             "flipped": "1" if flipped else "0",
             "reviewed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -337,12 +469,19 @@ class BehaviorReviewWindow(QWidget):
         self._decide("skip")
 
     def flip(self):
-        """Head and tail were swapped on the focal animal; the behaviour itself is right."""
+        """The behaviour is right but head and tail were swapped on the actor."""
         self._decide("accept", flipped=True)
 
     def relabel(self, k: int):
         if 0 <= k < len(self.ethogram):
-            self._decide("relabel", label=self.ethogram[k])
+            self._decide("relabel", actor_label=self.ethogram[k])
+
+    def swap_roles(self):
+        """The other animal is the one doing it: exchange actor and recipient and replay."""
+        if self.recipient in (None, ""):
+            return
+        self.actor, self.recipient = self.recipient, self.actor
+        self.show_bout(self.idx, keep_roles=True)
 
     def next_bout(self):
         if self.idx < len(self.bouts) - 1:
@@ -355,7 +494,7 @@ class BehaviorReviewWindow(QWidget):
     def keyPressEvent(self, e):
         k = e.key()
         actions = {Qt.Key_A: self.accept, Qt.Key_R: self.reject, Qt.Key_F: self.flip,
-                   Qt.Key_S: self.skip, Qt.Key_Space: self.toggle_play,
+                   Qt.Key_W: self.swap_roles, Qt.Key_S: self.skip, Qt.Key_Space: self.toggle_play,
                    Qt.Key_N: self.next_bout, Qt.Key_Right: self.next_bout,
                    Qt.Key_B: self.prev_bout, Qt.Key_Left: self.prev_bout}
         if k in actions:
@@ -368,6 +507,11 @@ class BehaviorReviewWindow(QWidget):
 
     def closeEvent(self, e):
         self._timer.stop()
+        for store in self._h5_cache.values():
+            try:
+                store.close()
+            except Exception:
+                pass
         super().closeEvent(e)
 
 
