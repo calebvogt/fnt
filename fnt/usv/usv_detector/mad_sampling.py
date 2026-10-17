@@ -421,9 +421,10 @@ def condition_of(folder: str, keywords: Sequence[str]) -> str:
 
 
 def trial_of(folder: str) -> str:
-    """'T005' from 'T005_prairie_anosmic-saline'; the folder name otherwise."""
+    """'T005' from 'T005_prairie_anosmic-saline' or 'VC-T005_prairie_anosmic-saline'
+    (a project prefix is dropped); the folder name otherwise."""
     name = os.path.basename(os.path.normpath(folder))
-    m = re.match(r"^(T\d+)", name, re.I)
+    m = re.match(r"^(?:[A-Z]{2}-)?(T\d+)", name, re.I)
     return m.group(1).upper() if m else name
 
 

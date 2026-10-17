@@ -67,7 +67,9 @@ def test_day_and_night_by_clock_hour(hour, phase):
 
 def test_trial_and_condition_from_the_folder():
     assert S.trial_of(r"Z:\Data\T009_prairie_anosmic-saline") == "T009"
+    assert S.trial_of(r"Z:\Data\VC-T009_prairie_anosmic-saline") == "T009"
     assert S.condition_of("T010_prairie_anosmic-mmz", ["mmz", "saline"]) == "mmz"
+    assert S.condition_of("VC-T010_prairie_anosmic-mmz", ["mmz", "saline"]) == "mmz"
     assert S.condition_of("T001_Prairie_2M2F", ["mmz", "saline"]) == ""
 
 
