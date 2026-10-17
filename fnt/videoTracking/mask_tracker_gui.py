@@ -6903,7 +6903,7 @@ class MaskTrackerWindow(QMainWindow):
         self._tools_view_row.addWidget(self.btn_view_masks)
         self._tools_view_row.addStretch()
         self.lbl_class_keys = QLabel("")
-        self.lbl_class_keys.setWordWrap(True)
+        self.lbl_class_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
         self.lbl_class_keys.setToolTip(
             "Number keys: with a mask pending (SAM or Paint), save it as that class;\n"
@@ -9217,7 +9217,9 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.available_categories = list(self._categories)
         if hasattr(self, "lbl_class_keys"):
             keys = [str((i + 1) % 10) for i in range(min(10, len(self._categories)))]
-            self.lbl_class_keys.setText("   ".join(f"{k} {c}" for k, c in zip(keys, self._categories)))
+            items = [f"{k}  {c}" for k, c in zip(keys, self._categories)]
+            # Two per line: one long line widened the whole left panel.
+            self.lbl_class_keys.setText("\n".join("      ".join(items[i:i + 2]) for i in range(0, len(items), 2)))
 
     def _active_category(self) -> Optional[str]:
         cat = self.combo_active_class.currentText().strip()

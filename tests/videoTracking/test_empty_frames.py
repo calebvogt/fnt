@@ -333,7 +333,7 @@ def test_a_number_key_saves_the_pending_mask_as_that_class():
         w._coco.add_category(c)
         w._categories.append(c)
     w._refresh_active_class_combo()
-    assert "3 hut" in w.lbl_class_keys.text()
+    assert "3  hut" in w.lbl_class_keys.text()
     w._select_frame_row(0)
     pv = w.preview
     pv.resize(400, 300)
