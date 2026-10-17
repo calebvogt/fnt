@@ -44,6 +44,7 @@ STITCH_DIST_BL = 1.0     # ... if the next starts within this many body lengths 
 NOSE_NEAR_BL = 0.5
 NOSE_MIN_S = 0.3
 HEAD_CONF = 1.0          # |head evidence| below this: which end is the head is a guess
+JOIN_GAP_S = 1.0         # facial and anogenital bouts this close are one investigation
 ACTIVE_FRAC = 0.3        # a sniff needs the actor's head busy on this share of the bout
 CHASE_FOCAL_BLS, CHASE_OTHER_BLS, CHASE_DIST_BL, CHASE_ANGLE, CHASE_MIN_S = 2.7, 1.8, 4.5, 35, 0.5
 STILL_BLS, HEAD_RATIO, HEAD_MIN_S = 0.27, 2.0, 1.0
@@ -424,7 +425,48 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
         for a, b in mp.runs(imm, max(1, int(round(IMMOBILE_MIN_S * fps))), gap=5):
             together = np.mean([((t, k) in contact_t) or merged[t] for t in range(a, b + 1)]) > 0.5
             add("huddle" if together else "immobile", k, "", a, b)
-    return bouts
+    return join_investigations(bouts, fps)
+
+
+def join_investigations(bouts: List[Dict], fps: float, max_gap_s: float = JOIN_GAP_S) -> List[Dict]:
+    """One bout per investigation sequence of a pair, pre-split where it changes.
+
+    An actor's anogenital bouts and the nose-nose bouts of the same two animals, less than
+    ``max_gap_s`` apart, become one ``investigation`` bout whose ``segments`` list each
+    part's first frame index and kind (a gap goes to the part after it). The reviewer then
+    confirms or moves the split instead of finding it. Each nose-nose bout joins at most
+    one sequence."""
+    gap = int(round(max_gap_s * fps))
+    used = set()
+    joined = []
+    ano = sorted((b for b in bouts if b["kind"] == "anogenital"), key=lambda b: -b["dur_s"])
+    for seed in ano:
+        if id(seed) in used:
+            continue
+        f, o = seed["focal"], seed["other"]
+        pool = [b for b in bouts if id(b) not in used and (
+            (b["kind"] == "anogenital" and b["focal"] == f and b["other"] == o) or
+            (b["kind"] == "nose_nose" and {b["focal"], b["other"]} == {f, o}))]
+        pool.sort(key=lambda b: b["t0"])
+        i = pool.index(seed)
+        lo = hi = i
+        while lo > 0 and pool[lo]["t0"] - pool[lo - 1]["t1"] <= gap:
+            lo -= 1
+        while hi < len(pool) - 1 and pool[hi + 1]["t0"] - pool[hi]["t1"] <= gap:
+            hi += 1
+        chain = pool[lo:hi + 1]
+        if not any(b["kind"] == "nose_nose" for b in chain):
+            continue
+        segs = []
+        for b in chain:
+            if not segs or segs[-1][1] != b["kind"]:
+                segs.append((b["t0"], b["kind"]))
+        segs[0] = (chain[0]["t0"], segs[0][1])
+        t0, t1 = chain[0]["t0"], max(b["t1"] for b in chain)
+        joined.append({"kind": "investigation", "focal": f, "other": o, "t0": t0, "t1": t1,
+                       "dur_s": round((t1 - t0 + 1) / fps, 2), "segments_t": segs})
+        used.update(id(b) for b in chain)
+    return [b for b in bouts if id(b) not in used] + joined
 
 
 def bouts_from_csv(tracks_csv: str, pairs_csv: str, fps: float) -> List[Dict]:
@@ -452,6 +494,7 @@ def bouts_from_csv(tracks_csv: str, pairs_csv: str, fps: float) -> List[Dict]:
     bouts = candidate_bouts(rows, pairs, fps, n)
     for b in bouts:
         b["frame0"], b["frame1"] = frame_of[b["t0"]], frame_of[b["t1"]]
+        b["segments"] = _segments_text(b, lambda t: frame_of[t])
     return bouts
 
 
@@ -478,7 +521,13 @@ TRACK_COLS = ["frame", "t", "track", "area", "merged", "cx", "cy", "vx", "vy", "
               "body_len", "nose_x", "nose_y", "tb_x", "tb_y", "heading", "bend", "tail", "head_ev",
               "me_head", "me_mid", "me_rear"]
 PAIR_COLS = ["frame", "t", "focal", "other", "centroid_dist", "nose_nose", "nose_tailbase", "contact"]
-BOUT_COLS = ["kind", "focal", "other", "frame0", "frame1", "dur_s", "video", "tracks_csv", "tracks_h5"]
+BOUT_COLS = ["kind", "focal", "other", "frame0", "frame1", "dur_s", "video", "tracks_csv", "tracks_h5",
+             "segments"]
+
+
+def _segments_text(b: Dict, frame_of) -> str:
+    """``frame:kind;...`` for a pre-split bout (frame indices -> video frames)."""
+    return ";".join(f"{frame_of(t)}:{k}" for t, k in b.get("segments_t", []))
 
 
 def _write_csv(path, cols, rows):
@@ -552,7 +601,8 @@ def run_window(video: str, start_frame: int, n_frames: int, out_dir: str,
     _write_csv(paths["pairs_csv"], PAIR_COLS, pairs)
     for b in bouts:
         b.update(frame0=frames[b["t0"]], frame1=frames[b["t1"]], video=video,
-                 tracks_csv=paths["tracks_csv"], tracks_h5=paths["tracks_h5"])
+                 tracks_csv=paths["tracks_csv"], tracks_h5=paths["tracks_h5"],
+                 segments=_segments_text(b, lambda t: frames[t]))
     _write_csv(paths["bouts_csv"], BOUT_COLS, bouts)
     if crop_size and crops:
         paths["crops"] = os.path.join(out_dir, stem + "_crops.npz")

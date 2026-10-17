@@ -1,5 +1,6 @@
 """Behaviour review window: decisions per key, saved after every press, resumable; actor and
-recipient roles with both animals' labels; masks drawn from a track store.
+recipient roles with both animals' labels; masks drawn from a track store; bouts split into
+segments with their own labels.
 
 A synthetic video (two dark discs), tracks CSV and track store stand in for a real
 session. Runs under pytest, or directly.
@@ -28,7 +29,7 @@ def positions(i):
     return {1: (60 + 2 * i, 100), 2: (20 + 2 * i, 140)}
 
 
-def make_session(tmp, n_bouts=4, with_store=False, other=""):
+def make_session(tmp, n_bouts=4, with_store=False, other="", segments=""):
     video = os.path.join(tmp, "clip.avi")
     w = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"MJPG"), 15, (W, H))
     for i in range(90):
@@ -62,9 +63,11 @@ def make_session(tmp, n_bouts=4, with_store=False, other=""):
     kinds = ["nose_nose", "chase", "immobile", "head_only"]
     with open(bouts, "w", newline="") as fh:
         wr = csv.writer(fh)
-        wr.writerow(["video", "frame0", "frame1", "kind", "focal", "other", "tracks_csv", "tracks_h5"])
+        wr.writerow(["video", "frame0", "frame1", "kind", "focal", "other", "tracks_csv", "tracks_h5",
+                     "segments"])
         for k in range(n_bouts):
-            wr.writerow([video, 10 + 15 * k, 20 + 15 * k, kinds[k % 4], 1, other, tracks, store])
+            wr.writerow([video, 10 + 15 * k, 20 + 15 * k, kinds[k % 4], 1, other, tracks, store,
+                         segments if k == 0 else ""])
     return bouts
 
 
@@ -73,8 +76,12 @@ def press(win, key):
 
 
 def read_review(bouts):
-    with open(br.review_path(bouts), newline="") as fh:
-        return {r["bout_id"]: r for r in csv.DictReader(fh)}
+    """Bout id -> its first segment row (segments: read_segments)."""
+    return {k: v[0] for k, v in br.load_review(br.review_path(bouts)).items()}
+
+
+def read_segments(bouts):
+    return br.load_review(br.review_path(bouts))
 
 
 def test_keys_record_decisions_and_save_each_time():
@@ -83,12 +90,12 @@ def test_keys_record_decisions_and_save_each_time():
         win = br.BehaviorReviewWindow(bouts)
         assert win._frames, "frames of the first bout were not read"
         press(win, Qt.Key_A)                       # bout 0 accepted as proposed
-        assert read_review(bouts)["0"]["label"] == "nose-nose sniff"
-        press(win, Qt.Key_8)                       # bout 1 relabelled: key 8 = 8th behaviour
+        assert read_review(bouts)["0"]["label"] == "facial investigation"
+        press(win, Qt.Key_7)                       # bout 1 (chase) relabelled: key 7 = 7th behaviour
         press(win, Qt.Key_R)                       # bout 2 rejected
         press(win, Qt.Key_F)                       # bout 3: right behaviour, head/tail swapped
         r = read_review(bouts)
-        assert r["1"]["decision"] == "relabel" and r["1"]["label"] == br.ETHOGRAM[7]
+        assert r["1"]["decision"] == "relabel" and r["1"]["label"] == br.ETHOGRAM[6]
         assert r["2"]["decision"] == "reject" and r["2"]["label"] == ""
         assert r["3"]["decision"] == "accept" and r["3"]["flipped"] == "1"
         assert win.lbl_progress.text() == "4 of 4 reviewed"
@@ -116,14 +123,14 @@ def test_both_animals_get_their_side_of_a_social_behaviour():
         press(win, Qt.Key_A)                       # nose-nose: mutual
         press(win, Qt.Key_W)                       # chase, but track 2 is the chaser
         press(win, Qt.Key_A)
-        press(win, Qt.Key_5)                       # relabel bout 2: anogenital sniff
+        press(win, Qt.Key_5)                       # relabel bout 2: anogenital investigation
         r = read_review(bouts)
         assert (r["0"]["actor"], r["0"]["recipient"]) == ("1", "2")
-        assert r["0"]["recipient_label"] == "nose-nose sniff"
+        assert r["0"]["recipient_label"] == "receives facial investigation"
         assert (r["1"]["actor"], r["1"]["recipient"]) == ("2", "1")
         assert r["1"]["actor_label"] == "chase" and r["1"]["recipient_label"] == "chased / flees"
-        assert r["2"]["actor_label"] == "anogenital sniff"
-        assert r["2"]["recipient_label"] == "receives anogenital sniff"
+        assert r["2"]["actor_label"] == "anogenital investigation"
+        assert r["2"]["recipient_label"] == "receives anogenital investigation"
         win.close()
 
 
@@ -148,13 +155,62 @@ def test_masks_are_drawn_in_role_colours():
     assert tinted.any()
 
 
+def goto(win, frame):
+    win._pos = win._frame_ids.index(frame)
+
+
+def test_a_bout_splits_into_labelled_segments():
+    with tempfile.TemporaryDirectory() as tmp:
+        bouts = make_session(tmp, n_bouts=2, other=2)
+        win = br.BehaviorReviewWindow(bouts)
+        goto(win, 15)
+        press(win, Qt.Key_X)                       # split bout 0 (frames 10-20) at 15
+        press(win, Qt.Key_5)                       # 15-20: anogenital; stays on the bout
+        assert win.idx == 0 and len(win.segments) == 2
+        goto(win, 12)
+        press(win, Qt.Key_4)                       # 10-14: facial
+        press(win, Qt.Key_A)
+        segs = read_segments(bouts)["0"]
+        assert [(int(r["frame0"]), int(r["frame1"]), r["actor_label"], r["recipient_label"]) for r in segs] == [
+            (10, 14, "facial investigation", "receives facial investigation"),
+            (15, 20, "anogenital investigation", "receives anogenital investigation")]
+        assert win.idx == 1
+        win.close()
+        again = br.BehaviorReviewWindow(bouts)     # reopened on bout 0, its segments are back
+        again.show_bout(0)
+        assert [(s["start"], s["label"]) for s in again.segments] == [
+            (10, "facial investigation"), (15, "anogenital investigation")]
+        again.close()
+
+
+def test_merge_joins_a_segment_to_the_one_before():
+    with tempfile.TemporaryDirectory() as tmp:
+        win = br.BehaviorReviewWindow(make_session(tmp, n_bouts=1, other=2))
+        goto(win, 13); press(win, Qt.Key_X)
+        goto(win, 17); press(win, Qt.Key_X)
+        assert [s["start"] for s in win.segments] == [10, 13, 17]
+        press(win, Qt.Key_M)                       # playhead in 17-20: joins 13-16
+        assert [(s["start"], s["end"]) for s in win.segments] == [(10, 12), (13, 20)]
+        win.close()
+
+
+def test_bouts_the_rules_split_open_pre_split():
+    with tempfile.TemporaryDirectory() as tmp:
+        win = br.BehaviorReviewWindow(make_session(tmp, n_bouts=1, other=2,
+                                                   segments="10:nose_nose;16:anogenital"))
+        assert [(s["start"], s["end"], s["label"]) for s in win.segments] == [
+            (10, 15, "facial investigation"), (16, 20, "anogenital investigation")]
+        assert "facial investigation → anogenital investigation" in win.table.item(0, 1).text()
+        win.close()
+
+
 def test_the_view_follows_the_animals():
     with tempfile.TemporaryDirectory() as tmp:
         bouts = make_session(tmp, n_bouts=1)
         win = br.BehaviorReviewWindow(bouts)
         # 0.5 s (8 frames at 15 fps) of context either side of an 11-frame bout.
         assert len(win._frames) == 11 + 2 * 8
-        assert sum(win._in_bout) == 11
+        assert sum(10 <= f <= 20 for f in win._frame_ids) == 11
         win.close()
 
 

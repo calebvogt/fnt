@@ -221,6 +221,17 @@ def test_stitching_takes_only_mutual_best_matches():
     assert joined[0]["bbox"][0] == 100                                   # the nearer one
 
 
+def test_facial_then_anogenital_becomes_one_pre_split_bout():
+    nn = {"kind": "nose_nose", "focal": 1, "other": 2, "t0": 0, "t1": 9, "dur_s": 0.67}
+    ag = {"kind": "anogenital", "focal": 2, "other": 1, "t0": 15, "t1": 30, "dur_s": 1.07}
+    far = {"kind": "anogenital", "focal": 2, "other": 1, "t0": 200, "t1": 210, "dur_s": 0.73}
+    out = bf.join_investigations([nn, ag, far], fps=15)
+    inv = [b for b in out if b["kind"] == "investigation"]
+    assert len(inv) == 1 and inv[0]["focal"] == 2 and (inv[0]["t0"], inv[0]["t1"]) == (0, 30)
+    assert inv[0]["segments_t"] == [(0, "nose_nose"), (15, "anogenital")]
+    assert far in out and nn not in out and ag not in out
+
+
 def test_link_tracks_bridges_a_short_gap():
     m1 = np.zeros((50, 80), bool); m1[20:30, 10:30] = True
     det = bf._as_det(m1, 0.9)
