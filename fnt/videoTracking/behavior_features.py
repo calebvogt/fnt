@@ -165,6 +165,21 @@ def link_tracks(dets: Sequence[Sequence[Dict]], fps: float, max_gap_s: float = M
 
 
 # ---------------------------------------------------------------- features
+MERGED_X = 1.6           # a mask this many times one animal's area is several animals
+
+
+def mark_merged(rows: List[Dict]):
+    """Flag masks that are several animals merged into one, in place.
+
+    One animal's area is the window's median over masks with a tail seen (a visible tail
+    means the mask is a single animal), else over all masks. A track's own median would
+    miss a pile that stays merged all window -- the case that matters for huddles."""
+    single = [float(r["area"]) for r in rows if int(float(r.get("tail") or 0))]
+    ref = float(np.median(single if len(single) >= 20 else [float(r["area"]) for r in rows])) if rows else 0.0
+    for r in rows:
+        r["merged"] = int(ref > 0 and float(r["area"]) > MERGED_X * ref)
+
+
 def track_rows(tracks: Dict[int, Dict[int, Dict]], frames: Sequence[int], fps: float) -> List[Dict]:
     """Per animal per frame: geometry, oriented keypoints and speed (no pixels yet)."""
     rows = []
@@ -178,14 +193,13 @@ def track_rows(tracks: Dict[int, Dict[int, Dict]], frames: Sequence[int], fps: f
         lens = [kp["body_length"] for kp in kps if kp is not None and kp["body_length"] > 0]
         body = float(np.median(lens)) if lens else 1.0
         areas = [tr[t]["crop"].sum() for t in ts]
-        med_area = float(np.median(areas))
         for i, t in enumerate(ts):
             d = tr[t]
             i0, i1 = max(0, i - 2), min(len(ts) - 1, i + 2)
             dt_s = (ts[i1] - ts[i0]) / fps
             speed = (np.linalg.norm(cents[i1] - cents[i0]) / dt_s / body) if dt_s else 0.0
             r = {"frame": int(frames[t]), "t": t, "track": k, "area": int(areas[i]),
-                 "merged": int(areas[i] > 1.6 * med_area), "cx": float(cents[i][0]),
+                 "cx": float(cents[i][0]),
                  "cy": float(cents[i][1]), "speed": float(speed), "body_ref": body,
                  "vx": float(cents[i1][0] - cents[i0][0]) / dt_s if dt_s else 0.0,
                  "vy": float(cents[i1][1] - cents[i0][1]) / dt_s if dt_s else 0.0}
@@ -197,6 +211,7 @@ def track_rows(tracks: Dict[int, Dict[int, Dict]], frames: Sequence[int], fps: f
                          tail=int(bool(oriented[i]["tail"])), head_ev=conf[i],
                          _spine=kp["body_spine"], _kp=kp)
             rows.append(r)
+    mark_merged(rows)
     return rows
 
 
@@ -380,6 +395,7 @@ def bouts_from_csv(tracks_csv: str, pairs_csv: str, fps: float) -> List[Dict]:
                 dt = (int(b["t"]) - int(a["t"])) / fps
                 r["vx"] = (float(b["cx"]) - float(a["cx"])) / dt if dt else 0.0
                 r["vy"] = (float(b["cy"]) - float(a["cy"])) / dt if dt else 0.0
+    mark_merged(rows)
     n = max(int(r["t"]) for r in rows) + 1 if rows else 0
     frame_of = {int(r["t"]): int(r["frame"]) for r in rows}
     bouts = candidate_bouts(rows, pairs, fps, n)

@@ -162,6 +162,13 @@ def test_a_still_merged_blob_is_a_huddle():
     assert kinds == ["huddle"]
 
 
+def test_merged_is_judged_against_one_animal():
+    """A pile that stays merged all window is still a pile."""
+    rows = [{"area": 1000, "tail": 1} for _ in range(30)] + [{"area": 3000, "tail": 0} for _ in range(30)]
+    bf.mark_merged(rows)
+    assert [r["merged"] for r in rows] == [0] * 30 + [1] * 30
+
+
 def test_bouts_rebuild_from_the_saved_csvs(window):
     tmp, _, paths, _, _, bouts = window
     rebuilt = bf.bouts_from_csv(paths["tracks_csv"], paths["pairs_csv"], FPS)
