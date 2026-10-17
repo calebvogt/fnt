@@ -176,6 +176,12 @@ def _parser():
                         help="Pool windows' candidate bouts into one behavior_review session CSV.")
     s_.add_argument("--bouts", nargs="+", required=True, help="*_bouts.csv files.")
     s_.add_argument("--out", required=True, help="Session CSV to write.")
+    s_.add_argument("--per-kind", type=int, default=0,
+                    help="Keep at most this many bouts of each kind, taken in turn from the windows.")
+    r_ = sub.add_parser("behavior-rebout",
+                        help="Rebuild windows' candidate bouts with the current rules from their saved "
+                             "tracks and pairs CSVs (no detection).")
+    r_.add_argument("--bouts", nargs="+", required=True, help="*_bouts.csv files to rewrite.")
     return p
 
 
@@ -225,7 +231,12 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "behavior-session":
         from .behavior_features import build_session
-        print(f"{build_session(args.bouts, args.out)} bouts -> {args.out}")
+        print(f"{build_session(args.bouts, args.out, args.per_kind)} bouts -> {args.out}")
+        return 0
+    if args.cmd == "behavior-rebout":
+        from .behavior_features import rebuild_bouts
+        for p in args.bouts:
+            print(f"{rebuild_bouts(p)} bouts: {os.path.basename(p)}", flush=True)
         return 0
     return 2
 

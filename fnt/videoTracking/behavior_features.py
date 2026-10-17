@@ -40,7 +40,9 @@ MIN_TRACK_S = 1.0        # shorter tracks are dropped as flicker
 # Candidate rules. BL = body length, nose to tail base (the scratchpad prototype measured
 # with the tail in, about 1.8 BL, and these are its thresholds converted).
 NOSE_NEAR_BL = 0.5
-NOSE_MIN_S = 0.2
+NOSE_MIN_S = 0.3
+HEAD_CONF = 1.0          # |head evidence| below this: which end is the head is a guess
+ACTIVE_FRAC = 0.3        # a sniff needs the actor's head busy on this share of the bout
 CHASE_FOCAL_BLS, CHASE_OTHER_BLS, CHASE_DIST_BL, CHASE_ANGLE, CHASE_MIN_S = 2.7, 1.8, 4.5, 35, 0.5
 STILL_BLS, HEAD_RATIO, HEAD_MIN_S = 0.27, 2.0, 1.0
 IMMOBILE_BLS, IMMOBILE_MIN_S = 0.18, 3.0
@@ -256,6 +258,14 @@ def pair_rows(rows: List[Dict], tracks) -> List[Dict]:
 
 
 # ---------------------------------------------------------------- candidate bouts
+def _f(r: Dict, k: str) -> float:
+    try:
+        v = float(r.get(k, np.nan))
+    except (TypeError, ValueError):
+        return np.nan
+    return v
+
+
 def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: int) -> List[Dict]:
     """Rule-based candidate bouts (first guesses, to be tuned against review):
 
@@ -265,69 +275,141 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
                 the other faster than CHASE_OTHER_BLS moving away, within CHASE_DIST_BL
     head_only   body still (< STILL_BLS) with head motion over HEAD_RATIO x rear motion
                 (sniffing or grooming in place)
-    immobile    slower than IMMOBILE_BLS for IMMOBILE_MIN_S; huddle when in contact
+    immobile    slower than IMMOBILE_BLS for IMMOBILE_MIN_S; huddle when in contact with
+                another animal, or when the mask is a merged blob of several
+
+    The nose rules count a frame only when the animals involved have a confident head
+    call (|head evidence| >= HEAD_CONF: a tail seen, or a strong taper or direction of
+    travel), and keep a bout only when the actor's head is busy (head motion above the
+    window's median) on at least ACTIVE_FRAC of it. Two resting mice side by side otherwise
+    read as endless short sniffs, and a guessed head end as a sniff of the wrong end.
+
+    ``rows`` and ``pairs`` are the dicts written to the tracks and pairs CSVs (numbers may
+    be strings), so bouts can be rebuilt from saved windows (:func:`bouts_from_csv`).
     """
     T = n_frames
-    key = {(r["t"], r["track"]): r for r in rows}
+    key = {(int(r["t"]), int(r["track"])): r for r in rows}
     bouts = []
 
     def add(kind, focal, other, a, b):
         bouts.append({"kind": kind, "focal": focal, "other": other, "t0": a, "t1": b,
                       "dur_s": round((b - a + 1) / fps, 2)})
 
+    heads = np.array([_f(r, "me_head") for r in rows])
+    heads = heads[~np.isnan(heads)]
+    busy_floor = float(np.median(heads)) if len(heads) else 0.0
+    me = np.array([np.nanmean([_f(r, "me_head"), _f(r, "me_mid"), _f(r, "me_rear")]) for r in rows])
+    me = me[~np.isnan(me)]
+    head_floor = float(np.percentile(me, 60)) if len(me) else 0.0
+
+    def confident(r):
+        return r is not None and abs(_f(r, "head_ev")) >= HEAD_CONF
+
+    def busy(track, a, b):
+        flags = [_f(key[(t, track)], "me_head") > busy_floor for t in range(a, b + 1) if (t, track) in key]
+        return bool(flags) and np.mean(flags) >= ACTIVE_FRAC
+
     by_pair: Dict[Tuple[int, int], Dict[int, Dict]] = {}
     for p in pairs:
-        by_pair.setdefault((p["focal"], p["other"]), {})[p["t"]] = p
+        by_pair.setdefault((int(p["focal"]), int(p["other"])), {})[int(p["t"])] = p
+    min_nose = max(1, int(round(NOSE_MIN_S * fps)))
     for (f, o), ps in by_pair.items():
         nn = np.zeros(T, bool)
         ag = np.zeros(T, bool)
         ch = np.zeros(T, bool)
         for t, p in ps.items():
-            close_nn = p["nose_nose"] < NOSE_NEAR_BL
-            nn[t] = close_nn
-            ag[t] = p["nose_tailbase"] < NOSE_NEAR_BL and not close_nn
             F, O = key.get((t, f)), key.get((t, o))
-            if (F and O and p["centroid_dist"] < CHASE_DIST_BL and F["speed"] > CHASE_FOCAL_BLS
-                    and O["speed"] > CHASE_OTHER_BLS and "heading" in F):
-                to_o = np.array([O["cx"] - F["cx"], O["cy"] - F["cy"]])
-                hd = np.array([np.cos(np.radians(F["heading"])), np.sin(np.radians(F["heading"]))])
+            close_nn = _f(p, "nose_nose") < NOSE_NEAR_BL
+            nn[t] = close_nn and confident(F) and confident(O)
+            ag[t] = _f(p, "nose_tailbase") < NOSE_NEAR_BL and not close_nn and confident(F) and confident(O)
+            if (F and O and confident(F) and _f(p, "centroid_dist") < CHASE_DIST_BL
+                    and _f(F, "speed") > CHASE_FOCAL_BLS and _f(O, "speed") > CHASE_OTHER_BLS):
+                to_o = np.array([_f(O, "cx") - _f(F, "cx"), _f(O, "cy") - _f(F, "cy")])
+                h = np.radians(_f(F, "heading"))
+                hd = np.array([np.cos(h), np.sin(h)])
                 ang = np.degrees(np.arccos(np.clip(hd @ to_o / (np.linalg.norm(to_o) + 1e-9), -1, 1)))
-                ch[t] = ang < CHASE_ANGLE and np.array([O["vx"], O["vy"]]) @ to_o > 0
+                ch[t] = ang < CHASE_ANGLE and np.array([_f(O, "vx"), _f(O, "vy")]) @ to_o > 0
         if f < o:
-            for a, b in mp.runs(nn, max(1, int(NOSE_MIN_S * fps))):
-                add("nose_nose", f, o, a, b)
-        for a, b in mp.runs(ag, max(1, int(NOSE_MIN_S * fps))):
-            add("anogenital", f, o, a, b)
-        for a, b in mp.runs(ch, max(1, int(CHASE_MIN_S * fps))):
+            for a, b in mp.runs(nn, min_nose):
+                if busy(f, a, b) or busy(o, a, b):
+                    add("nose_nose", f, o, a, b)
+        for a, b in mp.runs(ag, min_nose):
+            if busy(f, a, b):
+                add("anogenital", f, o, a, b)
+        for a, b in mp.runs(ch, max(1, int(round(CHASE_MIN_S * fps)))):
             add("chase", f, o, a, b)
-    contact_t = {(p["t"], p["focal"]) for p in pairs if p["contact"]}
-    me = np.array([np.nanmean([r.get("me_head", np.nan), r.get("me_mid", np.nan), r.get("me_rear", np.nan)])
-                   for r in rows if "me_head" in r and not np.isnan(r.get("me_head", np.nan))])
-    head_floor = float(np.percentile(me, 60)) if len(me) else 0.0
+    contact_t = {(int(p["t"]), int(p["focal"])) for p in pairs if int(p["contact"])}
     by_track: Dict[int, Dict[int, Dict]] = {}
     for r in rows:
-        by_track.setdefault(r["track"], {})[r["t"]] = r
+        by_track.setdefault(int(r["track"]), {})[int(r["t"])] = r
     for k, rs in by_track.items():
         still = np.zeros(T, bool)
         head = np.zeros(T, bool)
         imm = np.zeros(T, bool)
+        merged = np.zeros(T, bool)
         for t, r in rs.items():
-            still[t] = r["speed"] < STILL_BLS
-            imm[t] = r["speed"] < IMMOBILE_BLS
-            h, rr = r.get("me_head", np.nan), r.get("me_rear", np.nan)
+            still[t] = _f(r, "speed") < STILL_BLS
+            imm[t] = _f(r, "speed") < IMMOBILE_BLS
+            merged[t] = bool(int(_f(r, "merged") or 0))
+            h, rr = _f(r, "me_head"), _f(r, "me_rear")
             head[t] = (not np.isnan(h)) and h > HEAD_RATIO * (rr if not np.isnan(rr) else 0) and h > head_floor
-        for a, b in mp.runs(still & head, max(1, int(HEAD_MIN_S * fps))):
+        for a, b in mp.runs(still & head, max(1, int(round(HEAD_MIN_S * fps)))):
             add("head_only", k, "", a, b)
-        for a, b in mp.runs(imm, max(1, int(IMMOBILE_MIN_S * fps)), gap=5):
-            touching = np.mean([(t, k) in contact_t for t in range(a, b + 1)]) > 0.5
-            add("huddle" if touching else "immobile", k, "", a, b)
+        for a, b in mp.runs(imm, max(1, int(round(IMMOBILE_MIN_S * fps))), gap=5):
+            together = np.mean([((t, k) in contact_t) or merged[t] for t in range(a, b + 1)]) > 0.5
+            add("huddle" if together else "immobile", k, "", a, b)
     return bouts
 
 
+def bouts_from_csv(tracks_csv: str, pairs_csv: str, fps: float) -> List[Dict]:
+    """Candidate bouts rebuilt from a saved window's tracks and pairs CSVs (no detection),
+    so changed rules can be applied to windows already run. Velocities missing from older
+    files are recomputed from the centroids."""
+    with open(tracks_csv, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    with open(pairs_csv, newline="", encoding="utf-8") as fh:
+        pairs = list(csv.DictReader(fh))
+    if rows and "vx" not in rows[0]:
+        by: Dict[str, List[Dict]] = {}
+        for r in rows:
+            by.setdefault(r["track"], []).append(r)
+        for rs in by.values():
+            rs.sort(key=lambda r: int(r["t"]))
+            for i, r in enumerate(rs):
+                a, b = rs[max(0, i - 2)], rs[min(len(rs) - 1, i + 2)]
+                dt = (int(b["t"]) - int(a["t"])) / fps
+                r["vx"] = (float(b["cx"]) - float(a["cx"])) / dt if dt else 0.0
+                r["vy"] = (float(b["cy"]) - float(a["cy"])) / dt if dt else 0.0
+    n = max(int(r["t"]) for r in rows) + 1 if rows else 0
+    frame_of = {int(r["t"]): int(r["frame"]) for r in rows}
+    bouts = candidate_bouts(rows, pairs, fps, n)
+    for b in bouts:
+        b["frame0"], b["frame1"] = frame_of[b["t0"]], frame_of[b["t1"]]
+    return bouts
+
+
+def rebuild_bouts(bouts_csv: str, fps: Optional[float] = None) -> int:
+    """Rewrite a window's bouts CSV with the current rules, from its tracks and pairs CSVs.
+    Returns the number of bouts."""
+    stem = bouts_csv[:-len("_bouts.csv")]
+    with open(bouts_csv, newline="", encoding="utf-8") as fh:
+        old = list(csv.DictReader(fh))
+    video = old[0]["video"] if old else ""
+    if fps is None:
+        cap = cv2.VideoCapture(video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+        cap.release()
+    bouts = bouts_from_csv(stem + "_tracks.csv", stem + "_pairs.csv", fps)
+    for b in bouts:
+        b.update(video=video, tracks_csv=stem + "_tracks.csv", tracks_h5=stem + "_tracks.h5")
+    _write_csv(bouts_csv, BOUT_COLS, bouts)
+    return len(bouts)
+
+
 # ---------------------------------------------------------------- writing
-TRACK_COLS = ["frame", "t", "track", "area", "merged", "cx", "cy", "speed", "body_len", "nose_x",
-              "nose_y", "tb_x", "tb_y", "heading", "bend", "tail", "head_ev", "me_head", "me_mid",
-              "me_rear"]
+TRACK_COLS = ["frame", "t", "track", "area", "merged", "cx", "cy", "vx", "vy", "speed", "body_ref",
+              "body_len", "nose_x", "nose_y", "tb_x", "tb_y", "heading", "bend", "tail", "head_ev",
+              "me_head", "me_mid", "me_rear"]
 PAIR_COLS = ["frame", "t", "focal", "other", "centroid_dist", "nose_nose", "nose_tailbase", "contact"]
 BOUT_COLS = ["kind", "focal", "other", "frame0", "frame1", "dur_s", "video", "tracks_csv", "tracks_h5"]
 
@@ -411,24 +493,40 @@ def run_window(video: str, start_frame: int, n_frames: int, out_dir: str,
     return paths
 
 
-def build_session(bouts_csvs: Sequence[str], out_csv: str) -> int:
-    """Pool windows' candidate bouts into one review session: longest first within each
-    kind, kinds interleaved, numbered. Returns the number of bouts."""
-    rows = []
+def build_session(bouts_csvs: Sequence[str], out_csv: str, per_kind: int = 0, seed: int = 0) -> int:
+    """Pool windows' candidate bouts into one review session, numbered, kinds interleaved.
+
+    With ``per_kind`` > 0 each kind keeps at most that many bouts, taken in turn from the
+    windows (each window's longest first), so a few busy minutes don't fill the session.
+    Returns the number of bouts."""
+    import random
+
+    by_kind: Dict[str, Dict[str, List[Dict]]] = {}
     for p in bouts_csvs:
         with open(p, newline="", encoding="utf-8") as fh:
-            rows += list(csv.DictReader(fh))
-    by_kind: Dict[str, List[Dict]] = {}
-    for r in rows:
-        by_kind.setdefault(r["kind"], []).append(r)
-    for v in by_kind.values():
-        v.sort(key=lambda r: -float(r["dur_s"]))
-    ordered = []
-    rank = 0
-    while any(rank < len(v) for v in by_kind.values()):
-        for kind in sorted(by_kind):
-            if rank < len(by_kind[kind]):
-                ordered.append(by_kind[kind][rank])
+            for r in csv.DictReader(fh):
+                by_kind.setdefault(r["kind"], {}).setdefault(p, []).append(r)
+    rng = random.Random(seed)
+    chosen: Dict[str, List[Dict]] = {}
+    for kind, wins in by_kind.items():
+        for v in wins.values():
+            v.sort(key=lambda r: -float(r["dur_s"]))
+        order = sorted(wins)
+        rng.shuffle(order)
+        out, depth = [], 0
+        while any(depth < len(wins[w]) for w in order):
+            for w in order:
+                if depth < len(wins[w]) and (not per_kind or len(out) < per_kind):
+                    out.append(wins[w][depth])
+            depth += 1
+            if per_kind and len(out) >= per_kind:
+                break
+        chosen[kind] = out
+    ordered, rank = [], 0
+    while any(rank < len(v) for v in chosen.values()):
+        for kind in sorted(chosen):
+            if rank < len(chosen[kind]):
+                ordered.append(chosen[kind][rank])
         rank += 1
     for i, r in enumerate(ordered):
         r["bout_id"] = str(i)

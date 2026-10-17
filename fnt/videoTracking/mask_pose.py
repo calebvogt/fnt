@@ -273,10 +273,32 @@ def motion_by_thirds(diff: np.ndarray, crop: np.ndarray, offset: Tuple[int, int]
     return tuple(float(vals[part == i].mean()) if np.any(part == i) else np.nan for i in range(3))
 
 
+def body_only(crop: np.ndarray, offset: Tuple[int, int], body_spine: np.ndarray) -> np.ndarray:
+    """The mask without its tail: pixels within 1.2 half-widths of the body spine (nose to
+    tail base). The tail beyond the base is far from every body-spine point and drops out;
+    a stub at the base stays."""
+    m = crop.astype(bool)
+    ys, xs = np.nonzero(m)
+    if not len(ys) or len(body_spine) < 2:
+        return m
+    dt = cv2.distanceTransform(np.pad(m, 1).astype(np.uint8), cv2.DIST_L2, 5)
+    radius = 1.2 * float(dt.max())
+    pts = np.stack([xs + offset[0], ys + offset[1]], 1).astype(float)
+    anchors = body_spine[::2]
+    d2 = ((pts[:, None, :] - anchors[None]) ** 2).sum(-1).min(1)
+    out = np.zeros_like(m)
+    keep = d2 <= radius * radius
+    out[ys[keep], xs[keep]] = True
+    return out
+
+
 def body_aligned_crop(grey: np.ndarray, crop: np.ndarray, offset: Tuple[int, int],
-                      kp: Dict, size: int = 96) -> np.ndarray:
+                      kp: Dict, size: int = 96, drop_tail: bool = True) -> np.ndarray:
     """The animal's pixels rotated nose-up, centred on the body, two body lengths across,
-    background zeroed."""
+    background zeroed. Without its tail by default: embeddings of crops with the tail in
+    group by the tail's shape more than by posture."""
+    if drop_tail:
+        crop = body_only(crop, offset, kp["body_spine"])
     nose, tb = kp["nose"], kp["tail_base"]
     c = (nose + tb) / 2
     angle = np.degrees(np.arctan2(nose[1] - tb[1], nose[0] - tb[0])) + 90

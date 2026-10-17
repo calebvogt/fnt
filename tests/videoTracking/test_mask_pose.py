@@ -135,5 +135,16 @@ def test_runs_bridge_short_gaps():
     assert mp.runs([], 1) == []
 
 
+def test_body_only_drops_the_tail():
+    m = mouse(angle=0, tail=50)
+    g = mp.orient_track([mp.mask_geometry(m)], [None], fps=15)[0][0]
+    kp = mp.keypoints(g)
+    body = mp.body_only(m, (0, 0), kp["body_spine"])
+    tail_zone = np.zeros_like(m)
+    tail_zone[:, :55] = True                          # well past the rump (x = 70): tail only
+    assert (m & tail_zone).sum() > 50 and (body & tail_zone).sum() == 0
+    assert body.sum() > 0.9 * mouse(angle=0, tail=0).sum()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
