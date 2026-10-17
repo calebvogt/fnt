@@ -232,6 +232,65 @@ def test_facial_then_anogenital_becomes_one_pre_split_bout():
     assert far in out and nn not in out and ag not in out
 
 
+def _row(t, k, nose, tb, speed=0.0, vx=0.0, me=1.0, ev=3.0):
+    nose, tb = np.array(nose, float), np.array(tb, float)
+    c = (nose + tb) / 2
+    head = np.degrees(np.arctan2(nose[1] - tb[1], nose[0] - tb[0]))
+    return {"t": t, "frame": t, "track": k, "cx": c[0], "cy": c[1], "vx": vx, "vy": 0.0, "speed": speed,
+            "heading": head, "head_ev": ev, "merged": 0, "body_ref": 60.0, "nose_x": nose[0], "nose_y": nose[1],
+            "tb_x": tb[0], "tb_y": tb[1], "me_head": me, "me_mid": 1.0, "me_rear": 1.0}
+
+
+def _pair(t, f, o, rows):
+    F, O = rows[(t, f)], rows[(t, o)]
+    d = lambda a, b: float(np.hypot(a[0] - b[0], a[1] - b[1])) / 60.0
+    return {"t": t, "frame": t, "focal": f, "other": o, "contact": 1,
+            "centroid_dist": d((F["cx"], F["cy"]), (O["cx"], O["cy"])),
+            "nose_nose": d((F["nose_x"], F["nose_y"]), (O["nose_x"], O["nose_y"])),
+            "nose_tailbase": d((F["nose_x"], F["nose_y"]), (O["tb_x"], O["tb_y"]))}
+
+
+def _scene(n, place):
+    """place(t) -> {track: row kwargs}; returns rows and both directed pairs per frame."""
+    rows = {}
+    for t in range(n):
+        for k, kw in place(t).items():
+            rows[(t, k)] = _row(t, k, **kw)
+    pairs = [_pair(t, f, o, rows) for t in range(n) for f, o in ((1, 2), (2, 1))]
+    return list(rows.values()), pairs
+
+
+def _kinds(n, place):
+    rows, pairs = _scene(n, place)
+    return [(b["kind"], b["focal"]) for b in bf.candidate_bouts(rows, pairs, 15, n)]
+
+
+def test_a_slow_pursuit_is_a_follow_and_a_fast_one_a_chase():
+    def pursuit(speed):
+        return lambda t: {1: dict(nose=(130 + 3 * t, 100), tb=(70 + 3 * t, 100), speed=speed, vx=90),
+                          2: dict(nose=(250 + 3 * t, 100), tb=(190 + 3 * t, 100), speed=speed, vx=90)}
+    assert ("follow", 1) in _kinds(15, pursuit(3.0)) and ("chase", 1) not in _kinds(15, pursuit(3.0))
+    assert ("chase", 1) in _kinds(15, pursuit(7.0))
+
+
+def test_nose_at_the_mid_body_is_a_flank_investigation():
+    busy = lambda t: 5.0 if t % 2 else 1.0
+    place = lambda t: {1: dict(nose=(170, 125), tb=(170, 185), me=busy(t)),     # nose at 2's side
+                       2: dict(nose=(205, 100), tb=(135, 100))}
+    assert ("flank", 1) in _kinds(30, place)
+
+
+def test_a_brush_past_the_rear_is_not_anogenital():
+    busy = lambda t: 5.0 if t % 2 else 1.0
+
+    def place(n_close):
+        return lambda t: {1: dict(nose=(130, 105) if t < n_close else (60, 160), tb=(70, 105) if t < n_close else (60, 220),
+                                  me=busy(t)),
+                          2: dict(nose=(200, 100), tb=(140, 100))}
+    assert ("anogenital", 1) not in _kinds(30, place(9))      # 0.6 s
+    assert ("anogenital", 1) in _kinds(30, place(20))         # 1.3 s
+
+
 def test_link_tracks_bridges_a_short_gap():
     m1 = np.zeros((50, 80), bool); m1[20:30, 10:30] = True
     det = bf._as_det(m1, 0.9)

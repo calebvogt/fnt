@@ -42,11 +42,15 @@ STITCH_DIST_BL = 1.0     # ... if the next starts within this many body lengths 
 # Candidate rules. BL = body length, nose to tail base (the scratchpad prototype measured
 # with the tail in, about 1.8 BL, and these are its thresholds converted).
 NOSE_NEAR_BL = 0.5
-NOSE_MIN_S = 0.3
+NOSE_MIN_S = 0.5         # facial investigation
+ANOGENITAL_MIN_S = 1.0   # anogenital and flank: a brush past the rear is not an investigation
 HEAD_CONF = 1.0          # |head evidence| below this: which end is the head is a guess
 JOIN_GAP_S = 1.0         # facial and anogenital bouts this close are one investigation
 ACTIVE_FRAC = 0.3        # a sniff needs the actor's head busy on this share of the bout
+# Follow: one animal moving after another, heading at it. Chase: the same, fast (the
+# follower over CHASE_FAST_BLS on most of the bout) -- an aggressive pursuit with a flight.
 CHASE_FOCAL_BLS, CHASE_OTHER_BLS, CHASE_DIST_BL, CHASE_ANGLE, CHASE_MIN_S = 2.7, 1.8, 4.5, 35, 0.5
+CHASE_FAST_BLS = 6.0
 STILL_BLS, HEAD_RATIO, HEAD_MIN_S = 0.27, 2.0, 1.0
 IMMOBILE_BLS, IMMOBILE_MIN_S = 0.18, 3.0
 
@@ -336,12 +340,17 @@ def _f(r: Dict, k: str) -> float:
 def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: int) -> List[Dict]:
     """Rule-based candidate bouts (first guesses, to be tuned against review):
 
-    nose_nose   noses within NOSE_NEAR_BL for NOSE_MIN_S (each pair once)
-    anogenital  focal nose within NOSE_NEAR_BL of the other's tail base, not nose-nose
-    chase       focal faster than CHASE_FOCAL_BLS heading at the other (< CHASE_ANGLE deg),
-                the other faster than CHASE_OTHER_BLS moving away, within CHASE_DIST_BL
-    head_only   body still (< STILL_BLS) with head motion over HEAD_RATIO x rear motion
-                (sniffing or grooming in place)
+    nose_nose   noses within NOSE_NEAR_BL for NOSE_MIN_S (each pair once): facial
+                investigation, mutual
+    anogenital  focal nose within NOSE_NEAR_BL of the other's tail base, not nose-nose, for
+                ANOGENITAL_MIN_S
+    flank       focal nose within NOSE_NEAR_BL of the other's mid-body, neither of the above,
+                for ANOGENITAL_MIN_S
+    follow      focal faster than CHASE_FOCAL_BLS heading at the other (< CHASE_ANGLE deg),
+                the other faster than CHASE_OTHER_BLS moving away, within CHASE_DIST_BL;
+                chase when the follower is over CHASE_FAST_BLS on most of it
+    look_around body still (< STILL_BLS) with head motion over HEAD_RATIO x rear motion
+                (looking around, vigilance; or grooming in place)
     immobile    slower than IMMOBILE_BLS for IMMOBILE_MIN_S; huddle when in contact with
                 another animal, or when the mask is a merged blob of several
 
@@ -383,12 +392,21 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
     for (f, o), ps in by_pair.items():
         nn = np.zeros(T, bool)
         ag = np.zeros(T, bool)
+        fl = np.zeros(T, bool)
         ch = np.zeros(T, bool)
+        fast = np.zeros(T, bool)
         for t, p in ps.items():
             F, O = key.get((t, f)), key.get((t, o))
             close_nn = _f(p, "nose_nose") < NOSE_NEAR_BL
-            nn[t] = close_nn and confident(F) and confident(O)
-            ag[t] = _f(p, "nose_tailbase") < NOSE_NEAR_BL and not close_nn and confident(F) and confident(O)
+            close_ag = _f(p, "nose_tailbase") < NOSE_NEAR_BL
+            both = confident(F) and confident(O)
+            nn[t] = close_nn and both
+            ag[t] = close_ag and not close_nn and both
+            if both and not close_nn and not close_ag:
+                mid = np.array([(_f(O, "nose_x") + _f(O, "tb_x")) / 2, (_f(O, "nose_y") + _f(O, "tb_y")) / 2])
+                bl = _f(F, "body_ref") if not np.isnan(_f(F, "body_ref")) else _f(F, "body_len")
+                d = np.linalg.norm(np.array([_f(F, "nose_x"), _f(F, "nose_y")]) - mid) / max(bl, 1e-6)
+                fl[t] = d < NOSE_NEAR_BL
             if (F and O and confident(F) and _f(p, "centroid_dist") < CHASE_DIST_BL
                     and _f(F, "speed") > CHASE_FOCAL_BLS and _f(O, "speed") > CHASE_OTHER_BLS):
                 to_o = np.array([_f(O, "cx") - _f(F, "cx"), _f(O, "cy") - _f(F, "cy")])
@@ -396,15 +414,20 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
                 hd = np.array([np.cos(h), np.sin(h)])
                 ang = np.degrees(np.arccos(np.clip(hd @ to_o / (np.linalg.norm(to_o) + 1e-9), -1, 1)))
                 ch[t] = ang < CHASE_ANGLE and np.array([_f(O, "vx"), _f(O, "vy")]) @ to_o > 0
+                fast[t] = ch[t] and _f(F, "speed") > CHASE_FAST_BLS
+        min_ag = max(1, int(round(ANOGENITAL_MIN_S * fps)))
         if f < o:
             for a, b in mp.runs(nn, min_nose):
                 if busy(f, a, b) or busy(o, a, b):
                     add("nose_nose", f, o, a, b)
-        for a, b in mp.runs(ag, min_nose):
+        for a, b in mp.runs(ag, min_ag):
             if busy(f, a, b):
                 add("anogenital", f, o, a, b)
+        for a, b in mp.runs(fl, min_ag):
+            if busy(f, a, b):
+                add("flank", f, o, a, b)
         for a, b in mp.runs(ch, max(1, int(round(CHASE_MIN_S * fps)))):
-            add("chase", f, o, a, b)
+            add("chase" if fast[a:b + 1].mean() > 0.5 else "follow", f, o, a, b)
     contact_t = {(int(p["t"]), int(p["focal"])) for p in pairs if int(p["contact"])}
     by_track: Dict[int, Dict[int, Dict]] = {}
     for r in rows:
@@ -421,7 +444,7 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
             h, rr = _f(r, "me_head"), _f(r, "me_rear")
             head[t] = (not np.isnan(h)) and h > HEAD_RATIO * (rr if not np.isnan(rr) else 0) and h > head_floor
         for a, b in mp.runs(still & head, max(1, int(round(HEAD_MIN_S * fps)))):
-            add("head_only", k, "", a, b)
+            add("look_around", k, "", a, b)
         for a, b in mp.runs(imm, max(1, int(round(IMMOBILE_MIN_S * fps))), gap=5):
             together = np.mean([((t, k) in contact_t) or merged[t] for t in range(a, b + 1)]) > 0.5
             add("huddle" if together else "immobile", k, "", a, b)
@@ -431,21 +454,21 @@ def candidate_bouts(rows: List[Dict], pairs: List[Dict], fps: float, n_frames: i
 def join_investigations(bouts: List[Dict], fps: float, max_gap_s: float = JOIN_GAP_S) -> List[Dict]:
     """One bout per investigation sequence of a pair, pre-split where it changes.
 
-    An actor's anogenital bouts and the nose-nose bouts of the same two animals, less than
-    ``max_gap_s`` apart, become one ``investigation`` bout whose ``segments`` list each
-    part's first frame index and kind (a gap goes to the part after it). The reviewer then
-    confirms or moves the split instead of finding it. Each nose-nose bout joins at most
-    one sequence."""
+    An actor's anogenital and flank bouts and the nose-nose bouts of the same two animals,
+    less than ``max_gap_s`` apart, become one ``investigation`` bout whose ``segments`` list
+    each part's first frame index and kind (a gap goes to the part after it), when the
+    sequence holds more than one kind. The reviewer then confirms or moves the split
+    instead of finding it. Each bout joins at most one sequence."""
     gap = int(round(max_gap_s * fps))
     used = set()
     joined = []
-    ano = sorted((b for b in bouts if b["kind"] == "anogenital"), key=lambda b: -b["dur_s"])
+    ano = sorted((b for b in bouts if b["kind"] in ("anogenital", "flank")), key=lambda b: -b["dur_s"])
     for seed in ano:
         if id(seed) in used:
             continue
         f, o = seed["focal"], seed["other"]
         pool = [b for b in bouts if id(b) not in used and (
-            (b["kind"] == "anogenital" and b["focal"] == f and b["other"] == o) or
+            (b["kind"] in ("anogenital", "flank") and b["focal"] == f and b["other"] == o) or
             (b["kind"] == "nose_nose" and {b["focal"], b["other"]} == {f, o}))]
         pool.sort(key=lambda b: b["t0"])
         i = pool.index(seed)
@@ -455,7 +478,7 @@ def join_investigations(bouts: List[Dict], fps: float, max_gap_s: float = JOIN_G
         while hi < len(pool) - 1 and pool[hi + 1]["t0"] - pool[hi]["t1"] <= gap:
             hi += 1
         chain = pool[lo:hi + 1]
-        if not any(b["kind"] == "nose_nose" for b in chain):
+        if len({b["kind"] for b in chain}) < 2:
             continue
         segs = []
         for b in chain:

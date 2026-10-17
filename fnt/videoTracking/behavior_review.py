@@ -48,17 +48,24 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSizePolicy,
+    QApplication, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSizePolicy,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+# The ethogram, in key order (KEYS). Follow vs chase, look around, flank investigation and
+# social contact come from the user's narration of review round 2 (2026-10-17).
 ETHOGRAM = [
-    "immobile", "wheel running", "huddle", "facial investigation", "anogenital investigation",
-    "sniff / explore", "self-groom", "chase", "fight / tumble", "other",
+    "immobile", "locomotion", "look around", "self-groom", "wheel running",
+    "facial investigation", "anogenital investigation", "flank investigation", "follow",
+    "chase", "fight / tumble", "social contact", "huddle", "other",
 ]
+KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "H", "O"]
+_QT_KEYS = {Qt.Key_1: "1", Qt.Key_2: "2", Qt.Key_3: "3", Qt.Key_4: "4", Qt.Key_5: "5",
+            Qt.Key_6: "6", Qt.Key_7: "7", Qt.Key_8: "8", Qt.Key_9: "9", Qt.Key_0: "0",
+            Qt.Key_Minus: "-", Qt.Key_Equal: "=", Qt.Key_H: "H", Qt.Key_O: "O"}
 # What the recipient is doing when the actor does a social behaviour. Behaviours not
 # listed belong to the actor alone. Mutual ones (both animals doing the same) carry the same
 # label on both: in facial investigation, two heads together, who investigates whom can't
@@ -66,22 +73,30 @@ ETHOGRAM = [
 RECIPROCAL = {
     "facial investigation": "facial investigation",
     "anogenital investigation": "receives anogenital investigation",
-    "chase": "chased / flees",
+    "flank investigation": "receives flank investigation",
+    "follow": "followed",
+    "chase": "flees",
     "fight / tumble": "fight / tumble",
+    "social contact": "social contact",
     "huddle": "huddle",
 }
-MUTUAL = {"facial investigation", "huddle", "fight / tumble"}
+MUTUAL = {"facial investigation", "fight / tumble", "social contact", "huddle"}
 # Candidate-rule names -> ethogram entries.
 KIND_TO_LABEL = {
     "immobile": "immobile", "huddle": "huddle", "nose_nose": "facial investigation",
-    "anogenital": "anogenital investigation", "chase": "chase", "head_only": "sniff / explore",
+    "anogenital": "anogenital investigation", "flank": "flank investigation",
+    "follow": "follow", "chase": "chase", "head_only": "look around", "look_around": "look around",
     "wheel": "wheel running", "fight": "fight / tumble", "investigation": "facial investigation",
+    "locomotion": "locomotion", "contact": "social contact",
 }
+BACKGROUND = True      # load a bout's frames in a worker thread (tests load in line)
+MAX_FRAMES = 240       # longer bouts are shown every k-th frame (faster than real time)
 # Okabe-Ito, as BGR: actor orange, recipient sky blue, anyone else grey.
 ROLE_COLOURS = {"actor": (0, 159, 230), "recipient": (233, 180, 86), "other": (150, 150, 150)}
 # Timeline colours per ethogram entry (BGR).
 LABEL_COLOURS = [(0, 159, 230), (233, 180, 86), (115, 158, 0), (66, 228, 240), (178, 114, 0),
-                 (0, 94, 213), (167, 121, 204), (60, 60, 200), (40, 40, 140), (140, 140, 140)]
+                 (0, 94, 213), (167, 121, 204), (60, 60, 200), (40, 40, 140), (200, 200, 90),
+                 (90, 60, 160), (120, 200, 200), (60, 130, 60), (140, 140, 140)]
 PAD_S = 0.5            # context shown before and after each bout
 VIEW = 640             # side of the square view, px
 BAR = 34               # timeline height, px
@@ -211,6 +226,53 @@ def draw_tag(img, text: str, anchor, colour, scale: float = 1.0):
     cv2.putText(img, text, (x, y - 2), font, 0.6 * scale, colour, th, cv2.LINE_AA)
 
 
+class _View(QLabel):
+    """The video view; a click or drag on the timeline strip seeks."""
+
+    def __init__(self, on_seek):
+        super().__init__()
+        self._on_seek = on_seek
+
+    def _emit(self, e):
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return
+        x0 = (self.width() - pm.width()) / 2
+        y0 = (self.height() - pm.height()) / 2
+        x, y = e.x() - x0, e.y() - y0
+        if 0 <= x < pm.width() and pm.height() - BAR <= y < pm.height():
+            self._on_seek(x / max(1, pm.width() - 1))
+
+    def mousePressEvent(self, e):
+        self._emit(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton:
+            self._emit(e)
+
+
+class _Loader(QThread):
+    """Renders a bout's frames off the GUI thread and hands them over one by one."""
+    frame = pyqtSignal(int, object)
+    done = pyqtSignal(int)
+
+    def __init__(self, gen, frames_iter):
+        super().__init__()
+        self.gen = gen
+        self._it = frames_iter
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for item in self._it:
+            if self._stop:
+                break
+            self.frame.emit(self.gen, item)
+        self.done.emit(self.gen)
+
+
 class BehaviorReviewWindow(QWidget):
     def __init__(self, bouts_csv: str, ethogram: Optional[List[str]] = None):
         super().__init__()
@@ -218,7 +280,7 @@ class BehaviorReviewWindow(QWidget):
         self.setStyleSheet(DARK_STYLESHEET)
         self.bouts_csv = bouts_csv
         self.bouts = load_bouts(bouts_csv)
-        self.ethogram = list(ethogram or ETHOGRAM)[:10]
+        self.ethogram = list(ethogram or ETHOGRAM)[:len(KEYS)]
         self.out_path = review_path(bouts_csv)
         self.decisions = load_review(self.out_path)
         self._kp_cache: Dict[str, _Keypoints] = {}
@@ -232,7 +294,11 @@ class BehaviorReviewWindow(QWidget):
         self.actor = self.recipient = ""
         self.segments: List[Dict] = []
         self.flipped = False
-        self.setWindowTitle(f"Behavior Review — {os.path.basename(bouts_csv)} ({len(self.bouts)} bouts)")
+        self._gen = 0
+        self._loader = None
+        self._loading = False
+        self._step_k = 1
+        self.setWindowTitle(f"Behavior Focus Session — {os.path.basename(bouts_csv)} ({len(self.bouts)} bouts)")
         self._build()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -267,11 +333,19 @@ class BehaviorReviewWindow(QWidget):
             self._show_decision(i)
         self.table.cellClicked.connect(lambda r, _c: self.show_bout(r))
         left.addWidget(self.table, 1)
-        keys = "\n".join(f"{(i + 1) % 10}  {name}" for i, name in enumerate(self.ethogram))
+        left.addWidget(QLabel("Label the actor (key or click):"))
+        grid = QGridLayout()
+        grid.setSpacing(2)
+        for i, name in enumerate(self.ethogram):
+            btn = QPushButton(f"{KEYS[i]}  {name}")
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setStyleSheet("text-align: left; padding: 2px 6px;")
+            btn.clicked.connect(lambda _c, k=i: self.relabel(k))
+            grid.addWidget(btn, i // 2, i % 2)
+        left.addLayout(grid)
         self.lbl_keys = QLabel(
-            "Label (actor):\n" + keys +
-            "\n\nX  split at the playhead · M  merge with the part before\n"
-            ", / .  step a frame · W  swap actor and recipient")
+            "X  split at the playhead · M  merge with the part before\n"
+            ", / .  step a frame · click the timeline to jump · W  swap actor and recipient")
         self.lbl_keys.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         left.addWidget(self.lbl_keys)
         self.lbl_progress = QLabel("")
@@ -285,7 +359,7 @@ class BehaviorReviewWindow(QWidget):
         self.lbl_info = QLabel("")
         self.lbl_info.setStyleSheet("font-size: 14px; font-weight: bold;")
         right.addWidget(self.lbl_info)
-        self.view = QLabel()
+        self.view = _View(self.seek)
         self.view.setMinimumSize(VIEW, VIEW + BAR)
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -407,9 +481,16 @@ class BehaviorReviewWindow(QWidget):
                 tags.append((self._role(track), nose[0], nose[1] - 28 * scale))
         return tags
 
-    def _load_frames(self, b: Dict):
+    def _bout_fps(self, b: Dict) -> float:
         cap = cv2.VideoCapture(b["video"])
         fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+        cap.release()
+        return fps
+
+    def _render(self, b: Dict, fps: float, k: int):
+        """Yield (frame image, video frame number, label anchors) for the bout and its
+        padding, every k-th frame."""
+        cap = cv2.VideoCapture(b["video"])
         f0, f1 = int(b["frame0"]), int(b["frame1"])
         pad = int(round(PAD_S * fps))
         start = max(0, f0 - pad)
@@ -424,12 +505,13 @@ class BehaviorReviewWindow(QWidget):
                     if _num(r, "cx") is not None:
                         pts.append((_num(r, "cx"), _num(r, "cy")))
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-        frames, ids_out, tags_out = [], [], []
         centre, side = None, None
         for f in range(start, f1 + pad + 1):
             ok, img = cap.read()
             if not ok:
                 break
+            if (f - start) % k:
+                continue
             h, w = img.shape[:2]
             if centre is None:
                 if pts:
@@ -446,13 +528,63 @@ class BehaviorReviewWindow(QWidget):
                 x0 = int(np.clip(centre[0] - side / 2, 0, w - side))
                 y0 = int(np.clip(centre[1] - side / 2, 0, h - side))
                 img = img[y0:y0 + side, x0:x0 + side]
-            k = VIEW / max(img.shape[:2])
-            img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
-            frames.append(img)
-            ids_out.append(f)
-            tags_out.append([(role, (x - x0) * k, (y - y0) * k) for role, x, y in tags])
+            z = VIEW / max(img.shape[:2])
+            img = cv2.resize(img, None, fx=z, fy=z, interpolation=cv2.INTER_AREA)
+            yield img, f, [(role, (x - x0) * z, (y - y0) * z) for role, x, y in tags]
         cap.release()
-        return frames, ids_out, tags_out, fps
+
+    def _start_loading(self, b: Dict, fps: float):
+        if self._loader is not None:
+            self._loader.stop()
+            self._loader.wait(3000)
+            self._loader = None
+        self._gen += 1
+        n = int(b["frame1"]) - int(b["frame0"]) + 1 + 2 * int(round(PAD_S * fps))
+        self._step_k = max(1, -(-n // MAX_FRAMES))
+        self._frames, self._frame_ids, self._tags = [], [], []
+        it = self._render(b, fps, self._step_k)
+        if not BACKGROUND:
+            for item in it:
+                self._add_frame(self._gen, item)
+            self._loading = False
+            return
+        self._loading = True
+        self._loader = _Loader(self._gen, it)
+        self._loader.frame.connect(self._add_frame)
+        self._loader.done.connect(self._loaded)
+        self._loader.start()
+
+    def _add_frame(self, gen: int, item):
+        if gen != self._gen:
+            return
+        img, f, tags = item
+        self._frames.append(img)
+        self._frame_ids.append(f)
+        self._tags.append(tags)
+
+    def _loaded(self, gen: int):
+        if gen == self._gen:
+            self._loading = False
+            self._update_info()
+
+    def wait_loaded(self, timeout_s: float = 30.0):
+        """Process events until the bout's frames are in (tests, scripts)."""
+        t0 = time.time()
+        while self._loading and time.time() - t0 < timeout_s:
+            QApplication.processEvents()
+            time.sleep(0.01)
+
+    def seek(self, frac: float):
+        """Jump to a point of the timeline (0-1) and pause."""
+        if not self._frame_ids:
+            return
+        b = self.bouts[self.idx]
+        a = int(b["frame0"]) - int(round(PAD_S * getattr(self, "_fps", 15.0)))
+        z = int(b["frame1"]) + int(round(PAD_S * getattr(self, "_fps", 15.0)))
+        target = a + frac * (z - a)
+        self._pos = int(np.argmin(np.abs(np.array(self._frame_ids) - target)))
+        self._playing = False
+        self._tick()
 
     def show_bout(self, i: int, keep_roles: bool = False):
         if not self.bouts:
@@ -470,12 +602,13 @@ class BehaviorReviewWindow(QWidget):
                                   "proposed": r.get("label") or None} for r in saved]
             else:
                 self.segments = parse_segments(b.get("segments", ""), f0, f1)
-        self._frames, self._frame_ids, self._tags, fps = self._load_frames(b)
-        self._pos = 0
-        self._timer.start(int(1000 / fps))
-        self._playing = True
-        self.table.selectRow(self.idx)
+        fps = self._bout_fps(b)
         self._fps = fps
+        self._pos = 0
+        self._playing = True
+        self._start_loading(b, fps)
+        self._timer.start(int(1000 / fps))
+        self.table.selectRow(self.idx)
         self._update_info()
         self._update_progress()
         self._tick()
@@ -487,8 +620,10 @@ class BehaviorReviewWindow(QWidget):
         who = f"  actor: track {self.actor}"
         if self.recipient:
             who += f" → recipient: track {self.recipient}"
-        self.lbl_info.setText(f"#{b['bout_id']}  {parts}  {dur:.1f} s{who}   "
-                              f"{os.path.basename(b['video'])} frames {b['frame0']}-{b['frame1']}")
+        speed = f"  (shown at {self._step_k}x)" if self._step_k > 1 else ""
+        loading = "  loading..." if self._loading else ""
+        self.lbl_info.setText(f"#{b['bout_id']}  {parts}  {dur:.1f} s{speed}{who}   "
+                              f"{os.path.basename(b['video'])} frames {b['frame0']}-{b['frame1']}{loading}")
 
     def _seg_label(self, seg: Dict) -> str:
         return seg["label"] or self._proposed()
@@ -504,7 +639,9 @@ class BehaviorReviewWindow(QWidget):
         bar = np.full((BAR, width, 3), 35, np.uint8)
         if not self._frame_ids:
             return bar
-        a, z = self._frame_ids[0], self._frame_ids[-1]
+        b = self.bouts[self.idx]
+        pad = int(round(PAD_S * getattr(self, "_fps", 15.0)))
+        a, z = int(b["frame0"]) - pad, int(b["frame1"]) + pad
         span = max(1, z - a + 1)
 
         def x(f):
@@ -530,8 +667,10 @@ class BehaviorReviewWindow(QWidget):
 
     def _tick(self):
         if not self._frames:
-            self.view.setText("Could not read this bout's frames.")
+            if not self._loading:
+                self.view.setText("Could not read this bout's frames.")
             return
+        self._pos = min(self._pos, len(self._frames) - 1)
         img = self._frames[self._pos].copy()
         b = self.bouts[self.idx]
         f = self._frame_ids[self._pos]
@@ -551,7 +690,10 @@ class BehaviorReviewWindow(QWidget):
         qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format_RGB888)
         self.view.setPixmap(QPixmap.fromImage(qimg.copy()))
         if self._playing:
-            self._pos = (self._pos + 1) % len(self._frames)
+            nxt = self._pos + 1
+            if nxt >= len(self._frames):
+                nxt = self._pos if self._loading else 0      # wait for frames still loading
+            self._pos = nxt
 
     def toggle_play(self):
         self._playing = not self._playing
@@ -675,14 +817,16 @@ class BehaviorReviewWindow(QWidget):
                    Qt.Key_B: self.prev_bout, Qt.Key_Left: self.prev_bout}
         if k in actions:
             actions[k]()
-        elif Qt.Key_0 <= k <= Qt.Key_9:
-            n = k - Qt.Key_0
-            self.relabel(9 if n == 0 else n - 1)
+        elif k in _QT_KEYS and KEYS.index(_QT_KEYS[k]) < len(self.ethogram):
+            self.relabel(KEYS.index(_QT_KEYS[k]))
         else:
             super().keyPressEvent(e)
 
     def closeEvent(self, e):
         self._timer.stop()
+        if self._loader is not None:
+            self._loader.stop()
+            self._loader.wait(3000)
         for store in self._h5_cache.values():
             try:
                 store.close()
@@ -693,10 +837,11 @@ class BehaviorReviewWindow(QWidget):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="behavior-review",
-                                description="Review candidate behaviour bouts, one key per decision.")
+                                description="Behavior Focus Session: review candidate behaviour bouts, "
+                                            "one key per decision.")
     p.add_argument("--bouts", required=True, help="Bouts CSV (video, frame0, frame1, kind, ...).")
     p.add_argument("--ethogram", default="",
-                   help="Comma-separated behaviours for keys 1-9, 0 (default: the rodent set).")
+                   help="Comma-separated behaviours for keys 1-9, 0, -, =, H, O (default: the rodent set).")
     args = p.parse_args(argv)
     try:
         from .mask_tracker_gui import _host_like_startup
