@@ -614,6 +614,8 @@ PRED_GROUP = "pred_calls"
 #: the answer.
 PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
               "harmonic_call_id", "harmonic_n", "f0_hz")
+# Read back with them; written only by _store_ridge (computed, never copied).
+_RIDGE_ATTRS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
 
 #: The spectrogram image (uint8, MAD's 0-255 levels) inside each prediction
 #: crop, saved beside its mask as ``/pred_specs/<blob_id>`` (same shape and
@@ -622,6 +624,47 @@ PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
 #: the mask) can be measured from the store without the audio. A mask drawn as
 #: a blob over a fast trill has a flat centroid; the levels inside do not.
 PRED_SPEC_GROUP = "pred_specs"
+
+#: The brightness ridge of each prediction with a stored spectrogram (see
+#: mad_ridge): ``/pred_ridge/<blob_id>`` holds the ridge in kHz per time column of
+#: the crop (NaN where the mask is empty), and the crop's dataset carries
+#: ``ridge_turns``, ``ridge_rate_hz``, ``ridge_depth_khz`` and ``ridge_trill``.
+#: Recomputed whenever a crop is written with its spectrogram.
+PRED_RIDGE_GROUP = "pred_ridge"
+
+
+def _ridge_units(f):
+    """(kHz per bin, ms per frame) from a file's grid attrs, or None."""
+    try:
+        sr = float(f.attrs["sample_rate"])
+        nperseg, noverlap, nfft = (int(f.attrs["nperseg"]), int(f.attrs["noverlap"]),
+                                   int(f.attrs["nfft"]))
+    except KeyError:
+        return None
+    from .mad_ridge import grid_units
+    return grid_units(sr, nperseg, noverlap, nfft)
+
+
+def _store_ridge(f, key: str, ds, m: np.ndarray, spec, units) -> None:
+    """Compute and store one crop's ridge (attrs on ``ds``, path in /pred_ridge);
+    without a spectrogram or grid, drop any stale one."""
+    from .mad_ridge import RIDGE_ATTRS, ridge_measures
+    rgrp = f.get(PRED_RIDGE_GROUP)
+    if rgrp is not None and key in rgrp:
+        del rgrp[key]
+    for k in RIDGE_ATTRS:
+        if k in ds.attrs:
+            del ds.attrs[k]
+    if spec is None or units is None or np.asarray(spec).shape != m.shape:
+        return
+    res = ridge_measures(np.asarray(spec), m > 0, units[0], units[1],
+                         f_off=int(ds.attrs.get("f_off", 0)))
+    if res is None:
+        return
+    for k in RIDGE_ATTRS:
+        ds.attrs[k] = res[k]
+    f.require_group(PRED_RIDGE_GROUP).create_dataset(
+        key, data=res["khz"], compression="gzip", compression_opts=4)
 
 
 def spec_crop(spec, f_off: int, t_off: int, shape) -> np.ndarray:
@@ -661,11 +704,12 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
                     old_specs[key] = (int(ds.attrs.get("f_off", 0)),
                                       int(ds.attrs.get("t_off", 0)),
                                       f[PRED_SPEC_GROUP][key][()])
-        for g in (PRED_GROUP, PRED_SPEC_GROUP):
+        for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
             if g in f:
                 del f[g]
         grp = f.require_group(PRED_GROUP)
         sgrp = None
+        units = _ridge_units(f)
         for c in crops:
             m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
             key = str(c["blob_id"])
@@ -691,17 +735,23 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
                 # h5py cannot store None, and a mixed-type attr is a trap for
                 # readers — keep numbers numeric and everything else a string.
                 ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+            if s is not None and np.asarray(s).shape == m.shape:
+                _store_ridge(f, key, ds, m, s, units)
         f.attrs["n_pred_blobs"] = int(len(crops))
 
 
-def read_all_pred_masks(h5_path: str, include_spec: bool = False) -> Dict[str, Dict]:
+def read_all_pred_masks(h5_path: str, include_spec: bool = False,
+                        include_ridge: bool = False) -> Dict[str, Dict]:
     """Return ``{blob_id: {mask(bool), f_off, t_off}}`` for every stored
     prediction crop (cheap — only small per-blob arrays, never the grid).
 
     Any of :data:`PRED_ATTRS` stored with a crop (score, class, model
     provenance) comes back alongside it, so a pending detection can be fully
     described without consulting the CSV. ``include_spec`` adds ``spec`` (the
-    uint8 image under the mask) for crops that have one."""
+    uint8 image under the mask) for crops that have one; ``include_ridge`` adds
+    ``ridge_khz`` (the brightness ridge per time column). The ridge measures
+    (ridge_turns, ridge_rate_hz, ridge_depth_khz, ridge_trill) come back
+    whenever stored."""
     _require_h5()
     out: Dict[str, Dict] = {}
     if not os.path.isfile(h5_path):
@@ -711,6 +761,7 @@ def read_all_pred_masks(h5_path: str, include_spec: bool = False) -> Dict[str, D
         if grp is None:
             return out
         sgrp = f.get(PRED_SPEC_GROUP) if include_spec else None
+        rgrp = f.get(PRED_RIDGE_GROUP) if include_ridge else None
         for key in grp:
             ds = grp[key]
             rec = {
@@ -720,7 +771,9 @@ def read_all_pred_masks(h5_path: str, include_spec: bool = False) -> Dict[str, D
             }
             if sgrp is not None and key in sgrp:
                 rec["spec"] = sgrp[key][()]
-            for k in PRED_ATTRS:
+            if rgrp is not None and key in rgrp:
+                rec["ridge_khz"] = rgrp[key][()]
+            for k in PRED_ATTRS + _RIDGE_ATTRS:
                 if k in ds.attrs:
                     v = ds.attrs[k]
                     rec[k] = (v.decode() if isinstance(v, bytes)
@@ -758,7 +811,7 @@ def read_pred_masks(h5_path: str, blob_ids) -> Dict[str, Dict]:
                 "f_off": int(ds.attrs.get("f_off", 0)),
                 "t_off": int(ds.attrs.get("t_off", 0)),
             }
-            for k in PRED_ATTRS:
+            for k in PRED_ATTRS + _RIDGE_ATTRS:
                 if k in ds.attrs:
                     v = ds.attrs[k]
                     rec[k] = (v.decode() if isinstance(v, bytes)
@@ -786,6 +839,7 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
     with h5py.File(h5_path, "a") as f:
         grp = f.require_group(PRED_GROUP)
+        units = _ridge_units(f)
         for c in crops:
             key = str(c["blob_id"])
             m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
@@ -801,6 +855,9 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
                 if v is None or v == "":
                     continue
                 ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+            sgrp = f.get(PRED_SPEC_GROUP)
+            _store_ridge(f, key, ds, m, sgrp[key][()] if sgrp is not None and key in sgrp else None,
+                         units)
         # Kept in step so file lists can still show the count without reading
         # a single crop.
         f.attrs["n_pred_blobs"] = int(len(grp))
@@ -930,6 +987,29 @@ def has_pred_masks(h5_path: str) -> bool:
 
 
 @_reporting_write
+def add_pred_ridges(h5_path: str, overwrite: bool = False) -> int:
+    """Store the brightness ridge of every prediction that has its spectrogram
+    (/pred_specs) but no ridge yet (all of them with ``overwrite``). No audio
+    needed. Returns the number computed."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return 0
+    n = 0
+    with h5py.File(h5_path, "a") as f:
+        grp, sgrp = f.get(PRED_GROUP), f.get(PRED_SPEC_GROUP)
+        units = _ridge_units(f)
+        if grp is None or sgrp is None or units is None:
+            return 0
+        for key in list(grp.keys()):
+            ds = grp[key]
+            if key not in sgrp or (not overwrite and "ridge_turns" in ds.attrs):
+                continue
+            _store_ridge(f, key, ds, ds[()], sgrp[key][()], units)
+            n += "ridge_turns" in ds.attrs
+    return n
+
+
+@_reporting_write
 def delete_pred_mask(h5_path: str, blob_id) -> None:
     """Remove one prediction crop by blob_id (no-op if absent). Used when a
     prediction is *deleted* (vs rejected, which keeps its crop)."""
@@ -938,7 +1018,7 @@ def delete_pred_mask(h5_path: str, blob_id) -> None:
         return
     try:
         with h5py.File(h5_path, "a") as f:
-            for g in (PRED_GROUP, PRED_SPEC_GROUP):
+            for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
                 grp = f.get(g)
                 if grp is not None and str(blob_id) in grp:
                     del grp[str(blob_id)]
@@ -964,11 +1044,12 @@ def delete_pred_masks(h5_path: str, blob_ids) -> None:
             for key in list(grp.keys()):
                 if key in want:
                     del grp[key]
-            sgrp = f.get(PRED_SPEC_GROUP)
-            if sgrp is not None:
-                for key in list(sgrp.keys()):
-                    if key in want:
-                        del sgrp[key]
+            for g in (PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
+                sgrp = f.get(g)
+                if sgrp is not None:
+                    for key in list(sgrp.keys()):
+                        if key in want:
+                            del sgrp[key]
             f.attrs["n_pred_blobs"] = int(len(grp))
     except Exception:
         pass
@@ -981,7 +1062,7 @@ def clear_pred_masks(h5_path: str) -> None:
     if not os.path.isfile(h5_path):
         return
     with h5py.File(h5_path, "a") as f:
-        for g in (PRED_GROUP, PRED_SPEC_GROUP):
+        for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
             if g in f:
                 del f[g]
         if "n_pred_blobs" in f.attrs:

@@ -710,6 +710,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Recompute crops that already have one.")
     ps.set_defaults(func=_cmd_add_specs)
 
+    # add-ridge
+    pr = sub.add_parser('add-ridge',
+                        help="Add the brightness ridge (turns, rate, depth, trill) of each "
+                             "stored detection; fills missing spectrograms from the audio first.")
+    pr.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections.")
+    pr.add_argument('--db-min', type=float, default=-100.0,
+                    help="The model's dB floor, for missing spectrograms (default -100).")
+    pr.add_argument('--db-max', type=float, default=-20.0,
+                    help="The model's dB ceiling, for missing spectrograms (default -20).")
+    pr.add_argument('--db-norm', default='fixed',
+                    help="The model's dB normalisation (default fixed).")
+    pr.add_argument('--overwrite', action='store_true',
+                    help="Recompute ridges that are already stored.")
+    pr.set_defaults(func=_cmd_add_ridge)
+
     return p
 
 
@@ -734,6 +750,34 @@ def _cmd_add_specs(args) -> int:
         print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: {k} detection(s)",
               flush=True)
     print(f"added spectrograms to {n_crops} detection(s) in {n_files} file(s)")
+    return 0
+
+
+def _cmd_add_ridge(args) -> int:
+    """Store the brightness ridge of every detection (mad_ridge) in the given recordings'
+    .mad files. Detections recorded before MAD kept their spectrogram get it from the
+    audio first (as add-specs). Never run on files MAD is writing."""
+    from .fnt_mask_store import (add_pred_ridges, has_pred_masks, masks_sibling_path,
+                                 read_all_pred_masks)
+    from .mad_inference import backfill_pred_specs
+    wavs = [w for w in _expand_inputs(args.input)
+            if has_pred_masks(masks_sibling_path(w))]
+    n_files = n_calls = 0
+    for i, w in enumerate(wavs, 1):
+        h5 = masks_sibling_path(w)
+        try:
+            crops = read_all_pred_masks(h5, include_spec=True)
+            if any('spec' not in c for c in crops.values()):
+                backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
+                                    db_norm=args.db_norm)
+            k = add_pred_ridges(h5, overwrite=args.overwrite)
+        except Exception as e:
+            print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: failed ({e})", flush=True)
+            continue
+        n_files += bool(k)
+        n_calls += k
+        print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: {k} detection(s)", flush=True)
+    print(f"added ridges to {n_calls} detection(s) in {n_files} file(s)")
     return 0
 
 

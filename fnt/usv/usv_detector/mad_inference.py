@@ -1205,6 +1205,9 @@ _EXTRA_COLS = [
     'total_energy_db', 'snr_db', 'peak_time_frac', 'amplitude_modulation',
     'fill_ratio', 'aspect_ratio',
     'model_name', 'threshold', 'min_blob_pixels',
+    # Brightness ridge inside the mask (mad_ridge): turns of the brightest
+    # continuous path, its rate and depth, and whether that makes a trill.
+    'ridge_turns', 'ridge_rate_hz', 'ridge_depth_khz', 'ridge_trill',
 ]
 
 # Harmonic grouping (see mad_harmonics). Written by the review GUI, not by
@@ -1538,6 +1541,9 @@ def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
             sgrp.create_dataset(key, data=spec_crop(spec, c['f_off'], c['t_off'],
                                                     c['mask'].shape),
                                 compression='gzip', compression_opts=4)
+    # The images make the brightness ridge measurable (no audio needed).
+    from .fnt_mask_store import add_pred_ridges
+    add_pred_ridges(h5, overwrite=overwrite)
     return len(todo)
 
 
