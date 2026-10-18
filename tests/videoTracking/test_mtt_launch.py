@@ -146,6 +146,22 @@ def test_launched_open_never_asks_and_focus_limits_the_queue(monkeypatch):
     w.close()
 
 
+def test_a_focus_session_keeps_the_lists_order():
+    """The queue followed file names, so a list mixing hard and easy frames came
+    out in blocks of one clip's frames."""
+    root = tempfile.mkdtemp(prefix="mtt_focus_order_")
+    proj = make_project(root, FRAMES)
+    w = window()
+    w._load_project(os.path.join(proj, "project_config.json"))
+    order = [FRAMES[2], FRAMES[0], FRAMES[1]]
+    assert sorted(order) != order
+    w.focus_frames(order)
+    assert [os.path.basename(p) for _, _, p in w._extracted_frames] == order
+    w.show_all_frames()
+    assert [os.path.basename(p) for _, _, p in w._extracted_frames] == sorted(FRAMES)
+    w.close()
+
+
 def test_training_defaults_and_predict_flag():
     """The first 8x8 zone model trained with the backbone frozen, AdamW at 0.01
     and no mosaic; the defaults are now unfrozen, 0.002 and mosaic + copy-paste."""

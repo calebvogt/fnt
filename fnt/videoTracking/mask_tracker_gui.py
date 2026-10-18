@@ -8509,6 +8509,11 @@ class MaskTrackerWindow(QMainWindow):
                 )
             else:
                 frames.append(("", 0, full))
+        if self._focus_names is not None:
+            # The list's own order: it is chosen (hard frames between easy
+            # ones, not one clip's frames in a block); the name sort is not.
+            rank = getattr(self, "_focus_rank", {})
+            frames.sort(key=lambda fr: rank.get(os.path.basename(fr[2]), len(rank)))
         self._extracted_frames = frames
         self._refresh_frame_list()
 
@@ -8523,6 +8528,7 @@ class MaskTrackerWindow(QMainWindow):
         """
         names = expand_focus_items(items)
         self._focus_names = set(names)
+        self._focus_rank = {n: i for i, n in enumerate(names)}
         self.current_frame_idx = -1
         if self._output_dir and os.path.isdir(self._output_dir):
             self._scan_frames_dir(self._output_dir)
