@@ -19,6 +19,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PyQt5.QtCore import Qt  # noqa: E402
 
 import fnt.videoTracking.mask_tracker_cli as C  # noqa: E402
 import fnt.videoTracking.mask_tracker_gui as G  # noqa: E402
@@ -157,6 +158,9 @@ def test_a_focus_session_keeps_the_lists_order():
     assert sorted(order) != order
     w.focus_frames(order)
     assert [os.path.basename(p) for _, _, p in w._extracted_frames] == order
+    rows = [w.frame_list.topLevelItem(i).data(0, Qt.UserRole)
+            for i in range(w.frame_list.topLevelItemCount())]
+    assert rows == [0, 1, 2]                      # the list shows the queue's order too
     w.show_all_frames()
     assert [os.path.basename(p) for _, _, p in w._extracted_frames] == sorted(FRAMES)
     w.close()

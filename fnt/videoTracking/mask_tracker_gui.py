@@ -8429,7 +8429,8 @@ class MaskTrackerWindow(QMainWindow):
             item = self._NumericTreeItem(["", "", ""])
             self._render_frame_item(item, idx)
             self.frame_list.addTopLevelItem(item)
-        self.frame_list.setSortingEnabled(True)
+        # A focus session shows its list's order (the queue's), not the names'.
+        self.frame_list.setSortingEnabled(self._focus_names is None)
         self.frame_list.blockSignals(False)
         self._update_nav_state()
         self._schedule_scrubber_refresh()
