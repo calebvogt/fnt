@@ -161,6 +161,11 @@ def test_a_focus_session_keeps_the_lists_order():
     rows = [w.frame_list.topLevelItem(i).data(0, Qt.UserRole)
             for i in range(w.frame_list.topLevelItemCount())]
     assert rows == [0, 1, 2]                      # the list shows the queue's order too
+    lst = os.path.join(root, "focus_zone_round6.txt")
+    with open(lst, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(order))
+    w.focus_frames([lst])                         # the list file names the session
+    assert "(focus_zone_round6: 3 frames)" in w.windowTitle()
     w.show_all_frames()
     assert [os.path.basename(p) for _, _, p in w._extracted_frames] == sorted(FRAMES)
     w.close()

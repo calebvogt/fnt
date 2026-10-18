@@ -8530,6 +8530,11 @@ class MaskTrackerWindow(QMainWindow):
         names = expand_focus_items(items)
         self._focus_names = set(names)
         self._focus_rank = {n: i for i, n in enumerate(names)}
+        # The session's name in the title: the list file's (focus_zone_round6), so
+        # which round is open is never a guess.
+        lists = [Path(str(i)).stem for i in items or ()
+                 if str(i).lower().endswith(".txt")]
+        self._focus_label = ", ".join(lists) or "focus"
         self.current_frame_idx = -1
         if self._output_dir and os.path.isdir(self._output_dir):
             self._scan_frames_dir(self._output_dir)
@@ -8566,7 +8571,8 @@ class MaskTrackerWindow(QMainWindow):
         if self._project_dir:
             title += f" — {os.path.basename(self._project_dir)}"
         if self._focus_names is not None:
-            title += f" (focus: {len(self._extracted_frames)} frames)"
+            label = getattr(self, "_focus_label", "focus")
+            title += f" ({label}: {len(self._extracted_frames)} frames)"
         self.setWindowTitle(title)
 
     def _load_existing_frames(self):
