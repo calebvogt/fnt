@@ -490,6 +490,7 @@ HET_LO_KEY = "mad/audio/het_lo_khz"
 HET_FLOOR_KEY = "mad/audio/het_floor_khz"
 #: Whether the training-window shading (W) is on.
 TRAIN_WINDOWS_KEY = "mad/ui/show_train_windows"
+RIDGES_KEY = "mad/ui/show_ridges"
 MAX_RECENT_PROJECTS = 8
 
 # Per-pixel mask values
@@ -543,6 +544,9 @@ _SEMANTIC_PALETTE = {
     # Training-window shading: a faint lift of the spectrogram, not a hue --
     # it marks a region, and must not read as a fifth review state.
     'train_window': (255, 255, 255),
+    # A detection's brightness ridge: a line inside the mask, so it needs a hue
+    # of its own against the pending yellow it sits in.
+    'ridge':     (255, 120, 0),
 }
 # Inverted grayscale is the one *light* background, where white and bright
 #: Stroke width of a mask outline, and of the selected one. The halo pen is
@@ -551,6 +555,8 @@ _SEMANTIC_PALETTE = {
 #: ends of a colormap, so it is the line that thins, never the halo.
 MASK_OUTLINE_W = 1
 MASK_OUTLINE_W_SELECTED = 2
+#: Stroke width of a detection's brightness ridge.
+RIDGE_W = 2
 
 
 #: Everything File > Settings can change, in one place.
@@ -654,6 +660,7 @@ _SEMANTIC_PALETTE_LIGHT = {
     'harmonic':  (0, 90, 170),
     'halo':      (255, 255, 255),
     'train_window': (0, 0, 0),
+    'ridge':     (190, 70, 0),
 }
 _OVERLAY_PALETTES = {
     name: _SEMANTIC_PALETTE
@@ -1875,6 +1882,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
     #: rule it shows is not visible anywhere else, and getting it wrong teaches
     #: real calls as background.
     show_training_windows = True
+    #: Draw each detection's brightness ridge (see mad_ridge) through its mask.
+    show_ridges = True
     #: Context each side of a call, in frames, that training uses on this
     #: recording. The main window sets it from the project's context_ms and
     #: the file's grid (see MADMainWindow._apply_training_context).
@@ -1985,6 +1994,38 @@ class MADSpectrogramWidget(SpectrogramWidget):
             painter.setPen(pen)
             for poly in polys:
                 painter.drawPolygon(poly)
+
+    def _paint_ridge(self, painter, ann, tpx_to_x, fpx_to_y, pal):
+        """A detection's brightness ridge: the brightest continuous path through
+        the pixels under its mask, one point per time column (mad_ridge). A blob
+        over a fast trill has a flat centroid; this line still shows the trill.
+
+        Drawn only while the mask is the one the ridge was computed from: an
+        edited mask has no ridge until inference or add-ridge writes one."""
+        bins = ann.get('ridge_bins')
+        if bins is None or ann.get('_ridge_mask') is not ann.get('mask'):
+            return
+        t0 = ann['t0']
+        runs, cur = [], []
+        for j, b in enumerate(bins):
+            if np.isfinite(b):
+                cur.append(QPointF(tpx_to_x(t0 + j), fpx_to_y(b)))
+            elif cur:
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+        painter.setBrush(Qt.NoBrush)
+        # 2 px: at the outline's 1 px the halo swallows the hue.
+        for col, w in ((pal['halo'], RIDGE_W + 2), (pal['ridge'], RIDGE_W)):
+            pen = QPen(QColor(*col))
+            pen.setWidth(w)
+            painter.setPen(pen)
+            for pts in runs:
+                if len(pts) > 1:
+                    painter.drawPolyline(QPolygonF(pts))
+                else:
+                    painter.drawPoint(pts[0])
 
     @staticmethod
     def _draw_haloed_text(painter, pos, text, color, halo):
@@ -2299,6 +2340,22 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     painter.drawText(mr, Qt.AlignCenter, "✎")
                     painter.restore()
                     self._note_hits.append((mr.adjusted(-2, -2, 2, 2), ai))
+
+        # Brightness ridges, in every view mode: over the bare spectrogram is
+        # where you judge whether the line follows the call.
+        if self.show_ridges and overlays_visible and self.annotations:
+            painter.save()
+            painter.setClipRect(spec_rect)
+            for ai, ann in enumerate(self.annotations):
+                if (ai == self._editing_ann_idx or 'ridge_bins' not in ann
+                        or ann.get('status') == 'rejected'
+                        or self._score_hidden(ann)):
+                    continue
+                if (ann['t1'] <= t_start or ann['t0'] >= t_end or
+                        ann['f1'] <= f_start or ann['f0'] >= f_end):
+                    continue
+                self._paint_ridge(painter, ann, _tpx_to_x, _fpx_to_y, pal)
+            painter.restore()
 
         self._draw_open_note(painter)
 
@@ -6692,10 +6749,29 @@ class MADMainWindow(QMainWindow):
         self.chk_train_windows.setChecked(_show_tw)
         self.spectrogram.show_training_windows = _show_tw
         self.chk_train_windows.toggled.connect(self._set_training_windows_shown)
+        self.chk_ridges = QCheckBox("Ridges")
+        self.chk_ridges.setToolTip(
+            "Draw each detection's brightness ridge: the brightest continuous "
+            "path through the pixels under its mask, one point per frame. It is "
+            "where the turns, depth and trill columns come from. A blob over a "
+            "fast trill has a flat centre; the ridge still oscillates.\n\n"
+            "Pending detections from inference only (an edited mask has none "
+            "until inference or `add-ridge` runs again).")
+        self.chk_ridges.setFocusPolicy(Qt.NoFocus)
+        self.chk_ridges.setStyleSheet("font-size: 10px;")
+        try:
+            _show_r = str(self._settings.value(
+                RIDGES_KEY, "true")).lower() not in ("false", "0")
+        except Exception:
+            _show_r = True
+        self.chk_ridges.setChecked(_show_r)
+        self.spectrogram.show_ridges = _show_r
+        self.chk_ridges.toggled.connect(self._set_ridges_shown)
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 4, 0)
         header_row.setSpacing(6)
         header_row.addWidget(self.lbl_view_header, 1)
+        header_row.addWidget(self.chk_ridges, 0, Qt.AlignRight)
         header_row.addWidget(self.chk_train_windows, 0, Qt.AlignRight)
         header_row.addWidget(self.chk_trajectories, 0, Qt.AlignRight)
         right_layout.addLayout(header_row)
@@ -10950,6 +11026,14 @@ class MADMainWindow(QMainWindow):
         if not self._focus_is_edit():
             self.chk_train_windows.toggle()
 
+    def _set_ridges_shown(self, on: bool):
+        self.spectrogram.show_ridges = bool(on)
+        try:
+            self._settings.setValue(RIDGES_KEY, bool(on))
+        except Exception:
+            pass
+        self.spectrogram.update()
+
     def _set_training_windows_shown(self, on: bool):
         self.spectrogram.show_training_windows = bool(on)
         try:
@@ -11186,7 +11270,7 @@ class MADMainWindow(QMainWindow):
         # Per-blob crops (few MB). Migrate a legacy prob file once, carving
         # crops from the CSV's blob boxes when a CSV is present so blob_ids and
         # accept/reject status stay joined.
-        crops = read_all_pred_masks(h5_path)
+        crops = read_all_pred_masks(h5_path, include_ridge=True)
         if not crops and has_prob(h5_path):
             crops, migrated_rows = self._migrate_legacy_prob(h5_path, sp, rows)
             if rows is None:
@@ -11387,6 +11471,13 @@ class MADMainWindow(QMainWindow):
                 'tags': list(r.get('tags') or []),
                 'csv_path': csv_path if os.path.isfile(csv_path) else None,
             })
+            if crop is not None and crop.get('ridge_khz') is not None:
+                # kHz -> spectrogram bins; tied to this mask object, so an
+                # edit (which replaces the mask) hides a ridge it no longer fits.
+                a = sg.annotations[-1]
+                a['ridge_bins'] = (np.asarray(crop['ridge_khz'], np.float64)
+                                   * 1000.0 / df)
+                a['_ridge_mask'] = a['mask']
             n_added += 1
             if ann_status == 'prediction':
                 n_pending += 1
