@@ -426,6 +426,7 @@ def migrate_store(h5_path: str, *, dry_run: bool = True,
                     del g["neighbors"]
                 g.create_dataset("neighbors", data=nb.astype(np.uint8),
                                  compression="gzip", compression_opts=4)
+                _ms.store_example_ridge(g)
     except Exception as exc:
         rep.error = f"{type(exc).__name__}: {exc}"
     return rep

@@ -126,18 +126,31 @@ _RIDGE_COLS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
 
 
 def _add_ridge_fields(h5_path: str, rows: Dict[str, Dict]) -> None:
-    """The brightness-ridge measures stored on each detection's crop, onto its row
-    (accepted, rejected or pending alike: the crop is kept after review). Rows
-    without a crop -- calls painted by hand -- stay blank."""
+    """The brightness-ridge measures onto each row: from the detection's crop
+    (accepted, rejected or pending alike: the crop is kept after review), then
+    from the call's training example. A label's own ridge wins -- its mask is
+    the reviewed one, possibly edited -- and covers calls painted by hand; a
+    rejected example only fills a row its crop left blank."""
     from . import fnt_mask_store as _ms
+
+    def put(row, rec, only_blank=False):
+        for k in _RIDGE_COLS:
+            v = rec.get(k)
+            if v is None or (isinstance(v, float) and v != v):
+                continue
+            if only_blank and row.get(k) not in (None, ""):
+                continue
+            row[k] = round(v, 3) if isinstance(v, float) else v
+
     for key, crop in _ms.read_all_pred_masks(h5_path).items():
         row = rows.get(str(key))
-        if row is None:
-            continue
-        for k in _RIDGE_COLS:
-            v = crop.get(k)
-            if v is not None and not (isinstance(v, float) and v != v):
-                row[k] = round(v, 3) if isinstance(v, float) else v
+        if row is not None:
+            put(row, crop)
+    for eid, rec in _ms.read_example_ridges(h5_path).items():
+        key = str(rec["blob_id"]) if rec.get("blob_id") is not None else str(eid)
+        row = rows.get(key)
+        if row is not None:
+            put(row, rec, only_blank=rec["kind"] != "label")
 
 
 def _recompute_features(wav_path: str, rows, grid: Dict, masks) -> int:

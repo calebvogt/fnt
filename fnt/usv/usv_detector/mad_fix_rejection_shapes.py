@@ -324,6 +324,7 @@ def repair_store(h5_path: str, *, dry_run: bool = True,
                                      data=res["neighbors"].astype(np.uint8),
                                      compression="gzip", compression_opts=4)
                 g.attrs["meta_json"] = json.dumps(res["meta"])
+                _ms.store_example_ridge(g)
     except Exception as exc:
         rep.error = f"{type(exc).__name__}: {exc}"
     return rep

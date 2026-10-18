@@ -667,6 +667,132 @@ def _store_ridge(f, key: str, ds, m: np.ndarray, spec, units) -> None:
         key, data=res["khz"], compression="gzip", compression_opts=4)
 
 
+#: A training example's ridge: the dataset ``ridge`` in its group (kHz per time
+#: frame of the call's own span, NaN where its mask is empty there), the attr
+#: ``ridge_t_off`` (the patch frame that span starts at) and the measures as
+#: attrs, named as on a prediction. Recomputed whenever an example is written,
+#: its mask changes or its bounds change.
+EXAMPLE_RIDGE_DS = "ridge"
+_EXAMPLE_BOUNDS = ("t_start_s", "t_stop_s", "f_low_hz", "f_high_hz", "patch_t0_s")
+
+
+def example_ridge(spec, mask, meta) -> Optional[Dict]:
+    """The brightness ridge of one training example (see mad_ridge), or None.
+
+    The call's own pixels are its mask inside its time and frequency bounds
+    from ``meta`` -- the cut the 2021_8x8_Mus analysis makes of a verified
+    call, so the two agree. ``spec`` is the patch (uint8 0-255, or a float
+    image in [0, 1], scaled as it is stored). The result carries ``t_off``, the
+    patch frame the ridge starts at."""
+    from .mad_examples import _bbox_from_meta
+    from .mad_ridge import grid_units, ridge_measures
+    meta = meta or {}
+    box = _bbox_from_meta(meta)
+    if box is None:
+        return None
+    try:
+        df_khz, dt_ms = grid_units(float(meta["sample_rate"]), int(meta["nperseg"]),
+                                   int(meta["noverlap"]), int(meta["nfft"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    m = np.asarray(mask) > 0
+    s = np.asarray(spec)
+    if s.shape != m.shape:
+        return None
+    if s.dtype != np.uint8:
+        s = (np.clip(s, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    f0, f1, t0, t1 = box
+    f1, t1 = min(f1, m.shape[0]), min(t1, m.shape[1])
+    if f1 <= f0 or t1 <= t0:
+        return None
+    res = ridge_measures(s[f0:f1, t0:t1], m[f0:f1, t0:t1], df_khz, dt_ms, f_off=f0)
+    if res is not None:
+        res["t_off"] = int(t0)
+    return res
+
+
+def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
+    """(Re)compute an example group's ridge, dropping any stale one first.
+
+    ``spec``, ``mask`` and ``meta`` default to what the group holds. Returns
+    the measures stored (``{ridge_turns, ...}``), or None when the example has
+    no ridge (no pixels inside its bounds, or no grid in its meta). Never
+    raises: a ridge must not stop a label from being saved."""
+    from .mad_ridge import RIDGE_ATTRS
+    try:
+        if EXAMPLE_RIDGE_DS in g:
+            del g[EXAMPLE_RIDGE_DS]
+        for k in RIDGE_ATTRS + ("ridge_t_off",):
+            if k in g.attrs:
+                del g.attrs[k]
+        if spec is None:
+            spec = g["spec"][()]
+        if mask is None:
+            mask = g["mask"][()]
+        if meta is None:
+            meta = json.loads(g.attrs.get("meta_json", "{}"))
+        res = example_ridge(spec, mask, meta)
+        if res is None:
+            return None
+        for k in RIDGE_ATTRS:
+            g.attrs[k] = res[k]
+        g.attrs["ridge_t_off"] = res["t_off"]
+        g.create_dataset(EXAMPLE_RIDGE_DS, data=res["khz"], compression="gzip",
+                         compression_opts=4)
+        return {k: res[k] for k in RIDGE_ATTRS}
+    except Exception:
+        return None
+
+
+def add_example_ridges(h5_path: str, overwrite: bool = False) -> int:
+    """Store the brightness ridge of every training example that has none yet
+    (all of them with ``overwrite``), in a recording's .mad or a project's
+    training store. No audio needed. Returns the number stored."""
+    _require_h5()
+    if not os.path.isfile(h5_path):
+        return 0
+    n = 0
+    with h5py.File(h5_path, "a") as f:
+        ex = f.get("examples")
+        if ex is None:
+            return 0
+        for key in list(ex.keys()):
+            g = ex[key]
+            if not overwrite and "ridge_turns" in g.attrs:
+                continue
+            n += store_example_ridge(g) is not None
+    return n
+
+
+def read_example_ridges(h5_path: str) -> Dict[str, Dict]:
+    """``{example_id: {kind, blob_id, ridge_turns, ...}}`` for every training
+    example with a stored ridge (attributes only)."""
+    from .mad_ridge import RIDGE_ATTRS
+    _require_h5()
+    out: Dict[str, Dict] = {}
+    if not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        ex = f.get("examples")
+        if ex is None:
+            return out
+        for key in ex:
+            g = ex[key]
+            if "ridge_turns" not in g.attrs:
+                continue
+            try:
+                meta = json.loads(g.attrs.get("meta_json", "{}"))
+            except Exception:
+                meta = {}
+            rec = {"kind": example_kind(meta), "blob_id": meta.get("blob_id")}
+            for k in RIDGE_ATTRS:
+                if k in g.attrs:
+                    v = g.attrs[k]
+                    rec[k] = v.item() if hasattr(v, "item") else v
+            out[key] = rec
+    return out
+
+
 def spec_crop(spec, f_off: int, t_off: int, shape) -> np.ndarray:
     """The ``shape`` (freq x time) window of a full-file spectrogram image at
     (f_off, t_off), as uint8 0-255 (a float image in [0, 1] is scaled, as
@@ -1229,6 +1355,7 @@ def td_save_example(h5_path: str, spec_patch: np.ndarray,
         g.create_dataset("mask", data=mask, compression="gzip", compression_opts=4)
         _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
+        store_example_ridge(g, spec, mask, meta)
     return example_id
 
 
@@ -1279,9 +1406,9 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
     ``replace_blob_id`` drops any other *label* example recorded for that
     detection, which is what keeps re-accepting from stacking copies.
 
-    Returns ``{'id', 'ids_before', 'dropped'}``: the id written, the example ids
-    that existed beforehand (what the undo snapshot needs) and the stale ids
-    removed.
+    Returns ``{'id', 'ids_before', 'dropped', 'ridge'}``: the id written, the
+    example ids that existed beforehand (what the undo snapshot needs), the
+    stale ids removed, and the call's ridge measures (None without one).
     """
     _require_h5()
     import uuid
@@ -1328,7 +1455,9 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
                          compression_opts=4)
         _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
-    return {"id": example_id, "ids_before": ids_before, "dropped": dropped}
+        ridge = store_example_ridge(g, spec, mask, meta)
+    return {"id": example_id, "ids_before": ids_before, "dropped": dropped,
+            "ridge": ridge}
 
 
 def _apply_grid_attrs(f, params: Dict) -> None:
@@ -1622,6 +1751,7 @@ def td_update_mask(h5_path: str, example_id: str, mask_patch: np.ndarray,
             meta = json.loads(g.attrs.get("meta_json", "{}"))
             meta.update(meta_updates)
             g.attrs["meta_json"] = json.dumps(meta)
+        store_example_ridge(g)
 
 
 @_reporting_write
@@ -1643,6 +1773,8 @@ def td_update_meta(h5_path: str, example_id: str, updates: Dict) -> bool:
         meta = json.loads(g.attrs.get("meta_json", "{}"))
         meta.update(updates)
         g.attrs["meta_json"] = json.dumps(meta)
+        if any(k in updates for k in _EXAMPLE_BOUNDS):
+            store_example_ridge(g, meta=meta)       # the call's span moved
         return True
 
 
