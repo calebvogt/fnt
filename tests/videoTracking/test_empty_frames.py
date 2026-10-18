@@ -430,6 +430,36 @@ def test_train_only_narrows_the_training_export(tmp_path):
     assert G.read_frame_names([str(lst), "x/b.png"]) == {"a.png", "b.png", "c.png"}
 
 
+def test_a_mask_in_two_pieces_shows_and_keeps_both():
+    """A tail coming out past another mouse, painted as a second piece of the same
+    mouse: it was saved but never drawn (only the largest piece was), so it looked
+    as if painting there did nothing."""
+    from PyQt5.QtCore import Qt
+    w = window()
+    w._select_frame_row(0)
+    pv = w.preview
+    pv.resize(400, 300)
+    w._set_object_tool("paint")
+    m = square_mask()                             # body: rows 10-30, cols 10-40
+    m[40:44, 50:62] = True                        # a detached tail piece
+    pv.add_pending_mask(m)
+    assert len(pv._ai_objects) == 1 and len(pv._ai_objects[0]["extra"]) == 1   # drawn pending
+    key(pv, Qt.Key_Return)
+    ann = pv.annotations[0]
+    assert len(ann.extra) == 1                    # drawn once saved
+    stored = w._coco.get_annotation(ann.ann_id)
+    from fnt.videoTracking.mask_tracker_annotator import segmentation_to_mask
+    full = segmentation_to_mask(stored["segmentation"], 48, 64).astype(bool)
+    assert full[42, 55] and full[20, 20]          # both pieces stored
+    w._select_frame_row(1); w._select_frame_row(0)   # reload from the store
+    assert len(pv.annotations[0].extra) == 1
+    # a vertex edit of the body keeps the tail piece
+    w._coco.update_annotation_polygon(ann.ann_id, pv.annotations[0].points, pv.annotations[0].extra)
+    full = segmentation_to_mask(w._coco.get_annotation(ann.ann_id)["segmentation"], 48, 64).astype(bool)
+    assert full[42, 55]
+    w.close()
+
+
 def test_review_accepts_rejects_and_advances_as_in_mad():
     """A accepts the prediction under review, R rejects it, Shift+A accepts the
     frame's rest; a frame with none left opens the next with predictions."""

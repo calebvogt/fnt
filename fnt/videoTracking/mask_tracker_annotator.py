@@ -472,12 +472,14 @@ class COCOAnnotationManager:
                 return int(img["height"]), int(img["width"])
         return None
 
-    def update_annotation_polygon(self, ann_id: int, points: list):
+    def update_annotation_polygon(self, ann_id: int, points: list, extra: Optional[list] = None):
         """Replace an annotation's shape with a hand-edited polygon.
 
         The edited outline is rasterised and stored as RLE like every other
         mask, so the storage format stays uniform: readers never need to
-        handle a mix of shapes within one project's new annotations.
+        handle a mix of shapes within one project's new annotations. ``extra``
+        holds the mask's other pieces (a tail past another mouse), kept as they
+        were.
         """
         if len(points) < 3:
             return
@@ -489,8 +491,8 @@ class COCOAnnotationManager:
                 return
             h, w = dims
             mask = np.zeros((h, w), dtype=np.uint8)
-            pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(mask, [pts], 1)
+            pieces = [points] + [q for q in (extra or []) if len(q) >= 3]
+            cv2.fillPoly(mask, [np.array(q, dtype=np.int32).reshape(-1, 1, 2) for q in pieces], 1)
             mask = mask.astype(bool)
             ann["segmentation"] = mask_to_rle(mask)
             ann["bbox"] = list(mask_bbox(mask))

@@ -184,6 +184,9 @@ class AnnotationObject:
                  ann_id: int = -1, is_ai: bool = False, inferred: bool = False,
                  score: Optional[float] = None, rejected: bool = False):
         self.points = list(points)
+        # Other pieces of the same mask (a tail coming out past another mouse):
+        # drawn with it; ``points`` stays the largest piece (vertices, label).
+        self.extra: List[List[Tuple[float, float]]] = []
         self.category = category
         self.ann_id = ann_id
         self.is_ai = is_ai
@@ -623,7 +626,9 @@ class AnnotationPreviewWidget(QWidget):
         if obj["erase"] is not None:
             m &= ~obj["erase"]
         obj["mask"] = m if m.any() else None
-        obj["outline"] = self._mask_outline(m) if obj["mask"] is not None else []
+        pieces = self._mask_pieces(m) if obj["mask"] is not None else []
+        obj["outline"] = pieces[0] if pieces else []
+        obj["extra"] = pieces[1:]
 
     def add_sam_click(self, ix: float, iy: float, positive: bool = True,
                       new_object: bool = False) -> Optional[int]:
@@ -911,6 +916,20 @@ class AnnotationPreviewWidget(QWidget):
         if not self._ai_objects:
             self._drawing_active = False
         self.update()
+
+    @staticmethod
+    def _mask_pieces(mask: np.ndarray) -> List[List[Tuple[float, float]]]:
+        """Every piece's outline, largest first (``_mask_outline`` is the first)."""
+        from .mask_tracker_annotator import MASK_SIMPLIFY_EPS
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for c in sorted(contours, key=cv2.contourArea, reverse=True):
+            approx = cv2.approxPolyDP(c, MASK_SIMPLIFY_EPS, True)
+            pts = [(float(q[0][0]), float(q[0][1])) for q in approx]
+            if len(pts) >= 3:
+                out.append(pts)
+        return out
 
     @staticmethod
     def _mask_outline(mask: np.ndarray) -> List[Tuple[float, float]]:
@@ -1427,6 +1446,7 @@ class AnnotationPreviewWidget(QWidget):
                 if len(outline) < 3:
                     continue
                 self._pending_annotation = outline
+                self._pending_extra = self._mask_pieces(comp)[1:]
                 self._pending_is_ai = True
                 self._ai_mask = comp
                 self._drawing_accepted = True
@@ -1463,6 +1483,8 @@ class AnnotationPreviewWidget(QWidget):
             self._pending_annotation, category, ann_id=ann_id,
             is_ai=self._pending_is_ai,
         )
+        ann.extra = list(getattr(self, "_pending_extra", None) or [])
+        self._pending_extra = []
         self.annotations.append(ann)
         self._clear_drawing()
 
@@ -1553,6 +1575,10 @@ class AnnotationPreviewWidget(QWidget):
                 else:
                     painter.setPen(QPen(color, 1.5))
                 painter.drawPolygon(poly)
+                for piece in ann.extra:
+                    if len(piece) >= 3:
+                        painter.drawPolygon(QPolygonF([QPointF(*self._img_to_widget(px, py))
+                                                       for px, py in piece]))
 
             if is_editing:
                 painter.setPen(QPen(QColor(0, 0, 0), 1))
@@ -1663,11 +1689,12 @@ class AnnotationPreviewWidget(QWidget):
                 width = 3.5 if (obj is focus and len(self._ai_objects) > 1) else 2
                 painter.setPen(QPen(QColor(r, g, b), width, Qt.DashLine))
                 painter.setBrush(QBrush(QColor(r, g, b, 22)))
-                poly = QPolygonF()
-                for px, py in obj["outline"]:
-                    wx, wy = self._img_to_widget(px, py)
-                    poly.append(QPointF(wx, wy))
-                painter.drawPolygon(poly)
+                for piece in [obj["outline"]] + list(obj.get("extra") or []):
+                    poly = QPolygonF()
+                    for px, py in piece:
+                        wx, wy = self._img_to_widget(px, py)
+                        poly.append(QPointF(wx, wy))
+                    painter.drawPolygon(poly)
 
 # ======================================================================
 # Worker threads
@@ -8878,19 +8905,24 @@ class MaskTrackerWindow(QMainWindow):
             polys = segmentation_to_polygons(
                 ann["segmentation"], dims[0], dims[1]
             )
+            extra = []
             if polys:
-                # The largest piece: a mask in pieces (a tail cut off by
-                # erasing) showed only its first piece, often the fragment.
-                seg = max(polys, key=lambda q: cv2.contourArea(
-                    np.asarray(q, np.float32).reshape(-1, 2)))
+                # The largest piece carries the vertices and the label; the
+                # others (a tail coming out past another mouse) are drawn too.
+                polys = sorted(polys, key=lambda q: cv2.contourArea(
+                    np.asarray(q, np.float32).reshape(-1, 2)), reverse=True)
+                seg = polys[0]
                 for i in range(0, len(seg), 2):
                     points.append((float(seg[i]), float(seg[i + 1])))
+                extra = [[(float(q[i]), float(q[i + 1])) for i in range(0, len(q), 2)]
+                         for q in polys[1:] if len(q) >= 6]
             is_inferred = ann.get("inferred", False)
             ann_obj = AnnotationObject(
                 points, cat_name, ann_id=ann["id"], inferred=is_inferred,
                 score=ann.get("score") if is_inferred else None,
                 rejected=bool(ann.get("rejected")),
             )
+            ann_obj.extra = extra
             self.preview.annotations.append(ann_obj)
 
         self.preview.review_idx = None
@@ -9539,7 +9571,7 @@ class MaskTrackerWindow(QMainWindow):
             before = {k: copy.deepcopy(before_dict[k])
                       for k in ("segmentation", "bbox", "area")
                       if k in before_dict}
-            self._coco.update_annotation_polygon(ann.ann_id, ann.points)
+            self._coco.update_annotation_polygon(ann.ann_id, ann.points, ann.extra)
             after_dict = self._coco.get_annotation(ann.ann_id)
             if after_dict is not None:
                 after = {k: copy.deepcopy(after_dict[k])
