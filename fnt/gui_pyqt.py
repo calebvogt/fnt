@@ -48,7 +48,6 @@ except ImportError:
 
 import threading
 from datetime import datetime
-from fnt.fed3.fed_widgets import FEDTabWidget
 from fnt.tool_launcher import ToolProcessManager
 
 
@@ -662,8 +661,8 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
 
         buttons = [
-            ("FED Processing Tool",
-             "Universal FED tool for monitoring and managing devices",
+            ("FED3",
+             "Run FED3 experiments: protocols, devices, live data",
              self.run_fed_processing),
         ]
 
@@ -674,42 +673,8 @@ class FNTMainWindow(QMainWindow):
         layout.addStretch()
 
     def run_fed_processing(self):
-        """Launch FED Processing Tool"""
-        try:
-            class FEDWindow(QMainWindow):
-                def __init__(self, parent=None):
-                    super().__init__(parent)
-                    self.fed_widget = None
-
-                def closeEvent(self, event):
-                    if self.fed_widget:
-                        try:
-                            self.fed_widget.cleanup()
-                        except Exception as e:
-                            print(f"Error cleaning up FED widget: {e}")
-                    event.accept()
-
-            self.fed_window = FEDWindow(self)
-            self.fed_window.setWindowTitle("FED Processing Tool")
-            self.fed_window.resize(1000, 800)
-            self.fed_window.setStyleSheet(self.styleSheet())
-
-            # Wrap FEDTabWidget in a container with margins to match other FNT windows
-            container = QWidget()
-            container_layout = QVBoxLayout(container)
-            container_layout.setContentsMargins(10, 10, 10, 10)
-
-            fed_widget = FEDTabWidget(parent=self.fed_window, worker_class=WorkerThread)
-            self.fed_window.fed_widget = fed_widget
-            container_layout.addWidget(fed_widget)
-
-            self.fed_window.setCentralWidget(container)
-            self.fed_window.show()
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Error",
-                f"Failed to launch FED tool: {str(e)}"
-            )
+        """Open the FED3 window in its own process."""
+        self.tools.launch("fed3")
 
     def create_wifp_tab(self):
         """Create the WiFP (Wireless Fiber Photometry) processing tab"""
@@ -1539,14 +1504,6 @@ class FNTMainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close event"""
-        # Close the FED processing window if open (which will trigger its own
-        # closeEvent and cleanup). FED still runs in-process.
-        if hasattr(self, 'fed_window') and self.fed_window is not None:
-            try:
-                self.fed_window.close()
-            except Exception:
-                pass
-
         # Tool windows run in their own processes and get hard-terminated on
         # quit, with no chance to save in-progress work. We can't see inside
         # another process to know whether it's mid-export, so list what's still

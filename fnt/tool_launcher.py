@@ -44,9 +44,10 @@ TOOL_REGISTRY = {
                  post_show="show_start_dialog"),   # New / Open project chooser
         ToolSpec("rfid_preprocessing", "fnt.rfid.rfid_preprocessing_pyqt",
                  "RFIDPreprocessingWindow", "RFID PreProcessing"),
-        # NOTE: the FED Processing tool is deliberately NOT registered here. It
-        # still opens in-process from fnt.gui_pyqt.run_fed_processing and is
-        # owned separately; isolating it is that owner's call.
+        # FED3 runs devices that keep going without it, so its window can live
+        # in its own process like every other tool: a crash costs the window,
+        # never the experiment. One copy only, since two would fight over ports.
+        ToolSpec("fed3", "fnt.fed3.ui.window", "FedWindow", "FED3", multi=False),
         ToolSpec("musestudio", "fnt.musestudio.musestudio_pyqt",
                  "MuseStudioWindow", "Muse Studio"),
 

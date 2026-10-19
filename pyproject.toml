@@ -52,6 +52,8 @@ dependencies = [
     "segmentation-models-pytorch>=0.3.4",
     # USB serial communication for FED devices
     "pyserial",
+    # FED3 protocol files
+    "pyyaml",
     # SAM2 — AI-assisted mask annotation
     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
     # OCR — timestamp extraction from DVR video overlays
@@ -89,6 +91,7 @@ all = [
 [project.scripts]
 fnt = "fnt.gui_pyqt:main"
 mad = "fnt.usv.usv_detector.cli:main"
+fnt-fed = "fnt.fed3.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"

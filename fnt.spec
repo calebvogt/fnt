@@ -8,10 +8,12 @@ hiddenimports += collect_submodules('torch')
 hiddenimports += collect_submodules('torchvision')
 hiddenimports += collect_submodules('segmentation_models_pytorch')
 hiddenimports += ['scipy.special.cython_special', 'sklearn.utils._typedefs']
+# Tool windows are imported by name in their own process, so nothing
+# imports them statically for PyInstaller to find.
+hiddenimports += collect_submodules('fnt.fed3')
 
 datas = []
 datas += [('icons', 'icons')]
-datas += [('fnt/fed3/fed3_image.svg', 'fnt/fed3')]
 datas += collect_data_files('ultralytics')
 datas += collect_data_files('sam2')
 datas += collect_data_files('segmentation_models_pytorch')
