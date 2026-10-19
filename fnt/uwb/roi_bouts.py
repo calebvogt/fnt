@@ -1,10 +1,11 @@
 """ROI occupancy as BOUTS rather than as summed dwell time.
 
-A bout is a maximal run of consecutive fixes inside one region. The rule is
+A bout is a maximal run of consecutive fixes inside one region, with no
+silence longer than ``max_gap_s`` between two of them. The rule is
 deliberately strict: a single fix outside the region, or inside a different
-one, ends the bout, and the next fix back inside starts a new one. Nothing is
-smoothed over, no gap is bridged, and no duration is rounded — the exported
-numbers are the observed ones.
+one, ends the bout, and the next fix back inside starts a new one; so does a
+gap in the recording. Nothing is smoothed over, no gap is bridged, and no
+duration is rounded — the exported numbers are the observed ones.
 
 Two products come from the same runs:
 
@@ -36,8 +37,20 @@ import pandas as pd
 # still a row, and n_reads says exactly how much evidence stands behind it.
 LONE_READ_S = 0.0
 
+# The longest silence a bout may span. A run of fixes in one region is one
+# visit only while the tag keeps reporting: across a longer gap the animal's
+# whereabouts are unknown, so the run ends at the last fix before the gap and
+# the next fix starts a new bout, even in the same region. Without this, a
+# whole-system outage (every tag silent for 14-16 h in the 2024_LID_MesoUWB
+# trials) whose last and first fixes fell in the same zone was exported as one
+# 15.8 h visit. Callers pass the preprocessing "time gap" (the setting that
+# also splits the track into segments for the velocity and jump filters); this
+# default stands in when they do not.
+MAX_GAP_S = 60.0
 
-def region_bouts(zone_idx, times_ns, lone_read_s=LONE_READ_S):
+
+def region_bouts(zone_idx, times_ns, lone_read_s=LONE_READ_S,
+                 max_gap_s=MAX_GAP_S):
     """Runs of consecutive reads in one region.
 
     Yields ``(region, t0, t1, seconds, n_reads)``.
@@ -46,6 +59,8 @@ def region_bouts(zone_idx, times_ns, lone_read_s=LONE_READ_S):
     (-1 for outside), ``times_ns`` the matching timestamps as int64 nanoseconds,
     both in fix order. A run of length one reports ``t0 == t1`` and
     ``lone_read_s`` seconds; every other run reports its true span, unrounded.
+    Two consecutive fixes more than ``max_gap_s`` seconds apart never share a
+    run (``None`` disables the gap rule).
     """
     zi = np.asarray(zone_idx)
     t = np.asarray(times_ns, dtype='int64')
@@ -58,6 +73,9 @@ def region_bouts(zone_idx, times_ns, lone_read_s=LONE_READ_S):
     brk = np.empty(n, dtype=bool)
     brk[0] = True
     brk[1:] = zi[1:] != zi[:-1]
+    # ...and so is a silence longer than max_gap_s: an outage is not a stay.
+    if max_gap_s is not None:
+        brk[1:] |= np.diff(t) > int(round(float(max_gap_s) * 1e9))
     starts = np.flatnonzero(brk)
     stops = np.append(starts[1:], n) - 1
 

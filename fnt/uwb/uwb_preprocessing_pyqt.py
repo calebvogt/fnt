@@ -445,8 +445,10 @@ ROI_BOUTS_TOOLTIP = (
     "Columns: SexID, Day, ROI, bout_start, bout_stop, duration_s, n_reads.\n"
     "\n"
     "STRICT. A single fix outside the region ends the bout, and the next fix "
-    "back inside starts a new one. Nothing is bridged, no dropout is filled "
-    "in, and no duration is rounded — millisecond edges throughout.\n"
+    "back inside starts a new one; so does a recording gap longer than the "
+    "Time gap setting (the one that splits the track into segments), even "
+    "inside one region. Nothing is bridged, no dropout is filled in, and no "
+    "duration is rounded — millisecond edges throughout.\n"
     "\n"
     "A LONE READ inside a region reports identical bout_start and bout_stop "
     "and duration 0.0 s, with n_reads = 1. That is what was observed: the "
@@ -11001,7 +11003,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # each fix its sampling interval instead - what this used to do -
             # ran exactly one second per visit ahead of the CSV.
             t_ns = ts.values.astype('datetime64[ns]').astype('int64')
-            for r_i, t0, t1, secs, _n in RB.region_bouts(zi, t_ns):
+            for r_i, t0, t1, secs, _n in RB.region_bouts(
+                    zi, t_ns, max_gap_s=self.roi_bout_max_gap_s()):
                 by_animal.setdefault((label, r_i), []).append(
                     (t0 / 1e9, t1 / 1e9, secs))
             if label not in seen:
@@ -11565,8 +11568,9 @@ class UWBQuickVisualizationWindow(QWidget):
         """One row per visit: a run of consecutive fixes inside one region.
 
         Strict by design. A single fix outside the region ends the bout, and
-        the next fix back inside starts a new one — nothing is bridged and no
-        duration is rounded. A lone fix inside a region reports identical
+        the next fix back inside starts a new one; so does a recording gap
+        longer than the Time gap setting (``roi_bout_max_gap_s``) — nothing is
+        bridged and no duration is rounded. A lone fix inside a region reports identical
         start and stop and 0.0 s (roi_bouts.LONE_READ_S), because its real
         span cannot be observed; n_reads = 1 marks it.
 
@@ -11596,7 +11600,8 @@ class UWBQuickVisualizationWindow(QWidget):
         for column, regions in sets:
             names = [r.get('name', f'{column} {i + 1}')
                      for i, r in enumerate(regions)]
-            for r_i, t0, t1, secs, n_reads in RB.region_bouts(idx[column], t_ns):
+            for r_i, t0, t1, secs, n_reads in RB.region_bouts(
+                    idx[column], t_ns, max_gap_s=self.roi_bout_max_gap_s()):
                 rows.append({
                     'SexID': label,
                     'ROI': names[r_i],
@@ -11744,6 +11749,14 @@ class UWBQuickVisualizationWindow(QWidget):
             f"\u2713 Exported {fname} ({len(df)} row(s), "
             f"{df['ROI'].nunique()} region(s) over {df['Day'].nunique()} day(s))")
         return path
+
+    def roi_bout_max_gap_s(self):
+        """The longest recording gap a ROI bout may span: the Time gap setting,
+        so a visit breaks exactly where the track's segments do (see
+        roi_bouts.MAX_GAP_S for why a bout must not bridge an outage)."""
+        from fnt.uwb import roi_bouts as RB
+        spin = getattr(self, 'spin_time_gap', None)
+        return float(spin.value()) if spin is not None else RB.MAX_GAP_S
 
     def region_bouts_from_csv(self, csv_path, sets, selected_tags=None):
         """Re-derive ROI bouts from an existing smoothed CSV.
